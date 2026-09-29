@@ -40,7 +40,8 @@ def _make_feature(initial_state: TaskState = TaskState.SUBMITTED):
 
     state = {"task": task}
 
-    async def get_task(task_id):
+    async def get_task(task_id, recipient_agent_id):
+        assert recipient_agent_id == "did:test:receiver"
         return state["task"] if state["task"].id == task_id else None
 
     async def update_status(
@@ -64,8 +65,15 @@ def _make_feature(initial_state: TaskState = TaskState.SUBMITTED):
         ]
         return state["task"]
 
-    async def cancel_task(task_id, reason=None, agent_name=None):
+    async def cancel_task(
+        task_id,
+        reason=None,
+        agent_name=None,
+        *,
+        recipient_agent_id,
+    ):
         assert state["task"].id == task_id
+        assert recipient_agent_id == "did:test:receiver"
         prior = state["task"].status.state
         state["task"].status = TaskStatus(
             state=TaskState.CANCELED,
@@ -79,7 +87,8 @@ def _make_feature(initial_state: TaskState = TaskState.SUBMITTED):
         return state["task"]
 
     task_manager = MagicMock()
-    task_manager.get_task = AsyncMock(side_effect=get_task)
+    task_manager.get_task_for_recipient = AsyncMock(side_effect=get_task)
+    task_manager.is_task_recipient = AsyncMock(return_value=True)
     task_manager.update_status = AsyncMock(side_effect=update_status)
     task_manager.cancel_task = AsyncMock(side_effect=cancel_task)
 
@@ -159,6 +168,7 @@ async def test_canceled_state_supported():
         "task-1",
         reason="declining: out of scope",
         agent_name="did:test:receiver",
+        recipient_agent_id="did:test:receiver",
     )
 
 

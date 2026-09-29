@@ -16,9 +16,18 @@ These tests exercise the real wiring:
   freshly-constructed ContextBuilder against the same real DB (round-trip).
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from kestrel_sovereign.agent.context_builder import ContextBuilder
+from kestrel_sovereign.features.contribution_runtime import (
+    ContextClauseRegistry,
+    FeatureContributionRuntimeError,
+    ResolvedContextClause,
+)
+
+
 @pytest.fixture
 async def real_db(tmp_path, sqlite_database_factory):
     """A real SQLite AsyncDatabase with the bootstrap_config table created."""
@@ -108,6 +117,50 @@ class TestPersistenceRoundTrip:
         assert "AGENTS.md" in cb2._bootstrap_loader.file_order
         await cb2.load_bootstrap_db_config()
         assert "AGENTS.md" not in cb2._bootstrap_loader.file_order
+
+    @pytest.mark.asyncio
+    async def test_persisted_bootstrap_name_cannot_collide_with_active_context(
+        self, real_db, agent_dir
+    ):
+        """DB-restored custom names are checked before first prompt assembly."""
+
+        policy_path = agent_dir / "POLICY.yaml"
+        policy_path.write_text("Custom operator policy.")
+        seed = _make_builder(real_db, agent_dir)
+        await seed._bootstrap_loader.save_db_entry(
+            file_name="POLICY.yaml",
+            file_path=str(policy_path),
+            enabled=True,
+            priority=150,
+        )
+        owner = "tests:persisted-bootstrap-collision"
+        registry = ContextClauseRegistry()
+        registry.register_batch(
+            (
+                ResolvedContextClause(
+                    owner=owner,
+                    name="POLICY.yaml",
+                    priority=10,
+                    body="feature policy",
+                    registration=SimpleNamespace(
+                        identity=(owner, "POLICY.yaml")
+                    ),
+                ),
+            )
+        )
+        builder = ContextBuilder(
+            storage=None,
+            db=real_db,
+            agent_id="did:test:wired",
+            agent_data_path=str(agent_dir),
+            context_clause_registry=registry,
+        )
+
+        with pytest.raises(
+            FeatureContributionRuntimeError,
+            match="already registered",
+        ):
+            await builder.load_bootstrap_db_config()
 
 
 class TestFirstPromptOrdering:

@@ -19,7 +19,7 @@ import hashlib
 import hmac as hmac_mod
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.features.webhooks.models import (
     WebhookAuthType,
@@ -1368,6 +1368,231 @@ class TestWebhookMultiAgentDispatch:
         )
         assert rows[0][0] == "ghost"
         assert rows[0][1] == 404
+
+    @pytest.mark.asyncio
+    async def test_duplicate_name_is_refused_in_either_order_and_audited_on_every_owner(
+        self, tmp_path, sqlite_database_factory
+    ):
+        """#3216: two receivers own the same name → refused, not first-wins.
+
+        For BOTH provider orders the unprefixed form answers the unregistered-
+        name 404 and dispatches to neither receiver; each owner's own
+        ``webhook_log`` persists the refusal (404, unauthenticated, with the
+        real source and payload hash) and holds no successful receive. The
+        host log names the collision and the agent-prefixed remedy, and no
+        owner's rate-limit window is touched — the properties the refusal
+        docstrings promise, each pinned here because a refactor that dropped
+        any one of them left every test green.
+        """
+        import hashlib
+        import logging
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.features.webhooks.receiver import (
+            build_webhook_dispatch_router,
+        )
+
+        db_a = await sqlite_database_factory(tmp_path / "a.db")
+        feat_a = WebhookFeature(_make_agent(db=db_a, agent_id="did:test:agent-a"))
+        await feat_a.initialize()
+        await feat_a.webhooks_register(
+            name="alpha", auth_type="none", allow_unauthenticated=True
+        )
+        db_b = await sqlite_database_factory(tmp_path / "b.db")
+        feat_b = WebhookFeature(_make_agent(db=db_b, agent_id="did:test:agent-b"))
+        await feat_b.initialize()
+        await feat_b.webhooks_register(
+            name="alpha", auth_type="none", allow_unauthenticated=True
+        )
+
+        payload = b'{"amount": 5}'
+        # A handler on the module logger itself: the app's boot reconfigures
+        # root logging, so a root-level capture can miss the warning.
+        records = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        target = logging.getLogger("kestrel_sovereign.features.webhooks.receiver")
+        handler = _Collect(level=logging.WARNING)
+        target.addHandler(handler)
+        try:
+            for order in ((feat_a, feat_b), (feat_b, feat_a)):
+                receivers = [feat.receiver for feat in order]
+                app = FastAPI()
+                app.include_router(
+                    build_webhook_dispatch_router(
+                        lambda _agent=None, receivers=receivers: receivers
+                    )
+                )
+                resp = TestClient(app).post("/webhooks/alpha", content=payload)
+                assert resp.status_code == 404, order
+                assert resp.json() == {"error": "Unknown webhook: alpha"}, order
+        finally:
+            target.removeHandler(handler)
+
+        collisions = [
+            record for record in records
+            if record.levelno == logging.WARNING and "alpha" in record.getMessage()
+        ]
+        assert len(collisions) == 2, [r.getMessage() for r in records]
+        for record in collisions:
+            assert "/api/agents/{agent}/webhooks/alpha" in record.getMessage()
+
+        expected_hash = hashlib.sha256(payload).hexdigest()
+        for feat, db in ((feat_a, db_a), (feat_b, db_b)):
+            rows = await db.fetchall(
+                "SELECT webhook_name, status_code, authenticated, source_ip, "
+                "payload_hash FROM webhook_log"
+            )
+            # One refusal per order, nothing dispatched, each row carrying the
+            # forensic fields a real receive would.
+            assert [(r[0], r[1], bool(r[2]), r[3], r[4]) for r in rows] == [
+                ("alpha", 404, False, "testclient", expected_hash),
+                ("alpha", 404, False, "testclient", expected_hash),
+            ]
+            # A refusal is not a receive: no sliding window was opened, so
+            # the collision cannot pre-poison the limit that applies once
+            # the sender is re-addressed.
+            assert "alpha" not in feat.receiver._rate_windows
+
+
+    @pytest.mark.asyncio
+    async def test_register_hands_back_the_agent_prefixed_address_and_it_dispatches_here(
+        self, tmp_path, sqlite_database_factory
+    ):
+        """#3216, registration side: the tool cannot see its peers, so it
+        cannot refuse a colliding name — but it must not hand back
+        ``/webhooks/{name}`` as though the host will honour it.
+
+        On a hosted agent the reply carries ``agent_endpoint``, keyed by the
+        ROUTING name the AgentManager registered the agent under (not the
+        display name), and the test then POSTs to exactly that address on
+        the real app with the real routing middleware: it dispatches to this
+        agent's receiver and to nobody else's, even while a peer owns the
+        same name and the unprefixed form is refused.
+        """
+        from contextlib import asynccontextmanager
+
+        from fastapi.testclient import TestClient
+        from server import app
+        from kestrel_sovereign.server import (
+            _mount_feature_routers,
+            _unmount_feature_routers,
+        )
+
+        db_a = await sqlite_database_factory(tmp_path / "a.db")
+        agent_a = _make_agent(db=db_a, agent_id="did:test:agent-emma")
+        agent_a.agent_name = "Emma (display name, not the routing key)"
+        feat_a = WebhookFeature(agent_a)
+        await feat_a.initialize()
+        agent_a.features = {"WebhookFeature": feat_a}
+
+        db_b = await sqlite_database_factory(tmp_path / "b.db")
+        agent_b = _make_agent(db=db_b, agent_id="did:test:agent-nellie")
+        feat_b = WebhookFeature(agent_b)
+        await feat_b.initialize()
+        agent_b.features = {"WebhookFeature": feat_b}
+
+        fleet = {"emma": agent_a, "nellie": agent_b}
+        by_did = {agent.did: name for name, agent in fleet.items()}
+        manager = MagicMock()
+        manager.list_agents = MagicMock(side_effect=lambda: dict(fleet))
+        manager.get_agent = MagicMock(side_effect=lambda name: fleet.get(name))
+        manager.get_agent_name = MagicMock(side_effect=lambda did: by_did.get(did))
+        agent_a._agent_manager = manager
+        agent_b._agent_manager = manager
+
+        await feat_b.webhooks_register(
+            name="deposit", auth_type="none", allow_unauthenticated=True
+        )
+        reg = await feat_a.webhooks_register(
+            name="deposit", auth_type="none", allow_unauthenticated=True
+        )
+        assert reg.data["endpoint"] == "/webhooks/deposit"
+        assert reg.data["agent_endpoint"] == "/api/agents/emma/webhooks/deposit"
+        manager.get_agent_name.assert_any_call("did:test:agent-emma")
+        assert "/api/agents/emma/webhooks/deposit" in reg.confirmation
+        assert "refused" in reg.confirmation
+        assert "/webhooks/deposit" in reg.confirmation
+
+        @asynccontextmanager
+        async def noop_lifespan(_app):
+            yield
+
+        original = (
+            app.router.lifespan_context,
+            getattr(app.state, "agent", None),
+            getattr(app.state, "agent_manager", None),
+        )
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = manager
+        _mount_feature_routers(app)
+        try:
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    # The unprefixed form is contested → refused.
+                    refused = client.post("/webhooks/deposit", content=b"{}")
+                    assert refused.status_code == 404, refused.text
+                    # The address the tool handed back dispatches HERE.
+                    resp = client.post(reg.data["agent_endpoint"], content=b"{}")
+                    assert resp.status_code == 200, resp.text
+                    assert resp.json()["webhook"] == "deposit"
+        finally:
+            _unmount_feature_routers(app)
+            app.router.lifespan_context = original[0]
+            app.state.agent = original[1]
+            app.state.agent_manager = original[2]
+
+        rows_a = await db_a.fetchall(
+            "SELECT status_code FROM webhook_log ORDER BY rowid"
+        )
+        rows_b = await db_b.fetchall(
+            "SELECT status_code FROM webhook_log ORDER BY rowid"
+        )
+        assert [r[0] for r in rows_a] == [404, 200]
+        assert [r[0] for r in rows_b] == [404]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "manager_factory,label",
+        [
+            (lambda: None, "single-agent boot: no manager, no /api/agents/* route"),
+            (
+                lambda: MagicMock(get_agent_name=MagicMock(return_value=None)),
+                "fenced or unknown route: the registry resolves no name",
+            ),
+            (
+                lambda: MagicMock(),
+                "registry answers with a non-string (a mock leak)",
+            ),
+        ],
+    )
+    async def test_register_invents_no_prefixed_address_without_a_routing_name(
+        self, tmp_path, sqlite_database_factory, manager_factory, label
+    ):
+        """Where the host serves no ``/api/agents/{name}`` route for this
+        agent, the reply must not point the sender at one. ``agent_name``
+        (a display name every agent carries from birth, floor "Unnamed
+        Agent") is deliberately NOT consulted — on a single-agent host it
+        would yield a URL that 404s forever.
+        """
+        db = await sqlite_database_factory(tmp_path / "solo.db")
+        agent = _make_agent(db=db, agent_id="did:test:agent-solo")
+        agent.agent_name = "Unnamed Agent"
+        agent._agent_manager = manager_factory()
+        feat = WebhookFeature(agent)
+        await feat.initialize()
+        reg = await feat.webhooks_register(
+            name="deposit", auth_type="bearer_token",
+            auth_config_json='{"token": "sekret"}',
+        )
+        assert reg.data["endpoint"] == "/webhooks/deposit", label
+        assert "agent_endpoint" not in reg.data, label
+        assert "/api/agents/" not in reg.confirmation, label
 
 
 # The legacy multi-agent host's ``/webhooks/{name}`` PROXY (which forwarded to a

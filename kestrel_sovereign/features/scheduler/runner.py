@@ -30,6 +30,7 @@ from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.features.scheduler.constants import (
     ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
 )
+from kestrel_sovereign.turn_scope import turn_scoped
 from kestrel_sovereign.storage.database_clock import (
     database_backend_type as scheduler_database_backend_type,
     database_clock as scheduler_database_clock,
@@ -42,6 +43,7 @@ from kestrel_sovereign.features.scheduler.status import (
     DEFAULT_MISFIRE_GRACE_SECONDS,
     emit_runtime_status,
     ensure_runtime_status_table,
+    mark_runtime_owner_stopped,
     scheduler_tick_in_progress_limit_seconds,
 )
 
@@ -330,6 +332,64 @@ class SchedulerFeatureUnavailable(RuntimeError):
         )
 
 
+class SchedulerDispatchNotReady(RuntimeError):
+    """The target agent has not passed its ``post_all_features_loaded`` barrier.
+
+    Until every feature finished cross-feature wiring, a task's owning tool
+    may simply not be registered yet (#2474). Nothing was executed, so the
+    runner neither records a result nor advances the occurrence: the claim
+    stays live and is recovered after its lease expires, which bounds retries
+    to one per lease interval.
+    """
+
+    def __init__(self, agent_id: str, task_name: str) -> None:
+        self.agent_id = agent_id
+        self.task_name = task_name
+        super().__init__(
+            f"agent {agent_id!r} has not finished loading features; "
+            f"deferring scheduled task {task_name!r}"
+        )
+
+
+class ScheduledTaskOwnerUnavailable(RuntimeError):
+    """No loaded feature provides the tool a scheduled task delegates to.
+
+    Raised only after the feature-load barrier, so the owner is not merely
+    late: it is not installed, not allowed for this agent, or failed to load.
+    The runner records an honest ``failed`` row with this actionable text,
+    leaves ``last_run_at`` untouched because no effect ran, and moves a
+    recurring schedule to its next occurrence (one failure per occurrence,
+    never a hot loop).
+    """
+
+    def __init__(self, task_name: str) -> None:
+        self.task_name = task_name
+        super().__init__(
+            f"scheduled task {task_name!r} was not executed: no loaded, enabled "
+            f"feature provides tool {task_name!r} after all features finished "
+            "loading. Install or enable the feature that provides it for this "
+            "agent, or remove the schedule."
+        )
+
+
+class SchedulerAuthorityRevoked(RuntimeError):
+    """Scheduler work observed its occurrence after the runner revoked it.
+
+    This is deliberately distinct from "not scheduler work".  A task that
+    inherited a scheduler scope (for example, a detached child created during
+    dispatch) is still scheduler-originated after the runner finalizes or
+    loses the occurrence.  Treating that as absence would let the child run as
+    ordinary interactive work without the occurrence's effect identity, so the
+    reader fails closed instead.
+    """
+
+    def __init__(self, execution_id: str) -> None:
+        self.execution_id = execution_id
+        super().__init__(
+            f"scheduler authority for occurrence {execution_id!r} was revoked"
+        )
+
+
 def validate_schedule_idempotency_base(base: str) -> Optional[str]:
     """Return an invariant error when ``base`` cannot form an SDK-safe key."""
 
@@ -355,7 +415,8 @@ class SchedulerExecution:
     Target tools can call :func:`get_current_scheduler_execution` while a
     scheduler dispatch is active instead of receiving undocumented arguments.
     The identity is revoked as soon as that dispatch returns, including from
-    child tasks that inherited the parent task's context.
+    child tasks that inherited the parent task's context: reading it there
+    raises :class:`SchedulerAuthorityRevoked`.
     """
 
     id: str
@@ -425,6 +486,12 @@ _current_execution: contextvars.ContextVar[Optional[_SchedulerExecutionScope]] =
 def get_current_scheduler_execution() -> Optional[SchedulerExecution]:
     """Return the active execution identity, or ``None`` outside a schedule.
 
+    ``None`` means only that this is not scheduler work.  A context that
+    carries a scheduler scope the runner has revoked raises
+    :class:`SchedulerAuthorityRevoked` rather than returning ``None``: that
+    work is still scheduler-originated, and reading it as absent would let it
+    proceed as interactive work without its occurrence identity.
+
     Tools that cause externally-visible effects should use
     ``execution.idempotency_key`` at their effect boundary.  The value is not
     added to a tool's normal arguments, which keeps existing tool signatures
@@ -432,8 +499,10 @@ def get_current_scheduler_execution() -> Optional[SchedulerExecution]:
     """
 
     scope = _current_execution.get()
-    if scope is None or not scope.active:
+    if scope is None:
         return None
+    if not scope.active:
+        raise SchedulerAuthorityRevoked(scope.execution.id)
     return scope.execution
 
 
@@ -461,9 +530,9 @@ def bind_scheduler_execution_scope(scope: Optional[_SchedulerExecutionScope]):
     uncertainty could then repeat an irreversible effect -- a merge running
     twice.
 
-    Exposed as a binder rather than another hand-rolled set/reset pair so the
-    next transport re-binds by calling this, instead of by remembering that
-    this ContextVar exists.
+    Declared below as a turn-scoped carrier (#3114), so every executor that
+    re-presents a turn's context on a foreign task carries this scope with the
+    rest of the turn, instead of by remembering that this ContextVar exists.
     """
 
     token = _current_execution.set(scope)
@@ -471,6 +540,14 @@ def bind_scheduler_execution_scope(scope: Optional[_SchedulerExecutionScope]):
         yield
     finally:
         _current_execution.reset(token)
+
+
+turn_scoped(
+    "scheduler_execution",
+    variables=(_current_execution,),
+    capture=lambda _agent: capture_scheduler_execution_scope(),
+    bind=bind_scheduler_execution_scope,
+)
 
 
 @dataclass
@@ -958,6 +1035,13 @@ class SchedulerRunner:
             Callable[[str], Union[bool, Awaitable[bool]]]
         ] = None,
         on_protocol_failure: Optional[Callable[[BaseException], None]] = None,
+        authorized_agent_ids_page_provider: Optional[
+            Callable[
+                [Optional[str], int],
+                Union[Collection[str], Awaitable[Collection[str]]],
+            ]
+        ] = None,
+        authorized_agent_ids_page_size: int = 500,
     ):
         try:
             normalized_lease_seconds = int(lease_seconds)
@@ -965,13 +1049,38 @@ class SchedulerRunner:
             raise ValueError("lease_seconds must be positive") from e
         if normalized_lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
+        if (
+            authorized_agent_ids_provider is not None
+            and authorized_agent_ids_page_provider is not None
+        ):
+            raise ValueError(
+                "authorized_agent_ids_provider and "
+                "authorized_agent_ids_page_provider are mutually exclusive"
+            )
+        try:
+            normalized_authority_page_size = int(authorized_agent_ids_page_size)
+        except (TypeError, ValueError) as e:
+            raise ValueError("authorized_agent_ids_page_size must be positive") from e
+        if normalized_authority_page_size <= 0:
+            raise ValueError("authorized_agent_ids_page_size must be positive")
+        if (
+            authorized_agent_ids_page_provider is not None
+            and is_agent_authorized is None
+        ):
+            raise ValueError(
+                "paged host scheduler authority requires is_agent_authorized"
+            )
         if authorized_agent_ids is not None:
             authorized = tuple(sorted(set(authorized_agent_ids)))
             if any(not isinstance(value, str) or not value for value in authorized):
                 raise ValueError(
                     "authorized_agent_ids must contain only non-empty agent IDs"
                 )
-            if not authorized and authorized_agent_ids_provider is None:
+            if (
+                not authorized
+                and authorized_agent_ids_provider is None
+                and authorized_agent_ids_page_provider is None
+            ):
                 raise ValueError(
                     "an empty host scheduler scope requires a live "
                     "authorized_agent_ids_provider"
@@ -988,10 +1097,19 @@ class SchedulerRunner:
             raise ValueError(
                 "agent-scoped SchedulerRunner may authorize only its agent_id"
             )
+        if agent_id is not None and authorized_agent_ids_page_provider is not None:
+            raise ValueError(
+                "agent-scoped SchedulerRunner cannot use paged host authority"
+            )
         self._db = db
         self._agent_id = agent_id
         self._authorized_agent_ids = authorized
         self._authorized_agent_ids_provider = authorized_agent_ids_provider
+        self._authorized_agent_ids_page_provider = authorized_agent_ids_page_provider
+        self._authorized_agent_ids_page_size = normalized_authority_page_size
+        self._authorized_agent_ids_page_cursor: Optional[str] = None
+        # The one bounded page currently admitted to selection and telemetry.
+        self._authorized_agent_ids_page: tuple[str, ...] = ()
         self._executor = executor
         self._poll_interval = poll_interval
         self._misfire_grace_seconds = max(0, int(misfire_grace_seconds))
@@ -1125,6 +1243,11 @@ class SchedulerRunner:
 
         if agent_id not in await self._current_authorized_agent_ids():
             return False
+        return await self._live_agent_authority_allows(agent_id)
+
+    async def _live_agent_authority_allows(self, agent_id: str) -> bool:
+        """Revalidate one DID at a provider-effect or claim boundary."""
+
         if self._is_agent_authorized is None:
             return True
         result = self._is_agent_authorized(agent_id)
@@ -1135,6 +1258,8 @@ class SchedulerRunner:
     async def _current_authorized_agent_ids(self) -> tuple[str, ...]:
         """Return a validated snapshot of this runner's current SQL scope."""
 
+        if self._authorized_agent_ids_page_provider is not None:
+            return self._authorized_agent_ids_page
         provider = self._authorized_agent_ids_provider
         if provider is None:
             return self._authorized_agent_ids
@@ -1151,6 +1276,44 @@ class SchedulerRunner:
                 "agent-scoped SchedulerRunner provider may authorize only its agent_id"
             )
         return authorized
+
+    async def _next_authorized_agent_ids_page(
+        self,
+    ) -> tuple[tuple[str, ...], Optional[str]]:
+        """Resolve one strict bounded keyset page without advancing it.
+
+        The cursor is committed only after rollout reconciliation, selection,
+        and the claim batch complete. Cancellation or infrastructure failure
+        therefore retries the same page instead of skipping tenants.
+        """
+
+        provider = self._authorized_agent_ids_page_provider
+        if provider is None:
+            return await self._current_authorized_agent_ids(), None
+        cursor = self._authorized_agent_ids_page_cursor
+        values = provider(cursor, self._authorized_agent_ids_page_size)
+        if inspect.isawaitable(values):
+            values = await values
+        page = tuple(values)
+        if len(page) > self._authorized_agent_ids_page_size:
+            raise ValueError(
+                "authorized_agent_ids_page_provider exceeded its page limit"
+            )
+        if any(not isinstance(value, str) or not value for value in page):
+            raise ValueError(
+                "authorized_agent_ids_page_provider returned an invalid agent ID"
+            )
+        if tuple(sorted(set(page))) != page:
+            raise ValueError(
+                "authorized_agent_ids_page_provider must return unique agent IDs "
+                "in ascending order"
+            )
+        if cursor is not None and any(value <= cursor for value in page):
+            raise ValueError(
+                "authorized_agent_ids_page_provider returned an agent ID at or "
+                "before its keyset cursor"
+            )
+        return page, (page[-1] if page else None)
 
     async def start(self, *, polling: bool = True):
         """Establish protocol state and optionally arm the polling loop.
@@ -1275,6 +1438,9 @@ class SchedulerRunner:
         await emit_runtime_status(
             self._db,
             agent_ids=agent_ids,
+            complete_authority_snapshot=(
+                self._authorized_agent_ids_page_provider is None
+            ),
             owner_id=self._owner_id,
             worker_state=worker_state,
             last_tick_started_at=last_tick_started_at,
@@ -1283,6 +1449,19 @@ class SchedulerRunner:
             consecutive_failures=self._consecutive_worker_failures,
             last_error_type=self._last_worker_error_type,
         )
+        if (
+            worker_state == "stopped"
+            and self._authorized_agent_ids_page_provider is not None
+        ):
+            await mark_runtime_owner_stopped(
+                self._db,
+                owner_id=self._owner_id,
+                last_tick_started_at=last_tick_started_at,
+                last_tick_completed_at=last_tick_completed_at,
+                restart_count=self._worker_restart_count,
+                consecutive_failures=self._consecutive_worker_failures,
+                last_error_type=self._last_worker_error_type,
+            )
 
     async def _publish_runtime_status_best_effort(
         self,
@@ -1560,6 +1739,15 @@ class SchedulerRunner:
             await asyncio.sleep(self._poll_interval)
 
     async def _tick(self):
+        authority_page_next_cursor: Optional[str] = None
+        if self._authorized_agent_ids_page_provider is not None:
+            authority_page, authority_page_next_cursor = (
+                await self._next_authorized_agent_ids_page()
+            )
+            # Rollout, selection, telemetry, and claim membership all observe
+            # this same bounded page. The cursor remains uncommitted until the
+            # complete batch succeeds.
+            self._authorized_agent_ids_page = authority_page
         # A legacy binary can insert a row after this runner started. Check the
         # durable per-agent protocol state before every claim batch so an
         # unknown/null protocol row is fenced rather than silently adopted.
@@ -1573,6 +1761,8 @@ class SchedulerRunner:
         now = datetime.now(timezone.utc)
         rows = await self._due_rows(now)
         if not rows:
+            if self._authorized_agent_ids_page_provider is not None:
+                self._authorized_agent_ids_page_cursor = authority_page_next_cursor
             return
         semaphore = asyncio.Semaphore(self._max_concurrent_tasks)
 
@@ -1608,6 +1798,8 @@ class SchedulerRunner:
                 exc_info=(type(result), result, result.__traceback__),
             )
             self._latch_protocol_failure(result)
+        if self._authorized_agent_ids_page_provider is not None:
+            self._authorized_agent_ids_page_cursor = authority_page_next_cursor
 
     async def _executor_accepts_scheduled_agent(self, agent_id: str) -> bool:
         """Return whether an optional hosted executor can admit this DID.
@@ -2424,9 +2616,10 @@ class SchedulerRunner:
             else 1
         )
 
-        authorized_agent_ids = await self._current_authorized_agent_ids()
-        if task.agent_id not in authorized_agent_ids:
-            return None
+        # Selection constrained the task to the current bounded page and the
+        # live callback above revalidated it. Keep the CAS scope to this exact
+        # DID rather than rebuilding the complete host fleet.
+        authorized_agent_ids = (task.agent_id,)
         authorization_scope = self._authorized_agent_placeholders(
             authorized_agent_ids
         )
@@ -2676,9 +2869,9 @@ class SchedulerRunner:
 
         if task.next_run_at is None:
             return
-        authorized_agent_ids = await self._current_authorized_agent_ids()
-        if task.agent_id not in authorized_agent_ids:
+        if not await self._agent_is_currently_authorized(task.agent_id):
             return
+        authorized_agent_ids = (task.agent_id,)
         authorization_scope = self._authorized_agent_placeholders(
             authorized_agent_ids
         )
@@ -2902,6 +3095,7 @@ class SchedulerRunner:
                     result_text: Optional[str] = None
                     outcome_signal: Optional[float] = None
                     pause_schedule = False
+                    ran = True
                     scope = _SchedulerExecutionScope(execution)
                     token = _current_execution.set(scope)
                     try:
@@ -2961,6 +3155,24 @@ class SchedulerRunner:
                                 task.agent_id,
                             )
                             return
+                        except SchedulerDispatchNotReady as e:
+                            # Same deferral contract as above (#2474): nothing
+                            # ran, so no success row, no last_run_at, no cron
+                            # advance. Lease expiry bounds the retry.
+                            logger.info(
+                                "Deferring scheduler claim %s: %s", execution.id, e
+                            )
+                            return
+                        except ScheduledTaskOwnerUnavailable as e:
+                            status = "failed"
+                            result_text = str(e)
+                            ran = False
+                            logger.error(
+                                "Scheduled task %s (%s) failed: %s",
+                                task.id,
+                                task.task_name,
+                                e,
+                            )
                         except Exception as e:
                             status = "failed"
                             result_text = f"{type(e).__name__}: {e}"
@@ -2992,7 +3204,7 @@ class SchedulerRunner:
                         result_text=result_text,
                         duration_ms=int((time.monotonic() - started) * 1000),
                         outcome_signal=outcome_signal,
-                        ran=True,
+                        ran=ran,
                         pause_schedule=pause_schedule,
                     )
         except asyncio.CancelledError:
@@ -4386,6 +4598,12 @@ class SchedulerRunner:
             preexisting_schedule_table=preexisting_schedule_table
         )
         for agent_id in await self._current_authorized_agent_ids():
+            # A page is an SQL selection capability, not a durable grant. A
+            # tenant can be removed after the page query, so every rollout
+            # mutation revalidates the live per-DID authority just as claim
+            # and executor admission do.
+            if not await self._live_agent_authority_allows(agent_id):
+                continue
             # Bootstrap already owns every gate in stable order, so it enters
             # the mutating reconciliation directly. Steady state first takes
             # a read-only probe: an active v2 row is overwhelmingly normal and

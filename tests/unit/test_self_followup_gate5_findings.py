@@ -347,33 +347,42 @@ def test_no_await_between_the_pre_turn_guard_and_the_turn():
     success. See ``test_self_followup_fire_time_privacy.py``.
 
     So the property that actually carries the guarantee is measured here
-    instead: between the dispatcher's pre-turn guard and the ``process_input``
-    that starts the turn, there is no ``await`` for a privacy transition to
-    occupy.
+    instead. Since #3310 the guard is not evaluated by the dispatcher at all:
+    it is handed to ``process_input``, which runs it as the first act inside
+    the turn's privacy-transition span. A transition must take that same
+    mutex, so the answer holds for the rest of the turn -- provided nothing
+    between entering the span and evaluating the guard can suspend.
     """
     import inspect
 
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.signals.dispatcher import SignalDispatcher
 
-    src = inspect.getsource(SignalDispatcher._run_cognition_with_audit)
-    guard = src.index("self._pre_turn_refusal(signal, registration)")
-    turn = src.index("self._agent.process_input(prompt")
-    stmt_start = src.rindex("\n", 0, turn)
-    between = src[guard:stmt_start]
+    dispatcher_src = inspect.getsource(SignalDispatcher._run_cognition_with_audit)
+    assert 'process_input_kwargs["pre_turn_guard"]' in dispatcher_src, (
+        "the dispatcher no longer hands the source's pre-turn guard to the "
+        "turn, so nothing evaluates it inside the privacy-transition span"
+    )
 
-    # ``await await_monitored_execution(...)`` is the await that PERFORMS the
-    # turn, so it is the boundary rather than something sitting inside it --
-    # the same carve-out the superseded test made for ``await dispatcher.``.
+    src = inspect.getsource(KestrelAgent.process_input)
+    span_marker = "async with transition_lock:"
+    span = src.index(span_marker)
+    guard = src.index("self._evaluate_pre_turn_guard(pre_turn_guard)")
+    assert span < guard, (
+        "the pre-turn guard is evaluated before the turn enters the "
+        "privacy-transition span, where a transition can still land after it"
+    )
+    between = src[span + len(span_marker):guard]
+
     offenders = [
-        line.strip()
-        for line in between.splitlines()
-        if "await " in line and "await_monitored_execution" not in line
+        line.strip() for line in between.splitlines() if "await " in line
     ]
     assert not offenders, (
-        "an await now sits between the pre-turn guard and the turn, so a "
-        "privacy transition can land in between and the guard no longer "
-        f"means anything at the moment the intent is used: {offenders}"
+        "an await now sits between entering the privacy-transition span and "
+        "the pre-turn guard, so the guard no longer runs first in the span: "
+        f"{offenders}"
     )
+
 
 
 

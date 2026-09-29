@@ -152,6 +152,8 @@ test('mount initializes chat in provided container and returns public API', () =
 
     assert.equal(typeof component.initChat, 'function');
     assert.equal(typeof component.sendMessage, 'function');
+    assert.equal(typeof component.prepareHostStop, 'function',
+        'embedders can supply the shared agent pane browser-work fence');
     assert.equal(capabilityChecked, true);
     assert.equal(state.mountedChatAgent, 'factory-agent');
     assert.equal(chatContainer.children.length, 1);
@@ -188,4 +190,3 @@ test('appendMessagePart renders a registered part and isolates a throwing render
     assert.equal(threw, false);
     assert.equal(div.children[0].textContent, 'fallback-text');
 });
-

@@ -3,17 +3,22 @@
 Many tests here build ``TestClient(server.app)`` without overriding the
 lifespan. That lifespan calls ``build_host_context()`` with no ``db_path``,
 so the host-feature database resolves through the *production* precedence:
-``$KESTREL_HOST_DB_PATH``, else ``$KESTREL_HOME/host-data``, else
-``~/.kestrel/host-data``. On a developer machine that last branch is the
-live fleet database — running the unit suite migrated its schema as a side
-effect of ``pytest``, and the real host features named by the project's
-``.kestrel-host-features.toml`` started (and recorded their start failures)
-against it. CI never notices: the runner's ``HOME`` is fresh, so the same
-code writes a throwaway file.
+``$KESTREL_HOST_DB_PATH``, else ``$KESTREL_DB_PATH/host-data``, else
+``$KESTREL_HOME/host-data``, else ``~/.kestrel/host-data``. On a developer
+machine that last branch is the live fleet database — running the unit suite
+migrated its schema as a side effect of ``pytest``, and the real host features
+named by the project's ``.kestrel-host-features.toml`` started (and recorded
+their start failures) against it. CI never notices: the runner's ``HOME`` is
+fresh, so the same code writes a throwaway file.
 
-The autouse fixture below moves those roots into a temporary directory of its
-own, and seeds that directory with a host manifest that starts no host features
-(#3099). Isolating ``KESTREL_HOME`` alone would have *widened* enablement: the
+Every test in the repository already has every runtime-path variable
+(``paths.RUNTIME_PATH_ENV_NAMES``) redirected by the suite-wide autouse
+fixture in ``tests/conftest.py`` (#3286), and every resolver refuses a path outside
+the test's temporary roots anyway (see
+``tests/shared/host_runtime_isolation.py``). The autouse fixture below adds the
+unit tier's ``HOME`` redirect inside that same temporary directory, and seeds
+it with a host manifest that starts no host features (#3099).
+Isolating ``KESTREL_HOME`` alone would have *widened* enablement: the
 manifest is read from the resolved project dir, and
 ``instantiate_host_features`` treats a missing one as enable-all, so hiding the
 operator's manifest could start host features they had explicitly disabled.
@@ -21,18 +26,18 @@ The seeded manifest says ``[host_features] default_enabled = false``, which is a
 policy rather than a list -- host feature number seven cannot appear in the
 suite without an edit here that says so.
 
-Scope, precisely: this isolates *function-based* path resolution --
-``paths.host_data_dir()``, ``paths.project_dir()``, ``host_database_path()``
-and anything else that reads the environment when called. It does **not**
-isolate module-scope constants that build an absolute path at **import**
-time, because collection imports them before any fixture runs. Five such
-constants still name the operator's real home:
-``cli_serve.STATE_DIR`` / ``STATE_FILE`` / ``LOG_DIR``,
-``destructive_policy.DEFAULT_TRASH_DIR``, and
-``local_mps_adapter.DEFAULT_WORKING_DIR``. Those are tracked in #3104; the
-fix there is resolve-on-call in the modules, not a longer patch list here --
-a fixture that enumerates names is a set that grows, and the sixth constant
-would silently reopen the hole.
+Scope, precisely: the per-test redirect isolates *function-based* path
+resolution -- ``paths.host_data_dir()``, ``paths.project_dir()``,
+``host_database_path()`` and anything else that reads the environment when
+called. A module-scope constant that builds a path at **import** time is
+collected before any fixture runs. Those that read a registered runtime-path
+variable (``cli_serve.STATE_DIR`` / ``STATE_FILE`` / ``LOG_DIR``,
+``destructive_policy.DEFAULT_TRASH_DIR``, ``config.TRUSTED_AGENTS_DIR``)
+resolve against the session pins ``tests/conftest.py`` installs before any
+package import (#3286), so they name a session temporary root, shared by every
+test, rather than the operator's home. Resolving on call in the modules
+remains the fix (#3104), as ``local_mps_adapter.default_working_dir`` now does,
+not a longer patch list here.
 
 Note for anyone verifying this: a probe that imports inside a test body sees
 everything clean, because the fixture has already run. Only a module-level
@@ -55,19 +60,11 @@ from kestrel_sovereign.host_features.discovery import (
     HOST_MANIFEST_FILENAME,
     HOST_SCOPE_TABLE,
 )
-from kestrel_sovereign.host_features.storage import (
-    HOST_DB_PATH_ENV,
-    HOST_FEATURE_DB_FILENAME,
+from tests.shared.host_runtime_isolation import (
+    OWNS_HOST_PATHS_MARKER,
+    PROJECT_HOME_DIRNAME,
 )
-
-#: Marker name for tests that own host/home path resolution themselves.
-OWNS_HOST_PATHS_MARKER = "owns_host_paths"
-
-#: Name of the fixture's own temporary root. It is a sibling of each test's
-#: ``tmp_path``, not a child: the fixture writes a host manifest, and a
-#: directory the test owns is the wrong place for the fixture's state — one
-#: test asserts its ``tmp_path`` is empty, and every test is entitled to.
-ISOLATION_DIRNAME = "_kestrel_host_runtime_isolation"
+from tests.utils.ci_budget import refuse_unbudgeted_timeouts
 
 #: The seeded manifest. A *default*, deliberately not a list of slugs: a list
 #: would name today's host features and silently miss tomorrow's, which is the
@@ -80,17 +77,20 @@ HOST_FEATURES_DISABLED_MANIFEST = (
 )
 
 
-@pytest.fixture(autouse=True)
-def _isolate_host_runtime_paths(request, tmp_path_factory, monkeypatch):
-    """Point every host-runtime root at a temporary directory of our own.
+def pytest_collection_modifyitems(config, items):
+    """Refuse a per-test timeout the tier's wall-clock budget cannot hold."""
+    refuse_unbudgeted_timeouts(config, items, "unit")
 
-    ``KESTREL_HOST_DB_PATH`` is the authoritative override for the
-    host-feature database. ``HOME`` and ``KESTREL_HOME`` close the two
-    default branches behind it, so a code path that ignores the override —
-    or resolves some *other* implicit host-runtime root, such as the Phoenix
-    trace store, the host-feature manifest, or the ``~/.kestrel`` project
-    fallback — still lands in the temporary directory rather than on the
-    operator's disk.
+
+@pytest.fixture(autouse=True)
+def _isolate_unit_host_runtime_paths(_isolate_host_runtime_paths, monkeypatch):
+    """Add ``HOME`` to the suite-wide redirect of the host-runtime roots.
+
+    The suite-wide fixture already moved every runtime-path variable. ``HOME``
+    closes the last default branch behind them, so a code path that ignores
+    the variables — or resolves some *other* implicit host-runtime root, such
+    as the Phoenix trace store or the ``~/.kestrel`` project fallback — still
+    lands in the temporary directory rather than on the operator's disk.
 
     The one thing created eagerly is the host manifest, because
     ``instantiate_host_features`` reads it from the resolved project dir at
@@ -98,68 +98,33 @@ def _isolate_host_runtime_paths(request, tmp_path_factory, monkeypatch):
     left to its writer — ``prepare_host_database`` even creates its own parent
     ``0700``, the same custody path production takes.
     """
-    if request.node.get_closest_marker(OWNS_HOST_PATHS_MARKER):
+    root = _isolate_host_runtime_paths
+    if root is None:  # the owns_host_paths opt-out
         yield
         return
 
-    root = tmp_path_factory.mktemp(ISOLATION_DIRNAME)
-    project_home = root / "kestrel-home"
+    project_home = root / PROJECT_HOME_DIRNAME
 
     monkeypatch.setenv("HOME", str(root / "home"))
-    monkeypatch.setenv("KESTREL_HOME", str(project_home))
-    monkeypatch.setenv(
-        HOST_DB_PATH_ENV,
-        str(root / "host-data" / HOST_FEATURE_DB_FILENAME),
-    )
 
     # Hiding the operator's manifest is not neutral: absent means enable-all,
     # so isolation without this file would start host features the operator
     # had turned off. Written before the first test line runs, since the
     # lifespan reads it during startup.
-    project_home.mkdir(parents=True, exist_ok=True)
     project_home.joinpath(HOST_MANIFEST_FILENAME).write_text(
         HOST_FEATURES_DISABLED_MANIFEST, encoding="utf-8"
     )
 
-    # ``token_counter`` freezes its cache path at import time, so ``HOME``
-    # above cannot move it: without this, every unit test reads (and a
-    # discovery run rewrites) the operator's real
-    # ``~/.kestrel/discovered_context_limits.json``. Reset the one-time read
-    # too, so the redirect is what the next lookup sees.
-    #
-    # This is a point fix for the one import-time constant this suite was
-    # observed to write, NOT a general solution: five more are frozen the
-    # same way and are deliberately left alone here (see the module
-    # docstring and #3104). Do not grow this into a patch list.
-    monkeypatch.setattr(
-        token_counter, "CACHE_FILE", root / "discovered_context_limits.json"
-    )
-    monkeypatch.setattr(token_counter, "_cached_limits", None)
-
-    # ``project_dir`` memoizes on ``(KESTREL_HOME, cwd)``. The key changes
-    # with the value so a stale answer is impossible, but the cache is small
-    # and per-test temporary homes would otherwise evict real entries.
-    paths.reset_cache()
-    try:
-        yield root
-    finally:
-        paths.reset_cache()
+    yield root
 
 
-@pytest.fixture
-def host_runtime_isolation_root(_isolate_host_runtime_paths):
-    """The temporary root this test's host-runtime paths were redirected into.
+@pytest.fixture(autouse=True)
+def _seed_isolated_project_config():
+    """Override the suite-wide seed: the unit tier starts from an empty project.
 
-    Requesting it is how a test asserts *where* a resolved path landed without
-    reconstructing the layout from the environment.
+    A test that needs catalog-driven behaviour writes it with
+    ``kestrel_toml_catalog`` rather than reading the checkout's configuration.
     """
-    if _isolate_host_runtime_paths is None:
-        pytest.fail(
-            f"host-runtime isolation is off under the "
-            f"{OWNS_HOST_PATHS_MARKER!r} opt-out, so there is no isolation "
-            f"root; drop the marker or resolve the path yourself."
-        )
-    return _isolate_host_runtime_paths
 
 
 @pytest.fixture
@@ -211,6 +176,21 @@ def kestrel_toml_catalog(request, monkeypatch):
     return publish
 
 
+@pytest.fixture
+def new_york_clock(monkeypatch):
+    """A non-UTC process zone, so a rule about naive or local time can be
+    seen to fail on CI's UTC runners. Undone in the right order:
+    ``monkeypatch`` restores ``TZ`` at teardown but ``tzset()`` is what the C
+    library reads, and on glibc the cached zone outlives the variable."""
+    import time
+
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
 # ---------------------------------------------------------------------------
 # self_followup test environment (#3101 / #3128)
 #
@@ -237,6 +217,7 @@ async def followup_env(tmp_path):
     from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
     from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
     from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.signals import (
         OrderedLockManager,
         SignalDispatcher,
@@ -272,7 +253,12 @@ async def followup_env(tmp_path):
             self._live_turn_id: str | None = None
             self._active_session_id: str | None = None
 
-        async def process_input(self, prompt, **kwargs):
+        async def process_input(self, prompt, pre_turn_guard=None, **kwargs):
+            # Declares `pre_turn_guard` and evaluates it with the real agent's
+            # evaluator before recording the turn, as `KestrelAgent` does first
+            # thing inside its span (#3310). A refused guard therefore records
+            # no turn, exactly like production.
+            KestrelAgent._evaluate_pre_turn_guard(pre_turn_guard)
             self.turn_prompts.append(prompt)
             self.turn_kwargs.append(kwargs)
             return "follow-up handled"
@@ -304,7 +290,11 @@ async def followup_env(tmp_path):
     async def _lookup(name, args):  # no cron tool is exercised here
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(tool_lookup=_lookup):
+    for registration in build_cron_registrations(
+        tool_lookup=_lookup,
+        reason_codes_lookup=lambda _name: frozenset(),
+        agent=agent,
+    ):
         registry.register(registration)
 
     db = AsyncDatabase(backend)

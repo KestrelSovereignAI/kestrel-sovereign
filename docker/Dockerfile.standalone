@@ -14,6 +14,7 @@ WORKDIR /app
 
 # Install system dependencies including Ollama requirements
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    bubblewrap \
     curl \
     wget \
     && rm -rf /var/lib/apt/lists/*

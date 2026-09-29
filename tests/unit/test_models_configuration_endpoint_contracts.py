@@ -91,7 +91,7 @@ def test_ipfs_status_reports_local_node_gateways_and_filecoin_adapter():
         ),
         f"{local_api}/version": _FakeAiohttpResponse(payload={"Version": "1.2.3"}),
         f"{local_api}/pin/ls?type=recursive": _FakeAiohttpResponse(
-            payload={"Keys": {"bafy1": {"Type": "recursive"}}}
+            payload={"Keys": {"bafy1": {"Type": "recursive"}, "bafy2": {"Type": "recursive"}}}
         ),
     }
     gateway_heads = {
@@ -106,7 +106,16 @@ def test_ipfs_status_reports_local_node_gateways_and_filecoin_adapter():
     ]
     filecoin_adapter = SimpleNamespace(cache_dir="/tmp/filecoin-cache")
     sovereign_adapter = SimpleNamespace(filecoin_adapter=filecoin_adapter)
+    # The agent's own receipt names bafy1; the daemon also pins bafy2, which
+    # no receipt of this agent names (#3226).
+    receipt = SimpleNamespace(node_id="hash-1", properties={"ipfs_cid": "bafy1"})
+
+    async def get_nodes_by_type(node_type):
+        return [receipt] if node_type == "backup_artifact" else []
+
     storage = MagicMock(sovereign_adapter=sovereign_adapter)
+    storage.privacy_config = None
+    storage.get_nodes_by_type = get_nodes_by_type
     agent = MagicMock(storage=storage)
 
     app, original = _prepare_app(agent)
@@ -119,18 +128,19 @@ def test_ipfs_status_reports_local_node_gateways_and_filecoin_adapter():
         payload = response.json()
         assert payload["backup_tier"]["label"] == "sovereign-operated"
         assert payload["backup_tier"]["status"] == "decommissioned"
-        assert payload["local_node"]["available"] is True
-        assert payload["local_node"]["peer_id"] == "peer-123"
-        assert payload["local_node"]["agent_version"] == "kubo/1.0.0"
-        assert payload["local_node"]["version"] == "1.2.3"
+        # Reachability only: the node's identity and version, and the
+        # daemon's full pin set, are the host's (#3226) — GET /api/ipfs/node.
+        assert payload["local_node"] == {"available": True, "error": None}
+        assert "details" not in payload["backup_tier"]
         assert payload["pinned_content"] == [{"cid": "bafy1", "type": "recursive"}]
+        # X-API-Key is the sovereign credential on this app.
+        assert payload["can_view_node"] is True
         assert len(payload["gateways"]) == 3
         assert payload["gateways"][0]["name"] == "ipfs.io"
         assert payload["gateways"][0]["available"] is True
         assert payload["gateways"][1]["name"] == "dweb.link"
         assert payload["gateways"][1]["available"] is False
-        assert payload["filecoin_adapter"]["configured"] is True
-        assert payload["filecoin_adapter"]["cache_dir"] == "/tmp/filecoin-cache"
+        assert payload["filecoin_adapter"] == {"configured": True}
     finally:
         _restore_app(app, original)
 

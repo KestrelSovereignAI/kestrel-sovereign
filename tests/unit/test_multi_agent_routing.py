@@ -21,6 +21,9 @@ def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC", name: str = "Test
     """Create a mock KestrelAgent."""
     agent = MagicMock()
     agent.agent_id = agent_id
+    # The routed observability reads scope by `did` (#3215/#3229) and
+    # refuse a MagicMock fabrication; on a real agent `agent_id` IS the DID.
+    agent.did = agent_id
     agent.initialize = AsyncMock()
     agent.shutdown = AsyncMock()
     agent.observability_store = MagicMock()

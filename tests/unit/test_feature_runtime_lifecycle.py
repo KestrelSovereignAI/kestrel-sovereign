@@ -34,6 +34,7 @@ from kestrel_sdk.features import (
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 from kestrel_sdk.tools import Outcome, WaitStatus
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.security.feature import SecurityFeature
@@ -41,6 +42,28 @@ from kestrel_sovereign.features.security.permissions import PermissionLevel
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.signals.registry import SourceRegistry
 from kestrel_sovereign.waits import WaitRegistry
+
+
+def _sovereign_feature_app(agent) -> FastAPI:
+    """A features-router app whose caller is the sovereign.
+
+    `/install` and `/remove` require sovereign authority (#3214) and read
+    it from `request.state.caller`, which the auth middleware sets in
+    production and nothing sets here. Without this stand-in the tests
+    below stop at a 403 instead of asserting what they exist for — that
+    teardown drains every registration a live feature acquired (#2522).
+    """
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def _attach_sovereign_caller(request, call_next):
+        request.state.caller = CallerContext.sovereign()
+        return await call_next(request)
+
+    app.include_router(features_router)
+    app.state.agent = agent
+    return app
+
 
 
 # ---------------------------------------------------------------------------
@@ -260,9 +283,7 @@ async def test_endpoint_disable_detaches_everything_then_enable_recreates(tmp_pa
     live = _live_registrations(agent, feature)
     assert all(live.values()), f"feature not fully live after boot: {live}"
 
-    app = FastAPI()
-    app.include_router(features_router)
-    app.state.agent = agent
+    app = _sovereign_feature_app(agent)
 
     with TestClient(app) as client:
         disable = client.post("/api/features/_FullFeature/disable")
@@ -316,6 +337,37 @@ async def test_unregister_runtime_cleans_everything_when_on_disable_raises(tmp_p
 
     # No provider / source / hook / A2A / tool / feature remains despite the
     # on_disable failure (#2522 P2).
+    assert _FullFeature.SOURCE not in agent.signal_registry
+    assert agent.wait_registry.get("lifecycle") is None
+    assert feature._hook not in agent.hooks_manager.get_hooks(
+        HookEvent.SESSION_START
+    )
+    assert feature.tool_name not in agent.task_manager.agents
+    assert not any(
+        owner == feature.tool_name for owner in agent._tool_to_feature.values()
+    )
+    assert feature.name not in agent.features
+
+
+@pytest.mark.asyncio
+async def test_unregister_runtime_cleans_everything_when_on_disable_cancels(tmp_path):
+    """A hook-owned cancelled child is an operation failure, so canonical
+    teardown still drains every independent registration before it propagates."""
+    agent = _agent(tmp_path)
+    feature = _FullFeature(agent)
+    await _boot_feature(agent, feature)
+    assert all(_live_registrations(agent, feature).values())
+
+    async def cancel_from_child():
+        child = asyncio.create_task(asyncio.sleep(3600))
+        child.cancel()
+        await child
+
+    feature.on_disable = cancel_from_child
+
+    with pytest.raises(asyncio.CancelledError):
+        await agent._unregister_feature_runtime(feature)
+
     assert _FullFeature.SOURCE not in agent.signal_registry
     assert agent.wait_registry.get("lifecycle") is None
     assert feature._hook not in agent.hooks_manager.get_hooks(
@@ -549,9 +601,7 @@ async def test_disabled_feature_is_invisible_to_llm_then_enable_restores(tmp_pat
     live = _llm_visibility(agent, feature)
     assert all(live.values()), f"feature not fully visible while enabled: {live}"
 
-    app = FastAPI()
-    app.include_router(features_router)
-    app.state.agent = agent
+    app = _sovereign_feature_app(agent)
 
     with TestClient(app) as client:
         assert client.post("/api/features/_DispatchFeature/disable").status_code == 200
@@ -727,6 +777,190 @@ async def test_reenable_on_agent_ready_failure_is_non_fatal(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reenable_ready_hook_owner_cancellation_propagates(tmp_path):
+    """Cancelling the transition itself must not look like a hook-owned failure."""
+
+    agent = _agent(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingReadyFeature(_FullFeature):
+        async def on_agent_ready(self, ready_agent):
+            started.set()
+            await release.wait()
+
+    feature = BlockingReadyFeature(agent)
+    await _boot_feature(agent, feature)
+    await agent._unregister_feature_runtime(feature, unload=False)
+
+    transition = asyncio.create_task(agent._activate_feature_runtime(feature))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    transition.cancel("runtime enable caller cancelled")
+    try:
+        with pytest.raises(asyncio.CancelledError, match="runtime enable caller cancelled"):
+            await transition
+    finally:
+        release.set()
+
+    # Ready runs only after commit, so cancellation propagates without rolling
+    # back the already-live generation.
+    assert feature.enabled is True
+    assert all(_live_registrations(agent, feature).values())
+
+
+@pytest.mark.asyncio
+async def test_reenable_ready_hook_child_cancellation_is_non_fatal(tmp_path):
+    """A hook-owned cancelled child remains a best-effort ready-hook failure."""
+
+    agent = _agent(tmp_path)
+
+    class ChildCancelledReadyFeature(_FullFeature):
+        async def on_agent_ready(self, ready_agent):
+            child = asyncio.create_task(asyncio.sleep(0))
+            child.cancel("ready child cancelled")
+            await child
+
+    feature = ChildCancelledReadyFeature(agent)
+    await _boot_feature(agent, feature)
+    await agent._unregister_feature_runtime(feature, unload=False)
+
+    await agent._activate_feature_runtime(feature)
+
+    assert feature.enabled is True
+    assert all(_live_registrations(agent, feature).values())
+
+
+@pytest.mark.asyncio
+async def test_boot_ready_hook_waits_until_host_context_is_published(tmp_path):
+    """A readiness hook may await cognition without circular startup waiting."""
+
+    agent = _agent(tmp_path)
+    gate = asyncio.Event()
+    agent._host_context_publication_gate = gate
+    entered = asyncio.Event()
+
+    class CognitionReadyFeature(_FullFeature):
+        async def on_agent_ready(self, ready_agent):
+            async with ready_agent._turn_lifecycle():
+                entered.set()
+
+    feature = CognitionReadyFeature(agent)
+    agent.features[feature.name] = feature
+
+    await asyncio.wait_for(agent._run_or_defer_agent_ready_hooks(), timeout=1)
+    assert not entered.is_set()
+
+    gate.set()
+    await asyncio.wait_for(agent.complete_deferred_agent_readiness(), timeout=1)
+    assert entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_deferred_readiness_completion_is_exactly_once(tmp_path):
+    """Registration and the server snapshot may race the same ready pass."""
+
+    agent = _agent(tmp_path)
+    gate = asyncio.Event()
+    gate.set()
+    agent._host_context_publication_gate = gate
+    agent.defer_agent_readiness_to_host()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    class BlockingReadyFeature(_FullFeature):
+        async def on_agent_ready(self, ready_agent):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+
+    feature = BlockingReadyFeature(agent)
+    agent.features[feature.name] = feature
+    await agent._run_or_defer_agent_ready_hooks()
+    assert agent._agent_ready_hooks_deferred is True
+    assert agent._agent_readiness_host_owned is True
+
+    first = asyncio.create_task(agent.complete_deferred_agent_readiness())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    second = asyncio.create_task(agent.complete_deferred_agent_readiness())
+    await asyncio.sleep(0)
+    assert calls == 1
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+
+    assert calls == 1
+    assert agent._agent_ready_hooks_deferred is False
+    assert agent._agent_ready_hooks_completed is True
+    assert agent._agent_readiness_host_owned is False
+
+
+@pytest.mark.asyncio
+async def test_deferred_best_effort_hook_child_cancellation_settles_readiness(tmp_path):
+    """A hook-owned cancelled child cannot cancel the published agent's boot."""
+
+    agent = _agent(tmp_path)
+    gate = asyncio.Event()
+    gate.set()
+    agent._host_context_publication_gate = gate
+    agent.defer_agent_readiness_to_host()
+
+    class ChildCancelledReadyFeature(_FullFeature):
+        async def on_agent_ready(self, ready_agent):
+            child = asyncio.create_task(asyncio.sleep(0))
+            child.cancel()
+            await child
+
+    feature = ChildCancelledReadyFeature(agent)
+    agent.features[feature.name] = feature
+    await agent._run_or_defer_agent_ready_hooks()
+    assert agent._agent_ready_hooks_deferred is True
+
+    await agent.complete_deferred_agent_readiness()
+
+    assert agent._agent_ready_hooks_deferred is False
+    assert agent._agent_ready_hooks_completed is True
+    assert agent._agent_readiness_host_owned is False
+
+
+@pytest.mark.asyncio
+async def test_direct_readiness_caller_cancellation_propagates(tmp_path):
+    """Cancelling the readiness caller must not be mistaken for a hook failure."""
+
+    agent = _agent(tmp_path)
+    gate = asyncio.Event()
+    gate.set()
+    agent._host_context_publication_gate = gate
+    agent.defer_agent_readiness_to_host()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingReadyFeature(_FullFeature):
+        async def on_agent_ready(self, ready_agent):
+            started.set()
+            await release.wait()
+
+    feature = BlockingReadyFeature(agent)
+    agent.features[feature.name] = feature
+    await agent._run_or_defer_agent_ready_hooks()
+    assert agent._agent_ready_hooks_deferred is True
+
+    readiness = asyncio.create_task(agent.complete_deferred_agent_readiness())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    readiness.cancel("direct readiness caller cancelled")
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await readiness
+    finally:
+        release.set()
+
+    assert agent._agent_ready_hooks_deferred is True
+    assert agent._agent_ready_hooks_completed is False
+    assert agent._agent_readiness_host_owned is True
+
+
+@pytest.mark.asyncio
 async def test_runtime_enable_registers_contributed_hard_permission_immediately(
     tmp_path,
 ):
@@ -834,9 +1068,7 @@ async def test_endpoint_remove_drains_every_registration_and_direct_tool(tmp_pat
         features=["_FullFeature"], description="full", core=False,
     )
 
-    app = FastAPI()
-    app.include_router(features_router)
-    app.state.agent = agent
+    app = _sovereign_feature_app(agent)
 
     with patch(
         "kestrel_sovereign.endpoints.features.get_package_for_feature",

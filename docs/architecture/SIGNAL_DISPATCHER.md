@@ -480,6 +480,78 @@ initial-reservation capabilities cannot recreate work. Re-registration cannot
 change an inactive consumer back to active; a new workflow wait needs a new
 consumer ID.
 
+#### Resuming on a wait handle instead of holding a turn
+
+A held wait (`wait("<kind>:<handle>")`, or any `run_wait_loop` caller) is
+capped at `MAX_HANDLE_WAIT_SECONDS`. Work that must outlive that ceiling — a
+workflow stage waiting on the `talon:<job_id>` its dispatch stage returned —
+parks instead and subscribes to the handle's wake (#3295):
+
+```python
+from kestrel_sovereign.waits.reconciler import register_wait_resume_consumer
+
+resume = await register_wait_resume_consumer(
+    agent, "talon:job-42", consumer_id="workflows:wait:run-42"
+)
+if resume.already_terminal is not None:
+    ...  # finished before the park took effect: act on it now
+```
+
+It validates the ref exactly like `wait(..., mode="signal")`, arms the same
+reconciler watch, and only then registers a durable consumer on the provider's
+wake source (`provider.signal`, else `wait.complete`) with the selector
+`payload.ref=<kind>:<handle>`. The reconciler writes `payload.ref` after
+spreading the provider's poll data, so a provider cannot point one handle's
+completion at another handle's parked work, and kinds sharing
+`wait.complete` never cross.
+
+Selectors match the *stored* event, and ANONYMOUS storage anonymizes it: a
+5-digit run in a handle reads as a ZIP code, so `ci:owner/repo#12345` would be
+stored as `ci:owner/repo#[ZIP_REDACTED]` and never match. The wake is therefore
+a `SignalWithDurableCorrelation` naming `ref` in `durable_correlation_keys`;
+the durable projection keeps those producer-written identifiers verbatim and
+anonymizes everything else. Payload-eliding modes still elide them.
+
+Those modes are therefore refused. Under EPHEMERAL, ISOLATED, or DEIDENTIFIED
+storage every durable wake is persisted as a bare privacy marker, so no stored
+event could satisfy the `payload.ref` selector, and a still-pending handle
+would park work that never resumes. `register_wait_resume_consumer` asks the
+dispatcher (`durable_payload_elided_by()`, which uses the projection's own
+`elides_durable_payloads` definition) before writing anything. If the answer
+is an eliding mode, it raises `DurableResumeUnsupportedError`
+(`reason == "unsupported_in_privacy_mode"`, a `ValueError`). No watch is
+armed, no consumer is registered, and the provider is not polled. The caller
+keeps the non-durable `wait(..., mode="signal")` path.
+
+A privacy mode that switches to an eliding one *after* registration (or a
+projection that fails closed with the `projection_error` marker) does not
+strand the consumer. Its delivery is materialized from the live payload when
+the wake commits, so a prompt claim receives the real wake. A claim that
+arrives after the emitter's first lease expired receives the delivery as
+marker-only retry work (#3370, below). Either way the consumer is woken and
+polls the provider, as every delivery requires.
+
+The watch is armed before the consumer exists, and that order is load-bearing.
+An interruption between the two writes must never leave a durable consumer
+with no watch behind it: for a poll-only provider (Talon, CI) the reconciler
+would never poll that handle again, and the parked work would stall silently.
+A watch without a consumer only wakes the agent through the normal reconciler
+path, and retrying the idempotent registration completes it.
+
+The resume guarantee is the poll it makes *after* the watch and consumer are
+durable, not backfill. If the handle is already terminal, that `WaitStatus` is
+returned as `already_terminal` and the caller acts on it directly: a wake
+committed earlier may be unmatchable (one committed while a payload-eliding
+mode was active holds only a marker), and the reconciler never re-announces a
+transition it already delivered. Otherwise the transition happens after the
+registration and is delivered directly. A matchable earlier wake is also
+backfilled, so the same transition can arrive both ways. A poll that raises
+propagates: the handle's state is unknown, so the caller must not park, and
+re-registering the same `consumer_id` is idempotent. `max_attempts` defaults
+to `0` because the wake is the only thing that resumes the parked work. A
+delivery is a wake, not a verdict: poll the provider for the handle's state on
+every delivery, then deactivate the consumer when the parked work finishes.
+
 The dispatcher permits durable registrations only for its own `agent.did`.
 Every claim, acknowledgement, retry, and observation query is selected by
 that scope in storage; scope is therefore an authorization boundary for a
@@ -542,6 +614,38 @@ failure, lease expiry, and shutdown; after a crash or expired lease, normal
 replay intentionally receives only the persisted marker. Raw payload is never
 written to the durable ledger.
 
+A first lease that expires before any worker claims it belongs to a *live*
+dispatcher, so ordinary claim recovery deliberately never reclaims it. The
+emitting dispatcher therefore keeps that lease's opaque capability (never the
+payload) when it drops the expired sidecar, or when a transfer is refused.
+On the next claim, or its next owner heartbeat, it releases the row to
+`retry` with `last_error` set to `EXPIRED_INITIAL_HANDOFF_ERROR`. Each
+release also wakes that consumer's durable cognition drainer if it has been
+started, because a drainer that scanned while the row was still leased has
+already exited. The
+owner/token compare-and-set leaves a transferred, acknowledged, or terminal
+delivery untouched. Before #3370 the row stayed leased until the process
+stopped, and a late consumer claim silently returned nothing.
+
+The capability does not decide an event's fate; its row does (#3283).
+Between an exact-event claim's row claim and its reservation transfer,
+another claimant may legitimately return the reservation (a generic claim
+deferred by Hold returns every volatile reservation of its consumer) or
+take it (an unheld generic claim transfers one to its executor). When
+`claim_durable_delivery_for_event` finds no reservation left to transfer, it
+releases any retired capability and claims the event's row once more. A
+returned row is `retry` and due now, so the emitting dispatch runs it with
+its live envelope. A row that another claimant owns, or one already settled,
+still misses, and the caller reads that outcome from the row. Before #3283
+the emitting dispatch treated the missing token as "delivery unavailable"
+and failed the first delivery. The drain cannot recover an elided row's
+caller, so a bounded consumer then lost the message.
+
+A Hold read that fails at the exact-event claim's own pre-check returns
+that event's reservation exactly as a Hold deferral would, then raises, as
+the post-claim fence already does. Terminal ingress deferred by Hold
+reports `HELD` admission, as cognition ingress does.
+
 Registration and persistence also serialize their handoff at the
 `(agent_id, source)` scope.  Thus an event racing a new workflow subscription
 is either committed first and backfilled by that registration, or sees the
@@ -577,6 +681,14 @@ The dispatcher pipeline:
    - COGNITION → select the registration `prompt_template`, or the signal's `prompt_template_override` only when the registration has `allow_prompt_override=True`; render with the signal envelope → `await agent.process_input_or_streaming(prompt, ...)`. The entry point itself acquires `CONVERSATION` at the shared turn lifecycle (Concern #1) — the dispatcher does not pre-acquire it. Streaming vs non-streaming is selected by the calling context; both share the same lifecycle boundary.
 8. **Release locks** in reverse acquisition order.
 9. **Log** the routed outcome per the source's redaction policy.
+
+An `InFlightControlActionRegistration` (today only `a2a.peer_stop`, #3169)
+is an ACTION that acts on work already running. Step 3 persists only a fixed
+marker for it (no payload, caller, or chain) without taking the privacy
+transition lock every running turn holds, and Hold's begin-work disposition
+does not apply to it. Validation, cycle/TTL, durable deduplication, and rate
+limiting are unchanged. See the peer Stop section of
+[`SIGNAL_SOURCES_GUIDE.md`](./SIGNAL_SOURCES_GUIDE.md).
 
 The dispatcher lives as a sibling component the agent holds a reference to. Easier to test than another mixin.
 

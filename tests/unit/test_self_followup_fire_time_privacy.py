@@ -14,6 +14,9 @@ guard placed after them would pass a naive test and still be reachable.
 
 from __future__ import annotations
 
+import functools
+from types import SimpleNamespace
+
 import pytest
 from kestrel_sovereign.features.scheduler.feature import (
     SELF_FOLLOWUP_TASK_NAME,
@@ -269,11 +272,32 @@ def test_the_source_actually_registers_the_pre_turn_guard():
         refuse_followup_under_volatile_privacy,
     )
 
-    registration = build_self_followup_registration()
-    assert (
-        getattr(registration, "pre_turn_guard", None)
-        is refuse_followup_under_volatile_privacy
+    agent = object()
+    registration = build_self_followup_registration(agent)
+    guard = getattr(registration, "pre_turn_guard", None)
+    # The guard contract hands a guard only the signal (#3310), so the agent
+    # whose privacy mode it judges is bound at registration.
+    assert isinstance(guard, functools.partial)
+    assert guard.func is refuse_followup_under_volatile_privacy
+    assert guard.keywords == {"agent": agent}
+
+
+def test_the_guard_refuses_when_no_agent_is_bound():
+    """A registration built without an agent cannot judge privacy: refuse.
+
+    Admitting the turn would read persisted intent back without knowing
+    whether the mode permits it -- the silent accept this source exists to
+    rule out.
+    """
+    from kestrel_sovereign.signals.sources.self_followup import (
+        build_self_followup_registration,
     )
+
+    guard = build_self_followup_registration().pre_turn_guard
+    reason = guard(SimpleNamespace(payload={"intent": SENTINEL}))
+
+    assert reason is not None and reason.startswith("refused:")
+    assert SENTINEL not in reason, "a refusal reason must never quote the intent"
 
 
 @pytest.mark.asyncio

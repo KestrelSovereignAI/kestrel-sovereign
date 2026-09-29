@@ -112,7 +112,8 @@ def _audit_summary(
         k.lower(): v
         for k, v in request.headers.items()
         if k.lower() not in {
-            "x-api-key", "authorization", "cookie", "set-cookie",
+            "x-api-key", "x-kestrel-peer-key", "authorization", "cookie",
+            "set-cookie",
         }
     }
     payload = {

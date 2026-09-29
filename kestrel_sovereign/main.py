@@ -5,6 +5,7 @@ The main entry point for the Kestrel Agent.
 import argparse
 import asyncio
 import os
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.storage import AsyncStorage
 from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.kestrel_agent import (
@@ -12,7 +13,12 @@ from kestrel_sovereign.kestrel_agent import (
     await_agent_shutdown_completion,
 )
 from kestrel_sovereign.llm.service import LLMService
-from kestrel_sovereign.paths import load_project_env, project_dir
+from kestrel_sovereign.paths import (
+    AGENT_DB_PATH_ENV,
+    load_project_env,
+    project_dir,
+    runtime_path_env,
+)
 import logging
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
@@ -147,10 +153,15 @@ async def get_agent_by_did(did: str) -> KestrelAgent:
     """
     Retrieves an agent instance based on its DID.
     """
-    storage_path = os.environ.get("KESTREL_DB_PATH", os.getcwd())
+    storage_path = runtime_path_env(AGENT_DB_PATH_ENV, os.getcwd())
     llm_service = LLMService()
     agent = KestrelAgent(did=did, storage_path=storage_path, llm_service=llm_service)
-    await agent.initialize()
+    from kestrel_sovereign.hold import initialize_with_bound_hold_context
+
+    agent._standalone_hold_context = await initialize_with_bound_hold_context(
+        agent,
+        agent_data_root=storage_path,
+    )
     return agent
 
 async def main():
@@ -187,7 +198,7 @@ async def main():
     )
     args = parser.parse_args()
 
-    db_path = args.db_path or os.environ.get("KESTREL_DB_PATH")
+    db_path = args.db_path or runtime_path_env(AGENT_DB_PATH_ENV)
     if not db_path:
         print("❌ Error: Agent database path not specified.")
         return
@@ -206,7 +217,15 @@ async def main():
     storage_path = os.path.join(storage_dir, "kestrel_prime.db")
     llm_service = LLMService()
     agent = KestrelAgent(did=agent_did, storage_path=storage_path, llm_service=llm_service)
-    await agent.initialize()
+    from kestrel_sovereign.hold import (
+        close_bound_host_context,
+        initialize_with_bound_hold_context,
+    )
+
+    hold_context = await initialize_with_bound_hold_context(
+        agent,
+        agent_data_root=storage_dir,
+    )
 
     if args.app:
         extension_class = None
@@ -235,6 +254,8 @@ async def main():
                 response = await agent.process_input(user_input)
                 decryption_error_count = 0  # Reset on success
                 print(f"\nKestrel: {response}")
+            except HoldTurnRefusal as exc:
+                print(f"\n{exc.wire_json()}")
             except DecryptionError as e:
                 decryption_error_count += 1
                 logger.error(f"DecryptionError during processing: {e}")
@@ -284,6 +305,7 @@ async def main():
             logger.debug(f"Error during shutdown: {e}")
             print("Agent deactivated (with errors).")
         cancelled = await await_agent_shutdown_completion(agent) or cancelled
+        await close_bound_host_context(hold_context)
         if cancelled:
             raise asyncio.CancelledError()
 

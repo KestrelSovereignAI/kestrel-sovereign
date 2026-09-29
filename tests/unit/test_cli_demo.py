@@ -163,6 +163,11 @@ def test_cmd_demo_run_refuses_busy_port(monkeypatch, capsys):
 def test_build_demo_env_strips_api_key_sets_signal_flags(tmp_path):
     parent = {
         "KESTREL_API_KEY": "production-key-must-not-leak",
+        "KESTREL_DB_BACKEND": "postgres",
+        "KESTREL_DATABASE_URL": "postgresql://primary/live",
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL": "postgresql://evidence/live",
+        "KESTREL_HOLD_BACKEND": "postgres",
+        "KESTREL_HOST_DB_PATH": "/srv/live/host-features.db",
         "ANTHROPIC_API_KEY": "sk-ant-...",
         "PATH": "/usr/bin",
     }
@@ -174,6 +179,13 @@ def test_build_demo_env_strips_api_key_sets_signal_flags(tmp_path):
     assert env["KESTREL_MULTI_AGENT_CONFIG"] == str(
         demo_db / "multi_agent-disabled.toml"
     )
+    assert env["KESTREL_HOST_DB_PATH"] == str(
+        demo_db / "host-data" / "host-features.db"
+    )
+    assert env["KESTREL_DB_BACKEND"] == "sqlite"
+    assert "KESTREL_DATABASE_URL" not in env
+    assert "KESTREL_HOLD_EVIDENCE_DATABASE_URL" not in env
+    assert "KESTREL_HOLD_BACKEND" not in env
     # Provider key untouched.
     assert env["ANTHROPIC_API_KEY"] == "sk-ant-..."
 
@@ -217,6 +229,11 @@ def test_build_playwright_env_strips_api_key_preserves_provider_keys(tmp_path):
         "TAVILY_API_KEY": "tvly-key",
         "RUNPOD_API_KEY": "rp-key",
         "OLLAMA_HOST": "http://localhost:11434",
+        "KESTREL_DB_BACKEND": "postgres",
+        "KESTREL_DATABASE_URL": "postgresql://primary/live",
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL": "postgresql://evidence/live",
+        "KESTREL_HOLD_BACKEND": "postgres",
+        "KESTREL_HOST_DB_PATH": "/srv/live/host-features.db",
         "PATH": "/usr/bin",
     }
     demo_db = tmp_path / "agent_data" / "demo"
@@ -227,6 +244,13 @@ def test_build_playwright_env_strips_api_key_preserves_provider_keys(tmp_path):
     # The demo must know its isolated sandbox so resetDemoAgentDatabases can
     # prove which dir is safe to reset (issue #1973).
     assert env["KESTREL_DB_PATH"] == str(demo_db)
+    assert env["KESTREL_HOST_DB_PATH"] == str(
+        demo_db / "host-data" / "host-features.db"
+    )
+    assert env["KESTREL_DB_BACKEND"] == "sqlite"
+    assert "KESTREL_DATABASE_URL" not in env
+    assert "KESTREL_HOLD_EVIDENCE_DATABASE_URL" not in env
+    assert "KESTREL_HOLD_BACKEND" not in env
     # All provider keys survive.
     assert env["ANTHROPIC_API_KEY"] == "sk-ant-prod"
     assert env["OPENROUTER_API_KEY"] == "sk-or-prod"

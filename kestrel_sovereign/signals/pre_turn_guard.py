@@ -1,110 +1,86 @@
-"""Last-instant precondition revalidation for a COGNITION dispatch.
+"""Source-declared pre-turn admission, evaluated inside the turn's own span.
 
-A source can have a precondition that is true when the scheduler decides to
-fire and false by the time the turn actually starts. The scheduler's
-``self_followup`` privacy guard is the motivating case (#3101 review P1): it
-checks ``hides_persisted_user_content(agent)`` and then calls
-``await dispatcher.dispatch_signal(...)``. There is no ``await`` between those
-two statements, but ``dispatch_signal`` is itself a suspension point — durable
-admission, event persistence and lock acquisition all await before the
-COGNITION route reaches ``process_input``. A privacy transition landing in that
-window produced a turn carrying resurrected conversation content under a mode
-that forbids it; that was reproduced against the real dispatcher.
+#3310. A COGNITION source sometimes has a precondition the turn must still
+satisfy at the instant it consumes its prompt — the motivating case is a
+privacy mode that may no longer permit the persisted intent the wake is
+carrying. Such a check is only worth anything if nothing can change the
+answer between the check and the prompt being used.
 
-The obvious repair — hold the agent's privacy-transition lock across
-check-and-dispatch, mirroring the write side in ``_create_schedule`` — is
-**wrong here**, and that is worth stating in the code rather than rediscovering.
-The system's lock-order invariant is CONVERSATION (via ``_turn_lifecycle``)
-**before** the transition lock; see the comment in
-``StreamingMixin.process_input_streaming``. Taking the transition lock in the
-scheduler and then entering ``process_input``, which acquires CONVERSATION,
-inverts that pair and reintroduces the AB-BA wedge this repository has already
-fixed once.
+Before #3310 there was nowhere to put it. The check kept being moved one door
+further along — schedule creation, fire time, the last synchronous instant
+before handoff — and a transition kept landing in a later ``await``, because
+the non-streaming turn serialized against nothing a privacy transition takes.
+``KestrelAgent.process_input`` now holds CONVERSATION (via ``_turn_lifecycle``)
+and then the privacy-transition mutex for its whole body, which finally makes
+one region authoritative.
 
-So the guard is evaluated **twice**, at two different kinds of boundary, and
-the second one is the load-bearing one:
+This module is the seam that puts the source's check *in* that region:
 
-1. At the last *synchronous* instant of the dispatcher pipeline, before the
-   cognition turn is even created. This is an early refusal, not a
-   serialization: it closes the long I/O-bound stretch (durable admission,
-   event persistence, lock acquisition, constitution anchoring) cheaply, and
-   it is the only check available for a duck-typed agent whose
-   ``process_input`` cannot take a precondition.
-2. **Inside the turn's own ``CONVERSATION`` → privacy-transition lock span**,
-   immediately before the prompt is consumed. The dispatcher hands the guard
-   down as ``process_input(..., turn_precondition=...)`` and
-   ``KestrelAgent.process_input`` calls it as its first act inside that span.
+* a source declares ``pre_turn_guard`` on its registration (via
+  :class:`SourceRegistrationWithPreTurnGuard`, or any registration object
+  carrying the attribute — the registry and dispatcher both read it with
+  ``getattr`` so an author can combine it with other adapter subclasses);
+* :class:`~kestrel_sovereign.signals.dispatcher.SignalDispatcher` binds the
+  signal to it and hands the zero-argument result to ``process_input``; and
+* ``process_input`` runs it as the FIRST operation inside the span, and raises
+  :class:`PreTurnRefusal` when it refuses. The dispatcher maps that to
+  ``Status.DROPPED_VALIDATION`` — no turn ran, and the occurrence says so.
 
-Check 1 alone was not enough, and three successive review rounds each found
-that same defect one door further along: ``await_monitored_execution`` creates
-the execution task and yields, and ``process_input`` awaits readiness
-(byok refresh, the genesis gate, the periodic constitution audit) before it
-consumes the prompt. A transition landing in *those* suspension points still
-reached a turn carrying the persisted intent.
+The guard is **synchronous by contract**. The whole value of the region is
+that it contains no suspension point between the check and the prompt being
+consumed; a guard that could ``await`` would put one back. The registry
+rejects a coroutine function at registration time and ``process_input``
+refuses an awaitable return at call time.
 
-What makes check 2 different in kind is that it is not another read-side test
-racing a write-side transition — it runs *inside the span the writer must
-acquire*. ``set_privacy_mode`` / ``confirm_privacy_transition`` take
-``KestrelAgent._privacy_transition_lock``; the turn now holds that lock from
-before the guard runs until the turn ends, in the same
-CONVERSATION-then-transition order the streaming turn has always used. So a
-transition either lands before the guard (and the guard sees it and refuses)
-or blocks until the turn is over. There is no third interleaving, which is
-why this is the last door rather than a fourth one.
-
-The guard itself stays deliberately **sync**: a coroutine guard would put an
-``await`` back between the check and the prompt, reopening the window inside
-the very span that exists to close it.
+The seam is deliberately small. It is the one place a source's pre-turn
+precondition is evaluated — not a second one next to an existing check — so
+it can be deleted rather than grown.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from kestrel_sdk.signals import Signal, SourceRegistration
 
-#: Called with the signal being dispatched and the dispatching agent.
-#: Returns ``None`` to allow the turn, or a short operator-readable reason to
-#: refuse it. The reason reaches ``signal_log`` and the scheduler's execution
-#: record, so it must describe the refusal WITHOUT quoting the payload.
-PreTurnGuard = Callable[[Signal, Any], Optional[str]]
+#: A source's pre-turn admission: given the signal about to become a turn,
+#: return ``None`` to admit it or a refusal reason to stop it. Synchronous.
+PreTurnGuard = Callable[[Signal], Optional[str]]
+
+#: The same guard with its signal already bound, as ``process_input`` receives
+#: it. The turn evaluates an admission decision; it does not read signals.
+BoundPreTurnGuard = Callable[[], Optional[str]]
 
 
-class TurnPreconditionRefused(RuntimeError):
-    """A source's precondition no longer held at the turn's own lock span.
+class PreTurnRefusal(Exception):
+    """A source's pre-turn guard refused the turn from inside its own span.
 
-    Raised by the ``turn_precondition`` callable the dispatcher hands to
-    ``process_input``, from inside the turn's CONVERSATION → transition span
-    and before the prompt is consumed. The turn unwinds without persisting or
-    processing anything; the dispatcher maps it to
-    ``Status.DROPPED_VALIDATION`` so the occurrence is recorded as a refusal
-    rather than as a turn that ran.
-
-    An exception rather than a return value on purpose: ``process_input``
-    returns the agent's response text, so a refusal returned in-band would be
-    indistinguishable from a turn that ran and said something — the exact
-    "accept that produces no turn but reports success" shape #3101 exists to
-    prevent.
+    Raised by ``KestrelAgent.process_input`` while it holds CONVERSATION and
+    the privacy-transition mutex, before any of the turn body runs. It is a
+    policy decision, not a failure: the dispatcher maps it to
+    ``Status.DROPPED_VALIDATION``. A guard that *raises* something else is a
+    bug in the guard and is deliberately left to propagate as ``FAILED``.
     """
 
 
 @dataclass
 class SourceRegistrationWithPreTurnGuard(SourceRegistration):
-    """Source registration that revalidates a precondition before its turn.
+    """Source registration that declares a pre-turn admission guard.
 
-    A Core-side subclass for the same reason as
-    :class:`~kestrel_sovereign.signals.prompt_overrides.SourceRegistrationWithPromptOverride`:
-    the canonical dataclass lives in ``kestrel_sdk.signals`` and does not carry
-    this field yet. It remains an ordinary ``SourceRegistration`` to the
-    registry and the dispatcher, which reads the attribute defensively.
+    COGNITION-only: a guard exists to stop a turn, and ACTION / ARTIFACT
+    dispatches have no turn to stop. The registry enforces that, rejects a
+    non-callable or coroutine-function guard, and folds the guard into the
+    source's contract signature so a re-registration that swaps the guard is
+    a mismatch rather than silently keeping the old one.
     """
 
     pre_turn_guard: Optional[PreTurnGuard] = None
 
 
 __all__ = [
+    "BoundPreTurnGuard",
     "PreTurnGuard",
+    "PreTurnRefusal",
     "SourceRegistrationWithPreTurnGuard",
-    "TurnPreconditionRefused",
 ]

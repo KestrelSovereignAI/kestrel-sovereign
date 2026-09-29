@@ -442,6 +442,7 @@ retroactively claim that current rows already meet this contract.
 |---|---|---|
 | `GraphNode` / `Edge` | `storage/async_graph_store.py`; `graph_nodes(node_id, node_type, label, properties)` and `graph_edges(source_id, target_id, label, properties)` with ownership ledgers | A property-graph **projection/input**. Stable existing non-fact nodes remain application resources. A legacy fact-shaped node is migrated only through an explicit adapter that emits a source occurrence and canonical assertion. |
 | Explicit fact teaching | `features/memory_agency/feature.py::save_fact` maps its small local vocabulary through `semantic_facts.py` and writes a governed canonical assertion | New teaching has no graph-node write path. Historical `node_type='fact'` rows are only a bounded migration input under the #2752 rules below. |
+| Strategy-ledger rows | `features/strategic_memory/ledger_assertions.py` maps pattern/blocker rows; `PrivacyEnforcingStorage.project_strategy_ledger_assertions` owns every await and the privacy lease | `STRATEGY_LEDGER.yaml` stays canonical and the assertion is derived from it. The row type is the predicate and the stable row IRI is the object, so an edit revises rather than duplicates. See the producer rules below. |
 | Saved items | `storage/saved_items_store.py` and `saved_items` support stashes, files, excerpts, and structured items with embedding search | Evidence artifacts or user-curated notes. They become knowledge only after an explicit extraction/approval creates assertions with item spans/digests as source occurrences. |
 | RAG files/chunks | `storage/async_rag_store.py`, `document_chunks`, BM25, and vector backends | Evidence retrieval, not a truth store. RAG text may support a source occurrence; search ranking cannot assert a claim. |
 | Conversation history | `storage/async_conversation_store.py`, privacy-gated `conversation_history` | A transcript/evidence artifact, not knowledge. User/agent/LLM text is at most `reported`/`hypothesis` evidence until an authorized assertion process accepts it. |
@@ -551,6 +552,76 @@ tenant/privacy/normalization checks, recorded source or derivation lineage,
 and reached the selected acceptance state. Raw files, chunks, transcripts,
 embeddings, model weights, response text, labels, tool descriptions, ontology
 documents, shapes, and validation reports are **not knowledge by themselves**.
+
+### Strategy-ledger assertion producer (#3051)
+
+`features/strategic_memory/ledger_assertions.py` is the first producer that
+populates `semantic_assertions` from an agent's own recorded knowledge. It maps
+`STRATEGY_LEDGER.yaml`'s `patterns_learned` and `blockers` rows, and nothing
+else: decisions and consolidated episodes follow this shape later rather than
+multiplying the vocabulary and the reconciliation surface at once.
+
+The terms are closed and pinned to the immutable `kestrel-vocab` 1.2.0 release:
+
+```text
+subject   urn:kestrel:agent:<tenant>:strategy-ledger
+predicate kestrel:strategicPattern | kestrel:strategicBlocker
+object    urn:kestrel:agent:<tenant>:ledgerRow:<row_id>
+```
+
+The row **type** is the predicate and the stable row **identity** is the
+object. `derive_assertion_id` hashes `tenant + subject + predicate + object`,
+so it hashes nothing an edit changes: editing a row's wording writes a new
+revision of the same assertion, and the row's content digest rides in
+`revision_id` rather than in any identity term. Row prose never enters an IRI —
+encoding it there would make the mapping an ad-hoc ontology authoring surface,
+which `semantic_facts.py` refuses for the same reason.
+
+The lifecycle rule is one sentence: an adapter assertion is active exactly
+while its row is present, projectable and active in the canonical ledger. A row
+retired in place (`superseded_at` / `resolved_at`) is retracted, not left
+asserted, because `strategy_supersede_pattern` and `strategy_resolve_blocker`
+retire rows without changing their text. Retraction is terminal here, so the
+producer refuses a whole section whose canonical state is ambiguous — duplicate
+or unaddressable row ids, malformed members — and protects a present row whose
+text was blanked rather than retracting it. Absence of a claim is not a claim
+of absence.
+
+The producer reconciles only against a state the canonical file actually
+holds. It accepts a `LedgerSnapshot` — never the live `StrategyLedger`, never a
+bare mapping — and only `StrategyLedger` can confirm one: a deep copy taken when
+`save()` succeeds, or on a `load()` that minted no ids. `StrategicMemoryFeature`
+performs every ledger mutation, its save, and that capture under one
+`_ledger_mutation_lock`, and projects after releasing it, so a mutation whose
+save failed produces no snapshot and cannot authorize a retraction (#3320).
+Snapshots carry a process-wide persisted sequence; because they are projected
+after other awaits, a pass holding an older snapshot than one already projected
+for the same file is refused (`ledger_snapshot_superseded`) rather than allowed
+to reconcile away what the newer save added. An unconfirmed snapshot is refused
+as `ledger_ids_unpersisted`.
+
+Ownership is settled by the bounded provenance grammar the producer actually
+wrote, never by the marker fields alone, which any canonical writer can supply.
+Ownership is asked of the revision held, not of the assertion's whole history:
+a foreign revision of one of our assertions is reported foreign and left alone.
+
+Two things are deliberately **not** in this producer:
+
+* **No vector projection.** `semantic_assertion_vector_projection_entries`
+  stays empty; recall falls back to the non-vector ranking path. A pinned
+  `SemanticVectorProfile` (capability digest, dimension, `renderer_version`)
+  plus an embedding-provider binding is a separate governed artifact with its
+  own release-evidence obligations.
+* **No renderer change.** `_claim_text` renders `subject | predicate | object`,
+  so these assertions carry no prose into recall. Teaching a generic renderer
+  to join one feature's ledger would be worse than the residue; keyword search
+  over the rows' own text is already served by `strategy_search`. Rendering
+  prose for ledger-derived assertions belongs with the vector-projection
+  follow-up.
+
+The producer sets `lineage` and `owning_agent_id` at write time, which is what
+makes the `claim_source` vocabulary question in #3060 answerable against real
+assertions. `claim_source` is deliberately untouched here.
 
 ### Governed learning-corpus capability
 

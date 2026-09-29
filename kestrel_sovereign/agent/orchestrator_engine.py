@@ -11,6 +11,7 @@ Extracted from kestrel_agent.py — handles the core orchestrator loop:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -20,6 +21,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    raise_owned_outcome,
+)
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
@@ -28,6 +33,12 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
     tool_result_size_bytes,
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
+from kestrel_sovereign.turn_completion import (
+    confirms_complete,
+    repair_addition,
+    settle_repaired_content,
+    turn_completion_repair_prompt,
+)
 from kestrel_sdk.llm import ToolCallStarted
 # Re-use streaming.py's in-band sentinel builders for follow-up
 # ToolCallStarted events so the chat UI's revise-on-tool semantic
@@ -35,28 +46,26 @@ from kestrel_sdk.llm import ToolCallStarted
 # (codex P1 on PR #1346: follow-up pre-tool prose was streamed without
 # the honesty-layer clear).
 from kestrel_sovereign.agent.parts import (
-    bind_part_collector,
     build_part_sentinel,
     current_part_collector,
     drain_parts,
     sanitize_part,
 )
-from kestrel_sovereign.agent.turn_lifecycle import (
-    bind_current_chain,
-    bind_turn_session,
-    capture_current_chain,
-    capture_turn_session_binding,
+from kestrel_sovereign.agent.invocation import (
+    current_invocation_effect_checkpoint,
+    current_invocation_id,
+    mark_current_invocation_effect_completed,
 )
 from kestrel_sovereign.storage.privacy_wrapper import (
-    bind_transition_lock_reentry,
+    held_transition_reentry_token,
 )
-from kestrel_sovereign.signals.context import (
-    bind_current_signal,
-    get_current_signal,
-)
+from kestrel_sovereign.turn_scope import capture_turn_scope
 from kestrel_sovereign.agent.streaming import (
+    _DeferredToolBatchCancellation,
+    _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
     _build_revise_sentinel,
     _build_tool_sentinel,
+    STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
 )
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.security.tool_audit import (
@@ -91,12 +100,13 @@ MAX_TOOL_CONCURRENCY = int(os.environ.get("KESTREL_MAX_TOOL_CONCURRENCY", "10"))
 # warning naming the model that failed to resolve — never as a silent default.
 _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT = 131072
 
-# Per-LLM-call timeout for the orchestrator's multi-iteration tool loop.
+# Inactivity watchdog for the orchestrator's multi-iteration tool loop.
 # Wraps each follow-up ``stream_with_tool_detection`` so a hung upstream
 # (anthropic 429 backoff, network blip, frozen provider queue) surfaces
 # as a visible "❌ failed: timeout" marker instead of silent dead air.
-# A turn can run multiple iterations; the timeout applies PER iteration,
-# not to the whole turn — long but progressing turns aren't killed.
+# It fires after this many seconds WITHOUT a stream item (#3300) — re-armed
+# on every item — so a long but progressing response is never killed, and
+# it applies PER iteration, so a long multi-iteration turn isn't either.
 ORCHESTRATOR_TURN_TIMEOUT_SECS = float(
     os.environ.get("KESTREL_ORCHESTRATOR_TURN_TIMEOUT_SECS", "180")
 )
@@ -141,12 +151,7 @@ TOOL_CALL_AS_TEXT_RE = re.compile(
 # markup raw, whereas documentation/examples of the markup live in code.
 _CODE_SPAN_RE = re.compile(r"```.*?```|~~~.*?~~~|`[^`]*`", re.DOTALL)
 
-TURN_COMPLETION_REPAIR_PROMPT = """You just wrote text that indicates this turn is still in progress, but you did not emit a tool call.
-
-Continue the same turn now:
-- If the work requires an available tool, emit the tool call now.
-- If no tool is needed or available, provide the final answer now.
-- Do not describe a future tool call without making it."""
+TURN_COMPLETION_REPAIR_PROMPT = turn_completion_repair_prompt("turn")
 
 TOOL_CALL_AS_TEXT_REPAIR_PROMPT = """Your previous message contained tool-call markup (for example <function_calls>/<invoke>/<tool_call>) written as plain text. That is NOT a real tool call — nothing was executed, so any result you described was fabricated.
 
@@ -519,8 +524,14 @@ class OrchestratorEngineMixin:
         streaming: bool = False,
         request_id: Optional[str] = None,
         invocation_context=None,
+        original_delivered: bool = False,
     ) -> Union[str, LLMResponse]:
-        """Give the model one more step when it narrates continuing but emits no tool call."""
+        """Give the model one more step when it narrates continuing but emits no tool call.
+
+        ``original_delivered`` says the repaired message has already been
+        yielded to the client (the streaming tool loop streams text as it
+        arrives), so a finished answer needs only the repair's addition.
+        """
         content = response.content or ""
         if not tools or not OrchestratorEngineMixin._signals_unfinished_tool_work(content):
             return response
@@ -534,7 +545,7 @@ class OrchestratorEngineMixin:
         # identity as the original turn. Without this, an explicit-context
         # caller loses companion/user attribution on repair calls (there is
         # no ambient set_observability_context state to recover from).
-        return await self.llm_service.generate_with_messages(
+        repaired = await self.llm_service.generate_with_messages(
             messages=OrchestratorEngineMixin._append_missing_tool_call_repair(messages, content),
             tools=tools or None,
             force_local_only=force_local_only,
@@ -547,6 +558,47 @@ class OrchestratorEngineMixin:
             ),
             invocation_context=invocation_context,
         )
+        return OrchestratorEngineMixin._settle_repaired_turn(
+            content, repaired, original_delivered=original_delivered,
+        )
+
+    @staticmethod
+    def _settle_repaired_turn(
+        original: str,
+        repaired: Union[str, LLMResponse],
+        *,
+        original_delivered: bool,
+    ) -> Union[str, LLMResponse]:
+        """The repair's result, with a finished answer kept.
+
+        A repair that acted, by a structured tool call or by tools an adapter
+        ran inline (``executed_tool_calls``, the codex app-server), goes on as
+        the turn. A repair of tool-call markup written as text replaces that
+        text, which executed nothing and was never an answer, and so does a
+        reply that does not confirm completion: it is the model's new answer.
+        A confirming reply means the message was the answer, so the turn
+        delivers that message followed by any addition, never the reply to the
+        runtime's check alone. When the message has already reached the client,
+        only the addition is left to deliver.
+
+        The content is settled on the repair's own response object rather than
+        a copy: adapters and the service attach runtime attributes to it
+        (``executed_tool_calls``, ``model``, ``provider``) that are not
+        dataclass fields, and a copy would drop them.
+        """
+        if isinstance(repaired, str) or repaired.has_tool_calls:
+            return repaired
+        if getattr(repaired, "executed_tool_calls", None):
+            return repaired
+        if OrchestratorEngineMixin._tool_call_emitted_as_text(original):
+            return repaired
+        if not confirms_complete(repaired.content):
+            return repaired
+        if original_delivered:
+            repaired.content = repair_addition(repaired.content)
+        else:
+            repaired.content = settle_repaired_content(original, repaired.content)
+        return repaired
 
     async def _execute_tool_with_hooks(
         self,
@@ -654,80 +706,22 @@ class OrchestratorEngineMixin:
         dispatch. Adapters that don't run an inline tool loop ignore
         the callable.
         """
-        # Capture the OWNING turn's #1914 part collector at closure-creation
-        # time — this method is called inside ``process_input_streaming``'s
-        # ``part_collector()`` scope, on the turn's asyncio task. The codex
-        # app-server dispatches each ``item/tool/call`` on its own reader-spawned
-        # task, which inherits a frozen copy of the reader's context (turn-1's,
-        # captured once at ``ensure_started``) — NOT the current turn's. Without
-        # re-binding, ``emit_part`` calls made by an inline tool would land on a
-        # stale/abandoned collector and be silently dropped on every turn after
-        # the first. Binding per closure (per turn) keeps concurrent turns —
-        # multiplexed by threadId over one long-lived app-server — routing to
-        # their own buffers; a process-global "current collector" would clobber.
-        turn_part_collector = current_part_collector()
-        # Capture the OWNING turn's privacy-transition reentry token the same way,
-        # and for the same reason (#2672 review P1). A streamed turn holds the
-        # transition lock across the whole turn; the codex app-server dispatches
-        # each inline tool on its own reader-spawned task, so a durable-identity
-        # write (rename / description / discovery history / user name / SOUL) run
-        # inline re-acquires that lock from a DIFFERENT task — a deadlock, because
-        # the write waits on the lock the turn holds while the turn waits on the
-        # app-server's tool result. Capturing the token here (on the turn task,
-        # which holds the lock) and re-presenting it around the tool execution lets
-        # THAT turn's write re-enter the lock; a genuinely concurrent transition
-        # from an unrelated task still serializes. ``None`` off a streamed turn /
-        # when no lock is held (anthropic path runs the tool on the turn task, so
-        # reentry is by task identity and needs no token).
-        transition_reentry_token = self._capture_transition_reentry_token()
-        # Capture the authoritative lifecycle binding on the OWNING turn task.
-        # The codex app-server reader was spawned before this turn and therefore
-        # carries a frozen pre-turn ContextVar snapshot. Re-presenting this exact
-        # turn/session pair inside the callback lets lifecycle-only consumers
-        # such as ``request_restart`` preserve wake routing without trusting the
-        # transport parameter, logging context, or agent-global session. The
-        # binding is explicitly empty when this executor was built off-turn.
-        turn_session_binding = capture_turn_session_binding(self)
-        # Capture the OWNING turn's in-flight Signal for the same reason as the
-        # three bindings above (#3112 review P1 — the FOURTH instance of this
-        # defect in this one function). ``set_current_signal`` is called in
-        # exactly one place, ``SignalDispatcher`` around ``process_input``, on
-        # the dispatching task. The codex reader task's frozen pre-turn snapshot
-        # therefore reads ``None``, and any guard of the form "refuse when the
-        # current signal is X" silently stops guarding. The concrete casualty is
-        # the scheduler's ``self_followup`` single-hop limit: a follow-up turn
-        # could schedule another follow-up without bound. ``None`` off a
-        # signal-driven turn is the correct value and stays correct.
-        turn_signal = get_current_signal()
-        # Capture the OWNING turn's scheduler execution scope -- the FIFTH
-        # instance of this defect in this one function (#3112 gate-2 P1).
-        # A ``self_followup`` turn runs inside a scheduler execution, and an
-        # isolated/effectful tool reads ``get_current_scheduler_execution()``
-        # to stamp its stable idempotency key. On the codex reader task that
-        # returns ``None``, so the tool omits the key -- and an occurrence
-        # retried after lease/finalization uncertainty repeats the effect.
-        # For a feature whose worked example is "merge PR N once CI settles",
-        # the concrete casualty is a merge running twice.
-        #
-        # Imported here rather than at module scope: this engine must not take
-        # a hard import dependency on an optional feature package.
-        from kestrel_sovereign.features.scheduler.runner import (
-            bind_scheduler_execution_scope,
-            capture_scheduler_execution_scope,
-        )
-
-        turn_scheduler_scope = capture_scheduler_execution_scope()
-        # Capture the OWNING turn's causation chain -- the SIXTH instance of
-        # this defect here (#3112 gate-2 P1). The dispatcher publishes it on
-        # the dispatching task only, so an inline tool that sends an A2A task
-        # from the codex reader reads ``[]`` and ``TaskManager.create_task``
-        # attaches no lineage. The peer's completion then wakes a turn at
-        # depth 1 with no trace of the ``self_followup`` turn that caused it,
-        # and that turn may schedule another follow-up: the single-hop bound
-        # evaded by one A2A round trip. Rebinding the current signal alone
-        # does not cover this -- outbound lineage reads the chain, not the
-        # signal.
-        turn_chain = capture_current_chain()
+        # Capture EVERY turn-scoped value on the OWNING turn task, at closure
+        # creation. The codex app-server dispatches each ``item/tool/call`` on
+        # a reader-spawned task whose context is a frozen copy of the reader's
+        # — taken before this turn published anything — so without
+        # re-presentation an inline tool reads each turn-scoped ContextVar at
+        # its default: parts dropped (#2081), transition-lock deadlock (#2672),
+        # restart wakes routed nowhere (#2965), the dispatching signal lost
+        # (#3112), and ``turn_id`` / the causation chain stamped as empty
+        # (#3114). The set is declared where each ContextVar is defined (see
+        # ``kestrel_sovereign.turn_scope``), not listed here, so a new
+        # turn-scoped value is carried without touching this executor. Capture
+        # per closure (per turn) keeps concurrent turns multiplexed over one
+        # app-server routing to their own state.
+        turn_scope = capture_turn_scope(self)
+        request_id = current_invocation_id()
+        effect_checkpoint = current_invocation_effect_checkpoint()
 
         async def _exec(name: str, args: dict):
             # Capture the post-hook args so the inline adapter's
@@ -735,19 +729,60 @@ class OrchestratorEngineMixin:
             # redactors stay applied in audit/UI/STOP-hook
             # surfaces — pre-hook args would leak redacted values).
             capture: Dict[str, Any] = {}
-            with bind_part_collector(turn_part_collector), \
-                    bind_transition_lock_reentry(transition_reentry_token), \
-                    bind_turn_session(turn_session_binding), \
-                    bind_current_signal(turn_signal), \
-                    bind_scheduler_execution_scope(turn_scheduler_scope), \
-                    bind_current_chain(turn_chain):
+            with turn_scope.bind():
                 result = await self.execute_named_tool(
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,
                 )
+            # The Codex reader owns this callback on an old task context.  Pass
+            # the turn's captured mutable state explicitly: a ContextVar lookup
+            # here would see the reader's stale pre-turn snapshot.
+            mark_current_invocation_effect_completed(
+                session_id,
+                checkpoint=effect_checkpoint,
+            )
             return capture.get("effective_args", args), result
 
+        async def _persist_completed_effects(executed: list[dict]) -> None:
+            """Checkpoint an inline effect before transport cancellation wins."""
+
+            if not executed:
+                return
+            await self._persist_completed_tool_stop_checkpoint(
+                session_id=session_id,
+                request_id=request_id,
+            )
+
+        # Codex runs the callable on a reader-owned task and therefore owns the
+        # only cancellation boundary that can see both the completed inline
+        # effect log and the pending turn cancellation.  Publish a narrow
+        # callback on the callable itself so the adapter can make that boundary
+        # durable without learning anything about Kestrel's storage layer.
+        _exec.persist_completed_effects = _persist_completed_effects
+
         return _exec
+
+    async def _persist_completed_tool_stop_checkpoint(
+        self,
+        *,
+        session_id: Optional[str],
+        request_id: Optional[str],
+    ) -> None:
+        """Persist fixed anti-repeat evidence for a cancelled completed batch."""
+
+        await self._persist_assistant_turn_safely(
+            STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+            metadata={
+                "tool_batch_checkpoint": dict(
+                    _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA[
+                        "tool_batch_checkpoint"
+                    ]
+                )
+            },
+            session_id=session_id,
+            request_id=request_id,
+            require_success=True,
+        )
 
     def _capture_transition_reentry_token(self):
         """Capture the owning turn's transition-lock reentry token, or ``None``.
@@ -760,15 +795,7 @@ class OrchestratorEngineMixin:
         (tests / CLI), in which case the inline write runs unguarded or on the turn
         task. Never raises — token capture must not break tool dispatch.
         """
-        getter = getattr(self, "_get_privacy_transition_lock", None)
-        if not callable(getter):
-            return None
-        try:
-            lock = getter()
-            grab = getattr(lock, "current_reentry_token", None)
-            return grab() if callable(grab) else None
-        except Exception:  # noqa: BLE001 - never let token capture break dispatch
-            return None
+        return held_transition_reentry_token(self)
 
     async def _append_executed_tool_breadcrumbs(
         self, messages: list,
@@ -2333,6 +2360,76 @@ class OrchestratorEngineMixin:
                 # parts once after the gather and attach to the last event.
                 _collect_parts()
 
+    async def _execute_tool_batch_at_stop_boundary(
+        self,
+        *args,
+        defer_cancellation_to_persistence: bool = False,
+        **kwargs,
+    ):
+        """Finish a side-effecting batch before propagating cancellation.
+
+        Cooperative Stop may cancel the top-level invocation task at any
+        await.  A tool batch is not such a boundary: cancelling it halfway can
+        leave an external effect committed while the corresponding tool result
+        is absent from history.  Give the batch its own lifecycle owner, join
+        it through repeated caller cancellation, and only then let Stop unwind
+        the turn.  The next loop checkpoint observes the cancellation flag and
+        prevents another tool or provider round-trip.
+        """
+
+        # The batch context below is a copy of this one, so ContextVars carry
+        # over by inheritance; what does not is authority defined relative to
+        # this task — the held transition span's reentry token and the
+        # explicit turn/session pairing. Re-present the whole turn scope, as
+        # every closure that runs turn work on another task does.
+        turn_scope = capture_turn_scope(self)
+
+        async def run_owned_batch():
+            with turn_scope.bind():
+                return await self._execute_tool_batch(*args, **kwargs)
+
+        # This moves the SAME logical turn into a cancellable task, which is
+        # exactly the case delegate_current_task_ownership documents: ordinary
+        # child tasks deliberately do not inherit a non-reentrant lock, so
+        # without this the batch runs with the turn's CONVERSATION hold
+        # invisible. is_owned_by_current_task and _caller_belongs_to_live_turn
+        # both go False inside every tool, which turns an in-turn isolated tool
+        # into a wait on a config-transition gate the turn itself is holding
+        # the lock against, and makes privacy_transition() re-acquire a lock
+        # its own turn owns. The invocation boundary and the dispatcher both
+        # delegate at their task boundaries; this one has to as well. Tokens
+        # are per-acquisition, so the delegation stops authorizing the moment
+        # this turn releases.
+        batch_context = contextvars.copy_context()
+        lock_manager = None
+        get_lock_manager = getattr(type(self), "_get_lock_manager", None)
+        if callable(get_lock_manager):
+            lock_manager = get_lock_manager(self)
+        delegate_lock_ownership = getattr(
+            lock_manager, "delegate_current_task_ownership", None
+        )
+        if callable(delegate_lock_ownership):
+            delegate_lock_ownership(batch_context)
+        owner = asyncio.create_task(
+            run_owned_batch(),
+            name="orchestrator-tool-batch",
+            context=batch_context,
+        )
+        tool_results = kwargs.get("tool_results")
+        result_count = len(tool_results) if isinstance(tool_results, list) else None
+        outcome = await await_owned_task(owner)
+        if (
+            result_count is not None
+            and len(tool_results) > result_count
+        ):
+            mark_current_invocation_effect_completed(kwargs.get("session_id"))
+        if defer_cancellation_to_persistence and outcome.cancellation is not None:
+            return _DeferredToolBatchCancellation(outcome)
+        return raise_owned_outcome(
+            outcome,
+            operation="side-effecting orchestrator tool batch",
+        )
+
     # ------------------------------------------------------------------
     # Non-streaming orchestrator response handler
     # ------------------------------------------------------------------
@@ -2420,6 +2517,57 @@ class OrchestratorEngineMixin:
         return 1 + history_len + (1 if has_user_message else 0), history_len
 
     async def _handle_orchestrator_response(
+        self,
+        response: Union[str, LLMResponse],
+        feature_tools: List[Dict[str, Any]],
+        system_prompt: str,
+        force_local_only: bool,
+        effective_model: str,
+        max_iterations: int = None,
+        user_message: str = None,
+        session_id: Optional[str] = None,
+        tool_results: Optional[list] = None,
+        invocation_context=None,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        continuation_user_content: Optional[str] = None,
+    ) -> str:
+        """Run the non-streaming loop behind a completed-effect Stop fence."""
+
+        captured_results = tool_results if tool_results is not None else []
+        had_inline_effect = bool(getattr(response, "executed_tool_calls", None))
+        try:
+            return await OrchestratorEngineMixin._handle_orchestrator_response_impl(
+                self,
+                response=response,
+                feature_tools=feature_tools,
+                system_prompt=system_prompt,
+                force_local_only=force_local_only,
+                effective_model=effective_model,
+                max_iterations=max_iterations,
+                user_message=user_message,
+                session_id=session_id,
+                tool_results=captured_results,
+                invocation_context=invocation_context,
+                conversation_history=conversation_history,
+                continuation_user_content=continuation_user_content,
+            )
+        except asyncio.CancelledError as error:
+            state = current_invocation_effect_checkpoint()
+            already_checkpointed = bool(
+                getattr(error, "_kestrel_completed_effect_checkpointed", False)
+                or (state is not None and state.checkpointed)
+            )
+            if (had_inline_effect or captured_results) and not already_checkpointed:
+                await self._persist_completed_tool_stop_checkpoint(
+                    session_id=session_id,
+                    request_id=current_invocation_id(),
+                )
+                if state is not None:
+                    state.checkpointed = True
+                setattr(error, "_kestrel_completed_effect_checkpointed", True)
+            raise
+
+    async def _handle_orchestrator_response_impl(
         self,
         response: Union[str, LLMResponse],
         feature_tools: List[Dict[str, Any]],
@@ -2523,13 +2671,19 @@ class OrchestratorEngineMixin:
 
             features_by_tool_name = self._visible_features_by_tool_name()
             known_tools = self._known_tool_names()
-            await self._execute_tool_batch(
+            batch_result = await self._execute_tool_batch_at_stop_boundary(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
                 tool_results=tool_results,
                 session_id=session_id,
                 effective_model=effective_model,
+                defer_cancellation_to_persistence=True,
             )
+            if isinstance(batch_result, _DeferredToolBatchCancellation):
+                raise_owned_outcome(
+                    batch_result.outcome,
+                    operation="side-effecting orchestrator tool batch",
+                )
 
             # Continue conversation with tool results
             all_tools = self._build_all_tools()
@@ -3004,13 +3158,22 @@ class OrchestratorEngineMixin:
             # as (terminal_event_index, [parts]). Lets us yield each component
             # bubble right after its producing tool's card in a multi-tool batch.
             part_emit_buffer: list = []
-            await self._execute_tool_batch(
+            batch_result = await self._execute_tool_batch_at_stop_boundary(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
                 tool_events=tool_events, tool_results=tool_results, streaming=True,
                 session_id=session_id, part_emit_buffer=part_emit_buffer,
                 effective_model=effective_model,
+                defer_cancellation_to_persistence=True,
             )
+            if isinstance(batch_result, _DeferredToolBatchCancellation):
+                # The side effect and its result are complete, but Stop cancelled
+                # the invocation owner while this batch was in flight. Hand the
+                # captured cancellation to StreamingMixin without emitting any
+                # more client-visible bytes; it re-raises only after durable
+                # conversation history contains the completed result.
+                yield batch_result
+                return
             _parts_by_event_index: dict = {}
             for _evt_idx, _evt_parts in part_emit_buffer:
                 _parts_by_event_index.setdefault(_evt_idx, []).extend(_evt_parts)
@@ -3138,8 +3301,17 @@ class OrchestratorEngineMixin:
                     _call_timeout = _route_timeout
             except Exception:
                 pass
+            # #3300: the watchdog measures INACTIVITY, not total elapsed time.
+            # Its job is hang detection — "silent dead air" from a stuck
+            # upstream — and it now re-arms on every item the stream yields,
+            # so a response that is still arriving is never cut off however
+            # long it runs (output is bounded by the model's own ceiling, not
+            # a 4,096-token literal, so a legitimate answer can take minutes),
+            # while a stream that goes silent for ``_call_timeout`` seconds —
+            # including before its first item — still trips it.
+            _watchdog_loop = asyncio.get_running_loop()
             try:
-                async with asyncio.timeout(_call_timeout):
+                async with asyncio.timeout(_call_timeout) as _watchdog:
                     async for item in self.llm_service.stream_with_tool_detection(
                         messages=messages,
                         tools=all_tools or None,
@@ -3158,6 +3330,7 @@ class OrchestratorEngineMixin:
                             if request_id else None
                         ),
                     ):
+                        _watchdog.reschedule(_watchdog_loop.time() + _call_timeout)
                         if _cancelled():
                             break
                         if isinstance(item, str):
@@ -3258,10 +3431,11 @@ class OrchestratorEngineMixin:
                 return
 
             if not response.has_tool_calls:
+                streamed_text = "".join(iter_text_chunks)
                 repaired_missing_tool_call = (
                     bool(all_tools)
                     and OrchestratorEngineMixin._signals_unfinished_tool_work(
-                        "".join(iter_text_chunks) or response.content or ""
+                        streamed_text or response.content or ""
                     )
                 )
                 if repaired_missing_tool_call:
@@ -3275,6 +3449,7 @@ class OrchestratorEngineMixin:
                         streaming=True,
                         request_id=request_id,
                         invocation_context=invocation_context,
+                        original_delivered=bool(streamed_text),
                     )
                     if isinstance(response, str):
                         yield response
@@ -3282,9 +3457,14 @@ class OrchestratorEngineMixin:
                     if response.has_tool_calls:
                         messages.append(self._build_assistant_tool_history_msg(response))
                         continue
-                    # Repair is non-streaming (buffered LLMResponse); yield
-                    # its text so the user sees the repaired completion.
-                    yield response.content or ""
+                    # Repair is non-streaming (buffered LLMResponse). When the
+                    # repaired text was streamed above, this is only what the
+                    # repair adds to it; otherwise it is the whole answer.
+                    if response.content:
+                        yield (
+                            f"\n\n{response.content}" if streamed_text
+                            else response.content
+                        )
                     return
                 # Text-only response: already streamed to user during the
                 # tool-detection pass. No second LLM round-trip needed —

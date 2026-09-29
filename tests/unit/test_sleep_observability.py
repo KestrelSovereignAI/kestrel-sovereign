@@ -466,3 +466,123 @@ def test_authenticated_invoke_preserves_consolidate_only_maintenance_summary() -
         ]
     finally:
         _restore_app(app, original)
+
+
+def test_the_report_names_its_first_terminal_failure_not_the_skip():
+    """A privacy skip followed by an export failure composes
+    ``consolidation_skipped; Export failed: ...``. The structured code is the
+    export failure — the skip is a deliberate no-op and is never recorded —
+    and the summary names it instead of the skip."""
+    from kestrel_sovereign.agent.sleep import SleepReport, _record_failure_code
+
+    report = SleepReport(success=False, error="consolidation_skipped")
+    _record_failure_code(report, "consolidation_skipped")
+    assert report.failure_code is None
+    _record_failure_code(report, "export_failed")
+    _record_failure_code(report, "consolidation_failed")  # later phases do not overwrite
+    assert report.failure_code == "export_failed"
+    fresh = SleepReport(success=False, error="Export failed: [Errno 28] No space left")
+    _record_failure_code(fresh, "Export failed: [Errno 28] No space left")  # prose never lands
+    assert fresh.failure_code is None
+    report.error = "consolidation_skipped; Export failed: [Errno 28] No space left"
+
+    assert "Sleep failed: export_failed" in str(report)
+    assert report.to_dict()["failure_code"] == "export_failed"
+
+
+def test_a_skip_only_cycle_still_reads_as_the_skip():
+    from kestrel_sovereign.agent.sleep import SleepReport
+
+    report = SleepReport(success=False, error="consolidation_skipped")
+    assert "Sleep failed: consolidation_skipped" in str(report)
+
+
+def test_a_failed_maintenance_unit_still_yields_a_reason():
+    """Semantic maintenance reports through its own status map, not ``error``,
+    and records no failure_code — the one failing path that reached the
+    scheduler with no cause at all. failure_reason() is the single resolution
+    both the summary and the scheduler door read."""
+    from kestrel_sovereign.agent.sleep import SleepReport
+
+    # A known reason on the status map is the cause itself...
+    report = SleepReport(
+        success=False,
+        semantic_maintenance={"status": "failed", "reason": "semantic_storage_unavailable"},
+    )
+    assert report.failure_reason() == "semantic_storage_unavailable"
+    assert report.to_dict()["failure_reason"] == "semantic_storage_unavailable"
+    assert "Sleep failed: semantic_storage_unavailable" in str(report)
+    # ...and an unknown one resolves to the status.
+    report = SleepReport(
+        success=False,
+        semantic_maintenance={"status": "failed", "reason": "something the code never named"},
+    )
+    assert report.failure_reason() == "semantic_maintenance_failed"
+    assert "Sleep failed: semantic_maintenance_failed" in str(report)
+    assert SleepReport(success=True).failure_reason() is None
+
+
+def test_a_partial_maintenance_unit_yields_a_reason_and_keeps_its_wording():
+    """`partial` fails the cycle exactly like `failed` (any status outside
+    complete/no_op), but tier 3 only knew `failed`: the scheduler door got
+    no cause while the summary said "incomplete". One resolution now; the
+    operator wording stays."""
+    from kestrel_sovereign.agent.sleep import SleepReport
+
+    report = SleepReport(
+        success=False,
+        semantic_maintenance={"status": "partial", "reason": "semantic_maintenance_lease_lost"},
+    )
+    assert report.failure_reason() == "semantic_maintenance_partial"
+    assert report.to_dict()["failure_reason"] == "semantic_maintenance_partial"
+    assert "Sleep incomplete: semantic maintenance is partial." in str(report)
+
+    known = SleepReport(
+        success=False,
+        semantic_maintenance={"status": "partial", "reason": "semantic_storage_unavailable"},
+    )
+    assert known.failure_reason() == "semantic_storage_unavailable"
+
+
+class _NoLegalFeatureSleepAgent(_CommandSleepAgent):
+    def get_feature(self, name):
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "inner",
+    [
+        # Tier 3: the one failing path that sets neither error nor failure_code —
+        # a partial maintenance unit reports through its own status map.
+        SleepReport(success=False, semantic_maintenance={"status": "partial", "reason": "x"}),
+        # Tier 1: the phase's recorded code.
+        SleepReport(
+            success=False,
+            error="consolidation_skipped; Export failed: remote backup unavailable",
+            failure_code="export_failed",
+        ),
+    ],
+    ids=["maintenance_partial", "export_failed"],
+)
+async def test_cryostasis_resolves_the_same_failure_reason_as_the_inner_cycle(inner):
+    """The cryostasis report used to be a field-by-field copy of the inner
+    report; it dropped ``failure_code`` once and the maintenance maps once,
+    each time turning a caused failure into ``Sleep failed: unavailable``."""
+    # Snapshot the inner verdict BEFORE the call: the double hands back the
+    # same object, so reading it afterwards would agree with any mutation.
+    expected_reason = inner.failure_reason()
+    expected_dict = inner.to_dict()
+    expected_text = str(inner)
+    assert expected_reason is not None
+
+    agent = _NoLegalFeatureSleepAgent(inner)
+    report = await agent.cryostasis_sleep(incorporation_params={"entity_name": "x"})
+
+    assert report.failure_reason() == expected_reason
+    assert report.to_dict()["failure_reason"] == expected_dict["failure_reason"]
+    assert str(report) == expected_text
+    assert agent.sleep_calls == [{"tier": "filecoin"}]
+    # The incorporation verdict still rides on the returned report.
+    assert report.incorporation_attempted is True
+    assert report.incorporation_success is False

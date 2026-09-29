@@ -402,3 +402,42 @@ async def test_partial_shard_package_is_structured_reject(
         assert log[0]["status"] == "rejected"
         assert log[0]["reject_reason"] == "incomplete_shards"
         assert log[0]["messages_restored"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Incomplete legacy-session stamping is reported, not turned into an error
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_incomplete_session_stamp_warns_and_import_still_succeeds(
+    db_path: Path, user_secret: str, monkeypatch, caplog,
+):
+    """The #3120 warning used an undefined module ``logger``: an import
+    whose conversations had already committed raised ``NameError`` and was
+    audited as ``restore_failed``. It must warn and report ``imported``."""
+    from kestrel_sovereign.storage import sovereign_adapter
+
+    async def _incomplete(db, agent_id):
+        return {"incomplete": 2}
+
+    async with Storage(db_path=str(db_path), agent_id=AGENT_ID) as storage:
+        await _seed(storage)
+        adapter = SovereignStorageAdapter(
+            storage.db, user_secret=user_secret, agent_id=AGENT_ID,
+        )
+        cid = await adapter.export_agent(
+            AGENT_DID, storage_tier=StorageTier.LOCAL_ONLY,
+        )
+        await storage.db.execute_commit("DELETE FROM conversation_history")
+        monkeypatch.setattr(
+            sovereign_adapter, "stamp_legacy_sessions", _incomplete,
+        )
+
+        with caplog.at_level("WARNING", logger=sovereign_adapter.__name__):
+            result = await adapter.import_agent(cid)
+
+        assert result.status == "imported"
+        assert result.messages_restored == len(_MESSAGES)
+        assert "stamp-sessions" in caplog.text
+        log = await adapter.get_import_log(agent_did=AGENT_DID)
+        assert [row["status"] for row in log] == ["imported"]

@@ -777,11 +777,20 @@ def _budget_event(
     try:
         total = int(budget_summary.get("total_budget") or 0)
         used = int(budget_summary.get("total_used") or 0)
+        external_reserved = max(
+            0,
+            int(budget_summary.get("external_reserved_tokens") or 0),
+        )
     except (TypeError, ValueError):
         return None
     if total <= 0:
         return None
-    remaining = max(0, total - used)
+    # ``total_used`` is deliberately the sum of named context-section usage.
+    # Tool schemas and other provider payloads consume the same turn ceiling,
+    # but ElasticTokenBudget reports them separately so section attribution
+    # remains exact.  Count both here: the operator notice promises remaining
+    # budget for the whole turn, not merely unspent named sections.
+    remaining = max(0, total - used - external_reserved)
     threshold = _budget_threshold(total)
     is_low = remaining <= threshold
     was_low = low_state.get(session_key, False)

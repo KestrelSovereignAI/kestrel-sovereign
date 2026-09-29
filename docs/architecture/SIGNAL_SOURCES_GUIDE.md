@@ -396,6 +396,168 @@ ping-pong on the SAME source is a loop.
 
 ---
 
+## Peer Stop is an authenticated in-flight ACTION source
+
+`a2a.peer_stop` (#3169) is the andon-cord rail for cooperative peer Stop. Any
+authenticated peer may pull it; it infers no hierarchy, never Holds, and never
+terminates a process. It is deliberately not the operator/local HTTP Stop door
+(`POST /api/agent/stop`, `POST /api/host/stop`): those doors neither build nor
+impersonate this signal, and the A2A transport lane cannot reach them.
+
+Two doors feed it, and both call `dispatch_peer_stop`, which builds a `Signal`
+and awaits `SignalDispatcher.dispatch_signal`. Neither door cancels anything:
+
+- `POST /api/agent/peer/stop` carries the replay-protected hybrid A2A envelope
+  (`a2a_verb=peer_stop`). An unsigned envelope is refused.
+- `AgentManager.stop_host_attested_local_peer` carries the manager's
+  same-process route capability for co-hosted agents.
+
+Identities are routing principals, never payload:
+
+- `Signal.caller` is the verified (or host-attested) sender. It becomes the
+  Stop receipt's `actor_id`.
+- `Signal.target_agent` is the recipient's own DID. The envelope also signs an
+  `a2a_audience`, which the recipient compares with its own identity before
+  dispatch so a signed Stop cannot be forwarded to another agent.
+- The signed payload holds only the intent: `scope`, work target, `reason`,
+  `cascade`, `correlation_id`. Any other key is a grammar error.
+
+Policy decided by the dispatcher, each with a `refused` Stop receipt:
+
+| Dispatcher outcome | Cause | Receipt detail names |
+|---|---|---|
+| `DROPPED_VALIDATION` | `host` or `tool_call` scope, or `cascade: true` (following signed descendants is sovereign-only, #3143) | the specific policy |
+| `DROPPED_CYCLE` | `(target, a2a.peer_stop)` already in the signed causation chain, or depth past the TTL | cycle or depth policy |
+| `DROPPED_RATE_LIMIT` | more than 4 per minute / 20 per hour for this recipient | peer rate limits |
+
+The rate limit is load-bearing: a peer that could stop every new turn without
+limit would have synthesized Hold. It bounds one peer; the **fleet circuit
+breaker** (#3170) bounds all of them. It decides at the single
+`peer_stop_breaker_refusal` seam in the handler, after dispatcher policy and
+before any cancellation:
+
+- Once the honored peer Stops against one agent, from any peers, reach
+  `PEER_STOP_CIRCUIT_THRESHOLD` (default 8) inside a sliding
+  `PEER_STOP_CIRCUIT_WINDOW_SECONDS` (default 900), the circuit for that agent
+  is open. Hosts tune both with `KESTREL_PEER_STOP_CIRCUIT_THRESHOLD` and
+  `KESTREL_PEER_STOP_CIRCUIT_WINDOW_SECONDS`; a malformed value fails startup.
+- A peer Stop against an open circuit is refused with an operation-keyed
+  `refused` receipt whose detail is `peer_stop_circuit_open`. A breaker that
+  cannot read or write its state refuses with `peer_stop_circuit_unavailable`
+  rather than honoring an uncounted Stop.
+- Counting is a durable admission written in the same transaction that counted
+  the window, under a per-target lock (PostgreSQL advisory lock; SQLite
+  `BEGIN IMMEDIATE`), so concurrent peers at `N - 1` cannot both be honored and
+  a restart does not reset the count. The Stop receipt decides finality: an
+  admission whose receipt stopped nothing (`already_complete`, `refused`)
+  stops counting; one still in flight counts. Actor and target are the signal
+  principals, never payload.
+- Operator and local sovereign Stops (`/api/agent/stop`, `/api/host/stop`) are
+  never counted and never refused. Every Stop receipt records the `door` it
+  came through (`peer`, `agent`, `host`).
+- `opened`, `closed` (automatic recovery once the window clears), and `reset`
+  transitions are receipted in `stop_circuit_events`. Opening logs one WARNING
+  naming the target. The sovereign-only `GET /api/host/stop/circuit` lists the
+  open circuits (target, `opened_at`, count, window); it is its own read, not a
+  rider on the Stop All inventory, so an inventory failure cannot hide an open
+  circuit and an unreadable breaker answers its own 503
+  `peer_stop_circuit_unavailable` without masking `GET /api/host/stop/status`.
+  The agents banner polls it independently, renders each circuit with a Reset
+  action, and shows "circuit status unavailable" rather than "none open" when
+  the read fails. The reset door is the sovereign-only
+  `POST /api/host/stop/circuit/reset` (`target`, `reason`), and
+  `GET /api/host/stop/circuit/events` reads the history.
+- Nothing latches: the breaker never writes a Hold, and an open circuit closes
+  by itself as the window slides past its admissions.
+
+Idempotency: the durable `source_event_id` and the receipt correlation id are
+both `peer-stop:<sha256(actor, correlation_id)>`, so two peers may reuse a
+correlation id without colliding. A different request reusing the same
+correlation id is refused as a conflict.
+
+Exactly one durable record decides a Stop operation's fate: **the Stop
+receipt keyed by the operation id**, written only by the handler that executes
+(or definitively refuses) that operation under the receipt store's claim. The
+dispatcher commits the source event before the handler runs, so the event
+alone cannot prove a Stop happened. A duplicate that the dispatcher answers
+`COALESCED` therefore resolves through the receipt store:
+
+- a receipt exists: it is replayed. The handler does not run again, nothing
+  fans out again, and no rate-limit slot is consumed;
+- no receipt exists (the first attempt was interrupted between the event
+  commit and its receipt, or is still running): the Stop is re-admitted as a
+  *new* source unit through `dispatch_signal`, so validation, cycle/TTL, and
+  the rate limit all apply to it again. The receipt store's operation claim
+  serializes it against a first attempt that is still running, which answers
+  the retry `refused` ("already in progress") rather than stopping twice.
+
+Delivery-level decisions — cycle/depth, rate limit, validation, dispatch
+failure — belong to the **delivery**, not the operation. Their receipt
+(`refused`, or `unreachable` for a dispatch failure) is keyed by the delivery's signal id (`peer-stop-delivery:<signal
+id>`), so it still appears in `GET /api/host/stop/receipts` with the actor and
+the refusal named, but it never pre-empts the operation: a retry refused by the
+rate limit cannot suppress an admitted first attempt that has not yet claimed,
+and once the budget refills a later retry can still complete an interrupted
+Stop. A signal dedup record likewise only coalesces and does rate-limit
+accounting; it never decides that a Stop happened.
+
+The response names the one record its outcomes are. `receipt_kind` is
+`operation` (the handler's receipt, or its replay) or `delivery` (a decision
+about this delivery alone), and `stop_correlation_id` is that record's key;
+`recorded` says whether anything durable holds it. The sender (`stop_peer`)
+matches each kind by its own identity: an operation record by the named key, a
+delivery record only when it is `peer_stop_delivery_id(signal_receipt.signal_id)`
+and `refused` or `unreachable`. A delivery record for another signal, or one
+claiming an effect, is rejected as a mismatched receipt; a real dispatcher
+refusal reaches the caller typed, with its detail.
+
+An operation identity binds its intent at first sight. Before the first
+dispatch, `StopReceiptStore.bind_operation` records the request fingerprint
+under the operation id (only the fingerprint; the id is blinded like every
+other Stop identity). A later delivery under the same identity naming a
+different intent — changed scope, target, or reason — is refused as identity
+reuse *before dispatch* (`signal_receipt.status` is `null`), receipted under
+its own delivery id, and never re-admitted; `claim()` independently refuses to
+claim an operation bound to another request. So a first attempt interrupted
+between its source event and its claim can be completed only by its own
+intent.
+
+An operation claim carries its owner's lease (#3356): the claiming process's
+owner id and a heartbeat it renews while the Stop executes. Renewal is
+non-revivable, and liveness is read with the database clock. A retry against
+a claim whose heartbeat is inside the lease is answered with the typed
+"already in progress" refusal and writes nothing under the operation id. A
+claim whose owner is proven dead (its heartbeat expired, or the row predates
+owner liveness and has none) is taken over by the retry in one
+compare-and-set, so concurrent retries yield one new owner. The retaker
+re-executes the Stop and records what it observes now: `stopped` if the dead
+owner never cancelled, `already_complete` if it did. Stop is idempotent, so
+this is never a second effect. The dead owner cannot come back and write: its
+receipt commit must delete its own claim id, which the takeover replaced. This
+applies to every Stop door, not only the peer rail.
+
+Retry after a lost response: the wire envelope's replay nonce refuses a
+byte-identical resend (403), exactly as for every other A2A action. The
+`stop_peer` sender therefore re-signs the *same* intent, `id`, and `sessionId`
+with a fresh nonce, up to `PEER_STOP_DELIVERY_ATTEMPTS`, and only after an
+unconfirmed delivery (transport error or 503). The recipient answers that
+retry from the original receipt, or completes the interrupted Stop as above.
+Authorization and protocol decisions are final and never retried.
+
+The registration is an `InFlightControlActionRegistration`. It acts only on
+work already running, so the dispatcher:
+
+- persists only a fixed durable marker (no payload, caller, or chain) and
+  therefore does not wait on the privacy-transition lock that every running
+  turn holds;
+- does not apply Hold's begin-work disposition, so a held agent still receives
+  Stop for work in flight.
+
+Validation, cycle/TTL, rate limiting, and the `signal_log` audit apply
+unchanged.
+
+---
+
 ## Common patterns
 
 ### Default-deny visibility
@@ -452,20 +614,28 @@ Five rules:
    tasks, so each read lies on its own: out-of-turn work (a cron tick)
    sees whatever chat turn is concurrently in flight, and a task
    detached from a finished turn still reports that turn's id forever.
-   The accessor accepts only one of two authorities: the calling task owns the
-   *live* turn, or the task carries a binding captured on that owning turn with
-   `capture_turn_session_binding()` and re-presented with
-   `bind_turn_session()`. A captured binding remains valid only while that exact
+   The accessor accepts only one of two authorities: the calling task belongs
+   to the *live* turn through the binding the lifecycle publishes at turn entry
+   (inherited by that task's genuine children), or the task carries a binding
+   captured on that owning turn with `capture_turn_session_binding()` and
+   re-presented with `bind_turn_session()`. The raw turn id is never ownership
+   evidence: it is carried onto foreign tasks for attribution (#3114). A captured binding remains valid only while that exact
    turn is live, so unrelated background work still reads as unattended instead
    of hijacking a stranger's window. A present explicit binding is authoritative
    even when unbound or stale; callback code never replaces captured authority
    with an ambient turn copied into the invoking task. The carve-out is turn
    entry itself: a task that enters `_turn_lifecycle` owns that new turn outright,
-   so the lifecycle clears any binding inherited from the callback or tool that
+   so the lifecycle replaces any binding inherited from the callback or tool that
    spawned it. If a source callback runs on a task created before the turn (for
    example, a transport reader or app-server handler), the accessor alone returns
    `None`: capture while building the callback on the owning turn and bind inside
-   the callback across the task boundary. See
+   the callback across the task boundary. Inside core, do that with
+   `kestrel_sovereign.turn_scope.capture_turn_scope(agent)` and its
+   `.bind()` rather than one value at a time: it re-presents every turn-scoped
+   value declared at its definition site (turn/session binding, turn id,
+   causation chain, dispatching signal, part collector, caller binding,
+   transition-lock reentry), and the turn-scope completeness unit test fails
+   on a hand-written re-presentation. See
    `OrchestratorEngineMixin._make_inline_tool_executor` and
    `Feature._make_feature_inline_tool_executor` for the two in-tree examples.
 

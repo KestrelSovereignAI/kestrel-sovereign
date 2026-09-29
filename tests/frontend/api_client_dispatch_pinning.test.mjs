@@ -187,6 +187,20 @@ test('invokeForAgent publishes and sends an exact non-streaming Stop id', async 
         JSON.parse(calls[0].options.body).request_id,
         'nonstream-turn-1',
     );
+    assert.equal(
+        client.getCurrentStreamRequestId('dispatch-A'),
+        'nonstream-turn-1',
+        'response settlement must not erase the Stop address before the UI owner settles',
+    );
+    assert.equal(
+        client.completeCurrentStreamRequestId('dispatch-A', 'wrong-owner'),
+        false,
+    );
+    assert.equal(client.getCurrentStreamRequestId('dispatch-A'), 'nonstream-turn-1');
+    assert.equal(
+        client.completeCurrentStreamRequestId('dispatch-A', 'nonstream-turn-1'),
+        true,
+    );
     assert.equal(client.getCurrentStreamRequestId('dispatch-A'), null);
 });
 

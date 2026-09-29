@@ -41,11 +41,14 @@ import tomllib
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
+from kestrel_sovereign.paths import SERVE_STATE_DIR_ENV, runtime_path_env
 
 logger = __import__("logging").getLogger(__name__)
 
 DEFAULT_PORT = 8001
-STATE_DIR = Path(os.environ.get("KESTREL_SERVE_STATE_DIR", str(Path.home() / ".kestrel")))
+STATE_DIR = Path(
+    runtime_path_env(SERVE_STATE_DIR_ENV, str(Path.home() / ".kestrel"))
+)
 STATE_FILE = STATE_DIR / "serve_state.json"
 LOG_DIR = STATE_DIR / "logs"
 # Keep a margin so we never fill RAM to the brim and trigger swap thrash.

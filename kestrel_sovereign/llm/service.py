@@ -16,6 +16,7 @@ import inspect
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
+from kestrel_sovereign.llm.retry import common_declined_wait
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
 
@@ -44,6 +45,7 @@ from .error_handling import (
 )
 from .openai_adapter import OpenAIAdapter
 from .adapter import LLMResponse, messages_for, response_usage_available
+from .output_ceiling import response_stop_reason
 from .model_discovery import ModelDiscoveryMixin
 from .mandate import ModelMandateMixin
 from .usage_tracking import UsageTrackingMixin
@@ -359,6 +361,8 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self,
         database_url: Optional[str] = None,
         agent_data_dir: Optional[Any] = None,
+        *,
+        usage_db: Optional['AsyncDatabase'] = None,
     ):
         """Initialize LLM service.
 
@@ -376,6 +380,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                          the process environment cannot name each agent's data
                          root and SQLite usage rows would otherwise all land in
                          one agent's database (#2769).
+            usage_db: Optional host-owned initialized database for model usage.
+                      Takes precedence over ``database_url`` and avoids opening
+                      one connection pool per service in multi-agent hosts.
 
         Reads the process environment; does not load it. ``load_dotenv()`` used
         to be the first statement here, so constructing a service — lazily, on
@@ -413,6 +420,17 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         # Model discovery uses process-wide SharedModelCache (see model_cache.py).
         # Pre-populate from disk if this is the first LLMService instance.
+        # vendor -> last model-discovery error (#3190). Records the fact that a
+        # vendor's catalog could NOT be retrieved, which ``len(catalog) > 0``
+        # cannot express: a failed ``list_models`` and a vendor that genuinely
+        # serves nothing both yield an empty list.
+        #
+        # MUST be created before ``_load_from_disk_cache()`` on the next line.
+        # That call restores a persisted catalog AND its failure record, so
+        # initialising this afterwards made the restoration dead code on every
+        # real construction — the map it wrote into did not exist yet, and the
+        # later assignment then replaced it with an empty one (codex r2 P1).
+        self._discovery_failures: Dict[str, str] = {}
         self._load_from_disk_cache()  # Immediate availability before API discovery
 
         # Storage info cache
@@ -442,7 +460,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self.disabled: bool = False
 
         # Database for model usage tracking (uses abstract data layer)
-        self._init_usage_tracking(database_url, agent_data_dir=agent_data_dir)
+        self._init_usage_tracking(
+            database_url, agent_data_dir=agent_data_dir, usage_db=usage_db
+        )
 
         # Constitutional profile service
         self._init_constitutional_profiles()
@@ -454,6 +474,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # shape are dropped by model_preference._load_model_preference().
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
         self._mandate_fallbacks = []
+
+        # Set when a PERSISTED mandate failed to apply at boot (#3190) — the
+        # operator set a model and it is not in effect. Cleared by a successful
+        # set_model_preference.
+        self._mandate_load_error: Optional[str] = None
 
         # Top-level embedding-route knob (#2263). ``[llm] embedding_route =
         # "<vendor>:<route>"`` selects the embedding channel independently of
@@ -1803,6 +1828,8 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         model: str,
         vendor: Optional[str] = None,
         route: Optional[str] = None,
+        *,
+        validate: bool = True,
     ) -> None:
         """Set the mandated model selection for this session.
 
@@ -1862,9 +1889,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             # must be held to the same bar, else a hallucinated/stale
             # ``{vendor, route, model}`` lands a broken mandate that only
             # surfaces on the NEXT request (the #1927 route-fidelity skew).
-            self._validate_explicit_mandate(model, vendor, route)
+            if validate:
+                self._validate_explicit_mandate(model, vendor, route)
 
         self._mandate_preference = {"vendor": vendor, "model": model, "route": route}
+        # A mandate is in effect again — clear any recorded boot-time drop so
+        # the health surface stops reporting a condition the operator fixed
+        # (#3190). Without this the warning is sticky for the process lifetime.
+        self._mandate_load_error = None
         if route:
             logger.info("Model preference set: %s:%s/%s", vendor, route, model)
         else:
@@ -2014,6 +2046,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
     def clear_model_preference(self) -> None:
         """Clear any mandated model preference, returning to default behavior."""
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
+        # Returning to automatic routing is a DELIBERATE unpinned state, so the
+        # boot-failure notice must go with it (#3190 r3 P2). Only the set path
+        # cleared it, so health went on reporting "a persisted preference
+        # failed to apply; running UNPINNED" about a state the operator chose.
+        # A flag that one door sets and only one other door clears is a flag
+        # that gets stuck.
+        self._mandate_load_error = None
         logger.info("Model preference cleared, using default route order")
 
         if self._preference_persistence_callback:
@@ -3588,6 +3627,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             record_metadata.setdefault("provider_reported_cost_usd", cost)
         if not usage_available:
             record_metadata.setdefault("usage_available", False)
+        # #3300: why the provider stopped. ``max_tokens`` marks a response cut
+        # at its output ceiling, which is otherwise indistinguishable from a
+        # finished one in telemetry — the durable ``llm_calls`` row and the
+        # ``llm.usage`` line both carry it so a monitor can find those calls.
+        stop_reason = response_stop_reason(response)
+        if stop_reason is not None:
+            record_metadata.setdefault("stop_reason", stop_reason)
 
         usage_tracker_ready = (
             hasattr(self, "_db_initialized")
@@ -4011,6 +4057,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 "structured_output": structured_output,
                 "cost": cost,
                 "usage_available": usage_available,
+                "stop_reason": record_metadata.get("stop_reason"),
                 "session_id": context.session_id,
                 "correlation_id": context.correlation_id,
             }
@@ -4282,6 +4329,22 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
         target_selector = self._get_default_mandate_selector()
+        # Whether this is an EXPLICIT selection comes from the CANONICAL
+        # routing metadata, not a second opinion computed here (#3190 r7 P1).
+        #
+        # The catalog guard below must apply the same rule generation applies —
+        # it skips the guard for an explicit pin, and an audit that does not
+        # would reject a target the very same request just generated with
+        # (warn mode annotating every response, strict mode denying every one,
+        # r6 P1). But "explicit" is a question `_compute_route_authorization`
+        # already answers, and the hand-rolled version disagreed with it: a
+        # bare model, or a vendor selector matching several routes, is NOT
+        # explicit there, and treating it as explicit here would let a stale or
+        # cross-vendor model broadcast across routes past a guard generation
+        # still enforces.
+        #
+        # Re-deriving a predicate that exists is how the two ends drift apart
+        # in the first place. One question, one implementation.
         if not target_selector:
             pref_model = self._mandate_preference.get("model")
             pref_vendor = self._mandate_preference.get("vendor")
@@ -4329,6 +4392,26 @@ No other text or formatting.
             errors = {}
             for provider in available_providers:
                 logger.info(f"Auditing with provider: {provider['name']}")
+                # The audit keeps this guard UNCONDITIONALLY, unlike the
+                # generation path which skips it for an explicit selection
+                # (#3190 r9 P1).
+                #
+                # Three rounds were spent trying to make the audit mirror
+                # generation, because during a discovery outage a pinned route
+                # generates fine and then fails its own audit. That is a real
+                # annoyance and the fix for it was wrong: this guard is what
+                # makes the audit FAIL CLOSED at risk 3 when no route can serve
+                # the mandated model, and
+                # `test_get_audit_response_failclosed_when_no_route_serves_mandate`
+                # is that contract. Skipping it on explicitness returned risk 1
+                # for a genuinely unservable model.
+                #
+                # Explicitness cannot tell a transiently incomplete catalog from
+                # a model that truly is not there — the same thing this whole
+                # change concluded is unknowable from the catalog alone. Given
+                # that, an auditor that refuses to vouch for a route it cannot
+                # verify is behaving correctly. Degrading a fail-closed security
+                # check to make an outage more comfortable is the wrong trade.
                 if target_model and not self._model_available_for_route(provider, target_model):
                     # Record the skip so that if EVERY route rejects the
                     # mandated model, the loop fails closed (risk=3) instead of
@@ -4551,6 +4634,7 @@ No other text or formatting.
         tools = self._check_model_tool_support(available_providers, tools, model_override)
 
         errors = {}
+        route_errors: list[BaseException] = []  # attempted routes only
         for provider_index, provider in enumerate(available_providers):
             if not explicit_selection and self._skip_paid_fallback(
                 provider, available_providers, provider_index
@@ -4618,6 +4702,7 @@ No other text or formatting.
             except LLMProviderError as e:
                 logger.warning(f"Provider {provider['name']} failed: {e}")
                 errors[provider['name']] = e
+                route_errors.append(e)
                 # Record the failed attempt as an event on the one
                 # logical-request span (opened by the public entry method).
                 # #2674 finding 4: thread the per-invocation redaction flag so an
@@ -4645,14 +4730,24 @@ No other text or formatting.
                         "an unconfigured vendor. Error: %s",
                         available_providers[0].get("vendor"), provider["name"], e,
                     )
-                    raise LLMServiceError(
+                    exhausted = LLMServiceError(
                         f"Preferred route {provider['name']} failed and the "
                         f"only remaining routes are unconfigured vendors; "
                         f"refusing to silently swap vendors. "
                         f"Underlying error: {e}"
-                    ) from e
+                    )
+                    # This too is an aggregate of every attempted route: its
+                    # verdict is the common decline, not this route's error.
+                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    raise exhausted from e
 
-        raise LLMAllProvidersFailedError(errors)
+        # The aggregate states its own verdict: a reset time only when every
+        # ATTEMPTED route declined (skipped routes and models a route cannot
+        # serve were not attempted). Surfaces read the verdict, never the
+        # routes' errors behind it.
+        aggregate = LLMAllProvidersFailedError(errors)
+        aggregate.declined_wait = common_declined_wait(route_errors)
+        raise aggregate from aggregate.declined_wait
 
     async def get_response_with_model(
         self,
@@ -4726,16 +4821,16 @@ No other text or formatting.
 
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
             logger.error(f"Model {model_id} API error: {e}", exc_info=True)
-            raise RuntimeError(f"Model {model_id} failed: {e}")
+            raise RuntimeError(f"Model {model_id} failed: {e}") from e
         except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
             logger.error(f"Model {model_id} network error: {e}", exc_info=True)
-            raise RuntimeError(f"Model {model_id} failed: {e}")
+            raise RuntimeError(f"Model {model_id} failed: {e}") from e
         except (KeyError, AttributeError, TypeError) as e:
             logger.error(f"Model {model_id} data error: {e}", exc_info=True)
-            raise RuntimeError(f"Model {model_id} failed: {e}")
+            raise RuntimeError(f"Model {model_id} failed: {e}") from e
         except Exception as e:
             logger.error(f"Model {model_id} failed: {e}", exc_info=True)
-            raise RuntimeError(f"Model {model_id} failed: {e}")
+            raise RuntimeError(f"Model {model_id} failed: {e}") from e
 
     # get_streaming_response is provided by StreamingMixin
 
@@ -5192,6 +5287,7 @@ No other text or formatting.
             force_local_only=force_local_only,
         )
         last_error = None
+        route_errors: list[BaseException] = []
         last_provider_name = None
         for provider_index, provider in enumerate(providers):
             if not explicit_selection and self._skip_paid_fallback(
@@ -5254,6 +5350,7 @@ No other text or formatting.
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 self._maybe_disable_route(provider, e)
                 last_error = e
+                route_errors.append(e)
                 if explicit_selection:
                     raise LLMServiceError(
                         f"Selected route {provider['name']} failed: {e}"
@@ -5272,22 +5369,28 @@ No other text or formatting.
                         "route is an unconfigured vendor. Error: %s",
                         providers[0].get("vendor"), provider["name"], e,
                     )
-                    raise LLMServiceError(
+                    exhausted = LLMServiceError(
                         f"Preferred route {provider['name']} failed and the "
                         f"only remaining routes are unconfigured vendors; "
                         f"refusing to silently swap vendors. "
                         f"Underlying error: {e}"
-                    ) from e
+                    )
+                    # This too is an aggregate of every attempted route: its
+                    # verdict is the common decline, not this route's error.
+                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    raise exhausted from e
                 logger.warning(
                     "Falling through from %s in generate_with_messages: %s",
                     provider["name"], e,
                 )
                 continue
 
-        raise LLMServiceError(
+        aggregate = LLMServiceError(
             f"All providers failed for generate_with_messages "
             f"(last: {last_provider_name}): {last_error}"
         )
+        aggregate.declined_wait = common_declined_wait(route_errors)
+        raise aggregate from last_error
 
     # generate_stream, stream_with_messages, and stream_with_tool_detection
     # are provided by StreamingMixin

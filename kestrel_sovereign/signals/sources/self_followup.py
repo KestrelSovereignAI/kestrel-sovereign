@@ -31,6 +31,7 @@ spend.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import re
 from datetime import timedelta
@@ -183,7 +184,7 @@ def self_followup_result_summary(body: Any) -> str:
 
 
 def refuse_followup_under_volatile_privacy(
-    signal: Any, agent: Any
+    signal: Any, *, agent: Any
 ) -> Optional[str]:
     """Refuse the turn when the mode now forbids resurfacing stored content.
 
@@ -195,17 +196,28 @@ def refuse_followup_under_volatile_privacy(
     the persisted intent still reached a turn (#3101 review P1, reproduced
     against the real dispatcher).
 
-    The dispatcher runs this at two boundaries: once at the last synchronous
-    instant of its pipeline (an early refusal), and once more inside the
-    turn's own CONVERSATION → privacy-transition span, immediately before the
-    prompt is consumed. The second is the one that makes the answer
-    authoritative — a transition must acquire that same lock, so it cannot
-    slip between this check and the turn. See
-    :mod:`kestrel_sovereign.signals.pre_turn_guard` for why one boundary was
-    not enough and why this function must stay synchronous.
+    Registered as this source's ``pre_turn_guard`` (#3310), so ``process_input``
+    evaluates it as the first operation inside the turn's own CONVERSATION ->
+    privacy-transition span, immediately before the prompt is consumed. A
+    transition must acquire that same lock, so it cannot slip between this
+    check and the turn. See :mod:`kestrel_sovereign.signals.pre_turn_guard`
+    for why the guard must stay synchronous.
+
+    ``agent`` is bound at registration by
+    :func:`build_self_followup_registration`; the guard contract hands the
+    guard only the signal. A registration built with no agent has nothing to
+    judge the mode against and refuses fail-closed rather than admitting a
+    turn it cannot vouch for.
 
     Returns a reason that names the mode class only — never the intent.
     """
+    if agent is None:
+        return (
+            "refused: no agent is bound to this follow-up's registration to "
+            "judge its privacy mode, so the persisted intent is not read back "
+            "into a turn"
+        )
+
     from kestrel_sovereign.features.storage_access import (
         hides_persisted_user_content,
     )
@@ -218,8 +230,14 @@ def refuse_followup_under_volatile_privacy(
     )
 
 
-def build_self_followup_registration() -> SourceRegistrationWithPreTurnGuard:
-    """Source registration for the agent's own scheduled follow-up turn."""
+def build_self_followup_registration(
+    agent: Any = None,
+) -> SourceRegistrationWithPreTurnGuard:
+    """Source registration for the agent's own scheduled follow-up turn.
+
+    ``agent`` is the agent the source is registered for; its pre-turn guard
+    judges that agent's privacy mode from inside the turn.
+    """
     return SourceRegistrationWithPreTurnGuard(
         name=f"cron.{TASK_NAME}",
         schema=_schema,
@@ -257,9 +275,10 @@ def build_self_followup_registration() -> SourceRegistrationWithPreTurnGuard:
         # the follow-up is bound to a chat session.
         result_summary=self_followup_result_summary,
         retention_days=30,
-        # Revalidated by the dispatcher at the last synchronous instant of its
-        # pipeline AND again inside the turn's own CONVERSATION ->
+        # Revalidated inside the turn's own CONVERSATION ->
         # privacy-transition span, because the scheduler's fire-time check and
         # the turn are separated by the whole pipeline plus the handoff.
-        pre_turn_guard=refuse_followup_under_volatile_privacy,
+        pre_turn_guard=functools.partial(
+            refuse_followup_under_volatile_privacy, agent=agent
+        ),
     )

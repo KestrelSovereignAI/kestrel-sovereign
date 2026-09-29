@@ -14,12 +14,13 @@ Mirrors openclaw commit ``aa0a29099f`` (#87181) at the Python layer.
 """
 
 from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
 from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.claude_max_adapter import ClaudeMaxAdapter
+from tests.utils.anthropic_client import anthropic_client, install_models_api
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +108,8 @@ async def _capture_messages_create_kwargs(
     model: str,
     messages: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    fake_client = MagicMock()
-    fake_client.messages.create = AsyncMock(
-        return_value=MagicMock(
+    fake_client = anthropic_client(
+        MagicMock(
             content=[MagicMock(type="text", text="ok")],
             stop_reason="end_turn",
             usage=MagicMock(input_tokens=10, output_tokens=1),
@@ -120,7 +120,7 @@ async def _capture_messages_create_kwargs(
         model=model,
         messages=messages,
     )
-    return fake_client.messages.create.call_args.kwargs
+    return fake_client.messages.stream.call_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -187,6 +187,7 @@ async def _capture_messages_stream_kwargs(
 ) -> Dict[str, Any]:
     fake_client = MagicMock()
     fake_client.messages.stream = MagicMock(return_value=_FakeStreamContext())
+    install_models_api(fake_client)
     chunks: List[Any] = []
     async for chunk in adapter.get_streaming_response(
         client=fake_client,
@@ -215,6 +216,7 @@ async def test_get_streaming_response_with_tools_sends_bare_model_id_when_prefix
     """
     fake_client = MagicMock()
     fake_client.messages.stream = MagicMock(return_value=_FakeStreamContext())
+    install_models_api(fake_client)
     adapter = AnthropicAdapter()
     chunks: List[Any] = []
     async for chunk in adapter.get_streaming_response_with_tools(

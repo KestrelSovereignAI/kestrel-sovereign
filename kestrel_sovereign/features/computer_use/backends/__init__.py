@@ -2,6 +2,7 @@
 
 from .base import (
     CapabilityBlocked,
+    CaptureTarget,
     CompletedRun,
     DirEntry,
     SandboxBackend,
@@ -11,6 +12,7 @@ from .local import LocalSandboxBackend
 
 __all__ = [
     "CapabilityBlocked",
+    "CaptureTarget",
     "CompletedRun",
     "DirEntry",
     "DockerSandboxBackend",

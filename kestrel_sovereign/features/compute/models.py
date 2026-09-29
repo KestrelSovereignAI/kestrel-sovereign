@@ -8,7 +8,7 @@ and execution tracking.
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 
 class ScriptState(Enum):
@@ -184,11 +184,70 @@ class ComputeScript:
         )
 
 
+@dataclass(frozen=True)
+class ComputeCommand:
+    """An argv vector to execute directly — not a script.
+
+    A script is *text handed to an interpreter*; a command is an
+    *argument vector handed to exec*. The difference is load-bearing,
+    not stylistic. In a script the first word is read by the shell's
+    grammar, so ``eval``, ``FOO=x`` and ``trap`` each dispatch a program
+    of their own choosing; in an argv vector, element zero is the
+    program and every other element is an argument to it. #3187 is what
+    happens when a caller is promised the second and given the first.
+
+    Deliberately a separate type rather than a mode flag on
+    :class:`ComputeScript`: a command has no ``language`` because
+    nothing interprets it, and no ``content`` because there is no text,
+    while a script has no argv. One type carrying both would let a
+    caller set the fields of one execution primitive and get the other.
+    """
+
+    id: str  # UUID
+    name: str  # Human-readable name
+    argv: Tuple[str, ...]  # argv[0] is the program; the rest its arguments
+    purpose: str  # Why the agent created this
+
+    timeout_seconds: int = 300
+    environment: Dict[str, str] = field(default_factory=dict)  # Env vars
+
+    parent_task_id: Optional[str] = None  # A2A task that triggered this
+    created_at: datetime = field(default_factory=datetime.now)
+
+    def __post_init__(self) -> None:
+        # An empty vector is not "run nothing": ``docker run IMAGE`` with
+        # no command runs the image's own default CMD, which for the
+        # execution images is a shell. Refuse it at construction, where
+        # the caller is, rather than discovering it as a container that
+        # started something nobody asked for.
+        #
+        # Validating once is only worth anything if the value cannot
+        # change afterwards, which is why this type is frozen and argv
+        # is copied into a tuple. A list would stay the caller's: the
+        # caller clears it, or assigns a new one, and the check that
+        # already passed is describing a vector that no longer exists
+        # (codex round 1 P2). The environment is left a plain dict
+        # because it has no equivalent cliff — a changed value is a
+        # different value, while an emptied argv is a different program.
+        if not self.argv:
+            raise ValueError("ComputeCommand requires a non-empty argv")
+        for index, element in enumerate(self.argv):
+            if not isinstance(element, str):
+                raise TypeError(
+                    f"ComputeCommand argv[{index}] must be str, "
+                    f"got {type(element).__name__}"
+                )
+        if not self.argv[0]:
+            raise ValueError("ComputeCommand argv[0] must name a program")
+        object.__setattr__(self, "argv", tuple(self.argv))
+
+
 @dataclass
 class ExecutionRecord:
-    """Record of a script execution."""
+    """Record of one execution — of a :class:`ComputeScript` or a
+    :class:`ComputeCommand`."""
     id: str
-    script_id: str
+    script_id: str  # id of the executed script OR command
     
     # Execution details
     started_at: datetime = field(default_factory=datetime.now)
@@ -196,6 +255,21 @@ class ExecutionRecord:
     exit_code: Optional[int] = None
     stdout: str = ""
     stderr: str = ""
+    # Whether the executor's output cap discarded anything, per stream.
+    # Previously the only signal was a marker appended to ``stdout``/
+    # ``stderr`` themselves, which a consumer had to parse back out of
+    # caller-controlled text — so a command whose own output happened to end
+    # that way was read as truncated. A boolean cannot be spoofed by what the
+    # command prints. Two of them, because the streams are capped
+    # independently and reporting a clipped stdout as a clipped stderr is a
+    # different claim from the true one.
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+
+    @property
+    def output_truncated(self) -> bool:
+        """Whether either stream was clipped."""
+        return self.stdout_truncated or self.stderr_truncated
     
     # Sandbox info
     executor: Literal["uv", "docker", "local"] = "uv"
@@ -218,6 +292,11 @@ class ExecutionRecord:
             "exit_code": self.exit_code,
             "stdout": self.stdout,
             "stderr": self.stderr,
+            # Round-tripped: a clipped record reconstructed from storage that
+            # reported itself whole would defeat the point of moving the fact
+            # off the text in the first place.
+            "stdout_truncated": self.stdout_truncated,
+            "stderr_truncated": self.stderr_truncated,
             "executor": self.executor,
             "container_id": self.container_id,
             "resource_usage": self.resource_usage,
@@ -236,6 +315,8 @@ class ExecutionRecord:
             exit_code=data.get("exit_code"),
             stdout=data.get("stdout", ""),
             stderr=data.get("stderr", ""),
+            stdout_truncated=bool(data.get("stdout_truncated", False)),
+            stderr_truncated=bool(data.get("stderr_truncated", False)),
             executor=data.get("executor", "uv"),
             container_id=data.get("container_id"),
             resource_usage=data.get("resource_usage", {}),

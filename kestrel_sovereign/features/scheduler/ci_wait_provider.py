@@ -14,9 +14,23 @@ head-commit check runs and combined status to decide a terminal verdict:
   * open + checks still running,
     or the rollup was not read      -> PENDING (keep watching)
 
-The change-detection primitives (``fetch``/``summarize_checks``) are reused
-from :mod:`kestrel_sovereign.signals.sources.github_pr_watch`, which is pure
-core — this provider does NOT depend on the out-of-tree GitHub feature.
+The change-detection primitives (``fetch_check_rollup``/``_check_verdict``)
+are reused from :mod:`kestrel_sovereign.signals.sources.github_pr_watch`,
+which is pure core — this provider does NOT depend on the out-of-tree GitHub
+feature.
+
+A third rule joins the two below, from the same root: a rollup that could not
+be read in full may still produce a verdict, but never an unqualified pass.
+``fetch_check_rollup`` degrades from the Checks API to the Actions API when a
+credential cannot read the former (permanent for a fine-grained PAT, which
+has no ``checks`` permission to grant), which recovers the verdict for an
+Actions-and-statuses repository while staying blind to third-party apps that
+report only through check runs. So an incomplete rollup that reads
+``success`` settles PARTIAL with a caveat naming the blind spot, not DONE —
+"everything I could see passed" is a weaker claim than "everything passed",
+and collapsing them is the false green this module exists to refuse. An
+observed *failure* is unaffected: a gate that was seen to fail is a real
+failure however much else was invisible.
 
 Transient failures (no token, auth error, network blip) return
 :class:`Outcome.PENDING`, never a terminal failure: a durable
@@ -60,25 +74,20 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 from kestrel_sdk.tools import Outcome, WaitStatus
+from kestrel_sovereign.signals.sources.github_pr_watch import (
+    CHECKS_SOURCE_CHECK_RUNS,
+    CheckRollup,
+    _check_verdict,
+)
 
 logger = logging.getLogger(__name__)
 
 # A CI handle is a PR reference: ``owner/repo#123``. The owner/repo half may
 # contain the usual GitHub name characters; the number is the PR/issue id.
 _CI_HANDLE_RE = re.compile(r"^(?P<repo>[^\s#]+/[^\s#]+)#(?P<number>\d+)$")
-
-# GitHub check-run conclusions that mean the check did NOT pass. ``success``,
-# ``neutral`` and ``skipped`` are treated as non-blocking passes: they mean
-# the check did not need to run. ``cancelled`` deliberately stays a failure —
-# it means the check was stopped before it could tell us anything, which is an
-# absence of evidence rather than a pass (#2939).
-_FAIL_CONCLUSIONS = frozenset(
-    {"failure", "timed_out", "cancelled", "action_required", "stale",
-     "startup_failure"}
-)
 
 
 def parse_ci_handle(handle: str) -> Tuple[str, int]:
@@ -94,91 +103,6 @@ def parse_ci_handle(handle: str) -> Tuple[str, int]:
             f"ci wait handle must be 'owner/repo#<number>', got {handle!r}"
         )
     return m.group("repo"), int(m.group("number"))
-
-
-def _positive_count(value: Any) -> bool:
-    """Whether ``value`` is a GitHub ``total_count`` greater than zero.
-
-    Tolerates the field being absent, ``null``, or a string; anything that is
-    not a positive integer reads as "no statuses reported".
-    """
-    try:
-        return int(value) > 0
-    except (TypeError, ValueError):
-        return False
-
-
-def _check_verdict(
-    check_runs: Any = None, combined_status: Any = None
-) -> str:
-    """Reduce raw check-runs + combined commit status to a coarse verdict.
-
-    Returns one of:
-      * ``"unknown"`` — the rollup was not read at all (neither payload was
-        fetched); an evidence gap, NOT a statement about the checks,
-      * ``"none"``    — read successfully and empty: no check runs and no
-        statuses exist for this commit (no CI ran),
-      * ``"pending"`` — at least one check/status is not yet terminal,
-      * ``"failure"`` — everything terminal and at least one failed,
-      * ``"success"`` — everything terminal and all passed.
-
-    A check run counts as terminal on ``status == "completed"`` whatever its
-    conclusion, so ``skipped``/``neutral`` never hold the rollup open.
-    """
-    runs_read = isinstance(check_runs, (dict, list))
-    runs: List[dict] = []
-    if isinstance(check_runs, dict):
-        raw_runs = check_runs.get("check_runs", []) or []
-    elif isinstance(check_runs, list):
-        raw_runs = check_runs
-    else:
-        raw_runs = []
-    for r in raw_runs:
-        if isinstance(r, dict):
-            runs.append(r)
-
-    status_read = isinstance(combined_status, dict)
-    combined_state = ""
-    statuses: List[dict] = []
-    if isinstance(combined_status, dict):
-        for s in combined_status.get("statuses", []) or []:
-            if isinstance(s, dict):
-                statuses.append(s)
-        # GitHub reports the combined ``state`` as "pending" for a commit that
-        # carries ZERO legacy statuses — the shape of every Actions-only repo,
-        # where CI reports through check runs instead. Reading that as "a
-        # check is still running" pins the verdict at pending forever (#2939),
-        # so the combined state is evidence only when a status backs it.
-        if statuses or _positive_count(combined_status.get("total_count")):
-            combined_state = str(combined_status.get("state", "") or "").lower()
-
-    if not runs_read and not status_read:
-        return "unknown"
-    if not runs and not statuses and not combined_state:
-        return "none"
-
-    # Not terminal yet if any check run is still queued/in_progress, or the
-    # combined/legacy status is still pending.
-    for r in runs:
-        if str(r.get("status", "") or "").lower() != "completed":
-            return "pending"
-    if combined_state == "pending":
-        return "pending"
-    for s in statuses:
-        if str(s.get("state", "") or "").lower() == "pending":
-            return "pending"
-
-    # Everything terminal — any failure makes the verdict a failure.
-    for r in runs:
-        if str(r.get("conclusion", "") or "").lower() in _FAIL_CONCLUSIONS:
-            return "failure"
-    if combined_state in ("failure", "error"):
-        return "failure"
-    for s in statuses:
-        if str(s.get("state", "") or "").lower() in ("failure", "error"):
-            return "failure"
-
-    return "success"
 
 
 def _mergeability(pr_raw: Dict[str, Any]) -> Tuple[Optional[bool], str]:
@@ -201,6 +125,8 @@ def classify_ci_state(
     *,
     check_runs: Any = None,
     combined_status: Any = None,
+    checks_source: str = CHECKS_SOURCE_CHECK_RUNS,
+    unreadable: Tuple[str, ...] = (),
     repo: str = "",
     number: Optional[int] = None,
 ) -> WaitStatus:
@@ -212,10 +138,21 @@ def classify_ci_state(
     are the head commit's check-runs and combined status JSON. Passing
     *neither* means the rollup was never read — an evidence gap that stays
     PENDING — which is distinct from reading it and finding it empty.
+
+    ``checks_source``/``unreadable`` carry how completely that rollup was read
+    (see :class:`CheckRollup`). They default to a complete read, so a caller
+    holding a full rollup passes nothing extra; when they say otherwise, no
+    verdict here is allowed to claim more than was visible.
     """
     state = str(pr_raw.get("state", "") or "").strip().lower()
     merged = bool(pr_raw.get("merged", False))
     verdict = _check_verdict(check_runs, combined_status)
+    rollup = CheckRollup(
+        check_runs=check_runs,
+        combined_status=combined_status,
+        source=checks_source,
+        unreadable=tuple(unreadable),
+    )
     data: Dict[str, Any] = {
         "repo": repo,
         "number": number,
@@ -223,6 +160,13 @@ def classify_ci_state(
         "merged": merged,
         "checks": verdict,
     }
+    if not rollup.complete:
+        # Recorded on EVERY outcome, terminal or not, including the merged and
+        # closed ones below: a reader auditing why a wait settled the way it
+        # did should not have to infer that the rollup behind it was partial.
+        data["checks_source"] = rollup.source
+        data["unreadable"] = list(rollup.unreadable)
+        data["blind_spot"] = rollup.caveat()
     label = f"{repo}#{number}" if repo else "PR"
 
     if merged:
@@ -232,9 +176,41 @@ def classify_ci_state(
             Outcome.FAILED, f"{label} closed without merge", data=data
         )
     if verdict == "failure":
+        # Terminal whatever else was invisible. An unread gate can only hide
+        # MORE failures, never turn an observed one into a pass, so a partial
+        # rollup does not soften a failure the way it softens a pass.
         return WaitStatus(Outcome.FAILED, f"{label} CI checks failed", data=data)
     if verdict == "success":
+        if not rollup.complete:
+            # Everything VISIBLE passed. Reported PARTIAL rather than DONE so
+            # the caveat rides out to the waiter via ``ToolResult.partial``
+            # instead of being discarded into an unqualified green.
+            data["caveat"] = (
+                f"{label}: every check this poll could read passed, but "
+                f"{rollup.caveat()}"
+            )
+            return WaitStatus(
+                Outcome.PARTIAL,
+                f"{label} visible CI checks passed, rollup incomplete",
+                data=data,
+            )
         return WaitStatus(Outcome.DONE, f"{label} CI checks passed", data=data)
+    if verdict == "none" and not rollup.complete:
+        # Empty, but only the part that was readable. Terminal for the same
+        # #2939 reason as a complete empty rollup — a mode="signal" watch on
+        # an unobservable gate would never fire — but the caveat must not
+        # make the claim the complete case makes. "Nothing ran" and "nothing
+        # I could see ran" differ by exactly the blind spot.
+        data["caveat"] = (
+            f"nothing ran in the part of {label}'s rollup this poll could "
+            f"read, and {rollup.caveat()} — this is NOT evidence that no "
+            f"checks ran"
+        )
+        return WaitStatus(
+            Outcome.PARTIAL,
+            f"{label} open, no checks visible (rollup incomplete)",
+            data=data,
+        )
     if verdict == "none":
         # Read the rollup and it is empty: no CI is configured for this head
         # SHA, or no workflow matched its paths. Terminal — there is nothing
@@ -278,6 +254,28 @@ def classify_ci_state(
     )
 
 
+class _UnderscopedToken(Exception):
+    """The credential can read the PR but no check evidence whatsoever.
+
+    Distinct from a transient auth blip on purpose. This module's contract is
+    that every observed state must be either terminal or provably
+    still-progressing (#2939), and an under-scoped token is neither: nothing
+    is progressing, and nothing will change until a human edits the token's
+    permissions. Reported as ordinary PENDING it is indistinguishable from a
+    gate that is merely slow — which is how a wait sat blind for 920 seconds
+    on 2026-09-07 while ``gh`` read the same check runs without trouble.
+
+    Narrower than it once was, twice over. A refused Checks API alone no
+    longer reaches here: :func:`fetch_check_rollup` falls back to the Actions
+    API and the wait proceeds on a caveated rollup. And it is a **403** only —
+    a permission this credential lacks. A 401 means the credential itself is
+    finished, which is a different remedy and stays on the plain
+    ``blocked="auth"`` path. What is left is a valid token refused by an
+    endpoint it cannot route around: no verdict to caveat, only a permission
+    to grant.
+    """
+
+
 class CIWaitable:
     """Polls a GitHub PR's merge/CI-check state by ``owner/repo#<number>``."""
 
@@ -306,9 +304,13 @@ class CIWaitable:
 
     async def _fetch(
         self, repo: str, number: int, token: str
-    ) -> Tuple[Dict[str, Any], Any, Any]:
-        """Fetch the PR payload + head-commit checks. Split out for tests."""
-        from kestrel_sovereign.signals.sources.github_pr_watch import _github_get
+    ) -> Tuple[Dict[str, Any], CheckRollup]:
+        """Fetch the PR payload + head-commit check rollup. Split out for tests."""
+        from kestrel_sovereign.signals.sources.github_pr_watch import (
+            PRWatchAuthError,
+            _github_get,
+            fetch_check_rollup,
+        )
 
         base = f"https://api.github.com/repos/{repo}"
         ref = f"{repo}#{number}"
@@ -324,18 +326,42 @@ class CIWaitable:
             )
         head = pr_raw.get("head")
         head_sha = head.get("sha") if isinstance(head, dict) else None
-        check_runs: Any = None
-        combined_status: Any = None
+        # No head SHA (nothing to roll up) reads as an unread rollup, which
+        # ``classify_ci_state`` keeps PENDING rather than settling.
+        rollup = CheckRollup()
         if head_sha:
-            check_runs = await _github_get(
-                f"{base}/commits/{head_sha}/check-runs",
-                token=token, timeout=10, ref=f"{ref} check-runs",
-            )
-            combined_status = await _github_get(
-                f"{base}/commits/{head_sha}/status",
-                token=token, timeout=10, ref=f"{ref} status",
-            )
-        return pr_raw, check_runs, combined_status
+            # Reaching here means the PR read SUCCEEDED with this token, so a
+            # surviving auth error from the rollup is a credential that cannot
+            # see CI rather than one GitHub rejects outright.
+            # ``fetch_check_rollup`` degrades the Checks read on its own; what
+            # reaches this handler is a gate class it could not route around.
+            # ``_UnderscopedToken`` carries that up to ``poll``, which cannot
+            # otherwise tell it from a blip.
+            try:
+                rollup = await fetch_check_rollup(
+                    base, head_sha, token=token, timeout=10, ref=ref
+                )
+            except PRWatchAuthError as exc:
+                if exc.status_code != 403:
+                    # A 401 is the credential itself — expired or revoked
+                    # between the PR read and this one — not an endpoint
+                    # refusing a valid token. It belongs on the plain
+                    # ``blocked="auth"`` path: wrapping it here would tell an
+                    # operator to grant repository permissions when what they
+                    # need is a new credential, and a remedy that cannot work
+                    # is its own way of being stuck.
+                    raise
+                raise _UnderscopedToken(
+                    f"{ref}: the PR read succeeded but a check endpoint "
+                    f"returned an authorization error ({exc}). The token "
+                    f"cannot see CI; this will not resolve on its own. Grant "
+                    f"it 'Actions' and 'Commit statuses' read. Note that "
+                    f"'Checks' is a GitHub App permission with no fine-grained "
+                    f"PAT equivalent, so /commits/{{sha}}/check-runs is "
+                    f"readable only by a classic token with 'repo' or by a "
+                    f"GitHub App."
+                ) from exc
+        return pr_raw, rollup
 
     async def poll(self, handle: str) -> WaitStatus:
         from kestrel_sovereign.signals.sources.github_pr_watch import (
@@ -368,8 +394,21 @@ class CIWaitable:
             )
 
         try:
-            pr_raw, check_runs, combined_status = await self._fetch(
-                repo, number, token
+            pr_raw, rollup = await self._fetch(repo, number, token)
+        except _UnderscopedToken as exc:
+            # Still not terminal — a human can widen the token and the watch
+            # should then complete — but it must never read as progress.
+            # ``blocked="permission"`` is the flag a caller can act on;
+            # ``"auth"`` below is the one it should keep waiting through.
+            return WaitStatus(
+                Outcome.PENDING,
+                f"{repo}#{number}: CI GATE BLIND — {exc}",
+                data={
+                    "repo": repo,
+                    "number": number,
+                    "blocked": "permission",
+                    "actionable": True,
+                },
             )
         except (PRWatchAuthError, PRWatchNetworkError) as exc:
             # Auth/network blip is transient — stay pending, never a false
@@ -389,8 +428,10 @@ class CIWaitable:
 
         return classify_ci_state(
             pr_raw,
-            check_runs=check_runs,
-            combined_status=combined_status,
+            check_runs=rollup.check_runs,
+            combined_status=rollup.combined_status,
+            checks_source=rollup.source,
+            unreadable=rollup.unreadable,
             repo=repo,
             number=number,
         )

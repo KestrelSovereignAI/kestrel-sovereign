@@ -107,6 +107,16 @@ jobs:
   # `name:` that differs) makes the old required check never report and blocks
   # every PR until branch protection is edited by hand. Not worth a better
   # label. Four `needs:` references and publish.yml also key on this id.
+  # #2683 re-audited this before touching the name: the repository ruleset
+  # carries no status-check rule, and classic branch protection is not
+  # readable with a repo-scoped token, so absence of a requirement cannot be
+  # proven from here. The id therefore stays; the step names below say what
+  # each check actually validates.
+  #
+  # This job is deliberately NOT a repository-wide ruff/mypy gate. Broad
+  # lint and type enforcement is staged under the structural quality campaign
+  # (#2480), which adds narrow gates as each noisy baseline is paid down. Do
+  # not add an always-red tree-wide lint or type step here.
   lint-and-imports:
     runs-on: ubuntu-latest
     permissions:
@@ -333,6 +343,25 @@ jobs:
     permissions:
       contents: read
     needs: lint-and-imports
+    # The unit tier's dual-backend tests run their PostgreSQL case only when
+    # TEST_POSTGRES_URL is set. Without this service all of them skipped and
+    # the tier still reported green: 137 cases, including every PostgreSQL
+    # path #2527's crash lived on (#3381). Same image and major as the
+    # integration tier below, for the same #2958 floor.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: kestrel_user
+          POSTGRES_PASSWORD: kestrel_password
+          POSTGRES_DB: kestrel
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -353,16 +382,23 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
 
       - name: Install dependencies
         run: uv sync
+
+      # jsdom (a devDependency) is required by tests/frontend. The lockfile's
+      # `file:../kestrel-flight` entry is a symlink npm tolerates when the
+      # sibling checkout is absent; no frontend test imports it.
+      - name: Install JavaScript dependencies
+        run: npm ci --no-audit --no-fund
 
       - name: Run unit tests
         # ``-n auto`` parallelizes across runner cores via pytest-xdist
         # (already a dev dep). Note that ``auto`` resolves to **2 workers**
         # on the standard GitHub-hosted runner, not the 16 an earlier
-        # revision of this comment assumed — 12.4k tests take ~5 min across
-        # five observed runs (one outlier at 8). Runner sizing is tracked in
+        # revision of this comment assumed. Runner sizing is tracked in
         # #2795. The PYTHONHASHSEED env at the workflow level keeps
         # parametrize ordering deterministic across workers.
         #
@@ -377,28 +413,68 @@ jobs:
         # TestIndexUsage::test_agent_status_query_uses_index. The only tests
         # that fail are the by-name existence checks in TestJsonPathIndexes.
         # See #2798. The integration tier does exclude benchmarks; below.
-        run: uv run pytest tests/unit/ -n auto -v --tb=short -x --timeout=60
-        # 10 was too tight and started killing PASSING runs. The tier was
-        # measured at 7:43 on the 2-core runner (#2795) and has since grown —
-        # #2465, #2890 and #2902 added ~1.2k lines of tests in one week. The
-        # median push still lands at 5.6-6.7 min, but the distribution now
-        # crosses 10 and which side you land on is runner luck: 0.51.0's
-        # release PR timed out twice on a tree whose `main` push had passed in
-        # 6.4 min, stalling at 97% and then 88% — different points, so not a
-        # hung test.
+        # No -x. Under -n auto this suite has a tail of load-sensitive tests
+        # (#3276): repeated runs on ONE unchanged commit fail a different 1-3
+        # each time, all passing serially. With -x the run stopped at whichever
+        # test lost the race, so the reported failure was rarely the real
+        # problem and a genuine regression could hide behind a flake that
+        # tripped first. --maxfail bounds a truly broken tree without hiding
+        # the set. Reading a red run now means reading every failure, which is
+        # what tells you flake from regression.
+        run: uv run pytest tests/unit/ -n auto -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100
+        # Budgeted the way the integration tier below is (#3212), because the
+        # unit tier hit the same wall for the same reason (#3330). 10 min was
+        # too tight, then 20 was: at 44e77ec5 the push run passed the step in
+        # 12.4 min while the pull_request run of the IDENTICAL tree was killed
+        # at 20:00 with 72% done. Its progress was uniformly slow, not stalled
+        # — 2.3x the push run at the same percentage (19.2 vs 8.4 min to 72%),
+        # and 3.7x that PR run's own rerun, which passed in 8.3. That is runner
+        # speed, not event type: across 51 successful steps the push and
+        # pull_request medians are both 11.3 min (max 13.8).
         #
-        # This does not mask a hang. Per-test `--timeout=60` above is what
-        # catches those; the job wall clock only decides how much passing work
-        # gets thrown away. Runner sizing — the real fix — stays in #2795.
-        timeout-minutes: 20
+        # The runner's kill is the failure worth removing. pytest writes
+        # tracebacks and the short summary only in its epilogue, so a killed
+        # step names FAILED tests and says nothing about why — #3330's
+        # 27k-line log had no traceback at all. `--session-timeout` makes
+        # pytest stop itself first: under xdist the worker that crosses it
+        # stops, the controller shuts the others down after their current
+        # test, and the FAILURES section and summary still print.
+        #
+        # Sizing: the slowest pass observed (13.8) on the slowest runner
+        # observed (2.3x) is 31.7 min; the 35 min session deadline clears it.
+        # The deadline is checked BETWEEN tests, so a run can overshoot it by
+        # up to the longest per-test ceiling — 300s, from the unit tier's
+        # `timeout(300)` markers, which tests/unit/conftest.py now refuses to
+        # exceed. 35 + 5, plus teardown, is why the runner backstop is 45.
+        #
+        # This does not mask a hang. Per-test `--timeout=60` catches those in
+        # a minute; the wall clock only decides how much passing work is
+        # thrown away. Runner sizing — the real fix — stays in #2795.
+        #
+        # budget-basis(unit): slowest-pass=13.8 worst-runner-ratio=2.3 samples=51 longest-test=300
+        timeout-minutes: 45
         env:
           KESTREL_AUDIT_MODE: skip
+          # TEST_POSTGRES_URL, not DATABASE_URL: it is the one variable every
+          # dual-backend fixture reads, and it is read only by tests, so it
+          # cannot move code under test onto PostgreSQL behind its back.
+          # Each xdist worker rewrites it to a schema of its own, so workers
+          # booting the core schema at once cannot race in the catalogs
+          # (#3383, tests/shared/postgres_worker_isolation.py).
+          TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+          # Fail, not skip: a PostgreSQL case that skips here is a failure,
+          # and a missing URL stops the session before collection. See
+          # tests/shared/postgres_requirement.py.
+          KESTREL_REQUIRE_POSTGRES_TESTS: "1"
 
       - name: Run voice playback JavaScript tests
         run: >-
           node --test
           tests/js/test_voice_playback.mjs
           tests/js/test_voice_playback_worklet.mjs
+
+      - name: Run frontend JavaScript tests
+        run: npm run test:js
 
   # Fail-fast across the parallel tiers.
   #
@@ -619,33 +695,58 @@ jobs:
         # thresholds are the least trustworthy thing to assert on a shared
         # runner. It still runs weekly via weekly-analysis.yml, which
         # invokes run_tests.py with no marker filter.
-        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 -m "not docker_mcp and not cloud_resource and not bench"
-        # 20 was too tight, for the same reason 10 was too tight on the unit
-        # tier above: it started killing PASSING runs. This tier is far closer
-        # to its ceiling than that one ever was. Over the last 17 successful
-        # runs it took 14.3-16.4 min (median 15.9) against a 20 min budget —
-        # ~80% utilization, i.e. ~4 min of headroom. Unit sits at ~6 min
-        # against 20.
+        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 --session-timeout=2700 -m "not docker_mcp and not cloud_resource and not bench"
+        # 20 was too tight, then 30 was too tight, each for the same reason
+        # 10 was too tight on the unit tier above: they started killing
+        # PASSING runs. #3212 is the third instance, and the repetition is
+        # the point — each budget was sized to the worst runner ratio seen
+        # SO FAR, which guarantees the next worse one re-teaches the lesson
+        # by discarding a green suite.
         #
-        # A runner ~1.3x slower than median is therefore enough to discard a
-        # green suite, and one turned up: #3099's push stalled at 91% on the
-        # wall clock. It was measured against the immediately preceding run on
-        # the same tree — median per-test ratio 1.32 across the 256 tests
-        # common to both. The tell that it was the machine and not the code:
-        # the wall-clock-bound tests were untouched (53.1s -> 55.9s, 33.3s ->
-        # 33.4s, 10.3s -> 10.2s) while CPU-bound ones moved as a block. A
-        # regression does not spare sleeps and inflate everything else.
+        # What a slow runner costs, measured on ONE tree rather than
+        # inferred (PR #3208, run 33843748702): attempt 1 was killed at
+        # exactly 30:00 with every test already passed — pytest printed
+        # `1472 passed ... in 1789.82s (0:29:49)` and the step died 11s
+        # later. The rerun of the same commit finished the step in 16:11.
+        # That is a 1.85x runner-speed swing on identical code, and the
+        # 30 min budget was 1.81x the median: the ceiling sat BELOW the
+        # variance already demonstrated.
         #
-        # 30 absorbs ~1.9x on the median and ~1.55x on the slowest observed
-        # pass, which brackets the 1.32 actually seen.
+        # The distribution is not the problem; the suite has not drifted.
+        # Across the last 19 successful runs the step took 15.7-20.6 min,
+        # median 16.5, p90 17.5 — tight. So the budget is sized against
+        # runner speed, not growth: the slowest pass ever observed (20.6),
+        # on the slowest runner ever observed (1.85x), is 38.1 min. The
+        # `--session-timeout=2700` above (45 min) clears that by ~18%, and
+        # `budget-basis(integration)` below states those inputs where a test
+        # can check them — because the previous version of this comment made
+        # the same argument in prose and was falsified without anything
+        # noticing.
         #
-        # This does not mask a hang, and the ceiling is not a cost. Per-test
-        # `--timeout=120` catches a stuck test in 2 min, and `-x` exits on the
-        # first real failure; a healthy run still finishes and exits at ~16
-        # min. The wall clock only decides how much passing work gets thrown
-        # away. Parallelizing this tier (#2794) is the fix that would actually
+        # Two numbers, and the order between them is the point. pytest owns
+        # the deadline, the runner owns the backstop: when a run really is
+        # too slow, `--session-timeout` stops it and prints
+        # `session-timeout: 2700.0 sec exceeded` with exit 1, which is a
+        # greppable failure. The runner's own kill prints
+        # `##[error]The action ... has timed out` with no `FAILED tests/`
+        # line anywhere, which is why #3212's red read as a test failure
+        # until someone tailed the log.
+        #
+        # 50 rather than 46 because the session deadline is checked BETWEEN
+        # tests, not during one: a run that crosses it inside a test keeps
+        # going until that test ends, up to the per-test `--timeout=120`.
+        # So the runner budget has to clear 45 + 2, and 50 leaves 3 min for
+        # teardown and reporting on top.
+        #
+        # This does not mask a hang. Per-test `--timeout=120` catches a
+        # stuck test in 2 min, and `-x` exits on the first real failure; a
+        # healthy run still finishes and exits at ~16 min. The wall clock
+        # only decides how much passing work gets thrown away.
+        # Parallelizing this tier (#2794) is the fix that would actually
         # lower the number; runner sizing is #2795.
-        timeout-minutes: 30
+        #
+        # budget-basis(integration): slowest-pass=20.6 worst-runner-ratio=1.85 samples=19 longest-test=180
+        timeout-minutes: 50
         env:
           KESTREL_AUDIT_MODE: skip
           KESTREL_SKIP_REACHABILITY_PROBE: "1"

@@ -118,8 +118,9 @@
  * signature below is the design intent: return an element the component appends
  * inside the card shell it owns).
  *
- * Default (omitted) = the CONSOLE ROW style (status dot + name + description +
- * stop button), matching today's `.agent-item` markup in identity.js. Frinz
+ * Default (omitted) = the CONSOLE ROW style (status dot + name + description),
+ * matching today's `.agent-item` markup in identity.js. The shared component,
+ * not this replaceable body renderer, owns the Stop control. Frinz
  * supplies a PORTRAIT-CARD renderer: large portrait, name below, and an actions
  * area under the portrait. The shared list layout BUDGETS for an actions row by
  * default (design question 2) so buttons under a portrait have real vertical
@@ -147,6 +148,12 @@
  * @property {AgentCardRenderer} [renderCard]
  *           - per-card body renderer (design question 2 + clarification).
  *             Omitted ⇒ console row style.
+ * @property {(name: string) => boolean} [isThinking]
+ *           - reports whether a card has live work; gates the shared Stop
+ *             affordance for default and custom renderers alike.
+ * @property {(name: string) => Promise<Object>} [onStop]
+ *           - invokes the host's typed cooperative Stop seam for the exact
+ *             routing name. The component renders its typed outcome.
  * @property {(item: AgentListItem, meta: { standalone: boolean }) => void} [onSelect]
  *           - fired when a card is chosen. The component ALWAYS drives the
  *             shared host-agent selection path first (`API.setHostAgent(name)`
@@ -220,6 +227,7 @@
  *   onToggle?: (collapsed: boolean) => void,
  *   onNew?: () => (void | Promise<void>),
  *   newLabel?: string,
+ *   onPrepareStopAll: (items: AgentListItem[]) => ((response: Object|null, error: Error|null, correlationId: string) => void),
  * }} AgentListPaneConfig
  */
 

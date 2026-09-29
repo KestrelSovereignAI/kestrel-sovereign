@@ -9,6 +9,7 @@ import pytest
 from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.command_policy import (
+    AGENT_RUNTIME_MUTATION_COMMANDS,
     HOST_ADMIN_COMMANDS,
     RECOVERY_COMMAND_POLICY,
     RECOVERY_COMMANDS,
@@ -209,7 +210,17 @@ def test_recovery_policy_is_complete_immutable_and_authority_derived():
         }
     )
     assert SOVEREIGN_COMMANDS == frozenset(
-        {"!safe-mode", "!reanchor-constitution", "!create-agent"}
+        {
+            "!safe-mode",
+            "!reanchor-constitution",
+            "!create-agent",
+            # #3234: the external features package's management commands are
+            # per-agent runtime mutations (and an interpreter install) typed
+            # through an agent-invoke door; same authority as the HTTP routes.
+            "!feature-add",
+            "!feature-remove",
+            "!feature-configure",
+        }
     )
     assert RECOVERY_SOVEREIGN_COMMANDS == frozenset(
         command
@@ -217,8 +228,13 @@ def test_recovery_policy_is_complete_immutable_and_authority_derived():
         if rule.requires_sovereign
     )
     assert HOST_ADMIN_COMMANDS == frozenset({"!create-agent"})
+    assert AGENT_RUNTIME_MUTATION_COMMANDS == frozenset(
+        {"!feature-add", "!feature-remove", "!feature-configure"}
+    )
     assert SOVEREIGN_COMMANDS == (
-        RECOVERY_SOVEREIGN_COMMANDS | HOST_ADMIN_COMMANDS
+        RECOVERY_SOVEREIGN_COMMANDS
+        | HOST_ADMIN_COMMANDS
+        | AGENT_RUNTIME_MUTATION_COMMANDS
     )
     with pytest.raises(TypeError):
         RECOVERY_COMMAND_POLICY["!status"] = True

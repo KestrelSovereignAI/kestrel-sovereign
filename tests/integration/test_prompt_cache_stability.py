@@ -84,12 +84,18 @@ def _make_cm_with_retrieval(memories: str, rag: str) -> ContextManager:
 
     cm.context_builder = MagicMock()
     # Build a system prompt the same way ContextBuilder does for a stable
-    # constitution+briefing; content is immaterial beyond being stable.
-    cm.context_builder.build_system_prompt = MagicMock(
+    # constitution+briefing; content is immaterial beyond being stable. The
+    # subsection result is part of the production seam so ContextManager can
+    # attribute exact prefix deltas without reconstructing the prompt.
+    stable_system_prompt = (
+        "--- GOVERNING CONSTITUTION ---\n"
+        "This is the Kestrel Constitution.\n"
+        "--- END CONSTITUTION ---"
+    )
+    cm.context_builder.build_system_prompt_with_subsections = MagicMock(
         return_value=(
-            "--- GOVERNING CONSTITUTION ---\n"
-            "This is the Kestrel Constitution.\n"
-            "--- END CONSTITUTION ---"
+            stable_system_prompt,
+            [("constitution", stable_system_prompt)],
         )
     )
     cm.context_builder.retrieve_context = AsyncMock(return_value=rag)

@@ -23,6 +23,49 @@ MULTI_AGENT_CONFIG="${KESTREL_MULTI_AGENT_CONFIG:-/app/multi_agent.toml}"
 AGENT_DATA_DIR="${KESTREL_AGENT_DATA_DIR:-/app/agent_data}"
 PERSISTENCE_MODE="${KESTREL_DEPLOYMENT_PERSISTENCE:-}"
 
+# Compare canonical paths below. A supported relative KESTREL_HOST_DB_PATH
+# otherwise cannot match the absolute agent-directory glob, and a restart can
+# mistake the persistent host-control directory for a new agent. Python is
+# already the image-owned runtime used by this entrypoint and resolves missing
+# leaf paths without creating them.
+canonicalize_path() {
+    /app/.venv/bin/python - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).expanduser().resolve(strict=False))
+PY
+}
+paths_overlap() {
+    /app/.venv/bin/python - "$1" "$2" <<'PY'
+from pathlib import Path
+import sys
+
+from kestrel_sovereign.security.path_identity import (
+    paths_overlap_by_filesystem_identity,
+)
+
+raise SystemExit(
+    0
+    if paths_overlap_by_filesystem_identity(Path(sys.argv[1]), Path(sys.argv[2]))
+    else 1
+)
+PY
+}
+AGENT_DATA_DIR="$(canonicalize_path "$AGENT_DATA_DIR")"
+if [ -n "${KESTREL_HOST_DB_PATH:-}" ]; then
+    # An operator-selected path owns its migration policy. Never let an
+    # inherited internal marker make that explicit override look derived.
+    unset KESTREL_DERIVED_HOST_DB_PATH
+else
+    export KESTREL_HOST_DB_PATH="$AGENT_DATA_DIR/host-data/host-features.db"
+    # The entrypoint selected this from the persistent data-root default.
+    # Preserve implicit upgrade migration from the previous host-data path.
+    export KESTREL_DERIVED_HOST_DB_PATH="$KESTREL_HOST_DB_PATH"
+fi
+HOST_CONTROL_DIR="$(dirname -- "$KESTREL_HOST_DB_PATH")"
+HOST_CONTROL_DIR="$(canonicalize_path "$HOST_CONTROL_DIR")"
+
 if [ "$PERSISTENCE_MODE" = "durable_sovereign" ]; then
     echo "FATAL: durable multi-agent Cloud Run needs one custody bundle and database binding per agent; refusing local inception." >&2
     exit 1
@@ -43,7 +86,11 @@ if [ -n "${KESTREL_AGENTS:-}" ]; then
     IFS=',' read -ra AGENTS <<< "$KESTREL_AGENTS"
     for agent in "${AGENTS[@]}"; do
         agent=$(echo "$agent" | xargs)  # trim whitespace
-        agent_dir="$AGENT_DATA_DIR/$agent"
+        agent_dir="$(canonicalize_path "$AGENT_DATA_DIR/$agent")"
+        if paths_overlap "$HOST_CONTROL_DIR" "$agent_dir"; then
+            echo "FATAL: requested agent '$agent' collides with host control path $HOST_CONTROL_DIR; choose another agent name or set KESTREL_HOST_DB_PATH outside that agent directory." >&2
+            exit 1
+        fi
         if [ ! -d "$agent_dir" ]; then
             echo "  Creating agent directory: $agent_dir"
             mkdir -p "$agent_dir"
@@ -77,6 +124,17 @@ fi
 # Bootstrap identity and initialize DB for each agent data dir
 for dir in "$AGENT_DATA_DIR"/*/; do
     [ -d "$dir" ] || continue
+    resolved_dir="$(canonicalize_path "$dir")"
+    # The Hold database lives on the persistent agent-data volume, but its
+    # directory is host infrastructure. A restart must not mint an identity or
+    # an agent database inside it.
+    if paths_overlap "$HOST_CONTROL_DIR" "$resolved_dir"; then
+        if [ -f "$dir/kestrel_prime.db" ]; then
+            echo "FATAL: host control path $HOST_CONTROL_DIR collides with existing agent directory $dir; move that agent or set KESTREL_HOST_DB_PATH outside agent_data before restarting." >&2
+            exit 1
+        fi
+        continue
+    fi
     agent_name=$(basename "$dir")
 
     # Bootstrap identity if missing
@@ -126,6 +184,7 @@ PY
         unset KESTREL_BOOTSTRAP_DB_PATH
     fi
 done
+unset -f canonicalize_path paths_overlap
 
 echo "Starting Kestrel MultiAgent Host on port $PORT..."
 # Consolidated onto server:app in multi-agent mode (#2382). The legacy

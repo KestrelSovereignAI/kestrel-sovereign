@@ -18,7 +18,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -28,9 +28,14 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.auth import CallerContext, caller_context_scope
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.restart_coordinator import (
     RestartCoordinatorFeature,
+)
+from kestrel_sovereign.features.restart_coordinator.authority import (
+    issue_restart_delegation_revocation,
+    verify_restart_authority,
 )
 from kestrel_sovereign.features.restart_coordinator.event_store import (
     list_events_for_request,
@@ -39,15 +44,20 @@ from kestrel_sovereign.features.restart_coordinator.feature import (
     _MAX_NAMED_BUSY_KINDS,
     MAX_IDLE_ONLY_DEFERRAL_SECONDS,
     _describe_background_tasks,
+    _is_infra_background_task,
 )
 from kestrel_sovereign.features.restart_coordinator.store import (
+    claim_request_for_execution,
     clear_deferral_started,
     ensure_restart_requests_table,
     get_request,
     insert_request,
     list_requests,
+    mark_deferral_started,
     record_update_log,
+    resolve_restart_delegation,
     update_status,
+    verify_restart_authority_at_use,
 )
 from kestrel_sovereign.features.restart_coordinator.update_profiles import (
     get_update_profile,
@@ -138,7 +148,7 @@ def _track_test_database(db: AsyncDatabase) -> AsyncDatabase:
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _close_test_owned_resources():
+async def _close_test_owned_resources(monkeypatch):
     """Model production ownership: stop wakes before closing their database.
 
     ``SignalDispatcher`` owns the dispatch task through the agent and the
@@ -149,21 +159,28 @@ async def _close_test_owned_resources():
     """
     _test_databases.clear()
     _real_dispatch_lifecycles.clear()
-    try:
-        yield
-    finally:
-        for feature, agent in reversed(_real_dispatch_lifecycles):
-            await feature.shutdown()
-            await agent.shutdown()
+    monkeypatch.setenv("KESTREL_API_KEY", "restart-authority-test-key")
+    with caller_context_scope(
+        CallerContext.sovereign(
+            identity="test-sovereign",
+            credential="restart-authority-test-key",
+        )
+    ):
+        try:
+            yield
+        finally:
+            for feature, agent in reversed(_real_dispatch_lifecycles):
+                await feature.shutdown()
+                await agent.shutdown()
 
-        for database, connection in reversed(_test_databases):
-            await database.close()
-            assert not _sqlite_worker_is_alive(connection), (
-                "test-owned aiosqlite worker survived database shutdown"
-            )
+            for database, connection in reversed(_test_databases):
+                await database.close()
+                assert not _sqlite_worker_is_alive(connection), (
+                    "test-owned aiosqlite worker survived database shutdown"
+                )
 
-        _test_databases.clear()
-        _real_dispatch_lifecycles.clear()
+            _test_databases.clear()
+            _real_dispatch_lifecycles.clear()
 
 
 async def _backend(tmp_path):
@@ -438,7 +455,15 @@ async def test_fleet_idle_excludes_only_requesters_own_marker(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_fleet_blocker_does_not_disclose_sibling_task_names(tmp_path):
+async def test_fleet_blocker_names_sibling_task_kind_and_age_not_its_tail(tmp_path):
+    """#3347: a sibling's blocking tasks are named by KIND with their age.
+
+    "busy (background task(s) in flight)" alone let one agent's permanent
+    task hold every host restart off for two months with nobody able to see
+    what it was. The per-instance tail — where a name carries a peer
+    counterparty, a signal id or a DID — is still withheld from a different
+    tenant's event stream.
+    """
     feat, _ = await _make_feature(tmp_path)
     requester = feat.agent
     sibling = _idle_sibling("did:test:sibling", busy=False)
@@ -448,22 +473,51 @@ async def test_fleet_blocker_does_not_disclose_sibling_task_names(tmp_path):
         await blocked.wait()
 
     task = asyncio.create_task(
-        private_counterparty_sync(), name="private-counterparty-sync"
+        private_counterparty_sync(),
+        name="a2a_question_answered_retry:PrivateCounterparty:task-secret",
     )
+    task._kestrel_started_at = time.monotonic() - 2 * 3600
     sibling._background_tasks = {task}
     requester._cohosted_agents_provider = lambda: [requester, sibling]
     try:
         state = feat._fleet_idle(ignore_request_id="")
         assert state["idle"] is False
-        assert state["blocker"]["count"] is None
-        assert state["blocker"]["summary"] is None
-        assert state["blocker"]["oldest_age_seconds"] is None
-        assert "private-counterparty-sync" not in state["reason"]
-        assert "1 background task" not in state["reason"]
+        assert state["blocker"]["scope"] == "cohosted_agent"
+        assert state["blocker"]["count"] == 1
+        assert state["blocker"]["summary"] == "a2a_question_answered_retry (2h)"
+        assert state["blocker"]["oldest_age_seconds"] >= 2 * 3600
+        assert state["reason"] == (
+            "co-hosted agent did:test:sibling busy (1 background task(s) in "
+            "flight: a2a_question_answered_retry (2h))"
+        )
+        assert "PrivateCounterparty" not in state["reason"]
+        assert "task-secret" not in state["reason"]
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+async def test_fleet_blocker_labels_a_sibling_by_display_name_and_did(tmp_path):
+    """A real ``KestrelAgent`` has no ``name`` attribute — its display name is
+    ``agent_name`` — so the live reason rendered a bare DID (#3347)."""
+    feat, _ = await _make_feature(tmp_path)
+    requester = feat.agent
+    sibling = SimpleNamespace(
+        did="did:test:meridian",
+        agent_name="Meridian",
+        dispatcher=SimpleNamespace(),
+        _active_request_ids={"r-active"},
+        _background_tasks=set(),
+    )
+    requester._cohosted_agents_provider = lambda: [requester, sibling]
+
+    state = feat._fleet_idle(ignore_request_id="")
+
+    assert state["reason"].startswith(
+        "co-hosted agent Meridian (did:test:meridian) busy ("
+    )
 
 
 @pytest.mark.asyncio
@@ -543,6 +597,33 @@ async def test_update_status_gated_on_expected_current(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_update_status_gated_on_exact_authority_signature(tmp_path):
+    backend = await _backend(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="a", reason="signed transition",
+    )
+
+    stale = await update_status(
+        backend,
+        req.id,
+        status="executing",
+        expected_current_status="pending",
+        expected_authority_signature="0" * 64,
+    )
+    assert stale is False
+    assert (await get_request(backend, req.id)).status == "pending"
+
+    current = await update_status(
+        backend,
+        req.id,
+        status="executing",
+        expected_current_status="pending",
+        expected_authority_signature=req.authority_signature,
+    )
+    assert current is True
+
+
+@pytest.mark.asyncio
 async def test_list_requests_filters_by_status_and_agent(tmp_path):
     backend = await _backend(tmp_path)
     await insert_request(backend, requested_by_agent="a", reason="r1")
@@ -576,6 +657,680 @@ async def test_request_restart_creates_pending_row(tmp_path):
     # Persisted to the table.
     rows = await list_requests(backend)
     assert any(r.id == req["id"] for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_request_beyond_agent_bounds_requires_sovereign_caller(tmp_path):
+    """#3339: with no sovereign caller only the agent-requestable bounds file.
+
+    Before #3339 this asserted that a plain ``restart_only`` with no sovereign
+    caller was refused; that is now the agent's own in-bounds request (see the
+    agent-request tests below). What still needs a sovereign caller or a
+    delegation is anything wider, here another repository.
+    """
+    feat, backend = await _make_feature(tmp_path)
+    elsewhere = str(tmp_path / "some-other-checkout")
+    wider = {
+        "operation": "update_then_restart",
+        "update_profile": "sovereign_local_uv_sync",
+        "target_ref": "main",
+        "repo_path": elsewhere,
+    }
+
+    with caller_context_scope(None):
+        absent = await feat.request_restart(
+            reason="agent decided autonomously", **wider,
+        )
+    with caller_context_scope(CallerContext.authenticated("oauth@example.test")):
+        oauth = await feat.request_restart(
+            reason="generic authenticated user", **wider,
+        )
+
+    for refused in (absent, oauth):
+        assert refused.status is ToolResultStatus.ERROR
+        assert refused.data["created"] is False
+        assert refused.data["authority"] == "required"
+        assert refused.data["exceeded_bound"] == "repo_path"
+        assert "sovereign-key caller" in refused.error
+        assert "delegation" in refused.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_request_restart_persists_exact_nonpublic_sovereign_evidence(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+
+    result = await feat.request_restart(reason="authorized host restart")
+    row = await get_request(backend, result.data["request"]["id"])
+
+    assert verify_restart_authority(row) == (
+        True,
+        "verified sovereign-key authority",
+    )
+    assert row.authority_evidence
+    assert row.authority_signature
+    assert "authority_signature" not in row.to_public_dict()
+
+
+@pytest.mark.asyncio
+async def test_request_restart_fails_without_stable_sovereign_key(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    result = await feat.request_restart(reason="cannot seal this")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "no stable sovereign key" in result.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_request_restart_rejects_server_generated_temporary_key(
+    tmp_path, monkeypatch,
+):
+    """Local bootstrap access is not durable whole-host authority."""
+
+    from kestrel_sovereign.server import get_api_key
+
+    feat, backend = await _make_feature(tmp_path)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+    with patch("kestrel_sovereign.server.secrets.token_urlsafe") as generate:
+        generate.return_value = "process-only-bootstrap-key"
+        assert get_api_key() == "process-only-bootstrap-key"
+
+    result = await feat.request_restart(reason="cannot survive restart")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "temporary sovereign key" in result.error
+    assert "stable KESTREL_API_KEY" in result.error
+    assert await list_requests(backend) == []
+
+
+# ---------------------------------------------------------------------------
+# Narrow sovereign-signed restart delegations (#3148)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sovereign_grants_did_bound_delegation_for_autonomous_restart(
+    tmp_path,
+):
+    feat, backend = await _make_feature(tmp_path, did="did:test:delegate")
+
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did="did:test:delegate",
+        operation="restart_only",
+        expires_in_seconds=600,
+    )
+    assert granted.status is ToolResultStatus.OK
+    delegation = granted.data["delegation"]
+    assert delegation["subject_agent_did"] == "did:test:delegate"
+    assert delegation["operation"] == "restart_only"
+    assert "authority_signature" not in delegation
+
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="delegated unattended recovery",
+            delegation_id=delegation["delegation_id"],
+        )
+
+    assert requested.status is ToolResultStatus.OK
+    row = await get_request(backend, requested.data["request"]["id"])
+    assert row.reason == "delegated unattended recovery"
+    assert json.loads(row.authority_evidence)["request"]["reason"] == (
+        "delegated unattended recovery"
+    )
+    assert await verify_restart_authority_at_use(backend, row) == (
+        True,
+        "restart request is within delegated bounds",
+    )
+    listed = await feat.list_restart_delegations()
+    assert listed.data["delegations"][0]["active"] is True
+
+
+@pytest.mark.asyncio
+async def test_nonsovereign_cannot_grant_or_revoke_restart_delegation(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+
+    with caller_context_scope(CallerContext.authenticated("auto-mode")):
+        denied_grant = await feat.grant_restart_delegation(
+            subject_agent_did=feat.agent.did,
+        )
+        denied_revoke = await feat.revoke_restart_delegation(delegation_id)
+
+    assert denied_grant.status is ToolResultStatus.ERROR
+    assert denied_revoke.status is ToolResultStatus.ERROR
+    listed = await feat.list_restart_delegations()
+    assert listed.data["delegations"][0]["active"] is True
+
+
+@pytest.mark.asyncio
+async def test_restart_delegation_cannot_cross_agent_boundary(tmp_path):
+    owner, backend = await _make_feature(tmp_path, did="did:test:owner")
+    peer = RestartCoordinatorFeature(_make_agent(backend, did="did:test:peer"))
+    await peer.initialize()
+    granted = await owner.grant_restart_delegation(
+        subject_agent_did="did:test:owner",
+    )
+
+    with caller_context_scope(None):
+        result = await peer.request_restart(
+            reason="peer tries owner mandate",
+            delegation_id=granted.data["delegation"]["delegation_id"],
+        )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "subject" in result.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_grant_rejects_subject_outside_agent_local_authority_store(tmp_path):
+    """Default SQLite grants must be usable from the database that stores them."""
+
+    owner, backend = await _make_feature(tmp_path, did="did:test:owner")
+
+    granted = await owner.grant_restart_delegation(
+        subject_agent_did="did:test:other-agent",
+    )
+
+    assert granted.status is ToolResultStatus.ERROR
+    assert "this agent" in granted.error
+    assert await backend.fetchval(
+        "SELECT COUNT(*) FROM restart_authority_delegations"
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_update_delegation_enforces_exact_operation_profile_repo_and_ref(
+    tmp_path,
+):
+    feat, backend = await _make_feature(tmp_path)
+    repo = _git_checkout(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=repo,
+        expires_in_seconds=600,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+
+    with caller_context_scope(None):
+        wrong_operation = await feat.request_restart(
+            reason="widen to restart",
+            delegation_id=delegation_id,
+        )
+        wrong_ref = await feat.request_restart(
+            reason="widen ref",
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="release",
+            repo_path=repo,
+            delegation_id=delegation_id,
+        )
+        exact = await feat.request_restart(
+            reason="exact delegated update",
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="main",
+            repo_path=repo,
+            delegation_id=delegation_id,
+        )
+
+    assert wrong_operation.status is ToolResultStatus.ERROR
+    assert wrong_ref.status is ToolResultStatus.ERROR
+    assert "delegated operation bounds" in wrong_operation.error
+    assert "delegated operation bounds" in wrong_ref.error
+    assert exact.status is ToolResultStatus.OK
+    assert len(await list_requests(backend)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["grant", "request"])
+async def test_update_repository_embedded_nul_returns_failed_tool_result(
+    tmp_path,
+    surface,
+):
+    """Malformed filesystem input is a validation error, not a tool crash."""
+
+    feat, backend = await _make_feature(tmp_path)
+    if surface == "grant":
+        result = await feat.grant_restart_delegation(
+            subject_agent_did=feat.agent.did,
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="main",
+            repo_path="bad\0checkout",
+        )
+        stored = await backend.fetchval(
+            "SELECT COUNT(*) FROM restart_authority_delegations"
+        )
+    else:
+        result = await feat.request_restart(
+            reason="reject malformed repository",
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="main",
+            repo_path="bad\0checkout",
+        )
+        stored = len(await list_requests(backend))
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "repo_path" in result.error
+    assert stored == 0
+
+
+@pytest.mark.asyncio
+async def test_delegated_update_rejects_repository_retarget_before_mutation(
+    tmp_path,
+):
+    """A signed canonical path cannot be replaced by a symlink before use."""
+
+    feat, backend = await _make_feature(tmp_path)
+    authorized = tmp_path / "authorized"
+    attacker = tmp_path / "attacker"
+    authorized.mkdir()
+    attacker.mkdir()
+    _git_checkout(authorized)
+    _git_checkout(attacker)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=str(authorized),
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="bound repository must remain bound",
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="main",
+            repo_path=str(authorized),
+            delegation_id=delegation_id,
+        )
+
+    shutil.rmtree(authorized)
+    authorized.symlink_to(attacker, target_is_directory=True)
+    feat._run_update = AsyncMock(
+        side_effect=AssertionError("retargeted repository reached update runner")
+    )
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as restart:
+        result = await feat.restart_coordinator()
+
+    row = await get_request(backend, requested.data["request"]["id"])
+    assert row.status == "rejected"
+    assert "repo_path" in row.status_reason
+    assert result.data["executed"] == []
+    feat._run_update.assert_not_awaited()
+    restart.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_expired_or_forged_delegation_fails_closed_before_filing(
+    tmp_path,
+):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+        expires_in_seconds=1,
+    )
+    delegation = granted.data["delegation"]
+    delegation_id = delegation["delegation_id"]
+    after_expiry = datetime.fromisoformat(delegation["expires_at"]) + timedelta(
+        seconds=1
+    )
+
+    with (
+        caller_context_scope(None),
+        patch(
+            "kestrel_sovereign.features.restart_coordinator.store.database_clock",
+            AsyncMock(return_value=after_expiry),
+        ),
+    ):
+        expired = await feat.request_restart(
+            reason="expired", delegation_id=delegation_id,
+        )
+    assert expired.status is ToolResultStatus.ERROR
+    assert "expired" in expired.error
+
+    await backend.execute(
+        "UPDATE restart_authority_delegations SET authority_signature = ? "
+        "WHERE delegation_id = ?",
+        ("0" * 64, delegation_id),
+    )
+    with caller_context_scope(None):
+        forged = await feat.request_restart(
+            reason="forged", delegation_id=delegation_id,
+        )
+    assert forged.status is ToolResultStatus.ERROR
+    assert "signature verification failed" in forged.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_revocation_is_durable_signed_and_blocks_new_requests(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+
+    revoked = await feat.revoke_restart_delegation(delegation_id)
+    assert revoked.status is ToolResultStatus.OK
+    assert revoked.data["revoked_by"] == "test-sovereign"
+    receipt = await backend.fetchone(
+        "SELECT revoked_by, revocation_evidence, revocation_signature FROM "
+        "restart_authority_delegation_revocations WHERE delegation_id = ?",
+        (delegation_id,),
+    )
+    assert receipt[0] == "test-sovereign"
+    assert json.loads(receipt[1])["delegation_id"] == delegation_id
+    assert len(receipt[2]) == 64
+
+    with caller_context_scope(None):
+        denied = await feat.request_restart(
+            reason="revoked", delegation_id=delegation_id,
+        )
+    assert denied.status is ToolResultStatus.ERROR
+    assert "revoked" in denied.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_delegation_revoked_during_clock_read_blocks_final_use(tmp_path):
+    """A revocation committed during resolution must precede host mutation."""
+
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    revoked_at = datetime.now(timezone.utc).isoformat()
+    evidence, signature = issue_restart_delegation_revocation(
+        delegation_id=delegation_id,
+        revoked_at=revoked_at,
+    )
+
+    async def commit_revocation_during_clock_read(db):
+        await db.execute(
+            "INSERT INTO restart_authority_delegation_revocations "
+            "(delegation_id, revoked_at, revoked_by, revocation_evidence, "
+            "revocation_signature) VALUES (?, ?, ?, ?, ?)",
+            (
+                delegation_id,
+                revoked_at,
+                "test-sovereign",
+                evidence,
+                signature,
+            ),
+        )
+        return datetime.now(timezone.utc)
+
+    with patch(
+        "kestrel_sovereign.features.restart_coordinator.store.database_clock",
+        side_effect=commit_revocation_during_clock_read,
+    ):
+        delegation, reason = await resolve_restart_delegation(
+            backend,
+            delegation_id,
+            subject_agent_did=feat.agent.did,
+            operation="restart_only",
+            update_repo_path="",
+            update_target_ref="",
+            update_profile="",
+            update_allow_migrations=False,
+        )
+
+    assert delegation is None
+    assert reason == "restart delegation was revoked"
+
+
+@pytest.mark.asyncio
+async def test_malformed_durable_revocation_fails_closed(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    await feat.revoke_restart_delegation(delegation_id)
+    await backend.execute(
+        "UPDATE restart_authority_delegation_revocations "
+        "SET revocation_signature = ? WHERE delegation_id = ?",
+        ("0" * 64, delegation_id),
+    )
+
+    with caller_context_scope(None):
+        denied = await feat.request_restart(
+            reason="tampered revocation", delegation_id=delegation_id,
+        )
+
+    assert denied.status is ToolResultStatus.ERROR
+    assert "invalid revocation receipt" in denied.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_delegation_survives_database_reconnect(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="durable delegated recovery", delegation_id=delegation_id,
+        )
+    request_id = requested.data["request"]["id"]
+    assert (await verify_restart_authority_at_use(
+        backend, await get_request(backend, request_id)
+    ))[0] is True
+
+    raw = SQLiteBackend(str(tmp_path / "restart.db"))
+    await raw.connect()
+    restarted_db = _track_test_database(AsyncDatabase(raw))
+    await ensure_restart_requests_table(restarted_db)
+    restarted = RestartCoordinatorFeature(
+        _make_agent(restarted_db, did=feat.agent.did)
+    )
+    await restarted.initialize()
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        result = await restarted.restart_coordinator()
+
+    assert spawn.call_count == 1
+    assert result.data["executed"][0]["request_id"] == request_id
+    assert (await get_request(restarted_db, request_id)).status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_executor_rechecks_delegation_revocation_after_request_filing(
+    tmp_path,
+):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="revoke before executor",
+            delegation_id=delegation_id,
+        )
+    request_id = requested.data["request"]["id"]
+    await feat.revoke_restart_delegation(delegation_id)
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "delegation was revoked" in row.status_reason
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_request_insert_rechecks_delegation_after_initial_authorization(
+    tmp_path,
+):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+
+    async def revoke_at_insert(db, **kwargs):
+        with caller_context_scope(CallerContext.sovereign(
+            identity="test-sovereign",
+            credential="restart-authority-test-key",
+        )):
+            revoked = await feat.revoke_restart_delegation(delegation_id)
+        assert revoked.status is ToolResultStatus.OK
+        return await insert_request(db, **kwargs)
+
+    with (
+        caller_context_scope(None),
+        patch(
+            "kestrel_sovereign.features.restart_coordinator.feature.insert_request",
+            side_effect=revoke_at_insert,
+        ),
+    ):
+        requested = await feat.request_restart(
+            reason="revoked between check and insert",
+            delegation_id=delegation_id,
+        )
+
+    assert requested.status is ToolResultStatus.ERROR
+    assert "delegation was revoked" in requested.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_execution_claim_rechecks_live_delegation_state(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="claim seam", delegation_id=delegation_id,
+        )
+    row = await get_request(backend, requested.data["request"]["id"])
+    await feat.revoke_restart_delegation(delegation_id)
+
+    claimed = await claim_request_for_execution(
+        backend,
+        row,
+        status="executing",
+        status_reason="must not land",
+    )
+
+    assert claimed == "invalid"
+    assert (await get_request(backend, row.id)).status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_executor_rechecks_delegation_at_final_restart_boundary(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="revoke at boundary",
+            delegation_id=delegation_id,
+        )
+    request_id = requested.data["request"]["id"]
+    original_emit = feat._emit_status_event
+
+    async def revoke_after_execution_transition(req, *, state, **kwargs):
+        await original_emit(req, state=state, **kwargs)
+        if state == "executing":
+            with caller_context_scope(CallerContext.sovereign(
+                identity="test-sovereign",
+                credential="restart-authority-test-key",
+            )):
+                revoked = await feat.revoke_restart_delegation(delegation_id)
+            assert revoked.status is ToolResultStatus.OK
+
+    feat._emit_status_event = revoke_after_execution_transition
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "delegation was revoked" in row.status_reason
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_rechecks_delegation_at_update_mutation_boundary(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    repo = _git_checkout(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=repo,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="revoke before update mutation",
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="main",
+            repo_path=repo,
+            delegation_id=delegation_id,
+        )
+    request_id = requested.data["request"]["id"]
+    original_emit = feat._emit_status_event
+
+    async def revoke_after_updating_transition(req, *, state, **kwargs):
+        await original_emit(req, state=state, **kwargs)
+        if state == "updating":
+            with caller_context_scope(CallerContext.sovereign(
+                identity="test-sovereign",
+                credential="restart-authority-test-key",
+            )):
+                revoked = await feat.revoke_restart_delegation(delegation_id)
+            assert revoked.status is ToolResultStatus.OK
+
+    feat._emit_status_event = revoke_after_updating_transition
+    with (
+        patch.object(RestartCoordinatorFeature, "_run_update") as run_update,
+        patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn,
+    ):
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "delegation was revoked" in row.status_reason
+    run_update.assert_not_called()
+    spawn.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -820,6 +1575,100 @@ async def test_agent_cannot_acknowledge_another_agents_escalation(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_sovereign_acknowledgement_seals_legacy_row_for_execution(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    await backend.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at, status, "
+        "escalation_acknowledged) VALUES (?, ?, ?, ?, 'pending', 0)",
+        (
+            "legacy-to-authorize",
+            feat.agent.did,
+            "operator adopts legacy request",
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    acknowledged = await feat.acknowledge_restart_escalation(
+        "legacy-to-authorize"
+    )
+    sealed = await get_request(backend, "legacy-to-authorize")
+
+    assert acknowledged.status is ToolResultStatus.OK
+    assert sealed.escalation_acknowledged is True
+    assert verify_restart_authority(sealed) == (
+        True,
+        "verified sovereign-key authority",
+    )
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+    assert mock_spawn.call_count == 1
+    assert result.data["executed"][0]["request_id"] == "legacy-to-authorize"
+
+
+@pytest.mark.asyncio
+async def test_acknowledgement_rolls_back_when_issuance_conflicts(tmp_path):
+    """The signed row and its independent issuance are one atomic fact."""
+
+    feat, backend = await _make_feature(tmp_path)
+    request_id = "legacy-issuance-conflict"
+    await backend.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at, status, "
+        "escalation_acknowledged) VALUES (?, ?, ?, ?, 'pending', 0)",
+        (
+            request_id,
+            feat.agent.did,
+            "conflicting issuance",
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    await backend.execute(
+        "INSERT INTO restart_authority_issuances "
+        "(request_id, lifecycle_generation, issued_at) VALUES (?, ?, ?)",
+        (request_id, "f" * 32, datetime.now(timezone.utc).isoformat()),
+    )
+
+    result = await feat.acknowledge_restart_escalation(request_id)
+    row = await get_request(backend, request_id)
+
+    assert result.status is ToolResultStatus.ERROR
+    assert row.escalation_acknowledged is False
+    assert row.authority_evidence == ""
+    assert row.authority_signature == ""
+
+
+@pytest.mark.asyncio
+async def test_nonsovereign_cannot_authorize_legacy_escalation(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    await backend.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at, status, "
+        "escalation_acknowledged) VALUES (?, ?, ?, ?, 'pending', 0)",
+        (
+            "legacy-stays-unsigned",
+            feat.agent.did,
+            "legacy request",
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    with caller_context_scope(CallerContext.authenticated("oauth@example.test")):
+        result = await feat.acknowledge_restart_escalation(
+            "legacy-stays-unsigned"
+        )
+    unchanged = await get_request(backend, "legacy-stays-unsigned")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["authority"] == "required"
+    assert unchanged.escalation_acknowledged is False
+    assert unchanged.authority_evidence == ""
+    assert unchanged.authority_signature == ""
+
+
+@pytest.mark.asyncio
 async def test_restart_request_list_is_scoped_to_requesting_agent(tmp_path):
     owner, backend = await _make_feature(tmp_path, did="did:test:owner")
     other = RestartCoordinatorFeature(_make_agent(backend, did="did:test:other"))
@@ -878,7 +1727,8 @@ async def test_executor_defers_when_agent_reports_active_request(tmp_path):
     agent._active_request_ids.add("req-1")
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
-    await feat.request_restart(reason="r")
+    created = await feat.request_restart(reason="r")
+    request_id = created.data["request"]["id"]
 
     with patch.object(
         RestartCoordinatorFeature, "_spawn_restart_subprocess",
@@ -888,6 +1738,35 @@ async def test_executor_defers_when_agent_reports_active_request(tmp_path):
     assert mock_spawn.call_count == 0
     assert len(result.data["deferred"]) == 1
     assert "busy" in result.data["deferred"][0]["reason"]
+    row = await get_request(backend, request_id)
+    assert row.first_blocked_at
+    assert verify_restart_authority(row)[0] is True
+
+
+@pytest.mark.asyncio
+async def test_executor_uses_resealed_row_after_idle_deferral_clears(tmp_path):
+    """An idle observation must dispatch the exact row resealed by the clear."""
+
+    feat, backend = await _make_feature(tmp_path)
+    feat.agent._active_request_ids.add("busy-turn")
+    created = await feat.request_restart(reason="wait for idle")
+    request_id = created.data["request"]["id"]
+
+    await feat.restart_coordinator()
+    blocked = await get_request(backend, request_id)
+    assert blocked.first_blocked_at
+
+    feat.agent._active_request_ids.clear()
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    mock_spawn.assert_called_once()
+    assert result.data["executed"][0]["request_id"] == request_id
+    row = await get_request(backend, request_id)
+    assert row.status == "executing"
+    assert row.first_blocked_at == ""
 
 
 @pytest.mark.asyncio
@@ -944,17 +1823,20 @@ async def test_escalation_event_is_not_emitted_before_lifecycle_cas(tmp_path):
         datetime.now(timezone.utc)
         - timedelta(seconds=MAX_IDLE_ONLY_DEFERRAL_SECONDS + 1)
     ).isoformat()
-    await backend.execute(
-        "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
-        (blocked_at, request_id),
+    assert await mark_deferral_started(
+        backend,
+        request_id,
+        expected_current_status="pending",
+        blocked_at=blocked_at,
     )
     captured = _attach_emit_capture(feat)
 
     async def lose_transition(*args, **kwargs):
-        return False
+        return "lost_race"
 
     with patch(
-        "kestrel_sovereign.features.restart_coordinator.feature.update_status",
+        "kestrel_sovereign.features.restart_coordinator.feature."
+        "claim_request_for_execution",
         side_effect=lose_transition,
     ), patch.object(
         RestartCoordinatorFeature, "_spawn_restart_subprocess",
@@ -975,9 +1857,11 @@ async def test_deferral_clear_cannot_reset_competing_execution_interval(tmp_path
     created = await feat.request_restart(reason="clear race")
     request_id = created.data["request"]["id"]
     blocked_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-    await backend.execute(
-        "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
-        (blocked_at, request_id),
+    assert await mark_deferral_started(
+        backend,
+        request_id,
+        expected_current_status="pending",
+        blocked_at=blocked_at,
     )
     assert await update_status(
         backend,
@@ -992,10 +1876,37 @@ async def test_deferral_clear_cannot_reset_competing_execution_interval(tmp_path
         expected_current_status="pending",
     )
 
-    assert cleared is False
+    assert cleared is None
     row = await get_request(backend, request_id)
     assert row.status == "executing"
     assert row.first_blocked_at == blocked_at
+
+
+@pytest.mark.asyncio
+async def test_deferral_clock_transitions_reseal_exact_safety_state(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="signed deferral transitions")
+    request_id = created.data["request"]["id"]
+    blocked_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+
+    marked = await mark_deferral_started(
+        backend,
+        request_id,
+        expected_current_status="pending",
+        blocked_at=blocked_at,
+    )
+    assert marked is not None
+    assert marked.first_blocked_at == blocked_at
+    assert verify_restart_authority(marked)[0] is True
+
+    cleared = await clear_deferral_started(
+        backend,
+        request_id,
+        expected_current_status="pending",
+    )
+    assert cleared is not None
+    assert cleared.first_blocked_at == ""
+    assert verify_restart_authority(cleared)[0] is True
 
 
 def _attach_lifecycle(agent):
@@ -1186,7 +2097,14 @@ async def test_executor_defers_for_unrelated_active_request(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_executor_executes_on_busy_with_timeout_policy(tmp_path):
+async def test_executor_executes_on_busy_with_timeout_policy(
+    tmp_path,
+    monkeypatch,
+):
+    from kestrel_sovereign.features.restart_coordinator import (
+        store as restart_store_module,
+    )
+
     backend = await _backend(tmp_path)
     agent = _make_agent(backend)
     agent._active_request_ids.add("req-busy")
@@ -1194,20 +2112,18 @@ async def test_executor_executes_on_busy_with_timeout_policy(tmp_path):
     await feat.initialize()
     # File a request, then back-date requested_at past the 5-min
     # timeout so the policy allows execution despite a busy agent.
+    aged = datetime.now(timezone.utc) - timedelta(seconds=600)
+    monkeypatch.setattr(
+        restart_store_module,
+        "database_clock",
+        AsyncMock(return_value=aged),
+    )
     req = await insert_request(
         backend,
         requested_by_agent=agent.did,
         reason="r",
         policy="allow_busy_after_timeout",
     )
-    aged = (
-        datetime.now(timezone.utc) - timedelta(seconds=600)
-    ).isoformat()
-    await backend.execute(
-        "UPDATE restart_requests SET requested_at = ? WHERE id = ?",
-        (aged, req.id),
-    )
-
     with patch.object(
         RestartCoordinatorFeature, "_spawn_restart_subprocess",
     ) as mock_spawn:
@@ -1221,6 +2137,778 @@ async def test_executor_executes_on_busy_with_timeout_policy(tmp_path):
         if event["request_id"] == req.id
     ]
     assert all(event["state"] != "escalated" for event in request_events)
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_unsigned_legacy_request(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    await backend.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at) VALUES (?, ?, ?, ?)",
+        ("legacy-unsigned", feat.agent.did, "old row", datetime.now(timezone.utc).isoformat()),
+    )
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, "legacy-unsigned")
+    assert row.status == "rejected"
+    assert "unsigned legacy" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_unsigned_manual_row_instead_of_deferring(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    await backend.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at, policy) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            "legacy-manual-unsigned",
+            feat.agent.did,
+            "old manual row",
+            datetime.now(timezone.utc).isoformat(),
+            "manual_only",
+        ),
+    )
+
+    await feat.restart_coordinator()
+
+    row = await get_request(backend, "legacy-manual-unsigned")
+    assert row.status == "rejected"
+    assert "unsigned legacy" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_tampered_signed_request_bounds(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="signed restart")
+    request_id = created.data["request"]["id"]
+    await backend.execute(
+        "UPDATE restart_requests SET policy = ? WHERE id = ?",
+        ("allow_busy_after_timeout", request_id),
+    )
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "do not match signed authority bounds" in row.status_reason
+    mock_spawn.assert_not_called()
+
+    # A terminal authority rejection consumes the signed lifecycle generation.
+    # Rewriting only the request row back to its sealed public fields must not
+    # make that rejected whole-host mutation executable again.
+    await backend.execute(
+        "UPDATE restart_requests SET policy = 'idle_agents_only', "
+        "status = 'pending', completed_at = NULL WHERE id = ?",
+        (request_id,),
+    )
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as replay_spawn:
+        await feat.restart_coordinator()
+
+    replayed = await get_request(backend, request_id)
+    assert replayed.status == "rejected"
+    assert "already consumed" in replayed.status_reason
+    replay_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["completed", "rejected"])
+async def test_consumed_restart_generation_cannot_be_replayed_from_terminal_status(
+    tmp_path,
+    terminal_status,
+):
+    """Editing restart_requests cannot reactivate a consumed host mutation."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="single-use restart authority")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+        return_value=MagicMock(),
+    ):
+        first = await feat.restart_coordinator()
+    assert first.data["executed"] == [{"request_id": request_id}]
+    assert await update_status(
+        backend,
+        request_id,
+        status=terminal_status,
+        status_reason="terminal for replay test",
+        completed_at=datetime.now(timezone.utc).isoformat(),
+        expected_current_status="executing",
+    )
+
+    # This is the review's raw-store attack: only the request row is writable;
+    # the separate lifecycle-consumption ledger remains authoritative.
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'pending', completed_at = NULL "
+        "WHERE id = ?",
+        (request_id,),
+    )
+
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as replay_spawn:
+        await feat.restart_coordinator()
+
+    replayed = await get_request(backend, request_id)
+    assert replayed.status == "rejected"
+    assert "already consumed" in replayed.status_reason
+    replay_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_update_reset_cannot_reseal_consumed_terminal_authority(
+    tmp_path,
+):
+    """Bootstrap recovery trusts its retry ledger, never a rewritten row."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="terminal reset replay")
+    request_id = created.data["request"]["id"]
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+        return_value=MagicMock(),
+    ):
+        first = await feat.restart_coordinator()
+    assert first.data["executed"] == [{"request_id": request_id}]
+    assert await update_status(
+        backend,
+        request_id,
+        status="completed",
+        status_reason="completed before forged interrupted update",
+        completed_at=datetime.now(timezone.utc).isoformat(),
+        expected_current_status="executing",
+    )
+
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'updating', completed_at = NULL "
+        "WHERE id = ?",
+        (request_id,),
+    )
+    await feat._reset_interrupted_updates()
+
+    replayed = await get_request(backend, request_id)
+    assert replayed is not None
+    assert replayed.status == "rejected"
+    assert "no durable retry authority" in replayed.status_reason
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as replay_spawn:
+        await feat.restart_coordinator()
+    replay_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_canceled_restart_generation_cannot_be_replayed(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="cancel consumes authority")
+    request_id = created.data["request"]["id"]
+    canceled = await feat.cancel_restart_request(request_id=request_id)
+    assert canceled.data["canceled"] is True
+
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'pending', completed_at = NULL "
+        "WHERE id = ?",
+        (request_id,),
+    )
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as replay_spawn:
+        await feat.restart_coordinator()
+
+    replayed = await get_request(backend, request_id)
+    assert replayed.status == "rejected"
+    assert "already consumed" in replayed.status_reason
+    replay_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_terminalization_revokes_issued_generation_after_evidence_swap(tmp_path):
+    """Terminal state consumes the issued generation, never mutable evidence."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="swap generation before cancel")
+    request_id = created.data["request"]["id"]
+    original = await get_request(backend, request_id)
+    assert original is not None
+
+    tampered = json.loads(original.authority_evidence)
+    tampered["lifecycle_generation"] = "f" * 32
+    await backend.execute(
+        "UPDATE restart_requests SET authority_evidence = ? WHERE id = ?",
+        (json.dumps(tampered), request_id),
+    )
+    canceled = await feat.cancel_restart_request(request_id=request_id)
+    assert canceled.data["canceled"] is True
+
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'pending', completed_at = NULL, "
+        "authority_evidence = ?, authority_signature = ? WHERE id = ?",
+        (original.authority_evidence, original.authority_signature, request_id),
+    )
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as replay_spawn:
+        await feat.restart_coordinator()
+
+    replayed = await get_request(backend, request_id)
+    assert replayed is not None
+    assert replayed.status == "rejected"
+    assert "already consumed" in replayed.status_reason
+    replay_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancel_revokes_claimed_update_retry_permission(tmp_path):
+    """A canceled claimed row cannot borrow its former recovery grant."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="cancel claimed update")
+    request_id = created.data["request"]["id"]
+    current = await get_request(backend, request_id)
+    assert (
+        await claim_request_for_execution(
+            backend,
+            current,
+            status="updating",
+            status_reason="claimed before cancellation",
+        )
+        == "claimed"
+    )
+    permissions = await backend.fetchall(
+        "SELECT request_id FROM restart_authority_retry_permissions "
+        "WHERE request_id = ?",
+        (request_id,),
+    )
+    assert permissions == [(request_id,)]
+
+    # Reproduce the raw-row rollback from the review: cancellation must still
+    # revoke the independent grant even though the generation was consumed.
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'pending' WHERE id = ?",
+        (request_id,),
+    )
+    canceled = await feat.cancel_restart_request(request_id=request_id)
+    assert canceled.data["canceled"] is True
+    assert await backend.fetchall(
+        "SELECT request_id FROM restart_authority_retry_permissions "
+        "WHERE request_id = ?",
+        (request_id,),
+    ) == []
+
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'updating', completed_at = NULL "
+        "WHERE id = ?",
+        (request_id,),
+    )
+    await feat._reset_interrupted_updates()
+    replayed = await get_request(backend, request_id)
+    assert replayed.status == "rejected"
+    assert "no durable retry authority" in replayed.status_reason
+
+
+@pytest.mark.asyncio
+async def test_malformed_signature_rejects_row_and_continues_scan(tmp_path):
+    """Hostile signature bytes cannot wedge later coordinator candidates."""
+
+    feat, backend = await _make_feature(tmp_path)
+    malformed = await feat.request_restart(
+        reason="malformed first candidate",
+        urgency="critical",
+    )
+    later = await feat.request_restart(
+        reason="later candidate must still be inspected",
+        urgency="low",
+        policy="manual_only",
+    )
+    malformed_id = malformed.data["request"]["id"]
+    later_id = later.data["request"]["id"]
+    await backend.execute(
+        "UPDATE restart_requests SET authority_signature = ? WHERE id = ?",
+        ("é" * 64, malformed_id),
+    )
+
+    result = await feat.restart_coordinator()
+
+    rejected = await get_request(backend, malformed_id)
+    untouched = await get_request(backend, later_id)
+    assert rejected.status == "rejected"
+    assert "signature is malformed" in rejected.status_reason
+    assert untouched.status == "pending"
+    assert result.status is ToolResultStatus.OK
+    assert [item["request_id"] for item in result.data["deferred"]] == [later_id]
+
+
+@pytest.mark.asyncio
+async def test_malformed_unicode_evidence_rejects_row_and_continues_scan(tmp_path):
+    """An unpaired surrogate cannot wedge later coordinator candidates."""
+
+    feat, backend = await _make_feature(tmp_path)
+    malformed = await feat.request_restart(
+        reason="malformed Unicode candidate",
+        urgency="critical",
+    )
+    later = await feat.request_restart(
+        reason="later candidate must still be inspected",
+        urgency="low",
+        policy="manual_only",
+    )
+    malformed_id = malformed.data["request"]["id"]
+    later_id = later.data["request"]["id"]
+    row = await get_request(backend, malformed_id)
+    document = json.loads(row.authority_evidence)
+    document["unused"] = "\ud800"
+    await backend.execute(
+        "UPDATE restart_requests SET authority_evidence = ?, "
+        "authority_signature = ? WHERE id = ?",
+        (json.dumps(document), "0" * 64, malformed_id),
+    )
+
+    result = await feat.restart_coordinator()
+
+    rejected = await get_request(backend, malformed_id)
+    untouched = await get_request(backend, later_id)
+    assert rejected.status == "rejected"
+    assert "not valid UTF-8" in rejected.status_reason
+    assert untouched.status == "pending"
+    assert result.status is ToolResultStatus.OK
+    assert [item["request_id"] for item in result.data["deferred"]] == [later_id]
+
+
+@pytest.mark.asyncio
+async def test_non_object_authority_evidence_rejects_row_and_continues_scan(tmp_path):
+    """Valid JSON of the wrong shape cannot wedge coordinator polling."""
+
+    feat, backend = await _make_feature(tmp_path)
+    malformed = await feat.request_restart(
+        reason="non-object first candidate",
+        urgency="critical",
+    )
+    later = await feat.request_restart(
+        reason="later candidate must still be inspected",
+        urgency="low",
+        policy="manual_only",
+    )
+    malformed_id = malformed.data["request"]["id"]
+    later_id = later.data["request"]["id"]
+    await backend.execute(
+        "UPDATE restart_requests SET authority_evidence = ?, "
+        "authority_signature = ? WHERE id = ?",
+        ("[]", "0" * 64, malformed_id),
+    )
+
+    result = await feat.restart_coordinator()
+
+    rejected = await get_request(backend, malformed_id)
+    untouched = await get_request(backend, later_id)
+    assert rejected.status == "rejected"
+    assert "evidence is not an object" in rejected.status_reason
+    assert untouched.status == "pending"
+    assert result.status is ToolResultStatus.OK
+    assert [item["request_id"] for item in result.data["deferred"]] == [later_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timestamp_field", ["requested_at", "first_blocked_at"])
+async def test_executor_rejects_tampered_safety_clock(
+    tmp_path,
+    timestamp_field,
+):
+    """Row aging cannot release a busy-host gate outside the signed seam."""
+
+    feat, backend = await _make_feature(tmp_path)
+    feat.agent._active_request_ids.add("busy-turn")
+    created = await feat.request_restart(
+        reason="signed safety clock",
+        policy=(
+            "allow_busy_after_timeout"
+            if timestamp_field == "requested_at"
+            else "idle_agents_only"
+        ),
+    )
+    request_id = created.data["request"]["id"]
+    aged = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    await backend.execute(
+        f"UPDATE restart_requests SET {timestamp_field} = ? WHERE id = ?",
+        (aged, request_id),
+    )
+
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "do not match signed authority bounds" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_authority_revoked_by_sovereign_key_rotation(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="revoke before poll")
+    request_id = created.data["request"]["id"]
+    monkeypatch.setenv("KESTREL_API_KEY", "rotated-sovereign-key")
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "signature verification failed" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_terminalizes_a_missing_authority_issuance(tmp_path):
+    """A valid seal without its independent issuance must not retry forever."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="lose issuance before poll")
+    request_id = created.data["request"]["id"]
+    await backend.execute(
+        "DELETE FROM restart_authority_issuances WHERE request_id = ?",
+        (request_id,),
+    )
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "issuance" in row.status_reason
+    assert result.data["deferred"] == []
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_whitespace_only_sovereign_key_rotation(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="revoke with significant whitespace")
+    request_id = created.data["request"]["id"]
+    monkeypatch.setenv("KESTREL_API_KEY", "restart-authority-test-key ")
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "signature verification failed" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_reverifies_after_awaited_safety_check(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="rotate during safety")
+    request_id = created.data["request"]["id"]
+
+    async def rotate_key_during_safety(req):
+        monkeypatch.setenv("KESTREL_API_KEY", "rotated-during-safety")
+        return req, {"safe": True, "reason": "fleet idle"}
+
+    feat._evaluate_and_track_safety = rotate_key_during_safety
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "signature verification failed" in row.status_reason
+    mock_spawn.assert_not_called()
+    events = await feat.list_restart_status_events()
+    assert all(
+        event["state"] != "executing"
+        for event in events.data["events"]
+        if event["request_id"] == request_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_executor_defers_when_safety_state_is_resealed_during_check(
+    tmp_path,
+):
+    """A valid newer seal invalidates the stale safety observation."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="reseal during safety")
+    request_id = created.data["request"]["id"]
+
+    async def reseal_during_safety(req):
+        refreshed = await mark_deferral_started(
+            backend,
+            req.id,
+            expected_current_status=req.status,
+            blocked_at="2026-08-30T00:00:00+00:00",
+        )
+        assert refreshed is not None
+        assert refreshed.authority_signature != req.authority_signature
+        return req, {"safe": True, "reason": "stale fleet-idle observation"}
+
+    feat._evaluate_and_track_safety = reseal_during_safety
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "pending"
+    assert row.first_blocked_at == "2026-08-30T00:00:00+00:00"
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_authority_recheck_rejects_a_valid_but_stale_seal(tmp_path):
+    """The verifier compares the caller snapshot with the durable version."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="direct stale-seal check")
+    stale = await get_request(backend, created.data["request"]["id"])
+    refreshed = await mark_deferral_started(
+        backend,
+        stale.id,
+        expected_current_status="pending",
+        blocked_at="2026-08-30T00:00:00+00:00",
+    )
+    assert refreshed.authority_signature != stale.authority_signature
+
+    stop = await feat._reject_invalid_authority(
+        stale,
+        expected_current_status="pending",
+    )
+
+    assert stop is True
+    assert (await get_request(backend, stale.id)).status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_execution_transition_is_bound_to_reverified_safety_seal(
+    tmp_path,
+):
+    """A reseal after re-verification still loses the execution CAS."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="reseal after verification")
+    request_id = created.data["request"]["id"]
+    original_reject = feat._reject_invalid_authority
+    successful_checks = 0
+
+    async def reseal_after_second_check(req, *, expected_current_status):
+        nonlocal successful_checks
+        stop = await original_reject(
+            req,
+            expected_current_status=expected_current_status,
+        )
+        if not stop:
+            successful_checks += 1
+            if successful_checks == 2:
+                refreshed = await mark_deferral_started(
+                    backend,
+                    req.id,
+                    expected_current_status=expected_current_status,
+                    blocked_at="2026-08-30T00:00:01+00:00",
+                )
+                assert refreshed is not None
+                assert refreshed.authority_signature != req.authority_signature
+        return stop
+
+    feat._reject_invalid_authority = reseal_after_second_check
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "pending"
+    assert row.first_blocked_at == "2026-08-30T00:00:01+00:00"
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_reverifies_at_restart_boundary(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="rotate at execution boundary")
+    request_id = created.data["request"]["id"]
+    original_emit = feat._emit_status_event
+
+    async def rotate_after_execution_transition(req, *, state, **kwargs):
+        await original_emit(req, state=state, **kwargs)
+        if state == "executing":
+            monkeypatch.setenv("KESTREL_API_KEY", "rotated-before-spawn")
+
+    feat._emit_status_event = rotate_after_execution_transition
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "signature verification failed" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_reverifies_at_update_mutation_boundary(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="rotate before update",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=_git_checkout(tmp_path),
+    )
+    request_id = created.data["request"]["id"]
+    original_emit = feat._emit_status_event
+
+    async def rotate_after_updating_transition(req, *, state, **kwargs):
+        await original_emit(req, state=state, **kwargs)
+        if state == "updating":
+            monkeypatch.setenv("KESTREL_API_KEY", "rotated-before-update")
+
+    feat._emit_status_event = rotate_after_updating_transition
+    with patch.object(
+        RestartCoordinatorFeature, "_run_update",
+    ) as run_update, patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "signature verification failed" in row.status_reason
+    run_update.assert_not_called()
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_rotated_authority_before_post_update_safety_write(
+    tmp_path,
+    monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="rotate after update",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=_git_checkout(tmp_path),
+    )
+    request_id = created.data["request"]["id"]
+
+    async def rotate_during_update(_req, _profile):
+        monkeypatch.setenv("KESTREL_API_KEY", "rotated-after-update")
+        feat.agent._active_request_ids.add("became-busy")
+        return {
+            "ok": True,
+            "failed_step": None,
+            "steps": [],
+            "resolved_ref": "",
+            "migration": {"ran": False},
+        }
+
+    feat._run_update = rotate_during_update
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "signature verification failed" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_update_deferral_recovers_when_authority_rotates_during_safety(
+    tmp_path,
+    monkeypatch,
+):
+    """A failed deferral CAS must not strand an update request as active."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="rotate during post-update safety",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=_git_checkout(tmp_path),
+    )
+    request_id = created.data["request"]["id"]
+
+    async def successful_update(_req, _profile):
+        return {
+            "ok": True,
+            "failed_step": None,
+            "steps": [],
+            "resolved_ref": "deadbeef",
+            "migration": {"ran": False},
+        }
+
+    safety_checks = 0
+
+    async def rotate_during_post_update_safety(req):
+        nonlocal safety_checks
+        safety_checks += 1
+        if safety_checks == 1:
+            return req, {"safe": True, "reason": "fleet initially idle"}
+        monkeypatch.setenv("KESTREL_API_KEY", "rotated-during-post-update-safety")
+        return req, {
+            "safe": False,
+            "reason": "agent became busy",
+            "deferable": True,
+        }
+
+    feat._run_update = successful_update
+    feat._evaluate_and_track_safety = rotate_during_post_update_safety
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "authority revoked" in row.status_reason
+    assert "post-update safety deferral" in row.status_reason
+    mock_spawn.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1266,6 +2954,10 @@ async def test_executor_recovers_on_spawn_failure(tmp_path):
     feat, backend = await _make_feature(tmp_path)
     created = await feat.request_restart(reason="r")
     req_id = created.data["request"]["id"]
+    original = await get_request(backend, req_id)
+    original_generation = json.loads(original.authority_evidence)[
+        "lifecycle_generation"
+    ]
 
     with patch.object(
         RestartCoordinatorFeature,
@@ -1276,6 +2968,46 @@ async def test_executor_recovers_on_spawn_failure(tmp_path):
 
     row = await get_request(backend, req_id)
     assert row.status == "pending"
+    assert "spawn failed" in row.status_reason
+    assert (
+        json.loads(row.authority_evidence)["lifecycle_generation"]
+        != original_generation
+    )
+
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+        return_value=MagicMock(),
+    ):
+        retried = await feat.restart_coordinator()
+    assert retried.data["executed"] == [{"request_id": req_id}]
+
+
+@pytest.mark.asyncio
+async def test_spawn_failure_terminally_rejects_authority_revoked_in_flight(
+    tmp_path,
+    monkeypatch,
+):
+    """A revoked claimed request cannot remain permanently ``executing``."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="revoke during spawn")
+    req_id = created.data["request"]["id"]
+
+    def revoke_then_fail():
+        monkeypatch.setenv("KESTREL_API_KEY", "rotated-during-spawn")
+        raise OSError("kestrel binary missing")
+
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+        side_effect=revoke_then_fail,
+    ):
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, req_id)
+    assert row.status == "rejected"
+    assert "authority revoked" in row.status_reason
     assert "spawn failed" in row.status_reason
 
 
@@ -1798,6 +3530,50 @@ async def test_request_update_then_restart_creates_row(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_denied_update_request_never_inspects_checkout_paths(tmp_path):
+    """An out-of-bounds path is refused before anything inspects it.
+
+    Before #3339 the denied request omitted repo_path, because every
+    non-sovereign request was denied; an omitted repo_path now means the
+    default checkout, which is inside the agent bounds. The filesystem-oracle
+    property is about a caller-chosen path, so the request names one.
+    """
+    feat, backend = await _make_feature(tmp_path)
+    probe = str(tmp_path / "probe" / "does-this-exist")
+    with (
+        caller_context_scope(CallerContext.authenticated("oauth@example.test")),
+        patch(
+            "kestrel_sovereign.features.restart_coordinator.feature."
+            "default_sovereign_repo_path"
+        ) as default_path,
+        patch(
+            "kestrel_sovereign.features.restart_coordinator.feature."
+            "repo_is_git_checkout"
+        ) as inspect_checkout,
+        patch(
+            "kestrel_sovereign.features.restart_coordinator.feature."
+            "_canonical_update_repo_path"
+        ) as resolve_path,
+    ):
+        result = await feat.request_restart(
+            reason="denied update",
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="main",
+            repo_path=probe,
+        )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["authority"] == "required"
+    assert result.data["exceeded_bound"] == "repo_path"
+    assert probe not in result.error
+    default_path.assert_not_called()
+    inspect_checkout.assert_not_called()
+    resolve_path.assert_not_called()
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
 async def test_request_update_then_restart_rejects_unknown_profile(tmp_path):
     feat, _ = await _make_feature(tmp_path)
     repo = _git_checkout(tmp_path)
@@ -1990,6 +3766,67 @@ async def test_coordinator_update_failure_leaves_retryable(tmp_path):
     assert "install" in row.status_reason
     assert row.update_log_dict()["failed_step"] == "install"
     assert len(result.data["deferred"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_update_with_rotated_authority_never_stays_updating(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="failed update while key rotates",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=_git_checkout(tmp_path),
+    )
+    request_id = created.data["request"]["id"]
+
+    async def failed_after_rotation(_req, _profile):
+        monkeypatch.setenv("KESTREL_API_KEY", "rotated-during-failed-update")
+        return {
+            "ok": False,
+            "failed_step": "install",
+            "steps": [],
+            "resolved_ref": "",
+            "migration": {"ran": False},
+        }
+
+    feat._run_update = failed_after_rotation
+    await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "authority revoked during failed update" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_failed_update_emits_each_lifecycle_transition_once(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    captured = _attach_emit_capture(feat)
+    await feat.request_restart(
+        reason="failed update has one recovery event",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=_git_checkout(tmp_path),
+    )
+
+    async def failed_update(_req, _profile):
+        return {
+            "ok": False,
+            "failed_step": "install",
+            "steps": [],
+            "resolved_ref": "",
+            "migration": {"ran": False},
+        }
+
+    feat._run_update = failed_update
+    await feat.restart_coordinator()
+
+    assert [
+        event["status"] for event in _restart_status_events(captured)
+    ] == ["pending", "updating", "pending"]
 
 
 @pytest.mark.asyncio
@@ -2202,10 +4039,12 @@ async def test_boot_resets_interrupted_updating_row(tmp_path):
         update_target_ref="main",
         update_repo_path=str(tmp_path),
     )
-    await update_status(
-        backend, req.id, status="updating",
-        expected_current_status="pending",
-    )
+    assert await claim_request_for_execution(
+        backend,
+        req,
+        status="updating",
+        status_reason="running update profile before restart",
+    ) == "claimed"
 
     dispatcher = _CapturingDispatcher()
     agent = _make_agent(backend, dispatcher=dispatcher)
@@ -2704,6 +4543,110 @@ async def test_inline_restart_preserves_session_across_frozen_reader_task(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_inline_restart_carries_owning_caller_across_frozen_reader_task(
+    tmp_path,
+):
+    """The persistent Codex reader must receive this turn's exact caller."""
+
+    backend = await _backend(tmp_path)
+    agent = _InlineRestartAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {feat.name: feat}
+    reader = _FrozenReaderHarness(agent)
+
+    # The app-server reader is born outside authenticated request handling and
+    # therefore carries no caller.  The later endpoint turn authenticates with
+    # the sovereign key and builds its per-turn executor on a different task.
+    with caller_context_scope(None):
+        await reader.start()
+    try:
+        with caller_context_scope(
+            CallerContext.sovereign(
+                identity="endpoint-sovereign",
+                credential="restart-authority-test-key",
+            )
+        ):
+            async with agent._turn_lifecycle():
+                agent._active_session_id = "chat-authorized"
+                executor = agent._make_inline_tool_executor("chat-authorized")
+                _effective_args, result = await reader.dispatch(
+                    executor,
+                    "request_restart",
+                    {"reason": "authorized inline callback"},
+                )
+    finally:
+        await reader.stop()
+
+    assert reader.handler_turn_ids == [None]
+    assert result["success"] is True
+    row = await get_request(backend, result["data"]["request"]["id"])
+    assert row.reason == "authorized inline callback"
+
+
+@pytest.mark.asyncio
+async def test_inline_restart_cannot_borrow_readers_overlapping_sovereign_caller(
+    tmp_path,
+):
+    """A callback is authorized by its owning turn, never the reader's turn.
+
+    Before #3339 turn B's plain restart was refused outright. B may now file
+    its own in-bounds request, so the borrowing question is asked two ways: a
+    request wider than the agent bounds is still refused, and B's in-bounds
+    request is sealed as B's own agent request, never as turn A's sovereign.
+    """
+
+    backend = await _backend(tmp_path)
+    agent = _InlineRestartAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {feat.name: feat}
+    reader = _FrozenReaderHarness(agent)
+
+    # Model overlap with turn A: the persistent reader and its handler task
+    # inherited A's still-live sovereign scope, while turn B explicitly has no
+    # caller.  B's executor must clear A instead of borrowing its authority.
+    with caller_context_scope(
+        CallerContext.sovereign(
+            identity="other-turn-sovereign",
+            credential="restart-authority-test-key",
+        )
+    ):
+        await reader.start()
+        try:
+            with caller_context_scope(None):
+                executor = agent._make_inline_tool_executor("unowned-turn")
+                _effective_args, wider = await reader.dispatch(
+                    executor,
+                    "request_restart",
+                    {
+                        "reason": "must not borrow reader authority",
+                        "operation": "update_then_restart",
+                        "update_profile": "sovereign_local_uv_sync",
+                        "target_ref": "main",
+                        "repo_path": str(tmp_path / "not-the-default"),
+                    },
+                )
+                _effective_args, own = await reader.dispatch(
+                    executor,
+                    "request_restart",
+                    {"reason": "the agent's own plain restart"},
+                )
+        finally:
+            await reader.stop()
+
+    assert wider["success"] is False
+    assert "authenticated sovereign-key caller" in wider["error"]
+    assert own["success"] is True
+    rows = await list_requests(backend)
+    assert [row.reason for row in rows] == ["the agent's own plain restart"]
+    evidence = json.loads(rows[0].authority_evidence)
+    assert evidence["basis"] == "agent_request"
+    assert evidence["actor"] == agent.did
+    assert evidence["actor"] != "other-turn-sovereign"
+
+
+@pytest.mark.asyncio
 async def test_inline_restart_without_turn_stays_unbound_across_reader_task(
     tmp_path,
 ):
@@ -2813,6 +4756,54 @@ async def test_nested_inline_restart_preserves_session_across_two_readers(
         backend, llm_service.result["data"]["request"]["id"]
     )
     assert row.origin_session_id == "chat-nested-42"
+
+
+@pytest.mark.asyncio
+async def test_nested_inline_restart_carries_caller_across_both_reader_tasks(
+    tmp_path,
+):
+    """A feature subagent re-presents the endpoint caller at its own callback."""
+
+    backend = await _backend(tmp_path)
+    agent = _InlineRestartAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {feat.name: feat}
+    parent_reader = _FrozenReaderHarness(agent)
+    feature_reader = _FrozenReaderHarness(agent)
+    llm_service = _NestedRestartLLMService(feature_reader)
+    agent.llm_service = llm_service
+
+    with caller_context_scope(None):
+        await parent_reader.start()
+        await feature_reader.start()
+    try:
+        with caller_context_scope(
+            CallerContext.sovereign(
+                identity="endpoint-sovereign",
+                credential="restart-authority-test-key",
+            )
+        ):
+            async with agent._turn_lifecycle():
+                agent._active_session_id = "chat-nested-authorized"
+                parent_executor = agent._make_inline_tool_executor(
+                    "chat-nested-authorized"
+                )
+                _effective_args, result = await parent_reader.dispatch(
+                    parent_executor,
+                    feat.tool_name,
+                    {"task": "file an authorized nested restart request"},
+                )
+    finally:
+        await parent_reader.stop()
+        await feature_reader.stop()
+
+    assert result["success"] is True
+    assert llm_service.result["success"] is True
+    row = await get_request(
+        backend, llm_service.result["data"]["request"]["id"]
+    )
+    assert row.reason == "nested inline tool filed"
 
 
 @pytest.mark.asyncio
@@ -3747,6 +5738,52 @@ def test_unstamped_task_reports_unknown_age_rather_than_guessing():
     assert "age unknown" in described
 
 
+def test_kinds_only_description_withholds_every_per_instance_tail():
+    """#3347: the co-hosted form names each blocking KIND and its oldest age,
+    oldest first, and never an example name's tail."""
+    described = _describe_background_tasks(
+        [
+            _FakeTask("signal_dispatch:channel.telegram:sig_a", age_seconds=30),
+            _FakeTask("signal_dispatch:peer.Claw:sig_b", age_seconds=7200),
+            _FakeTask("wait_fallback_reconcile", age_seconds=90000),
+        ],
+        now=1000000.0,
+        kinds_only=True,
+    )
+    assert described == "wait_fallback_reconcile (25h), signal_dispatch x2 (2h)"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # WaitFeature (mandatory): permanent ``while True`` driver, #2729.
+        "wait_fallback_reconcile",
+        # Durable dispatcher owner-liveness tick, a fresh task every ~40s.
+        "durable_signal_owner_heartbeat:did:pkh:eip155:1:0xabc",
+    ],
+)
+def test_permanent_bookkeeping_daemons_are_infrastructure(name):
+    """#3347: these are in every agent's task set whether or not it has done
+    anything, so counting them made no agent ever idle."""
+    assert _is_infra_background_task(_FakeTask(name)) is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "signal_dispatch:channel.telegram:sig_1",
+        "durable_cognition:a2a.task_submitted:sig_1",
+        "durable_terminal:workflow:sig_1",
+        "a2a_submitted:12345678",
+        "post_response_memory_enrichment",
+        # A lookalike must not ride on the heartbeat's exclusion.
+        "durable_signal_owner:did:x",
+    ],
+)
+def test_real_work_is_not_infrastructure(name):
+    assert _is_infra_background_task(_FakeTask(name)) is False
+
+
 @pytest.mark.asyncio
 async def test_idle_gate_reason_carries_task_names_end_to_end(tmp_path):
     """The names must reach the reason string the coordinator actually emits,
@@ -3945,6 +5982,34 @@ async def test_dead_restart_child_returns_the_row_for_retry(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_dead_restart_child_rejects_authority_revoked_in_flight(
+    tmp_path,
+    monkeypatch,
+):
+    """The watchdog terminalizes a dead dispatch whose seal was revoked."""
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    feat._restart_dispatch_grace = 0
+    created = await feat.request_restart(reason="revoke before child dies")
+    req_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+        return_value=_dead_child(tmp_path),
+    ):
+        await feat.restart_coordinator()
+    monkeypatch.setenv("KESTREL_API_KEY", "rotated-before-watchdog")
+    await agent.drain_background_tasks()
+
+    row = await get_request(backend, req_id)
+    assert row.status == "rejected"
+    assert "authority revoked" in row.status_reason
+    assert "exited 1" in row.status_reason
+
+
+@pytest.mark.asyncio
 async def test_live_restart_child_leaves_the_row_executing(tmp_path):
     """The watchdog must RUN and decline to act on a restart still in flight.
 
@@ -4011,11 +6076,13 @@ async def test_stranded_executing_row_is_recovered_by_the_sweep(tmp_path):
     req = await insert_request(
         backend, requested_by_agent="did:test:agent", reason="stranded",
     )
-    await update_status(
-        backend, req.id, status="executing",
-        expected_current_status="pending",
+    assert await claim_request_for_execution(
+        backend,
+        req,
+        status="executing",
+        status_reason="dispatching restart",
         executing_boot_id=_PROCESS_BOOT_ID,
-    )
+    ) == "claimed"
     # Stamped by this process but with no dispatch in flight — nothing is
     # waiting on it and nothing else will ever move it.
     assert req.id not in feat._executing_since
@@ -4031,6 +6098,42 @@ async def test_stranded_executing_row_is_recovered_by_the_sweep(tmp_path):
     assert reset == [req.id]
     row = await get_request(backend, req.id)
     assert row.status == "pending"
+    assert "did not happen" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_stranded_row_rejects_authority_revoked_in_flight(
+    tmp_path,
+    monkeypatch,
+):
+    """The durable backstop terminalizes revoked in-flight authority."""
+
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        STALE_EXECUTING_SECONDS,
+        _PROCESS_BOOT_ID,
+    )
+
+    feat, backend, _agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    req = await insert_request(
+        backend,
+        requested_by_agent="did:test:agent",
+        reason="revoked stranded dispatch",
+    )
+    assert await claim_request_for_execution(
+        backend,
+        req,
+        status="executing",
+        status_reason="dispatching restart",
+        executing_boot_id=_PROCESS_BOOT_ID,
+    ) == "claimed"
+    feat._instance_started_at -= STALE_EXECUTING_SECONDS + 1
+    monkeypatch.setenv("KESTREL_API_KEY", "rotated-before-recovery")
+
+    assert await feat._reconcile_stranded_executing_rows() == []
+    row = await get_request(backend, req.id)
+    assert row.status == "rejected"
+    assert "authority revoked" in row.status_reason
     assert "did not happen" in row.status_reason
 
 
@@ -4161,13 +6264,13 @@ async def test_boot_sweeps_stderr_files_orphaned_by_successful_restarts(
 async def test_reconciler_cannot_reset_a_dispatch_mid_transition(tmp_path):
     """TOCTOU guard, probing the actual window.
 
-    ``update_status`` awaits. If the in-flight record is written AFTER it
+    The durable execution claim awaits. If the in-flight record is written AFTER it
     returns, there is a window where the row is durably ``executing`` under
     this boot id with NO entry in ``_executing_since`` — and the reconciler
     treats exactly that as an orphan. A cron tick landing there resets a
     dispatch that is very much alive.
 
-    This runs the reconciler INSIDE that window (from within update_status,
+    This runs the reconciler INSIDE that window (from within the execution claim,
     immediately after the executing row commits) rather than after the fact,
     which is the only placement that can tell the two orderings apart.
     """
@@ -4179,18 +6282,18 @@ async def test_reconciler_cannot_reset_a_dispatch_mid_transition(tmp_path):
     created = await feat.request_restart(reason="ship")
     req_id = created.data["request"]["id"]
 
-    real_update_status = fm.update_status
+    real_claim = fm.claim_request_for_execution
     fired = {"count": 0}
 
-    async def _reconcile_inside_the_window(db, request_id, **kwargs):
-        landed = await real_update_status(db, request_id, **kwargs)
-        if kwargs.get("status") == "executing" and landed:
+    async def _reconcile_inside_the_window(db, request, **kwargs):
+        result = await real_claim(db, request, **kwargs)
+        if kwargs.get("status") == "executing" and result == "claimed":
             # A concurrent cron tick, arriving at the worst possible moment.
             fired["count"] += 1
             await feat._reconcile_stranded_executing_rows()
-        return landed
+        return result
 
-    fm.update_status = _reconcile_inside_the_window
+    fm.claim_request_for_execution = _reconcile_inside_the_window
     try:
         with patch.object(
             RestartCoordinatorFeature, "_spawn_restart_subprocess",
@@ -4199,7 +6302,7 @@ async def test_reconciler_cannot_reset_a_dispatch_mid_transition(tmp_path):
             await feat.restart_coordinator()
         await agent.drain_background_tasks()
     finally:
-        fm.update_status = real_update_status
+        fm.claim_request_for_execution = real_claim
 
     assert fired["count"] == 1, "the window was never exercised"
     row = await get_request(backend, req_id)
@@ -4827,3 +6930,959 @@ async def test_a_lost_delivered_write_storms_but_never_claims_delivery(
         f"exactly one dispatch reached the ack path; the other two coalesced "
         f"without reaching it (see docstring). Got {len(lost)} warnings"
     )
+
+
+# ---------------------------------------------------------------------------
+# Self-scoped reads route through the shared DID guard (#3251)
+# ---------------------------------------------------------------------------
+
+_SCOPE_DID = "did:test:scope-owner"
+_NOT_A_DID = "display-id-not-a-did"
+
+
+async def _scoped_feature(tmp_path, *, did=_SCOPE_DID):
+    """A feature whose agent's ``did`` and ``agent_id`` DIFFER (or whose
+    ``did`` is absent), so a site that reads the wrong field binds a value
+    the assertion can see."""
+    feat, backend = await _make_feature(tmp_path, did=_SCOPE_DID)
+    feat.agent = SimpleNamespace(**{**vars(feat.agent), "did": did, "agent_id": _NOT_A_DID})
+    return feat, backend
+
+
+def _status_req():
+    return SimpleNamespace(
+        id="req-scope", requested_by_agent="", operation="restart_only",
+        urgency="normal", policy="idle_agents_only",
+    )
+
+
+@pytest.mark.asyncio
+async def test_grant_delegation_checks_the_subject_against_the_did(tmp_path):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc  # noqa: F401
+
+    feat, _backend = await _scoped_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(subject_agent_did=_SCOPE_DID, operation="restart_only")
+    assert granted.status is ToolResultStatus.OK, granted.error
+    # A well-formed DID that is not this agent's: the subject check compares
+    # against the guard's DID, so a site reading agent_id would accept it.
+    mismatched = await feat.grant_restart_delegation(subject_agent_did="did:test:someone-else", operation="restart_only")
+    assert mismatched.error and "must identify this agent" in mismatched.error
+
+
+@pytest.mark.asyncio
+async def test_grant_delegation_refuses_without_a_did(tmp_path):
+    from kestrel_sovereign.features.restart_coordinator.store import (
+        list_restart_delegations as stored_delegations,
+    )
+
+    feat, backend = await _scoped_feature(tmp_path, did=None)
+    result = await feat.grant_restart_delegation(subject_agent_did=_SCOPE_DID, operation="restart_only")
+    assert result.error and "durable identity" in result.error
+    assert result.data == {"created": False}
+    assert await stored_delegations(backend, subject_agent_did=_SCOPE_DID) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("did", [None, "", 7])
+async def test_request_restart_refuses_without_a_did_before_any_authority_work(tmp_path, did):
+    feat, backend = await _scoped_feature(tmp_path, did=did)
+    result = await feat.request_restart(reason="identity-less request")
+    assert result.error and "durable identity" in result.error
+    assert result.data == {"created": False}
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_request_restart_binds_the_did_not_agent_id(tmp_path):
+    feat, backend = await _scoped_feature(tmp_path)
+    result = await feat.request_restart(reason="scoped request")
+    assert result.status is ToolResultStatus.OK, result.error
+    rows = await list_requests(backend)
+    assert [row.requested_by_agent for row in rows] == [_SCOPE_DID]
+
+
+@pytest.mark.asyncio
+async def test_list_delegations_scopes_by_the_did(tmp_path, monkeypatch):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path)
+    seen = []
+
+    async def fake_list(db, *, subject_agent_did):
+        seen.append(subject_agent_did)
+        return []
+
+    monkeypatch.setattr(rc, "list_restart_delegations", fake_list)
+    result = await feat.list_restart_delegations()
+    assert result.error is None, result.error
+    assert seen == [_SCOPE_DID]
+
+
+@pytest.mark.asyncio
+async def test_list_delegations_refuses_without_a_did(tmp_path, monkeypatch):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path, did=None)
+    called = AsyncMock(return_value=[])
+    monkeypatch.setattr(rc, "list_restart_delegations", called)
+    result = await feat.list_restart_delegations()
+    assert result.error and "durable identity" in result.error
+    called.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_status_event_is_attributed_to_the_did(tmp_path, monkeypatch):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path)
+    built = []
+    monkeypatch.setattr(rc, "build_restart_status_event", lambda req, **kw: built.append(kw) or {"state": kw["state"]})
+    recorded = AsyncMock()
+    monkeypatch.setattr(rc, "record_status_event", recorded)
+    feat._resolve_requesting_agent_name = lambda requester: ""
+    await feat._emit_status_event(_status_req(), state="pending")
+    assert [kw["agent_did"] for kw in built] == [_SCOPE_DID]
+    recorded.assert_awaited_once()
+    assert recorded.await_args.kwargs["agent_id"] == _SCOPE_DID
+
+
+@pytest.mark.asyncio
+async def test_status_event_is_not_emitted_without_a_did(tmp_path, monkeypatch, caplog):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path, did=None)
+    built = AsyncMock()
+    monkeypatch.setattr(rc, "build_restart_status_event", built)
+    recorded = AsyncMock()
+    monkeypatch.setattr(rc, "record_status_event", recorded)
+    with caplog.at_level("WARNING", logger="kestrel_sovereign.features.restart_coordinator.feature"):
+        await feat._emit_status_event(_status_req(), state="pending")
+    built.assert_not_called()
+    recorded.assert_not_awaited()
+    dropped = [r.getMessage() for r in caplog.records if "identity unavailable" in r.getMessage()]
+    assert dropped and "req-scope" in dropped[0], dropped
+
+
+@pytest.mark.asyncio
+async def test_interrupted_update_reset_scopes_by_the_did(tmp_path, monkeypatch):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path)
+    reader = AsyncMock(return_value=[])
+    monkeypatch.setattr(rc, "list_requests", reader)
+    await feat._reset_interrupted_updates()
+    reader.assert_awaited_once()
+    assert reader.await_args.kwargs["agent_id"] == _SCOPE_DID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("did", [None, "", 7])
+async def test_interrupted_update_reset_never_reads_with_an_empty_scope(tmp_path, monkeypatch, did):
+    """``list_requests`` omits the agent predicate for a falsy scope and would
+    read every agent's rows; the refusal must stand in front of it."""
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path, did=did)
+    reader = AsyncMock(return_value=[])
+    monkeypatch.setattr(rc, "list_requests", reader)
+    await feat._reset_interrupted_updates()
+    reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_restart_reap_scopes_by_the_did(tmp_path, monkeypatch):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path)
+    reader = AsyncMock(return_value=[])
+    monkeypatch.setattr(rc, "list_requests_needing_wake", reader)
+    assert await feat._reap_post_restart_rows() == []
+    reader.assert_awaited_once()
+    assert reader.await_args.kwargs["agent_id"] == _SCOPE_DID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("did", [None, "", 7])
+async def test_post_restart_reap_never_reads_with_an_empty_scope(tmp_path, monkeypatch, did):
+    """``list_requests_needing_wake`` has the same truthiness gate; an empty
+    scope would sweep and wake every agent's rows."""
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path, did=did)
+    reader = AsyncMock(return_value=[])
+    monkeypatch.setattr(rc, "list_requests_needing_wake", reader)
+    assert await feat._reap_post_restart_rows() == []
+    reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_requester_id_is_the_did_or_nothing(tmp_path):
+    feat, _backend = await _scoped_feature(tmp_path)
+    assert feat._agent_requester_id() == _SCOPE_DID
+    for did in (None, "", 7):
+        feat.agent = SimpleNamespace(**{**vars(feat.agent), "did": did})
+        assert feat._agent_requester_id() is None
+
+
+@pytest.mark.asyncio
+async def test_request_readers_see_what_the_writer_wrote_for_a_padded_did(tmp_path):
+    """The requester read routes through the same guard as the writer, so
+    the two agree on the raw value. A whitespace-padded DID is the one
+    input on which the old stripping reader disagreed with the writer and
+    silently listed nothing."""
+    padded = f"  {_SCOPE_DID}  "
+    feat, backend = await _scoped_feature(tmp_path, did=padded)
+    written = await feat.request_restart(reason="padded requester")
+    assert written.status is ToolResultStatus.OK, written.error
+    assert [row.requested_by_agent for row in await list_requests(backend)] == [padded]
+    listed = await feat.list_restart_requests()
+    assert listed.status is ToolResultStatus.OK, listed.error
+    assert listed.data["count"] == 1
+    assert feat._agent_requester_id() == padded
+
+
+# ---------------------------------------------------------------------------
+# Agent-requested restarts (#3339)
+#
+# Doctrine: an agent can request a whole-host restart from its own work; the
+# coordinator's idle/timeout gate is the control. With no sovereign caller and
+# no delegation, a request inside the agent-requestable bounds is sealed on the
+# ``agent_request`` basis; anything wider still needs sovereign authority.
+# ---------------------------------------------------------------------------
+
+
+_AGENT_UPDATE = {
+    "operation": "update_then_restart",
+    "update_profile": "sovereign_local_uv_sync",
+    "target_ref": "main",
+}
+
+
+def _point_origin_head(checkout, branch):
+    from kestrel_sovereign.features.restart_coordinator import update_profiles
+
+    subprocess.run(
+        [
+            "git", "-C", str(checkout), "symbolic-ref",
+            "refs/remotes/origin/HEAD", f"refs/remotes/origin/{branch}",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    update_profiles.clear_checkout_default_branch_cache()
+
+
+_GIT_IDENTITY = (
+    "-c", "user.email=restart-test@example.test",
+    "-c", "user.name=restart-test",
+    "-c", "commit.gpgsign=false",
+    "-c", "tag.gpgsign=false",
+)
+
+
+def _run_git(*args):
+    subprocess.run(["git", *_GIT_IDENTITY, *args], check=True, capture_output=True)
+
+
+def _agent_default_checkout(tmp_path, monkeypatch, *, default_branch="main"):
+    """A real clone of a throwaway bare origin, standing in for this host's
+    Sovereign checkout. ``tmp_path / "seed"`` can push new refs to origin."""
+    from kestrel_sovereign.features.restart_coordinator import (
+        feature as feature_module,
+        update_profiles,
+    )
+
+    seed = tmp_path / "seed"
+    origin = tmp_path / "origin.git"
+    checkout = tmp_path / "sovereign-default"
+    _run_git("init", "-q", "-b", "main", str(seed))
+    _run_git("-C", str(seed), "commit", "-q", "--allow-empty", "-m", "base")
+    _run_git("init", "-q", "--bare", "-b", "main", str(origin))
+    _run_git(
+        "-C", str(seed), "push", "-q", str(origin),
+        "refs/heads/main:refs/heads/main",
+    )
+    _run_git("clone", "-q", str(origin), str(checkout))
+    if default_branch is None:
+        _run_git(
+            "-C", str(checkout), "symbolic-ref", "-d", "refs/remotes/origin/HEAD",
+        )
+    elif default_branch != "main":
+        _point_origin_head(checkout, default_branch)
+    update_profiles.clear_checkout_default_branch_cache()
+    path = str(checkout.resolve())
+    monkeypatch.setattr(update_profiles, "default_sovereign_repo_path", lambda: path)
+    monkeypatch.setattr(feature_module, "default_sovereign_repo_path", lambda: path)
+    return path
+
+
+def _tag_on_origin(tmp_path, name, *, fetch_into_checkout=False):
+    """Push a tag named like the branch to origin (optionally fetch it)."""
+    seed = tmp_path / "seed"
+    _run_git("-C", str(seed), "tag", name)
+    _run_git(
+        "-C", str(seed), "push", "-q", str(tmp_path / "origin.git"),
+        f"refs/tags/{name}:refs/tags/{name}",
+    )
+    if fetch_into_checkout:
+        _run_git(
+            "-C", str(tmp_path / "sovereign-default"),
+            "fetch", "-q", "--tags", "origin",
+        )
+
+
+def _resigned(row, mutate):
+    """Evidence re-signed under the host key after ``mutate`` edits it.
+
+    Models a seal the host itself produced with those contents, so only the
+    agent-request checks (not the HMAC) can refuse it.
+    """
+    from kestrel_sovereign.features.restart_coordinator import authority
+
+    document = json.loads(row.authority_evidence)
+    mutate(document)
+    return (
+        authority._canonical(document).decode("utf-8"),
+        authority._signature(document),
+    )
+
+
+async def _write_evidence(backend, request_id, evidence, signature):
+    await backend.execute(
+        "UPDATE restart_requests SET authority_evidence = ?, "
+        "authority_signature = ? WHERE id = ?",
+        (evidence, signature, request_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_restart_only_without_caller_is_sealed_verified_and_executes(
+    tmp_path,
+):
+    feat, backend = await _make_feature(tmp_path)
+
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="deploy after merge")
+        assert created.status is ToolResultStatus.OK, created.error
+        request_id = created.data["request"]["id"]
+        row = await get_request(backend, request_id)
+        evidence = json.loads(row.authority_evidence)
+        verified = await verify_restart_authority_at_use(backend, row)
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn:
+            result = await feat.restart_coordinator()
+
+    assert evidence["basis"] == "agent_request"
+    assert evidence["actor"] == "did:test:agent"
+    assert "delegation" not in evidence
+    assert verified == (
+        True, "verified agent-requested restart within agent bounds",
+    )
+    spawn.assert_called_once()
+    assert result.data["executed"][0]["request_id"] == request_id
+    assert (await get_request(backend, request_id)).status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_sovereign_caller_seal_is_unchanged_by_agent_request_basis(tmp_path):
+    """The sovereign path never labels a seal as an agent request."""
+    feat, backend = await _make_feature(tmp_path)
+
+    created = await feat.request_restart(reason="operator restart")
+    row = await get_request(backend, created.data["request"]["id"])
+
+    evidence = json.loads(row.authority_evidence)
+    assert "basis" not in evidence
+    assert evidence["actor"] == "test-sovereign"
+    assert verify_restart_authority(row) == (
+        True, "verified sovereign-key authority",
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_insert_without_agent_request_still_requires_sovereign(
+    tmp_path,
+):
+    """Only the request tool opts into the agent-request basis."""
+    from kestrel_sovereign.features.restart_coordinator.authority import (
+        RestartAuthorityError,
+    )
+
+    backend = await _backend(tmp_path)
+    with caller_context_scope(None), pytest.raises(Exception) as raised:
+        await insert_request(
+            backend, requested_by_agent="did:test:agent", reason="direct",
+        )
+    # The store's transaction wrapper re-raises with the refusal as cause.
+    refusal = raised.value
+    if not isinstance(refusal, RestartAuthorityError):
+        refusal = refusal.__cause__
+    assert isinstance(refusal, RestartAuthorityError)
+    assert "authenticated sovereign-key caller" in str(refusal)
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_seal_refuses_agent_request_beyond_bounds_independently(
+    tmp_path, monkeypatch,
+):
+    """The host seal re-checks the bounds; the tool's screen is not the gate."""
+    from kestrel_sovereign.features.restart_coordinator.authority import (
+        RestartAuthorityError,
+    )
+
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    backend = await _backend(tmp_path)
+    with caller_context_scope(None), pytest.raises(Exception) as raised:
+        await insert_request(
+            backend,
+            requested_by_agent="did:test:agent",
+            reason="wider than the agent bounds",
+            operation="update_then_restart",
+            update_repo_path=default_repo,
+            update_target_ref="release",
+            update_profile="sovereign_local_uv_sync",
+            allow_agent_request=True,
+        )
+    refusal = raised.value
+    if not isinstance(refusal, RestartAuthorityError):
+        refusal = refusal.__cause__
+    assert isinstance(refusal, RestartAuthorityError)
+    assert "bound on target_ref" in str(refusal)
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_repo", [False, True])
+async def test_agent_update_to_default_branch_is_accepted(
+    tmp_path, monkeypatch, explicit_repo,
+):
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    extra = {"repo_path": default_repo} if explicit_repo else {}
+
+    with caller_context_scope(None):
+        created = await feat.request_restart(
+            reason="land merged main", **_AGENT_UPDATE, **extra,
+        )
+
+    assert created.status is ToolResultStatus.OK, created.error
+    row = await get_request(backend, created.data["request"]["id"])
+    assert row.update_repo_path == default_repo
+    assert row.update_target_ref == "main"
+    assert row.update_allow_migrations is False
+    assert json.loads(row.authority_evidence)["basis"] == "agent_request"
+    assert (await verify_restart_authority_at_use(backend, row))[0] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "bound"),
+    [
+        ({"target_ref": "release"}, "target_ref"),
+        ({"allow_migrations": True}, "allow_migrations"),
+        ({"repo_path": "OTHER"}, "repo_path"),
+        ({"update_profile": "not_a_profile"}, "update_profile"),
+    ],
+    ids=["other-ref", "migrations", "other-repo", "other-profile"],
+)
+async def test_agent_update_beyond_bounds_is_refused_by_name(
+    tmp_path, monkeypatch, overrides, bound,
+):
+    _agent_default_checkout(tmp_path, monkeypatch)
+    other = tmp_path / "other-checkout"
+    other.mkdir()
+    _git_checkout(other)
+    if overrides.get("repo_path") == "OTHER":
+        overrides = {"repo_path": str(other)}
+    feat, backend = await _make_feature(tmp_path)
+
+    with (
+        caller_context_scope(None),
+        patch(
+            "kestrel_sovereign.features.restart_coordinator.feature."
+            "repo_is_git_checkout"
+        ) as inspect_checkout,
+    ):
+        refused = await feat.request_restart(
+            reason="too wide", **{**_AGENT_UPDATE, **overrides},
+        )
+
+    assert refused.status is ToolResultStatus.ERROR
+    assert refused.data == {
+        "created": False, "authority": "required", "exceeded_bound": bound,
+    }
+    assert f"bound on {bound}" in refused.error
+    assert (
+        "requires an authenticated sovereign-key caller or a sovereign-signed "
+        "restart delegation"
+    ) in refused.error
+    inspect_checkout.assert_not_called()
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_agent_update_without_known_default_branch_is_refused(
+    tmp_path, monkeypatch,
+):
+    """No ``origin/HEAD`` means no default branch, never a guessed ``main``."""
+    _agent_default_checkout(tmp_path, monkeypatch, default_branch=None)
+    feat, backend = await _make_feature(tmp_path)
+
+    with caller_context_scope(None):
+        refused = await feat.request_restart(reason="guess", **_AGENT_UPDATE)
+
+    assert refused.status is ToolResultStatus.ERROR
+    assert refused.data["exceeded_bound"] == "target_ref"
+    assert "origin/HEAD" in refused.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_agent_restart_only_carrying_migrations_is_refused(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+
+    with caller_context_scope(None):
+        refused = await feat.request_restart(
+            reason="plain restart", allow_migrations=True,
+        )
+
+    assert refused.status is ToolResultStatus.ERROR
+    assert refused.data["exceeded_bound"] == "allow_migrations"
+    assert await list_requests(backend) == []
+
+
+def _drop_basis(document):
+    document.pop("basis")
+
+
+def _other_actor(document):
+    document["actor"] = "did:test:someone-else"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "edit",
+    [
+        "UPDATE restart_requests SET update_target_ref = 'release' WHERE id = ?",
+        "UPDATE restart_requests SET update_allow_migrations = 1 WHERE id = ?",
+        "UPDATE restart_requests SET update_repo_path = '/elsewhere' WHERE id = ?",
+        "UPDATE restart_requests SET update_profile = 'other' WHERE id = ?",
+        "actor",
+        "basis",
+    ],
+    ids=["ref", "migrations", "repo", "profile", "actor", "basis"],
+)
+async def test_edited_agent_request_row_fails_verification_at_executor(
+    tmp_path, monkeypatch, edit,
+):
+    _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+    request_id = created.data["request"]["id"]
+    row = await get_request(backend, request_id)
+
+    if edit in {"actor", "basis"}:
+        # An unsigned edit of the evidence itself: changing the actor, or
+        # dropping the basis so the seal reads as a sovereign-caller seal.
+        document = json.loads(row.authority_evidence)
+        (_other_actor if edit == "actor" else _drop_basis)(document)
+        await _write_evidence(
+            backend, request_id,
+            json.dumps(document, sort_keys=True, separators=(",", ":")),
+            row.authority_signature,
+        )
+    else:
+        await backend.execute(edit, (request_id,))
+
+    feat._run_update = AsyncMock(
+        side_effect=AssertionError("edited row reached the update runner")
+    )
+    with caller_context_scope(None), patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    edited = await get_request(backend, request_id)
+    assert edited.status == "rejected"
+    assert edited.status_reason.startswith("authority denied")
+    feat._run_update.assert_not_awaited()
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_agent_request_seal_with_actor_other_than_requester_fails(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship")
+    request_id = created.data["request"]["id"]
+    row = await get_request(backend, request_id)
+    await _write_evidence(backend, request_id, *_resigned(row, _other_actor))
+
+    forged = await get_request(backend, request_id)
+    assert verify_restart_authority(forged) == (
+        False, "agent-request restart authority actor is not the requester",
+    )
+    with caller_context_scope(None), patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+    assert (await get_request(backend, request_id)).status == "rejected"
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_signed_agent_request_outside_bounds_fails_verification(tmp_path):
+    """A validly signed agent seal is still re-checked against the bounds."""
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship")
+    request_id = created.data["request"]["id"]
+    row = await get_request(backend, request_id)
+
+    def widen(document):
+        document["request"]["update_allow_migrations"] = True
+
+    await backend.execute(
+        "UPDATE restart_requests SET update_allow_migrations = 1 WHERE id = ?",
+        (request_id,),
+    )
+    await _write_evidence(backend, request_id, *_resigned(row, widen))
+
+    widened = await get_request(backend, request_id)
+    verified, reason = verify_restart_authority(widened)
+    assert verified is False
+    assert "outside the agent-requestable bound on allow_migrations" in reason
+
+
+@pytest.mark.asyncio
+async def test_agent_update_is_rechecked_when_default_branch_moves(
+    tmp_path, monkeypatch,
+):
+    """The executor re-checks the bounds as they stand, not as sealed."""
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+    request_id = created.data["request"]["id"]
+
+    _point_origin_head(default_repo, "trunk")
+    feat._run_update = AsyncMock(
+        side_effect=AssertionError("stale-bound row reached the update runner")
+    )
+    with caller_context_scope(None), patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "bound on target_ref" in row.status_reason
+    feat._run_update.assert_not_awaited()
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_agent_update_runs_update_then_restart_without_caller(
+    tmp_path, monkeypatch,
+):
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+    request_id = created.data["request"]["id"]
+
+    async def _fake_run_update(self, req, profile):
+        assert req.update_repo_path == default_repo
+        return {
+            "ok": True,
+            "profile": "sovereign_local_uv_sync",
+            "repo_path": default_repo,
+            "target_ref": "main",
+            "resolved_ref": "abc1234",
+            "steps": [],
+            "migration": {"ran": False, "reason": "additive"},
+            "failed_step": None,
+        }
+
+    with (
+        caller_context_scope(None),
+        patch.object(RestartCoordinatorFeature, "_run_update", _fake_run_update),
+        patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn,
+    ):
+        await feat.restart_coordinator()
+
+    spawn.assert_called_once()
+    assert (await get_request(backend, request_id)).status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_agent_filed_idle_only_request_escalates_after_bounded_deferral(
+    tmp_path,
+):
+    """"Or after a timeout": an agent's request is not starved by a busy host."""
+    feat, backend = await _make_feature(tmp_path)
+    captured = _attach_emit_capture(feat)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="deploy while busy")
+        request_id = created.data["request"]["id"]
+        feat.agent._active_request_ids.add("unrelated-busy-turn")
+
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn:
+            await feat.restart_coordinator()
+        spawn.assert_not_called()
+        blocked = await get_request(backend, request_id)
+        # The deferral clock was resealed with no sovereign caller present.
+        assert blocked.first_blocked_at
+        assert blocked.escalation_acknowledged is True
+        assert json.loads(blocked.authority_evidence)["basis"] == "agent_request"
+
+        assert await clear_deferral_started(
+            backend, request_id, expected_current_status="pending",
+        )
+        assert await mark_deferral_started(
+            backend,
+            request_id,
+            expected_current_status="pending",
+            blocked_at=(
+                datetime.now(timezone.utc)
+                - timedelta(seconds=MAX_IDLE_ONLY_DEFERRAL_SECONDS + 1)
+            ).isoformat(),
+        )
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn:
+            result = await feat.restart_coordinator()
+
+    spawn.assert_called_once()
+    assert result.data["executed"][0]["request_id"] == request_id
+    assert (await get_request(backend, request_id)).status == "executing"
+    assert any(
+        event["status"] == "escalated" and event["request_id"] == request_id
+        for event in _restart_status_events(captured)
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_request_retry_reseals_without_sovereign_caller(tmp_path):
+    """A failed dispatch returns the row for retry under the same agent bounds."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    feat._restart_dispatch_grace = 0
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship")
+        request_id = created.data["request"]["id"]
+        first = json.loads(
+            (await get_request(backend, request_id)).authority_evidence
+        )
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            return_value=_dead_child(tmp_path),
+        ):
+            await feat.restart_coordinator()
+        await agent.drain_background_tasks()
+
+        retried = await get_request(backend, request_id)
+        assert retried.status == "pending"
+        resealed = json.loads(retried.authority_evidence)
+        assert resealed["basis"] == "agent_request"
+        assert resealed["actor"] == first["actor"] == agent.did
+        assert resealed["lifecycle_generation"] != first["lifecycle_generation"]
+        assert (await verify_restart_authority_at_use(backend, retried))[0]
+
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            return_value=_LiveChild(),
+        ) as spawn:
+            await feat.restart_coordinator()
+        await agent.drain_background_tasks()
+
+    spawn.assert_called_once()
+    assert (await get_request(backend, request_id)).status == "executing"
+
+
+async def _fake_ok_update(self, req, profile):
+    return {
+        "ok": True,
+        "profile": req.update_profile,
+        "repo_path": req.update_repo_path,
+        "target_ref": req.update_target_ref,
+        "resolved_ref": "abc1234",
+        "steps": [],
+        "migration": {"ran": False, "reason": "additive"},
+        "failed_step": None,
+    }
+
+
+async def _run_agent_update_tick(feat):
+    """One coordinator tick with no caller; the update runner must not run."""
+    feat._run_update = AsyncMock(
+        side_effect=AssertionError("refused agent update reached the runner")
+    )
+    with caller_context_scope(None), patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+    feat._run_update.assert_not_awaited()
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_agent_update_boundary_rereads_origin_head_inside_cache_window(
+    tmp_path, monkeypatch,
+):
+    """The cache cannot carry a stale default branch into the update step.
+
+    ``origin/HEAD`` is re-pointed with plain git and the answer cache is NOT
+    cleared, so every cached check still believes ``main``; only the
+    uncached read immediately before the profile runs can refuse.
+    """
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+    request_id = created.data["request"]["id"]
+    _run_git(
+        "-C", default_repo, "symbolic-ref",
+        "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk",
+    )
+    # Still inside the cache window: the cached verification accepts the row.
+    row = await get_request(backend, request_id)
+    assert (await verify_restart_authority_at_use(backend, row))[0] is True
+
+    await _run_agent_update_tick(feat)
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "bound on target_ref" in row.status_reason
+    assert "'main'" in row.status_reason and "'trunk'" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_agent_update_refused_when_a_tag_shadows_the_default_branch(
+    tmp_path, monkeypatch,
+):
+    """``git fetch origin main`` selects a tag named ``main`` over the branch."""
+    _agent_default_checkout(tmp_path, monkeypatch)
+    _tag_on_origin(tmp_path, "main", fetch_into_checkout=True)
+    feat, backend = await _make_feature(tmp_path)
+
+    with caller_context_scope(None):
+        refused = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+
+    assert refused.status is ToolResultStatus.ERROR
+    assert refused.data["exceeded_bound"] == "target_ref"
+    assert "tag named 'main'" in refused.error
+    assert "sovereign-key caller" in refused.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_seal_refuses_agent_update_when_a_tag_shadows_the_branch(
+    tmp_path, monkeypatch,
+):
+    from kestrel_sovereign.features.restart_coordinator.authority import (
+        RestartAuthorityError,
+    )
+
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    _tag_on_origin(tmp_path, "main", fetch_into_checkout=True)
+    backend = await _backend(tmp_path)
+    with caller_context_scope(None), pytest.raises(Exception) as raised:
+        await insert_request(
+            backend,
+            requested_by_agent="did:test:agent",
+            reason="shadowed",
+            operation="update_then_restart",
+            update_repo_path=default_repo,
+            update_target_ref="main",
+            update_profile="sovereign_local_uv_sync",
+            allow_agent_request=True,
+        )
+    refusal = raised.value
+    if not isinstance(refusal, RestartAuthorityError):
+        refusal = refusal.__cause__
+    assert isinstance(refusal, RestartAuthorityError)
+    assert "bound on target_ref" in str(refusal)
+    assert "tag named 'main'" in str(refusal)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fetched", [True, False], ids=["local-tag", "origin-only"])
+async def test_agent_update_boundary_refuses_tag_created_after_sealing(
+    tmp_path, monkeypatch, fetched,
+):
+    """A shadowing tag appearing after the seal is caught before the fetch.
+
+    ``local-tag``: the tag reached the checkout (a previous ``fetch --tags``);
+    the uncached local read catches it inside the cache window.
+    ``origin-only``: the tag exists only on origin, so only asking origin
+    catches it; the profile's own fetch would otherwise land on it.
+    """
+    _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+    request_id = created.data["request"]["id"]
+    _tag_on_origin(tmp_path, "main", fetch_into_checkout=fetched)
+
+    await _run_agent_update_tick(feat)
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "bound on target_ref" in row.status_reason
+    assert "tag named 'main'" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_agent_update_stays_retryable_when_origin_cannot_be_asked(
+    tmp_path, monkeypatch,
+):
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+    request_id = created.data["request"]["id"]
+    _run_git(
+        "-C", default_repo, "remote", "set-url", "origin",
+        str(tmp_path / "no-such-origin.git"),
+    )
+
+    await _run_agent_update_tick(feat)
+
+    row = await get_request(backend, request_id)
+    assert row.status == "pending"
+    assert "could not ask origin" in row.status_reason
+    assert (await verify_restart_authority_at_use(backend, row))[0] is True
+
+
+@pytest.mark.asyncio
+async def test_sovereign_update_is_not_subject_to_agent_tag_bound(
+    tmp_path, monkeypatch,
+):
+    """The profile's behavior for sovereign requests is unchanged."""
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    _tag_on_origin(tmp_path, "main", fetch_into_checkout=True)
+    feat, backend = await _make_feature(tmp_path)
+
+    created = await feat.request_restart(reason="operator ship", **_AGENT_UPDATE)
+    assert created.status is ToolResultStatus.OK, created.error
+    request_id = created.data["request"]["id"]
+    with (
+        patch.object(RestartCoordinatorFeature, "_run_update", _fake_ok_update),
+        patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn,
+    ):
+        await feat.restart_coordinator()
+
+    spawn.assert_called_once()
+    row = await get_request(backend, request_id)
+    assert row.status == "executing"
+    assert row.update_repo_path == default_repo

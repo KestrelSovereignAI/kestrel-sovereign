@@ -27,6 +27,7 @@ from typing import Any, Dict, Optional
 from .interface import DatabaseBackend, DatabaseError, ConnectionError, QueryError, TransactionError
 from .placeholder import sqlite_to_postgres, postgres_to_sqlite, normalize_schema
 from .sqlite import SQLiteBackend
+from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
 # Export all public interfaces
 __all__ = [
@@ -163,7 +164,7 @@ def _create_sqlite_backend(config: Dict[str, Any]) -> SQLiteBackend:
     """
     db_path = config.get(
         "db_path",
-        os.getenv("KESTREL_DB_PATH", "./agent_data/kestrel.db")
+        runtime_path_env(AGENT_DB_PATH_ENV, "./agent_data/kestrel.db")
     )
     return SQLiteBackend(db_path, cold_read=bool(config.get("cold_read", False)))
 

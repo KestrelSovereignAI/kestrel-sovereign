@@ -135,6 +135,7 @@ test('a delayed real feature config save cannot close a newer modal', async () =
                 },
             },
             config: { enabled: true },
+            can_manage_features: true,
         });
     };
     try {
@@ -352,6 +353,7 @@ test('feature configuration saves fields from a closed shadow overlay', async ()
                 },
             },
             config: { label: 'before' },
+            can_manage_features: true,
         };
     };
 

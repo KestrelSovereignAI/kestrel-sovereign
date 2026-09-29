@@ -11,6 +11,10 @@ from typing import Optional, Dict, Any, Callable
 from dataclasses import dataclass
 from enum import Enum
 
+from kestrel_sovereign.features.storage_access import (
+    AgentIdentityUnavailable,
+    resolve_scoped_agent_did,
+)
 from kestrel_sovereign.command_policy import (
     RECOVERY_COMMANDS as CANONICAL_RECOVERY_COMMANDS,
     SOVEREIGN_COMMANDS as CANONICAL_SOVEREIGN_COMMANDS,
@@ -768,7 +772,14 @@ class CommandHandler:
 
         try:
             # Get tasks from store
-            tasks = await self.task_manager.task_store.list_tasks(limit=limit)
+            try:
+                recipient_agent_id = resolve_scoped_agent_did(self.agent)
+            except AgentIdentityUnavailable:
+                return "❌ Task recipient identity unavailable"
+            tasks = await self.task_manager.task_store.list_tasks(
+                recipient_agent_id=recipient_agent_id,
+                limit=limit,
+            )
 
             if not tasks:
                 return "📋 No tasks found"

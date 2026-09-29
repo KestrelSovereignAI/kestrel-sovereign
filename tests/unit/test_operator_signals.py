@@ -138,6 +138,31 @@ async def test_budget_notice_emits_only_when_crossing_low_threshold():
 
 
 @pytest.mark.asyncio
+async def test_budget_notice_counts_external_provider_payload_reservation():
+    """Tool schemas consume the same turn ceiling as named context sections."""
+
+    producer = OperatorSignalProducer(SimpleNamespace(did="agent-1"))
+    llm = _LLM({"name": "openai:api", "model": "gpt-5", "capabilities": {}})
+
+    batch = await producer.collect_for_turn(
+        session_id="s1",
+        llm_service=llm,
+        model_override=None,
+        force_local_only=False,
+        budget_summary={
+            "total_budget": 7168,
+            "total_used": 100,
+            "external_reserved_tokens": 6120,
+        },
+        state_of_mind=None,
+    )
+
+    assert [event.source for event in batch.events] == [SOURCE_TOKEN_BUDGET]
+    assert batch.events[0].payload["remaining_tokens"] == 948
+    assert "948 tokens out of 7168" in batch.content
+
+
+@pytest.mark.asyncio
 async def test_governance_delta_emits_initial_state_and_dedupes_unchanged_state():
     producer = OperatorSignalProducer(SimpleNamespace(did="agent-1"))
     llm = _LLM({"name": "openai:api", "model": "gpt-5", "capabilities": {}})

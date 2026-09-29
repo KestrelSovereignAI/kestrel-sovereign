@@ -5,8 +5,16 @@ Provides fixtures and utilities specific to integration testing,
 including handling of bootstrap state for test agents.
 """
 import os
+
 import pytest
 import pytest_asyncio
+
+from tests.utils.ci_budget import refuse_unbudgeted_timeouts
+
+
+def pytest_collection_modifyitems(config, items):
+    """Refuse a per-test timeout the tier's wall-clock budget cannot hold."""
+    refuse_unbudgeted_timeouts(config, items, "integration")
 
 
 @pytest.fixture(autouse=True)

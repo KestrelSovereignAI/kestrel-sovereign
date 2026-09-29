@@ -6,6 +6,7 @@ import {
     createBearerTokenAuthProvider,
     applyHostAgentPrefix,
     isHostLevelEndpoint,
+    requestApiKeyFromOperator,
 } from '../../kestrel_sovereign/static/js/api_client.mjs';
 
 function createStorage(initial = {}) {
@@ -92,6 +93,46 @@ function createFetchQueue(...responses) {
     return fetchFn;
 }
 
+function createMinimalDocument() {
+    const elements = [];
+    function createElement(tagName) {
+        const listeners = {};
+        const element = {
+            tagName,
+            listeners,
+            children: [],
+            style: {},
+            hidden: false,
+            value: '',
+            removed: false,
+            focused: false,
+            append(...children) {
+                this.children.push(...children);
+            },
+            setAttribute(name, value) {
+                this[name] = String(value);
+            },
+            addEventListener(name, listener) {
+                listeners[name] = listener;
+            },
+            remove() {
+                this.removed = true;
+            },
+            focus() {
+                this.focused = true;
+            },
+        };
+        elements.push(element);
+        return element;
+    }
+    const body = createElement('body');
+    return {
+        documentRef: { body, createElement },
+        elements,
+        body,
+    };
+}
+
 function createClient({ fetchFn, sessionInitial = {}, authProvider = null } = {}) {
     const logger = createLogger();
     const location = { href: '/console', search: '' };
@@ -106,6 +147,58 @@ function createClient({ fetchFn, sessionInitial = {}, authProvider = null } = {}
     return { client, logger, location, sessionStorage };
 }
 
+test('init accepts a host key from the URL fragment without bootstrap disclosure', async () => {
+    const fetchFn = createFetchQueue();
+    const logger = createLogger();
+    const location = {
+        href: '/#key=host-secret',
+        pathname: '/',
+        search: '',
+        hash: '#key=host-secret',
+    };
+    const history = {
+        state: null,
+        calls: [],
+        replaceState(...args) {
+            this.calls.push(args);
+        },
+    };
+    const sessionStorage = createStorage();
+    const client = createApiClient({
+        fetchFn,
+        sessionStorage,
+        location,
+        history,
+        logger,
+    });
+
+    await client.init();
+
+    assert.equal(client.getApiKey(), 'host-secret');
+    assert.equal(sessionStorage.getItem('kestrel_api_key'), 'host-secret');
+    assert.equal(fetchFn.calls.length, 0);
+    assert.deepEqual(history.calls, [[null, '', '/']]);
+});
+
+test('default fleet key entry keeps the secret in a password control', async () => {
+    const { documentRef, elements, body } = createMinimalDocument();
+    const entered = requestApiKeyFromOperator({ documentRef });
+    const input = elements.find((element) => element.tagName === 'input');
+    const form = elements.find((element) => element.tagName === 'form');
+    const overlay = body.children[0];
+
+    assert.equal(input.type, 'password');
+    assert.equal(input.autocomplete, 'off');
+    assert.equal(input.focused, true);
+    input.value = 'key-entered-in-password-control';
+    let prevented = false;
+    form.listeners.submit({ preventDefault() { prevented = true; } });
+
+    assert.equal(await entered, 'key-entered-in-password-control');
+    assert.equal(prevented, true);
+    assert.equal(overlay.removed, true);
+});
+
 test('init caches bootstrap API key when bootstrap succeeds', async () => {
     const fetchFn = createFetchQueue(jsonResponse(200, { key: 'k-secret' }));
     const { client, sessionStorage, location } = createClient({ fetchFn });
@@ -116,6 +209,38 @@ test('init caches bootstrap API key when bootstrap succeeds', async () => {
     assert.equal(sessionStorage.getItem('kestrel_api_key'), 'k-secret');
     assert.equal(location.href, '/console');
     assert.deepEqual(fetchFn.calls.map((call) => call.url), ['/api/auth/key']);
+});
+
+test('init accepts an explicitly entered fleet key when bootstrap and OAuth are absent', async () => {
+    const fetchFn = createFetchQueue(
+        jsonResponse(404, { detail: 'disabled' }),
+        jsonResponse(401, { detail: 'unauthenticated' }),
+    );
+    const logger = createLogger();
+    const location = { href: '/', pathname: '/', search: '', hash: '' };
+    const sessionStorage = createStorage();
+    const requested = [];
+    const client = createApiClient({
+        fetchFn,
+        sessionStorage,
+        location,
+        logger,
+        requestApiKey: async () => {
+            requested.push('requested');
+            return 'operator-entered-key';
+        },
+    });
+
+    await client.init();
+
+    assert.deepEqual(requested, ['requested']);
+    assert.equal(client.getApiKey(), 'operator-entered-key');
+    assert.equal(sessionStorage.getItem('kestrel_api_key'), 'operator-entered-key');
+    assert.equal(location.href, '/');
+    assert.deepEqual(fetchFn.calls.map((call) => call.url), [
+        '/api/auth/key',
+        '/auth/me',
+    ]);
 });
 
 test('init redirects to login when bootstrap is unavailable and OAuth session is absent', async () => {
@@ -683,6 +808,71 @@ test('requestHost sends no CSRF token on safe (GET) host requests (#2293)', asyn
     assert.equal(fetchFn.calls[0].options.headers['X-CSRF-Token'], undefined);
 });
 
+test('stopHost is wired to the host-root cooperative Stop door', async () => {
+    const fetchFn = createFetchQueue(jsonResponse(200, {
+        stop_outcomes: [{ agent_id: 'did:agent:emma', disposition: 'stopped' }],
+    }));
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'machine-key' },
+    });
+    await client.init();
+
+    const result = await client.stopHost({ reason: 'operator andon cord' });
+
+    assert.equal(fetchFn.calls.length, 1);
+    assert.equal(fetchFn.calls[0].url, '/api/host/stop', 'never agent-prefixed');
+    assert.equal(fetchFn.calls[0].options.method, 'POST');
+    assert.deepEqual(
+        JSON.parse(fetchFn.calls[0].options.body),
+        { reason: 'operator andon cord' },
+    );
+    assert.equal(result.stop_outcomes[0].disposition, 'stopped');
+});
+
+test('getHostStopStatus reads caller-scoped host authority and live inventory', async () => {
+    const fetchFn = createFetchQueue(jsonResponse(200, {
+        can_stop: true,
+        in_flight_count: 2,
+    }));
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'machine-key' },
+    });
+    await client.init();
+
+    const result = await client.getHostStopStatus();
+
+    assert.equal(fetchFn.calls.length, 1);
+    assert.equal(fetchFn.calls[0].url, '/api/host/stop/status');
+    assert.equal(fetchFn.calls[0].options.method, undefined);
+    assert.equal(fetchFn.calls[0].options.cache, 'no-store');
+    assert.equal(result.can_stop, true);
+    assert.equal(result.in_flight_count, 2);
+});
+
+test('getPeerStopCircuits reads the circuit door, never the Stop All status', async () => {
+    const fetchFn = createFetchQueue(jsonResponse(200, {
+        threshold: 8,
+        window_seconds: 900,
+        open: [],
+    }));
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'machine-key' },
+    });
+    await client.init();
+    client.setHostAgent('claw');
+
+    const result = await client.getPeerStopCircuits();
+
+    assert.equal(fetchFn.calls.length, 1);
+    assert.equal(fetchFn.calls[0].url, '/api/host/stop/circuit');
+    assert.equal(fetchFn.calls[0].options.method, undefined);
+    assert.equal(fetchFn.calls[0].options.cache, 'no-store');
+    assert.deepEqual(result.open, []);
+});
+
 test('buildAgentUrl maps notification SSE paths through selected host agents', () => {
     const { client } = createClient({ fetchFn: createFetchQueue() });
 
@@ -874,10 +1064,15 @@ test('streamInvoke stores abort controller + request id keyed by the dispatching
     for await (const _ of aIter) { /* drain */ }
     for await (const _ of bIter) { /* drain */ }
 
-    // Once a stream finishes, its slot is cleared but the *other* agent's
-    // slot must remain untouched if that stream is still in flight.
+    // Once a stream finishes, its controller slot is cleared. The exact turn
+    // address remains until the chat owner clears busy state, so a late Stop
+    // in that handoff window cannot widen to agent scope.
     assert.equal(client.getStreamAbortController('agent-A'), null);
     assert.equal(client.getStreamAbortController('agent-B'), null);
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), 'req-A');
+    assert.equal(client.getCurrentStreamRequestId('agent-B'), 'req-B');
+    assert.equal(client.completeCurrentStreamRequestId('agent-A', 'req-A'), true);
+    assert.equal(client.completeCurrentStreamRequestId('agent-B', 'req-B'), true);
     assert.equal(client.getCurrentStreamRequestId('agent-A'), null);
     assert.equal(client.getCurrentStreamRequestId('agent-B'), null);
 });
@@ -945,6 +1140,11 @@ test('streamInvoke publishes and sends a client request id before response heade
 
     stream.finish();
     for await (const _ of iter) { /* drain */ }
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), 'client-turn-id');
+    assert.equal(
+        client.completeCurrentStreamRequestId('agent-A', 'client-turn-id'),
+        true,
+    );
     assert.equal(client.getCurrentStreamRequestId('agent-A'), null);
 });
 

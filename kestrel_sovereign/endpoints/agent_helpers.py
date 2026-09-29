@@ -14,6 +14,81 @@ from kestrel_sovereign.agent.invocation import (
 from kestrel_sovereign.api_errors import ApiHTTPException
 
 
+def require_sovereign_host_lifecycle(request: Request):
+    """Admit only the sovereign-key principal to host lifecycle mutations.
+
+    A FastAPI dependency rather than a call inside a handler, and that
+    placement is load-bearing: it runs before the handler body, so the
+    refusal itself carries no state about what it refused. A check placed
+    after a registry lookup would answer 404 for an unknown package and
+    403 for a known one, making the refusal a probe.
+
+    That is a property of the refusal, not a confidentiality guarantee
+    about the surface. `GET /api/features` deliberately returns the whole
+    catalogue with per-package status to any *authenticated* caller (it
+    sits behind the auth middleware, unlike `/health` or `/metrics`), so
+    a non-sovereign caller can already read what is installed and never
+    needs a probe pair. Do not cite this as though it hid anything.
+
+    Lives here, next to :func:`get_caller`, because it is the host's
+    authority predicate and not one endpoint module's private helper.
+    #3214 was what that privacy cost: `POST /api/features/{name}/install`
+    documented "requires a sovereign agent — governed agents cannot
+    install packages" and enforced nothing, while the predicate that
+    would have said so sat in a sibling module guarding
+    `POST /api/agents`.
+    """
+
+    if not caller_is_sovereign(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Sovereign authority is required.",
+        )
+    return get_caller(request)
+
+
+def caller_is_sovereign(request: Request) -> bool:
+    """Whether the caller would pass :func:`require_sovereign_host_lifecycle`.
+
+    The same predicate, asked without raising, so a read can tell the
+    console which controls to draw or which host view to fetch
+    (``can_manage_features`` on the feature catalogue, #3234;
+    ``can_view_node`` on the agent-local IPFS status, #3226). Absent or
+    non-sovereign caller → False.
+
+    This is a hint for the client, never the gate: a mutation or a
+    host-scoped read still declares the dependency, which refuses before
+    the handler body runs. The one other use is narrowing the reach of an
+    operation every authenticated caller is admitted to — agent Stop
+    cascades through signed descendants only for the sovereign (#3143) —
+    where nothing is refused, so there is no probe to avoid.
+    """
+    caller = get_caller(request)
+    return getattr(caller, "is_sovereign", False) is True
+
+
+def sovereign_actor_id(request: Request) -> str:
+    """Name the sovereign principal a host control-plane receipt is bound to.
+
+    Called as the FIRST statement of a host Stop/Hold handler rather than as
+    a dependency: those handlers resolve a target against the live inventory,
+    so a refusal raised after that lookup would answer 404 for an unknown
+    target and 403 for a known one, making the refusal a probe.
+
+    One copy for both host doors — a durable receipt must not name the actor
+    one way when Stop wrote it and another way when Hold did.
+    """
+
+    if not caller_is_sovereign(request):
+        raise ApiHTTPException(
+            status_code=403,
+            code="sovereign_authority_required",
+            message="Host control-plane authority is required.",
+        )
+    identity = get_caller(request).identity
+    return identity if isinstance(identity, str) and identity.strip() else "api_key"
+
+
 def get_caller(request: Request):
     """Return the CallerContext attached by the auth middleware, or None.
 
@@ -89,6 +164,67 @@ def request_invocation_provenance(
     )
 
 
+async def prime_durable_stop_fence(
+    request: Request,
+    agent: object,
+    invocation_id: str,
+) -> bool:
+    """Reinstall a durable exact-turn Stop before lifecycle registration.
+
+    The in-memory reservation closes the live race between Stop and request
+    registration. This lookup closes the longer restart/delivery-delay window:
+    an acknowledged durable Stop remains authoritative even after that short
+    reservation ages out. Stores without this optional query are retained for
+    compatibility in tests and embedded deployments that do not expose Stop.
+    """
+
+    store = getattr(request.app.state, "stop_receipt_store", None)
+    lookup = getattr(store, "has_acknowledged_turn_stop", None)
+    if not callable(lookup):
+        startup_error = getattr(
+            request.app.state, "stop_receipt_store_error", ""
+        )
+        if isinstance(startup_error, str) and startup_error:
+            raise ApiHTTPException(
+                status_code=503,
+                code="stop_evidence_unavailable",
+                message=(
+                    "Durable Stop evidence could not be checked before execution."
+                ),
+            )
+        return False
+    agent_id = getattr(agent, "agent_id", None)
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        agent_id = "local-agent"
+    try:
+        stopped = await lookup(agent_id, invocation_id)
+    except Exception as error:
+        raise ApiHTTPException(
+            status_code=503,
+            code="stop_evidence_unavailable",
+            message=(
+                "Durable Stop evidence could not be checked before execution."
+            ),
+        ) from error
+    if not isinstance(stopped, bool):
+        raise ApiHTTPException(
+            status_code=503,
+            code="stop_evidence_unavailable",
+            message="Durable Stop evidence returned an invalid result.",
+        )
+    if not stopped:
+        return False
+    reserve = getattr(type(agent), "reserve_request_cancellation", None)
+    if not callable(reserve):
+        raise ApiHTTPException(
+            status_code=503,
+            code="stop_fence_unavailable",
+            message="The stopped request cannot be fenced safely.",
+        )
+    reserve(agent, invocation_id)
+    return True
+
+
 def stopped_invocation_http_error(invocation_id: str) -> ApiHTTPException:
     """Translate cooperative turn cancellation at a synchronous HTTP door."""
 
@@ -98,6 +234,43 @@ def stopped_invocation_http_error(invocation_id: str) -> ApiHTTPException:
         message="Request stopped during execution.",
         headers={"X-Request-ID": invocation_id_response_header(invocation_id)},
     )
+
+
+def invocation_was_self_fenced(agent: object, invocation_id: str) -> bool:
+    """Whether infrastructure, rather than peer/operator Stop, ended a turn."""
+
+    accessor = getattr(agent, "is_request_self_fenced", None)
+    return bool(
+        callable(accessor)
+        and accessor(invocation_id) is True
+    )
+
+
+def self_fenced_invocation_http_error(
+    invocation_id: str,
+) -> ApiHTTPException:
+    """Expose owner lease loss as retryable infrastructure unavailability."""
+
+    return ApiHTTPException(
+        status_code=503,
+        code="invocation_owner_lease_lost",
+        message="Invocation ownership was lost; retry the request.",
+        headers={
+            "Retry-After": "1",
+            "X-Request-ID": invocation_id_response_header(invocation_id),
+        },
+    )
+
+
+def cancelled_invocation_http_error(
+    agent: object,
+    invocation_id: str,
+) -> ApiHTTPException:
+    """Translate a cancellation marker without forging Stop provenance."""
+
+    if invocation_was_self_fenced(agent, invocation_id):
+        return self_fenced_invocation_http_error(invocation_id)
+    return stopped_invocation_http_error(invocation_id)
 
 
 def get_agent(request: Request):

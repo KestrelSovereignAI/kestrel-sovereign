@@ -92,6 +92,9 @@ def test_observability_summary_endpoint_returns_serialized_summary():
         metadata={"foo": "bar"},
     )
     agent = MagicMock(
+        # The summary scopes by the agent's DID and refuses a MagicMock
+        # fabrication as identity (the shared guard, #3229).
+        did="did:test:claw",
         observability_store=MagicMock(query_events=AsyncMock(return_value=[event]))
     )
 
@@ -216,6 +219,34 @@ def test_chat_completions_reports_cooperative_stop_as_conflict():
         assert response.headers["X-Request-ID"] == (
             "openai-stopped-turn-%E2%98%83"
         )
+    finally:
+        _restore_app(app, original)
+
+
+def test_chat_completions_reports_owner_self_fence_as_retryable():
+    from kestrel_sovereign.agent.invocation import InvocationSelfFencedError
+
+    agent = MagicMock()
+    agent.process_input = AsyncMock(
+        side_effect=InvocationSelfFencedError("owner lease lost")
+    )
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={"X-API-Key": "test-key"},
+                    json={
+                        "id": "openai-self-fenced-turn",
+                        "messages": [{"role": "user", "content": "retry this"}],
+                    },
+                )
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "invocation_owner_lease_lost"
+        assert response.headers["Retry-After"] == "1"
+        assert response.headers["X-Request-ID"] == "openai-self-fenced-turn"
     finally:
         _restore_app(app, original)
 

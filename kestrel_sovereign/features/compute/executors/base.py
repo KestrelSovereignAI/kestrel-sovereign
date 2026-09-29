@@ -17,7 +17,8 @@ from datetime import datetime
 from typing import Optional, TypeVar, cast
 from uuid import uuid4
 
-from ..models import ComputeScript, ExecutionRecord
+from ..models import ComputeCommand, ComputeScript, ExecutionRecord
+from kestrel_sovereign.security.subprocess_env import SAFE_SUBPROCESS_ENV_VARS
 
 logger = logging.getLogger(__name__)
 
@@ -33,20 +34,11 @@ _T = TypeVar("_T")
 # Never pass API keys, tokens, encryption keys (e.g. KESTREL_DATA_KEY), or
 # other secrets. Shared by every executor that builds a subprocess env so the
 # host environment is never leaked into script code (F129).
-_SAFE_ENV_VARS = {
-    "PATH",
-    "HOME",
-    "USER",
-    "SHELL",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TMPDIR",
-    "TERM",
-    "TZ",
-    "PYTHONPATH",
-    "VIRTUAL_ENV",
-}
+# Preserve the executor's public-by-convention module contract: LocalExecutor
+# and UvExecutor re-export this exact mutable ``set`` object.  The process-wide
+# source allowlist remains an immutable frozenset; compute gets its historical
+# local copy while the new computer-use boundary shares the canonical values.
+_SAFE_ENV_VARS = set(SAFE_SUBPROCESS_ENV_VARS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +68,11 @@ class _ExecutionResult:
     container_id: Optional[str] = None
 
 
+# What one run executes: a script (text an interpreter reads) or a
+# command (an argv vector exec runs). The lifecycle below needs only an
+# ``id`` from either.
+ExecutionSubject = ComputeScript | ComputeCommand
+
 _ExecutionRunner = Callable[[_ExecutionContext], Awaitable[_ExecutionResult]]
 _ExecutionCleanup = Callable[[_ExecutionContext], Awaitable[None]]
 _ProcessTerminator = Callable[[], Awaitable[None]]
@@ -88,13 +85,17 @@ class ExecutionError(Exception):
 
 
 class ExecutionTimeoutError(ExecutionError):
-    """Raised when script execution times out."""
+    """Raised when an execution times out.
+
+    ``script_id`` carries the id of whatever was executed — a
+    :class:`ComputeScript` or a :class:`ComputeCommand`.
+    """
 
     def __init__(self, script_id: str, timeout_seconds: int):
         self.script_id = script_id
         self.timeout_seconds = timeout_seconds
         super().__init__(
-            f"Script {script_id[:8]}... timed out after {timeout_seconds}s"
+            f"Execution {script_id[:8]}... timed out after {timeout_seconds}s"
         )
 
 
@@ -102,6 +103,26 @@ class ExecutionEnvironmentError(ExecutionError):
     """Raised when the execution environment is not available."""
 
     pass
+
+
+class CommandExecutionUnsupported(ExecutionError):
+    """Raised when an executor cannot execute an argv vector.
+
+    The refusal is the point. An executor that cannot exec argv could
+    always quote the vector into a script and run that instead — which
+    is exactly the substitution #3187 was filed for: the words come back
+    under a shell's grammar, so ``["eval", "printf HACKED"]`` runs
+    ``printf`` while the caller believes it ran ``eval``.
+    """
+
+    def __init__(self, executor_name: str):
+        self.executor_name = executor_name
+        super().__init__(
+            f"{executor_name} executor cannot exec an argv vector; it runs "
+            f"scripts through an interpreter. Refusing rather than quoting "
+            f"the vector into a script, which would re-read it as shell "
+            f"grammar."
+        )
 
 
 class BaseExecutor(ABC):
@@ -161,9 +182,35 @@ class BaseExecutor(ABC):
         """
         pass
 
+    async def execute_command(
+        self,
+        command: ComputeCommand,
+        working_dir: Optional[str] = None,
+    ) -> ExecutionRecord:
+        """Execute an argv vector directly — no shell, no script file.
+
+        Not abstract, because most executors legitimately cannot do it:
+        :class:`UvExecutor` runs Python, and :class:`LocalExecutor` has
+        no isolation to offer a raw vector. The default refuses. A
+        subclass that overrides it undertakes that ``command.argv[0]``
+        is the program that runs and nothing in the vector is read as
+        grammar.
+
+        Args:
+            command: The :class:`ComputeCommand` to execute
+            working_dir: Optional working directory for execution
+
+        Returns:
+            ExecutionRecord with stdout, stderr, exit_code, etc.
+
+        Raises:
+            CommandExecutionUnsupported: If this executor runs only scripts
+        """
+        raise CommandExecutionUnsupported(self.name)
+
     async def _execute_with_lifecycle(
         self,
-        script: ComputeScript,
+        subject: ExecutionSubject,
         *,
         temp_dir_prefix: str,
         runner: _ExecutionRunner,
@@ -179,16 +226,18 @@ class BaseExecutor(ABC):
         try:
             result = await runner(context)
             record = self._build_record(
-                script=script,
+                subject=subject,
                 context=context,
                 exit_code=result.exit_code,
                 stdout=self._decode_output(result.stdout),
                 stderr=self._decode_output(result.stderr),
                 container_id=result.container_id,
+                stdout_truncated=bool(result.stdout.truncated),
+                stderr_truncated=bool(result.stderr.truncated),
             )
             logger.info(
-                "Script %s... completed with exit code %s in %.2fs",
-                script.id[:8],
+                "Execution %s... completed with exit code %s in %.2fs",
+                subject.id[:8],
                 result.exit_code,
                 record.duration_seconds or 0.0,
             )
@@ -198,7 +247,7 @@ class BaseExecutor(ABC):
         except Exception as error:
             logger.error("%s execution failed: %s", self.name, error, exc_info=True)
             return self._build_record(
-                script=script,
+                subject=subject,
                 context=context,
                 exit_code=-1,
                 stdout="",
@@ -445,21 +494,25 @@ class BaseExecutor(ABC):
     def _build_record(
         self,
         *,
-        script: ComputeScript,
+        subject: ExecutionSubject,
         context: _ExecutionContext,
         exit_code: Optional[int],
         stdout: str,
         stderr: str,
         container_id: Optional[str] = None,
+        stdout_truncated: bool = False,
+        stderr_truncated: bool = False,
     ) -> ExecutionRecord:
         return ExecutionRecord(
             id=context.execution_id,
-            script_id=script.id,
+            script_id=subject.id,
             started_at=context.started_at,
             completed_at=datetime.now(),
             exit_code=exit_code,
             stdout=stdout,
             stderr=stderr,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
             executor=self.name,
             container_id=container_id,
             workdir=context.workdir,

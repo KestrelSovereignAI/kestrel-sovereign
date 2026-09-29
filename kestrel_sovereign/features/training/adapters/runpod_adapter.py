@@ -16,10 +16,19 @@ import asyncio
 import logging
 import os
 import uuid
+from collections.abc import Awaitable, Mapping
 from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
+
+from ._session_training_lifecycle import (
+    ReleaseIntent,
+    SessionLifecycleTimeouts,
+    SessionProviderHooks,
+    SessionTrainingLifecycle,
+    SessionTrainingRecord,
+)
 
 from ..protocol import (
     TrainingProviderError,
@@ -48,6 +57,82 @@ from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logger = logging.getLogger(__name__)
 
+# Observed pod states that prove a release. A stopped (EXITED) pod no longer
+# bills for its GPU, which is all a pause promises; a terminated one no longer
+# exists at all.
+_PAUSED_POD_STATES = frozenset({"EXITED", "STOPPED", "TERMINATED"})
+_TERMINATED_POD_STATES = frozenset({"TERMINATED"})
+# Read-back marker for a pod RunPod answers 404 for: it no longer exists.
+_POD_GONE = "GONE"
+
+
+def _is_pod_not_found(error: Exception) -> bool:
+    """Whether a RunPod call failed because the pod no longer exists.
+
+    ``RunPodAPIError`` carries the HTTP status itself; the managed provider's
+    ``raise_for_status()`` errors carry it on their response.
+    """
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+    return status_code == 404
+
+
+async def _pod_action(action: Awaitable[object], pod_id: str) -> None:
+    """Await a stop/terminate; a pod already gone is left for confirmation."""
+    try:
+        await action
+    except Exception as error:
+        if not _is_pod_not_found(error):
+            raise
+        logger.info(f"RunPod pod {pod_id} no longer exists")
+
+
+async def _read_pod_status(
+    manager, pod_id: str, outcome: str
+) -> tuple[object, str | None]:
+    """Read the pod back: ``(observed, STATUS)``, with ``STATUS`` ``"GONE"`` on 404.
+
+    Raises if the provider cannot be asked or the read fails for another reason.
+    """
+    get_status = getattr(manager.provider, "get_status", None)
+    if get_status is None:
+        raise TrainingProviderError(
+            f"{type(manager.provider).__name__} cannot confirm pod {pod_id} was "
+            f"{outcome}; it is retained until a release succeeds",
+            provider="runpod",
+        )
+    try:
+        observed = await asyncio.to_thread(get_status, pod_id)
+    except Exception as error:
+        if _is_pod_not_found(error):
+            return None, _POD_GONE
+        raise
+    status = None
+    if isinstance(observed, Mapping):
+        status = observed.get("status") or observed.get("desiredStatus")
+    return observed, status.upper() if isinstance(status, str) else None
+
+
+async def _confirm_pod_state(
+    manager, pod_id: str, accepted: frozenset[str], outcome: str
+) -> None:
+    """Read the pod back and raise unless it is in an ``accepted`` state.
+
+    A pod RunPod no longer knows (404) is released. Anything else - an error
+    payload, an empty response, or a pod still RUNNING - raises, so the job
+    stays in custody and a later release retries.
+    """
+    observed, status = await _read_pod_status(manager, pod_id, outcome)
+    if status == _POD_GONE:
+        return
+    if status not in accepted:
+        raise TrainingProviderError(
+            f"RunPod did not confirm pod {pod_id} was {outcome}: observed "
+            f"{observed!r}; it is retained until a release succeeds",
+            provider="runpod",
+        )
+
 
 class RunPodTrainingAdapter:
     """
@@ -71,15 +156,38 @@ class RunPodTrainingAdapter:
     provider_name = "runpod"
     provider_type = ProviderType.SESSION_BASED
 
-    def __init__(self, manager=None):
+    def __init__(
+        self,
+        manager=None,
+        *,
+        lifecycle_timeouts: Optional[SessionLifecycleTimeouts] = None,
+    ):
         """
         Initialize with optional pre-configured manager.
 
         Args:
             manager: RunPodManager instance (lazy loaded if not provided)
+            lifecycle_timeouts: Teardown bounds (defaults from kestrel_config)
         """
         self._manager = manager
-        self._active_jobs: dict[str, dict] = {}  # job_id -> {session, companion_id, ...}
+        self._lifecycle = SessionTrainingLifecycle(
+            SessionProviderHooks(
+                provider_name=self.provider_name,
+                display_name="RunPod",
+                acquire_session=self._acquire_session,
+                session_id=lambda session: session.pod_id,
+                validate_session=self._validate_session,
+                submit_job=self._submit_job,
+                release_session=self._release_session,
+                cancel_provider_job=self._cancel_provider_job,
+            ),
+            lifecycle_timeouts,
+        )
+
+    @property
+    def _active_jobs(self) -> dict[str, SessionTrainingRecord]:
+        """Live custody registry: a job stays here until its pod is released."""
+        return self._lifecycle.records
 
     def _get_manager(self):
         """Lazy load the RunPod manager.
@@ -138,6 +246,9 @@ class RunPodTrainingAdapter:
         2. Wait for model to load (may take 5-10 min on first run)
         3. Submit training job via HTTP API
 
+        Steps 2-3 run in a background submission task owned by the shared
+        session lifecycle, so this returns as soon as the pod is up.
+
         Args:
             companion_id: Companion being trained
             avatar_data: Training image bytes (JPEG/PNG)
@@ -147,71 +258,16 @@ class RunPodTrainingAdapter:
             TrainingJob with session tracking info
         """
         config = config or TrainingConfig()
-        job_id = str(uuid.uuid4())
         trigger_word = config.trigger_word or f"TOK{companion_id[:8]}"
-        now = datetime.now(timezone.utc)
 
         try:
-            manager = self._get_manager()
-
-            # Step 1: Start or resume training pod
-            logger.info(f"Starting RunPod training pod for companion {companion_id}")
-            session = await manager.start_training_pod(companion_id)
-
-            if session is None:
-                raise TrainingSubmissionError(
-                    "Failed to start RunPod training pod - no GPUs available or all profiles failed"
-                )
-
-            if not session.backend_base_url:
-                raise TrainingSubmissionError(
-                    f"Training pod {session.pod_id} started but has no backend URL"
-                )
-
-            logger.info(f"Training pod ready: {session.pod_id}, URL: {session.backend_base_url}")
-
-            # Step 2: Submit training job in background
-            # DON'T wait for model ready here - that blocks the HTTP response for 5-10 min
-            # The background task will handle waiting and submission
-
-            # Track this job with PENDING state - training not yet started
-            self._active_jobs[job_id] = {
-                "session": session,
-                "companion_id": companion_id,
-                "trigger_word": trigger_word,
-                "started_at": now,
-                "config": config,
-                "avatar_data": avatar_data,  # Store for background submission
-                "training_job_id": None,  # Will be set when /train is called
-                "state": "pending",  # Model loading, not yet submitted
-            }
-
-            # Launch background task to wait for model and submit training
-            import asyncio
-            asyncio.create_task(
-                self._submit_training_when_ready(
-                    job_id=job_id,
-                    manager=manager,
-                    session=session,
-                    avatar_data=avatar_data,
-                    companion_id=companion_id,
-                    callback_url=config.callback_url,
-                )
-            )
-
-            return TrainingJob(
-                job_id=job_id,
+            record = await self._lifecycle.start(
+                job_id=str(uuid.uuid4()),
                 companion_id=companion_id,
-                provider=self.provider_name,
-                state=TrainingState.PENDING,  # PENDING until model ready
                 trigger_word=trigger_word,
-                created_at=now,
-                started_at=None,  # Not started yet
                 config=config,
-                provider_job_id=None,  # Will be set when submitted
-                provider_session_id=session.pod_id,  # RunPod pod ID
+                avatar_data=avatar_data,
             )
-
         except TrainingProviderError:
             raise
         except httpx.HTTPError as e:
@@ -224,50 +280,153 @@ class RunPodTrainingAdapter:
             logger.error(f"RunPod training submission failed: {e}", exc_info=True)
             raise TrainingSubmissionError(f"Failed to start RunPod training: {e}")
 
-    async def _submit_training_when_ready(
-        self,
-        job_id: str,
-        manager,
-        session,
-        avatar_data: bytes,
-        companion_id: str,
-        callback_url: Optional[str] = None,
-    ) -> None:
-        """
-        Background task: Wait for model to load, then submit training.
+        logger.info(
+            f"Training pod ready: {record.session.pod_id}, "
+            f"URL: {record.session.backend_base_url}"
+        )
+        return self._lifecycle.training_job(record)
 
-        This runs asynchronously so the HTTP endpoint can return immediately.
-        Updates job state from PENDING -> TRAINING when submission succeeds.
-        """
-        try:
-            logger.info(f"[{job_id}] Background: waiting for model ready...")
+    # -- Provider hooks for the shared session lifecycle -------------------
 
-            # Wait for FLUX model to load (5-10 min on cold start)
-            training_job_id = await manager.submit_training_job(
-                session=session,
-                avatar_data=avatar_data,
-                companion_id=companion_id,
-                callback_url=callback_url,
-                wait_for_model_ready=True,  # This does the waiting
+    async def _acquire_session(
+        self, job_id: str, companion_id: str, config: TrainingConfig
+    ):
+        """Start or resume the training pod for one job."""
+        manager = self._get_manager()
+        logger.info(f"Starting RunPod training pod for companion {companion_id}")
+        session = await manager.start_training_pod(companion_id)
+        if session is None:
+            raise TrainingSubmissionError(
+                "Failed to start RunPod training pod - no GPUs available or all profiles failed"
+            )
+        return session
+
+    @staticmethod
+    def _validate_session(session) -> None:
+        if not session.backend_base_url:
+            raise TrainingSubmissionError(
+                f"Training pod {session.pod_id} started but has no backend URL"
             )
 
-            # Update job with training_job_id
-            if job_id in self._active_jobs:
-                self._active_jobs[job_id]["training_job_id"] = training_job_id
-                self._active_jobs[job_id]["state"] = "training"
-                self._active_jobs[job_id]["started_at"] = datetime.now(timezone.utc)
-                logger.info(f"[{job_id}] Training submitted: {training_job_id}")
+    async def _submit_job(self, record: SessionTrainingRecord, avatar_data: bytes) -> str:
+        """Wait for the FLUX model (5-10 min on cold start), then POST /train."""
+        return await self._get_manager().submit_training_job(
+            session=record.session,
+            avatar_data=avatar_data,
+            companion_id=record.companion_id,
+            callback_url=record.config.callback_url,
+            wait_for_model_ready=True,
+        )
 
-        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
-            logger.error(f"[{job_id}] Background training network error: {e}")
-            if job_id in self._active_jobs:
-                self._active_jobs[job_id]["state"] = "failed"
-                self._active_jobs[job_id]["error"] = str(e)
-        except Exception as e:
-            logger.error(f"[{job_id}] Background training submission failed: {e}", exc_info=True)
-            if job_id in self._active_jobs:
-                self._active_jobs[job_id]["state"] = "failed"
-                self._active_jobs[job_id]["error"] = str(e)
+    async def _cancel_provider_job(
+        self, record: SessionTrainingRecord, provider_job_id: str
+    ) -> dict:
+        return await self._get_manager().cancel_training_job(
+            record.session, provider_job_id
+        )
+
+    async def _release_session(self, session) -> None:
+        """Release exactly this job's pod, raising unless RunPod confirms it.
+
+        A persistent pod (the profile's ``persistent_pod_id`` resolves at
+        release time) is paused so it can be resumed; every other pod is
+        terminated. Both act on this pod's identity rather than through the
+        manager's ``terminate_session``/``terminate_pod``, which log a failed
+        call and return (and only stop, never terminate).
+
+        A provider call that returns is not proof either: kestrel-cloud-runpod's
+        ``DirectRunPodProvider.terminate_pod``/``stop_pod`` raise on an HTTP
+        error but report ``TERMINATED``/``EXITED`` for an empty 204 response
+        without observing the pod. The release therefore reads the pod back
+        and succeeds only on the confirmed state (see ``_confirm_pod_state``).
+        A provider with no terminate call gets the pod stopped and the release
+        still raises (see ``_stop_unterminable_pod``).
+        """
+        manager = self._get_manager()
+        persistent_pod_id = manager._expand_single_env_var(
+            session.profile.persistent_pod_id
+        )
+        if persistent_pod_id is not None:
+            await self._pause_pod(manager, session)
+        else:
+            await self._terminate_pod(manager, session)
+
+    @staticmethod
+    async def _pause_pod(manager, session) -> None:
+        await RunPodTrainingAdapter._stop_pod(manager, session)
+        logger.info(f"Paused persistent RunPod pod {session.pod_id}")
+
+    @staticmethod
+    async def _stop_pod(manager, session) -> None:
+        """Stop this job's pod and confirm it no longer bills for its GPU."""
+        # stop_session() takes no session argument: it stops whatever pod the
+        # manager holds, so it is only used when that is this job's pod (it
+        # also records GPU metering and lets a provider failure propagate).
+        if manager._session is session:
+            await _pod_action(manager.stop_session(), session.pod_id)
+        else:
+            await _pod_action(
+                asyncio.to_thread(manager.provider.stop_pod, session.pod_id),
+                session.pod_id,
+            )
+        await _confirm_pod_state(manager, session.pod_id, _PAUSED_POD_STATES, "paused")
+        await RunPodTrainingAdapter._forget_session(manager, session)
+
+    @staticmethod
+    async def _stop_unterminable_pod(manager, session) -> None:
+        """Stop an on-demand pod the provider cannot terminate, then raise.
+
+        ``ManagedRunPodProvider`` has ``stop_pod`` but no ``terminate_pod``.
+        Stopping ends GPU billing, but the stopped pod's disk still bills, so
+        the release is only partial: it raises and the job stays
+        ``RELEASE_FAILED`` with its pod ID until the pod is terminated. A pod
+        already stopped by an earlier attempt is not stopped again, and one
+        RunPod no longer knows (404) is fully released.
+        """
+        _, status = await _read_pod_status(manager, session.pod_id, "stopped")
+        if status == _POD_GONE:
+            await RunPodTrainingAdapter._forget_session(manager, session)
+            logger.info(f"On-demand RunPod pod {session.pod_id} no longer exists")
+            return
+        if status in _TERMINATED_POD_STATES:
+            await RunPodTrainingAdapter._forget_session(manager, session)
+            logger.info(f"Terminated on-demand RunPod pod {session.pod_id}")
+            return
+        if status not in _PAUSED_POD_STATES:
+            await RunPodTrainingAdapter._stop_pod(manager, session)
+        else:
+            await RunPodTrainingAdapter._forget_session(manager, session)
+        raise TrainingProviderError(
+            f"{type(manager.provider).__name__} cannot terminate on-demand pod "
+            f"{session.pod_id}: it was stopped (GPU billing ended) but its disk "
+            "still bills; it is retained until it is terminated",
+            provider="runpod",
+        )
+
+    @staticmethod
+    async def _terminate_pod(manager, session) -> None:
+        terminate_pod = getattr(manager.provider, "terminate_pod", None)
+        if terminate_pod is None:
+            await RunPodTrainingAdapter._stop_unterminable_pod(manager, session)
+            return
+        await _pod_action(
+            asyncio.to_thread(terminate_pod, session.pod_id), session.pod_id
+        )
+        # A stopped pod still bills for its disk, so only TERMINATED releases it.
+        await _confirm_pod_state(
+            manager, session.pod_id, _TERMINATED_POD_STATES, "terminated"
+        )
+        await RunPodTrainingAdapter._forget_session(manager, session)
+        logger.info(f"Terminated on-demand RunPod pod {session.pod_id}")
+
+    @staticmethod
+    async def _forget_session(manager, session) -> None:
+        """The manager must not hand a released pod to its next caller."""
+        async with manager._lock:
+            if manager._session is session:
+                manager._session = None
+
+    # -- TrainingProvider --------------------------------------------------
 
     async def get_status(self, job_id: str) -> TrainingStatus:
         """
@@ -282,49 +441,29 @@ class RunPodTrainingAdapter:
             TrainingStatus with current progress
         """
         try:
-            if job_id not in self._active_jobs:
-                raise TrainingStatusError(f"Unknown job: {job_id}")
-
-            job_info = self._active_jobs[job_id]
-            session = job_info["session"]
-            training_job_id = job_info.get("training_job_id")
-            manager = self._get_manager()
-
-            # Check if still waiting for model to load (background submission)
-            if training_job_id is None:
-                job_state = job_info.get("state", "pending")
-                if job_state == "failed":
-                    return TrainingStatus(
-                        job_id=job_id,
-                        state=TrainingState.FAILED,
-                        progress=0.0,
-                        error=job_info.get("error", "Background submission failed"),
-                    )
-                # Still waiting for model to load
-                return TrainingStatus(
-                    job_id=job_id,
-                    state=TrainingState.PREPARING,
-                    progress=0.0,
-                    message="Waiting for FLUX model to load (may take 5-10 min)...",
-                )
+            lookup = self._lifecycle.local_status(
+                job_id,
+                preparing_message="Waiting for FLUX model to load (may take 5-10 min)...",
+            )
+            if lookup.poll is None:
+                return lookup.status
+            record = lookup.poll
 
             # Poll the training status via manager
+            manager = self._get_manager()
             status_result = await manager.poll_training_status(
-                session=session,
-                job_id=training_job_id,
+                session=record.session,
+                job_id=record.provider_job_id,
             )
 
             # Map pod status to unified status
             pod_status = status_result.get("status", "unknown").lower()
             progress = status_result.get("progress", 0.0)
             error = status_result.get("error")
-            output_path = status_result.get("output_path")
 
             # Map RunPod training status to unified TrainingState
             if pod_status == "completed":
                 state = TrainingState.COMPLETED
-                # Store output path for download
-                job_info["output_path"] = output_path
             elif pod_status == "failed":
                 state = TrainingState.FAILED
             elif pod_status in ("running", "training"):
@@ -337,17 +476,13 @@ class RunPodTrainingAdapter:
                 # Map from RunPod pod state if no training status
                 state = TrainingState.from_runpod_state(pod_status)
 
-            elapsed = None
-            if job_info.get("started_at"):
-                elapsed = (datetime.now(timezone.utc) - job_info["started_at"]).total_seconds()
-
             return TrainingStatus(
                 job_id=job_id,
                 state=state,
                 progress=progress,
                 message=status_result.get("message"),
                 error=error,
-                elapsed_seconds=elapsed,
+                elapsed_seconds=record.elapsed_seconds(),
                 provider_details=status_result,
             )
 
@@ -376,18 +511,19 @@ class RunPodTrainingAdapter:
             LoRA weights as bytes, or None if not ready
         """
         try:
-            if job_id not in self._active_jobs:
+            record = self._lifecycle.get(job_id)
+            if record is None:
                 raise DownloadError(f"Unknown job: {job_id}")
+            training_job_id = record.provider_job_id
+            if training_job_id is None:
+                raise DownloadError(f"Job {job_id} was never submitted to RunPod")
 
-            job_info = self._active_jobs[job_id]
-            session = job_info["session"]
-            training_job_id = job_info["training_job_id"]
             manager = self._get_manager()
 
             # Download via manager
             logger.info(f"Downloading LoRA weights for job {training_job_id}")
             lora_bytes = await manager.download_lora(
-                session=session,
+                session=record.session,
                 job_id=training_job_id,
             )
 
@@ -405,82 +541,46 @@ class RunPodTrainingAdapter:
 
     async def cancel(self, job_id: str) -> bool:
         """
-        Cancel a running training job.
+        Cancel a training job and release its pod.
 
-        For RunPod persistent pods, this pauses the pod (can be resumed).
-        For on-demand pods, this terminates the pod.
+        Stops the background submission, cancels a published RunPod job, then
+        releases the pod: a persistent pod is paused (it can be resumed), an
+        on-demand pod is terminated. Concurrent and repeated calls share one
+        teardown.
 
         Args:
             job_id: Job to cancel
 
         Returns:
-            True if cancelled successfully
+            True once no pod or task of the job remains; False if the job is
+            unknown or its pod could not be released (custody is retained).
         """
-        try:
-            if job_id not in self._active_jobs:
-                return False
-
-            job_info = self._active_jobs[job_id]
-            session = job_info["session"]
-            manager = self._get_manager()
-
-            # Stop the session (pauses pod for persistent, terminates for on-demand)
-            await manager.stop_session()
-
-            # Clean up tracking
-            del self._active_jobs[job_id]
-
+        released = await self._lifecycle.release(job_id, ReleaseIntent.CANCEL)
+        if released:
             logger.info(f"Cancelled RunPod training job {job_id}")
-            return True
-
-        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
-            logger.error(f"Failed to cancel RunPod training: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to cancel RunPod training: {e}", exc_info=True)
-            return False
+        return released
 
     async def cleanup(self, job_id: str) -> None:
         """
         Clean up resources for a completed job.
 
-        For RunPod persistent pods, this pauses the pod (cost-free while paused).
-        For on-demand pods, this terminates the pod.
+        Releases the job's pod: a persistent pod is paused (cost-free while
+        paused), an on-demand pod is terminated. A failed release keeps the
+        job tracked so it can be retried.
 
         IMPORTANT: Always call this after download_weights() to stop billing!
 
         Args:
             job_id: Job to clean up
         """
-        try:
-            if job_id not in self._active_jobs:
-                return
+        if self._lifecycle.get(job_id) is None:
+            return
+        if not await self._lifecycle.release(job_id, ReleaseIntent.CLEANUP):
+            logger.warning(f"Failed to cleanup RunPod session for job {job_id}; custody retained")
 
-            job_info = self._active_jobs[job_id]
-            session = job_info["session"]
-            manager = self._get_manager()
-
-            # Check if this is a persistent pod (configured in profile)
-            # Expand env var at runtime to handle dynamic pod ID changes
-            profile = session.profile
-            resolved_pod_id = manager._expand_single_env_var(profile.persistent_pod_id)
-            is_persistent = resolved_pod_id is not None
-
-            if is_persistent:
-                logger.info(f"Pausing persistent pod {session.pod_id} after training cleanup")
-                await manager.stop_session()
-            else:
-                # Terminate on-demand pod
-                logger.info(f"Terminating on-demand pod {session.pod_id}")
-                await manager.terminate_session(session)
-
-            # Clean up tracking
-            del self._active_jobs[job_id]
-
-        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
-            logger.warning(f"Failed to cleanup RunPod session: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to cleanup RunPod session: {e}", exc_info=True)
+    async def close(self) -> None:
+        """Drain background submissions and release every pod this adapter holds."""
+        await self._lifecycle.close()
 
     async def generate_image(
         self,
@@ -522,11 +622,9 @@ class RunPodTrainingAdapter:
             if session is None:
                 logger.info("Starting RunPod pod for image generation...")
                 # Use existing active session if we have one
-                for job_info in self._active_jobs.values():
-                    if job_info.get("session"):
-                        session = job_info["session"]
-                        logger.info(f"Reusing existing session: {session.pod_id}")
-                        break
+                session = self._lifecycle.any_live_session()
+                if session is not None:
+                    logger.info(f"Reusing existing session: {session.pod_id}")
 
                 if session is None:
                     # Start a new pod
@@ -658,10 +756,7 @@ class RunPodTrainingAdapter:
 
             if session is None:
                 # Use any active session we're tracking
-                for job_info in self._active_jobs.values():
-                    if job_info.get("session"):
-                        session = job_info["session"]
-                        break
+                session = self._lifecycle.any_live_session()
 
             if session is None:
                 # No active session, so no training in progress (on our pod)
@@ -677,38 +772,36 @@ class RunPodTrainingAdapter:
 
     async def cancel_training(self, job_id: str) -> dict:
         """
-        Cancel a training job on the pod.
+        Cancel a training job on the pod while keeping the pod.
 
-        Note: This marks the job as cancelled but may not stop the actual
-        training process. For stuck jobs, use clear_training_lock().
+        Stops the background submission first and returns only once it has
+        stopped, cancelling on the pod any RunPod job it got accepted. The job
+        becomes FAILED; call cleanup() to release the pod. The pod's /cancel
+        may not stop the actual training process; for stuck jobs, use
+        clear_training_lock().
+
+        A job the pod accepted whose response was lost to the cancellation
+        (the POST /train was in flight) has no ID to cancel here; it keeps
+        running on the retained pod until cleanup() releases the pod.
 
         Args:
             job_id: Job ID to cancel
 
         Returns:
             Cancellation result
+
+        Raises:
+            SubmissionStopIncomplete: The submission did not stop in time (a
+                job it still gets accepted is cancelled when it lands) or the
+                RunPod job could not be cancelled. The job was not stopped;
+                retry, or call cleanup() to release the pod.
         """
-        if job_id not in self._active_jobs:
-            raise TrainingStatusError(f"Unknown job: {job_id}")
-
-        job_info = self._active_jobs[job_id]
-        session = job_info["session"]
-        training_job_id = job_info.get("training_job_id")
-
-        if not training_job_id:
-            # Job hasn't been submitted yet, just mark as failed
-            job_info["state"] = "failed"
-            job_info["error"] = "Cancelled before submission"
+        record = await self._lifecycle.stop_submission(job_id, reason="Cancelled")
+        if record.session_released:
+            return {"status": "cancelled", "message": "Job pod already released"}
+        if record.provider_job_id is None:
             return {"status": "cancelled", "message": "Job cancelled before submission"}
-
-        manager = self._get_manager()
-        result = await manager.cancel_training_job(session, training_job_id)
-
-        # Update local tracking
-        job_info["state"] = "failed"
-        job_info["error"] = "Cancelled"
-
-        return result
+        return record.provider_cancel_result
 
     async def clear_training_lock(self, session=None) -> dict:
         """
@@ -727,10 +820,7 @@ class RunPodTrainingAdapter:
         manager = self._get_manager()
 
         if session is None:
-            for job_info in self._active_jobs.values():
-                if job_info.get("session"):
-                    session = job_info["session"]
-                    break
+            session = self._lifecycle.any_live_session()
 
         if session is None:
             return {"cleared_job": None, "message": "No active session"}

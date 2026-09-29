@@ -32,6 +32,7 @@ from kestrel_sovereign.multi_agent.config import (
     MULTI_AGENT_CONFIG_FILENAME,
     MultiAgentConfig,
 )
+from kestrel_sovereign.paths import HOME_ENV, runtime_path_env, spawned_agent_env
 from kestrel_sovereign.setup.context import Flow, SetupContext
 from kestrel_sovereign.setup.toml_file import read_toml
 
@@ -89,6 +90,20 @@ def create_agent(
 
     agent_dir = agent_data_root / name
     db_path = agent_dir / "kestrel_prime.db"
+    candidate = LocalAgentConfig(
+        data_dir=agent_dir,
+        port=port,
+        autostart=autostart,
+    )
+    # The full config guard cannot see a row that does not exist yet. Validate
+    # the exact candidate before mkdir/inception, using the same environment a
+    # locally spawned agent will inherit from this project.
+    MultiAgentConfig.validate_local_agent_host_custody(
+        name,
+        candidate,
+        base_dir=project_dir,
+        runtime_env=spawned_agent_env(project_dir.resolve(strict=False)),
+    )
 
     did: str | None = None
     already_existed = db_path.exists()
@@ -428,7 +443,7 @@ def _build_configured_genesis_auditor(project_dir: Path):
         # Pin that instant to the explicit create_agent target, then restore the
         # host environment before the first await so concurrent agents cannot
         # observe a process-global KESTREL_HOME detour.
-        previous_home = os.environ.get("KESTREL_HOME")
+        previous_home = runtime_path_env(HOME_ENV)
         os.environ["KESTREL_HOME"] = str(project_dir)
         reset_cache()
         try:

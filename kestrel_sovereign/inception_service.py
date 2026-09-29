@@ -630,6 +630,24 @@ async def create_kestrel_identity_async(
                        demo callers should identify deterministic injected
                        auditors rather than bypassing the lifecycle.
     """
+    # A SpawnMandate is persisted as a JSON edge receipt. Normalize and prove
+    # that representation before creating a directory, database, or key file;
+    # otherwise a supported Decimal that cannot survive JSON conversion can
+    # strand a half-created identity at the late edge-write step.
+    spawn_edge_properties = (
+        spawn_mandate.to_edge_properties() if spawn_mandate is not None else None
+    )
+    if spawn_edge_properties is not None:
+        # AsyncGraphStore persists this exact mapping as JSON.  Validate the
+        # complete nested shape now, before identity/key/database creation,
+        # rather than relying on the shallow copies in to_edge_properties().
+        json.dumps(
+            spawn_edge_properties,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
     # Generate test cycle ID if needed
     if is_test_instance and not test_cycle_id:
         import uuid
@@ -1010,22 +1028,15 @@ async def create_kestrel_identity_async(
 
     # 6b. If spawned by a parent, record the delegation relationship
     if parent_did:
-        edge_properties = {}
-        if spawn_mandate:
-            edge_properties["purpose"] = spawn_mandate.purpose
-            edge_properties["ttl_seconds"] = spawn_mandate.ttl_seconds
-            edge_properties["max_child_depth"] = spawn_mandate.max_child_depth
-            edge_properties["created_at"] = spawn_mandate.created_at
-            # Durable record of the enforcement constraints (#2137): the anchored
-            # constitution carries them for soft/system-prompt enforcement, and
-            # the delegation edge records the machine-readable form for audit and
-            # a future load-time re-attach of the runtime restricted_tools hook.
-            edge_properties["additional_constraints"] = (
-                getattr(spawn_mandate, "additional_constraints", {}) or {}
-            )
-            edge_properties["features_allowed"] = list(
-                getattr(spawn_mandate, "features_allowed", []) or []
-            )
+        edge_properties = dict(spawn_edge_properties or {})
+        # Inception generates the child's DID, so a caller normally cannot
+        # sign a mandate that is already bound to that final identity.  Keep
+        # the initial edge useful for restrictions and attribution, but never
+        # persist a signature over ``child_did=None`` (or another child) as if
+        # it were an authority receipt.  AgentManager replaces this edge with
+        # the parent-signed, final-DID-bound receipt before publishing a spawn.
+        if spawn_mandate is not None and spawn_mandate.child_did != agent_did:
+            edge_properties["parent_signature"] = None
         await graph.add_trusted_cross_agent_edge(
             agent_did,
             parent_did,

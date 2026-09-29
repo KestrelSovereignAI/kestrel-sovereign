@@ -5,25 +5,32 @@ Execute scripts in isolated Docker containers for maximum security.
 """
 
 import asyncio
+import json
 import logging
+import os
+import shlex
 import shutil
+import stat
 import subprocess
+import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from kestrel_sovereign.kestrel_config.constants import SUBPROCESS_TIMEOUT_SHORT
 
+from ..destructive_policy import DestructiveOperationPolicy
+from ..models import ComputeCommand, ComputeScript, ExecutionRecord
+from ..trash_manager import _rename_noreplace
 from .base import (
     BaseExecutor,
-    ExecutionError,
     ExecutionEnvironmentError,
+    ExecutionError,
     ExecutionTimeoutError,
     _ExecutionContext,
     _ExecutionResult,
 )
-from ..destructive_policy import DestructiveOperationPolicy
-from ..models import ComputeScript, ExecutionRecord
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +40,29 @@ DEFAULT_IMAGES = {
     "bash": "alpine:3.19",
     "python": "python:3.11-slim",
 }
+
+# Image for argv execution. Keyed by nothing, because an argv vector has
+# no language: element zero names a program, and the image is simply
+# where that program has to exist. Named separately from
+# ``DEFAULT_IMAGES["bash"]`` even though it is the same image today —
+# the script entry means "the image whose shell runs bash scripts", and
+# reusing it here would re-attach a shell to a path that has none.
+DEFAULT_COMMAND_IMAGE = "alpine:3.19"
 _DOCKER_CONTROL_REAP_TIMEOUT_SECONDS = 1.0
+_DEFAULT_MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
+_DEFAULT_MAX_SNAPSHOT_ENTRIES = 100_000
+_SNAPSHOT_COPY_CHUNK_BYTES = 1024 * 1024
+_SNAPSHOT_WORKER_MODULE = (
+    "kestrel_sovereign.features.compute.executors.docker_snapshot_worker"
+)
+_SNAPSHOT_DIRFD_SUPPORTED = (
+    bool(getattr(os, "O_DIRECTORY", 0))
+    and bool(getattr(os, "O_NOFOLLOW", 0))
+    and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.readlink in os.supports_dir_fd
+    and os.scandir in os.supports_fd
+)
 
 _CONTAINER_TRASH_DIR = "/kestrel-trash"
 
@@ -64,6 +93,15 @@ class DockerExecutor(BaseExecutor):
         default_pids_limit: int = 50,
         max_output_bytes: int = 1024 * 1024,  # 1MB
         current_agent_data_path: Optional[str | Path] = None,
+        # Appended rather than grouped with `images`, which is where it
+        # belongs by meaning: `DockerExecutor` is a package-level export
+        # that already accepted these positions, and inserting a
+        # parameter mid-list silently remaps every caller that passed
+        # one positionally.
+        command_image: Optional[str] = None,
+        legacy_staging_age_seconds: Optional[int] = None,
+        max_snapshot_bytes: int = _DEFAULT_MAX_SNAPSHOT_BYTES,
+        max_snapshot_entries: int = _DEFAULT_MAX_SNAPSHOT_ENTRIES,
     ):
         """
         Initialize the Docker executor.
@@ -71,20 +109,36 @@ class DockerExecutor(BaseExecutor):
         Args:
             docker_path: Path to docker binary (default: auto-detect)
             images: Docker images by language (default: alpine for bash, python:3.11-slim for python)
+            command_image: Docker image for argv execution (default: alpine)
             default_memory_limit: Memory limit for containers
             default_cpu_quota: CPU quota (microseconds per 100ms)
             default_pids_limit: Maximum number of processes
             max_output_bytes: Maximum stdout/stderr size
+            max_snapshot_bytes: Maximum regular-file bytes copied from a cwd
+            max_snapshot_entries: Maximum entries copied from a cwd
         """
         super().__init__(max_output_bytes=max_output_bytes)
         self._docker_path = docker_path
         self._cached_docker_path: Optional[str] = None
         self._images = images or DEFAULT_IMAGES
+        self._command_image = command_image or DEFAULT_COMMAND_IMAGE
         self._memory_limit = default_memory_limit
         self._cpu_quota = default_cpu_quota
         self._pids_limit = default_pids_limit
+        if max_snapshot_bytes <= 0 or max_snapshot_entries <= 0:
+            raise ValueError("Docker snapshot limits must be positive")
+        self._max_snapshot_bytes = max_snapshot_bytes
+        self._max_snapshot_entries = max_snapshot_entries
         self._policy = DestructiveOperationPolicy(
             current_agent_data_path=current_agent_data_path
+        )
+        # A record-less staging directory (made by code that wrote no record)
+        # is swept once older than the longest a script may run under the
+        # policy this executor serves; the feature passes its configured
+        # maximum, the default is the policy's shipped default.
+        self._legacy_staging_age_seconds = (
+            int(legacy_staging_age_seconds or self.LEGACY_STAGING_AGE_SECONDS)
+            + self.LEGACY_STAGING_GRACE_SECONDS
         )
 
     @property
@@ -140,9 +194,12 @@ class DockerExecutor(BaseExecutor):
 
         Args:
             script: The ComputeScript to execute
-            working_dir: Optional working directory (mounted read-only)
+            working_dir: Optional host directory copied into a private,
+                read-only container snapshot.
             network: Whether to allow network access (default: False)
-            mounts: Additional mounts [{"src": "/host/path", "dst": "/container/path", "ro": True}]
+            mounts: Reserved compatibility parameter. Additional host mounts
+                are refused because even a read-only bind can expose a Unix
+                service socket.
 
         Returns:
             ExecutionRecord with execution results
@@ -156,6 +213,9 @@ class DockerExecutor(BaseExecutor):
             raise ExecutionError(
                 f"No Docker image configured for language: {script.language}"
             )
+
+        self._validate_additional_mounts(mounts)
+        self._validated_trash_root()
 
         async def run(context: _ExecutionContext) -> _ExecutionResult:
             container_name = self._container_name(context.execution_id)
@@ -183,6 +243,384 @@ class DockerExecutor(BaseExecutor):
             cleanup=cleanup,
         )
 
+    def _validate_additional_mounts(
+        self,
+        mounts: Optional[List[Dict[str, str]]],
+    ) -> None:
+        """Reject caller-selected host mounts at the sandbox boundary.
+
+        Read-only bind mounts prevent regular-file writes but do not prevent
+        ``connect(2)`` to a Unix socket.  A Docker/Podman socket, PostgreSQL
+        socket, or a directory in which one can appear would let compute cross
+        Hold custody through a host service.  A recursive scan is raceable, so
+        no arbitrary additional host mount is safe.  The executor-owned script,
+        workspace, and per-run trash binds are assembled internally instead.
+        """
+
+        if mounts:
+            raise ExecutionEnvironmentError(
+                "Refusing additional Docker mounts because read-only bind "
+                "mounts still expose host service sockets and cannot prove "
+                "separation from host Hold custody"
+            )
+
+    def _validated_trash_root(self) -> Path:
+        """Resolve the internal writable bind and keep it outside custody."""
+
+        host_trash_dir = self._policy.trash_dir.expanduser().resolve(strict=False)
+        if self._policy.touches_host_hold_custody(host_trash_dir):
+            raise ExecutionEnvironmentError(
+                "Docker trash staging overlaps host Hold custody; configure "
+                "KESTREL_TRASH_DIR outside the host control-data directory"
+            )
+        return host_trash_dir
+
+    @staticmethod
+    def _snapshot_working_directory(
+        source: str,
+        destination: Path,
+        *,
+        max_bytes: int = _DEFAULT_MAX_SNAPSHOT_BYTES,
+        max_entries: int = _DEFAULT_MAX_SNAPSHOT_ENTRIES,
+        deadline: float | None = None,
+    ) -> str:
+        """Copy a host cwd into executor custody without importing live sockets.
+
+        A read-only bind of the caller's directory would still expose Unix
+        sockets, including one created after a recursive preflight.  Copying
+        into the already-private execution directory gives the container a
+        stable regular-file snapshot. Every descent and file open is relative
+        to an already-validated directory descriptor, so a concurrent rename
+        cannot redirect traversal into an ambient host path. Bytes, entries,
+        and elapsed time are bounded while copying; symlinks are preserved
+        without following them.
+        """
+
+        if max_bytes <= 0 or max_entries <= 0:
+            raise ExecutionEnvironmentError(
+                "Docker working directory snapshot limits must be positive"
+            )
+        if not _SNAPSHOT_DIRFD_SUPPORTED:
+            raise ExecutionEnvironmentError(
+                "Docker working directory snapshots require anchored POSIX "
+                "directory-descriptor traversal"
+            )
+
+        try:
+            source_path = Path(source).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ExecutionEnvironmentError(
+                f"Cannot snapshot Docker working directory {source}: {exc}"
+            ) from exc
+        try:
+            source_stat = source_path.lstat()
+        except OSError as exc:
+            raise ExecutionEnvironmentError(
+                f"Cannot inspect Docker working directory {source_path}: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(source_stat.st_mode):
+            raise ExecutionEnvironmentError(
+                f"Docker working directory is not a directory: {source_path}"
+            )
+        destination_path = destination.expanduser().resolve(strict=False)
+        if destination_path == source_path or destination_path.is_relative_to(
+            source_path
+        ):
+            raise ExecutionEnvironmentError(
+                "Docker working directory snapshot would contain its own "
+                f"destination: {source_path}"
+            )
+
+        entries_copied = 0
+        bytes_copied = 0
+
+        def check_limits(*, add_entry: bool = False, add_bytes: int = 0) -> None:
+            nonlocal entries_copied, bytes_copied
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Docker working directory snapshot timed out")
+            if add_entry:
+                entries_copied += 1
+                if entries_copied > max_entries:
+                    raise ExecutionEnvironmentError(
+                        "Docker working directory snapshot exceeds the "
+                        f"{max_entries}-entry limit"
+                    )
+            if add_bytes:
+                bytes_copied += add_bytes
+                if bytes_copied > max_bytes:
+                    raise ExecutionEnvironmentError(
+                        "Docker working directory snapshot exceeds the "
+                        f"{max_bytes}-byte limit"
+                    )
+
+        def changed(path: Path) -> ExecutionEnvironmentError:
+            return ExecutionEnvironmentError(
+                f"Docker working directory entry changed during snapshot: {path}"
+            )
+
+        open_directory_flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        open_file_flags = (
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+
+        def same_object(before: os.stat_result, after: os.stat_result) -> bool:
+            return (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)) == (
+                after.st_dev,
+                after.st_ino,
+                stat.S_IFMT(after.st_mode),
+            )
+
+        def copy_regular_file(
+            parent_fd: int,
+            name: str,
+            before: os.stat_result,
+            destination_file: Path,
+            display_path: Path,
+        ) -> None:
+            descriptor = -1
+            try:
+                descriptor = os.open(name, open_file_flags, dir_fd=parent_fd)
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode):
+                    raise ExecutionEnvironmentError(
+                        "Docker working directory contains a host service socket "
+                        f"or other special file: {display_path}"
+                    )
+                if not same_object(before, opened):
+                    raise changed(display_path)
+                if opened.st_size > max_bytes - bytes_copied:
+                    raise ExecutionEnvironmentError(
+                        "Docker working directory snapshot exceeds the "
+                        f"{max_bytes}-byte limit"
+                    )
+                with os.fdopen(descriptor, "rb") as source_stream:
+                    descriptor = -1
+                    with destination_file.open("xb") as destination_stream:
+                        while chunk := source_stream.read(_SNAPSHOT_COPY_CHUNK_BYTES):
+                            check_limits(add_bytes=len(chunk))
+                            destination_stream.write(chunk)
+                after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    not same_object(before, after)
+                    or after.st_size != before.st_size
+                    or after.st_mtime_ns != before.st_mtime_ns
+                ):
+                    raise changed(display_path)
+                destination_file.chmod(stat.S_IMODE(before.st_mode))
+            except TimeoutError:
+                raise  # the snapshot deadline, not a tamper signal
+            except OSError as exc:
+                raise changed(display_path) from exc
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+
+        def copy_directory(
+            source_fd: int,
+            destination_directory: Path,
+            display_directory: Path,
+        ) -> None:
+            check_limits()
+            with os.scandir(source_fd) as iterator:
+                for entry in iterator:
+                    name = entry.name
+                    check_limits(add_entry=True)
+                    display_path = display_directory / name
+                    try:
+                        before = os.stat(
+                            name,
+                            dir_fd=source_fd,
+                            follow_symlinks=False,
+                        )
+                    except TimeoutError:
+                        raise  # the snapshot deadline, not a tamper signal
+                    except OSError as exc:
+                        raise changed(display_path) from exc
+                    destination_entry = destination_directory / name
+                    if stat.S_ISREG(before.st_mode):
+                        copy_regular_file(
+                            source_fd,
+                            name,
+                            before,
+                            destination_entry,
+                            display_path,
+                        )
+                    elif stat.S_ISDIR(before.st_mode):
+                        child_fd = -1
+                        try:
+                            child_fd = os.open(
+                                name,
+                                open_directory_flags,
+                                dir_fd=source_fd,
+                            )
+                            opened = os.fstat(child_fd)
+                            if not same_object(before, opened):
+                                raise changed(display_path)
+                            destination_entry.mkdir()
+                            copy_directory(child_fd, destination_entry, display_path)
+                            after = os.fstat(child_fd)
+                            if not same_object(before, after):
+                                raise changed(display_path)
+                            destination_entry.chmod(stat.S_IMODE(before.st_mode))
+                        except TimeoutError:
+                            raise  # the snapshot deadline, not a tamper signal
+                        except OSError as exc:
+                            raise changed(display_path) from exc
+                        finally:
+                            if child_fd >= 0:
+                                os.close(child_fd)
+                    elif stat.S_ISLNK(before.st_mode):
+                        try:
+                            link_target = os.readlink(name, dir_fd=source_fd)
+                            after = os.stat(
+                                name,
+                                dir_fd=source_fd,
+                                follow_symlinks=False,
+                            )
+                        except TimeoutError:
+                            raise  # the snapshot deadline, not a tamper signal
+                        except OSError as exc:
+                            raise changed(display_path) from exc
+                        if not same_object(before, after):
+                            raise changed(display_path)
+                        destination_entry.symlink_to(
+                            link_target,
+                            target_is_directory=False,
+                        )
+                    else:
+                        raise ExecutionEnvironmentError(
+                            "Docker working directory contains a host service "
+                            f"socket or other special file: {display_path}"
+                        )
+
+        source_fd = -1
+        try:
+            check_limits()
+            source_fd = os.open(source_path, open_directory_flags)
+            opened_source = os.fstat(source_fd)
+            if not same_object(source_stat, opened_source):
+                raise changed(source_path)
+            destination_path.mkdir(parents=True)
+            copy_directory(source_fd, destination_path, source_path)
+            destination_path.chmod(stat.S_IMODE(source_stat.st_mode))
+        except TimeoutError:
+            shutil.rmtree(destination_path, ignore_errors=True)
+            raise
+        except ExecutionEnvironmentError:
+            shutil.rmtree(destination_path, ignore_errors=True)
+            raise
+        except OSError as exc:
+            shutil.rmtree(destination_path, ignore_errors=True)
+            raise ExecutionEnvironmentError(
+                "Docker working directory contains a host service socket, "
+                f"special file, or unreadable entry: {source_path}: {exc}"
+            ) from exc
+        finally:
+            if source_fd >= 0:
+                os.close(source_fd)
+        return str(destination_path)
+
+    async def _bounded_working_directory_snapshot(
+        self,
+        source: str,
+        destination: Path,
+        *,
+        deadline: float,
+        subject_id: str,
+        timeout_seconds: float,
+    ) -> str:
+        """Copy a cwd in a killable child under the execution's deadline.
+
+        A thread cannot be stopped while a FUSE/NFS filesystem call is stuck in
+        the kernel, and a lingering ``asyncio.to_thread`` worker consumes the
+        shared executor and can delay loop shutdown.  The one-purpose child is
+        instead terminated and reaped through the same bounded process
+        lifecycle as script execution.
+        """
+
+        loop = asyncio.get_running_loop()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise ExecutionTimeoutError(subject_id, timeout_seconds)
+        worker_deadline = time.monotonic() + remaining
+        result_path = destination.parent / ".docker-snapshot-result.json"
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-I",
+            "-m",
+            _SNAPSHOT_WORKER_MODULE,
+            source,
+            str(destination),
+            str(self._max_snapshot_bytes),
+            str(self._max_snapshot_entries),
+            repr(worker_deadline),
+            str(result_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name == "posix",
+        )
+        try:
+            try:
+                _stdout, stderr = await self._capture_process_output(
+                    process,
+                    timeout_seconds=remaining,
+                    terminate=lambda: self._kill_process_group(process),
+                )
+            except TimeoutError:
+                raise ExecutionTimeoutError(subject_id, timeout_seconds) from None
+
+            try:
+                payload = result_path.read_bytes()
+                if len(payload) > 64 * 1024:
+                    raise ValueError
+                response = json.loads(payload)
+            except (OSError, ValueError, json.JSONDecodeError):
+                diagnostic = stderr.content.decode("utf-8", errors="replace").strip()
+                detail = f": {diagnostic}" if diagnostic else ""
+                raise ExecutionEnvironmentError(
+                    "Docker working directory snapshot worker failed without a "
+                    f"valid response{detail}"
+                ) from None
+            kind = response["kind"]
+            message = response["message"]
+            if not isinstance(kind, str) or not isinstance(message, str):
+                raise TypeError
+            if process.returncode == 0 and kind == "success" and destination.is_dir():
+                return str(destination)
+            if kind == "timeout":
+                raise ExecutionTimeoutError(subject_id, timeout_seconds)
+            if kind == "environment":
+                raise ExecutionEnvironmentError(message)
+            if kind == "success":
+                raise ExecutionEnvironmentError(
+                    "Docker working directory snapshot worker returned an "
+                    "invalid success response"
+                )
+            raise ExecutionEnvironmentError(message)
+        except (KeyError, TypeError):
+            raise ExecutionEnvironmentError(
+                "Docker working directory snapshot worker returned an invalid response"
+            ) from None
+        finally:
+            try:
+                result_path.unlink(missing_ok=True)
+            except TimeoutError:
+                raise  # the snapshot deadline, not a tamper signal
+            except OSError as exc:
+                logger.warning(
+                    "Could not remove Docker snapshot worker result %s: %s",
+                    result_path,
+                    exc,
+                )
+
     async def _execute_script(
         self,
         script: ComputeScript,
@@ -195,33 +633,202 @@ class DockerExecutor(BaseExecutor):
         network: bool,
         mounts: Optional[List[Dict[str, str]]],
     ) -> _ExecutionResult:
-        host_trash_dir = self._policy.trash_dir.expanduser().resolve(strict=False)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + script.timeout_seconds
+        isolated_working_dir = (
+            await self._bounded_working_directory_snapshot(
+                working_dir,
+                Path(context.workdir) / "workspace",
+                deadline=deadline,
+                subject_id=script.id,
+                timeout_seconds=script.timeout_seconds,
+            )
+            if working_dir
+            else None
+        )
+        # Repeat at the final pre-bind boundary so a path alias changed after
+        # admission cannot make the earlier validation stale.
+        host_trash_dir = self._validated_trash_root()
         host_trash_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Mount a PER-EXECUTION staging directory, never the shared trash
         # root: a read/write bind of the root would let any container script
         # read or corrupt entries trashed by previous runs and other agents.
         # Staged entries are promoted into the real trash root host-side
         # after the container exits (same filesystem, atomic renames).
+        await self._promote_stale_staging_dirs(host_trash_dir, docker_path)
         staging_dir = host_trash_dir / f".staging-{uuid.uuid4().hex[:12]}"
-        staging_dir.mkdir(mode=0o700)
+        # Guarded from the moment anything exists: the owner record, then
+        # the directory, then every exit below (a policy rewrite that
+        # refuses the script, the script write, a docker binary that is not
+        # there when the process is spawned, a timeout) promotes and removes
+        # both. Before this guard began at the process wait, each failed
+        # launch left an empty hidden directory in the trash root that no
+        # listing could see: 589 of them on one host (#3117).
+        try:
+            # The record lives BESIDE the directory, outside the bind mount,
+            # so the container cannot read or alter its own; it is written
+            # first, so a directory with no record is one this code never
+            # owned (see ``_promote_stale_staging_dirs``).
+            self._write_staging_owner(staging_dir, container_name)
+            staging_dir.mkdir(mode=0o700)
+            return await self._run_staged_script(
+                script,
+                isolated_working_dir,
+                context,
+                docker_path=docker_path,
+                image=image,
+                container_name=container_name,
+                network=network,
+                mounts=mounts,
+                staging_dir=staging_dir,
+                deadline=deadline,
+            )
+        finally:
+            self._promote_staged_trash(staging_dir, host_trash_dir)
 
+    async def _run_staged_script(
+        self,
+        script: ComputeScript,
+        working_dir: Optional[str],
+        context: _ExecutionContext,
+        *,
+        docker_path: str,
+        image: str,
+        container_name: str,
+        network: bool,
+        mounts: Optional[List[Dict[str, str]]],
+        staging_dir: Path,
+        deadline: float,
+    ) -> _ExecutionResult:
+        """Rewrite, stage and run the script against an existing staging dir."""
         # Container mounts (/scripts, /workspace) are read-only, so no
         # workdir is authorized for direct deletion; every delete moves to
         # the trash bind mount.  The container cwd only resolves relative
-        # operands for policy checks.
+        # operands for policy checks — which is why it is bound once and
+        # passed to both the rewriter and the container: if the two ever
+        # disagreed, the rewriter would vet a different path than the one
+        # the script actually names.
+        container_cwd = "/workspace" if working_dir else "/scripts"
         safe_content = self._policy.rewrite_script(
             script.content,
             script.language,
             None,
             runtime_trash_dir=_CONTAINER_TRASH_DIR,
-            script_cwd="/workspace" if working_dir else "/scripts",
+            script_cwd=container_cwd,
         )
 
-        script_name = "script.py" if script.language == "python" else "script.sh"
+        if script.language == "python":
+            interpreter, script_name = "python", "script.py"
+        else:
+            interpreter, script_name = "sh", "script.sh"
+        script_argument = f"/scripts/{script_name}"
         script_path = Path(context.workdir) / script_name
         script_path.write_text(safe_content)
         script_path.chmod(0o755)
 
+        cmd, log_safe_cmd = self._container_invocation(
+            docker_path=docker_path,
+            container_name=container_name,
+            image=image,
+            working_dir=working_dir,
+            container_cwd=container_cwd,
+            network=network,
+            mounts=mounts,
+            environment=script.environment,
+            binds=[
+                f"{context.workdir}:/scripts:ro",
+                # Safe deletions must survive the container.  The rewriter
+                # uses the container path while this dedicated bind mount
+                # anchors it to the host's configured Kestrel trash
+                # directory.
+                f"{staging_dir}:{_CONTAINER_TRASH_DIR}:rw",
+            ],
+            program=interpreter,
+        )
+        cmd.append(script_argument)
+        log_safe_cmd.append(script_argument)
+
+        logger.info("Executing script %s... in Docker container", script.id[:8])
+        logger.debug("Container command: %s", " ".join(log_safe_cmd))
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await self._capture_process_output(
+                process,
+                timeout_seconds=max(
+                    0.0,
+                    deadline - asyncio.get_running_loop().time(),
+                ),
+                terminate=lambda: self._kill_container(
+                    docker_path,
+                    container_name,
+                ),
+            )
+        except TimeoutError:
+            # The caller's guard still promotes staged entries: deletions
+            # performed before the interruption already happened, and their
+            # trash entries must stay restorable from the real trash root.
+            raise ExecutionTimeoutError(script.id, script.timeout_seconds) from None
+
+        return _ExecutionResult(
+            exit_code=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            container_id=container_name,
+        )
+
+    def _container_invocation(
+        self,
+        *,
+        docker_path: str,
+        container_name: str,
+        image: str,
+        working_dir: Optional[str],
+        container_cwd: str,
+        network: bool,
+        mounts: Optional[List[Dict[str, str]]],
+        environment: Dict[str, str],
+        binds: List[str],
+        program: str,
+    ) -> tuple[List[str], List[str]]:
+        """Build ``docker run`` up to and including the image.
+
+        Both execution modes build their container here so the vetted
+        isolation flags (``--read-only``, ``--network=none``,
+        ``--security-opt=no-new-privileges``, memory and pid limits)
+        cannot drift apart between them.
+
+        Returns ``(cmd, log_safe_cmd)``. The second is identical except
+        that environment values are redacted, so a debug log of the
+        container command cannot leak a secret the caller passed in.
+
+        ``program`` is what will run, and it is pinned with
+        ``--entrypoint`` rather than left to position. Words after the
+        image are not the process argv: Docker appends them to whatever
+        ``ENTRYPOINT`` the image declares, so an image with one runs its
+        own program with the caller's first word demoted to an argument.
+        Measured on an image built with
+        ``ENTRYPOINT ["/bin/echo", "ENTRYPOINT-RAN"]``: a vector of
+        ``["printf", "HACKED"]`` printed ``ENTRYPOINT-RAN printf
+        HACKED`` — ``echo`` ran while the policy had vetted ``printf``.
+        That is #3187 again, one layer down, and it is why the program
+        is named to Docker instead of positioned after the image.
+
+        ``--entrypoint`` also clears the image's default ``CMD``
+        (measured, not read: ``docker run --entrypoint printf alpine``
+        runs ``printf`` with no arguments, where the same run without
+        the override starts the image's shell). So a caller appending
+        nothing gets its own program with no arguments, never the
+        image's idea of what to do.
+
+        It is a required parameter for the same reason: the two modes
+        share this builder, and a mode that forgot to pin its program
+        would silently inherit the image's.
+        """
         cmd = [
             docker_path,
             "run",
@@ -237,12 +844,8 @@ class DockerExecutor(BaseExecutor):
         if not network:
             cmd.append("--network=none")
 
-        cmd.extend(["-v", f"{context.workdir}:/scripts:ro"])
-
-        # Safe deletions must survive the container.  The rewriter uses the
-        # container path while this dedicated bind mount anchors it to the
-        # host's configured Kestrel trash directory.
-        cmd.extend(["-v", f"{staging_dir}:{_CONTAINER_TRASH_DIR}:rw"])
+        for bind in binds:
+            cmd.extend(["-v", bind])
 
         if working_dir:
             cmd.extend(["-v", f"{working_dir}:/workspace:ro"])
@@ -253,32 +856,142 @@ class DockerExecutor(BaseExecutor):
             dst = mount.get("dst")
             read_only = mount.get("ro", True)
             if src and dst:
-                if dst == _CONTAINER_TRASH_DIR or dst.startswith(
-                    f"{_CONTAINER_TRASH_DIR}/"
-                ):
-                    raise ExecutionError(
-                        f"Mount destination is reserved: {_CONTAINER_TRASH_DIR}"
-                    )
                 ro_flag = ":ro" if read_only else ""
                 cmd.extend(["-v", f"{src}:{dst}{ro_flag}"])
 
-        cmd.extend(["-w", "/workspace" if working_dir else "/scripts"])
+        cmd.extend(["-w", container_cwd])
         log_safe_cmd = list(cmd)
-        for key, value in script.environment.items():
+
+        # The program is the caller's text on the command path. Its name
+        # is worth logging — it is what the policy vetted — but not
+        # raw: a newline in it would forge whole log lines. ``repr``
+        # escapes them, and ``shlex.join`` alone would not (it quotes a
+        # newline, it does not encode it).
+        cmd.extend(["--entrypoint", program])
+        log_safe_cmd.extend(["--entrypoint", repr(program)])
+        for key, value in environment.items():
             cmd.extend(["-e", f"{key}={value}"])
             log_safe_cmd.extend(["-e", f"{key}=<redacted>"])
 
         cmd.append(image)
         log_safe_cmd.append(image)
-        if script.language == "python":
-            runtime_command = ["python", "/scripts/script.py"]
-        else:
-            runtime_command = ["sh", "/scripts/script.sh"]
-        cmd.extend(runtime_command)
-        log_safe_cmd.extend(runtime_command)
+        return cmd, log_safe_cmd
 
-        logger.info("Executing script %s... in Docker container", script.id[:8])
-        logger.debug("Container command: %s", " ".join(log_safe_cmd))
+    async def execute_command(
+        self,
+        command: ComputeCommand,
+        working_dir: Optional[str] = None,
+    ) -> ExecutionRecord:
+        """Execute an argv vector in a container. No script, no shell.
+
+        ``command.argv[0]`` is the program and every later element is an
+        argument to it — pinned with ``--entrypoint`` rather than left
+        to position, for the reason :meth:`_container_invocation`
+        records. That is the whole difference from :meth:`execute`: a
+        script's first word is read by a shell's grammar first, which is
+        how a vetted ``eval`` ran an unvetted ``printf`` (#3187).
+
+        No trash mount is created. The rewriter that redirects deletions
+        into it only rewrites script text, and there is no script text
+        here — mounting a writable host directory that nothing can be
+        rewritten to use would be a hole with no purpose. Every other
+        mount is read-only, so the container has nothing of the host's
+        to delete.
+
+        The signature is the base contract exactly: no network, no
+        extra mounts. :meth:`execute` takes both because
+        ``ComputeFeature`` passes them for a reviewed, signed script;
+        nothing asks it of a one-shot vector, and an unused parameter is
+        an untested way to widen a container.
+
+        Args:
+            command: The :class:`ComputeCommand` to execute
+            working_dir: Optional host directory copied into a private,
+                read-only container snapshot.
+
+        Returns:
+            ExecutionRecord with execution results
+        """
+        docker_path = self._get_docker_path()
+        if not docker_path:
+            raise ExecutionEnvironmentError("Docker not found")
+
+        async def run(context: _ExecutionContext) -> _ExecutionResult:
+            container_name = self._container_name(context.execution_id)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + command.timeout_seconds
+            isolated_working_dir = (
+                await self._bounded_working_directory_snapshot(
+                    working_dir,
+                    Path(context.workdir) / "workspace",
+                    deadline=deadline,
+                    subject_id=command.id,
+                    timeout_seconds=command.timeout_seconds,
+                )
+                if working_dir
+                else None
+            )
+            return await self._execute_argv(
+                command,
+                isolated_working_dir,
+                docker_path=docker_path,
+                container_name=container_name,
+                deadline=deadline,
+            )
+
+        async def cleanup(context: _ExecutionContext) -> None:
+            await self._remove_container(
+                docker_path,
+                self._container_name(context.execution_id),
+            )
+
+        return await self._execute_with_lifecycle(
+            command,
+            temp_dir_prefix="kestrel_compute_docker_command_",
+            runner=run,
+            cleanup=cleanup,
+        )
+
+    async def _execute_argv(
+        self,
+        command: ComputeCommand,
+        working_dir: Optional[str],
+        *,
+        docker_path: str,
+        container_name: str,
+        deadline: float,
+    ) -> _ExecutionResult:
+        cmd, log_safe_cmd = self._container_invocation(
+            docker_path=docker_path,
+            container_name=container_name,
+            image=self._command_image,
+            working_dir=working_dir,
+            # With no host directory to mount there is no meaningful
+            # workspace; the image's read-only root is a defined place
+            # to stand rather than an inherited one.
+            container_cwd="/workspace" if working_dir else "/",
+            network=False,
+            mounts=None,
+            environment=command.environment,
+            binds=[],
+            program=command.argv[0],
+        )
+        cmd.extend(command.argv[1:])
+        # Count, not contents. Arguments are where a caller's secrets
+        # live — a bearer token, a `--password` — and the environment
+        # values on this same line are redacted for exactly that
+        # reason. The script path never logged them either: they were
+        # inside a file, and the line ended at `sh /scripts/script.sh`.
+        # Restoring them here would have been a new sink for secrets,
+        # and a way to forge log lines with an embedded newline.
+        log_safe_cmd.append(f"<{len(command.argv) - 1} argument(s) not logged>")
+
+        logger.info("Executing command %s... in Docker container", command.id[:8])
+        # Quoted, unlike the script path's log line: here the reader is
+        # looking at a vector whose word boundaries are the point, and a
+        # space-joined rendering of ["printf", "a b"] reads as three
+        # arguments. `shlex.join` makes the log line reproduce the run.
+        logger.debug("Container command: %s", shlex.join(log_safe_cmd))
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -288,19 +1001,19 @@ class DockerExecutor(BaseExecutor):
         try:
             stdout, stderr = await self._capture_process_output(
                 process,
-                timeout_seconds=script.timeout_seconds,
+                timeout_seconds=max(
+                    0.0,
+                    deadline - asyncio.get_running_loop().time(),
+                ),
                 terminate=lambda: self._kill_container(
                     docker_path,
                     container_name,
                 ),
             )
         except TimeoutError:
-            raise ExecutionTimeoutError(script.id, script.timeout_seconds) from None
-        finally:
-            # Promote staged trash entries even on timeout/failure: deletions
-            # performed before the interruption already happened, and their
-            # trash entries must stay restorable from the real trash root.
-            self._promote_staged_trash(staging_dir, host_trash_dir)
+            raise ExecutionTimeoutError(
+                command.id, command.timeout_seconds
+            ) from None
 
         return _ExecutionResult(
             exit_code=process.returncode,
@@ -309,26 +1022,404 @@ class DockerExecutor(BaseExecutor):
             container_id=container_name,
         )
 
+    #: Suffix of the owner record written beside a staging directory
+    #: (``.staging-<hex>.owner``), outside the container's bind mount.
+    STAGING_OWNER_SUFFIX = ".owner"
+
+    #: A record-bearing directory older than this is swept even though its
+    #: recorded pid answers ``kill -0``: after a reboot or a pid wraparound
+    #: the pid belongs to another process (one this user cannot signal
+    #: counts as alive, which widens it), and no script runs for a week. The
+    #: record's ``started`` stamp is the age; the directory's mtime moves
+    #: with every staged entry and is not.
+    OWNER_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
+    #: Added to the legacy floor: a script may run for the whole maximum, and
+    #: its promotion happens only after the timeout fires, the container is
+    #: killed and its output drained, so the floor must exceed the maximum.
+    LEGACY_STAGING_GRACE_SECONDS = 15 * 60
+
+    #: The most wall-clock one sweep may spend asking Docker about dead
+    #: owners' containers. Each ``docker inspect`` is bounded, but the sweep
+    #: runs at the head of every script and a wedged daemon answers nothing;
+    #: directories not reached this run are left for the next.
+    SWEEP_INSPECT_BUDGET_SECONDS = 20.0
+
+    #: Default for ``legacy_staging_age_seconds``: the compute policy's
+    #: shipped maximum script timeout. A staging directory with NO owner
+    #: record was made by code that wrote none (the leak this ticket closes,
+    #: or a run of that older code still in flight across an upgrade) and is
+    #: swept once older than this; a record-bearing directory is judged by
+    #: its owner, never by age.
+    LEGACY_STAGING_AGE_SECONDS = 60 * 60
+
+    @classmethod
+    def _write_staging_owner(cls, staging_dir: Path, container_name: str) -> None:
+        """Record which process and container own ``staging_dir``."""
+        record = staging_dir.with_name(staging_dir.name + cls.STAGING_OWNER_SUFFIX)
+        record.write_text(json.dumps({
+            "pid": os.getpid(),
+            "container": container_name,
+            "started": time.time(),
+        }))
+        record.chmod(0o600)
+
     @staticmethod
-    def _promote_staged_trash(staging_dir: Path, host_trash_dir: Path) -> None:
+    def _read_owner_record(record: Path) -> Optional[Dict[str, object]]:
+        """The owner record's fields, or ``None`` when it is not one of ours.
+
+        A record is a small JSON object with a bounded positive ``pid``;
+        anything else (prose, a forged value that overflows a C int, a
+        symlink) is no record at all.
+        """
+        try:
+            if record.is_symlink() or not record.is_file():
+                return None
+            data = json.loads(record.read_text(encoding="utf-8", errors="replace")[:4096])
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        pid = data.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or not 0 < pid < 2**31:
+            return None
+        container = data.get("container")
+        started = data.get("started")
+        return {
+            "pid": pid,
+            "container": container if isinstance(container, str) and container else None,
+            "started": float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else None,
+        }
+
+    @staticmethod
+    def _pid_is_alive(pid: int) -> bool:
+        """Whether ``pid`` names a running process; one this user may not
+        signal is still a live process."""
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    @classmethod
+    async def _container_exists(cls, docker_path: Optional[str], container_name: str) -> bool:
+        """Whether Docker still knows ``container_name``.
+
+        ``docker run --rm`` is a foreground client: a killed agent leaves its
+        container running with the staging bind for as long as the script
+        runs, and Docker removes the container when it exits. So "inspect
+        succeeds" means the run is still live; without a docker binary
+        nothing can be running.
+        """
+        if not docker_path:
+            return False
+        try:
+            code = await cls._run_control_command(docker_path, "inspect", container_name)
+        except Exception:  # noqa: BLE001 - a wedged daemon must not fail the sweep
+            logger.debug("docker inspect %s failed", container_name, exc_info=True)
+            return True  # unknown: leave the directory alone
+        if code is None:
+            # The client timed out or could not be spawned: inconclusive, and
+            # an inconclusive answer must never reap a bind a container may
+            # still be writing to.
+            return True
+        return code == 0
+
+    async def _promote_stale_staging_dirs(
+        self, host_trash_dir: Path, docker_path: Optional[str]
+    ) -> None:
+        """Promote and remove staging directories no execution still owns.
+
+        A failed launch used to leave its ``.staging-*`` directory behind
+        (#3117), and the trash listing hides dot-directories by design, so
+        nothing in band ever showed the accumulation. Each script run sweeps
+        the root before staging its own. "Still owned" is a fact about a
+        process and its container, not an age: a directory whose record
+        names a running process is left alone however old it is; one whose
+        process is gone is left alone while Docker still knows its container
+        (the container outlives a killed client), and otherwise promoted
+        (its entries, if any, into the real trash root) and removed at once,
+        record included. A directory with no record is legacy and is swept
+        once older than the executor's legacy floor. A record whose
+        directory is gone is an orphan and is removed the same way. Nothing
+        here follows a symlink or raises: the staging bind is the one
+        writable mount a container gets, and the sweep runs at the head of
+        every script execution, so a planted file must never turn every
+        later run into a failure.
+        """
+        try:
+            await self._sweep_staging_dirs(host_trash_dir, docker_path)
+        except Exception:  # noqa: BLE001 - the sweep is best-effort by contract
+            logger.warning(
+                "Sweep of stale staging directories under %s failed; continuing",
+                host_trash_dir,
+                exc_info=True,
+            )
+
+    async def _sweep_staging_dirs(self, host_trash_dir: Path, docker_path: Optional[str]) -> None:
+        try:
+            candidates = list(host_trash_dir.iterdir())
+        except OSError:
+            return
+        legacy_cutoff = time.time() - self._legacy_staging_age_seconds
+        suffix = self.STAGING_OWNER_SUFFIX
+        inspect_deadline = time.monotonic() + self.SWEEP_INSPECT_BUDGET_SECONDS
+        for candidate in candidates:
+            name = candidate.name
+            if not name.startswith(".staging-"):
+                continue
+            try:
+                st = candidate.lstat()
+            except OSError:
+                continue
+            if name.endswith(suffix):
+                # An orphan record: its directory is gone (a failed mkdir, or
+                # a promotion that did not get to remove it). Reap it once
+                # its owner is, or it is unreadable and past the floor.
+                directory = candidate.with_name(name[: -len(suffix)])
+                if directory.exists() or directory.is_symlink():
+                    continue
+                owner = self._read_owner_record(candidate)
+                if (
+                    owner is not None
+                    and not self._owner_record_expired(owner)
+                    and self._pid_is_alive(owner["pid"])
+                ):
+                    continue
+                if owner is None and st.st_mtime > legacy_cutoff:
+                    continue
+                self._remove_staging_owner(directory)
+                continue
+            if not stat.S_ISDIR(st.st_mode):
+                # A symlink or file wearing a staging name is not a staging
+                # directory; it is never entered, promoted or followed.
+                continue
+            owner = self._read_owner_record(candidate.with_name(name + suffix))
+            if owner is not None:
+                expired = self._owner_record_expired(owner)
+                if not expired and self._pid_is_alive(owner["pid"]):
+                    continue
+                if owner["container"]:
+                    # A pid that is dead, or too old to be trusted, settles
+                    # nothing while Docker still knows the container.
+                    if time.monotonic() > inspect_deadline:
+                        logger.debug(
+                            "Sweep inspect budget spent; %s left for the next run", candidate
+                        )
+                        continue
+                    remaining = inspect_deadline - time.monotonic()
+                    try:
+                        exists = await asyncio.wait_for(
+                            self._container_exists(docker_path, owner["container"]),
+                            timeout=max(0.5, remaining),
+                        )
+                    except TimeoutError:
+                        exists = True  # inconclusive: leave the directory alone
+                    if exists:
+                        continue
+                if expired:
+                    logger.warning(
+                        "Staging directory %s is older than any script may run and "
+                        "Docker no longer knows its container; its recorded pid %s "
+                        "is treated as reused and the directory is reaped.",
+                        candidate, owner["pid"],
+                    )
+            elif st.st_mtime > legacy_cutoff:
+                continue
+            self._promote_staged_trash(candidate, host_trash_dir)
+
+    def _owner_record_expired(self, owner: Dict[str, object]) -> bool:
+        """Whether the record is older than any script may run, so its pid
+        is no longer evidence of a live owner (a reused pid answers
+        ``kill -0`` too). The bound follows the configured maximum when that
+        is longer than a week."""
+        started = owner.get("started")
+        if not isinstance(started, float):
+            return False
+        bound = max(self.OWNER_MAX_AGE_SECONDS, 2 * self._legacy_staging_age_seconds)
+        return time.time() - started > bound
+
+    #: How many collision suffixes a move tries before giving up.
+    MOVE_SUFFIX_LIMIT = 1000
+
+    @classmethod
+    def _move_noreplace(cls, entry: Path, into: Path, label: str) -> Path:
+        """Move ``entry`` into ``into`` under ``label`` (a suffix is added on
+        collision) without ever replacing a concurrently created target.
+
+        Two promoters (two sweeps, or a sweep and a live promotion) may settle
+        on the same destination before either renames; a plain rename would
+        make the second replace the first and destroy a restorable entry.
+        The rename is anchored on directory descriptors and refused when the
+        target exists (``_rename_noreplace``), so a collision is retried with
+        the next suffix rather than clobbered.
+        """
+        source_fd = os.open(entry.parent, os.O_RDONLY)
+        try:
+            dest_fd = os.open(into, os.O_RDONLY)
+            try:
+                expected = os.stat(entry.name, dir_fd=source_fd, follow_symlinks=False)
+                for suffix in range(cls.MOVE_SUFFIX_LIMIT):
+                    name = label if suffix == 0 else f"{label}.{suffix}"
+                    try:
+                        _rename_noreplace(
+                            entry.name, name,
+                            source_dir_fd=source_fd, destination_dir_fd=dest_fd,
+                            expected_source_stat=expected,
+                        )
+                    except FileExistsError:
+                        continue
+                    return into / name
+                raise OSError(f"no free name for {entry.name} under {into}")
+            finally:
+                os.close(dest_fd)
+        finally:
+            os.close(source_fd)
+
+    #: Where container-made hidden entries go. Not a ``.staging-`` name, so
+    #: the sweep never treats it or its contents as staging directories or
+    #: owner records; hidden, so the trash listing never shows it.
+    QUARANTINE_DIR_NAME = ".quarantine"
+
+    @classmethod
+    def _quarantine(cls, entry: Path, staging_dir: Path, host_trash_dir: Path) -> Path:
+        """Move ``entry`` into the quarantine; the name records which staging
+        directory it came from (the directory itself when moved whole)."""
+        quarantine = host_trash_dir / cls.QUARANTINE_DIR_NAME
+        quarantine.mkdir(mode=0o700, exist_ok=True)
+        label = staging_dir.name if entry == staging_dir else f"{staging_dir.name}-{entry.name}"
+        destination = cls._move_noreplace(entry, quarantine, label)
+        try:
+            held = sum(1 for _ in quarantine.iterdir())
+        except OSError:
+            held = -1
+        logger.warning(
+            "Quarantine %s now holds %s entries; container-made entries the host "
+            "user cannot delete need an operator's attention.",
+            quarantine, held,
+        )
+        return destination
+
+    @classmethod
+    def _remove_staging_owner(cls, staging_dir: Path) -> None:
+        record = staging_dir.with_name(staging_dir.name + cls.STAGING_OWNER_SUFFIX)
+        try:
+            record.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.debug("Could not remove staging owner record %s", record, exc_info=True)
+
+    @classmethod
+    def _promote_staged_trash(cls, staging_dir: Path, host_trash_dir: Path) -> None:
         """Move per-execution staged trash entries into the real trash root.
 
         Renames each staged entry (same filesystem, atomic) with a collision
-        suffix, then removes the staging directory. Best-effort: a promotion
-        failure must not mask the execution result — but it is logged loudly
-        because it strands restorable trash entries in a hidden directory.
+        suffix, then removes the staging directory and its owner record.
+        Best-effort: a promotion failure must not mask the execution result,
+        but it is logged loudly because it strands restorable trash entries
+        in a hidden directory. Two exceptions are quiet: a staging directory
+        that is not a real directory (a symlink planted by the container is
+        skipped, never followed, and reported), and entries that vanished
+        because another process promoted the same stale directory first
+        (the entries are then already in the root).
         """
         try:
-            if not staging_dir.is_dir():
+            try:
+                st = staging_dir.lstat()
+            except FileNotFoundError:
+                cls._remove_staging_owner(staging_dir)
                 return
-            for entry in staging_dir.iterdir():
-                destination = host_trash_dir / entry.name
-                suffix = 0
-                while destination.exists():
-                    suffix += 1
-                    destination = host_trash_dir / f"{entry.name}.{suffix}"
-                entry.rename(destination)
-            staging_dir.rmdir()
+            if not stat.S_ISDIR(st.st_mode):
+                logger.warning(
+                    "Refusing to promote %s: not a directory (a symlink or file "
+                    "wearing a staging name); left in place.",
+                    staging_dir,
+                )
+                return
+            try:
+                entries = list(staging_dir.iterdir())
+            except FileNotFoundError:
+                # Another sweep promoted and removed this directory between
+                # our lstat and our listing; its entries are in the root.
+                logger.debug("Staging directory %s already promoted by another process", staging_dir)
+                cls._remove_staging_owner(staging_dir)
+                return
+            for entry in entries:
+                if entry.is_symlink() or entry.name.startswith("."):
+                    # Never promote a link or a hidden entry. A link's target
+                    # is whatever the container chose; a hidden name is one
+                    # no rewriter-made trash entry ever has, and in the root
+                    # it would pass for a staging directory or an owner
+                    # record the sweep trusts (review of #3117). A link is
+                    # unlinked; anything else is moved aside into the
+                    # quarantine rather than deleted, because a container
+                    # can make a directory the host user cannot remove
+                    # (root-owned, or mode 0500) and a directory that will
+                    # not empty would keep this one, and its record, in the
+                    # root forever. A rename needs only this directory.
+                    if entry.is_symlink():
+                        logger.warning(
+                            "Refusing to promote symlink %s staged by a container; removed.",
+                            entry,
+                        )
+                        entry.unlink()
+                        continue
+                    try:
+                        quarantined = cls._quarantine(entry, staging_dir, host_trash_dir)
+                    except OSError:
+                        # Moving a directory rewrites its own '..' entry, so
+                        # one the host user cannot write (mode 0500, or
+                        # root-owned) will not move; the whole staging
+                        # directory, which is ours, is moved aside below.
+                        logger.warning(
+                            "Refusing to promote hidden entry %s staged by a container; "
+                            "it cannot be moved on its own.",
+                            entry,
+                        )
+                        continue
+                    logger.warning(
+                        "Refusing to promote hidden entry %s staged by a container; "
+                        "moved to %s.",
+                        entry, quarantined,
+                    )
+                    continue
+                try:
+                    cls._move_noreplace(entry, host_trash_dir, entry.name)
+                except FileNotFoundError:
+                    # Another sweep promoted this stale directory first.
+                    logger.debug(
+                        "Staged entry %s already promoted by another process", entry
+                    )
+                except OSError as move_error:
+                    # An entry the host user cannot move (a root-owned
+                    # directory from a root container: moving it rewrites
+                    # its own '..'). Keep promoting the rest; the ENOTEMPTY
+                    # fallback below moves this directory aside whole.
+                    logger.warning(
+                        "Staged entry %s could not be promoted (%s: %s); the "
+                        "staging directory will be moved aside whole.",
+                        entry, type(move_error).__name__, move_error,
+                    )
+            try:
+                staging_dir.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Something a container left could not be moved on its own.
+                # The staging directory itself is ours: move the whole of it
+                # aside so neither it nor its record stays in the root.
+                aside = cls._quarantine(staging_dir, staging_dir, host_trash_dir)
+                logger.warning(
+                    "Staging directory %s could not be emptied of container-made "
+                    "entries; moved whole to %s.",
+                    staging_dir, aside,
+                )
+            cls._remove_staging_owner(staging_dir)
         except OSError:
             logger.warning(
                 "Failed to promote staged trash entries from %s into %s; "

@@ -1,0 +1,6813 @@
+"""Typed, durable host and agent Hold latches.
+
+A Hold is state, not a cancellation event.  The current latch and its immutable
+mutation receipts live in the host control database so every worker observes
+the same answer after a restart.  This module owns only storage and composition;
+turn-start refusal is the separate enforcement seam tracked by #3162.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import errno
+import hashlib
+import json
+import logging
+import os
+import re
+import sqlite3
+from contextlib import AsyncExitStack, asynccontextmanager, closing, contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, Awaitable, Iterable, Mapping, Optional
+from uuid import UUID, uuid4
+
+try:  # pragma: no cover - exercised on Kestrel's POSIX deployment targets
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no POSIX advisory locks
+    fcntl = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - imported only on Windows
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX has no Windows byte-range locks
+    msvcrt = None  # type: ignore[assignment]
+
+from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+from kestrel_sovereign.private_storage import (
+    PrivateStorageError,
+    absolute_without_following_leaf,
+    ensure_private_directory,
+    exclusive_private_file_lock,
+    open_private_file,
+    open_private_file_for_validation,
+    path_exists,
+)
+from kestrel_sovereign.storage.database_clock import (
+    database_now_sql,
+    database_timestamp_bound_text,
+)
+from kestrel_sovereign.storage.db.interface import DatabaseError
+from kestrel_sovereign.storage.feed_sequence import ensure_feed_sequence
+
+logger = logging.getLogger(__name__)
+
+HOST_HOLD_TARGET = "host"
+_SCHEMA_LOCK = "hold_state_v1"
+_HISTORY_LOCK_KEY = "kestrel:hold:history-anchor"
+_WITNESS_BACKFILL = "hold_state_witness_ledgers_v1"
+_INITIALIZATION_WITNESS_PAYLOAD = b"kestrel-hold-state-initialized-v1\n"
+_SQLITE_CUSTODY_MARKER_HEADER = b"kestrel-hold-sqlite-custody-v2\n"
+_BOOTSTRAP_INTENT_PAYLOAD = b"kestrel-hold-bootstrap-pending-v1\n"
+_HISTORY_ANCHOR_MAX_BYTES = 256
+# Recorded in ``hold_schema_migrations`` by the one transaction that adds and
+# backfills ``hold_receipts.authority``; its presence is what says the
+# database's whole-history anchor uses the v2 projection.
+_HISTORY_ANCHOR_V2_MIGRATION = "hold_history_anchor_v2"
+# Recorded by the one schema transaction that widens every scoped Hold table
+# to admit ``mandate`` latches (#3168) and re-anchors the history under v3.
+# The v3 header is what makes a v2 binary refuse this database outright rather
+# than meet its first mandate row as an unexplained scope.
+_HISTORY_ANCHOR_V3_MIGRATION = "hold_history_anchor_v3"
+_HOLD_SCOPE_CHECK = "scope IN ('host', 'agent', 'mandate')"
+# The one pre-v3 spelling the widening migration replaces.
+_LEGACY_SCOPE_CHECK_PATTERN = re.compile(
+    r"CHECK\s*\(\s*scope\s+IN\s*\(\s*'host'\s*,\s*'agent'\s*\)\s*\)",
+    re.IGNORECASE,
+)
+# Every table keyed by ``(scope, target_id)`` carries the scope CHECK.
+_HOLD_SCOPED_TABLES = (
+    "hold_latches",
+    "hold_receipts",
+    "hold_receipt_witnesses",
+    "hold_receipt_content_witnesses",
+)
+_SQLITE_CUSTODY_MARKER_MAX_BYTES = (
+    len(_SQLITE_CUSTODY_MARKER_HEADER) + 65 + _HISTORY_ANCHOR_MAX_BYTES
+)
+_BOOTSTRAP_INTENT_MAX_BYTES = (
+    len(_BOOTSTRAP_INTENT_PAYLOAD) + _HISTORY_ANCHOR_MAX_BYTES
+)
+_EVIDENCE_LOCK_POLL_SECONDS = 0.01
+_POSTGRES_WITNESS_AGENT_ID = "__kestrel_host_control__"
+_POSTGRES_WITNESS_KEY = "hold_schema_initialized_v1"
+_POSTGRES_HISTORY_ANCHOR_KEY = "hold_history_anchor_v1"
+_POSTGRES_HISTORY_CANDIDATE_KEY = "hold_history_candidate_v1"
+_POSTGRES_BOOTSTRAP_INTENT_KEY = "hold_bootstrap_pending_v1"
+_POSTGRES_ROLLBACK_DOMAIN_KEY = "hold_rollback_domain_id_v1"
+_POSTGRES_ROLLBACK_DOMAIN_PREFIX = "kestrel-hold-rollback-domain-v1:"
+_POSTGRES_PRIMARY_BINDING_KEY = "hold_primary_custody_binding_v1"
+_POSTGRES_EVIDENCE_BINDING_KEY = "hold_evidence_custody_binding_v1"
+_POSTGRES_CUSTODY_BINDING_PREFIX = "kestrel-hold-custody-binding-v1:"
+_HOLD_BACKEND_BINDING_HEADER = b"kestrel-hold-backend-v1\n"
+_HOLD_BACKEND_BINDING_MAX_BYTES = len(_HOLD_BACKEND_BINDING_HEADER) + 16
+_POSTGRES_PAIR_BINDING_HEADER = b"kestrel-hold-postgres-pair-v1\n"
+_POSTGRES_PAIR_BINDING_MAX_BYTES = (
+    len(_POSTGRES_PAIR_BINDING_HEADER) + 36 + 1 + 64 + 1 + 64 + 1
+)
+_POSTGRES_PAIR_COMMIT_HEADER = b"kestrel-hold-postgres-pair-committed-v1\n"
+_POSTGRES_PAIR_COMMIT_MAX_BYTES = len(_POSTGRES_PAIR_COMMIT_HEADER) + 36 + 1
+POSTGRES_HOLD_PAIR_ID_ENV = "KESTREL_HOLD_PAIR_ID"
+# Serialize the first Hold metadata publication independently on each
+# PostgreSQL database. PostgreSQL's CREATE TABLE IF NOT EXISTS catalogue probe
+# can race a peer cold start, so the lock must precede that first DDL statement.
+_POSTGRES_SCHEMA_BOOTSTRAP_LOCK = (0x004B4553, 0x5343484D)
+# Two signed int32 values spelling ``KES`` / ``HOLD``. The lock lives on the
+# independent evidence service and spans both primary commit and publication.
+_POSTGRES_EVIDENCE_LOCK = (0x004B4553, 0x484F4C44)
+_HOLD_SCHEMA_TABLES = frozenset(
+    {
+        "hold_latches",
+        "hold_receipts",
+        "hold_receipt_witnesses",
+        "hold_receipt_content_witnesses",
+        "hold_operation_witnesses",
+        "hold_schema_migrations",
+    }
+)
+_HOLD_REQUIRED_UNIQUE_INDEXES = (
+    ("idx_hold_latches_scope_target_unique", "hold_latches", "scope, target_id"),
+    ("idx_hold_receipts_receipt_id_unique", "hold_receipts", "receipt_id"),
+    ("idx_hold_receipts_operation_id_unique", "hold_receipts", "operation_id"),
+    (
+        "idx_hold_receipt_witnesses_scope_target_unique",
+        "hold_receipt_witnesses",
+        "scope, target_id",
+    ),
+    (
+        "idx_hold_receipt_content_witnesses_receipt_id_unique",
+        "hold_receipt_content_witnesses",
+        "receipt_id",
+    ),
+    (
+        "idx_hold_operation_witnesses_operation_id_unique",
+        "hold_operation_witnesses",
+        "operation_id",
+    ),
+    (
+        "idx_hold_operation_witnesses_receipt_id_unique",
+        "hold_operation_witnesses",
+        "receipt_id",
+    ),
+    (
+        "idx_hold_schema_migrations_name_unique",
+        "hold_schema_migrations",
+        "name",
+    ),
+)
+_POSTGRES_HOLD_METADATA_SCHEMA_SQL = (
+    "CREATE TABLE IF NOT EXISTS agent_metadata ("
+    "agent_id TEXT NOT NULL, "
+    "key TEXT NOT NULL, "
+    "value TEXT NOT NULL, "
+    "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+    "PRIMARY KEY (agent_id, key))"
+)
+_POSTGRES_HOLD_METADATA_TABLE_SQL = (
+    "SELECT to_regclass("
+    "format('%I.%I', current_schema(), 'agent_metadata')"
+    ")::text"
+)
+_POSTGRES_HOLD_METADATA_UPSERT_PROBE_SQL = (
+    "EXPLAIN INSERT INTO agent_metadata "
+    "(agent_id, key, value) VALUES ($1, $2, $3) "
+    "ON CONFLICT (agent_id, key) DO UPDATE SET value = excluded.value"
+)
+_POSTGRES_HOLD_METADATA_UPSERT_PROBE_PARAMS = (
+    "__kestrel_hold_schema_probe__",
+    "__kestrel_hold_schema_probe__",
+    "__kestrel_hold_schema_probe__",
+)
+_LATCH_COLUMNS = (
+    "scope, target_id, active, hold_receipt_id, reason, actor_id, set_at, revision"
+)
+# The twelve v1 evidence fields: the whole receipt before ``authority``
+# existed, and still the projection of an un-migrated database.
+_RECEIPT_COLUMNS = (
+    "receipt_id, operation_id, action, disposition, scope, target_id, reason, "
+    "actor_id, occurred_at, expected_hold_receipt_id, prior_hold_receipt_id, "
+    "resulting_hold_receipt_id"
+)
+# The complete receipt once the schema transaction has added ``authority``.
+# Every reader that surfaces a receipt after that transaction selects it, and
+# so does every whole-history reader of a migrated database: the recorded
+# authority is receipt content, and the anchor and snapshot must cover it.
+_RECEIPT_AUTHORITY_COLUMNS = f"{_RECEIPT_COLUMNS}, authority"
+_RECEIPT_AUTHORITY_COLUMN_DEFINITION = "authority TEXT NOT NULL DEFAULT 'sovereign'"
+_V1_RECEIPT_WIDTH = 12
+# The value the migration backfills: every receipt written before the column
+# existed was written by the sovereign host door, the only door there was.
+_BACKFILLED_AUTHORITY = "sovereign"
+
+
+class _HistoryAnchorFormat(Enum):
+    """The receipt projection a whole-history anchor digests.
+
+    The format is part of the anchor payload (its header line), so an anchor
+    can never be compared against a history read under another projection
+    without that difference being visible.
+    """
+
+    # The twelve v1 fields. Written by every release before ``authority``.
+    V1 = b"kestrel-hold-history-v1\n"
+    # The v1 fields plus the recorded authority of every receipt.
+    V2 = b"kestrel-hold-history-v2\n"
+    # The v2 projection over a schema that admits ``mandate`` latches (#3168).
+    V3 = b"kestrel-hold-history-v3\n"
+
+    @property
+    def header(self) -> bytes:
+        return self.value
+
+    @property
+    def order(self) -> int:
+        return _HISTORY_ANCHOR_FORMAT_ORDER.index(self)
+
+    @property
+    def receipt_width(self) -> int:
+        if self is _HistoryAnchorFormat.V1:
+            return _V1_RECEIPT_WIDTH
+        return _V1_RECEIPT_WIDTH + 1
+
+    @property
+    def receipt_history_sql(self) -> str:
+        columns = (
+            _RECEIPT_COLUMNS
+            if self is _HistoryAnchorFormat.V1
+            else _RECEIPT_AUTHORITY_COLUMNS
+        )
+        return f"SELECT {columns} FROM hold_receipts ORDER BY receipt_id"
+
+
+_HISTORY_ANCHOR_FORMAT_ORDER = (
+    _HistoryAnchorFormat.V1,
+    _HistoryAnchorFormat.V2,
+    _HistoryAnchorFormat.V3,
+)
+_HISTORY_ANCHOR_MIGRATIONS = (
+    _HISTORY_ANCHOR_V2_MIGRATION,
+    _HISTORY_ANCHOR_V3_MIGRATION,
+)
+
+
+def _history_anchor_format_for(
+    migration_names: Iterable[object],
+) -> _HistoryAnchorFormat:
+    """The anchor format a database's recorded migrations commit it to."""
+
+    names = set(migration_names)
+    if _HISTORY_ANCHOR_V3_MIGRATION in names:
+        return _HistoryAnchorFormat.V3
+    if _HISTORY_ANCHOR_V2_MIGRATION in names:
+        return _HistoryAnchorFormat.V2
+    return _HistoryAnchorFormat.V1
+
+
+def _snapshot_history_anchor_format(
+    migration_rows: Iterable[Any],
+) -> _HistoryAnchorFormat:
+    return _history_anchor_format_for(
+        row[0] for row in migration_rows if len(row) == 1
+    )
+
+
+def _payload_history_anchor_format(payload: bytes) -> _HistoryAnchorFormat:
+    """The format a (validated) anchor payload declares in its header."""
+
+    for anchor_format in _HistoryAnchorFormat:
+        if payload.startswith(anchor_format.header):
+            return anchor_format
+    raise HoldCorruptStateError("Hold history anchor has invalid durable evidence")
+
+
+def _v1_projection_of(rows: Iterable[Any]) -> Optional[tuple[Any, ...]]:
+    """Project migrated rows back to v1, or ``None`` if v1 never covered them.
+
+    Only a receipt whose recorded authority is the backfilled value is one a
+    v1 anchor could have described; anything else is outside that anchor.
+    """
+
+    projected: list[Any] = []
+    for row in rows:
+        if len(row) != _V1_RECEIPT_WIDTH + 1:
+            raise HoldCorruptStateError("hold receipt row has an unexpected shape")
+        if _receipt_from_row(row).authority is not HoldAuthority.SOVEREIGN:
+            return None
+        projected.append(tuple(row)[:_V1_RECEIPT_WIDTH])
+    return tuple(projected)
+
+
+def _backfilled_projection_of(rows: Iterable[Any]) -> tuple[Any, ...]:
+    """The rows an un-migrated history becomes once ``authority`` backfills."""
+
+    projected: list[Any] = []
+    for row in rows:
+        if len(row) != _V1_RECEIPT_WIDTH:
+            raise HoldCorruptStateError("hold receipt row has an unexpected shape")
+        projected.append((*tuple(row), _BACKFILLED_AUTHORITY))
+    return tuple(projected)
+
+
+class HoldScope(str, Enum):
+    """The scopes on which a durable Hold may latch.
+
+    ``host`` and ``agent`` latches are set by the sovereign. A ``mandate``
+    latch is set by one ancestor on one of its signed spawned descendants
+    (#3168); it is keyed by the pair ``(target, holder)`` so two ancestors
+    never share a latch and no holder can reach a latch another authority set.
+    """
+
+    HOST = "host"
+    AGENT = "agent"
+    MANDATE = "mandate"
+
+
+class HoldAction(str, Enum):
+    HOLD = "hold"
+    RELEASE = "release"
+
+
+class HoldDisposition(str, Enum):
+    APPLIED = "applied"
+    ALREADY_IN_STATE = "already_in_state"
+    REFUSED_STALE = "refused_stale"
+
+
+class HoldAuthority(str, Enum):
+    """The authority under which a Hold receipt's actor acted.
+
+    Recorded by the door that performed the mutation, never inferred from the
+    shape of the actor string. The sovereign host door is the only writer
+    today; every receipt written before this column existed was written by it,
+    which is why the v1 backfill is ``sovereign``. ``mandate`` is recorded by
+    the descendant-Hold door (#3168): the actor is the holder, acting under
+    its verified signed spawn lineage over the target.
+    """
+
+    SOVEREIGN = "sovereign"
+    MANDATE = "mandate"
+
+
+class HoldStateError(RuntimeError):
+    """Base class for a durable Hold-state failure."""
+
+
+class HoldIdempotencyConflict(HoldStateError):
+    """One operation id was reused for a different mutation."""
+
+
+class HoldCorruptStateError(HoldStateError):
+    """Persisted Hold state cannot be interpreted safely."""
+
+
+class HoldAuthorityMismatch(HoldStateError):
+    """A mutation's recorded authority cannot act on the latch it names.
+
+    The store's own backstop for the door rules: only a holder sets its
+    mandate latch, only that holder or the sovereign releases it, and the
+    mandate authority never reaches a host or agent latch.
+    """
+
+
+def mandate_latch_key(target_id: str, holder_id: str) -> str:
+    """The durable latch key of the mandate Hold ``holder_id`` set on ``target_id``.
+
+    Canonical compact JSON of ``[target, holder]``: length-unambiguous, so no
+    identity character can forge a split, and prefix-free on the target, so
+    every mandate latch on one target shares :func:`_mandate_key_prefix`.
+    """
+
+    target = _required_text(target_id, "target_id")
+    holder = _required_text(holder_id, "holder_id")
+    if target == holder:
+        raise ValueError("a mandate Hold cannot target its own holder")
+    return json.dumps([target, holder], ensure_ascii=False, separators=(",", ":"))
+
+
+def _mandate_key_prefix(target_id: str) -> str:
+    encoded = json.dumps([target_id], ensure_ascii=False, separators=(",", ":"))
+    return encoded[:-1] + ","
+
+
+def parse_mandate_latch_key(key: object) -> tuple[str, str]:
+    """Return ``(target, holder)`` of a canonical mandate latch key."""
+
+    if not isinstance(key, str):
+        raise ValueError("mandate Hold key must be text")
+    try:
+        parts = json.loads(key)
+    except ValueError as exc:
+        raise ValueError("mandate Hold key is not canonical") from exc
+    if (
+        not isinstance(parts, list)
+        or len(parts) != 2
+        or not all(isinstance(part, str) for part in parts)
+    ):
+        raise ValueError("mandate Hold key is not canonical")
+    if mandate_latch_key(parts[0], parts[1]) != key:
+        raise ValueError("mandate Hold key is not canonical")
+    return parts[0], parts[1]
+
+
+def _scope_subject(scope: "HoldScope", target_id: str) -> str:
+    if scope is HoldScope.MANDATE:
+        return parse_mandate_latch_key(target_id)[0]
+    return target_id
+
+
+def _scope_holder(scope: "HoldScope", target_id: str) -> Optional[str]:
+    if scope is HoldScope.MANDATE:
+        return parse_mandate_latch_key(target_id)[1]
+    return None
+
+
+def _validate_door_authority(
+    *,
+    action: "HoldAction",
+    scope: "HoldScope",
+    target_id: str,
+    actor_id: str,
+    authority: "HoldAuthority",
+) -> None:
+    """Refuse a mutation whose authority cannot address this latch."""
+
+    if scope is not HoldScope.MANDATE:
+        if authority is not HoldAuthority.SOVEREIGN:
+            raise HoldAuthorityMismatch(
+                "only the sovereign may mutate a host or agent Hold"
+            )
+        return
+    holder = parse_mandate_latch_key(target_id)[1]
+    if authority is HoldAuthority.MANDATE:
+        if actor_id != holder:
+            raise HoldAuthorityMismatch(
+                "a mandate Hold is mutable only by its own holder"
+            )
+        return
+    if action is HoldAction.HOLD:
+        raise HoldAuthorityMismatch(
+            "a mandate Hold is set only by a verified ancestor"
+        )
+
+
+@dataclass(frozen=True)
+class PostgresHoldCustodySnapshot:
+    """Read-only identity and role evidence from one PostgreSQL database."""
+
+    cluster_identity: str
+    domain_identity: str | None = None
+    primary_binding: str | None = None
+    evidence_binding: str | None = None
+
+
+@dataclass(frozen=True)
+class HoldDatabaseSnapshot:
+    """Complete read-only rows needed to prove one Hold database at boot."""
+
+    existing_tables: frozenset[str]
+    latch_rows: tuple[Any, ...] = ()
+    receipt_rows: tuple[Any, ...] = ()
+    receipt_count_witness_rows: tuple[Any, ...] = ()
+    content_witness_rows: tuple[Any, ...] = ()
+    operation_witness_rows: tuple[Any, ...] = ()
+    migration_rows: tuple[Any, ...] = ()
+    resolvable_conflict_keys: frozenset[tuple[str, frozenset[str]]] | None = None
+    occupied_schema_names: frozenset[str] | None = None
+    duplicate_conflict_keys: frozenset[tuple[str, frozenset[str]]] | None = None
+
+
+def _hold_duplicate_conflict_key_sql(table: str, columns: str) -> str:
+    """Build the read-only duplicate probe for one declared repair key."""
+
+    declaration = next(
+        (
+            (declared_table, declared_columns)
+            for _name, declared_table, declared_columns in _HOLD_REQUIRED_UNIQUE_INDEXES
+            if declared_table == table and declared_columns == columns
+        ),
+        None,
+    )
+    if declaration is None:
+        raise ValueError("unknown Hold conflict key")
+    column_names = tuple(column.strip() for column in columns.split(","))
+    present = " AND ".join(f"{column} IS NOT NULL" for column in column_names)
+    return (
+        f"SELECT 1 FROM {table} WHERE {present} GROUP BY {columns} "
+        "HAVING COUNT(*) > 1 LIMIT 1"
+    )
+
+
+def validate_postgres_hold_readiness_snapshot(
+    *,
+    snapshot: HoldDatabaseSnapshot,
+    evidence_rows: list[Any] | tuple[Any, ...],
+) -> None:
+    """Validate the read-only PostgreSQL state that boot will trust.
+
+    Doctor cannot call :meth:`HoldStore.ensure_schema` because a diagnostic is
+    forbidden to create, migrate, or recover durable state.  This pure
+    validator mirrors the external bootstrap/history decisions far enough to
+    distinguish a clean or recoverable deployment from one boot will reject.
+    In particular, the independent history head must agree with the complete
+    immutable receipt set rather than merely with the two custody role rows.
+    """
+
+    allowed_evidence = {
+        _POSTGRES_WITNESS_KEY,
+        _POSTGRES_HISTORY_ANCHOR_KEY,
+        _POSTGRES_HISTORY_CANDIDATE_KEY,
+        _POSTGRES_BOOTSTRAP_INTENT_KEY,
+    }
+    evidence: dict[str, bytes] = {}
+    for row in evidence_rows:
+        if (
+            len(row) != 2
+            or not isinstance(row[0], str)
+            or row[0] not in allowed_evidence
+            or row[0] in evidence
+            or not isinstance(row[1], str)
+        ):
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold protocol evidence is invalid"
+            )
+        try:
+            evidence[row[0]] = row[1].encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold protocol evidence is invalid"
+            ) from exc
+
+    validate_hold_readiness_snapshot(
+        snapshot=snapshot,
+        initialization_witness=evidence.get(_POSTGRES_WITNESS_KEY),
+        history_anchor=evidence.get(_POSTGRES_HISTORY_ANCHOR_KEY),
+        history_candidate=evidence.get(_POSTGRES_HISTORY_CANDIDATE_KEY),
+        bootstrap_intent=evidence.get(_POSTGRES_BOOTSTRAP_INTENT_KEY),
+    )
+
+
+def postgres_hold_custody_binding_payload(
+    pair_id: UUID,
+    primary_identity: str,
+    evidence_identity: str,
+) -> str:
+    """Encode the durable declaration binding both custody databases."""
+
+    return (
+        _POSTGRES_CUSTODY_BINDING_PREFIX
+        + str(pair_id)
+        + "|"
+        + primary_identity
+        + "|"
+        + evidence_identity
+    )
+
+
+def _validate_postgres_domain_identity(identity: str, *, label: str) -> None:
+    if not identity.startswith(_POSTGRES_ROLLBACK_DOMAIN_PREFIX):
+        raise HoldStateError(
+            f"could not verify PostgreSQL Hold {label} rollback domain"
+        )
+    try:
+        parsed = UUID(identity.removeprefix(_POSTGRES_ROLLBACK_DOMAIN_PREFIX))
+    except (ValueError, AttributeError) as exc:
+        raise HoldStateError(
+            f"could not verify PostgreSQL Hold {label} rollback domain"
+        ) from exc
+    if identity != _POSTGRES_ROLLBACK_DOMAIN_PREFIX + str(parsed):
+        raise HoldStateError(
+            f"could not verify PostgreSQL Hold {label} rollback domain"
+        )
+
+
+def _validate_postgres_custody_binding(
+    payload: str,
+    *,
+    primary_identity: str,
+    evidence_identity: str,
+) -> UUID:
+    if not payload.startswith(_POSTGRES_CUSTODY_BINDING_PREFIX):
+        raise HoldStateError("PostgreSQL Hold custody binding is invalid")
+    parts = payload.removeprefix(_POSTGRES_CUSTODY_BINDING_PREFIX).split("|")
+    if len(parts) != 3:
+        raise HoldStateError("PostgreSQL Hold custody binding is invalid")
+    pair, bound_primary, bound_evidence = parts
+    try:
+        pair_id = UUID(pair)
+    except ValueError as exc:
+        raise HoldStateError("PostgreSQL Hold custody binding is invalid") from exc
+    if str(pair_id) != pair or (
+        bound_primary != primary_identity or bound_evidence != evidence_identity
+    ):
+        raise HoldStateError(
+            "PostgreSQL Hold custody binding does not match the configured pair"
+        )
+    return pair_id
+
+
+def validate_postgres_hold_custody(
+    primary: PostgresHoldCustodySnapshot,
+    evidence: PostgresHoldCustodySnapshot,
+) -> UUID | None:
+    """Fail closed on a read-only snapshot before either schema is mutated.
+
+    A brand-new pair has no metadata table yet and is valid to initialize. Once
+    either side contains role evidence, the persisted domains and pair binding
+    must describe exactly the configured primary/evidence ordering.
+    """
+
+    if (
+        not isinstance(primary.cluster_identity, str)
+        or not primary.cluster_identity.strip()
+    ):
+        raise HoldStateError(
+            "could not verify PostgreSQL Hold primary cluster identity"
+        )
+    if (
+        not isinstance(evidence.cluster_identity, str)
+        or not evidence.cluster_identity.strip()
+    ):
+        raise HoldStateError(
+            "could not verify PostgreSQL Hold evidence cluster identity"
+        )
+    if primary.cluster_identity == evidence.cluster_identity:
+        raise HoldStateError(
+            "PostgreSQL Hold evidence requires an independent PostgreSQL cluster"
+        )
+
+    if (
+        primary.evidence_binding is not None
+        or evidence.primary_binding is not None
+    ):
+        raise HoldStateError(
+            "PostgreSQL Hold database has the wrong durable custody role"
+        )
+
+    for label, identity in (
+        ("primary", primary.domain_identity),
+        ("evidence", evidence.domain_identity),
+    ):
+        if identity is not None:
+            if not isinstance(identity, str):
+                raise HoldStateError(
+                    f"could not verify PostgreSQL Hold {label} rollback domain"
+                )
+            _validate_postgres_domain_identity(identity, label=label)
+
+    if (
+        primary.domain_identity is not None
+        and primary.domain_identity == evidence.domain_identity
+    ):
+        raise HoldStateError(
+            "PostgreSQL Hold evidence must use an independent rollback domain"
+        )
+
+    expected = tuple(
+        binding
+        for binding in (primary.primary_binding, evidence.evidence_binding)
+        if binding is not None
+    )
+    if not expected:
+        return None
+    if primary.domain_identity is None or evidence.domain_identity is None:
+        raise HoldStateError(
+            "PostgreSQL Hold custody binding lacks a durable rollback domain"
+        )
+    pair_ids = []
+    for binding in expected:
+        if not isinstance(binding, str):
+            raise HoldStateError("PostgreSQL Hold custody binding is invalid")
+        pair_ids.append(
+            _validate_postgres_custody_binding(
+                binding,
+                primary_identity=primary.domain_identity,
+                evidence_identity=evidence.domain_identity,
+            )
+        )
+    if len(expected) == 2 and expected[0] != expected[1]:
+        raise HoldStateError(
+            "PostgreSQL Hold custody binding disagrees between databases"
+        )
+    return pair_ids[0]
+
+
+def postgres_hold_custody_snapshot_from_rows(
+    cluster_identity: str,
+    rows: list[Any] | tuple[Any, ...],
+    *,
+    label: str,
+) -> PostgresHoldCustodySnapshot:
+    """Parse the three allowlisted custody keys from read-only query rows."""
+
+    values: dict[str, str] = {}
+    allowed = {
+        _POSTGRES_ROLLBACK_DOMAIN_KEY,
+        _POSTGRES_PRIMARY_BINDING_KEY,
+        _POSTGRES_EVIDENCE_BINDING_KEY,
+    }
+    for row in rows:
+        if (
+            len(row) != 2
+            or not isinstance(row[0], str)
+            or row[0] not in allowed
+            or row[0] in values
+            or not isinstance(row[1], str)
+        ):
+            raise HoldStateError(
+                f"PostgreSQL Hold {label} custody metadata is invalid"
+            )
+        values[row[0]] = row[1]
+    return PostgresHoldCustodySnapshot(
+        cluster_identity=cluster_identity,
+        domain_identity=values.get(_POSTGRES_ROLLBACK_DOMAIN_KEY),
+        primary_binding=values.get(_POSTGRES_PRIMARY_BINDING_KEY),
+        evidence_binding=values.get(_POSTGRES_EVIDENCE_BINDING_KEY),
+    )
+
+
+async def _gather_database_probes(
+    *probes: Awaitable[Any],
+) -> tuple[Any, ...]:
+    """Cancel and await every sibling before a failed probe leaves its scope."""
+
+    tasks = tuple(asyncio.ensure_future(probe) for probe in probes)
+    try:
+        return tuple(await asyncio.gather(*tasks))
+    except BaseException as failure:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        cleanup = asyncio.gather(*tasks, return_exceptions=True)
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # Repeated cancellation must not let a database probe escape
+                # into host-context pool cleanup. Re-raise the original failure
+                # only after every owned child has reached a terminal state.
+                continue
+        await cleanup
+        raise
+
+
+@asynccontextmanager
+async def _postgres_custody_locks(
+    primary_db: Any,
+    evidence_db: Any,
+    *,
+    primary_cluster: str,
+    evidence_cluster: str,
+):
+    """Lock both custody clusters in one deterministic global order.
+
+    The same pair can be presented in opposite roles by two concurrent cold
+    starts. Locking only the configured evidence side would then give each
+    process a different serialization point and let both publish incompatible
+    roles. Cluster identities are immutable PostgreSQL ``initdb`` identities,
+    so sorting them gives every role ordering the same acquisition order.
+    """
+
+    if primary_cluster == evidence_cluster:
+        raise HoldStateError(
+            "PostgreSQL Hold evidence requires an independent PostgreSQL cluster"
+        )
+    databases = sorted(
+        (
+            (primary_cluster, "primary", primary_db),
+            (evidence_cluster, "evidence", evidence_db),
+        ),
+        key=lambda item: item[0],
+    )
+    async with AsyncExitStack() as stack:
+        for cluster, label, database in databases:
+            lock_owner = getattr(database, "backend", None) or database
+            locks = getattr(lock_owner, "advisory_locks", None)
+            if not callable(locks):
+                raise HoldStateError(
+                    f"PostgreSQL Hold {label} database cannot provide advisory locks"
+                )
+            await stack.enter_async_context(
+                locks(
+                    (_POSTGRES_EVIDENCE_LOCK,),
+                    expected_cluster_identity=cluster,
+                )
+            )
+        yield
+
+
+@asynccontextmanager
+async def _postgres_operational_session(
+    database: Any,
+    *,
+    expected_cluster_identity: str | None = None,
+):
+    """Pin Hold I/O when the concrete PostgreSQL backend exposes the seam."""
+
+    owner = getattr(database, "backend", None) or database
+    session = getattr(owner, "operational_session", None)
+    if callable(session):
+        context = (
+            session()
+            if expected_cluster_identity is None
+            else session(expected_cluster_identity=expected_cluster_identity)
+        )
+        async with context:
+            yield
+        return
+    # Compatibility for narrow test/storage facades. Production PostgreSQL
+    # uses PostgresBackend, which always supplies operational_session.
+    yield
+
+
+@asynccontextmanager
+async def _postgres_operational_sessions(
+    primary_db: Any,
+    evidence_db: Any,
+    *,
+    primary_cluster: str,
+    evidence_cluster: str,
+):
+    """Pin both operational pools in the same immutable cluster order."""
+
+    databases = sorted(
+        (
+            (primary_cluster, primary_db),
+            (evidence_cluster, evidence_db),
+        ),
+        key=lambda item: item[0],
+    )
+    async with AsyncExitStack() as stack:
+        for cluster, database in databases:
+            await stack.enter_async_context(
+                _postgres_operational_session(
+                    database,
+                    expected_cluster_identity=cluster,
+                )
+            )
+        yield
+
+
+@asynccontextmanager
+async def _postgres_schema_initialization_guard(
+    backend: Any,
+    *,
+    expected_cluster_identity: str,
+):
+    """Keep identity verification, advisory exclusion, and DDL on one cluster."""
+
+    async with _postgres_operational_session(
+        backend,
+        expected_cluster_identity=expected_cluster_identity,
+    ), backend.advisory_locks(
+        (_POSTGRES_SCHEMA_BOOTSTRAP_LOCK,),
+        expected_cluster_identity=expected_cluster_identity,
+    ):
+        yield
+
+
+async def _read_raw_postgres_cluster_identity(
+    backend: Any,
+    *,
+    label: str,
+) -> str:
+    """Return the cluster identity from one connected raw PostgreSQL pool."""
+
+    try:
+        cluster_rows = await backend.fetch_all(
+            "SELECT system_identifier::text FROM pg_catalog.pg_control_system()"
+        )
+    except Exception as exc:
+        raise HoldStateError(
+            f"could not verify PostgreSQL Hold {label} cluster identity; "
+            "the runtime role requires EXECUTE on "
+            "pg_catalog.pg_control_system()"
+        ) from exc
+    if (
+        len(cluster_rows) != 1
+        or len(cluster_rows[0]) != 1
+        or not isinstance(cluster_rows[0][0], str)
+        or not cluster_rows[0][0].strip()
+    ):
+        raise HoldStateError(
+            f"could not verify PostgreSQL Hold {label} cluster identity"
+        )
+    return cluster_rows[0][0]
+
+
+async def _read_postgres_hold_custody_snapshot(
+    backend: Any,
+    *,
+    label: str,
+) -> PostgresHoldCustodySnapshot:
+    """Read custody evidence without creating or changing database objects."""
+
+    async with _postgres_operational_session(backend):
+        cluster_identity = await _read_raw_postgres_cluster_identity(
+            backend,
+            label=label,
+        )
+
+        try:
+            table_rows = await backend.fetch_all(_POSTGRES_HOLD_METADATA_TABLE_SQL)
+        except Exception as exc:
+            raise HoldStateError(
+                f"could not inspect PostgreSQL Hold {label} custody metadata"
+            ) from exc
+        if len(table_rows) != 1 or len(table_rows[0]) != 1:
+            raise HoldStateError(
+                f"could not inspect PostgreSQL Hold {label} custody metadata"
+            )
+        table_name = table_rows[0][0]
+        if table_name is None:
+            return PostgresHoldCustodySnapshot(cluster_identity=cluster_identity)
+        if not isinstance(table_name, str) or not table_name.strip():
+            raise HoldStateError(
+                f"could not inspect PostgreSQL Hold {label} custody metadata"
+            )
+
+        try:
+            rows = await backend.fetch_all(
+                "SELECT key, value FROM agent_metadata "
+                "WHERE agent_id = ? AND key IN (?, ?, ?)",
+                (
+                    _POSTGRES_WITNESS_AGENT_ID,
+                    _POSTGRES_ROLLBACK_DOMAIN_KEY,
+                    _POSTGRES_PRIMARY_BINDING_KEY,
+                    _POSTGRES_EVIDENCE_BINDING_KEY,
+                ),
+            )
+        except Exception as exc:
+            raise HoldStateError(
+                f"could not inspect PostgreSQL Hold {label} custody metadata"
+            ) from exc
+
+    return postgres_hold_custody_snapshot_from_rows(
+        cluster_identity,
+        rows,
+        label=label,
+    )
+
+
+async def _close_postgres_preflight_backends(
+    *backends: Any,
+) -> tuple[BaseException, ...]:
+    """Finish every raw-pool close even under repeated caller cancellation."""
+
+    async def close_all() -> tuple[Any, ...]:
+        return tuple(
+            await asyncio.gather(
+                *(backend.close() for backend in backends),
+                return_exceptions=True,
+            )
+        )
+
+    cleanup = asyncio.create_task(close_all())
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+    results = cleanup.result()
+    if cancelled:
+        raise asyncio.CancelledError()
+    return tuple(result for result in results if isinstance(result, BaseException))
+
+
+async def preflight_postgres_hold_custody(
+    primary_dsn: str,
+    evidence_dsn: str,
+) -> None:
+    """Verify existing custody roles through raw, read-only PostgreSQL pools."""
+
+    (
+        primary_backend,
+        evidence_backend,
+        _primary_cluster,
+        _evidence_cluster,
+        _pair_id,
+    ) = (
+        await _connect_postgres_hold_custody_backends(
+            primary_dsn,
+            evidence_dsn,
+        )
+    )
+    close_errors = await _close_postgres_preflight_backends(
+        primary_backend,
+        evidence_backend,
+    )
+    if close_errors:
+        raise HoldStateError(
+            "could not close PostgreSQL Hold custody preflight connections"
+        ) from close_errors[0]
+
+
+async def _connect_postgres_hold_custody_backends(
+    primary_dsn: str,
+    evidence_dsn: str,
+) -> tuple[Any, Any, str, str, UUID | None]:
+    """Return the exact connected pools whose custody roles were validated."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    primary_backend = PostgresBackend(
+        dsn=primary_dsn,
+        min_pool_size=1,
+        max_pool_size=1,
+    )
+    evidence_backend = PostgresBackend(
+        dsn=evidence_dsn,
+        min_pool_size=1,
+        max_pool_size=1,
+    )
+    try:
+        await _gather_database_probes(
+            primary_backend.connect(),
+            evidence_backend.connect(),
+        )
+        primary_cluster, evidence_cluster = await _gather_database_probes(
+            _read_raw_postgres_cluster_identity(
+                primary_backend,
+                label="primary",
+            ),
+            _read_raw_postgres_cluster_identity(
+                evidence_backend,
+                label="evidence",
+            ),
+        )
+        async with _postgres_custody_locks(
+            primary_backend,
+            evidence_backend,
+            primary_cluster=primary_cluster,
+            evidence_cluster=evidence_cluster,
+        ):
+            # Re-read the entire pair only after both clusters are locked. A
+            # concurrent first boot publishes domain and role rows in stages;
+            # two unlocked per-database reads can otherwise construct a state
+            # that never existed as one custody snapshot.
+            primary, evidence = await _gather_database_probes(
+                _read_postgres_hold_custody_snapshot(
+                    primary_backend,
+                    label="primary",
+                ),
+                _read_postgres_hold_custody_snapshot(
+                    evidence_backend,
+                    label="evidence",
+                ),
+            )
+            if (
+                primary.cluster_identity != primary_cluster
+                or evidence.cluster_identity != evidence_cluster
+            ):
+                raise HoldStateError(
+                    "PostgreSQL Hold cluster identity changed while acquiring "
+                    "custody locks"
+                )
+            pair_id = validate_postgres_hold_custody(primary, evidence)
+    except BaseException as failure:
+        close_errors: tuple[BaseException, ...] = ()
+        try:
+            close_errors = await _close_postgres_preflight_backends(
+                primary_backend,
+                evidence_backend,
+            )
+        except asyncio.CancelledError as cancellation:
+            failure = cancellation
+        for close_error in close_errors:
+            failure.add_note(
+                "Additional PostgreSQL Hold custody preflight close failure: "
+                f"{close_error!r}"
+            )
+        raise failure.with_traceback(failure.__traceback__)
+    return (
+        primary_backend,
+        evidence_backend,
+        primary_cluster,
+        evidence_cluster,
+        pair_id,
+    )
+
+
+async def initialize_postgres_hold_databases(
+    primary_dsn: str,
+    evidence_dsn: str,
+    *,
+    control_db_path: str | Path,
+    expected_external_pair_id: UUID | None = None,
+) -> tuple[Any, Any, UUID]:
+    """Validate, then initialize Hold prerequisites on those connected pools."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    (
+        primary_backend,
+        evidence_backend,
+        primary_cluster,
+        evidence_cluster,
+        internal_pair_id,
+    ) = (
+        await _connect_postgres_hold_custody_backends(
+            primary_dsn,
+            evidence_dsn,
+        )
+    )
+    primary_db = None
+    evidence_db = None
+    primary_backend_consumed = False
+    evidence_backend_consumed = False
+    try:
+        validate_external_postgres_hold_pair_id(
+            internal_pair_id,
+            expected_external_pair_id,
+        )
+        # Publish an external, cluster-bound pair identity before either
+        # configurable database is mutated.  A committed local witness then
+        # distinguishes a recoverable interrupted first boot from two freshly
+        # repointed databases that would otherwise look like a new install.
+        pair_id = claim_postgres_hold_pair_custody(
+            control_db_path,
+            internal_pair_id=internal_pair_id,
+            primary_cluster_identity=primary_cluster,
+            evidence_cluster_identity=evidence_cluster,
+        )
+        # Hold's two custody services are deliberately narrower than Kestrel's
+        # agent database. Running the full core initializer here made a valid
+        # Hold deployment depend on write authority over every unrelated core
+        # table and made Doctor's Hold-specific readiness probe incapable of
+        # predicting boot. Only the metadata ledger used by the external
+        # custody protocol is required before HoldStore creates its own tables.
+        async def initialize_hold_metadata(db: Any) -> None:
+            await db.execute(_POSTGRES_HOLD_METADATA_SCHEMA_SQL)
+            try:
+                await db.fetchall(
+                    _POSTGRES_HOLD_METADATA_UPSERT_PROBE_SQL,
+                    _POSTGRES_HOLD_METADATA_UPSERT_PROBE_PARAMS,
+                )
+            except Exception as exc:
+                raise HoldCorruptStateError(
+                    "Hold agent_metadata schema cannot resolve its required "
+                    "agent/key conflict key"
+                ) from exc
+
+        # Lock each database separately rather than holding both locks at once.
+        # Besides bounding the critical section, this avoids a deadlock if two
+        # still-unbound databases are accidentally presented in opposite roles
+        # by concurrent starts. Custody-role validation remains the authority
+        # that rejects that topology.
+        # from_connected_backend takes ownership at invocation and closes that
+        # backend itself if initialization fails. Track the transfer so outer
+        # pair cleanup never double-closes the failed half.
+        primary_backend_consumed = True
+        primary_db = await AsyncDatabase.from_connected_backend(
+            primary_backend,
+            initialization_guard=_postgres_schema_initialization_guard(
+                primary_backend,
+                expected_cluster_identity=primary_cluster,
+            ),
+            schema_initializer=initialize_hold_metadata,
+        )
+        evidence_backend_consumed = True
+        evidence_db = await AsyncDatabase.from_connected_backend(
+            evidence_backend,
+            initialization_guard=_postgres_schema_initialization_guard(
+                evidence_backend,
+                expected_cluster_identity=evidence_cluster,
+            ),
+            schema_initializer=initialize_hold_metadata,
+        )
+        return primary_db, evidence_db, pair_id
+    except BaseException as failure:
+        close_errors: tuple[BaseException, ...] = ()
+        try:
+            remaining_owners = []
+            if primary_db is not None:
+                remaining_owners.append(primary_db)
+            elif not primary_backend_consumed:
+                remaining_owners.append(primary_backend)
+            if evidence_db is not None:
+                remaining_owners.append(evidence_db)
+            elif not evidence_backend_consumed:
+                remaining_owners.append(evidence_backend)
+            if remaining_owners:
+                close_errors = await _close_postgres_preflight_backends(
+                    *remaining_owners
+                )
+        except asyncio.CancelledError as cancellation:
+            failure = cancellation
+        for close_error in close_errors:
+            failure.add_note(
+                "Additional PostgreSQL Hold database initialization close failure: "
+                f"{close_error!r}"
+            )
+        raise failure.with_traceback(failure.__traceback__)
+
+
+def _domain_error_from_chain(error: BaseException) -> Optional[HoldStateError]:
+    """Recover a typed Hold failure wrapped by a transaction backend."""
+
+    current: Optional[BaseException] = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, HoldStateError):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+@dataclass(frozen=True)
+class HoldState:
+    """One active latch.
+
+    ``target_id`` is the durable latch key. For a mandate latch that key is
+    the ``(target, holder)`` pair; read :attr:`subject_id` and
+    :attr:`holder_id` rather than interpreting it.
+    """
+
+    scope: HoldScope
+    target_id: str
+    reason: str
+    actor_id: str
+    set_at: str
+    hold_receipt_id: str
+    revision: int
+
+    @property
+    def subject_id(self) -> str:
+        """The host marker or agent DID this latch withholds work from."""
+
+        return _scope_subject(self.scope, self.target_id)
+
+    @property
+    def holder_id(self) -> Optional[str]:
+        """The ancestor DID that owns a mandate latch; ``None`` otherwise."""
+
+        return _scope_holder(self.scope, self.target_id)
+
+
+@dataclass(frozen=True)
+class EffectiveHoldState:
+    """Independent latches applying to one agent.
+
+    Every latch composes: the agent is held while ANY of them is set, and
+    releasing one never releases another (#3135 decision 10, #3168).
+    """
+
+    host: Optional[HoldState]
+    agent: Optional[HoldState]
+    mandates: tuple[HoldState, ...] = ()
+
+    @property
+    def held(self) -> bool:
+        return (
+            self.host is not None
+            or self.agent is not None
+            or bool(self.mandates)
+        )
+
+    @property
+    def sources(self) -> tuple[HoldScope, ...]:
+        sources: list[HoldScope] = []
+        if self.host is not None:
+            sources.append(HoldScope.HOST)
+        if self.agent is not None:
+            sources.append(HoldScope.AGENT)
+        if self.mandates:
+            sources.append(HoldScope.MANDATE)
+        return tuple(sources)
+
+
+@dataclass(frozen=True)
+class HoldReceipt:
+    receipt_id: str
+    operation_id: str
+    action: HoldAction
+    disposition: HoldDisposition
+    scope: HoldScope
+    target_id: str
+    reason: str
+    actor_id: str
+    occurred_at: str
+    expected_hold_receipt_id: str
+    prior_hold_receipt_id: str
+    resulting_hold_receipt_id: str
+    authority: HoldAuthority
+
+    @property
+    def subject_id(self) -> str:
+        return _scope_subject(self.scope, self.target_id)
+
+    @property
+    def holder_id(self) -> Optional[str]:
+        return _scope_holder(self.scope, self.target_id)
+
+
+@dataclass(frozen=True)
+class HoldMutation:
+    receipt: HoldReceipt
+    current: Optional[HoldState]
+
+
+@dataclass(frozen=True)
+class HoldFeedEntry:
+    """One Hold receipt at its commit-ordered position in the history feed.
+
+    ``feed_seq`` is the paging key; the receipt's ``occurred_at`` is the
+    database clock's reading and is for display (#3159 R6).
+    """
+
+    feed_seq: int
+    receipt: HoldReceipt
+
+
+@dataclass(frozen=True)
+class HoldReceiptPage:
+    """One bounded page of immutable Hold history plus its continuation.
+
+    Hold history is append-only and is the ONLY record of a resume: the latch
+    row is blanked on release, so a released hold survives nowhere else. A
+    resume is therefore its own ``action='release'`` receipt linked to the hold
+    it ended, never a mutation of the hold event (#3159 R5).
+    """
+
+    entries: tuple[HoldFeedEntry, ...]
+    next_key: Optional[int]
+
+
+def hold_latch_payload(latch: Optional[HoldState]) -> Optional[dict[str, Any]]:
+    """The one wire projection of a latch, shared by every transport.
+
+    The turn-start refusal envelope and the host Hold door describe the same
+    durable fact; a second hand-written dict would let the console and the
+    refusal disagree about what "held" carries.
+    """
+
+    if latch is None:
+        return None
+    payload: dict[str, Any] = {
+        "scope": latch.scope.value,
+        "target_id": latch.subject_id,
+        "reason": latch.reason,
+        "actor_id": latch.actor_id,
+        "set_at": latch.set_at,
+        "hold_receipt_id": latch.hold_receipt_id,
+        "revision": latch.revision,
+    }
+    if latch.scope is HoldScope.MANDATE:
+        payload["holder_id"] = latch.holder_id
+    return payload
+
+
+def hold_mandate_payloads(
+    effective: "EffectiveHoldState",
+) -> list[dict[str, Any]]:
+    """Wire projection of every mandate latch in one effective snapshot."""
+
+    payloads: list[dict[str, Any]] = []
+    for latch in effective.mandates:
+        payload = hold_latch_payload(latch)
+        if payload is not None:
+            payloads.append(payload)
+    return payloads
+
+
+def hold_receipt_payload(receipt: HoldReceipt) -> dict[str, Any]:
+    """The wire projection of one immutable Hold receipt."""
+
+    payload: dict[str, Any] = {
+        "receipt_id": receipt.receipt_id,
+        "operation_id": receipt.operation_id,
+        "action": receipt.action.value,
+        "disposition": receipt.disposition.value,
+        "scope": receipt.scope.value,
+        "target_id": receipt.subject_id,
+        "reason": receipt.reason,
+        "actor_id": receipt.actor_id,
+        "occurred_at": receipt.occurred_at,
+        "expected_hold_receipt_id": receipt.expected_hold_receipt_id,
+        "prior_hold_receipt_id": receipt.prior_hold_receipt_id,
+        "resulting_hold_receipt_id": receipt.resulting_hold_receipt_id,
+        "authority": receipt.authority.value,
+    }
+    if receipt.scope is HoldScope.MANDATE:
+        payload["holder_id"] = receipt.holder_id
+    return payload
+
+
+def hold_initialization_witness_path(control_db_path: str | Path) -> Path:
+    """Return the external witness paired with one host control database."""
+
+    path = absolute_without_following_leaf(Path(control_db_path))
+    return Path(f"{path}.hold-initialized-v1")
+
+
+def hold_history_anchor_path(control_db_path: str | Path) -> Path:
+    """Return the external receipt-history anchor for one control database."""
+
+    path = absolute_without_following_leaf(Path(control_db_path))
+    return Path(f"{path}.hold-history-v1")
+
+
+def hold_sqlite_custody_marker_path(control_db_path: str | Path) -> Path:
+    """Return the directory-level marker for one SQLite Hold database.
+
+    The marker deliberately does not share the database basename.  Backup or
+    replacement tooling commonly treats ``<database>*`` as one replaceable
+    SQLite family; keeping this witness in a private sibling directory leaves
+    an independent fact that distinguishes a first boot from total family
+    loss. The filename binds that fact to the database name within the custody
+    root, rather than to an absolute mount path, so moving or restoring the
+    complete stopped root does not invalidate its authority evidence.
+    """
+
+    path = absolute_without_following_leaf(Path(control_db_path))
+    identity = hashlib.sha256(os.fsencode(path.name)).hexdigest()
+    return path.parent / ".hold-custody" / f"{identity}.initialized-v1"
+
+
+def hold_backend_binding_path(control_db_path: str | Path) -> Path:
+    """Return the immutable backend selection witness for one host database."""
+
+    path = absolute_without_following_leaf(Path(control_db_path))
+    identity = hashlib.sha256(os.fsencode(path.name)).hexdigest()
+    return path.parent / ".hold-custody" / f"{identity}.backend-v1"
+
+
+def hold_postgres_pair_binding_path(control_db_path: str | Path) -> Path:
+    """Return the external identity witness for one PostgreSQL Hold pair."""
+
+    path = absolute_without_following_leaf(Path(control_db_path))
+    identity = hashlib.sha256(os.fsencode(path.name)).hexdigest()
+    return path.parent / ".hold-custody" / f"{identity}.postgres-pair-v1"
+
+
+def hold_postgres_pair_commit_path(control_db_path: str | Path) -> Path:
+    """Return the witness that marks a PostgreSQL pair as initialized."""
+
+    return Path(f"{hold_postgres_pair_binding_path(control_db_path)}.committed")
+
+
+def _postgres_pair_binding_payload(
+    pair_id: UUID,
+    primary_cluster_identity: str,
+    evidence_cluster_identity: str,
+) -> bytes:
+    """Bind a pair UUID to the exact two configured cluster identities."""
+
+    primary_digest = hashlib.sha256(
+        primary_cluster_identity.encode("utf-8")
+    ).hexdigest()
+    evidence_digest = hashlib.sha256(
+        evidence_cluster_identity.encode("utf-8")
+    ).hexdigest()
+    return (
+        _POSTGRES_PAIR_BINDING_HEADER
+        + str(pair_id).encode("ascii")
+        + b"\n"
+        + primary_digest.encode("ascii")
+        + b"\n"
+        + evidence_digest.encode("ascii")
+        + b"\n"
+    )
+
+
+def configured_postgres_hold_pair_id(
+    env: Mapping[str, str],
+    *,
+    required: bool,
+) -> UUID | None:
+    """Read the restart-surviving PostgreSQL pair identity from runtime env."""
+
+    value = env.get(POSTGRES_HOLD_PAIR_ID_ENV)
+    if value is None or not value.strip():
+        if required:
+            raise HoldStateError(
+                f"{POSTGRES_HOLD_PAIR_ID_ENV} is required for disposable-filesystem "
+                "PostgreSQL Hold custody"
+            )
+        return None
+    canonical = value.strip()
+    try:
+        pair_id = UUID(canonical)
+    except ValueError as exc:
+        raise HoldStateError(
+            f"{POSTGRES_HOLD_PAIR_ID_ENV} must be a canonical UUID"
+        ) from exc
+    if str(pair_id) != canonical:
+        raise HoldStateError(
+            f"{POSTGRES_HOLD_PAIR_ID_ENV} must be a canonical UUID"
+        )
+    return pair_id
+
+
+def validate_external_postgres_hold_pair_id(
+    internal_pair_id: UUID | None,
+    expected_external_pair_id: UUID | None,
+) -> None:
+    """Require a provisioned DB pair to match its external durable witness."""
+
+    if expected_external_pair_id is None:
+        return
+    if internal_pair_id is None:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold databases lack the pair identity committed by "
+            f"{POSTGRES_HOLD_PAIR_ID_ENV}; refusing a replacement first boot"
+        )
+    if internal_pair_id != expected_external_pair_id:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold databases conflict with the pair identity committed "
+            f"by {POSTGRES_HOLD_PAIR_ID_ENV}; a verified migration is required"
+        )
+
+
+def _sqlite_custody_marker_payload(
+    control_db_path: str | Path,
+    history_anchor: bytes,
+) -> bytes:
+    """Bind installation-level SQLite custody to its latest receipt head."""
+
+    path = absolute_without_following_leaf(Path(control_db_path))
+    identity = hashlib.sha256(os.fsencode(path.name)).hexdigest().encode("ascii")
+    return _SQLITE_CUSTODY_MARKER_HEADER + identity + b"\n" + history_anchor
+
+
+def _sqlite_custody_marker_history(
+    control_db_path: str | Path,
+    marker_payload: bytes,
+) -> bytes:
+    """Return the validated receipt head carried by a custody marker."""
+
+    path = absolute_without_following_leaf(Path(control_db_path))
+    identity = hashlib.sha256(os.fsencode(path.name)).hexdigest().encode("ascii")
+    prefix = _SQLITE_CUSTODY_MARKER_HEADER + identity + b"\n"
+    if not marker_payload.startswith(prefix):
+        raise HoldCorruptStateError(
+            "SQLite Hold custody marker has invalid durable evidence"
+        )
+    try:
+        return HoldStore._validate_history_anchor_payload(
+            marker_payload.removeprefix(prefix)
+        )
+    except HoldCorruptStateError as exc:
+        raise HoldCorruptStateError(
+            "SQLite Hold custody marker has invalid durable evidence"
+        ) from exc
+
+
+def _validate_sqlite_custody_evidence(
+    *,
+    marker_payload: bytes | None,
+    expected_payload: bytes | None,
+    initialized: bool,
+    bootstrap_pending: bool,
+) -> bool:
+    """Validate the independent marker/local-witness state machine."""
+
+    if (
+        marker_payload is not None
+        and expected_payload is not None
+        and marker_payload != expected_payload
+    ):
+        raise HoldCorruptStateError(
+            "SQLite Hold custody marker does not match receipt history"
+        )
+    marked = marker_payload is not None
+    if marked and not initialized:
+        raise HoldCorruptStateError(
+            "SQLite Hold custody marker proves prior initialization but the "
+            "database family or its initialization witness is missing"
+        )
+    if initialized and not marked and not bootstrap_pending:
+        raise HoldCorruptStateError(
+            "SQLite Hold custody marker is missing for an initialized database"
+        )
+    return marked
+
+
+_UNUSED_SCHEMA_UNASSESSED = (
+    "this backend keeps no independent evidence that Hold was never initialized"
+)
+
+
+def _unused_schema_refusal(
+    *,
+    row_counts: Mapping[str, int],
+    migration_names: tuple[object, ...],
+    custody_marked: bool,
+) -> str | None:
+    """Say why uninitialized Hold tables are not an unused first bootstrap.
+
+    Boot already treats a database with no Hold tables and no external
+    evidence as a first bootstrap. Tables that exist but never recorded
+    anything carry the same facts: no latch, receipt, or witness row, only the
+    markers a schema transaction writes, and no SQLite custody marker proving
+    an earlier initialization. Adopting them grants nothing that dropping
+    those empty tables would not, so returning ``None`` is safe. Any recorded
+    row, the custody marker, or a migration this code does not know means Hold
+    may have been in force, and the absent witness must be restored instead.
+
+    Pre-release Hold code that predated the external witness left exactly
+    this state in a production host database and refused its next boot
+    (#3287).
+    """
+
+    if custody_marked:
+        return "the SQLite custody marker proves an earlier initialization"
+    occupied = [
+        f"{table} holds {count} row{'' if count == 1 else 's'}"
+        for table, count in sorted(row_counts.items())
+        if table != "hold_schema_migrations" and count
+    ]
+    if occupied:
+        return ", ".join(occupied)
+    unknown = sorted(
+        repr(name)
+        for name in migration_names
+        if name not in (_WITNESS_BACKFILL, *_HISTORY_ANCHOR_MIGRATIONS)
+    )
+    if unknown:
+        return "hold_schema_migrations records unknown migration " + ", ".join(
+            unknown
+        )
+    return None
+
+
+def _terminal_authority_ids(
+    authorities: Mapping[str, HoldReceipt],
+    consumers: Mapping[str, HoldReceipt],
+) -> set[str]:
+    """Return open Hold authorities with one linear visit per authority.
+
+    Applied receipts form a functional graph: an authority has at most one
+    successor, and a Hold successor is itself an authority.  Remembering every
+    completed suffix avoids re-walking the full history from each ancestor.
+    Any path that revisits its own unfinished suffix is a closed cycle.
+    """
+
+    terminal_authorities: set[str] = set()
+    completed: set[str] = set()
+    for authority_id in authorities:
+        if authority_id in completed:
+            continue
+        cursor = authority_id
+        path: list[str] = []
+        path_positions: dict[str, int] = {}
+        while cursor not in completed:
+            if cursor in path_positions:
+                raise HoldCorruptStateError("Hold receipt graph contains a cycle")
+            path_positions[cursor] = len(path)
+            path.append(cursor)
+            successor = consumers.get(cursor)
+            if successor is None:
+                terminal_authorities.add(cursor)
+                break
+            if successor.action is HoldAction.RELEASE:
+                break
+            cursor = successor.receipt_id
+        completed.update(path)
+    return terminal_authorities
+
+
+def _required_text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value.strip()
+
+
+def _required_authority(value: object) -> HoldAuthority:
+    """Require the door to name its authority; never infer or default it."""
+
+    if not isinstance(value, HoldAuthority):
+        raise TypeError("Hold authority must be a HoldAuthority recorded by its door")
+    return value
+
+
+def _coerce_scope(value: HoldScope | str) -> HoldScope:
+    if isinstance(value, HoldScope):
+        return value
+    try:
+        return HoldScope(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("scope must be 'host', 'agent' or 'mandate'") from exc
+
+
+def _target(
+    scope: HoldScope,
+    target_id: Optional[str],
+    holder_id: Optional[str] = None,
+) -> str:
+    """Resolve a scope's durable latch key from its caller-facing identities."""
+
+    if scope is HoldScope.MANDATE:
+        if holder_id is None:
+            raise ValueError("a mandate Hold names its holder")
+        return mandate_latch_key(
+            _required_text(target_id, "target_id"),
+            _required_text(holder_id, "holder_id"),
+        )
+    if holder_id is not None:
+        raise ValueError("only a mandate Hold has a holder")
+    if scope is HoldScope.HOST:
+        if target_id not in (None, "", HOST_HOLD_TARGET):
+            raise ValueError("host Hold target is fixed by the host control store")
+        return HOST_HOLD_TARGET
+    return _required_text(target_id, "target_id")
+
+
+def _assert_scope_key(scope: HoldScope, target_id: str, *, label: str) -> None:
+    """Fail closed on a persisted key its scope cannot interpret."""
+
+    if scope is HoldScope.HOST and target_id != HOST_HOLD_TARGET:
+        raise HoldCorruptStateError(f"{label} has a foreign host identity")
+    if scope is HoldScope.MANDATE:
+        try:
+            parse_mandate_latch_key(target_id)
+        except ValueError as exc:
+            raise HoldCorruptStateError(
+                f"{label} has an invalid mandate identity"
+            ) from exc
+
+
+def _exact_nonnegative_revision(value: object) -> int:
+    """Accept only the exact integer representation the latch schema promises."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HoldCorruptStateError("hold latch revision is invalid")
+    return value
+
+
+def _exact_active_flag(value: object) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value not in (0, 1)
+    ):
+        raise HoldCorruptStateError("hold latch active flag is invalid")
+    return value
+
+
+def _aware_timestamp(value: object, field: str) -> str:
+    """Validate persisted Hold time evidence without rewriting its digest."""
+
+    if not isinstance(value, str) or not value:
+        raise HoldCorruptStateError(f"hold {field} timestamp is invalid")
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise HoldCorruptStateError(
+            f"hold {field} timestamp is invalid"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise HoldCorruptStateError(
+            f"hold {field} timestamp must be timezone-aware"
+        )
+    return value
+
+
+def _latch_from_row(row: Any) -> Optional[HoldState]:
+    if row is None:
+        return None
+    if len(row) != 8:
+        raise HoldCorruptStateError("hold latch row has an unexpected shape")
+    try:
+        scope = HoldScope(str(row[0]))
+        target_id = str(row[1])
+        active = _exact_active_flag(row[2])
+        revision = _exact_nonnegative_revision(row[7])
+    except (TypeError, ValueError) as exc:
+        raise HoldCorruptStateError("hold latch row has invalid typed fields") from exc
+    hold_receipt_id = str(row[3] or "")
+    reason = str(row[4] or "")
+    actor_id = str(row[5] or "")
+    set_at = str(row[6] or "")
+    if not target_id.strip():
+        raise HoldCorruptStateError("hold latch is missing its target identity")
+    if scope is HoldScope.HOST and target_id != HOST_HOLD_TARGET:
+        raise HoldCorruptStateError("host hold latch has a foreign target")
+    _assert_scope_key(scope, target_id, label="hold latch")
+    evidence = (hold_receipt_id, reason, actor_id, set_at)
+    if active == 0:
+        if any(evidence):
+            raise HoldCorruptStateError(
+                "inactive latch retains active hold evidence"
+            )
+        return None
+    if any(not value.strip() for value in evidence):
+        raise HoldCorruptStateError("active hold latch is missing required evidence")
+    _aware_timestamp(set_at, "latch")
+    return HoldState(
+        scope=scope,
+        target_id=target_id,
+        reason=reason,
+        actor_id=actor_id,
+        set_at=set_at,
+        hold_receipt_id=hold_receipt_id,
+        revision=revision,
+    )
+
+
+def _feed_entry_from_row(row: Any) -> HoldFeedEntry:
+    """Split a feed row into its paging key and its validated receipt."""
+
+    width = _V1_RECEIPT_WIDTH + 1
+    if row is None or len(row) != width + 1:
+        raise HoldCorruptStateError("hold feed row has an unexpected shape")
+    feed_seq = row[width]
+    if isinstance(feed_seq, bool) or not isinstance(feed_seq, int) or feed_seq < 1:
+        raise HoldCorruptStateError("hold receipt feed sequence is invalid")
+    return HoldFeedEntry(
+        feed_seq=feed_seq, receipt=_receipt_from_row(tuple(row)[:width])
+    )
+
+
+def _receipt_from_row(row: Any) -> HoldReceipt:
+    """Validate one receipt row.
+
+    A row is either the v1 projection (``_RECEIPT_COLUMNS``) or that
+    projection plus its recorded ``authority``. A v1 projection carries no
+    authority of its own; it is interpreted as the v1 authority, which is what
+    the schema backfill records for every row written before the column
+    existed, and is sound only for a database that has not yet migrated:
+    every reader of a migrated database selects the recorded value.
+    """
+
+    if row is None or len(row) not in (_V1_RECEIPT_WIDTH, _V1_RECEIPT_WIDTH + 1):
+        raise HoldCorruptStateError("hold receipt row has an unexpected shape")
+    if any(value is None for value in row):
+        # SQLite does not implicitly make a non-INTEGER PRIMARY KEY non-null,
+        # and an imported/older schema may lack any of the v1 constraints.
+        # Never manufacture the string ``"None"`` as durable audit evidence.
+        raise HoldCorruptStateError("hold receipt has missing required evidence")
+    if any(not isinstance(value, str) for value in row):
+        raise HoldCorruptStateError("hold receipt has invalid evidence types")
+    try:
+        receipt = HoldReceipt(
+            receipt_id=str(row[0]),
+            operation_id=str(row[1]),
+            action=HoldAction(str(row[2])),
+            disposition=HoldDisposition(str(row[3])),
+            scope=HoldScope(str(row[4])),
+            target_id=str(row[5]),
+            reason=str(row[6] or ""),
+            actor_id=str(row[7]),
+            occurred_at=str(row[8]),
+            expected_hold_receipt_id=str(row[9] or ""),
+            prior_hold_receipt_id=str(row[10] or ""),
+            resulting_hold_receipt_id=str(row[11] or ""),
+            authority=(
+                HoldAuthority(str(row[12]))
+                if len(row) > _V1_RECEIPT_WIDTH
+                else HoldAuthority.SOVEREIGN
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HoldCorruptStateError("hold receipt has invalid typed fields") from exc
+    common_evidence = (
+        receipt.receipt_id,
+        receipt.operation_id,
+        receipt.target_id,
+        receipt.reason,
+        receipt.actor_id,
+        receipt.occurred_at,
+    )
+    if any(not value.strip() for value in common_evidence):
+        raise HoldCorruptStateError("hold receipt invariant is invalid")
+    _aware_timestamp(receipt.occurred_at, "receipt")
+    if receipt.scope is HoldScope.HOST and receipt.target_id != HOST_HOLD_TARGET:
+        raise HoldCorruptStateError("hold receipt invariant is invalid")
+    _assert_scope_key(receipt.scope, receipt.target_id, label="hold receipt")
+    try:
+        _validate_door_authority(
+            action=receipt.action,
+            scope=receipt.scope,
+            target_id=receipt.target_id,
+            actor_id=receipt.actor_id,
+            authority=receipt.authority,
+        )
+    except HoldAuthorityMismatch as exc:
+        raise HoldCorruptStateError(
+            "hold receipt records an authority that cannot act on its latch"
+        ) from exc
+
+    prior = receipt.prior_hold_receipt_id
+    resulting = receipt.resulting_hold_receipt_id
+    expected = receipt.expected_hold_receipt_id
+    if any(value and not value.strip() for value in (prior, resulting, expected)):
+        raise HoldCorruptStateError("hold receipt invariant is invalid")
+    if receipt.action is HoldAction.HOLD:
+        valid = expected == "" and (
+            (
+                receipt.disposition is HoldDisposition.APPLIED
+                and resulting == receipt.receipt_id
+            )
+            or (
+                receipt.disposition is HoldDisposition.ALREADY_IN_STATE
+                and bool(prior)
+                and resulting == prior
+            )
+        )
+    else:
+        valid = bool(expected) and (
+            (
+                receipt.disposition is HoldDisposition.APPLIED
+                and prior == expected
+                and resulting == ""
+            )
+            or (
+                receipt.disposition is HoldDisposition.ALREADY_IN_STATE
+                and prior == ""
+                and resulting == ""
+            )
+            or (
+                receipt.disposition is HoldDisposition.REFUSED_STALE
+                and bool(prior)
+                and prior != expected
+                and resulting == prior
+            )
+        )
+    if not valid:
+        raise HoldCorruptStateError("hold receipt invariant is invalid")
+    return receipt
+
+
+def _receipt_content_digest(row: Any) -> str:
+    """Hash every typed receipt field with unambiguous length framing.
+
+    The recorded authority is framed in after the v1 fields only when it is
+    not the v1 authority. Every witness written before the column existed
+    therefore still matches its (backfilled) row, while any other authority —
+    and any in-place rewrite of it in either direction — changes the digest.
+    """
+
+    receipt = _receipt_from_row(row)
+    values = list(tuple(row)[:_V1_RECEIPT_WIDTH])
+    if receipt.authority is not HoldAuthority.SOVEREIGN:
+        values.append(receipt.authority.value)
+    digest = hashlib.sha256()
+    for value in values:
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _snapshot_target(row: Any, *, label: str) -> tuple[HoldScope, str]:
+    """Parse one persisted target key without normalizing damaged evidence."""
+
+    try:
+        scope = HoldScope(str(row[0]))
+    except (IndexError, TypeError, ValueError) as exc:
+        raise HoldCorruptStateError(
+            f"{label} has an invalid scope"
+        ) from exc
+    try:
+        target_id = row[1]
+    except IndexError as exc:
+        raise HoldCorruptStateError(f"{label} is missing its identity") from exc
+    if not isinstance(target_id, str) or not target_id.strip():
+        raise HoldCorruptStateError(f"{label} is missing its identity")
+    if target_id != target_id.strip():
+        raise HoldCorruptStateError(f"{label} has a noncanonical identity")
+    _assert_scope_key(scope, target_id, label=label)
+    return scope, target_id
+
+
+def _validate_snapshot_target(
+    *,
+    target: tuple[HoldScope, str],
+    latch_row: Any,
+    receipt_rows: tuple[Any, ...],
+    receipt_count_rows: tuple[Any, ...],
+    content_witness_rows: tuple[Any, ...],
+    receipts_by_id: Mapping[str, HoldReceipt],
+) -> Optional[HoldState]:
+    """Apply the runtime authority-graph proof to one immutable row set."""
+
+    if latch_row is not None and _snapshot_target(
+        latch_row,
+        label="Hold latch projection",
+    ) != target:
+        raise HoldCorruptStateError("Hold latch projection has a foreign target")
+    latch = _latch_from_row(latch_row)
+    projection_revision = 0
+    if latch_row is not None:
+        projection_revision = _exact_nonnegative_revision(latch_row[7])
+
+    receipts = [_receipt_from_row(row) for row in receipt_rows]
+    if any((receipt.scope, receipt.target_id) != target for receipt in receipts):
+        raise HoldCorruptStateError("Hold receipt graph has a foreign target")
+    receipt_ids = {receipt.receipt_id for receipt in receipts}
+    if len(receipt_ids) != len(receipts):
+        raise HoldCorruptStateError("Hold receipt graph has duplicate identities")
+
+    content_witnesses: dict[str, str] = {}
+    content_witness_valid = True
+    for witness in content_witness_rows:
+        if len(witness) == 4 and _snapshot_target(
+            witness[1:],
+            label="Hold receipt content witness",
+        ) != target:
+            raise HoldCorruptStateError(
+                "Hold receipt content witness has a foreign target"
+            )
+        if (
+            len(witness) != 4
+            or not isinstance(witness[0], str)
+            or not witness[0]
+            or not isinstance(witness[3], str)
+            or len(witness[3]) != 64
+            or witness[0] in content_witnesses
+        ):
+            content_witness_valid = False
+            continue
+        content_witnesses[witness[0]] = witness[3]
+    if set(content_witnesses) != receipt_ids:
+        content_witness_valid = False
+    for row, receipt in zip(receipt_rows, receipts):
+        if content_witnesses.get(receipt.receipt_id) != _receipt_content_digest(row):
+            content_witness_valid = False
+
+    if not receipt_count_rows and not receipts and latch_row is None:
+        witnessed_receipts = 0
+    elif not receipt_count_rows:
+        raise HoldCorruptStateError("Hold receipt-count witness is missing")
+    elif len(receipt_count_rows) != 1:
+        raise HoldCorruptStateError("Hold receipt-count witness is duplicated")
+    else:
+        witness = receipt_count_rows[0]
+        if len(witness) != 3:
+            raise HoldCorruptStateError(
+                "Hold receipt-count witness has an unexpected shape"
+            )
+        if _snapshot_target(
+            witness,
+            label="Hold receipt-count witness",
+        ) != target:
+            raise HoldCorruptStateError(
+                "Hold receipt-count witness has a foreign target"
+            )
+        try:
+            witnessed_receipts = _exact_nonnegative_revision(witness[2])
+        except (TypeError, ValueError) as exc:
+            raise HoldCorruptStateError(
+                "Hold receipt-count witness has invalid typed fields"
+            ) from exc
+
+    applied = [
+        receipt
+        for receipt in receipts
+        if receipt.disposition is HoldDisposition.APPLIED
+    ]
+    authorities = {
+        receipt.receipt_id: receipt
+        for receipt in applied
+        if receipt.action is HoldAction.HOLD
+    }
+    for receipt in receipts:
+        for authority_id in {
+            receipt.prior_hold_receipt_id,
+            receipt.resulting_hold_receipt_id,
+        }:
+            if authority_id and authority_id not in authorities:
+                raise HoldCorruptStateError(
+                    "Hold history references missing authority receipt"
+                )
+    consumers: dict[str, HoldReceipt] = {}
+    for receipt in applied:
+        prior = receipt.prior_hold_receipt_id
+        if not prior:
+            continue
+        if prior not in authorities:
+            raise HoldCorruptStateError(
+                "applied Hold history consumes missing authority"
+            )
+        if prior in consumers:
+            raise HoldCorruptStateError(
+                "applied Hold authority has multiple successors"
+            )
+        consumers[prior] = receipt
+
+    terminal_authorities = _terminal_authority_ids(authorities, consumers)
+    if latch is None:
+        if witnessed_receipts != len(receipts):
+            raise HoldCorruptStateError(
+                "hold receipt-count revision does not match receipt history"
+            )
+        if terminal_authorities:
+            raise HoldCorruptStateError(
+                "unheld projection retains active Hold authority"
+            )
+        if projection_revision != len(applied):
+            raise HoldCorruptStateError(
+                "hold latch revision does not match applied receipt history"
+            )
+        if not content_witness_valid:
+            raise HoldCorruptStateError(
+                "Hold receipt content witness does not match receipt history"
+            )
+        return None
+
+    receipt = authorities.get(latch.hold_receipt_id)
+    if receipt is None:
+        if latch.hold_receipt_id in receipts_by_id:
+            raise HoldCorruptStateError(
+                "active hold latch does not match its authority receipt"
+            )
+        raise HoldCorruptStateError(
+            "active hold latch references a missing authority receipt"
+        )
+    if (
+        receipt.scope is not latch.scope
+        or receipt.target_id != latch.target_id
+        or receipt.reason != latch.reason
+        or receipt.actor_id != latch.actor_id
+        or receipt.occurred_at != latch.set_at
+    ):
+        raise HoldCorruptStateError(
+            "active hold latch does not match its authority receipt"
+        )
+    if terminal_authorities != {latch.hold_receipt_id}:
+        raise HoldCorruptStateError(
+            "active hold latch is not the receipt graph's terminal authority"
+        )
+    if witnessed_receipts != len(receipts):
+        raise HoldCorruptStateError(
+            "hold receipt-count revision does not match receipt history"
+        )
+    if projection_revision != len(applied):
+        raise HoldCorruptStateError(
+            "hold latch revision does not match applied receipt history"
+        )
+    if not content_witness_valid:
+        raise HoldCorruptStateError(
+            "Hold receipt content witness does not match receipt history"
+        )
+    return latch
+
+
+def validate_hold_database_snapshot(
+    snapshot: HoldDatabaseSnapshot,
+) -> tuple[HoldState, ...]:
+    """Validate every projection and append-only witness used during boot."""
+
+    migration_complete = False
+    for row in snapshot.migration_rows:
+        if len(row) != 1 or not isinstance(row[0], str):
+            raise HoldCorruptStateError(
+                "Hold witness migration marker has invalid durable evidence"
+            )
+        migration_complete = migration_complete or row[0] == _WITNESS_BACKFILL
+    if not migration_complete:
+        raise HoldCorruptStateError(
+            "initialized Hold schema is missing its required witness migration marker"
+        )
+    # A migrated database's receipt includes its recorded authority; a
+    # snapshot that omits it would validate every authority as sovereign.
+    anchor_format = _snapshot_history_anchor_format(snapshot.migration_rows)
+    if any(len(row) != anchor_format.receipt_width for row in snapshot.receipt_rows):
+        raise HoldCorruptStateError(
+            "Hold receipt snapshot does not carry the columns its anchor "
+            "format covers"
+        )
+
+    targets: set[tuple[HoldScope, str]] = {
+        (HoldScope.HOST, HOST_HOLD_TARGET)
+    }
+    latch_by_target: dict[tuple[HoldScope, str], Any] = {}
+    for row in snapshot.latch_rows:
+        if len(row) != 8:
+            raise HoldCorruptStateError("hold latch row has an unexpected shape")
+        target = _snapshot_target(row, label="Hold boot-state target")
+        if target in latch_by_target:
+            raise HoldCorruptStateError("duplicate hold latch key")
+        _latch_from_row(row)
+        latch_by_target[target] = row
+        targets.add(target)
+
+    receipt_rows_by_target: dict[tuple[HoldScope, str], list[Any]] = {}
+    receipts_by_id: dict[str, HoldReceipt] = {}
+    receipts_by_operation: dict[str, HoldReceipt] = {}
+    for row in snapshot.receipt_rows:
+        receipt = _receipt_from_row(row)
+        target = _snapshot_target(
+            (receipt.scope.value, receipt.target_id),
+            label="Hold boot-state target",
+        )
+        if receipt.receipt_id in receipts_by_id:
+            raise HoldCorruptStateError("Hold receipt graph has duplicate identities")
+        if receipt.operation_id in receipts_by_operation:
+            raise HoldCorruptStateError(
+                "Hold receipt history contains a duplicate operation id"
+            )
+        receipts_by_id[receipt.receipt_id] = receipt
+        receipts_by_operation[receipt.operation_id] = receipt
+        receipt_rows_by_target.setdefault(target, []).append(row)
+        targets.add(target)
+
+    receipt_count_by_target: dict[tuple[HoldScope, str], list[Any]] = {}
+    for row in snapshot.receipt_count_witness_rows:
+        if len(row) != 3:
+            raise HoldCorruptStateError(
+                "Hold receipt-count witness has an unexpected shape"
+            )
+        target = _snapshot_target(row, label="Hold boot-state target")
+        receipt_count_by_target.setdefault(target, []).append(row)
+        targets.add(target)
+
+    content_by_target: dict[tuple[HoldScope, str], list[Any]] = {}
+    for row in snapshot.content_witness_rows:
+        if len(row) != 4:
+            raise HoldCorruptStateError(
+                "Hold receipt content witness has an unexpected shape"
+            )
+        target = _snapshot_target(row[1:], label="Hold boot-state target")
+        content_by_target.setdefault(target, []).append(row)
+        targets.add(target)
+
+    operation_witnesses: dict[str, str] = {}
+    for row in snapshot.operation_witness_rows:
+        if (
+            len(row) != 2
+            or not isinstance(row[0], str)
+            or not row[0].strip()
+            or row[0] != row[0].strip()
+            or not isinstance(row[1], str)
+            or not row[1].strip()
+            or row[1] != row[1].strip()
+        ):
+            raise HoldCorruptStateError(
+                "Hold operation witness has invalid durable evidence"
+            )
+        if row[0] in operation_witnesses:
+            raise HoldCorruptStateError(
+                "Hold operation witness has a duplicate operation identity"
+            )
+        operation_witnesses[row[0]] = row[1]
+    for operation_id, receipt in receipts_by_operation.items():
+        if operation_id not in operation_witnesses:
+            raise HoldCorruptStateError(
+                "completed Hold witness migration is missing an operation witness"
+            )
+        if operation_witnesses[operation_id] != receipt.receipt_id:
+            raise HoldCorruptStateError(
+                "Hold operation witness does not match receipt identity"
+            )
+    for operation_id, receipt_id in operation_witnesses.items():
+        receipt = receipts_by_operation.get(operation_id)
+        if receipt is None or receipt.receipt_id != receipt_id:
+            raise HoldCorruptStateError(
+                "Hold operation witness refers to a missing receipt"
+            )
+
+    active: list[HoldState] = []
+    for target in sorted(targets, key=lambda item: (item[0].value, item[1])):
+        state = _validate_snapshot_target(
+            target=target,
+            latch_row=latch_by_target.get(target),
+            receipt_rows=tuple(receipt_rows_by_target.get(target, ())),
+            receipt_count_rows=tuple(receipt_count_by_target.get(target, ())),
+            content_witness_rows=tuple(content_by_target.get(target, ())),
+            receipts_by_id=receipts_by_id,
+        )
+        if state is not None:
+            active.append(state)
+    return tuple(active)
+
+
+def _snapshot_after_witness_backfill(
+    snapshot: HoldDatabaseSnapshot,
+) -> HoldDatabaseSnapshot:
+    """Project the deterministic migration a first boot would commit."""
+
+    migration_complete = any(
+        len(row) == 1 and row[0] == _WITNESS_BACKFILL
+        for row in snapshot.migration_rows
+    )
+    if migration_complete:
+        return HoldDatabaseSnapshot(
+            existing_tables=frozenset(_HOLD_SCHEMA_TABLES),
+            latch_rows=snapshot.latch_rows,
+            receipt_rows=snapshot.receipt_rows,
+            receipt_count_witness_rows=snapshot.receipt_count_witness_rows,
+            content_witness_rows=snapshot.content_witness_rows,
+            operation_witness_rows=snapshot.operation_witness_rows,
+            migration_rows=snapshot.migration_rows,
+            resolvable_conflict_keys=snapshot.resolvable_conflict_keys,
+            occupied_schema_names=snapshot.occupied_schema_names,
+            duplicate_conflict_keys=snapshot.duplicate_conflict_keys,
+        )
+
+    receipt_rows = tuple(snapshot.receipt_rows)
+    receipts = tuple(_receipt_from_row(row) for row in receipt_rows)
+    count_rows = list(snapshot.receipt_count_witness_rows)
+    count_targets = {
+        _snapshot_target(row, label="Hold boot-state target")
+        for row in count_rows
+        if len(row) == 3
+    }
+    receipt_groups: dict[tuple[HoldScope, str], int] = {}
+    for receipt in receipts:
+        target = _snapshot_target(
+            (receipt.scope.value, receipt.target_id),
+            label="Hold boot-state target",
+        )
+        receipt_groups[target] = receipt_groups.get(target, 0) + 1
+    for target, count in receipt_groups.items():
+        if target not in count_targets:
+            count_rows.append((target[0].value, target[1], count))
+            count_targets.add(target)
+    for row in snapshot.latch_rows:
+        if len(row) != 8:
+            raise HoldCorruptStateError("hold latch row has an unexpected shape")
+        target = _snapshot_target(row, label="Hold boot-state target")
+        if target not in count_targets:
+            count_rows.append((target[0].value, target[1], 0))
+            count_targets.add(target)
+
+    content_rows = list(snapshot.content_witness_rows)
+    content_receipt_ids = {
+        row[0]
+        for row in content_rows
+        if len(row) == 4 and isinstance(row[0], str)
+    }
+    for row, receipt in zip(receipt_rows, receipts):
+        if receipt.receipt_id not in content_receipt_ids:
+            content_rows.append(
+                (
+                    receipt.receipt_id,
+                    receipt.scope.value,
+                    receipt.target_id,
+                    _receipt_content_digest(row),
+                )
+            )
+            content_receipt_ids.add(receipt.receipt_id)
+
+    operation_rows = list(snapshot.operation_witness_rows)
+    witnessed_operations = {
+        row[0]
+        for row in operation_rows
+        if len(row) == 2 and isinstance(row[0], str)
+    }
+    for receipt in receipts:
+        if receipt.operation_id not in witnessed_operations:
+            operation_rows.append((receipt.operation_id, receipt.receipt_id))
+            witnessed_operations.add(receipt.operation_id)
+
+    return HoldDatabaseSnapshot(
+        existing_tables=frozenset(_HOLD_SCHEMA_TABLES),
+        latch_rows=tuple(snapshot.latch_rows),
+        receipt_rows=receipt_rows,
+        receipt_count_witness_rows=tuple(count_rows),
+        content_witness_rows=tuple(content_rows),
+        operation_witness_rows=tuple(operation_rows),
+        migration_rows=(*snapshot.migration_rows, (_WITNESS_BACKFILL,)),
+        resolvable_conflict_keys=frozenset(
+            (table, frozenset(column.strip() for column in columns.split(",")))
+            for _name, table, columns in _HOLD_REQUIRED_UNIQUE_INDEXES
+        ),
+        occupied_schema_names=frozenset(
+            name for name, _table, _columns in _HOLD_REQUIRED_UNIQUE_INDEXES
+        ),
+        duplicate_conflict_keys=frozenset(),
+    )
+
+
+def _validate_snapshot_conflict_keys(snapshot: HoldDatabaseSnapshot) -> None:
+    """Prove each existing table has or can build its required upsert key."""
+
+    resolved = snapshot.resolvable_conflict_keys
+    occupied = snapshot.occupied_schema_names
+    duplicates = snapshot.duplicate_conflict_keys
+    if resolved is None or occupied is None or duplicates is None:
+        # Synthetic snapshots used by pure state-machine callers predate schema
+        # catalogue evidence. Real SQLite/PostgreSQL readiness readers always
+        # populate all three fields before this validator is used as a boot
+        # oracle.
+        return
+    for name, table, columns in _HOLD_REQUIRED_UNIQUE_INDEXES:
+        if table not in snapshot.existing_tables:
+            continue
+        key = (
+            table,
+            frozenset(column.strip() for column in columns.split(",")),
+        )
+        if key in resolved:
+            # An existing arbiter is already usable.
+            continue
+        conflict_label = (
+            "scope/target"
+            if columns == "scope, target_id"
+            else "/".join(column.strip() for column in columns.split(","))
+        )
+        if name in occupied:
+            raise HoldCorruptStateError(
+                f"Hold {table} schema cannot resolve its required "
+                f"{conflict_label} conflict key"
+            )
+        if key in duplicates:
+            raise HoldCorruptStateError(
+                f"Hold {table} schema cannot enforce its required "
+                f"{conflict_label} unique key"
+            )
+
+
+def validate_hold_readiness_snapshot(
+    *,
+    snapshot: HoldDatabaseSnapshot,
+    initialization_witness: bytes | None,
+    history_anchor: bytes | None,
+    history_candidate: bytes | None,
+    bootstrap_intent: bytes | None,
+    sqlite_custody_marked: bool | None = None,
+) -> tuple[HoldState, ...]:
+    """Predict the exact bootstrap/read gate without mutating durable state.
+
+    ``sqlite_custody_marked`` says whether the SQLite custody marker exists;
+    ``None`` means the backend keeps no such marker, as boot's own PostgreSQL
+    store does not, so an unused schema is refused exactly as boot refuses it.
+    """
+
+    existing = set(snapshot.existing_tables)
+    if any(not isinstance(table, str) for table in existing):
+        raise HoldCorruptStateError("Hold schema probe is invalid")
+    unexpected = existing - _HOLD_SCHEMA_TABLES
+    if unexpected:
+        raise HoldCorruptStateError("Hold schema probe returned unexpected tables")
+
+    rows_by_table = {
+        "hold_latches": snapshot.latch_rows,
+        "hold_receipts": snapshot.receipt_rows,
+        "hold_receipt_witnesses": snapshot.receipt_count_witness_rows,
+        "hold_receipt_content_witnesses": snapshot.content_witness_rows,
+        "hold_operation_witnesses": snapshot.operation_witness_rows,
+        "hold_schema_migrations": snapshot.migration_rows,
+    }
+    for table, rows in rows_by_table.items():
+        if table not in existing and rows:
+            raise HoldCorruptStateError(
+                f"Hold state probe returned rows without {table}"
+            )
+    _validate_snapshot_conflict_keys(snapshot)
+
+    if (
+        initialization_witness is not None
+        and initialization_witness != _INITIALIZATION_WITNESS_PAYLOAD
+    ):
+        raise HoldCorruptStateError(
+            "Hold initialization witness has invalid durable evidence"
+        )
+    initialized = initialization_witness is not None
+    anchored = (
+        None
+        if history_anchor is None
+        else HoldStore._validate_history_anchor_payload(history_anchor)
+    )
+    candidate = (
+        None
+        if history_candidate is None
+        else HoldStore._validate_history_anchor_payload(history_candidate)
+    )
+    bootstrap_history = None
+    if bootstrap_intent is not None:
+        if not bootstrap_intent.startswith(_BOOTSTRAP_INTENT_PAYLOAD):
+            raise HoldCorruptStateError(
+                "Hold bootstrap intent has invalid durable evidence"
+            )
+        try:
+            bootstrap_history = HoldStore._validate_history_anchor_payload(
+                bootstrap_intent.removeprefix(_BOOTSTRAP_INTENT_PAYLOAD)
+            )
+        except HoldCorruptStateError as exc:
+            raise HoldCorruptStateError(
+                "Hold bootstrap intent has invalid durable evidence"
+            ) from exc
+
+    unused_schema_refusal: str | None = _UNUSED_SCHEMA_UNASSESSED
+    if sqlite_custody_marked is not None:
+        unused_schema_refusal = _unused_schema_refusal(
+            row_counts={
+                table: len(rows)
+                for table, rows in rows_by_table.items()
+                if table in existing
+            },
+            migration_names=tuple(
+                row[0] if len(row) == 1 else row for row in snapshot.migration_rows
+            ),
+            custody_marked=sqlite_custody_marked,
+        )
+    HoldStore._validate_schema_evidence(
+        initialized=initialized,
+        anchored=anchored,
+        existing=existing,
+        bootstrap_pending=bootstrap_history is not None,
+        unused_schema_refusal=unused_schema_refusal,
+    )
+    receipt_rows = snapshot.receipt_rows
+    anchor_format = _snapshot_history_anchor_format(snapshot.migration_rows)
+    current = HoldStore._history_anchor_payload_from_rows(
+        receipt_rows, anchor_format=anchor_format
+    )
+    if bootstrap_history is not None and not HoldStore._history_payload_describes(
+        bootstrap_history, receipt_rows, anchor_format=anchor_format
+    ):
+        raise HoldCorruptStateError(
+            "Hold bootstrap intent does not match receipt history"
+        )
+    if (
+        bootstrap_history is not None
+        and anchored is not None
+        and not HoldStore._history_payload_describes(
+            anchored, receipt_rows, anchor_format=anchor_format
+        )
+    ):
+        raise HoldCorruptStateError(
+            "Hold bootstrap intent conflicts with the stable history anchor"
+        )
+    if not initialized:
+        if candidate is not None:
+            raise HoldCorruptStateError(
+                "Hold history publication exists without initialized schema"
+            )
+        return validate_hold_database_snapshot(
+            _snapshot_after_witness_backfill(snapshot)
+        )
+
+    missing = sorted(_HOLD_SCHEMA_TABLES - existing)
+    if missing:
+        raise HoldCorruptStateError(
+            "initialized Hold schema is missing required tables: "
+            + ", ".join(missing)
+        )
+    effective_anchor = anchored
+    if candidate is not None:
+        if current == candidate:
+            if anchored != candidate and (
+                anchored is None
+                or not HoldStore._is_history_predecessor(
+                    anchored,
+                    receipt_rows,
+                    anchor_format=anchor_format,
+                )
+            ):
+                raise HoldCorruptStateError(
+                    "staged Hold history publication conflicts with the stable "
+                    "history anchor"
+                )
+            effective_anchor = candidate
+        elif anchored is not None and current == anchored:
+            if not HoldStore._is_uncommitted_anchor_format_migration(
+                candidate, receipt_rows, anchor_format=anchor_format
+            ):
+                raise HoldCorruptStateError(
+                    "ambiguous staged Hold history publication matches the "
+                    "stable anchor; refusing to discard possible committed "
+                    "evidence"
+                )
+        else:
+            raise HoldCorruptStateError(
+                "interrupted Hold history publication matches neither durable state"
+            )
+    if effective_anchor != current:
+        raise HoldCorruptStateError(
+            "Hold history anchor does not match receipt history"
+        )
+    return validate_hold_database_snapshot(snapshot)
+
+
+class HoldStore:
+    """Durable latch + append-only receipt store on an ``AsyncDatabase``."""
+
+    def __init__(
+        self,
+        db: Any,
+        *,
+        initialization_witness_path: str | Path | None = None,
+        history_anchor_path: str | Path | None = None,
+        evidence_db: Any = None,
+        expected_postgres_pair_id: UUID | None = None,
+    ):
+        self._db = db
+        self._evidence_db = evidence_db
+        if expected_postgres_pair_id is not None and not isinstance(
+            expected_postgres_pair_id, UUID
+        ):
+            raise TypeError("expected_postgres_pair_id must be a UUID")
+        self._expected_postgres_pair_id = expected_postgres_pair_id
+        is_postgres = getattr(db, "backend_type", "") == "postgres"
+        explicit_file_evidence = (
+            initialization_witness_path is not None
+            or history_anchor_path is not None
+        )
+        if is_postgres and evidence_db is None and not explicit_file_evidence:
+            raise HoldStateError(
+                "PostgreSQL Hold requires an independent evidence database"
+            )
+        if evidence_db is not None:
+            if not is_postgres:
+                raise HoldStateError(
+                    "an evidence database is only valid for PostgreSQL Hold"
+                )
+            if evidence_db is db:
+                raise HoldStateError(
+                    "PostgreSQL Hold evidence must use an independent rollback domain"
+                )
+            if getattr(evidence_db, "backend_type", "") != "postgres":
+                raise HoldStateError(
+                    "PostgreSQL Hold evidence requires a PostgreSQL database"
+                )
+        elif expected_postgres_pair_id is not None:
+            raise HoldStateError(
+                "a PostgreSQL Hold pair identity requires an evidence database"
+            )
+        if initialization_witness_path is not None:
+            self._initialization_witness_path = absolute_without_following_leaf(
+                Path(initialization_witness_path)
+            )
+        elif getattr(db, "backend_type", "") == "sqlite":
+            backend = getattr(db, "backend", None)
+            db_path = getattr(backend, "db_path", None)
+            self._initialization_witness_path = (
+                None
+                if not db_path or db_path == ":memory:"
+                else hold_initialization_witness_path(db_path)
+            )
+        else:
+            self._initialization_witness_path = None
+
+        if history_anchor_path is not None:
+            self._history_anchor_path = absolute_without_following_leaf(
+                Path(history_anchor_path)
+            )
+        elif initialization_witness_path is not None:
+            self._history_anchor_path = absolute_without_following_leaf(
+                Path(f"{initialization_witness_path}.history-v1")
+            )
+        elif getattr(db, "backend_type", "") == "sqlite":
+            backend = getattr(db, "backend", None)
+            db_path = getattr(backend, "db_path", None)
+            self._history_anchor_path = (
+                None
+                if not db_path or db_path == ":memory:"
+                else hold_history_anchor_path(db_path)
+            )
+        else:
+            self._history_anchor_path = None
+
+        if getattr(db, "backend_type", "") == "sqlite":
+            backend = getattr(db, "backend", None)
+            db_path = getattr(backend, "db_path", None)
+            if db_path and db_path != ":memory:":
+                control_path = absolute_without_following_leaf(Path(db_path))
+                self._custody_marker_path = hold_sqlite_custody_marker_path(
+                    control_path
+                )
+                self._custody_control_path = control_path
+            else:
+                self._custody_marker_path = None
+                self._custody_control_path = None
+        else:
+            self._custody_marker_path = None
+            self._custody_control_path = None
+
+        if self._history_anchor_path is None:
+            self._history_candidate_path = None
+            self._bootstrap_intent_path = None
+            self._evidence_lock_path = None
+        else:
+            anchor = self._history_anchor_path
+            self._history_candidate_path = Path(f"{anchor}.pending")
+            self._bootstrap_intent_path = Path(f"{anchor}.bootstrap")
+            self._evidence_lock_path = Path(f"{anchor}.lock")
+
+    @asynccontextmanager
+    async def _sqlite_evidence_lock(self):
+        """Serialize SQLite DB snapshots with external evidence publication.
+
+        SQLite cannot atomically commit a database transaction and replace a
+        sidecar. Every Hold reader, writer, and initializer therefore takes the
+        same cross-process lock while it observes or advances that pair. The
+        nonblocking retry keeps a contended host from blocking its event loop.
+        """
+
+        path = self._evidence_lock_path
+        if path is None:
+            yield
+            return
+        if fcntl is None and msvcrt is None:
+            raise HoldStateError(
+                "durable SQLite Hold requires advisory file locks"
+            )
+        try:
+            descriptor = open_private_file(
+                path,
+                os.O_RDWR | os.O_CREAT,
+                label="Hold evidence protocol lock",
+            )
+        except PrivateStorageError as exc:
+            raise HoldStateError(
+                f"could not acquire Hold evidence protocol lock: {exc}"
+            ) from exc
+        acquired = False
+        try:
+            if fcntl is None:
+                # ``msvcrt.locking`` locks bytes from the current file offset;
+                # a zero-length file cannot provide a lock range. The byte is
+                # protocol structure only, never evidence, so two creators
+                # writing the same value before either locks remain benign.
+                if os.fstat(descriptor).st_size == 0:
+                    os.write(descriptor, b"\0")
+                    os.fsync(descriptor)
+            while not acquired:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:
+                        assert msvcrt is not None
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                except OSError as exc:
+                    windows_contention = (
+                        fcntl is None
+                        and (
+                            exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+                            or getattr(exc, "winerror", None) in {33, 36}
+                        )
+                    )
+                    if isinstance(exc, BlockingIOError) or windows_contention:
+                        await asyncio.sleep(_EVIDENCE_LOCK_POLL_SECONDS)
+                        continue
+                    raise HoldStateError(
+                        f"could not acquire Hold evidence protocol lock: {exc}"
+                    ) from exc
+            yield
+        finally:
+            if acquired:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    else:
+                        assert msvcrt is not None
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            os.close(descriptor)
+
+    async def _postgres_domain_identity(
+        self,
+        db: Any,
+        *,
+        label: str,
+    ) -> str:
+        """Read or found one durable identity for a PostgreSQL rollback domain.
+
+        Network coordinates are not identities: two Cloud SQL Unix-socket
+        connections both report a null address, while failover can change an
+        address without changing the database. A unique marker stored in each
+        domain rejects two pools aimed at the same database and also rejects a
+        cloned evidence database until an operator deliberately separates it.
+        """
+
+        rows = await db.fetchall(
+            "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+            (_POSTGRES_WITNESS_AGENT_ID, _POSTGRES_ROLLBACK_DOMAIN_KEY),
+        )
+        if not rows:
+            candidate = _POSTGRES_ROLLBACK_DOMAIN_PREFIX + str(uuid4())
+            await db.execute(
+                "INSERT INTO agent_metadata (agent_id, key, value) "
+                "VALUES (?, ?, ?) ON CONFLICT (agent_id, key) DO NOTHING",
+                (
+                    _POSTGRES_WITNESS_AGENT_ID,
+                    _POSTGRES_ROLLBACK_DOMAIN_KEY,
+                    candidate,
+                ),
+            )
+            rows = await db.fetchall(
+                "SELECT value FROM agent_metadata "
+                "WHERE agent_id = ? AND key = ?",
+                (_POSTGRES_WITNESS_AGENT_ID, _POSTGRES_ROLLBACK_DOMAIN_KEY),
+            )
+        if (
+            len(rows) != 1
+            or len(rows[0]) != 1
+            or not isinstance(rows[0][0], str)
+            or not rows[0][0].startswith(_POSTGRES_ROLLBACK_DOMAIN_PREFIX)
+        ):
+            raise HoldStateError(
+                f"could not verify PostgreSQL Hold {label} rollback domain"
+            )
+        identity = rows[0][0]
+        _validate_postgres_domain_identity(identity, label=label)
+        return identity
+
+    async def _postgres_cluster_identity(self, db: Any, *, label: str) -> str:
+        """Return PostgreSQL's cluster-wide initdb identity."""
+
+        try:
+            rows = await db.fetchall(
+                "SELECT system_identifier::text "
+                "FROM pg_catalog.pg_control_system()"
+            )
+        except Exception as exc:
+            raise HoldStateError(
+                f"could not verify PostgreSQL Hold {label} cluster identity; "
+                "the runtime role requires EXECUTE on "
+                "pg_catalog.pg_control_system()"
+            ) from exc
+        if (
+            len(rows) != 1
+            or len(rows[0]) != 1
+            or not isinstance(rows[0][0], str)
+            or not rows[0][0].strip()
+        ):
+            raise HoldStateError(
+                f"could not verify PostgreSQL Hold {label} cluster identity"
+            )
+        return rows[0][0]
+
+    async def _assert_postgres_clusters_independent(self) -> tuple[str, str]:
+        """Reject one backup unit and return both immutable cluster identities."""
+
+        evidence_db = self._evidence_db
+        if evidence_db is None:
+            raise HoldStateError(
+                "PostgreSQL Hold requires an independent evidence database"
+            )
+        primary, evidence = await _gather_database_probes(
+            self._postgres_cluster_identity(self._db, label="primary"),
+            self._postgres_cluster_identity(evidence_db, label="evidence"),
+        )
+        if primary == evidence:
+            raise HoldStateError(
+                "PostgreSQL Hold evidence requires an independent PostgreSQL cluster"
+            )
+        return primary, evidence
+
+    async def _read_postgres_binding(
+        self,
+        db: Any,
+        key: str,
+        *,
+        label: str,
+    ) -> str | None:
+        rows = await db.fetchall(
+            "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+            (_POSTGRES_WITNESS_AGENT_ID, key),
+        )
+        if not rows:
+            return None
+        if len(rows) != 1 or len(rows[0]) != 1 or not isinstance(rows[0][0], str):
+            raise HoldStateError(
+                f"PostgreSQL Hold {label} custody binding is invalid"
+            )
+        return rows[0][0]
+
+    async def _write_postgres_binding(self, db: Any, key: str, payload: str) -> None:
+        await db.execute(
+            "INSERT INTO agent_metadata (agent_id, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT (agent_id, key) DO NOTHING",
+            (_POSTGRES_WITNESS_AGENT_ID, key, payload),
+        )
+
+    async def _read_postgres_custody_roles(
+        self,
+        evidence_db: Any,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        """Read the expected and forbidden role records from both databases."""
+
+        return tuple(
+            await _gather_database_probes(
+                self._read_postgres_binding(
+                    self._db,
+                    _POSTGRES_PRIMARY_BINDING_KEY,
+                    label="primary",
+                ),
+                self._read_postgres_binding(
+                    evidence_db,
+                    _POSTGRES_EVIDENCE_BINDING_KEY,
+                    label="evidence",
+                ),
+                self._read_postgres_binding(
+                    self._db,
+                    _POSTGRES_EVIDENCE_BINDING_KEY,
+                    label="primary",
+                ),
+                self._read_postgres_binding(
+                    evidence_db,
+                    _POSTGRES_PRIMARY_BINDING_KEY,
+                    label="evidence",
+                ),
+            )
+        )
+
+    @staticmethod
+    def _custody_binding_payload(
+        pair_id: UUID,
+        primary_identity: str,
+        evidence_identity: str,
+    ) -> str:
+        return postgres_hold_custody_binding_payload(
+            pair_id,
+            primary_identity,
+            evidence_identity,
+        )
+
+    @staticmethod
+    def _validate_custody_binding(
+        payload: str,
+        *,
+        primary_identity: str,
+        evidence_identity: str,
+    ) -> UUID:
+        return _validate_postgres_custody_binding(
+            payload,
+            primary_identity=primary_identity,
+            evidence_identity=evidence_identity,
+        )
+
+    async def _assert_postgres_evidence_domain_independent(self) -> None:
+        """Bind each database permanently to one side of this custody pair."""
+
+        evidence_db = self._evidence_db
+        if evidence_db is None:
+            return
+        primary, evidence = await _gather_database_probes(
+            self._postgres_domain_identity(self._db, label="primary"),
+            self._postgres_domain_identity(evidence_db, label="evidence"),
+        )
+        if primary == evidence:
+            raise HoldStateError(
+                "PostgreSQL Hold evidence must use an independent rollback domain"
+            )
+
+        primary_binding, evidence_binding, primary_foreign, evidence_foreign = (
+            await self._read_postgres_custody_roles(evidence_db)
+        )
+        if primary_foreign is not None or evidence_foreign is not None:
+            raise HoldStateError(
+                "PostgreSQL Hold database has the wrong durable custody role"
+            )
+
+        expected_pair_id = self._expected_postgres_pair_id
+        if primary_binding is None and evidence_binding is None:
+            binding = self._custody_binding_payload(
+                expected_pair_id or uuid4(),
+                primary,
+                evidence,
+            )
+        else:
+            binding = primary_binding or evidence_binding
+            assert binding is not None
+            actual_pair_id = self._validate_custody_binding(
+                binding,
+                primary_identity=primary,
+                evidence_identity=evidence,
+            )
+            if expected_pair_id is not None and actual_pair_id != expected_pair_id:
+                raise HoldStateError(
+                    "PostgreSQL Hold custody binding conflicts with the external "
+                    "pair identity"
+                )
+            if (
+                primary_binding is not None
+                and evidence_binding is not None
+                and primary_binding != evidence_binding
+            ):
+                raise HoldStateError(
+                    "PostgreSQL Hold custody binding disagrees between databases"
+                )
+
+        if primary_binding is None:
+            await self._write_postgres_binding(
+                self._db,
+                _POSTGRES_PRIMARY_BINDING_KEY,
+                binding,
+            )
+            # INSERT .. DO NOTHING is a compare-and-declare boundary. The pair
+            # locks serialize cooperating initializers, while the re-read also
+            # covers a role left by an interrupted older boot or an out-of-band
+            # writer. Adopt a compatible winner (same pair, different UUID),
+            # but reject an incompatible winner before writing into evidence.
+            primary_binding = await self._read_postgres_binding(
+                self._db,
+                _POSTGRES_PRIMARY_BINDING_KEY,
+                label="primary",
+            )
+            primary_foreign = await self._read_postgres_binding(
+                self._db,
+                _POSTGRES_EVIDENCE_BINDING_KEY,
+                label="primary",
+            )
+            if primary_foreign is not None:
+                raise HoldStateError(
+                    "PostgreSQL Hold database has the wrong durable custody role"
+                )
+            if primary_binding is None:
+                raise HoldStateError(
+                    "PostgreSQL Hold primary custody binding was not durably published"
+                )
+            self._validate_custody_binding(
+                primary_binding,
+                primary_identity=primary,
+                evidence_identity=evidence,
+            )
+            binding = primary_binding
+        if evidence_binding is None:
+            await self._write_postgres_binding(
+                evidence_db,
+                _POSTGRES_EVIDENCE_BINDING_KEY,
+                binding,
+            )
+
+        primary_binding, evidence_binding, primary_foreign, evidence_foreign = (
+            await self._read_postgres_custody_roles(evidence_db)
+        )
+        if primary_foreign is not None or evidence_foreign is not None:
+            raise HoldStateError(
+                "PostgreSQL Hold database has the wrong durable custody role"
+            )
+        if (
+            primary_binding is None
+            or evidence_binding is None
+            or primary_binding != evidence_binding
+        ):
+            raise HoldStateError(
+                "PostgreSQL Hold custody binding was not durably published"
+            )
+        actual_pair_id = self._validate_custody_binding(
+            primary_binding,
+            primary_identity=primary,
+            evidence_identity=evidence,
+        )
+        if expected_pair_id is not None and actual_pair_id != expected_pair_id:
+            raise HoldStateError(
+                "PostgreSQL Hold custody binding conflicts with the external pair "
+                "identity"
+            )
+
+    @asynccontextmanager
+    async def _postgres_evidence_lock(self):
+        """Serialize a primary snapshot across both PostgreSQL custody clusters."""
+
+        evidence_db = self._evidence_db
+        if evidence_db is None:
+            yield
+            return
+        primary_cluster, evidence_cluster = (
+            await self._assert_postgres_clusters_independent()
+        )
+        async with _postgres_operational_sessions(
+            self._db,
+            evidence_db,
+            primary_cluster=primary_cluster,
+            evidence_cluster=evidence_cluster,
+        ), _postgres_custody_locks(
+            self._db,
+            evidence_db,
+            primary_cluster=primary_cluster,
+            evidence_cluster=evidence_cluster,
+        ):
+            locked_clusters = await self._assert_postgres_clusters_independent()
+            if locked_clusters != (primary_cluster, evidence_cluster):
+                raise HoldStateError(
+                    "PostgreSQL Hold cluster identity changed while acquiring "
+                    "custody locks"
+                )
+            await self._assert_postgres_evidence_domain_independent()
+            yield
+
+    async def _read_postgres_evidence(self, key: str, *, label: str) -> bytes | None:
+        """Read one unique evidence value from the independent database."""
+
+        evidence_db = self._evidence_db
+        if evidence_db is None:
+            raise HoldStateError(f"PostgreSQL Hold {label} has no evidence database")
+        rows = await evidence_db.fetchall(
+            "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+            (_POSTGRES_WITNESS_AGENT_ID, key),
+        )
+        if not rows:
+            return None
+        if len(rows) != 1 or len(rows[0]) != 1 or not isinstance(rows[0][0], str):
+            raise HoldCorruptStateError(
+                f"PostgreSQL Hold {label} has invalid durable evidence"
+            )
+        try:
+            return rows[0][0].encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise HoldCorruptStateError(
+                f"PostgreSQL Hold {label} has invalid durable evidence"
+            ) from exc
+
+    async def _write_postgres_evidence(self, key: str, payload: bytes) -> None:
+        """Commit one external protocol value before returning."""
+
+        evidence_db = self._evidence_db
+        if evidence_db is None:
+            raise HoldStateError("PostgreSQL Hold has no evidence database")
+        try:
+            value = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise HoldStateError("PostgreSQL Hold evidence is not ASCII") from exc
+        await evidence_db.execute(
+            "INSERT INTO agent_metadata (agent_id, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT (agent_id, key) DO UPDATE SET value = excluded.value",
+            (_POSTGRES_WITNESS_AGENT_ID, key, value),
+        )
+
+    async def _remove_postgres_evidence(self, key: str) -> None:
+        evidence_db = self._evidence_db
+        if evidence_db is None:
+            raise HoldStateError("PostgreSQL Hold has no evidence database")
+        await evidence_db.execute(
+            "DELETE FROM agent_metadata WHERE agent_id = ? AND key = ?",
+            (_POSTGRES_WITNESS_AGENT_ID, key),
+        )
+
+    @staticmethod
+    def _read_file_evidence(
+        path: Path,
+        *,
+        label: str,
+        max_bytes: int,
+        harden_custody: bool = True,
+    ) -> bytes | None:
+        """Read one complete private evidence file without following links."""
+
+        if not path_exists(path):
+            return None
+        try:
+            opener = (
+                open_private_file
+                if harden_custody
+                else open_private_file_for_validation
+            )
+            descriptor = opener(path, os.O_RDONLY, label=label)
+            try:
+                return os.read(descriptor, max_bytes + 1)
+            finally:
+                os.close(descriptor)
+        except PrivateStorageError as exc:
+            raise HoldCorruptStateError(f"{label} cannot be trusted: {exc}") from exc
+
+    def _read_file_initialization_witness(self) -> bool:
+        """Return whether the external initialized marker is present and valid."""
+
+        path = self._initialization_witness_path
+        assert path is not None
+        payload = self._read_file_evidence(
+            path,
+            label="Hold initialization witness",
+            max_bytes=len(_INITIALIZATION_WITNESS_PAYLOAD),
+        )
+        if payload is None:
+            return False
+        if payload != _INITIALIZATION_WITNESS_PAYLOAD:
+            raise HoldCorruptStateError(
+                "Hold initialization witness has invalid durable evidence"
+            )
+        return True
+
+    def _read_sqlite_custody_marker(self) -> bytes | None:
+        """Read the installation-level SQLite receipt head."""
+
+        path = self._custody_marker_path
+        if path is None:
+            return None
+        return self._read_file_evidence(
+            path,
+            label="SQLite Hold custody marker",
+            max_bytes=_SQLITE_CUSTODY_MARKER_MAX_BYTES,
+        )
+
+    def _write_sqlite_custody_marker(self, history_anchor: bytes) -> None:
+        """Publish the current receipt head outside the SQLite family."""
+
+        path = self._custody_marker_path
+        control_path = self._custody_control_path
+        if path is None or control_path is None:
+            return
+        self._validate_history_anchor_payload(history_anchor)
+        payload = _sqlite_custody_marker_payload(control_path, history_anchor)
+        try:
+            ensure_private_directory(path.parent, label="Hold custody evidence")
+        except PrivateStorageError as exc:
+            raise HoldStateError(
+                f"could not prepare SQLite Hold custody marker: {exc}"
+            ) from exc
+        existing = self._read_sqlite_custody_marker()
+        if existing == payload:
+            return
+        self._write_file_evidence(
+            path,
+            payload,
+            label="SQLite Hold custody marker",
+        )
+
+    async def _assert_sqlite_custody_head_intact(self) -> None:
+        """Reject a database/anchor pair older than installation evidence."""
+
+        control_path = self._custody_control_path
+        if control_path is None:
+            return
+        anchored = await self._read_history_anchor()
+        if anchored is None:
+            raise HoldCorruptStateError("Hold history anchor is missing")
+        marker = self._read_sqlite_custody_marker()
+        expected = _sqlite_custody_marker_payload(control_path, anchored)
+        _validate_sqlite_custody_evidence(
+            marker_payload=marker,
+            expected_payload=expected,
+            initialized=True,
+            bootstrap_pending=False,
+        )
+
+    async def _read_initialization_witness(self) -> bool:
+        """Read initialization evidence from restart-surviving custody."""
+
+        if self._initialization_witness_path is not None:
+            return self._read_file_initialization_witness()
+        if getattr(self._db, "backend_type", "") != "postgres":
+            raise HoldStateError(
+                "durable Hold requires an external initialization witness"
+            )
+        payload = await self._read_postgres_evidence(
+            _POSTGRES_WITNESS_KEY,
+            label="initialization witness",
+        )
+        if payload is None:
+            return False
+        if payload != _INITIALIZATION_WITNESS_PAYLOAD:
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold initialization witness has invalid durable evidence"
+            )
+        return True
+
+    @staticmethod
+    def _fsync_witness_directory(path: Path) -> None:
+        if os.name == "nt":  # pragma: no cover - directory fsync is POSIX-only
+            return
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(path.parent, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _write_file_evidence(self, path: Path, payload: bytes, *, label: str) -> None:
+        """Atomically replace one private evidence file with fsynced content."""
+
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            descriptor = open_private_file(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                label=label,
+            )
+        except PrivateStorageError as exc:
+            raise HoldStateError(f"could not persist {label}: {exc}") from exc
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError(f"short write while persisting {label}")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+
+            # Replace from the same private directory: readers can observe only
+            # the previous complete payload or the new fsynced payload, never
+            # the temporary inode while it is being written.
+            os.replace(temporary, path)
+            self._fsync_witness_directory(path)
+        except OSError as exc:
+            raise HoldStateError(f"could not persist {label}: {exc}") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if path_exists(temporary):
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
+    def _remove_file_evidence(self, path: Path, *, label: str) -> None:
+        """Durably remove one protocol marker without following its leaf."""
+
+        try:
+            os.unlink(path)
+            self._fsync_witness_directory(path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise HoldStateError(f"could not remove {label}: {exc}") from exc
+
+    def _read_bootstrap_intent(self) -> bytes | None:
+        path = self._bootstrap_intent_path
+        if path is None:
+            return None
+        payload = self._read_file_evidence(
+            path,
+            label="Hold bootstrap intent",
+            max_bytes=_BOOTSTRAP_INTENT_MAX_BYTES,
+        )
+        if payload is None:
+            return None
+        if not payload.startswith(_BOOTSTRAP_INTENT_PAYLOAD):
+            raise HoldCorruptStateError(
+                "Hold bootstrap intent has invalid durable evidence"
+            )
+        try:
+            return self._validate_history_anchor_payload(
+                payload.removeprefix(_BOOTSTRAP_INTENT_PAYLOAD)
+            )
+        except HoldCorruptStateError as exc:
+            raise HoldCorruptStateError(
+                "Hold bootstrap intent has invalid durable evidence"
+            ) from exc
+
+    def _write_bootstrap_intent(self, history_anchor: bytes) -> None:
+        path = self._bootstrap_intent_path
+        assert path is not None
+        self._write_file_evidence(
+            path,
+            _BOOTSTRAP_INTENT_PAYLOAD + history_anchor,
+            label="Hold bootstrap intent",
+        )
+
+    def _remove_bootstrap_intent(self) -> None:
+        path = self._bootstrap_intent_path
+        if path is not None:
+            self._remove_file_evidence(path, label="Hold bootstrap intent")
+
+    async def _read_external_bootstrap_intent(self) -> bytes | None:
+        if self._bootstrap_intent_path is not None:
+            return self._read_bootstrap_intent()
+        payload = await self._read_postgres_evidence(
+            _POSTGRES_BOOTSTRAP_INTENT_KEY,
+            label="bootstrap intent",
+        )
+        if payload is None:
+            return None
+        if not payload.startswith(_BOOTSTRAP_INTENT_PAYLOAD):
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold bootstrap intent has invalid durable evidence"
+            )
+        try:
+            return self._validate_history_anchor_payload(
+                payload.removeprefix(_BOOTSTRAP_INTENT_PAYLOAD)
+            )
+        except HoldCorruptStateError as exc:
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold bootstrap intent has invalid durable evidence"
+            ) from exc
+
+    async def _write_external_bootstrap_intent(
+        self,
+        history_anchor: bytes,
+    ) -> None:
+        if self._bootstrap_intent_path is not None:
+            self._write_bootstrap_intent(history_anchor)
+            return
+        await self._write_postgres_evidence(
+            _POSTGRES_BOOTSTRAP_INTENT_KEY,
+            _BOOTSTRAP_INTENT_PAYLOAD + history_anchor,
+        )
+
+    async def _remove_external_bootstrap_intent(self) -> None:
+        if self._bootstrap_intent_path is not None:
+            self._remove_bootstrap_intent()
+            return
+        await self._remove_postgres_evidence(_POSTGRES_BOOTSTRAP_INTENT_KEY)
+
+    def _write_file_initialization_witness(self) -> None:
+        """Atomically publish a complete local initialized marker."""
+
+        path = self._initialization_witness_path
+        assert path is not None
+        if path_exists(path) and self._read_file_initialization_witness():
+            return
+        self._write_file_evidence(
+            path,
+            _INITIALIZATION_WITNESS_PAYLOAD,
+            label="Hold initialization witness",
+        )
+
+    async def _write_initialization_witness(self) -> None:
+        """Publish initialized evidence after the Hold schema commits."""
+
+        if self._initialization_witness_path is not None:
+            self._write_file_initialization_witness()
+            return
+        if getattr(self._db, "backend_type", "") != "postgres":
+            raise HoldStateError(
+                "durable Hold requires an external initialization witness"
+            )
+        await self._write_postgres_evidence(
+            _POSTGRES_WITNESS_KEY,
+            _INITIALIZATION_WITNESS_PAYLOAD,
+        )
+        if not await self._read_initialization_witness():
+            raise HoldStateError(
+                "could not persist PostgreSQL Hold initialization witness"
+            )
+
+    async def _history_anchor_format(self) -> _HistoryAnchorFormat:
+        """The anchor format this database's recorded migrations commit it to.
+
+        ``hold_schema_migrations`` is part of every schema a stable anchor can
+        describe; the only pre-schema reader is ``_bootstrap_history``.
+        """
+
+        migrated = await self._db.fetchall(
+            "SELECT name FROM hold_schema_migrations WHERE name IN (?, ?)",
+            _HISTORY_ANCHOR_MIGRATIONS,
+        )
+        return _history_anchor_format_for(row[0] for row in migrated)
+
+    async def _current_history(
+        self,
+    ) -> tuple[_HistoryAnchorFormat, tuple[Any, ...]]:
+        """Read the complete receipt set under this database's anchor format."""
+
+        anchor_format = await self._history_anchor_format()
+        rows = tuple(await self._db.fetchall(anchor_format.receipt_history_sql))
+        return anchor_format, rows
+
+    async def _current_history_anchor_payload(self) -> bytes:
+        """Hash the complete immutable receipt set in a stable global order."""
+
+        anchor_format, rows = await self._current_history()
+        return self._history_anchor_payload_from_rows(
+            rows, anchor_format=anchor_format
+        )
+
+    @classmethod
+    def _is_immediate_history_predecessor(
+        cls,
+        predecessor: bytes,
+        current_rows: list[Any] | tuple[Any, ...],
+        *,
+        anchor_format: _HistoryAnchorFormat,
+    ) -> bool:
+        """Whether ``predecessor`` is exactly ``current_rows`` minus one receipt.
+
+        A Hold mutation appends exactly one immutable receipt before staging its
+        candidate head. Recovery is rare, so exhaustively proving which single
+        receipt was appended is preferable to trusting only the monotonically
+        increasing receipt count: two divergent histories can have the same
+        count. This proof prevents a restored primary/candidate pair from
+        replacing a newer stable external head. A mutation never changes the
+        anchor format, so a predecessor in another format is not one.
+        """
+
+        predecessor = cls._validate_history_anchor_payload(predecessor)
+        if _payload_history_anchor_format(predecessor) is not anchor_format:
+            return False
+        parts = predecessor.splitlines()
+        if int(parts[1]) != len(current_rows) - 1:
+            return False
+        return any(
+            cls._history_anchor_payload_from_rows(
+                tuple(
+                    row
+                    for position, row in enumerate(current_rows)
+                    if position != omitted
+                ),
+                anchor_format=anchor_format,
+            )
+            == predecessor
+            for omitted in range(len(current_rows))
+        )
+
+    @classmethod
+    def _history_payload_describes(
+        cls,
+        payload: bytes,
+        rows: list[Any] | tuple[Any, ...],
+        *,
+        anchor_format: _HistoryAnchorFormat,
+    ) -> bool:
+        """Whether ``payload`` describes exactly this history in either format.
+
+        ``rows`` were read under ``anchor_format``. A payload in the other
+        format is compared with the same history under the projection the
+        v2 migration moves between: an un-migrated history with its backfilled
+        authority, or a migrated one whose every authority is still the
+        backfilled value. This is for recognizing the anchor-format migration
+        itself; a stable anchor is always compared in its database's format.
+        """
+
+        payload = cls._validate_history_anchor_payload(payload)
+        payload_format = _payload_history_anchor_format(payload)
+        if payload_format.receipt_width == anchor_format.receipt_width:
+            # Same projection (v2 and v3 differ only in what the schema admits,
+            # which no receipt of an unchanged history can reflect).
+            projected: Optional[tuple[Any, ...]] = tuple(rows)
+        elif payload_format is _HistoryAnchorFormat.V1:
+            projected = _v1_projection_of(rows)
+        else:
+            projected = _backfilled_projection_of(rows)
+        return projected is not None and payload == (
+            cls._history_anchor_payload_from_rows(
+                projected, anchor_format=payload_format
+            )
+        )
+
+    @classmethod
+    def _is_anchor_format_predecessor(
+        cls,
+        predecessor: bytes,
+        current_rows: list[Any] | tuple[Any, ...],
+        *,
+        anchor_format: _HistoryAnchorFormat,
+    ) -> bool:
+        """Whether ``predecessor`` is this migrated history's earlier anchor.
+
+        An anchor-format migration re-anchors an unchanged history under a
+        later format. Its stable anchor until publication is therefore the
+        anchor of exactly the same receipts in an earlier format (for v1,
+        every one with the backfilled authority).
+        """
+
+        predecessor = cls._validate_history_anchor_payload(predecessor)
+        return (
+            _payload_history_anchor_format(predecessor).order
+            < anchor_format.order
+            and cls._history_payload_describes(
+                predecessor, current_rows, anchor_format=anchor_format
+            )
+        )
+
+    @classmethod
+    def _is_history_predecessor(
+        cls,
+        predecessor: bytes,
+        current_rows: list[Any] | tuple[Any, ...],
+        *,
+        anchor_format: _HistoryAnchorFormat,
+    ) -> bool:
+        """Whether a staged head may replace ``predecessor`` as the stable one."""
+
+        return cls._is_immediate_history_predecessor(
+            predecessor, current_rows, anchor_format=anchor_format
+        ) or cls._is_anchor_format_predecessor(
+            predecessor, current_rows, anchor_format=anchor_format
+        )
+
+    @classmethod
+    def _is_uncommitted_anchor_format_migration(
+        cls,
+        candidate: bytes,
+        current_rows: list[Any] | tuple[Any, ...],
+        *,
+        anchor_format: _HistoryAnchorFormat,
+    ) -> bool:
+        """Whether ``candidate`` re-anchors this un-migrated history later.
+
+        The migration stages that candidate before its database transaction
+        commits. Finding it beside a database that is still v1 and still
+        matches its stable anchor means either the transaction never committed
+        or the primary was restored to exactly the same receipts. Neither loses
+        Hold evidence, so unlike an ordinary mutation candidate it is safe to
+        discard and migrate again; refusing would wedge boot on an interrupted
+        upgrade.
+        """
+
+        candidate = cls._validate_history_anchor_payload(candidate)
+        return (
+            _payload_history_anchor_format(candidate).order > anchor_format.order
+            and cls._history_payload_describes(
+                candidate, current_rows, anchor_format=anchor_format
+            )
+        )
+
+    @staticmethod
+    def _history_anchor_payload_from_rows(
+        rows: list[Any] | tuple[Any, ...],
+        *,
+        anchor_format: _HistoryAnchorFormat,
+    ) -> bytes:
+        """Build the canonical receipt head, including the empty history.
+
+        Every row must carry exactly the columns ``anchor_format`` covers: a
+        v2 anchor built from rows missing ``authority`` would silently describe
+        every receipt as sovereign. V2 frames each receipt's recorded authority
+        explicitly, including the backfilled one.
+        """
+
+        if any(len(row) != anchor_format.receipt_width for row in rows):
+            raise HoldCorruptStateError(
+                "Hold receipt history does not carry the columns its anchor "
+                "format covers"
+            )
+        digest = hashlib.sha256()
+        digest.update(anchor_format.header)
+        for row in rows:
+            receipt = _receipt_from_row(row)
+            values = [receipt.receipt_id, _receipt_content_digest(row)]
+            if anchor_format is not _HistoryAnchorFormat.V1:
+                values.append(receipt.authority.value)
+            for value in values:
+                encoded = value.encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+        return (
+            anchor_format.header
+            + str(len(rows)).encode("ascii")
+            + b"\n"
+            + digest.hexdigest().encode("ascii")
+            + b"\n"
+        )
+
+    async def _bootstrap_history(
+        self, existing: set[str]
+    ) -> tuple[_HistoryAnchorFormat, tuple[Any, ...]]:
+        """Read the receipt history a pending bootstrap is authorized to migrate."""
+
+        if "hold_receipts" not in existing:
+            return _HistoryAnchorFormat.V1, ()
+        if "hold_schema_migrations" not in existing:
+            return _HistoryAnchorFormat.V1, tuple(
+                await self._db.fetchall(
+                    _HistoryAnchorFormat.V1.receipt_history_sql
+                )
+            )
+        return await self._current_history()
+
+    async def _read_history_anchor(self) -> bytes | None:
+        """Read the receipt-history head from custody outside Hold tables."""
+
+        if self._history_anchor_path is not None:
+            payload = self._read_file_evidence(
+                self._history_anchor_path,
+                label="Hold history anchor",
+                max_bytes=_HISTORY_ANCHOR_MAX_BYTES,
+            )
+        elif getattr(self._db, "backend_type", "") == "postgres":
+            payload = await self._read_postgres_evidence(
+                _POSTGRES_HISTORY_ANCHOR_KEY,
+                label="history anchor",
+            )
+        else:
+            raise HoldStateError("durable Hold requires an external history anchor")
+
+        if payload is None:
+            return None
+        return self._validate_history_anchor_payload(payload)
+
+    @staticmethod
+    def _validate_history_anchor_payload(payload: bytes) -> bytes:
+        """Validate one stable or staged history payload before trusting it."""
+
+        parts = payload.splitlines()
+        if (
+            len(parts) != 3
+            or parts[0]
+            not in {
+                anchor_format.header.rstrip(b"\n")
+                for anchor_format in _HistoryAnchorFormat
+            }
+            or not parts[1].isdigit()
+            or str(int(parts[1])).encode("ascii") != parts[1]
+            or len(parts[2]) != 64
+            or any(byte not in b"0123456789abcdef" for byte in parts[2])
+            or not payload.endswith(b"\n")
+        ):
+            raise HoldCorruptStateError(
+                "Hold history anchor has invalid durable evidence"
+            )
+        return payload
+
+    def _read_history_candidate(self) -> bytes | None:
+        path = self._history_candidate_path
+        if path is None:
+            return None
+        payload = self._read_file_evidence(
+            path,
+            label="Hold staged history anchor",
+            max_bytes=_HISTORY_ANCHOR_MAX_BYTES,
+        )
+        if payload is None:
+            return None
+        return self._validate_history_anchor_payload(payload)
+
+    def _stage_history_candidate(self, payload: bytes) -> None:
+        path = self._history_candidate_path
+        assert path is not None
+        self._validate_history_anchor_payload(payload)
+        self._write_file_evidence(
+            path,
+            payload,
+            label="Hold staged history anchor",
+        )
+
+    def _remove_history_candidate(self) -> None:
+        path = self._history_candidate_path
+        if path is not None:
+            self._remove_file_evidence(path, label="Hold staged history anchor")
+
+    async def _read_external_history_candidate(self) -> bytes | None:
+        if self._history_candidate_path is not None:
+            return self._read_history_candidate()
+        payload = await self._read_postgres_evidence(
+            _POSTGRES_HISTORY_CANDIDATE_KEY,
+            label="staged history anchor",
+        )
+        if payload is None:
+            return None
+        return self._validate_history_anchor_payload(payload)
+
+    async def _stage_external_history_candidate(self, payload: bytes) -> None:
+        self._validate_history_anchor_payload(payload)
+        if self._history_candidate_path is not None:
+            self._stage_history_candidate(payload)
+            return
+        await self._write_postgres_evidence(
+            _POSTGRES_HISTORY_CANDIDATE_KEY,
+            payload,
+        )
+
+    async def _remove_external_history_candidate(self) -> None:
+        if self._history_candidate_path is not None:
+            self._remove_history_candidate()
+            return
+        await self._remove_postgres_evidence(_POSTGRES_HISTORY_CANDIDATE_KEY)
+
+    async def _recover_history_publication(self) -> None:
+        """Resolve an interrupted primary commit from old/new durable evidence.
+
+        The stable anchor is never changed before the database commit. A
+        candidate written inside the transaction is the durable evidence of an
+        intended new head. If the committed database matches it, publication
+        can finish. If the database still matches the stable anchor, recovery
+        cannot distinguish an interrupted rollback from a committed mutation
+        followed by a primary restore, so it must fail closed. An ordinary
+        in-process transaction failure removes its own candidate before the
+        primary rollback through ``_primary_mutation_transaction``.
+
+        The v2 anchor-format migration uses the same protocol. Its candidate
+        re-anchors an unchanged history, so its stable predecessor is the v1
+        anchor of the same receipts, and a candidate found beside a database
+        that never committed the migration is discarded rather than refused
+        (see ``_is_uncommitted_anchor_format_migration``).
+        """
+
+        candidate = await self._read_external_history_candidate()
+        if candidate is None:
+            return
+        anchor_format, current_rows = await self._current_history()
+        current = self._history_anchor_payload_from_rows(
+            current_rows, anchor_format=anchor_format
+        )
+        stable = await self._read_history_anchor()
+        if current == candidate:
+            if stable != candidate and (
+                stable is None
+                or not self._is_history_predecessor(
+                    stable, current_rows, anchor_format=anchor_format
+                )
+            ):
+                raise HoldCorruptStateError(
+                    "staged Hold history publication conflicts with the stable "
+                    "history anchor"
+                )
+            if self._history_anchor_path is not None:
+                control_path = self._custody_control_path
+                if control_path is not None:
+                    marker = self._read_sqlite_custody_marker()
+                    if marker is None:
+                        raise HoldCorruptStateError(
+                            "SQLite Hold custody marker is missing for an "
+                            "initialized database"
+                        )
+                    marker_history = _sqlite_custody_marker_history(
+                        control_path,
+                        marker,
+                    )
+                    if stable != candidate:
+                        marker_valid = marker_history == stable
+                    else:
+                        marker_valid = marker_history == candidate or (
+                            self._is_history_predecessor(
+                                marker_history,
+                                current_rows,
+                                anchor_format=anchor_format,
+                            )
+                        )
+                    if not marker_valid:
+                        raise HoldCorruptStateError(
+                            "SQLite Hold custody marker conflicts with staged "
+                            "receipt history"
+                        )
+                self._write_file_evidence(
+                    self._history_anchor_path,
+                    candidate,
+                    label="Hold history anchor",
+                )
+                self._write_sqlite_custody_marker(candidate)
+            else:
+                await self._write_postgres_evidence(
+                    _POSTGRES_HISTORY_ANCHOR_KEY,
+                    candidate,
+                )
+            await self._remove_external_history_candidate()
+            return
+        if stable is not None and current == stable:
+            if self._is_uncommitted_anchor_format_migration(
+                candidate, current_rows, anchor_format=anchor_format
+            ):
+                await self._remove_external_history_candidate()
+                return
+            raise HoldCorruptStateError(
+                "ambiguous staged Hold history publication matches the stable "
+                "anchor; refusing to discard possible committed evidence"
+            )
+        raise HoldCorruptStateError(
+            "interrupted Hold history publication matches neither durable state"
+        )
+
+    @asynccontextmanager
+    async def _sqlite_evidence_protocol(self):
+        """Enter the one SQLite evidence boundary used by every live path."""
+
+        async with self._sqlite_evidence_lock():
+            if self._history_anchor_path is not None:
+                await self._recover_history_publication()
+                await self._assert_sqlite_custody_head_intact()
+            yield
+
+    @asynccontextmanager
+    async def _evidence_protocol(self):
+        """Serialize every primary snapshot with its independent evidence."""
+
+        if self._history_anchor_path is not None:
+            async with self._sqlite_evidence_protocol():
+                yield
+            return
+        async with self._postgres_evidence_lock():
+            await self._recover_history_publication()
+            yield
+
+    async def _prepare_history_publication(self) -> bytes | None:
+        """Stage the next external anchor before the primary commit."""
+
+        payload = await self._current_history_anchor_payload()
+        await self._stage_external_history_candidate(payload)
+        return payload
+
+    @asynccontextmanager
+    async def _primary_mutation_transaction(self):
+        """Rollback a known-failed mutation without leaving ambiguous evidence.
+
+        The exception handler deliberately lives *inside* the database context:
+        transaction-body failures are known not to have committed and may erase
+        their candidate, while a commit/exit failure remains ambiguous and must
+        leave the candidate for fail-closed recovery.
+        """
+
+        async with self._db.transaction(immediate=True):
+            try:
+                yield
+            except BaseException as mutation_failure:
+                # PostgreSQL candidate removal crosses into an independent
+                # database. Own that cleanup separately so a second cancel of
+                # the mutation caller cannot interrupt the delete and leave a
+                # known rollback looking like an ambiguous committed restore.
+                cleanup = asyncio.create_task(
+                    self._remove_external_history_candidate(),
+                    name="hold:rollback-history-candidate",
+                )
+                pending_cancellation = (
+                    mutation_failure
+                    if isinstance(mutation_failure, asyncio.CancelledError)
+                    else None
+                )
+                cleanup_outcome = await await_owned_task(
+                    cleanup,
+                    pending_cancellation,
+                )
+                raise_owned_outcome(
+                    cleanup_outcome,
+                    operation="Hold rollback history candidate cleanup",
+                )
+                raise
+
+    def _finish_history_publication(self, payload: bytes | None) -> None:
+        """Promote a staged SQLite candidate only after the DB commit returns."""
+
+        if payload is None:
+            return
+        candidate = self._read_history_candidate()
+        if candidate != payload:
+            raise HoldCorruptStateError(
+                "Hold staged history anchor changed before publication"
+            )
+        path = self._history_anchor_path
+        assert path is not None
+        control_path = self._custody_control_path
+        stable = self._read_file_evidence(
+            path,
+            label="Hold history anchor",
+            max_bytes=_HISTORY_ANCHOR_MAX_BYTES,
+        )
+        if stable is None:
+            raise HoldCorruptStateError("Hold history anchor is missing")
+        stable = self._validate_history_anchor_payload(stable)
+        if control_path is not None:
+            _validate_sqlite_custody_evidence(
+                marker_payload=self._read_sqlite_custody_marker(),
+                expected_payload=_sqlite_custody_marker_payload(control_path, stable),
+                initialized=True,
+                bootstrap_pending=False,
+            )
+        self._write_file_evidence(path, payload, label="Hold history anchor")
+        self._write_sqlite_custody_marker(payload)
+        self._remove_history_candidate()
+
+    async def _complete_history_publication(self, payload: bytes | None) -> None:
+        """Promote committed history evidence while the protocol lock is held."""
+
+        if payload is None:
+            return
+        if self._history_anchor_path is not None:
+            self._finish_history_publication(payload)
+            return
+        candidate = await self._read_external_history_candidate()
+        if candidate != payload:
+            raise HoldCorruptStateError(
+                "Hold staged history anchor changed before publication"
+            )
+        await self._write_postgres_evidence(
+            _POSTGRES_HISTORY_ANCHOR_KEY,
+            payload,
+        )
+        await self._remove_external_history_candidate()
+
+    async def _write_history_anchor(self) -> None:
+        """Publish the receipt-history head before a mutation can return."""
+
+        payload = await self._current_history_anchor_payload()
+        if self._history_anchor_path is not None:
+            self._write_file_evidence(
+                self._history_anchor_path,
+                payload,
+                label="Hold history anchor",
+            )
+            return
+        if getattr(self._db, "backend_type", "") != "postgres":
+            raise HoldStateError("durable Hold requires an external history anchor")
+        await self._write_postgres_evidence(
+            _POSTGRES_HISTORY_ANCHOR_KEY,
+            payload,
+        )
+
+    async def _assert_history_anchor_intact(self) -> None:
+        """Fail closed when the database no longer matches its durable head."""
+
+        anchored = await self._read_history_anchor()
+        if anchored is None:
+            raise HoldCorruptStateError("Hold history anchor is missing")
+        if anchored != await self._current_history_anchor_payload():
+            raise HoldCorruptStateError(
+                "Hold history anchor does not match receipt history"
+            )
+
+    async def _existing_schema_tables(self) -> set[str]:
+        placeholders = ", ".join("?" for _ in _HOLD_SCHEMA_TABLES)
+        names = tuple(sorted(_HOLD_SCHEMA_TABLES))
+        if getattr(self._db, "backend_type", "") == "postgres":
+            rows = await self._db.fetchall(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = current_schema() "
+                f"AND table_name IN ({placeholders})",
+                names,
+            )
+        else:
+            rows = await self._db.fetchall(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                f"AND name IN ({placeholders})",
+                names,
+            )
+        return {str(row[0]) for row in rows}
+
+    async def _schema_row_counts(self, existing: set[str]) -> dict[str, int]:
+        """Count rows in each existing Hold table without reading its columns."""
+
+        counts: dict[str, int] = {}
+        for table in sorted(existing & _HOLD_SCHEMA_TABLES):
+            row = await self._db.fetchone(f"SELECT COUNT(*) FROM {table}")
+            counts[table] = int(row[0])
+        return counts
+
+    async def _schema_migration_names(
+        self,
+        existing: set[str],
+    ) -> tuple[object, ...]:
+        if "hold_schema_migrations" not in existing:
+            return ()
+        rows = await self._db.fetchall("SELECT name FROM hold_schema_migrations")
+        return tuple(row[0] for row in rows)
+
+    async def _read_database_snapshot(self) -> HoldDatabaseSnapshot:
+        """Read every Hold projection and witness from one stable database."""
+
+        existing = frozenset(await self._existing_schema_tables())
+
+        async def rows(table: str, sql: str) -> tuple[Any, ...]:
+            if table not in existing:
+                return ()
+            return tuple(await self._db.fetchall(sql))
+
+        # Migrations first: they decide which receipt projection is complete.
+        migration_rows = await rows(
+            "hold_schema_migrations",
+            "SELECT name FROM hold_schema_migrations ORDER BY name",
+        )
+        return HoldDatabaseSnapshot(
+            existing_tables=existing,
+            latch_rows=await rows(
+                "hold_latches",
+                f"SELECT {_LATCH_COLUMNS} FROM hold_latches "
+                "ORDER BY scope, target_id",
+            ),
+            receipt_rows=await rows(
+                "hold_receipts",
+                _snapshot_history_anchor_format(
+                    migration_rows
+                ).receipt_history_sql,
+            ),
+            receipt_count_witness_rows=await rows(
+                "hold_receipt_witnesses",
+                "SELECT scope, target_id, receipt_count "
+                "FROM hold_receipt_witnesses ORDER BY scope, target_id",
+            ),
+            content_witness_rows=await rows(
+                "hold_receipt_content_witnesses",
+                "SELECT receipt_id, scope, target_id, receipt_digest "
+                "FROM hold_receipt_content_witnesses ORDER BY receipt_id",
+            ),
+            operation_witness_rows=await rows(
+                "hold_operation_witnesses",
+                "SELECT operation_id, receipt_id FROM hold_operation_witnesses "
+                "ORDER BY operation_id",
+            ),
+            migration_rows=migration_rows,
+        )
+
+    async def ensure_schema(self) -> None:
+        """Create the Hold schema while preserving typed integrity failures."""
+
+        try:
+            if self._history_anchor_path is not None:
+                async with self._sqlite_evidence_lock():
+                    await self._ensure_external_schema_protocol()
+            else:
+                async with self._postgres_evidence_lock():
+                    await self._ensure_external_schema_protocol()
+        except BaseException as exc:
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                if domain_error is exc:
+                    raise
+                raise domain_error from exc
+            raise
+
+    @staticmethod
+    def _validate_schema_evidence(
+        *,
+        initialized: bool,
+        anchored: bytes | None,
+        existing: set[str],
+        bootstrap_pending: bool = False,
+        unused_schema_refusal: str | None = _UNUSED_SCHEMA_UNASSESSED,
+    ) -> bool:
+        """Refuse evidence boot cannot trust; return whether it adopts tables.
+
+        ``unused_schema_refusal`` is :func:`_unused_schema_refusal` for this
+        database, or the default when the caller cannot assess it.
+        """
+
+        legacy_tables = {"hold_latches", "hold_receipts"}
+        if initialized and anchored is None:
+            raise HoldCorruptStateError("Hold history anchor is missing")
+        if not initialized and not bootstrap_pending:
+            if anchored is not None:
+                raise HoldCorruptStateError(
+                    "Hold history anchor exists without its initialization witness"
+                )
+            if existing - legacy_tables:
+                if unused_schema_refusal is None:
+                    return True
+                raise HoldCorruptStateError(
+                    "Hold initialization witness is missing for an initialized "
+                    "schema. Boot will not adopt it as an unused first "
+                    f"bootstrap because {unused_schema_refusal}. Restore the "
+                    "Hold witness and history anchor saved with this database, "
+                    "or boot the Kestrel release that wrote it; dropping Hold "
+                    "tables that hold rows would erase Hold history"
+                )
+        return False
+
+    async def _ensure_external_schema_protocol(self) -> None:
+        """Run or recover bootstrap under the external protocol lock."""
+
+        initialized = await self._read_initialization_witness()
+        anchored = await self._read_history_anchor()
+        existing = await self._existing_schema_tables()
+        bootstrap_history = await self._read_external_bootstrap_intent()
+        custody_marker = None
+        unused_schema_refusal: str | None = _UNUSED_SCHEMA_UNASSESSED
+        if self._custody_marker_path is not None:
+            custody_marker = self._read_sqlite_custody_marker()
+            if not initialized and bootstrap_history is None:
+                unused_schema_refusal = _unused_schema_refusal(
+                    row_counts=await self._schema_row_counts(existing),
+                    migration_names=await self._schema_migration_names(existing),
+                    custody_marked=custody_marker is not None,
+                )
+        adopting_unused_schema = self._validate_schema_evidence(
+            initialized=initialized,
+            anchored=anchored,
+            existing=existing,
+            bootstrap_pending=bootstrap_history is not None,
+            unused_schema_refusal=unused_schema_refusal,
+        )
+        bootstrap_format, bootstrap_rows = await self._bootstrap_history(existing)
+        current_bootstrap_history = self._history_anchor_payload_from_rows(
+            bootstrap_rows, anchor_format=bootstrap_format
+        )
+        # The bootstrap migration never changes receipts but may move the
+        # anchor format, so an intent (or an anchor published before its
+        # witness) matches the same history in either format.
+        if bootstrap_history is not None and not self._history_payload_describes(
+            bootstrap_history, bootstrap_rows, anchor_format=bootstrap_format
+        ):
+            raise HoldCorruptStateError(
+                "Hold bootstrap intent does not match receipt history"
+            )
+        if (
+            bootstrap_history is not None
+            and anchored is not None
+            and not self._history_payload_describes(
+                anchored, bootstrap_rows, anchor_format=bootstrap_format
+            )
+        ):
+            raise HoldCorruptStateError(
+                "Hold bootstrap intent conflicts with the stable history anchor"
+            )
+        if self._custody_marker_path is not None:
+            _validate_sqlite_custody_evidence(
+                marker_payload=custody_marker,
+                expected_payload=None,
+                initialized=initialized,
+                bootstrap_pending=bootstrap_history is not None,
+            )
+        if initialized:
+            missing = sorted(_HOLD_SCHEMA_TABLES - existing)
+            if missing:
+                raise HoldCorruptStateError(
+                    "initialized Hold schema is missing required tables: "
+                    + ", ".join(missing)
+                )
+            await self._recover_history_publication()
+            publication = await self._ensure_schema_transaction(initialized=True)
+            if publication is not None:
+                if (
+                    self._custody_marker_path is not None
+                    and custody_marker is None
+                    and bootstrap_history is not None
+                ):
+                    # A first bootstrap stopped after its witness and before
+                    # its custody marker. Publish the head it would have
+                    # written, the stable anchor the migration just verified,
+                    # so the re-anchor promotes from it like any other head.
+                    stable = await self._read_history_anchor()
+                    if stable is None:
+                        raise HoldCorruptStateError(
+                            "Hold history anchor is missing"
+                        )
+                    self._write_sqlite_custody_marker(stable)
+                await self._complete_history_publication(publication)
+            await self._assert_history_anchor_intact()
+            if self._custody_marker_path is not None:
+                if custody_marker is None and bootstrap_history is not None:
+                    self._write_sqlite_custody_marker(
+                        await self._current_history_anchor_payload()
+                    )
+                else:
+                    await self._assert_sqlite_custody_head_intact()
+            if bootstrap_history is not None:
+                await self._remove_external_bootstrap_intent()
+            return
+
+        if await self._read_external_history_candidate() is not None:
+            raise HoldCorruptStateError(
+                "Hold history publication exists without initialized schema"
+            )
+        if bootstrap_history is None:
+            # Durable intent precedes DDL. If the process stops anywhere after
+            # this write, a later initializer may finish exactly this bootstrap
+            # rather than mistaking committed v1 tables for unexplained state.
+            await self._write_external_bootstrap_intent(
+                current_bootstrap_history
+            )
+        await self._ensure_schema_transaction(initialized=False)
+        # The database transaction has committed while the cross-process lock
+        # still excludes readers and peer initializers. Publish both pieces of
+        # evidence, then retire the recovery authority last. The committed
+        # history is the intent's history, but the transaction moved it to
+        # the v2 anchor format, so every head published from here is re-read.
+        await self._write_history_anchor()
+        await self._write_initialization_witness()
+        if adopting_unused_schema:
+            # After the witness, not before the refusals that follow adoption:
+            # a boot that still refuses (a staged history candidate, a schema
+            # transaction that cannot resolve a conflict key) must not leave a
+            # line saying it completed a bootstrap it never completed.
+            logger.warning(
+                "Hold tables in %s had no initialization evidence and had "
+                "never recorded a latch, receipt, or witness, and no custody "
+                "marker proved an earlier initialization; completed them as a "
+                "first bootstrap",
+                self._custody_control_path,
+            )
+        if self._custody_marker_path is not None:
+            self._write_sqlite_custody_marker(
+                await self._current_history_anchor_payload()
+            )
+        await self._remove_external_bootstrap_intent()
+
+    async def _ensure_schema_transaction(
+        self,
+        *,
+        initialized: bool,
+    ) -> bytes | None:
+        """Create both Hold tables as one serialized schema unit.
+
+        Returns the history head this transaction staged for publication, or
+        ``None``. Only the v2 anchor-format migration of an initialized store
+        stages one; the caller publishes it once the transaction commits.
+        """
+
+        async with self._db.migration_lock(_SCHEMA_LOCK):
+            if initialized:
+                existing = await self._existing_schema_tables()
+                missing = sorted(_HOLD_SCHEMA_TABLES - existing)
+                if missing:
+                    raise HoldCorruptStateError(
+                        "initialized Hold schema is missing required tables: "
+                        + ", ".join(missing)
+                    )
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS hold_latches ("
+                "scope TEXT NOT NULL, "
+                "target_id TEXT NOT NULL, "
+                "active INTEGER NOT NULL DEFAULT 0, "
+                "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+                "reason TEXT NOT NULL DEFAULT '', "
+                "actor_id TEXT NOT NULL DEFAULT '', "
+                "set_at TEXT NOT NULL DEFAULT '', "
+                "revision INTEGER NOT NULL DEFAULT 0, "
+                "PRIMARY KEY (scope, target_id), "
+                f"CHECK ({_HOLD_SCOPE_CHECK}), "
+                "CHECK (scope <> 'host' OR target_id = 'host'), "
+                "CHECK (active IN (0, 1)), "
+                "CHECK (revision >= 0))"
+            )
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS hold_receipts ("
+                "receipt_id TEXT NOT NULL PRIMARY KEY, "
+                "operation_id TEXT NOT NULL UNIQUE, "
+                "action TEXT NOT NULL, "
+                "disposition TEXT NOT NULL, "
+                "scope TEXT NOT NULL, "
+                "target_id TEXT NOT NULL, "
+                "reason TEXT NOT NULL DEFAULT '', "
+                "actor_id TEXT NOT NULL, "
+                "occurred_at TEXT NOT NULL, "
+                "expected_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+                "prior_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+                "resulting_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+                f"{_RECEIPT_AUTHORITY_COLUMN_DEFINITION}, "
+                "CHECK (action IN ('hold', 'release')), "
+                "CHECK (disposition IN "
+                "('applied', 'already_in_state', 'refused_stale')), "
+                f"CHECK ({_HOLD_SCOPE_CHECK}), "
+                "CHECK (scope <> 'host' OR target_id = 'host'))"
+            )
+            # Additive: a receipt written before this column existed was
+            # written by the sovereign host door, the only door there was, so
+            # the default IS its recorded authority. The default is outside the
+            # per-receipt content digest by construction (see
+            # ``_receipt_content_digest``), so no content witness changes; the
+            # whole-history anchor does change, and is re-anchored by
+            # ``_migrate_history_anchor_format`` in this same transaction.
+            if not await self._db.column_exists("hold_receipts", "authority"):
+                await self._db.execute(
+                    "ALTER TABLE hold_receipts ADD COLUMN "
+                    f"{_RECEIPT_AUTHORITY_COLUMN_DEFINITION}"
+                )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_hold_receipts_target "
+                "ON hold_receipts(scope, target_id, occurred_at, receipt_id)"
+            )
+            # The commit-ordered key the sovereign receipt feed pages on
+            # (#3159 R2/R6). ``feed_seq`` is outside every content digest and
+            # witness, which cover the receipt columns only, so numbering a
+            # pre-existing row changes no evidence. The exclusive history lock
+            # is the one every receipt writer holds until commit, so numbering
+            # cannot collide with a concurrent append from another process.
+            await self._lock_write_history()
+            await ensure_feed_sequence(
+                self._db, table="hold_receipts", lock_key=_HISTORY_LOCK_KEY
+            )
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS hold_receipt_witnesses ("
+                "scope TEXT NOT NULL, "
+                "target_id TEXT NOT NULL, "
+                "receipt_count INTEGER NOT NULL DEFAULT 0, "
+                "PRIMARY KEY (scope, target_id), "
+                f"CHECK ({_HOLD_SCOPE_CHECK}), "
+                "CHECK (scope <> 'host' OR target_id = 'host'), "
+                "CHECK (receipt_count >= 0))"
+            )
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS hold_receipt_content_witnesses ("
+                "receipt_id TEXT NOT NULL PRIMARY KEY, "
+                "scope TEXT NOT NULL, "
+                "target_id TEXT NOT NULL, "
+                "receipt_digest TEXT NOT NULL, "
+                f"CHECK ({_HOLD_SCOPE_CHECK}), "
+                "CHECK (scope <> 'host' OR target_id = 'host'))"
+            )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_hold_receipt_content_witnesses_target "
+                "ON hold_receipt_content_witnesses(scope, target_id)"
+            )
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS hold_operation_witnesses ("
+                "operation_id TEXT NOT NULL PRIMARY KEY, "
+                "receipt_id TEXT NOT NULL UNIQUE)"
+            )
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS hold_schema_migrations ("
+                "name TEXT NOT NULL PRIMARY KEY)"
+            )
+            duplicate_operation = await self._db.fetchone(
+                "SELECT operation_id FROM hold_receipts "
+                "GROUP BY operation_id HAVING COUNT(*) > 1 LIMIT 1"
+            )
+            if duplicate_operation is not None:
+                raise HoldCorruptStateError(
+                    "Hold receipt history contains a duplicate operation id"
+                )
+            # ``CREATE TABLE IF NOT EXISTS`` cannot repair imported pre-v1
+            # tables.  Mutations rely on every one of these conflict keys, so
+            # establish them before an initialization witness can call the
+            # store ready.  Duplicate legacy evidence is corrupt rather than a
+            # row for a migration to choose between.
+            for index, table, columns in _HOLD_REQUIRED_UNIQUE_INDEXES:
+                try:
+                    await self._db.execute(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS {index} "
+                        f"ON {table}({columns})"
+                    )
+                except Exception as exc:
+                    raise HoldCorruptStateError(
+                        f"Hold {table} schema cannot enforce its required "
+                        "unique key"
+                    ) from exc
+            # Prove each conflict key itself, not just our index names. A
+            # pre-existing corrupt index may occupy an expected name while
+            # covering different columns. EXPLAIN asks the database to resolve
+            # every arbiter without inserting a probe row. Keep the proof
+            # derived from the complete unique-key declaration so a future
+            # upsert cannot be added behind a name-only readiness check.
+            for _index, table, columns in _HOLD_REQUIRED_UNIQUE_INDEXES:
+                column_names = tuple(
+                    column.strip() for column in columns.split(",")
+                )
+                placeholders = ", ".join("?" for _column in column_names)
+                conflict_label = (
+                    "scope/target"
+                    if column_names == ("scope", "target_id")
+                    else "/".join(column_names)
+                )
+                try:
+                    await self._db.fetchall(
+                        f"EXPLAIN INSERT INTO {table} ({columns}) "
+                        f"VALUES ({placeholders}) "
+                        f"ON CONFLICT ({columns}) DO NOTHING",
+                        tuple(
+                            f"__kestrel_hold_schema_probe_{position}__"
+                            for position, _column in enumerate(column_names)
+                        ),
+                    )
+                except Exception as exc:
+                    raise HoldCorruptStateError(
+                        f"Hold {table} schema cannot resolve its required "
+                        f"{conflict_label} conflict key"
+                    ) from exc
+            # After every legacy conflict key is proven, so a rebuild copies
+            # rows the widened table accepts and a defect keeps its own name.
+            if await self._widen_scope_checks():
+                # A SQLite rebuild drops the receipt table's feed trigger with
+                # the old table; re-establish it inside this transaction.
+                await ensure_feed_sequence(
+                    self._db, table="hold_receipts", lock_key=_HISTORY_LOCK_KEY
+                )
+            migration_complete = await self._db.fetchone(
+                "SELECT 1 FROM hold_schema_migrations WHERE name = ?",
+                (_WITNESS_BACKFILL,),
+            )
+            if migration_complete is not None:
+                await self._assert_completed_witness_migration_intact()
+                return await self._migrate_history_anchor_format(
+                    initialized=initialized
+                )
+            if initialized:
+                raise HoldCorruptStateError(
+                    "initialized Hold schema is missing its required witness "
+                    "migration marker"
+                )
+            # Seed the witness exactly once for upgraded databases. Future
+            # schema checks never derive missing witnesses from mutable receipt
+            # rows after the durable migration marker exists. Without that
+            # gate, deleting a witness on a later boot re-blessed whatever
+            # receipt content happened to remain.
+            await self._db.execute(
+                "INSERT INTO hold_receipt_witnesses "
+                "(scope, target_id, receipt_count) "
+                "SELECT scope, target_id, COUNT(*) FROM hold_receipts "
+                "WHERE scope <> 'host' OR target_id = 'host' "
+                "GROUP BY scope, target_id "
+                "ON CONFLICT (scope, target_id) DO NOTHING"
+            )
+            # One-time backfill for upgraded databases. A witness is never
+            # overwritten from receipt rows after it exists, so later in-place
+            # mutation remains detectable across schema checks and restarts.
+            missing_content_witnesses = await self._db.fetchall(
+                "SELECT r.receipt_id, r.operation_id, r.action, r.disposition, "
+                "r.scope, r.target_id, r.reason, r.actor_id, r.occurred_at, "
+                "r.expected_hold_receipt_id, r.prior_hold_receipt_id, "
+                "r.resulting_hold_receipt_id FROM hold_receipts AS r "
+                "LEFT JOIN hold_receipt_content_witnesses AS w "
+                "ON w.receipt_id = r.receipt_id WHERE w.receipt_id IS NULL"
+            )
+            for row in missing_content_witnesses:
+                receipt = _receipt_from_row(row)
+                await self._db.execute(
+                    "INSERT INTO hold_receipt_content_witnesses "
+                    "(receipt_id, scope, target_id, receipt_digest) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT (receipt_id) DO NOTHING",
+                    (
+                        receipt.receipt_id,
+                        receipt.scope.value,
+                        receipt.target_id,
+                        _receipt_content_digest(row),
+                    ),
+                )
+            # Operation identities are global, not target-local. Keep a
+            # separate append-only tombstone so deleting a receipt cannot make
+            # its operation id available to a different target. The anti-join
+            # keeps repeat startup proportional to genuinely missing legacy
+            # witnesses rather than total receipt history.
+            await self._db.execute(
+                "INSERT INTO hold_operation_witnesses (operation_id, receipt_id) "
+                "SELECT r.operation_id, r.receipt_id FROM hold_receipts AS r "
+                "LEFT JOIN hold_operation_witnesses AS w "
+                "ON w.operation_id = r.operation_id "
+                "WHERE w.operation_id IS NULL "
+                "ON CONFLICT (operation_id) DO NOTHING"
+            )
+            await self._db.execute(
+                "INSERT INTO hold_receipt_witnesses "
+                "(scope, target_id, receipt_count) "
+                "SELECT scope, target_id, 0 FROM hold_latches "
+                "WHERE scope <> 'host' OR target_id = 'host' "
+                "ON CONFLICT (scope, target_id) DO NOTHING"
+            )
+            await self._db.execute(
+                "INSERT INTO hold_schema_migrations (name) VALUES (?) "
+                "ON CONFLICT (name) DO NOTHING",
+                (_WITNESS_BACKFILL,),
+            )
+            return await self._migrate_history_anchor_format(
+                initialized=initialized
+            )
+
+    async def _widen_scope_checks(self) -> bool:
+        """Admit ``mandate`` wherever a scope CHECK forbids it (#3168).
+
+        Runs once, in the schema transaction that records the v3 anchor
+        migration, and only while that marker is absent. It widens exactly
+        the ``scope IN ('host', 'agent')`` constraint and nothing else: a
+        table created by this release already admits ``mandate``, and a legacy
+        table with no scope CHECK already does too, so neither is touched and
+        every other constraint keeps whatever shape the table had (the
+        runtime validators, not a migration, name a legacy row's defect).
+        PostgreSQL swaps the constraint in place; SQLite has no ``ALTER
+        CONSTRAINT``, so its table is rebuilt from its own DDL with only that
+        clause widened. Returns whether any SQLite table was rebuilt.
+        """
+
+        migrated = await self._db.fetchone(
+            "SELECT 1 FROM hold_schema_migrations WHERE name = ?",
+            (_HISTORY_ANCHOR_V3_MIGRATION,),
+        )
+        if migrated is not None:
+            return False
+        rebuilt = False
+        for table in _HOLD_SCOPED_TABLES:
+            try:
+                if getattr(self._db, "backend_type", "") == "postgres":
+                    await self._widen_postgres_scope_check(table)
+                else:
+                    rebuilt = await self._widen_sqlite_scope_check(table) or rebuilt
+            except HoldStateError:
+                raise
+            except Exception as exc:
+                raise HoldCorruptStateError(
+                    f"Hold {table} schema cannot admit mandate latches"
+                ) from exc
+        return rebuilt
+
+    async def _widen_sqlite_scope_check(self, table: str) -> bool:
+        row = await self._db.fetchone(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        )
+        if row is None or not isinstance(row[0], str):
+            raise HoldCorruptStateError(f"Hold {table} schema is unreadable")
+        ddl = row[0]
+        widened, count = _LEGACY_SCOPE_CHECK_PATTERN.subn(
+            f"CHECK ({_HOLD_SCOPE_CHECK})", ddl
+        )
+        if not count:
+            return False
+        header = re.match(
+            rf'CREATE TABLE\s+(?:"{table}"|{table})\s*\(', widened
+        )
+        if header is None:
+            raise HoldCorruptStateError(f"Hold {table} schema is unreadable")
+        template = (
+            "CREATE TABLE {table} ("
+            + widened[header.end():].replace("{", "{{").replace("}", "}}")
+        )
+        await self._db.rebuild_sqlite_table(table, template)
+        return True
+
+    async def _widen_postgres_scope_check(self, table: str) -> None:
+        rows = await self._db.fetchall(
+            "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = to_regclass(?) AND contype = 'c'",
+            (table,),
+        )
+        dropped = False
+        for name, definition in rows:
+            text = str(definition)
+            if "'agent'" in text and "'mandate'" not in text:
+                quoted = '"' + str(name).replace('"', '""') + '"'
+                await self._db.execute(
+                    f"ALTER TABLE {table} DROP CONSTRAINT {quoted}"
+                )
+                dropped = True
+        if dropped:
+            await self._db.execute(
+                f"ALTER TABLE {table} ADD CONSTRAINT {table}_scope_v3_check "
+                f"CHECK ({_HOLD_SCOPE_CHECK})"
+            )
+
+    async def _migrate_history_anchor_format(
+        self,
+        *,
+        initialized: bool,
+    ) -> bytes | None:
+        """Move the whole-history anchor to the current format, exactly once.
+
+        Runs inside the schema transaction that added and backfilled
+        ``authority`` (v2) and widened the scope CHECK for mandate latches
+        (v3), so the database records the new format atomically with the
+        schema it describes. An initialized store already has a stable anchor
+        in its recorded format: it is verified against the unchanged history
+        first, so re-anchoring can never bless a history the old anchor did
+        not describe, and the v3 head is then staged exactly like a
+        mutation's, for the caller to publish after commit. An uninitialized
+        store has no stable anchor yet; its bootstrap publishes the committed
+        head directly.
+        """
+
+        recorded = await self._history_anchor_format()
+        if recorded is _HistoryAnchorFormat.V3:
+            return None
+        rows = tuple(
+            await self._db.fetchall(_HistoryAnchorFormat.V3.receipt_history_sql)
+        )
+        if recorded is _HistoryAnchorFormat.V1:
+            recorded_rows = _v1_projection_of(rows)
+            if recorded_rows is None:
+                raise HoldCorruptStateError(
+                    "Hold receipt history records an authority its v1 history "
+                    "anchor never covered"
+                )
+        else:
+            recorded_rows = rows
+        if initialized:
+            stable = await self._read_history_anchor()
+            if stable is None:
+                raise HoldCorruptStateError("Hold history anchor is missing")
+            if stable != self._history_anchor_payload_from_rows(
+                recorded_rows, anchor_format=recorded
+            ):
+                raise HoldCorruptStateError(
+                    "Hold history anchor does not match receipt history"
+                )
+        for name in _HISTORY_ANCHOR_MIGRATIONS:
+            await self._db.execute(
+                "INSERT INTO hold_schema_migrations (name) VALUES (?) "
+                "ON CONFLICT (name) DO NOTHING",
+                (name,),
+            )
+        if not initialized:
+            return None
+        payload = self._history_anchor_payload_from_rows(
+            rows, anchor_format=_HistoryAnchorFormat.V3
+        )
+        await self._stage_external_history_candidate(payload)
+        return payload
+
+    async def _assert_completed_witness_migration_intact(self) -> None:
+        """Fail closed if a completed migration later loses any witness."""
+
+        missing_content = await self._db.fetchone(
+            "SELECT r.receipt_id FROM hold_receipts AS r "
+            "LEFT JOIN hold_receipt_content_witnesses AS w "
+            "ON w.receipt_id = r.receipt_id "
+            "WHERE w.receipt_id IS NULL LIMIT 1"
+        )
+        if missing_content is not None:
+            raise HoldCorruptStateError(
+                "completed Hold witness migration is missing a content witness"
+            )
+
+        await self._assert_no_missing_operation_witnesses(
+            context="completed Hold witness migration",
+        )
+        await self._assert_no_duplicate_operation_witnesses()
+        await self._assert_no_orphaned_operation_witnesses()
+
+        missing_count = await self._db.fetchone(
+            "SELECT source.scope, source.target_id FROM ("
+            "SELECT scope, target_id FROM hold_receipts "
+            "UNION SELECT scope, target_id FROM hold_latches"
+            ") AS source LEFT JOIN hold_receipt_witnesses AS w "
+            "ON w.scope = source.scope AND w.target_id = source.target_id "
+            "WHERE w.scope IS NULL LIMIT 1"
+        )
+        if missing_count is not None:
+            raise HoldCorruptStateError(
+                "completed Hold witness migration is missing a receipt-count witness"
+            )
+
+    async def _assert_no_missing_operation_witnesses(
+        self,
+        *,
+        context: str = "Hold receipt history",
+    ) -> None:
+        """Reject immutable receipts whose global operation evidence was lost."""
+
+        missing_operation = await self._db.fetchone(
+            "SELECT r.operation_id FROM hold_receipts AS r "
+            "LEFT JOIN hold_operation_witnesses AS w "
+            "ON w.operation_id = r.operation_id "
+            "WHERE w.operation_id IS NULL LIMIT 1"
+        )
+        if missing_operation is not None:
+            raise HoldCorruptStateError(f"{context} is missing an operation witness")
+
+    async def _assert_no_duplicate_operation_witnesses(self) -> None:
+        """Reject imported operation evidence whose nominal key is ambiguous."""
+
+        duplicate = await self._db.fetchone(
+            "SELECT operation_id FROM hold_operation_witnesses "
+            "GROUP BY operation_id HAVING COUNT(*) > 1 LIMIT 1"
+        )
+        if duplicate is not None:
+            raise HoldCorruptStateError(
+                "Hold operation witness has a duplicate operation identity"
+            )
+
+    async def _assert_no_orphaned_operation_witnesses(self) -> None:
+        """Reject append-only operation evidence without its immutable receipt."""
+
+        orphaned = await self._db.fetchone(
+            "SELECT w.operation_id FROM hold_operation_witnesses AS w "
+            "LEFT JOIN hold_receipts AS r "
+            "ON r.operation_id = w.operation_id AND r.receipt_id = w.receipt_id "
+            "WHERE r.operation_id IS NULL LIMIT 1"
+        )
+        if orphaned is not None:
+            raise HoldCorruptStateError(
+                "Hold operation witness refers to a missing receipt"
+            )
+
+    async def _assert_global_history_intact(self) -> None:
+        """Validate database-wide receipt evidence once per stable snapshot."""
+
+        await self._assert_no_duplicate_operation_witnesses()
+        await self._assert_no_missing_operation_witnesses()
+        await self._assert_no_orphaned_operation_witnesses()
+        await self._assert_history_anchor_intact()
+
+    async def read_boot_state(self) -> tuple[HoldState, ...]:
+        """Validate and return every active latch before work producers start."""
+
+        async with self._evidence_protocol():
+            # This is also Doctor's state gate. Keep it on the runtime path so
+            # a diagnostic cannot certify a row shape or witness topology that
+            # boot itself does not prove from the same complete snapshot.
+            try:
+                async with self._db.transaction():
+                    await self._lock_read_history()
+                    validated = validate_hold_database_snapshot(
+                        await self._read_database_snapshot()
+                    )
+            except Exception as exc:
+                domain_error = _domain_error_from_chain(exc)
+                if domain_error is not None:
+                    raise domain_error from exc
+                raise
+            rows = await self._db.fetchall(
+                "SELECT scope, target_id FROM hold_latches "
+                "UNION SELECT scope, target_id FROM hold_receipts "
+                "UNION SELECT scope, target_id FROM hold_receipt_witnesses "
+                "UNION SELECT scope, target_id FROM hold_receipt_content_witnesses"
+            )
+            targets: set[tuple[HoldScope, str]] = {
+                (HoldScope.HOST, HOST_HOLD_TARGET)
+            }
+            for row in rows:
+                if len(row) != 2:
+                    raise HoldCorruptStateError(
+                        "Hold boot-state target row has an unexpected shape"
+                    )
+                try:
+                    scope = HoldScope(str(row[0]))
+                except (TypeError, ValueError) as exc:
+                    raise HoldCorruptStateError(
+                        "Hold boot-state target has an invalid scope"
+                    ) from exc
+                target_id = row[1]
+                if not isinstance(target_id, str) or not target_id.strip():
+                    raise HoldCorruptStateError(
+                        "Hold boot-state target is missing its identity"
+                    )
+                if target_id != target_id.strip():
+                    raise HoldCorruptStateError(
+                        "Hold boot-state target has a noncanonical identity"
+                    )
+                _assert_scope_key(
+                    scope, target_id, label="Hold boot-state target"
+                )
+                targets.add((scope, target_id))
+
+            active: list[HoldState] = []
+            for scope, target_id in sorted(
+                targets,
+                key=lambda item: (item[0].value, item[1]),
+            ):
+                try:
+                    state = await self._get_hold(
+                        scope,
+                        target_id,
+                        validate_global_history=False,
+                    )
+                except Exception as exc:
+                    domain_error = _domain_error_from_chain(exc)
+                    if domain_error is not None:
+                        raise domain_error from exc
+                    raise
+                if state is not None:
+                    active.append(state)
+            # The evidence protocol excludes every legitimate Hold writer for
+            # this entire boot read. Validate the database-wide tombstones and
+            # receipt anchor once after the target-local walks. Repeating these
+            # global scans from ``_get_hold`` for every target makes boot
+            # O(targets * total receipts).
+            try:
+                async with self._db.transaction():
+                    await self._lock_read_history()
+                    await self._assert_global_history_intact()
+            except Exception as exc:
+                domain_error = _domain_error_from_chain(exc)
+                if domain_error is not None:
+                    raise domain_error from exc
+                raise
+            if tuple(active) != validated:
+                raise HoldCorruptStateError(
+                    "Hold boot validators disagree on active latch state"
+                )
+            return validated
+
+    async def list_receipts(
+        self,
+        *,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        scope: Optional[HoldScope] = None,
+        target_id: Optional[str] = None,
+        subject_id: Optional[str] = None,
+        after: Optional[int] = None,
+        limit: int,
+        newest_first: bool = False,
+    ) -> HoldReceiptPage:
+        """Read one bounded page of Hold history, oldest first by default.
+
+        ``target_id`` filters on the durable latch key. ``subject_id`` filters
+        on the agent a receipt's latch withholds work from; with scope
+        ``mandate`` it selects every holder's latch on that agent.
+
+        ``newest_first`` reverses the order, and ``after`` then names the
+        cursor the page continues BELOW. A bounded newest-first page is the
+        most recent suffix of that history, so a receipt on the page is
+        followed on the page by every receipt committed after it.
+
+        Pages on ``feed_seq``, which the table's insert trigger allocates for
+        every receipt write under the exclusive history lock (or SQLite's
+        writer slot), so a receipt that
+        commits after a page was served always sorts after that page's cursor
+        (#3159 R6). ``since`` / ``until`` filter on the displayed
+        ``occurred_at``.
+
+        ``refused_stale`` and ``already_in_state`` rows are returned rather
+        than filtered: an operator really did ask, and the answer they got is
+        part of the history they are reading (#3159 R5).
+
+        The page is taken inside the same evidence protocol every other live
+        read uses, and validates the database-wide receipt graph once, so a
+        deleted or forged row is reported as corrupt instead of rendered as
+        history.
+
+        The page bounds rows RETURNED, not work done: that validation hashes
+        the complete receipt set, exactly as turn-start ``get_effective`` and
+        every mutation already do, because the external anchor is a whole-set
+        digest. Making the anchor incremental changes the custody evidence
+        format and is #3321; skipping the check here instead would render a
+        forged or deleted row as history.
+
+        A backend that cannot answer raises :class:`HoldStateError`, never a
+        raw ``DatabaseError``. The evidence protocol itself talks to both
+        databases, so the translation wraps it too: the caller's promise is a
+        503 saying the history is unreadable, and an untyped backend failure
+        would escape that and arrive as a sanitized 500.
+        """
+
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("Hold receipt page size must be a positive integer")
+        if scope is not None and not isinstance(scope, HoldScope):
+            raise TypeError("Hold receipt scope filter must be a HoldScope")
+        if target_id is not None and (
+            not isinstance(target_id, str) or not target_id.strip()
+        ):
+            raise ValueError("Hold receipt target filter must be a concrete id")
+        if subject_id is not None and (
+            not isinstance(subject_id, str) or not subject_id.strip()
+        ):
+            raise ValueError("Hold receipt subject filter must be a concrete id")
+        if subject_id is not None and scope is not HoldScope.MANDATE:
+            raise ValueError("Hold receipt subject filter needs the mandate scope")
+        if not isinstance(newest_first, bool):
+            raise TypeError("Hold receipt page order must be a bool")
+
+        try:
+            async with self._evidence_protocol():
+                async with self._db.transaction():
+                    await self._lock_read_history()
+                    await self._assert_global_history_intact()
+                    rows = await self._read_receipt_page(
+                        since=since,
+                        until=until,
+                        scope=scope,
+                        target_id=target_id,
+                        subject_id=subject_id,
+                        after=after,
+                        limit=limit,
+                        newest_first=newest_first,
+                    )
+        except Exception as exc:
+            # Corruption stays corruption: it is a HoldStateError subclass and
+            # is recovered from the chain before anything is renamed.
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                if domain_error is exc:
+                    raise
+                raise domain_error from exc
+            if isinstance(exc, DatabaseError):
+                raise HoldStateError(
+                    "Hold receipt history could not be read"
+                ) from exc
+            raise
+        has_more = len(rows) > limit
+        entries = tuple(_feed_entry_from_row(row) for row in rows[:limit])
+        next_key = entries[-1].feed_seq if has_more and entries else None
+        return HoldReceiptPage(entries=entries, next_key=next_key)
+
+    async def _read_receipt_page(
+        self,
+        *,
+        since: Optional[datetime],
+        until: Optional[datetime],
+        scope: Optional[HoldScope],
+        target_id: Optional[str],
+        after: Optional[int],
+        limit: int,
+        newest_first: bool = False,
+        subject_id: Optional[str] = None,
+    ) -> tuple[Any, ...]:
+        filters = ["feed_seq IS NOT NULL"]
+        params: list[Any] = []
+        if since is not None:
+            filters.append("occurred_at >= ?")
+            params.append(
+                database_timestamp_bound_text(self._db, since)
+            )
+        if until is not None:
+            filters.append("occurred_at < ?")
+            params.append(
+                database_timestamp_bound_text(self._db, until)
+            )
+        if scope is not None:
+            filters.append("scope = ?")
+            params.append(scope.value)
+        if target_id is not None:
+            filters.append("target_id = ?")
+            params.append(target_id)
+        if subject_id is not None:
+            prefix = _mandate_key_prefix(subject_id)
+            filters.append("substr(target_id, 1, ?) = ?")
+            params.extend((len(prefix), prefix))
+        if after is not None:
+            # Strict keyset successor: a page boundary can neither repeat a
+            # receipt nor skip one.
+            filters.append("feed_seq < ?" if newest_first else "feed_seq > ?")
+            params.append(after)
+        # One row beyond the page so a cursor is issued only when more history
+        # actually exists.
+        params.append(limit + 1)
+        return tuple(
+            await self._db.fetchall(
+                f"SELECT {_RECEIPT_AUTHORITY_COLUMNS}, feed_seq FROM hold_receipts "
+                f"WHERE {' AND '.join(filters)} "
+                f"ORDER BY feed_seq {'DESC' if newest_first else 'ASC'} LIMIT ?",
+                tuple(params),
+            )
+        )
+
+    async def _lock_operation_and_target(
+        self, operation_id: str, scope: HoldScope, target_id: str
+    ) -> None:
+        if getattr(self._db, "backend_type", "") != "postgres":
+            return
+        # One global acquisition order for every writer: history first,
+        # operation second, target third. The global lock serializes the
+        # database-wide receipt head across otherwise-independent targets; the
+        # other locks close operation reuse and absent-row mutation gaps.
+        for key in (
+            _HISTORY_LOCK_KEY,
+            f"kestrel:hold:operation:{operation_id}",
+            f"kestrel:hold:target:{scope.value}:{target_id}",
+        ):
+            await self._db.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                (key,),
+            )
+
+    async def _lock_write_history(self) -> None:
+        """Take PostgreSQL's exclusive receipt-history slot until commit."""
+
+        if getattr(self._db, "backend_type", "") != "postgres":
+            return
+        await self._db.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+            (_HISTORY_LOCK_KEY,),
+        )
+
+    async def _lock_read_history(self) -> None:
+        """Stabilize PostgreSQL's global receipt set before inspecting it."""
+
+        if getattr(self._db, "backend_type", "") != "postgres":
+            return
+        await self._db.execute(
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))",
+            (_HISTORY_LOCK_KEY,),
+        )
+
+    async def _lock_read_targets(
+        self,
+        targets: tuple[tuple[HoldScope, str], ...],
+        *,
+        history_locked: bool = False,
+    ) -> None:
+        """Serialize a PostgreSQL read snapshot with legitimate target writers."""
+
+        if getattr(self._db, "backend_type", "") != "postgres":
+            return
+        target_keys = sorted(
+            {
+                f"kestrel:hold:target:{scope.value}:{target_id}"
+                for scope, target_id in targets
+            }
+        )
+        # Every read validates the database-wide history anchor. Its shared
+        # lock must therefore precede the same target locks as every writer.
+        if not history_locked:
+            await self._lock_read_history()
+        for key in target_keys:
+            await self._db.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))",
+                (key,),
+            )
+
+    async def _ensure_latch_row(self, scope: HoldScope, target_id: str) -> None:
+        await self._db.execute(
+            "INSERT INTO hold_latches (scope, target_id) VALUES (?, ?) "
+            "ON CONFLICT (scope, target_id) DO NOTHING",
+            (scope.value, target_id),
+        )
+        await self._db.execute(
+            "INSERT INTO hold_receipt_witnesses "
+            "(scope, target_id, receipt_count) VALUES (?, ?, 0) "
+            "ON CONFLICT (scope, target_id) DO NOTHING",
+            (scope.value, target_id),
+        )
+
+    async def _read_latch_row(
+        self, scope: HoldScope, target_id: str, *, for_update: bool = False
+    ) -> Any:
+        suffix = (
+            " FOR UPDATE"
+            if for_update and getattr(self._db, "backend_type", "") == "postgres"
+            else ""
+        )
+        rows = await self._db.fetchall(
+            f"SELECT {_LATCH_COLUMNS} FROM hold_latches "
+            f"WHERE scope = ? AND target_id = ?{suffix}",
+            (scope.value, target_id),
+        )
+        if len(rows) > 1:
+            raise HoldCorruptStateError("duplicate hold latch key")
+        return rows[0] if rows else None
+
+    async def _assert_host_latch_shape(self, *, for_update: bool = False) -> None:
+        """Fail closed if an upgraded/shared database has a foreign host row."""
+
+        suffix = (
+            " FOR UPDATE"
+            if for_update and getattr(self._db, "backend_type", "") == "postgres"
+            else ""
+        )
+        latch_rows = await self._db.fetchall(
+            "SELECT target_id FROM hold_latches WHERE scope = ?" + suffix,
+            (HoldScope.HOST.value,),
+        )
+        receipt_rows = await self._db.fetchall(
+            "SELECT target_id FROM hold_receipts WHERE scope = ?" + suffix,
+            (HoldScope.HOST.value,),
+        )
+        if any(
+            str(row[0]) != HOST_HOLD_TARGET
+            for row in (*latch_rows, *receipt_rows)
+        ):
+            raise HoldCorruptStateError(
+                "host hold state has a foreign target identity"
+            )
+
+    async def _read_receipt_by_operation(self, operation_id: str) -> Any:
+        rows = await self._db.fetchall(
+            f"SELECT {_RECEIPT_AUTHORITY_COLUMNS} FROM hold_receipts "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        )
+        if len(rows) > 1:
+            raise HoldCorruptStateError(
+                "Hold receipt history has a duplicate operation identity"
+            )
+        return rows[0] if rows else None
+
+    async def _validate_operation_witness(self, operation_id: str) -> Any:
+        """Return the receipt row only when its global identity is intact."""
+
+        witnesses = await self._db.fetchall(
+            "SELECT receipt_id FROM hold_operation_witnesses "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        )
+        if len(witnesses) > 1:
+            raise HoldCorruptStateError(
+                "Hold operation witness has a duplicate operation identity"
+            )
+        receipt_row = await self._read_receipt_by_operation(operation_id)
+        if not witnesses:
+            if receipt_row is not None:
+                raise HoldCorruptStateError(
+                    "Hold receipt is missing its global operation witness"
+                )
+            return None
+        if receipt_row is None:
+            raise HoldCorruptStateError(
+                "Hold operation witness refers to a missing receipt"
+            )
+        if str(witnesses[0][0]) != str(receipt_row[0]):
+            raise HoldCorruptStateError(
+                "Hold operation witness does not match receipt identity"
+            )
+        return receipt_row
+
+    async def _read_receipt_by_id(self, receipt_id: str) -> Any:
+        return await self._db.fetchone(
+            f"SELECT {_RECEIPT_AUTHORITY_COLUMNS} FROM hold_receipts "
+            "WHERE receipt_id = ?",
+            (receipt_id,),
+        )
+
+    async def _validate_receipt_authority_graph(
+        self,
+        latch: Optional[HoldState],
+        scope: HoldScope,
+        target_id: str,
+        *,
+        validate_global_history: bool = True,
+    ) -> None:
+        """Prove the append-only authority graph agrees with its latch.
+
+        Each applied Hold creates one authority. A later applied Hold or
+        Release may consume it exactly once. Every chain must be acyclic and
+        terminate either in an applied Release or in the one active authority
+        named by the latch. This catches projection deletion, latch rewind,
+        forked successors, and closed cycles rather than trusting a locally
+        well-formed latch row.
+        """
+
+        receipt_rows = tuple(await self._db.fetchall(
+            f"SELECT {_RECEIPT_AUTHORITY_COLUMNS} FROM hold_receipts "
+            "WHERE scope = ? AND target_id = ?",
+            (scope.value, target_id),
+        ))
+        content_witness_rows = tuple(await self._db.fetchall(
+            "SELECT receipt_id, scope, target_id, receipt_digest "
+            "FROM hold_receipt_content_witnesses "
+            "WHERE scope = ? AND target_id = ?",
+            (scope.value, target_id),
+        ))
+        projection_row = await self._read_latch_row(scope, target_id)
+        receipt_count_rows = tuple(await self._db.fetchall(
+            "SELECT scope, target_id, receipt_count FROM hold_receipt_witnesses "
+            "WHERE scope = ? AND target_id = ?",
+            (scope.value, target_id),
+        ))
+        referenced: dict[str, HoldReceipt] = {}
+        if latch is not None and not any(
+            len(row) == _V1_RECEIPT_WIDTH + 1 and row[0] == latch.hold_receipt_id
+            for row in receipt_rows
+        ):
+            referenced_row = await self._read_receipt_by_id(latch.hold_receipt_id)
+            if referenced_row is not None:
+                referenced[latch.hold_receipt_id] = _receipt_from_row(referenced_row)
+
+        projected = _validate_snapshot_target(
+            target=(scope, target_id),
+            latch_row=projection_row,
+            receipt_rows=receipt_rows,
+            receipt_count_rows=receipt_count_rows,
+            content_witness_rows=content_witness_rows,
+            receipts_by_id=referenced,
+        )
+        if projected != latch:
+            raise HoldCorruptStateError(
+                "Hold projection changed while its authority graph was validated"
+            )
+        if validate_global_history:
+            await self._assert_global_history_intact()
+
+    async def _validate_latch_projection(
+        self,
+        latch: Optional[HoldState],
+        scope: HoldScope,
+        target_id: str,
+        *,
+        validate_global_history: bool = True,
+    ) -> None:
+        await self._validate_receipt_authority_graph(
+            latch,
+            scope,
+            target_id,
+            validate_global_history=validate_global_history,
+        )
+
+    async def _latch_authority(self, latch: HoldState) -> HoldAuthority:
+        """The recorded authority of a latch's (already validated) receipt."""
+
+        row = await self._read_receipt_by_id(latch.hold_receipt_id)
+        if row is None:
+            raise HoldCorruptStateError(
+                "active hold latch references a missing authority receipt"
+            )
+        return _receipt_from_row(row).authority
+
+    @staticmethod
+    def _assert_replay(
+        receipt: HoldReceipt,
+        *,
+        action: HoldAction,
+        scope: HoldScope,
+        target_id: str,
+        reason: str,
+        actor_id: str,
+        expected_hold_receipt_id: str,
+        authority: HoldAuthority,
+    ) -> None:
+        supplied = (
+            action,
+            scope,
+            target_id,
+            reason,
+            actor_id,
+            expected_hold_receipt_id,
+            authority,
+        )
+        recorded = (
+            receipt.action,
+            receipt.scope,
+            receipt.target_id,
+            receipt.reason,
+            receipt.actor_id,
+            receipt.expected_hold_receipt_id,
+            receipt.authority,
+        )
+        if supplied != recorded:
+            raise HoldIdempotencyConflict(
+                "hold operation id was already used for a different mutation"
+            )
+
+    async def _insert_receipt(
+        self,
+        *,
+        operation_id: str,
+        action: HoldAction,
+        disposition: HoldDisposition,
+        scope: HoldScope,
+        target_id: str,
+        reason: str,
+        actor_id: str,
+        expected_hold_receipt_id: str,
+        prior_hold_receipt_id: str,
+        resulting_hold_receipt_id: str,
+        authority: HoldAuthority,
+        receipt_id: Optional[str] = None,
+    ) -> HoldReceipt:
+        receipt_id = receipt_id or str(uuid4())
+        # ``feed_seq`` is deliberately absent: the insert trigger allocates it
+        # under the exclusive history lock (PostgreSQL) or the ``BEGIN
+        # IMMEDIATE`` writer slot (SQLite), which every caller already holds
+        # until commit, so the position is commit-ordered (#3159 R6).
+        now_sql = database_now_sql(self._db)
+        await self._db.execute(
+            "INSERT INTO hold_receipts ("
+            "receipt_id, operation_id, action, disposition, scope, target_id, "
+            "reason, actor_id, occurred_at, expected_hold_receipt_id, "
+            "prior_hold_receipt_id, resulting_hold_receipt_id, authority"
+            f") VALUES (?, ?, ?, ?, ?, ?, ?, ?, {now_sql}, ?, ?, ?, ?)",
+            (
+                receipt_id,
+                operation_id,
+                action.value,
+                disposition.value,
+                scope.value,
+                target_id,
+                reason,
+                actor_id,
+                expected_hold_receipt_id,
+                prior_hold_receipt_id,
+                resulting_hold_receipt_id,
+                authority.value,
+            ),
+        )
+        receipt_row = await self._read_receipt_by_operation(operation_id)
+        receipt = _receipt_from_row(receipt_row)
+        await self._db.execute(
+            "INSERT INTO hold_operation_witnesses (operation_id, receipt_id) "
+            "VALUES (?, ?)",
+            (receipt.operation_id, receipt.receipt_id),
+        )
+        await self._db.execute(
+            "INSERT INTO hold_receipt_content_witnesses "
+            "(receipt_id, scope, target_id, receipt_digest) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                receipt.receipt_id,
+                receipt.scope.value,
+                receipt.target_id,
+                _receipt_content_digest(receipt_row),
+            ),
+        )
+        await self._db.execute(
+            "UPDATE hold_receipt_witnesses "
+            "SET receipt_count = receipt_count + 1 "
+            "WHERE scope = ? AND target_id = ?",
+            (scope.value, target_id),
+        )
+        return receipt
+
+    async def set_hold(
+        self,
+        *,
+        scope: HoldScope | str,
+        actor_id: str,
+        reason: str,
+        operation_id: str,
+        authority: HoldAuthority,
+        target_id: Optional[str] = None,
+        holder_id: Optional[str] = None,
+    ) -> HoldMutation:
+        """Set or replace one latch and append an immutable receipt.
+
+        ``authority`` is required: the door that resolved the caller's
+        authority records it, so a reader never infers it from ``actor_id``.
+        A ``mandate`` latch also names its ``holder_id``; only that holder,
+        acting under ``HoldAuthority.MANDATE``, may set it.
+        """
+
+        try:
+            async with self._evidence_protocol():
+                return await self._set_hold(
+                    scope=scope,
+                    actor_id=actor_id,
+                    reason=reason,
+                    operation_id=operation_id,
+                    authority=authority,
+                    target_id=target_id,
+                    holder_id=holder_id,
+                )
+        except Exception as exc:
+            # AsyncDatabase deliberately wraps transaction-body exceptions.
+            # Every Hold domain failure is part of this store's public
+            # contract, so preserve its type across that backend boundary.
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
+            raise
+
+    async def _set_hold(
+        self,
+        *,
+        scope: HoldScope | str,
+        actor_id: str,
+        reason: str,
+        operation_id: str,
+        authority: HoldAuthority,
+        target_id: Optional[str] = None,
+        holder_id: Optional[str] = None,
+    ) -> HoldMutation:
+        resolved_scope = _coerce_scope(scope)
+        resolved_target = _target(resolved_scope, target_id, holder_id)
+        actor = _required_text(actor_id, "actor_id")
+        why = _required_text(reason, "reason")
+        operation = _required_text(operation_id, "operation_id")
+        recorded_authority = _required_authority(authority)
+        _validate_door_authority(
+            action=HoldAction.HOLD,
+            scope=resolved_scope,
+            target_id=resolved_target,
+            actor_id=actor,
+            authority=recorded_authority,
+        )
+
+        publication: bytes | None = None
+        async with self._primary_mutation_transaction():
+            await self._assert_host_latch_shape(
+                for_update=resolved_scope is HoldScope.HOST
+            )
+            await self._lock_operation_and_target(
+                operation, resolved_scope, resolved_target
+            )
+            await self._ensure_latch_row(resolved_scope, resolved_target)
+            prior_row = await self._read_latch_row(
+                resolved_scope, resolved_target, for_update=True
+            )
+            prior = _latch_from_row(prior_row)
+            await self._validate_latch_projection(
+                prior, resolved_scope, resolved_target
+            )
+            replay_row = await self._validate_operation_witness(operation)
+            if replay_row is not None:
+                replay = _receipt_from_row(replay_row)
+                self._assert_replay(
+                    replay,
+                    action=HoldAction.HOLD,
+                    scope=resolved_scope,
+                    target_id=resolved_target,
+                    reason=why,
+                    actor_id=actor,
+                    expected_hold_receipt_id="",
+                    authority=recorded_authority,
+                )
+                return HoldMutation(receipt=replay, current=prior)
+
+            # A prior latch set by the same actor for the same reason under a
+            # different authority is not the same latch: re-apply it so the
+            # current authority receipt names what the caller acted under.
+            prior_authority = (
+                await self._latch_authority(prior) if prior is not None else None
+            )
+            if (
+                prior is not None
+                and prior.actor_id == actor
+                and prior.reason == why
+                and prior_authority is recorded_authority
+            ):
+                receipt = await self._insert_receipt(
+                    operation_id=operation,
+                    action=HoldAction.HOLD,
+                    disposition=HoldDisposition.ALREADY_IN_STATE,
+                    scope=resolved_scope,
+                    target_id=resolved_target,
+                    reason=why,
+                    actor_id=actor,
+                    expected_hold_receipt_id="",
+                    prior_hold_receipt_id=prior.hold_receipt_id,
+                    resulting_hold_receipt_id=prior.hold_receipt_id,
+                    authority=recorded_authority,
+                )
+                current = prior
+            else:
+                receipt_id = str(uuid4())
+                receipt = await self._insert_receipt(
+                    operation_id=operation,
+                    action=HoldAction.HOLD,
+                    disposition=HoldDisposition.APPLIED,
+                    scope=resolved_scope,
+                    target_id=resolved_target,
+                    reason=why,
+                    actor_id=actor,
+                    expected_hold_receipt_id="",
+                    prior_hold_receipt_id=(prior.hold_receipt_id if prior else ""),
+                    resulting_hold_receipt_id=receipt_id,
+                    authority=recorded_authority,
+                    receipt_id=receipt_id,
+                )
+                await self._db.execute(
+                    "UPDATE hold_latches SET active = 1, hold_receipt_id = ?, "
+                    "reason = ?, actor_id = ?, set_at = ?, revision = revision + 1 "
+                    "WHERE scope = ? AND target_id = ?",
+                    (
+                        receipt.receipt_id,
+                        why,
+                        actor,
+                        receipt.occurred_at,
+                        resolved_scope.value,
+                        resolved_target,
+                    ),
+                )
+                current = _latch_from_row(
+                    await self._read_latch_row(resolved_scope, resolved_target)
+                )
+            # Every non-replay path inserts exactly one immutable receipt. The
+            # external candidate is durable before primary commit, while the
+            # stable anchor remains untouched until that commit returns.
+            publication = await self._prepare_history_publication()
+            mutation = HoldMutation(receipt=receipt, current=current)
+        await self._complete_history_publication(publication)
+        return mutation
+
+    async def release_hold(
+        self,
+        *,
+        scope: HoldScope | str,
+        actor_id: str,
+        reason: str,
+        operation_id: str,
+        expected_hold_receipt_id: str,
+        authority: HoldAuthority,
+        target_id: Optional[str] = None,
+        holder_id: Optional[str] = None,
+    ) -> HoldMutation:
+        """Release exactly the observed latch, refusing a stale release.
+
+        A ``mandate`` latch is released by its own holder (``MANDATE``
+        authority) or by the sovereign; never by another holder.
+        """
+
+        try:
+            async with self._evidence_protocol():
+                return await self._release_hold(
+                    scope=scope,
+                    actor_id=actor_id,
+                    reason=reason,
+                    operation_id=operation_id,
+                    expected_hold_receipt_id=expected_hold_receipt_id,
+                    authority=authority,
+                    target_id=target_id,
+                    holder_id=holder_id,
+                )
+        except Exception as exc:
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
+            raise
+
+    async def _release_hold(
+        self,
+        *,
+        scope: HoldScope | str,
+        actor_id: str,
+        reason: str,
+        operation_id: str,
+        expected_hold_receipt_id: str,
+        authority: HoldAuthority,
+        target_id: Optional[str] = None,
+        holder_id: Optional[str] = None,
+    ) -> HoldMutation:
+        resolved_scope = _coerce_scope(scope)
+        resolved_target = _target(resolved_scope, target_id, holder_id)
+        actor = _required_text(actor_id, "actor_id")
+        why = _required_text(reason, "reason")
+        operation = _required_text(operation_id, "operation_id")
+        expected = _required_text(
+            expected_hold_receipt_id, "expected_hold_receipt_id"
+        )
+        recorded_authority = _required_authority(authority)
+        _validate_door_authority(
+            action=HoldAction.RELEASE,
+            scope=resolved_scope,
+            target_id=resolved_target,
+            actor_id=actor,
+            authority=recorded_authority,
+        )
+
+        publication: bytes | None = None
+        async with self._primary_mutation_transaction():
+            await self._assert_host_latch_shape(
+                for_update=resolved_scope is HoldScope.HOST
+            )
+            await self._lock_operation_and_target(
+                operation, resolved_scope, resolved_target
+            )
+            await self._ensure_latch_row(resolved_scope, resolved_target)
+            prior_row = await self._read_latch_row(
+                resolved_scope, resolved_target, for_update=True
+            )
+            prior = _latch_from_row(prior_row)
+            await self._validate_latch_projection(
+                prior, resolved_scope, resolved_target
+            )
+            replay_row = await self._validate_operation_witness(operation)
+            if replay_row is not None:
+                replay = _receipt_from_row(replay_row)
+                self._assert_replay(
+                    replay,
+                    action=HoldAction.RELEASE,
+                    scope=resolved_scope,
+                    target_id=resolved_target,
+                    reason=why,
+                    actor_id=actor,
+                    expected_hold_receipt_id=expected,
+                    authority=recorded_authority,
+                )
+                return HoldMutation(receipt=replay, current=prior)
+
+            if prior is None:
+                disposition = HoldDisposition.ALREADY_IN_STATE
+                prior_receipt_id = ""
+                resulting_receipt_id = ""
+            elif prior.hold_receipt_id != expected:
+                disposition = HoldDisposition.REFUSED_STALE
+                prior_receipt_id = prior.hold_receipt_id
+                resulting_receipt_id = prior.hold_receipt_id
+            else:
+                disposition = HoldDisposition.APPLIED
+                prior_receipt_id = prior.hold_receipt_id
+                resulting_receipt_id = ""
+
+            receipt = await self._insert_receipt(
+                operation_id=operation,
+                action=HoldAction.RELEASE,
+                disposition=disposition,
+                scope=resolved_scope,
+                target_id=resolved_target,
+                reason=why,
+                actor_id=actor,
+                expected_hold_receipt_id=expected,
+                prior_hold_receipt_id=prior_receipt_id,
+                resulting_hold_receipt_id=resulting_receipt_id,
+                authority=recorded_authority,
+            )
+            if disposition is HoldDisposition.APPLIED:
+                await self._db.execute(
+                    "UPDATE hold_latches SET active = 0, hold_receipt_id = '', "
+                    "reason = '', actor_id = '', set_at = '', revision = revision + 1 "
+                    "WHERE scope = ? AND target_id = ? AND active = 1 "
+                    "AND hold_receipt_id = ?",
+                    (resolved_scope.value, resolved_target, expected),
+                )
+            current = _latch_from_row(
+                await self._read_latch_row(resolved_scope, resolved_target)
+            )
+            publication = await self._prepare_history_publication()
+            mutation = HoldMutation(receipt=receipt, current=current)
+        await self._complete_history_publication(publication)
+        return mutation
+
+    async def get_hold(
+        self,
+        scope: HoldScope | str,
+        target_id: Optional[str] = None,
+        *,
+        holder_id: Optional[str] = None,
+    ) -> Optional[HoldState]:
+        try:
+            async with self._evidence_protocol():
+                resolved_scope = _coerce_scope(scope)
+                return await self._get_hold(
+                    resolved_scope, _target(resolved_scope, target_id, holder_id)
+                )
+        except Exception as exc:
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
+            raise
+
+    async def _get_hold(
+        self,
+        scope: HoldScope | str,
+        target_id: Optional[str] = None,
+        *,
+        validate_global_history: bool = True,
+    ) -> Optional[HoldState]:
+        """Read one latch by its durable key (a mandate key is the pair)."""
+
+        resolved_scope = _coerce_scope(scope)
+        if resolved_scope is HoldScope.MANDATE:
+            resolved_target = _required_text(target_id, "target_id")
+            parse_mandate_latch_key(resolved_target)
+        else:
+            resolved_target = _target(resolved_scope, target_id)
+        targets = ((resolved_scope, resolved_target),)
+        async with self._db.transaction():
+            await self._lock_read_targets(targets)
+            await self._assert_host_latch_shape()
+            latch = _latch_from_row(
+                await self._read_latch_row(resolved_scope, resolved_target)
+            )
+            if validate_global_history:
+                await self._validate_latch_projection(
+                    latch,
+                    resolved_scope,
+                    resolved_target,
+                )
+            else:
+                await self._validate_latch_projection(
+                    latch,
+                    resolved_scope,
+                    resolved_target,
+                    validate_global_history=False,
+                )
+            return latch
+
+    async def get_effective(self, agent_id: str) -> EffectiveHoldState:
+        """Read host + agent latches in one database snapshot."""
+
+        try:
+            async with self._evidence_protocol():
+                return await self._get_effective(agent_id)
+        except Exception as exc:
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
+            raise
+
+    async def _get_effective(self, agent_id: str) -> EffectiveHoldState:
+        """Read host + agent latches in one locked database snapshot."""
+
+        agent = _required_text(agent_id, "agent_id")
+        targets = (
+            (HoldScope.HOST, HOST_HOLD_TARGET),
+            (HoldScope.AGENT, agent),
+        )
+        async with self._db.transaction():
+            await self._lock_read_targets(targets)
+            await self._assert_host_latch_shape()
+            mandates = await self._read_subject_mandates_locked(agent)
+            rows = await self._db.fetchall(
+                f"SELECT {_LATCH_COLUMNS} FROM hold_latches "
+                "WHERE (scope = ? AND target_id = ?) "
+                "OR (scope = ? AND target_id = ?)",
+                (
+                    HoldScope.HOST.value,
+                    HOST_HOLD_TARGET,
+                    HoldScope.AGENT.value,
+                    agent,
+                ),
+            )
+            host: Optional[HoldState] = None
+            agent_state: Optional[HoldState] = None
+            seen: set[tuple[str, str]] = set()
+            for row in rows:
+                key = (str(row[0]), str(row[1]))
+                if key in seen:
+                    raise HoldCorruptStateError("duplicate hold latch key")
+                seen.add(key)
+                state = _latch_from_row(row)
+                if state is None:
+                    continue
+                if state.scope is HoldScope.HOST:
+                    host = state
+                elif state.target_id == agent:
+                    agent_state = state
+                else:
+                    raise HoldCorruptStateError(
+                        "effective hold query returned a foreign agent"
+                    )
+            await self._validate_latch_projection(
+                host,
+                HoldScope.HOST,
+                HOST_HOLD_TARGET,
+                validate_global_history=False,
+            )
+            await self._validate_latch_projection(
+                agent_state,
+                HoldScope.AGENT,
+                agent,
+                validate_global_history=False,
+            )
+            await self._assert_global_history_intact()
+            return EffectiveHoldState(
+                host=host, agent=agent_state, mandates=mandates
+            )
+
+    async def _read_subject_mandates_locked(
+        self, subject_id: str
+    ) -> tuple[HoldState, ...]:
+        """Every active mandate latch on ``subject_id``, each proven.
+
+        The caller holds the shared history lock, which every writer takes
+        exclusively first, so the key set cannot change under this read.
+        Each row's key must parse back to ``subject_id``; a prefix collision
+        or a damaged key is corruption, never a silently skipped latch.
+        """
+
+        prefix = _mandate_key_prefix(subject_id)
+        rows = await self._db.fetchall(
+            f"SELECT {_LATCH_COLUMNS} FROM hold_latches "
+            "WHERE scope = ? AND substr(target_id, 1, ?) = ? "
+            "ORDER BY target_id",
+            (HoldScope.MANDATE.value, len(prefix), prefix),
+        )
+        keys = [str(row[1]) for row in rows]
+        if len(set(keys)) != len(keys):
+            raise HoldCorruptStateError("duplicate hold latch key")
+        if keys:
+            await self._lock_read_targets(
+                tuple((HoldScope.MANDATE, key) for key in keys),
+                history_locked=True,
+            )
+        active: list[HoldState] = []
+        for row in rows:
+            latch = _latch_from_row(row)
+            key = str(row[1])
+            if _scope_subject(HoldScope.MANDATE, key) != subject_id:
+                raise HoldCorruptStateError(
+                    "mandate hold query returned a foreign agent"
+                )
+            await self._validate_latch_projection(
+                latch,
+                HoldScope.MANDATE,
+                key,
+                validate_global_history=False,
+            )
+            if latch is not None:
+                active.append(latch)
+        return tuple(active)
+
+    async def get_receipt(self, operation_id: str) -> Optional[HoldReceipt]:
+        try:
+            async with self._evidence_protocol():
+                return await self._get_receipt(operation_id)
+        except Exception as exc:
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
+            raise
+
+    async def get_receipt_by_id(self, receipt_id: str) -> Optional[HoldReceipt]:
+        """Read one receipt by its receipt id, under the same proof as above.
+
+        A latch names its authority receipt by receipt id, not by the
+        operation id that created it; this is how a reader learns the
+        recorded authority behind a current latch.
+        """
+
+        try:
+            async with self._evidence_protocol():
+                return await self._get_receipt_by_id(receipt_id)
+        except Exception as exc:
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
+            # As in ``list_receipts``: a reader is promised a typed "history is
+            # unreadable", never a raw backend error.
+            if isinstance(exc, DatabaseError):
+                raise HoldStateError("Hold receipt could not be read") from exc
+            raise
+
+    async def _get_receipt_by_id(self, receipt_id: str) -> Optional[HoldReceipt]:
+        identity = _required_text(receipt_id, "receipt_id")
+        async with self._db.transaction():
+            await self._lock_read_history()
+            row = await self._read_receipt_by_id(identity)
+            if row is None:
+                await self._assert_global_history_intact()
+                return None
+            operation = _receipt_from_row(row).operation_id
+            receipt = await self._validated_receipt_locked(operation)
+            if receipt is None or receipt.receipt_id != identity:
+                raise HoldCorruptStateError(
+                    "Hold operation witness does not match receipt identity"
+                )
+            return receipt
+
+    async def _get_receipt(self, operation_id: str) -> Optional[HoldReceipt]:
+        """Read one receipt only after proving its target authority graph."""
+
+        operation = _required_text(operation_id, "operation_id")
+        async with self._db.transaction():
+            # The absence path still depends on the global receipt/anchor pair.
+            # Lock it before the first witness query; otherwise READ COMMITTED
+            # can stitch together rows from opposite sides of a writer commit.
+            await self._lock_read_history()
+            return await self._validated_receipt_locked(operation)
+
+    async def _validated_receipt_locked(
+        self, operation: str
+    ) -> Optional[HoldReceipt]:
+        """Prove one receipt's graph; the caller holds the read-history lock."""
+
+        row = await self._validate_operation_witness(operation)
+        if row is None:
+            await self._assert_global_history_intact()
+            return None
+        receipt = _receipt_from_row(row)
+        targets = ((receipt.scope, receipt.target_id),)
+        await self._lock_read_targets(targets, history_locked=True)
+        await self._assert_host_latch_shape()
+        latch = _latch_from_row(
+            await self._read_latch_row(receipt.scope, receipt.target_id)
+        )
+        await self._validate_latch_projection(
+            latch, receipt.scope, receipt.target_id
+        )
+        return receipt
+
+
+def _sqlite_backend_custody_artifacts(database: Path) -> tuple[Path, ...]:
+    """Return authoritative external evidence of prior SQLite Hold state."""
+
+    history = hold_history_anchor_path(database)
+    return (
+        hold_initialization_witness_path(database),
+        history,
+        Path(f"{history}.pending"),
+        Path(f"{history}.bootstrap"),
+        hold_sqlite_custody_marker_path(database),
+    )
+
+
+def _sqlite_database_has_hold_schema(database: Path) -> bool:
+    """Read-only probe for any surviving SQLite Hold schema object."""
+
+    if not path_exists(database):
+        return False
+    names = tuple(sorted(_HOLD_SCHEMA_TABLES))
+    placeholders = ", ".join("?" for _ in names)
+    # immutable=1 tells SQLite to assume there is no WAL or journal, so a
+    # committed Hold latch still living in a hot -wal reads as ABSENT. This
+    # guard decides whether it is safe to switch off SQLite, so answering
+    # "no Hold state" about a held agent fails OPEN and abandons the latch.
+    # The sibling probe in validate_sqlite_hold_readiness already makes this
+    # distinction; make the same one here. An unresolved rollback journal
+    # cannot be read safely either way, so refuse rather than guess.
+    wal_present = path_exists(Path(f"{database}-wal"))
+    shm_present = path_exists(Path(f"{database}-shm"))
+    if path_exists(Path(f"{database}-journal")):
+        raise HoldCorruptStateError(
+            "Hold backend selection cannot prove the existing SQLite control "
+            "database is free of Hold state: unresolved rollback journal"
+        )
+    if wal_present != shm_present:
+        # REFUSE rather than repair. mode=ro would rebuild the missing -shm
+        # inside the very directory this probe is auditing, and this is
+        # documented as a read-only probe that creates no diagnostic state;
+        # it also has to work on read-only media. The sibling in
+        # validate_sqlite_hold_readiness refuses the same mismatch.
+        raise HoldCorruptStateError(
+            "Hold backend selection cannot prove the existing SQLite control "
+            "database is free of Hold state: incomplete live WAL sidecar pair"
+        )
+    # With an intact pair the -shm already exists, so mode=ro adds nothing and
+    # is the only flag that can see committed rows still living in the WAL.
+    flags = "mode=ro" if wal_present else "mode=ro&immutable=1"
+    try:
+        with closing(
+            sqlite3.connect(
+                f"{database.as_uri()}?{flags}",
+                uri=True,
+            )
+        ) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            row = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                f"WHERE name IN ({placeholders}) LIMIT 1",
+                names,
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise HoldCorruptStateError(
+            "Hold backend selection cannot prove the existing SQLite control "
+            f"database is free of Hold state: {exc}"
+        ) from exc
+    return row is not None
+
+
+def validate_hold_backend_custody(
+    control_db_path: str | Path,
+    backend: str,
+) -> bool:
+    """Read one backend claim without creating diagnostic state."""
+
+    selected = backend.strip().lower()
+    if selected not in {"sqlite", "postgres"}:
+        raise HoldStateError("Hold backend custody must be 'sqlite' or 'postgres'")
+    database = absolute_without_following_leaf(Path(control_db_path))
+    sqlite_artifacts = (
+        selected != "sqlite"
+        and (
+            any(
+                path_exists(path)
+                for path in _sqlite_backend_custody_artifacts(database)
+            )
+            or _sqlite_database_has_hold_schema(database)
+        )
+    )
+    if sqlite_artifacts:
+        raise HoldCorruptStateError(
+            "Hold backend switch would abandon existing SQLite custody state; "
+            "a verified migration is required"
+        )
+    pair_path = hold_postgres_pair_binding_path(database)
+    pair_commit_path = hold_postgres_pair_commit_path(database)
+    pair_binding = _read_postgres_pair_binding(database, harden_custody=False)
+    pair_commit = _read_postgres_pair_commit(database, harden_custody=False)
+    if pair_commit is not None and pair_binding is None:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold pair commit exists without its external binding"
+        )
+    if selected != "postgres" and (
+        pair_binding is not None
+        or pair_commit is not None
+        or path_exists(pair_path)
+        or path_exists(pair_commit_path)
+    ):
+        raise HoldCorruptStateError(
+            "Hold backend switch would abandon existing PostgreSQL custody state; "
+            "a verified migration is required"
+        )
+    binding_path = hold_backend_binding_path(database)
+    existing = HoldStore._read_file_evidence(
+        binding_path,
+        label="Hold backend custody binding",
+        max_bytes=_HOLD_BACKEND_BINDING_MAX_BYTES,
+        harden_custody=False,
+    )
+    if existing is None:
+        return False
+    expected = _HOLD_BACKEND_BINDING_HEADER + selected.encode("ascii") + b"\n"
+    if existing != expected:
+        raise HoldCorruptStateError(
+            "Hold backend switch conflicts with durable custody binding; "
+            "a verified migration is required"
+        )
+    if selected == "postgres" and pair_binding is None:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold backend custody lacks its external pair identity; "
+            "a verified migration is required"
+        )
+    return True
+
+
+def _read_postgres_pair_binding(
+    control_db_path: str | Path,
+    *,
+    harden_custody: bool,
+) -> tuple[UUID, bytes] | None:
+    """Read and strictly parse the external cluster-bound pair identity."""
+
+    path = hold_postgres_pair_binding_path(control_db_path)
+    payload = HoldStore._read_file_evidence(
+        path,
+        label="PostgreSQL Hold external pair binding",
+        max_bytes=_POSTGRES_PAIR_BINDING_MAX_BYTES,
+        harden_custody=harden_custody,
+    )
+    if payload is None:
+        return None
+    lines = payload.splitlines()
+    if len(lines) != 4 or lines[0] != _POSTGRES_PAIR_BINDING_HEADER.rstrip(b"\n"):
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold external pair binding is invalid"
+        )
+    try:
+        pair_id = UUID(lines[1].decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold external pair binding is invalid"
+        ) from exc
+    if str(pair_id).encode("ascii") != lines[1]:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold external pair binding is invalid"
+        )
+    for digest in lines[2:]:
+        if len(digest) != 64 or any(
+            byte not in b"0123456789abcdef" for byte in digest
+        ):
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold external pair binding is invalid"
+            )
+    if payload != b"\n".join(lines) + b"\n":
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold external pair binding is invalid"
+        )
+    return pair_id, payload
+
+
+def _read_postgres_pair_commit(
+    control_db_path: str | Path,
+    *,
+    harden_custody: bool,
+) -> UUID | None:
+    """Read the immutable marker that distinguishes initialized pair state."""
+
+    payload = HoldStore._read_file_evidence(
+        hold_postgres_pair_commit_path(control_db_path),
+        label="PostgreSQL Hold external pair commit",
+        max_bytes=_POSTGRES_PAIR_COMMIT_MAX_BYTES,
+        harden_custody=harden_custody,
+    )
+    if payload is None:
+        return None
+    if not payload.startswith(_POSTGRES_PAIR_COMMIT_HEADER):
+        raise HoldCorruptStateError("PostgreSQL Hold external pair commit is invalid")
+    encoded = payload.removeprefix(_POSTGRES_PAIR_COMMIT_HEADER)
+    if not encoded.endswith(b"\n") or b"\n" in encoded[:-1]:
+        raise HoldCorruptStateError("PostgreSQL Hold external pair commit is invalid")
+    try:
+        pair_id = UUID(encoded[:-1].decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold external pair commit is invalid"
+        ) from exc
+    if encoded != str(pair_id).encode("ascii") + b"\n":
+        raise HoldCorruptStateError("PostgreSQL Hold external pair commit is invalid")
+    return pair_id
+
+
+def validate_postgres_hold_pair_custody(
+    control_db_path: str | Path,
+    *,
+    internal_pair_id: UUID | None,
+    primary_cluster_identity: str,
+    evidence_cluster_identity: str,
+) -> bool:
+    """Compare configurable PostgreSQL state with its local custody witness."""
+
+    database = absolute_without_following_leaf(Path(control_db_path))
+    validate_hold_backend_custody(database, "postgres")
+    binding = _read_postgres_pair_binding(database, harden_custody=False)
+    committed_pair_id = _read_postgres_pair_commit(
+        database,
+        harden_custody=False,
+    )
+    if binding is None:
+        return False
+    external_pair_id, payload = binding
+    expected = _postgres_pair_binding_payload(
+        external_pair_id,
+        primary_cluster_identity,
+        evidence_cluster_identity,
+    )
+    if payload != expected:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold configuration conflicts with the external pair "
+            "identity; a verified migration is required"
+        )
+    if internal_pair_id is not None and internal_pair_id != external_pair_id:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold databases conflict with the external pair identity; "
+            "a verified migration is required"
+        )
+    if committed_pair_id is not None:
+        if committed_pair_id != external_pair_id:
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold external pair commit conflicts with its binding"
+            )
+        if internal_pair_id is None:
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold databases lost a committed pair identity; a "
+                "verified migration is required"
+            )
+    return True
+
+
+def _claim_exact_hold_custody_file(
+    path: Path,
+    expected: bytes,
+    *,
+    label: str,
+    max_bytes: int,
+) -> None:
+    """Create one immutable custody witness or accept an identical winner."""
+
+    def read_existing() -> bytes | None:
+        return HoldStore._read_file_evidence(
+            path,
+            label=label,
+            max_bytes=max_bytes,
+        )
+
+    lock_path = Path(f"{path}.publication.lock")
+    try:
+        with exclusive_private_file_lock(
+            lock_path,
+            label="Hold custody publication",
+        ):
+            try:
+                descriptor = open_private_file(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    label=label,
+                )
+            except PrivateStorageError as exc:
+                if path_exists(path):
+                    if read_existing() == expected:
+                        return
+                    raise HoldCorruptStateError(
+                        f"{label} conflicts with durable custody; a verified "
+                        "migration is required"
+                    ) from exc
+                raise HoldStateError(f"could not claim {label}: {exc}") from exc
+
+            try:
+                view = memoryview(expected)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError(f"short write while claiming {label}")
+                    view = view[written:]
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise HoldStateError(f"could not claim {label}: {exc}") from exc
+            finally:
+                os.close(descriptor)
+            HoldStore._fsync_witness_directory(path)
+            if read_existing() != expected:
+                raise HoldStateError(f"could not persist {label}")
+    except PrivateStorageError as exc:
+        raise HoldStateError(f"could not serialize {label}: {exc}") from exc
+
+
+def claim_hold_backend_custody(
+    control_db_path: str | Path,
+    backend: str,
+    *,
+    postgres_pair_id: UUID | None = None,
+    postgres_primary_cluster_identity: str | None = None,
+    postgres_evidence_cluster_identity: str | None = None,
+) -> Path:
+    """Immutably bind an installation to one Hold storage backend.
+
+    The claim is published before backend initialization.  A crash can
+    therefore strand a conservative claim, but it cannot initialize Hold in
+    one backend and later make a different, empty backend look authoritative.
+    Changing this file is an explicit migration/repair operation, never a
+    normal configuration switch.
+    """
+
+    selected = backend.strip().lower()
+    if selected not in {"sqlite", "postgres"}:
+        raise HoldStateError("Hold backend custody must be 'sqlite' or 'postgres'")
+    database = absolute_without_following_leaf(Path(control_db_path))
+    binding_path = hold_backend_binding_path(database)
+    expected = _HOLD_BACKEND_BINDING_HEADER + selected.encode("ascii") + b"\n"
+    validate_hold_backend_custody(database, selected)
+    if selected == "postgres":
+        if (
+            not isinstance(postgres_pair_id, UUID)
+            or not isinstance(postgres_primary_cluster_identity, str)
+            or not isinstance(postgres_evidence_cluster_identity, str)
+        ):
+            raise HoldStateError(
+                "PostgreSQL Hold backend custody requires a cluster-bound pair "
+                "identity"
+            )
+        pair_path = hold_postgres_pair_binding_path(database)
+        _claim_exact_hold_custody_file(
+            pair_path,
+            _postgres_pair_binding_payload(
+                postgres_pair_id,
+                postgres_primary_cluster_identity,
+                postgres_evidence_cluster_identity,
+            ),
+            label="PostgreSQL Hold external pair binding",
+            max_bytes=_POSTGRES_PAIR_BINDING_MAX_BYTES,
+        )
+    elif any(
+        value is not None
+        for value in (
+            postgres_pair_id,
+            postgres_primary_cluster_identity,
+            postgres_evidence_cluster_identity,
+        )
+    ):
+        raise HoldStateError(
+            "a PostgreSQL pair identity is invalid for SQLite Hold custody"
+        )
+    _claim_exact_hold_custody_file(
+        binding_path,
+        expected,
+        label="Hold backend custody binding",
+        max_bytes=_HOLD_BACKEND_BINDING_MAX_BYTES,
+    )
+    validate_hold_backend_custody(database, selected)
+    return binding_path
+
+
+def claim_postgres_hold_pair_custody(
+    control_db_path: str | Path,
+    *,
+    internal_pair_id: UUID | None,
+    primary_cluster_identity: str,
+    evidence_cluster_identity: str,
+) -> UUID:
+    """Claim or recover one external PostgreSQL pair before database writes."""
+
+    database = absolute_without_following_leaf(Path(control_db_path))
+    if validate_postgres_hold_pair_custody(
+        database,
+        internal_pair_id=internal_pair_id,
+        primary_cluster_identity=primary_cluster_identity,
+        evidence_cluster_identity=evidence_cluster_identity,
+    ):
+        existing = _read_postgres_pair_binding(database, harden_custody=True)
+        assert existing is not None
+        pair_id = existing[0]
+    else:
+        pair_id = internal_pair_id or uuid4()
+    try:
+        claim_hold_backend_custody(
+            database,
+            "postgres",
+            postgres_pair_id=pair_id,
+            postgres_primary_cluster_identity=primary_cluster_identity,
+            postgres_evidence_cluster_identity=evidence_cluster_identity,
+        )
+    except HoldCorruptStateError:
+        # A same-host peer can win the first immutable create after our
+        # read-only probe. Adopt it only when it names these exact clusters and
+        # remains compatible with any already-published database pair UUID.
+        if not validate_postgres_hold_pair_custody(
+            database,
+            internal_pair_id=internal_pair_id,
+            primary_cluster_identity=primary_cluster_identity,
+            evidence_cluster_identity=evidence_cluster_identity,
+        ):
+            raise
+        winner = _read_postgres_pair_binding(database, harden_custody=True)
+        assert winner is not None
+        pair_id = winner[0]
+        claim_hold_backend_custody(
+            database,
+            "postgres",
+            postgres_pair_id=pair_id,
+            postgres_primary_cluster_identity=primary_cluster_identity,
+            postgres_evidence_cluster_identity=evidence_cluster_identity,
+        )
+    return pair_id
+
+
+def commit_postgres_hold_pair_custody(
+    control_db_path: str | Path,
+    pair_id: UUID,
+) -> Path:
+    """Mark a pair committed only after both internal roles are durable."""
+
+    database = absolute_without_following_leaf(Path(control_db_path))
+    binding = _read_postgres_pair_binding(database, harden_custody=True)
+    if binding is None or binding[0] != pair_id:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold pair cannot commit without its matching external "
+            "binding"
+        )
+    if not validate_hold_backend_custody(database, "postgres"):
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold pair cannot commit without backend custody"
+        )
+    path = hold_postgres_pair_commit_path(database)
+    _claim_exact_hold_custody_file(
+        path,
+        _POSTGRES_PAIR_COMMIT_HEADER + str(pair_id).encode("ascii") + b"\n",
+        label="PostgreSQL Hold external pair commit",
+        max_bytes=_POSTGRES_PAIR_COMMIT_MAX_BYTES,
+    )
+    return path
+
+
+@contextmanager
+def _sqlite_readiness_evidence_lock(path: Path):
+    """Take the existing Hold protocol lock without creating diagnostics state."""
+
+    if not path_exists(path):
+        yield False
+        return
+    if fcntl is None and msvcrt is None:
+        raise HoldStateError("durable SQLite Hold requires advisory file locks")
+    flags = os.O_RDONLY if fcntl is not None else os.O_RDWR
+    try:
+        descriptor = open_private_file_for_validation(
+            path,
+            flags,
+            label="Hold evidence protocol lock",
+        )
+    except PrivateStorageError as exc:
+        raise HoldStateError(
+            f"could not inspect Hold evidence protocol lock: {exc}"
+        ) from exc
+    acquired = False
+    try:
+        try:
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            else:  # pragma: no cover - Windows-only lock API
+                assert msvcrt is not None
+                if os.fstat(descriptor).st_size == 0:
+                    raise HoldStateError(
+                        "SQLite Hold evidence protocol lock is invalid"
+                    )
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            acquired = True
+        except (BlockingIOError, OSError) as exc:
+            raise HoldStateError(
+                "SQLite Hold state is changing; retry the diagnostic"
+            ) from exc
+        yield True
+    finally:
+        if acquired:
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            else:  # pragma: no cover - Windows-only lock API
+                assert msvcrt is not None
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        os.close(descriptor)
+
+
+def _sqlite_hold_snapshot(connection: sqlite3.Connection) -> HoldDatabaseSnapshot:
+    """Read every existing Hold table through one SQLite transaction."""
+
+    names = tuple(sorted(_HOLD_SCHEMA_TABLES))
+    placeholders = ", ".join("?" for _ in names)
+    catalog_rows = tuple(
+        connection.execute(
+            "SELECT type, name FROM sqlite_master "
+            f"WHERE name IN ({placeholders}) ORDER BY name",
+            names,
+        ).fetchall()
+    )
+    non_table_collisions = sorted(
+        str(row[1])
+        for row in catalog_rows
+        if len(row) == 2 and row[0] != "table"
+    )
+    if non_table_collisions:
+        raise HoldCorruptStateError(
+            "Hold schema has non-table objects occupying required table names: "
+            + ", ".join(non_table_collisions)
+        )
+    existing = frozenset(
+        str(row[1])
+        for row in catalog_rows
+        if len(row) == 2 and row[0] == "table"
+    )
+
+    def rows(table: str, sql: str) -> tuple[Any, ...]:
+        if table not in existing:
+            return ()
+        return tuple(connection.execute(sql).fetchall())
+
+    required_names = tuple(
+        name for name, _table, _columns in _HOLD_REQUIRED_UNIQUE_INDEXES
+    )
+    name_placeholders = ", ".join("?" for _name in required_names)
+    occupied_names = frozenset(
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master "
+            f"WHERE name IN ({name_placeholders})",
+            required_names,
+        ).fetchall()
+    )
+    conflict_keys: set[tuple[str, frozenset[str]]] = set()
+    for table in existing:
+        quoted_table = '"' + table.replace('"', '""') + '"'
+        for index_row in connection.execute(
+            f"PRAGMA index_list({quoted_table})"
+        ).fetchall():
+            if len(index_row) < 5 or index_row[2] != 1 or index_row[4] != 0:
+                continue
+            index_name = index_row[1]
+            if not isinstance(index_name, str):
+                continue
+            quoted_index = '"' + index_name.replace('"', '""') + '"'
+            index_columns = connection.execute(
+                f"PRAGMA index_info({quoted_index})"
+            ).fetchall()
+            names_for_key = tuple(row[2] for row in index_columns)
+            if names_for_key and all(
+                isinstance(column, str) for column in names_for_key
+            ) and len(set(names_for_key)) == len(names_for_key):
+                conflict_keys.add((table, frozenset(names_for_key)))
+
+    duplicate_keys: set[tuple[str, frozenset[str]]] = set()
+    for _name, table, columns in _HOLD_REQUIRED_UNIQUE_INDEXES:
+        key = (
+            table,
+            frozenset(column.strip() for column in columns.split(",")),
+        )
+        if table not in existing or key in conflict_keys:
+            continue
+        duplicate = connection.execute(
+            _hold_duplicate_conflict_key_sql(table, columns)
+        ).fetchone()
+        if duplicate is not None:
+            duplicate_keys.add(key)
+
+    # Migrations first: they decide which receipt projection is complete.
+    migration_rows = rows(
+        "hold_schema_migrations",
+        "SELECT name FROM hold_schema_migrations ORDER BY name",
+    )
+    return HoldDatabaseSnapshot(
+        existing_tables=existing,
+        latch_rows=rows(
+            "hold_latches",
+            f"SELECT {_LATCH_COLUMNS} FROM hold_latches ORDER BY scope, target_id",
+        ),
+        receipt_rows=rows(
+            "hold_receipts",
+            _snapshot_history_anchor_format(migration_rows).receipt_history_sql,
+        ),
+        receipt_count_witness_rows=rows(
+            "hold_receipt_witnesses",
+            "SELECT scope, target_id, receipt_count FROM hold_receipt_witnesses "
+            "ORDER BY scope, target_id",
+        ),
+        content_witness_rows=rows(
+            "hold_receipt_content_witnesses",
+            "SELECT receipt_id, scope, target_id, receipt_digest "
+            "FROM hold_receipt_content_witnesses ORDER BY receipt_id",
+        ),
+        operation_witness_rows=rows(
+            "hold_operation_witnesses",
+            "SELECT operation_id, receipt_id FROM hold_operation_witnesses "
+            "ORDER BY operation_id",
+        ),
+        migration_rows=migration_rows,
+        resolvable_conflict_keys=frozenset(conflict_keys),
+        occupied_schema_names=occupied_names,
+        duplicate_conflict_keys=frozenset(duplicate_keys),
+    )
+
+
+def _validate_sqlite_creation_parent(
+    database: Path,
+    *,
+    runtime_hardens_parent: bool,
+) -> None:
+    """Predict whether runtime can create a fresh private control database."""
+
+    from kestrel_sovereign.host_features.storage import (
+        validate_host_database_parent_readiness,
+    )
+
+    validate_host_database_parent_readiness(
+        database,
+        runtime_hardens_parent=runtime_hardens_parent,
+    )
+
+
+def _validate_sqlite_custody_readiness(
+    *,
+    database: Path,
+    snapshot: HoldDatabaseSnapshot,
+    marker_payload: bytes | None,
+    initialization_witness: bytes | None,
+    history_anchor: bytes | None,
+    history_candidate: bytes | None,
+    bootstrap_intent: bytes | None,
+) -> None:
+    """Validate the independent SQLite head for an offline snapshot."""
+
+    initialized = initialization_witness is not None
+    bootstrap_pending = bootstrap_intent is not None
+    _validate_sqlite_custody_evidence(
+        marker_payload=marker_payload,
+        expected_payload=None,
+        initialized=initialized,
+        bootstrap_pending=bootstrap_pending,
+    )
+    if not initialized or marker_payload is None:
+        return
+    marker_history = _sqlite_custody_marker_history(database, marker_payload)
+    anchor_format = _snapshot_history_anchor_format(snapshot.migration_rows)
+    current = HoldStore._history_anchor_payload_from_rows(
+        snapshot.receipt_rows, anchor_format=anchor_format
+    )
+    anchored = (
+        None
+        if history_anchor is None
+        else HoldStore._validate_history_anchor_payload(history_anchor)
+    )
+    candidate = (
+        None
+        if history_candidate is None
+        else HoldStore._validate_history_anchor_payload(history_candidate)
+    )
+    if candidate is not None and current == candidate:
+        if anchored != candidate:
+            marker_valid = marker_history == anchored
+        else:
+            marker_valid = marker_history == candidate or (
+                HoldStore._is_history_predecessor(
+                    marker_history,
+                    snapshot.receipt_rows,
+                    anchor_format=anchor_format,
+                )
+            )
+    else:
+        marker_valid = marker_history == current
+    if not marker_valid:
+        raise HoldCorruptStateError(
+            "SQLite Hold custody marker does not match receipt history"
+        )
+
+
+def validate_sqlite_hold_readiness(
+    control_db_path: str | Path,
+    *,
+    runtime_hardens_parent: bool = False,
+) -> tuple[HoldState, ...]:
+    """Read and validate SQLite Hold state without creating or recovering it."""
+
+    from kestrel_sovereign.host_features.storage import (
+        sqlite_family,
+        validate_sqlite_family_private,
+    )
+
+    database = absolute_without_following_leaf(Path(control_db_path))
+    initialization_path = hold_initialization_witness_path(database)
+    history_path = hold_history_anchor_path(database)
+    candidate_path = Path(f"{history_path}.pending")
+    bootstrap_path = Path(f"{history_path}.bootstrap")
+    lock_path = Path(f"{history_path}.lock")
+    custody_path = hold_sqlite_custody_marker_path(database)
+
+    def evidence() -> tuple[bytes | None, ...]:
+        return (
+            HoldStore._read_file_evidence(
+                initialization_path,
+                label="Hold initialization witness",
+                max_bytes=len(_INITIALIZATION_WITNESS_PAYLOAD),
+                harden_custody=False,
+            ),
+            HoldStore._read_file_evidence(
+                history_path,
+                label="Hold history anchor",
+                max_bytes=_HISTORY_ANCHOR_MAX_BYTES,
+                harden_custody=False,
+            ),
+            HoldStore._read_file_evidence(
+                candidate_path,
+                label="Hold staged history anchor",
+                max_bytes=_HISTORY_ANCHOR_MAX_BYTES,
+                harden_custody=False,
+            ),
+            HoldStore._read_file_evidence(
+                bootstrap_path,
+                label="Hold bootstrap intent",
+                max_bytes=_BOOTSTRAP_INTENT_MAX_BYTES,
+                harden_custody=False,
+            ),
+            HoldStore._read_file_evidence(
+                custody_path,
+                label="SQLite Hold custody marker",
+                max_bytes=_SQLITE_CUSTODY_MARKER_MAX_BYTES,
+                harden_custody=False,
+            ),
+        )
+
+    if not path_exists(database):
+        _validate_sqlite_creation_parent(
+            database,
+            runtime_hardens_parent=runtime_hardens_parent,
+        )
+        if any(path_exists(path) for path in sqlite_family(database)[1:]):
+            raise HoldCorruptStateError(
+                "SQLite Hold database is missing while database sidecars remain"
+            )
+        with _sqlite_readiness_evidence_lock(lock_path):
+            evidence_before = evidence()
+            evidence_after = evidence()
+            if (
+                evidence_before != evidence_after
+                or path_exists(database)
+                or any(path_exists(path) for path in sqlite_family(database)[1:])
+            ):
+                raise HoldStateError(
+                    "SQLite Hold state changed during the diagnostic snapshot"
+                )
+            _validate_sqlite_custody_evidence(
+                marker_payload=evidence_after[4],
+                expected_payload=None,
+                initialized=evidence_after[0] is not None,
+                bootstrap_pending=evidence_after[3] is not None,
+            )
+            return validate_hold_readiness_snapshot(
+                snapshot=HoldDatabaseSnapshot(
+                    existing_tables=frozenset(),
+                    resolvable_conflict_keys=frozenset(),
+                    occupied_schema_names=frozenset(),
+                    duplicate_conflict_keys=frozenset(),
+                ),
+                initialization_witness=evidence_after[0],
+                history_anchor=evidence_after[1],
+                history_candidate=evidence_after[2],
+                bootstrap_intent=evidence_after[3],
+                sqlite_custody_marked=evidence_after[4] is not None,
+            )
+
+    _validate_sqlite_creation_parent(
+        database,
+        runtime_hardens_parent=runtime_hardens_parent,
+    )
+    validate_sqlite_family_private(database, label="host database")
+    for family_member in sqlite_family(database):
+        if path_exists(family_member) and not os.access(
+            family_member,
+            os.R_OK | os.W_OK,
+        ):
+            raise HoldStateError(
+                "SQLite Hold database family is not readable and writable by "
+                f"this runtime: {family_member}"
+            )
+    with _sqlite_readiness_evidence_lock(lock_path) as locked:
+        wal_path = Path(f"{database}-wal")
+        shm_path = Path(f"{database}-shm")
+        journal_path = Path(f"{database}-journal")
+        wal_present = path_exists(wal_path)
+        shm_present = path_exists(shm_path)
+        if wal_present != shm_present:
+            raise HoldStateError(
+                "SQLite Hold database has an incomplete live WAL sidecar pair"
+            )
+        if path_exists(journal_path):
+            raise HoldStateError(
+                "SQLite Hold database has an unresolved rollback journal"
+            )
+        wal_sidecars = (wal_path, shm_path) if wal_present else ()
+        if wal_sidecars and not locked:
+            raise HoldStateError(
+                "SQLite Hold state is live without its evidence protocol lock"
+            )
+        database_marker = database.stat()
+        marker = (
+            database_marker.st_ino,
+            database_marker.st_mtime_ns,
+            database_marker.st_size,
+        )
+        family_before = tuple(path_exists(path) for path in sqlite_family(database))
+        lock_stat = lock_path.lstat() if path_exists(lock_path) else None
+        lock_marker = (
+            None
+            if lock_stat is None
+            else (lock_stat.st_ino, lock_stat.st_mtime_ns, lock_stat.st_size)
+        )
+
+        evidence_before = evidence()
+        flags = "mode=ro" if wal_sidecars else "mode=ro&immutable=1"
+        try:
+            with closing(
+                sqlite3.connect(
+                    f"{database.as_uri()}?{flags}",
+                    uri=True,
+                )
+            ) as connection:
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("BEGIN")
+                snapshot = _sqlite_hold_snapshot(connection)
+        except sqlite3.Error as exc:
+            raise HoldCorruptStateError(
+                f"SQLite Hold database cannot be read: {exc}"
+            ) from exc
+        evidence_after = evidence()
+        if evidence_before != evidence_after:
+            raise HoldCorruptStateError(
+                "SQLite Hold protocol evidence changed during the diagnostic snapshot"
+            )
+        after_lock_stat = lock_path.lstat() if path_exists(lock_path) else None
+        after_lock_marker = (
+            None
+            if after_lock_stat is None
+            else (
+                after_lock_stat.st_ino,
+                after_lock_stat.st_mtime_ns,
+                after_lock_stat.st_size,
+            )
+        )
+        if lock_marker != after_lock_marker:
+            raise HoldStateError(
+                "SQLite Hold evidence lock changed during the diagnostic snapshot"
+            )
+        if not wal_sidecars:
+            after = database.stat()
+            after_marker = (after.st_ino, after.st_mtime_ns, after.st_size)
+            family_after = tuple(
+                path_exists(path) for path in sqlite_family(database)
+            )
+            if marker != after_marker or family_before != family_after:
+                raise HoldStateError(
+                    "SQLite Hold database changed during the diagnostic snapshot"
+                )
+
+        boot_state = validate_hold_readiness_snapshot(
+            snapshot=snapshot,
+            initialization_witness=evidence_after[0],
+            history_anchor=evidence_after[1],
+            history_candidate=evidence_after[2],
+            bootstrap_intent=evidence_after[3],
+            sqlite_custody_marked=evidence_after[4] is not None,
+        )
+        _validate_sqlite_custody_readiness(
+            database=database,
+            snapshot=snapshot,
+            marker_payload=evidence_after[4],
+            initialization_witness=evidence_after[0],
+            history_anchor=evidence_after[1],
+            history_candidate=evidence_after[2],
+            bootstrap_intent=evidence_after[3],
+        )
+        return boot_state
+
+
+__all__ = [
+    "HOST_HOLD_TARGET",
+    "POSTGRES_HOLD_PAIR_ID_ENV",
+    "EffectiveHoldState",
+    "HoldAction",
+    "HoldCorruptStateError",
+    "HoldDatabaseSnapshot",
+    "HoldDisposition",
+    "HoldIdempotencyConflict",
+    "HoldMutation",
+    "HoldReceipt",
+    "HoldScope",
+    "HoldState",
+    "HoldStateError",
+    "HoldStore",
+    "claim_hold_backend_custody",
+    "configured_postgres_hold_pair_id",
+    "hold_backend_binding_path",
+    "hold_sqlite_custody_marker_path",
+    "validate_hold_database_snapshot",
+    "validate_hold_backend_custody",
+    "validate_hold_readiness_snapshot",
+    "validate_external_postgres_hold_pair_id",
+    "validate_postgres_hold_readiness_snapshot",
+    "validate_sqlite_hold_readiness",
+]

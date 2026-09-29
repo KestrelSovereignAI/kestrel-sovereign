@@ -1,7 +1,11 @@
 """Tests for SpawnMandate data structure and DID delegation chains."""
 
+import json
+from dataclasses import replace
+from decimal import Decimal
+from types import SimpleNamespace
+
 import pytest
-from cryptography.hazmat.primitives.asymmetric import ec
 
 from kestrel_sovereign.spawn.mandate import (
     SpawnMandate,
@@ -10,6 +14,19 @@ from kestrel_sovereign.spawn.mandate import (
     create_child_did_document,
 )
 from kestrel_sovereign.inception_service import generate_secp256k1_keypair
+from kestrel_sovereign.identity.did_web import build_verification_methods
+from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+from kestrel_sovereign.identity.succession import (
+    SuccessionStatement,
+    finalize,
+    sign_predecessor,
+    sign_successor,
+)
+from kestrel_sovereign.identity.succession_chain import build_chain
+from kestrel_sovereign.security.crypto_suite import (
+    ALG_ECDSA_SECP256K1_SHA256,
+    get_suite,
+)
 
 
 @pytest.fixture
@@ -35,6 +52,56 @@ def sample_mandate():
         purpose="research assistant",
         max_child_depth=2,
     )
+
+
+@pytest.fixture(scope="module")
+def rotated_parent():
+    from kestrel_sovereign.inception_service import (
+        public_key_to_ethereum_address,
+    )
+
+    legacy_suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    legacy = legacy_suite.generate_keypair()
+    legacy_did = (
+        "did:pkh:eip155:1:"
+        f"{public_key_to_ethereum_address(legacy.public_key)}"
+    )
+    legacy_methods = build_verification_methods(
+        legacy_did, [(legacy_suite, legacy.public_key)]
+    )
+    successor = generate_hybrid_keypair()
+    successor_did = "did:web:example.test:rotated-parent"
+    successor_methods = build_verification_methods(
+        successor_did, successor.public_keys()
+    )
+    statement = SuccessionStatement(
+        predecessor_did=legacy_did,
+        successor_did=successor_did,
+        effective_from="2026-08-20T00:00:00+00:00",
+        reason="test rotation",
+        predecessor_verification_methods=legacy_methods,
+        successor_verification_methods=successor_methods,
+    )
+    statement = sign_predecessor(
+        statement,
+        [(legacy, legacy_methods[0]["id"].rsplit("#", 1)[-1])],
+    )
+    statement = sign_successor(
+        statement,
+        [
+            (successor.classical, successor_methods[0]["id"].rsplit("#", 1)[-1]),
+            (successor.pq, successor_methods[1]["id"].rsplit("#", 1)[-1]),
+        ],
+    )
+    statement = finalize(statement)
+    identity = SimpleNamespace(
+        is_hybrid=True,
+        legacy_did=legacy_did,
+        new_did=successor_did,
+        new_verification_methods=successor_methods,
+        succession_chain=build_chain([statement]),
+    )
+    return legacy, statement, identity
 
 
 class TestSpawnMandate:
@@ -63,6 +130,47 @@ class TestSpawnMandate:
         assert d["parent_did"] == "did:pkh:eip155:1:0xParent123"
         assert d["budget_allocation"] == 10.0
         assert isinstance(d, dict)
+
+    def test_decimal_budget_normalizes_mandate_to_signed_json_number(self):
+        """Runtime budget and durable receipt use one normalized value."""
+        mandate = SpawnMandate(
+            parent_did="did:test:parent",
+            budget_allocation=Decimal("0.100000000000000005"),
+        )
+
+        payload = json.loads(mandate._signable_payload())
+        edge = mandate.to_edge_properties()
+
+        assert mandate.budget_allocation == 0.1
+        assert payload["budget_allocation"] == mandate.budget_allocation
+        assert edge["budget_allocation"] == mandate.budget_allocation
+
+    def test_decimal_budget_rejects_float_overflow_before_signing(self):
+        mandate = SpawnMandate(
+            parent_did="did:test:parent",
+            budget_allocation=Decimal("1e10000"),
+        )
+
+        with pytest.raises(ValueError, match="JSON numeric range"):
+            mandate._signable_payload()
+
+    def test_decimal_budget_rejects_float_underflow_before_signing(self):
+        mandate = SpawnMandate(
+            parent_did="did:test:parent",
+            budget_allocation=Decimal("1e-400"),
+        )
+
+        with pytest.raises(ValueError, match="JSON numeric range"):
+            mandate._signable_payload()
+
+    def test_decimal_budget_rejects_normalization_that_widens_signed_limit(self):
+        mandate = SpawnMandate(
+            parent_did="did:test:parent",
+            budget_allocation=Decimal("9007199254740995"),
+        )
+
+        with pytest.raises(ValueError, match="would widen signed limit"):
+            mandate._signable_payload()
 
 
 class TestMandateSigning:
@@ -100,6 +208,72 @@ class TestMandateSigning:
         _, public_key = parent_keys
         sample_mandate.parent_signature = "deadbeef"
         assert verify_mandate(sample_mandate, public_key) is False
+
+    def test_rotated_parent_rejects_backdated_classical_mandate_without_trusted_time(
+        self, rotated_parent
+    ):
+        legacy, _statement, identity = rotated_parent
+        mandate = SpawnMandate(
+            parent_did=identity.legacy_did,
+            child_did="did:test:child",
+            created_at="2026-08-19T23:59:59+00:00",
+        )
+        sign_mandate(mandate, legacy.private_key)
+
+        assert verify_mandate(
+            mandate, legacy.public_key, parent_identity=identity
+        ) is False
+
+    def test_rotated_parent_rejects_classical_mandate_at_or_after_cutoff(
+        self, rotated_parent
+    ):
+        legacy, _statement, identity = rotated_parent
+        mandate = SpawnMandate(
+            parent_did=identity.legacy_did,
+            child_did="did:test:child",
+            created_at="2026-08-20T00:00:00+00:00",
+        )
+        sign_mandate(mandate, legacy.private_key)
+
+        assert verify_mandate(
+            mandate, legacy.public_key, parent_identity=identity
+        ) is False
+
+    def test_tampered_succession_cutoff_cannot_reenable_legacy_signature(
+        self, rotated_parent
+    ):
+        legacy, statement, identity = rotated_parent
+        tampered = replace(
+            statement, effective_from="2026-08-22T00:00:00+00:00"
+        )
+        forged_state = vars(identity).copy()
+        forged_state["succession_chain"] = build_chain([tampered])
+        forged_identity = SimpleNamespace(**forged_state)
+        mandate = SpawnMandate(
+            parent_did=identity.legacy_did,
+            child_did="did:test:child",
+            created_at="2026-08-21T00:00:00+00:00",
+        )
+        sign_mandate(mandate, legacy.private_key)
+
+        assert verify_mandate(
+            mandate, legacy.public_key, parent_identity=forged_identity
+        ) is False
+
+    def test_malformed_rotated_parent_timestamp_returns_false(
+        self, rotated_parent
+    ):
+        legacy, _statement, identity = rotated_parent
+        mandate = SpawnMandate(
+            parent_did=identity.legacy_did,
+            child_did="did:test:child",
+            created_at="2026-08-19T23:59:59",
+        )
+        sign_mandate(mandate, legacy.private_key)
+
+        assert verify_mandate(
+            mandate, legacy.public_key, parent_identity=identity
+        ) is False
 
 
 class TestChildDIDDocument:

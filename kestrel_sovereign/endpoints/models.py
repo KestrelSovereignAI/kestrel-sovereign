@@ -2,7 +2,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, UploadFile, File
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Mapping, Optional
 import aiohttp
 import httpx
 import asyncio
@@ -13,25 +14,34 @@ import uuid
 import logging
 
 from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
+from kestrel_sovereign.api_errors import rate_limited_until
+from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
 from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.sql_utils import safe_column_name
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
+from kestrel_sovereign.features.sovereignty.artifacts import owned_artifacts, owned_cids
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
+    prime_durable_stop_fence,
     request_invocation_provenance,
+    caller_is_sovereign,
+    require_sovereign_host_lifecycle,
     resolve_request_invocation_id,
+    self_fenced_invocation_http_error,
     stopped_invocation_http_error,
 )
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
+    InvocationSelfFencedError,
     invocation_id_response_header,
 )
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_feature_database,
 )
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.multi_agent.agent_manager import (
     RuntimeOffboardingAdmission,
     RuntimeOffboardingNotPerformedError,
@@ -47,16 +57,18 @@ router = APIRouter(tags=["models"])
 _AGENT_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
 
 
-def require_sovereign_host_lifecycle(request: Request):
-    """Admit only the sovereign-key principal to host lifecycle mutations."""
+def _reload_multi_agent_config(request: Request, config_path):
+    """Reload a roster under the same path context accepted at host boot."""
 
-    caller = get_caller(request)
-    if getattr(caller, "is_sovereign", False) is not True:
-        raise HTTPException(
-            status_code=403,
-            detail="Sovereign authority is required.",
-        )
-    return caller
+    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+
+    runtime_env = getattr(request.app.state, "multi_agent_runtime_env", None)
+    runtime_base = getattr(request.app.state, "multi_agent_runtime_base", None)
+    return MultiAgentConfig.from_file(
+        config_path,
+        runtime_env=runtime_env,
+        runtime_base=runtime_base,
+    )
 
 
 def _key_storage_privacy_detail() -> str:
@@ -193,7 +205,7 @@ def _grouped_runtime_retained_detail(
 
 
 @router.get("/api/agents")
-async def get_agents(request: Request):
+async def get_agents(request: Request, response: Response):
     """Get list of agents (A2A agent cards).
 
     In multi-agent mode, returns all agents with mode: "multi_agent".
@@ -204,6 +216,8 @@ async def get_agents(request: Request):
     can render a DEMO MODE banner — the browser-side defence in #868.
     """
     server_demo_mode = bool(getattr(request.app.state, "demo_mode", False))
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "Authorization, Cookie, X-API-Key"
     caller = get_caller(request)
     can_manage_host_lifecycle = (
         getattr(caller, "is_sovereign", False) is True
@@ -320,9 +334,8 @@ async def create_agent(request: Request, body: CreateAgentRequest):
         or clobber a malformed file mid-repair."""
         cfg_path = getattr(request.app.state, 'multi_agent_config_path', None)
         if cfg_path:
-            from kestrel_sovereign.multi_agent.config import MultiAgentConfig as _MAC
             try:
-                return _MAC.from_file(cfg_path), cfg_path, True
+                return _reload_multi_agent_config(request, cfg_path), cfg_path, True
             except Exception as reload_err:
                 logger.error(
                     f"Could not reload {cfg_path} ({reload_err}); refusing to "
@@ -428,10 +441,8 @@ def _read_persisted_agent_registration_for_offboarding(
                 "again on restart."
             ),
         )
-    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
-
     try:
-        current = MultiAgentConfig.from_file(config_path)
+        current = _reload_multi_agent_config(request, config_path)
     except Exception as exc:
         logger.error(
             "Could not load multi-agent config before offboarding %r",
@@ -481,10 +492,8 @@ def _remove_persisted_agent_registration_for_offboarding(
     """Remove the previously witnessed registration with a narrow CAS check."""
 
     config_path, persisted_name, expected_config = registration
-    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
-
     try:
-        current = MultiAgentConfig.from_file(config_path)
+        current = _reload_multi_agent_config(request, config_path)
     except Exception as exc:
         raise HTTPException(
             status_code=409,
@@ -532,9 +541,7 @@ def _restore_persisted_agent_registration(
     config_path, persisted_name, removed_config = rollback
     if removed_config is None:
         return
-    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
-
-    current = MultiAgentConfig.from_file(config_path)
+    current = _reload_multi_agent_config(request, config_path)
     if any(name.casefold() == persisted_name.casefold() for name in current.agents):
         raise RuntimeError(
             "agent registration changed concurrently; refusing rollback overwrite"
@@ -1242,30 +1249,71 @@ async def get_constitution(request: Request):
         raise HTTPException(status_code=500, detail="Error retrieving constitution.")
 
 
-@router.get("/api/ipfs/status")
-async def get_ipfs_status(request: Request):
-    """Check IPFS node connectivity and status."""
-    # Resolve the agent up front so a missing agent surfaces as the
-    # contractual 503 before any network probing starts (#2495).
-    agent = get_agent(request)
-    status = {
-        "local_node": {"available": False, "error": None, "peer_id": None, "version": None},
-        "backup_tier": {},
-        "gateways": [],
-        "pinned_content": [],
-    }
+@dataclass(frozen=True)
+class _LocalNodeProbe:
+    """What the host's IPFS daemon answered, before anyone decides who may see it."""
 
+    available: bool = False
+    error: Optional[str] = None
+    peer_id: Optional[str] = None
+    agent_version: Optional[str] = None
+    version: Optional[str] = None
+    # Every recursive pin the daemon reports, CID → pin info.
+    pins: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+
+
+async def _probe_local_node() -> _LocalNodeProbe:
+    """Ask the process-global IPFS daemon for identity, version and pins.
+
+    The full pin set stays in this process: the agent-local status
+    intersects it with the routed agent's own CIDs, the sovereign node
+    view returns it whole (#3226). A failed connection is reported as a
+    connection failure and nothing else — never as "nothing pinned".
+    """
+    local_api_url = get_ipfs_api_url() + "/api/v0"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.post(f"{local_api_url}/id") as resp:
+                if resp.status != 200:
+                    return _LocalNodeProbe()
+                data = await resp.json()
+                peer_id = data.get("ID")
+                agent_version = data.get("AgentVersion")
+
+            version = None
+            async with session.post(f"{local_api_url}/version") as resp:
+                if resp.status == 200:
+                    version = (await resp.json()).get("Version")
+
+            pins: Mapping[str, Mapping[str, Any]] = {}
+            async with session.post(f"{local_api_url}/pin/ls?type=recursive") as resp:
+                if resp.status == 200:
+                    pins = (await resp.json()).get("Keys", {}) or {}
+    except Exception as e:
+        logger.error(f"IPFS local node check failed: {e}")
+        return _LocalNodeProbe(error="Connection failed")
+
+    return _LocalNodeProbe(
+        available=True,
+        peer_id=peer_id,
+        agent_version=agent_version,
+        version=version,
+        pins=pins,
+    )
+
+
+async def _backup_tier_health() -> dict:
     try:
         from kestrel_sovereign.storage.sync.health import check_sovereign_ipfs_health
 
-        status["backup_tier"] = (
+        return (
             await check_sovereign_ipfs_health(
                 api_url=os.environ.get("SOVEREIGN_IPFS_URL")
             )
         ).to_dict()
     except Exception as e:
         logger.error(f"Sovereign IPFS backup tier check failed: {e}")
-        status["backup_tier"] = {
+        return {
             "name": "sovereign_ipfs",
             "label": "sovereign-operated",
             "configured": False,
@@ -1274,42 +1322,15 @@ async def get_ipfs_status(request: Request):
             "details": {},
         }
 
-    local_api_url = get_ipfs_api_url() + "/api/v0"
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-            async with session.post(f"{local_api_url}/id") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    status["local_node"]["available"] = True
-                    status["local_node"]["peer_id"] = data.get("ID")
-                    status["local_node"]["agent_version"] = data.get("AgentVersion")
 
-            if status["local_node"]["available"]:
-                async with session.post(f"{local_api_url}/version") as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        status["local_node"]["version"] = data.get("Version")
-
-                async with session.post(f"{local_api_url}/pin/ls?type=recursive") as resp:
-                    if resp.status == 200:
-                        from kestrel_sovereign.kestrel_config.constants import MAX_PINNED_ITEMS_DISPLAY
-                        data = await resp.json()
-                        pins = data.get("Keys", {})
-                        status["pinned_content"] = [
-                            {"cid": cid, "type": info.get("Type")}
-                            for cid, info in list(pins.items())[:MAX_PINNED_ITEMS_DISPLAY]
-                        ]
-    except Exception as e:
-        logger.error(f"IPFS local node check failed: {e}")
-        status["local_node"]["error"] = "Connection failed"
-
+async def _probe_gateways() -> list:
     test_cid = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
     gateways = [
         {"name": "ipfs.io", "url": f"https://ipfs.io/ipfs/{test_cid}"},
         {"name": "dweb.link", "url": f"https://dweb.link/ipfs/{test_cid}"},
         {"name": "cloudflare-ipfs", "url": f"https://cloudflare-ipfs.com/ipfs/{test_cid}"},
     ]
-
+    results = []
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
         for gw in gateways:
             gw_status = {"name": gw["name"], "available": False, "latency_ms": None, "error": None}
@@ -1322,24 +1343,138 @@ async def get_ipfs_status(request: Request):
             except Exception as e:
                 logger.error(f"IPFS gateway {gw['name']} check failed: {e}")
                 gw_status["error"] = "Connection failed"
-            status["gateways"].append(gw_status)
+            results.append(gw_status)
+    return results
 
+
+def _filecoin_adapter(agent):
+    """The routed agent's Filecoin adapter, or None. Best-effort introspection."""
     try:
-        if hasattr(agent, 'storage') and agent.storage:
-            storage = agent.storage
-            if hasattr(storage, 'sovereign_adapter') and storage.sovereign_adapter:
-                adapter = storage.sovereign_adapter
-                if hasattr(adapter, 'filecoin_adapter') and adapter.filecoin_adapter:
-                    status["filecoin_adapter"] = {
-                        "configured": True,
-                        "cache_dir": str(adapter.filecoin_adapter.cache_dir) if hasattr(adapter.filecoin_adapter, 'cache_dir') else None,
-                    }
-                else:
-                    status["filecoin_adapter"] = {"configured": False}
+        storage = getattr(agent, "storage", None)
+        sovereign_adapter = getattr(storage, "sovereign_adapter", None) if storage else None
+        return getattr(sovereign_adapter, "filecoin_adapter", None) if sovereign_adapter else None
     except Exception:
-        pass  # Filecoin adapter introspection is best-effort
+        return None
+
+
+def _host_filecoin_adapter(request: Request):
+    """The host's Filecoin adapter via whichever agent carries one.
+
+    Routed agent, then the app-level default, then any agent the manager
+    lists: the adapter's cache directory is process-global, so the first
+    configured one is the host's.
+    """
+    candidates = [
+        getattr(request.state, "agent", None),
+        getattr(request.app.state, "agent", None),
+    ]
+    manager = getattr(request.app.state, "agent_manager", None)
+    list_agents = getattr(manager, "list_agents", None)
+    if callable(list_agents):
+        try:
+            candidates.extend(list_agents().values())
+        except Exception:
+            pass
+    for agent in candidates:
+        adapter = _filecoin_adapter(agent)
+        if adapter is not None:
+            return adapter
+    return None
+
+
+@router.get("/api/ipfs/status")
+async def get_ipfs_status(request: Request):
+    """The routed agent's view of IPFS.
+
+    Whether the local node and the sovereign backup tier are reachable,
+    which of *this agent's own* exports the node holds pinned, and public
+    gateway health. The node's identity and version, the daemon's full pin
+    set, the backup tier's connection details and the adapter's host path
+    are the host's facts, not the agent's: co-hosted agents share one
+    daemon, so an agent-local route that returned its recursive pin set
+    disclosed every other agent's CIDs (#3226). Those live on
+    ``GET /api/ipfs/node``, which requires sovereign authority;
+    ``can_view_node`` tells the console whether this caller may fetch it.
+
+    Pin visibility is bound to the agent's durable receipts: a CID appears
+    here only if the agent's own storage recorded it as its export and the
+    daemon reports it pinned. A guessed CID has no receipt and so no
+    answer, pinned or not.
+    """
+    # Resolve the agent up front so a missing agent surfaces as the
+    # contractual 503 before any network probing starts (#2495).
+    agent = get_agent(request)
+    own_cids = owned_cids(await owned_artifacts(getattr(agent, "storage", None)))
+
+    backup_tier = await _backup_tier_health()
+    backup_tier.pop("details", None)
+
+    probe = await _probe_local_node()
+    pinned_content = [
+        {"cid": cid, "type": (probe.pins.get(cid) or {}).get("Type")}
+        for cid in sorted(own_cids)
+        if cid in probe.pins
+    ]
+
+    status = {
+        "local_node": {"available": probe.available, "error": probe.error},
+        "backup_tier": backup_tier,
+        "gateways": await _probe_gateways(),
+        "pinned_content": pinned_content,
+        "can_view_node": caller_is_sovereign(request),
+    }
+
+    adapter = _filecoin_adapter(agent)
+    if adapter is not None:
+        status["filecoin_adapter"] = {"configured": True}
+    elif getattr(getattr(agent, "storage", None), "sovereign_adapter", None):
+        status["filecoin_adapter"] = {"configured": False}
 
     return status
+
+
+@router.get(
+    "/api/ipfs/node",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
+async def get_ipfs_node(request: Request):
+    """The host's IPFS daemon, whole: identity, version, every recursive pin.
+
+    Host administration (#3226): the daemon is one per host and its pin set
+    names every co-hosted agent's content, so this is a sovereign surface.
+    The dependency refuses before the body runs, and needs no agent — the
+    node is not any agent's.
+    """
+    from kestrel_sovereign.kestrel_config.constants import MAX_PINNED_ITEMS_DISPLAY
+
+    probe = await _probe_local_node()
+    node = {
+        "local_node": {
+            "available": probe.available,
+            "error": probe.error,
+            "peer_id": probe.peer_id,
+            "agent_version": probe.agent_version,
+            "version": probe.version,
+        },
+        "backup_tier": await _backup_tier_health(),
+        "pinned_content": [
+            {"cid": cid, "type": info.get("Type")}
+            for cid, info in list(probe.pins.items())[:MAX_PINNED_ITEMS_DISPLAY]
+        ],
+        "pinned_total": len(probe.pins),
+    }
+    # The adapter is one directory per host, so any agent's will do; the
+    # routed agent comes first because on a multi-agent host the app-level
+    # default is None and the host view would otherwise silently lose the
+    # one field it exists to carry.
+    adapter = _host_filecoin_adapter(request)
+    if adapter is not None:
+        cache_dir = getattr(adapter, "cache_dir", None)
+        node["filecoin_adapter"] = {
+            "configured": True,
+            "cache_dir": str(cache_dir) if cache_dir is not None else None,
+        }
+    return node
 
 
 @router.get("/api/wallet")
@@ -3213,6 +3348,7 @@ async def chat_completions(request: Request, http_response: Response):
         # Extract user_passphrase for USER_BYOK agents
         user_passphrase = data.get("user_passphrase")
         request_id = resolve_request_invocation_id(request, data)
+        await prime_durable_stop_fence(request, agent, request_id)
         invocation_provenance = request_invocation_provenance(
             request,
             source_locator="POST:/v1/chat/completions",
@@ -3252,8 +3388,12 @@ async def chat_completions(request: Request, http_response: Response):
         }
         http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return resp
+    except InvocationSelfFencedError as error:
+        raise self_fenced_invocation_http_error(request_id) from error
     except InvocationCancelledError as error:
         raise stopped_invocation_http_error(request_id) from error
+    except HoldTurnRefusal as exc:
+        raise exc.as_http_exception() from exc
     except HTTPException:
         # Preserve the original status code (notably 503 from get_agent
         # when no agent is bound — multi-agent mode requires the
@@ -3265,4 +3405,10 @@ async def chat_completions(request: Request, http_response: Response):
         raise
     except Exception as e:
         logger.error(f"Error in chat_completions: {e}", exc_info=True)
+        declined = advised_wait_exceeding_budget(e)
+        if declined is not None:
+            # The route declined a server-advised wait (#3127): tell the
+            # OpenAI-compatible client when, the way it expects (429 with
+            # Retry-After), not a 500 that reads as a server bug.
+            raise rate_limited_until(declined) from e
         raise HTTPException(status_code=500, detail="Internal error in chat completions.")

@@ -21,10 +21,13 @@ from kestrel_sovereign.a2a.types import (
 )
 from kestrel_sovereign.a2a.stores.base import json_dumps, json_loads
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
-from kestrel_sovereign.storage.db.interface import DatabaseBackend
+from kestrel_sovereign.storage.db.interface import DatabaseBackend, QueryError
 
 logger = logging.getLogger(__name__)
 
+# Keep the v2 lock identity through the mixed-version window. A v2 worker uses
+# this exact advisory lock before probing/installing its compatibility trigger;
+# changing the key would let v2 and v3 replace database functions concurrently.
 _CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v2"
 
 
@@ -42,6 +45,14 @@ class TaskCancellationSnapshot:
 
     state: str
     actor_agent_id: Optional[str]
+
+
+@dataclass(frozen=True)
+class TaskCognitionWakeCandidate:
+    """Authoritative task row plus the revision that selected its wake."""
+
+    task: Task
+    lifecycle_revision: int
 
 
 def without_reserved_cancellation_receipt(
@@ -97,7 +108,9 @@ class TaskStore(UnifiedStoreBase):
                 cancel_reason TEXT,
                 cancel_previous_status TEXT,
                 cancel_operation_id TEXT,
-                terminal_operation_id TEXT
+                terminal_operation_id TEXT,
+                lifecycle_revision BIGINT NOT NULL DEFAULT 0,
+                lifecycle_updated_at {ts_type}
             )
         """)
 
@@ -156,6 +169,8 @@ class TaskStore(UnifiedStoreBase):
             UPDATE a2a_tasks
             SET status = 'failed',
                 message = ?,
+                lifecycle_revision = lifecycle_revision + 1,
+                lifecycle_updated_at = {self.now_sql()},
                 updated_at = {self.now_sql()}
             WHERE status IN ('submitted', 'working', 'input-required')
               AND (creator_agent_id IS NULL OR recipient_agent_id IS NULL)
@@ -176,7 +191,7 @@ class TaskStore(UnifiedStoreBase):
         row = await self._backend.fetch_one("""
             SELECT
                 (
-                    SELECT COUNT(*) = 7
+                    SELECT COUNT(*) = 9
                     FROM information_schema.columns
                     WHERE table_schema = current_schema()
                       AND table_name = 'a2a_tasks'
@@ -187,7 +202,9 @@ class TaskStore(UnifiedStoreBase):
                           'cancel_reason',
                           'cancel_previous_status',
                           'cancel_operation_id',
-                          'terminal_operation_id'
+                          'terminal_operation_id',
+                          'lifecycle_revision',
+                          'lifecycle_updated_at'
                       )
                 )
                 AND EXISTS (
@@ -209,6 +226,10 @@ class TaskStore(UnifiedStoreBase):
                       AND procedure.proname =
                           'a2a_tasks_enforce_authority_fence_v4'
                       AND pg_get_function_identity_arguments(procedure.oid) = ''
+                      AND position(
+                          'lifecycle_updated_at'
+                          IN pg_get_functiondef(procedure.oid)
+                      ) > 0
                 )
                 AND (
                     SELECT COUNT(*) = 5
@@ -245,6 +266,21 @@ class TaskStore(UnifiedStoreBase):
         )
         for column in authority_columns:
             await self.add_column_if_missing("a2a_tasks", column, "TEXT")
+        await self.add_column_if_missing(
+            "a2a_tasks",
+            "lifecycle_revision",
+            "BIGINT NOT NULL DEFAULT 0",
+        )
+        # When the current revision began. ``updated_at`` cannot stand in:
+        # appending an artifact moves it without a new revision, which would
+        # keep an old wake identity inside the reconciliation window long
+        # after retention forgot it. Rows written before this column existed
+        # stay NULL and are read through ``updated_at``.
+        await self.add_column_if_missing(
+            "a2a_tasks",
+            "lifecycle_updated_at",
+            self.timestamp_type(),
+        )
 
         # Cancellation is terminal at the storage boundary, including for
         # pre-upgrade writers still running during a PostgreSQL rollout. The
@@ -298,6 +334,18 @@ class TaskStore(UnifiedStoreBase):
                             OR NEW.recipient_agent_id IS NULL) THEN
                         RAISE EXCEPTION 'live A2A task requires durable authority'
                             USING ERRCODE = 'check_violation';
+                    END IF;
+                    -- A v3/v4 worker does not know about lifecycle_revision.
+                    -- Advance it at the shared database boundary so a status
+                    -- transition by that worker cannot reuse a cognition-wake
+                    -- identity minted for an earlier state of the same task.
+                    IF TG_OP = 'UPDATE'
+                       AND NEW.status IS DISTINCT FROM OLD.status THEN
+                        NEW.lifecycle_revision := OLD.lifecycle_revision + 1;
+                        NEW.lifecycle_updated_at := now();
+                    END IF;
+                    IF TG_OP = 'INSERT' AND NEW.lifecycle_updated_at IS NULL THEN
+                        NEW.lifecycle_updated_at := now();
                     END IF;
                     RETURN NEW;
                 END;
@@ -504,6 +552,8 @@ class TaskStore(UnifiedStoreBase):
                 history = ?,
                 metadata = ?,
                 terminal_operation_id = ?,
+                lifecycle_revision = lifecycle_revision + 1,
+                lifecycle_updated_at = {self.now_sql()},
                 updated_at = {self.now_sql()}
             WHERE id = ?
               AND recipient_agent_id = ?
@@ -553,36 +603,98 @@ class TaskStore(UnifiedStoreBase):
         )
         user_id = metadata.get("user_id")
 
-        rows_affected = await self._backend.execute(
-            f"""
-            INSERT INTO a2a_tasks
-            (id, session_id, user_id, task_type, status, message, artifacts,
-             history, metadata, updated_at, creator_agent_id, recipient_agent_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {self.now_sql()}, ?, ?)
-            ON CONFLICT (id) DO NOTHING
-            """,
-            (
-                task.id,
-                task.sessionId,
-                user_id,
-                task_type,
-                task.status.state.value,
-                message_json,
-                artifacts_json,
-                history_json,
-                metadata_json,
-                creator_agent_id,
-                recipient_agent_id,
-            ),
-        )
+        try:
+            rows_affected = await self._backend.execute(
+                f"""
+                INSERT INTO a2a_tasks
+                (id, session_id, user_id, task_type, status, message, artifacts,
+                 history, metadata, updated_at, lifecycle_updated_at,
+                 creator_agent_id, recipient_agent_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {self.now_sql()},
+                        {self.now_sql()}, ?, ?)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (
+                    task.id,
+                    task.sessionId,
+                    user_id,
+                    task_type,
+                    task.status.state.value,
+                    message_json,
+                    artifacts_json,
+                    history_json,
+                    metadata_json,
+                    creator_agent_id,
+                    recipient_agent_id,
+                ),
+            )
+        except QueryError as insert_error:
+            # SQLite fires BEFORE INSERT triggers before applying this
+            # statement's ON CONFLICT policy. The terminal canceled-row fence
+            # must continue blocking legacy INSERT OR REPLACE writers, but an
+            # ordinary duplicate submission still has the backend-independent
+            # TaskAlreadyExists contract. Re-probe the canonical key after the
+            # failed statement; do not translate unrelated storage failures.
+            try:
+                occupied = await self._backend.fetch_one(
+                    "SELECT 1 FROM a2a_tasks WHERE id = ?",
+                    (task.id,),
+                )
+            except QueryError:
+                raise insert_error
+            if occupied is not None:
+                raise TaskAlreadyExistsError(
+                    f"Task already exists: {task.id}"
+                ) from insert_error
+            raise
         if rows_affected != 1:
             raise TaskAlreadyExistsError(f"Task already exists: {task.id}")
 
-    async def get(self, task_id: str) -> Optional[Task]:
-        """Retrieve a task by ID."""
+    async def _get_unscoped(self, task_id: str) -> Optional[Task]:
+        """Internal canonical-row read after an already-authorized mutation."""
         row = await self._backend.fetch_one(
             "SELECT * FROM a2a_tasks WHERE id = ?",
             (task_id,),
+        )
+        if not row:
+            return None
+        return self._row_to_task(row)
+
+    async def get_for_creator(
+        self,
+        task_id: str,
+        creator_agent_id: str,
+        *,
+        recipient_agent_id: str,
+    ) -> Optional[Task]:
+        """Retrieve a sender-owned result through its exact routed peer."""
+
+        if not isinstance(creator_agent_id, str) or not creator_agent_id.strip():
+            raise ValueError("Task creator lookup requires a concrete identity")
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task creator lookup requires a concrete recipient")
+        row = await self._backend.fetch_one(
+            "SELECT * FROM a2a_tasks WHERE id = ? AND creator_agent_id = ? "
+            "AND recipient_agent_id = ?",
+            (task_id, creator_agent_id, recipient_agent_id),
+        )
+        if not row:
+            return None
+        return self._row_to_task(row)
+
+    async def get_for_principal(
+        self,
+        task_id: str,
+        principal_agent_id: str,
+    ) -> Optional[Task]:
+        """Retrieve a task visible to either one of its durable principals."""
+
+        if not isinstance(principal_agent_id, str) or not principal_agent_id.strip():
+            raise ValueError("Task principal lookup requires a concrete identity")
+        row = await self._backend.fetch_one(
+            "SELECT * FROM a2a_tasks WHERE id = ? "
+            "AND (creator_agent_id = ? OR recipient_agent_id = ?)",
+            (task_id, principal_agent_id, principal_agent_id),
         )
         if not row:
             return None
@@ -608,12 +720,18 @@ class TaskStore(UnifiedStoreBase):
     async def get_cancellation_snapshot(
         self,
         task_id: str,
+        *,
+        recipient_agent_id: str,
     ) -> Optional[TaskCancellationSnapshot]:
         """Read cancellation authority without loading task payload columns."""
 
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
+            raise ValueError("Cancellation snapshot requires a concrete recipient")
+
         row = await self._backend.fetch_one(
-            "SELECT status, canceled_by FROM a2a_tasks WHERE id = ?",
-            (task_id,),
+            "SELECT status, canceled_by FROM a2a_tasks "
+            "WHERE id = ? AND recipient_agent_id = ?",
+            (task_id, recipient_agent_id),
         )
         if not row:
             return None
@@ -660,34 +778,21 @@ class TaskStore(UnifiedStoreBase):
 
     async def get_pending_tasks(
         self,
-        limit: int = 10,
         *,
-        recipient_agent_id: Optional[str] = None,
+        recipient_agent_id: str,
+        limit: int = 10,
     ) -> list[Task]:
-        """Get submitted work, optionally constrained to one worker recipient."""
-
-        if recipient_agent_id is not None and (
-            not isinstance(recipient_agent_id, str)
-            or not recipient_agent_id.strip()
-        ):
-            raise ValueError("Pending-task recipient must be a concrete identity")
-        recipient_predicate = (
-            " AND recipient_agent_id = ?" if recipient_agent_id is not None else ""
-        )
-        params = (
-            (recipient_agent_id, limit)
-            if recipient_agent_id is not None
-            else (limit,)
-        )
+        """Get SUBMITTED work addressed to one durable recipient."""
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Pending-task reads require a concrete recipient")
         rows = await self._backend.fetch_all(
             f"""
             SELECT * FROM a2a_tasks
-            WHERE status = 'submitted'
-            {recipient_predicate}
+            WHERE status = 'submitted' AND recipient_agent_id = ?
             ORDER BY created_at ASC
             LIMIT ?
             """,
-            params,
+            (recipient_agent_id, limit),
         )
         return [self._row_to_task(row) for row in rows]
 
@@ -716,7 +821,10 @@ class TaskStore(UnifiedStoreBase):
         rows_affected = await self._backend.execute(
             f"""
             UPDATE a2a_tasks
-            SET status = ?, message = ?, updated_at = {self.now_sql()}
+            SET status = ?, message = ?,
+                lifecycle_revision = lifecycle_revision + 1,
+                lifecycle_updated_at = {self.now_sql()},
+                updated_at = {self.now_sql()}
             WHERE id = ?
               AND recipient_agent_id = ?
               AND status = ?
@@ -880,6 +988,8 @@ class TaskStore(UnifiedStoreBase):
                     canceled_by = ?,
                     cancel_reason = ?,
                     cancel_operation_id = ?,
+                    lifecycle_revision = lifecycle_revision + 1,
+                    lifecycle_updated_at = {self.now_sql()},
                     updated_at = {self.now_sql()}
                 WHERE {live_authority_predicate}
                 """,
@@ -986,14 +1096,18 @@ class TaskStore(UnifiedStoreBase):
 
     async def list_tasks(
         self,
+        *,
+        recipient_agent_id: str,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
         status: Optional[TaskState] = None,
         limit: int = 100,
     ) -> list[Task]:
-        """List tasks with optional filters."""
-        conditions = []
-        params = []
+        """List only tasks addressed to one durable recipient."""
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task listing requires a concrete recipient")
+        conditions = ["recipient_agent_id = ?"]
+        params = [recipient_agent_id]
 
         if session_id:
             conditions.append("session_id = ?")
@@ -1018,6 +1132,69 @@ class TaskStore(UnifiedStoreBase):
             tuple(params),
         )
         return [self._row_to_task(row) for row in rows]
+
+    async def list_cognition_wake_candidates(
+        self,
+        *,
+        recipient_agent_id: str,
+        live_changed_since: datetime,
+        terminal_changed_since: datetime,
+    ) -> list[TaskCognitionWakeCandidate]:
+        """List authoritative rows whose one-shot cognition wake may be absent.
+
+        Every row is bounded by when its current lifecycle revision began,
+        against the retention horizon of the source that owns its wake: live
+        SUBMITTED/WORKING rows by the submission source's, terminal rows by
+        the completion source's. A row past its horizon has outlived the
+        durable row that deduplicates its wake, so listing it would recreate
+        that wake once per retention period.
+        """
+
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task wake reconciliation requires a concrete recipient")
+        changed_at = "COALESCE(lifecycle_updated_at, updated_at)"
+        if self.is_sqlite:
+            # Task writes use SQLite's ``datetime('now')`` (space separator),
+            # while Python's canonical ISO form contains ``T`` and an offset.
+            # TEXT comparison orders those representations incorrectly around
+            # the retention boundary; SQLite's datetime parser normalizes both.
+            changed_predicate = f"datetime({changed_at}) >= datetime(?)"
+        else:
+            changed_predicate = f"{changed_at} >= ?"
+        rows = await self._backend.fetch_all(
+            f"""
+            SELECT * FROM a2a_tasks
+            WHERE recipient_agent_id = ?
+              AND (
+                    (
+                        status IN ('submitted', 'working')
+                        AND {changed_predicate}
+                    )
+                    OR (
+                        status IN ('completed', 'failed', 'canceled')
+                        AND {changed_predicate}
+                    )
+                  )
+            ORDER BY created_at ASC
+            """,
+            (
+                recipient_agent_id,
+                self.to_timestamp_param(live_changed_since),
+                self.to_timestamp_param(terminal_changed_since),
+            ),
+        )
+        candidates: list[TaskCognitionWakeCandidate] = []
+        for row in rows:
+            lifecycle_revision = int(row[18])
+            if lifecycle_revision < 0:
+                raise RuntimeError("A2A wake candidate has a negative lifecycle revision")
+            candidates.append(
+                TaskCognitionWakeCandidate(
+                    task=self._row_to_task(row),
+                    lifecycle_revision=lifecycle_revision,
+                )
+            )
+        return candidates
 
     async def delete(self, task_id: str) -> bool:
         """Delete a task. Returns True if deleted."""
@@ -1067,7 +1244,7 @@ class TaskStore(UnifiedStoreBase):
         9: created_at, 10: updated_at, 11: creator_agent_id,
         12: recipient_agent_id, 13: canceled_by, 14: cancel_reason,
         15: cancel_previous_status, 16: cancel_operation_id,
-        17: terminal_operation_id
+        17: terminal_operation_id, 18: lifecycle_revision
         """
         artifacts_data = json_loads(row[6]) if row[6] else []
         history_data = json_loads(row[7]) if row[7] else []

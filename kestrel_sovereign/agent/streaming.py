@@ -5,10 +5,15 @@ import json
 import logging
 import time
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
+from kestrel_sovereign._async_ownership import (
+    OwnedTaskOutcome,
+    await_owned_task,
+    raise_owned_outcome,
+)
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.hooks.manager import _hook_is_enforcing
 from kestrel_sdk.llm import ToolCallStarted
@@ -23,6 +28,7 @@ from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     bind_async_generator_invocation,
     current_invocation_id,
+    mark_current_invocation_effect_checkpointed,
 )
 from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.semantic_recall import persistence_dependency_metadata
@@ -32,14 +38,22 @@ from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
     check_prompt_injection,
 )
+from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
+    capture_turn_ids,
     start_span,
-    end_span,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredToolBatchCancellation:
+    """Carry Stop across the streaming turn's history checkpoint."""
+
+    outcome: OwnedTaskOutcome[Any]
 
 
 def resolve_turn_invocation_context(
@@ -736,6 +750,24 @@ STRICT_AUDIT_CONTINUATION_TIMEOUT_BLOCK = (
     "content was released. Please try again."
 )
 
+# A Stop that lands inside an already-running tool batch cannot erase the fact
+# that the external action completed. Strict audit still forbids persisting the
+# model/tool bytes, so record a fixed host-authored checkpoint instead. It is
+# safe to replay into the next turn and explicitly prevents the model from
+# treating the cancelled, otherwise-empty assistant row as permission to repeat
+# a send/payment/write automatically.
+STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT = (
+    "A tool batch completed before this request was stopped. Its details were "
+    "withheld by response-audit policy. Do not repeat the completed action "
+    "automatically."
+)
+_STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA = {
+    "tool_batch_checkpoint": {
+        "status": "completed",
+        "details_withheld": True,
+    }
+}
+
 
 def _strict_audit_release(final_text: str) -> list:
     """Post-verdict release for a strict (enforcing) buffered turn (#2674).
@@ -914,7 +946,9 @@ class StreamingMixin:
             images.append(data)
         return images
 
-    @bind_async_generator_invocation("request_id")
+    @bind_async_generator_invocation(
+        "request_id", track_request_lifecycle=True
+    )
     async def process_input_streaming(
         self,
         user_input: str,
@@ -955,9 +989,11 @@ class StreamingMixin:
         whole unaudited metadata envelope on persist — parts, pre_tool_reasoning,
         tool_events and tool_results — on ALLOW as much as on DENY, and suppresses
         the out-of-band ``revising`` SSE event while sanitizing the STOP hook's
-        tool_calls/tool_results (#2674). So the live stream, the persisted row,
-        the reloaded turn and every hook side channel all carry the reviewed prose
-        ONLY — nothing the audit did not see. That trades real-time token delivery
+        tool_calls/tool_results (#2674). The one non-model exception is a fixed,
+        host-authored completion checkpoint when Stop interrupts an already-running
+        side-effecting batch; it contains no tool bytes and prevents automatic
+        repetition. Otherwise the live stream, persisted row, reload and hook side
+        channels carry reviewed prose ONLY. That trades real-time token delivery
         (and live tool/part cards, which no longer survive a buffered turn) for
         the integrity gate. With audit disabled, or in advisory/warn mode,
         streaming stays fully incremental and this method's behavior is unchanged.
@@ -980,6 +1016,16 @@ class StreamingMixin:
             invocation_provenance: Endpoint-owned authenticated actor and
                 transport metadata bound task-locally for governed tools.
         """
+        from kestrel_sovereign.hold import require_turn_start_allowed
+        from kestrel_sovereign.hold.enforcement import (
+            _reuse_turn_admission_snapshot,
+        )
+
+        # Match ``process_input`` at the universal turn-start seam. Raising a
+        # typed refusal before the first yield lets each source preserve its
+        # transport semantics without rendering agent-authored rejection text.
+        hold_admission = await require_turn_start_allowed(self)
+
         # Match process_input's retryable pre-initialization behavior. Without
         # storage there is no durable genesis receipt to inspect yet.
         if getattr(self, "storage", None) is None:
@@ -1003,25 +1049,13 @@ class StreamingMixin:
         # same constitutional boundary as process_input. Commands delegate
         # below so Sovereign recovery remains available; ordinary cognition is
         # refused before a turn lock, context build, or LLM stream can start.
-        safe_mode = getattr(self, "_safe_mode", False) is True
-        audit_pending = (
-            getattr(self, "_constitution_audit_pending", False) is True
+        from kestrel_sovereign.agent.constitution import (
+            safe_mode_cognition_block,
         )
-        if (safe_mode or audit_pending) and not user_input.startswith("!"):
-            from kestrel_sovereign.agent.constitution import (
-                describe_safe_mode_restriction,
-            )
 
-            restriction = describe_safe_mode_restriction(
-                self, audit_pending=audit_pending
-            )
-            yield (
-                "🚨 SAFE MODE ACTIVE\n\n"
-                f"The agent cannot process queries due to {restriction}.\n"
-                "Use !safe-mode to check status or !verify-constitution to "
-                "re-verify.\n\n"
-                "Normal operation will resume once the restriction is cleared."
-            )
+        safe_mode_block = safe_mode_cognition_block(self, user_input)
+        if safe_mode_block is not None:
+            yield safe_mode_block
             return
 
         # Commands are not streamable - delegate to non-streaming handler.
@@ -1070,14 +1104,15 @@ class StreamingMixin:
                 # (test_streaming_audit asserts it) — invocation_context
                 # rides as a trailing kwarg. Codex round-1 P1 backwards-compat.
                 try:
-                    result = await self.process_input(
-                        user_input,
-                        model_override,
-                        session_id=session_id,
-                        caller=caller,
-                        invocation_context=invocation_context,
-                        invocation_id=current_invocation_id(),
-                    )
+                    with _reuse_turn_admission_snapshot(self, hold_admission):
+                        result = await self.process_input(
+                            user_input,
+                            model_override,
+                            session_id=session_id,
+                            caller=caller,
+                            invocation_context=invocation_context,
+                            invocation_id=current_invocation_id(),
+                        )
                 except InvocationCancelledError:
                     # The command delegate owns an isolated child so Stop does
                     # not cancel a persistent transport task. Its typed unwind
@@ -1113,33 +1148,70 @@ class StreamingMixin:
             "agent.streaming": True,
         })
 
-        try:
-            # Lock order — CONVERSATION (via _turn_lifecycle) BEFORE the privacy
-            # transition lock — is the deadlock-freedom invariant. The in-turn
-            # `!privacy` path runs inside process_input, which already holds
-            # CONVERSATION and then acquires the transition lock; acquiring in the
-            # same order here means no two callers can take this pair in opposite
-            # directions (the AB-BA wedge this replaces, where streaming took the
-            # transition lock first and then blocked on CONVERSATION).
-            async with self._turn_lifecycle():
-                transition_lock = self._get_privacy_transition_lock()
-                async with transition_lock:
-                    # #1914: bind a per-turn part buffer so tools/features can
-                    # ``emit_part`` typed component bubbles; the orchestrator
-                    # drains it into PART sentinels at the point each tool ran.
-                    with part_collector():
-                        async for chunk in self._process_input_streaming_traced_locked(
-                            user_input, model_override, session_id, _otel_span,
-                            request_id=request_id, attachments=attachments,
-                            invocation_context=invocation_context,
-                        ):
-                            yield chunk
-        except Exception as exc:
-            end_span(_otel_span, error=exc)
-            raise
-        else:
-            end_span(_otel_span)
-            return
+        # #3159: EVERY exit ends this span, and says how the turn ended.
+        #
+        # The pair this replaces was `except Exception` / `else`, which missed
+        # three whole classes of exit: `CancelledError` (what a hard Stop or a
+        # host shutdown raises), `GeneratorExit` (what a consumer that walked
+        # away raises), and the safe-mode early `return` below — because a
+        # `return` inside `try` skips `else`. Each of those left the span open
+        # and unexported, so a stopped turn and a disconnected one both read as
+        # "nothing arrived".
+        #
+        # `capture_turn_ids` records the canonical turn address as the
+        # lifecycle mints it, which is the only way to still know it out here:
+        # the lifecycle resets that scope on the way out, and the durable
+        # pre-admission Stop raises from INSIDE it, after the address exists.
+        _turn_error: BaseException | None = None
+        with capture_turn_ids() as _turn_ids:
+            try:
+                # Lock order — CONVERSATION (via _turn_lifecycle) BEFORE the privacy
+                # transition lock — is the deadlock-freedom invariant. The in-turn
+                # `!privacy` path runs inside process_input, which already holds
+                # CONVERSATION and then acquires the transition lock; acquiring in the
+                # same order here means no two callers can take this pair in opposite
+                # directions (the AB-BA wedge this replaces, where streaming took the
+                # transition lock first and then blocked on CONVERSATION).
+                async with self._turn_lifecycle():
+                    # `start_span` precedes lifecycle acquisition so setup failures
+                    # remain observable. Bind its concrete identity only once the
+                    # canonical turn address exists; a feature-owned turn root may
+                    # supersede this optional correlation at USER_PROMPT_SUBMIT.
+                    self.bind_current_turn_span(_otel_span)
+                    safe_mode_block = safe_mode_cognition_block(self, user_input)
+                    if safe_mode_block is not None:
+                        # A refusal the agent delivered is a turn that ran to
+                        # its own end, so it is `completed` — the outcome
+                        # separates HOW a turn ended, not whether its answer
+                        # was the one the caller wanted.
+                        yield safe_mode_block
+                        return
+                    transition_lock = self._get_privacy_transition_lock()
+                    async with transition_lock:
+                        # #1914: bind a per-turn part buffer so tools/features can
+                        # ``emit_part`` typed component bubbles; the orchestrator
+                        # drains it into PART sentinels at the point each tool ran.
+                        with part_collector():
+                            async for chunk in self._process_input_streaming_traced_locked(
+                                user_input, model_override, session_id, _otel_span,
+                                request_id=request_id, attachments=attachments,
+                                invocation_context=invocation_context,
+                            ):
+                                yield chunk
+            except BaseException as exc:
+                _turn_error = exc
+                raise
+            finally:
+                # Synchronous only: this also runs while `GeneratorExit` is
+                # propagating, where an await would raise RuntimeError and
+                # swallow the very exit it is here to record.
+                try:
+                    settle_turn_outcome(
+                        self, _otel_span, _turn_ids, _turn_error
+                    )
+                finally:
+                    if _otel_span is not None:
+                        _otel_span.end()
 
     async def _process_input_streaming_traced_locked(
         self, user_input, model_override, session_id, _otel_span,
@@ -1749,6 +1821,38 @@ class StreamingMixin:
             # stripped, so the orchestrator sets ``timed_out`` here instead and we
             # substitute a deterministic safe block below.
             strict_timeout_state: Dict[str, Any] = {}
+            deferred_tool_batch_cancellation: Optional[
+                _DeferredToolBatchCancellation
+            ] = None
+
+            def tool_batch_completed() -> bool:
+                # ``tool_results`` is populated only after each dispatch returns;
+                # the deferred marker covers the narrower cancellation race where
+                # the owned batch completed but its result channel is unexpectedly
+                # empty. Either is evidence that persistence is now load-bearing.
+                return bool(
+                    deferred_tool_batch_cancellation is not None or tool_results
+                )
+
+            async def persist_strict_cancelled_tool_turn() -> None:
+                checkpointed_batch = tool_batch_completed()
+                await self._persist_assistant_turn_safely(
+                    (
+                        STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT
+                        if checkpointed_batch
+                        else ""
+                    ),
+                    metadata=(
+                        _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA
+                        if checkpointed_batch
+                        else None
+                    ),
+                    session_id=session_id,
+                    request_id=request_id,
+                    response=tool_response,
+                    require_success=checkpointed_batch,
+                )
+
             async for chunk in self._handle_orchestrator_response_streaming(
                 response=tool_response,
                 feature_tools=feature_tools,
@@ -1774,6 +1878,11 @@ class StreamingMixin:
                 # speech for dispatched subagents.
                 continuation_user_content=prompt + lazy_hint,
             ):
+                if isinstance(chunk, _DeferredToolBatchCancellation):
+                    deferred_tool_batch_cancellation = chunk
+                    # Resume once so the inner async generator reaches its return
+                    # after the marker instead of leaving cleanup to finalization.
+                    continue
                 if isinstance(chunk, ThinkingDelta):
                     if not buffer_audit:
                         yield _build_thinking_sentinel(chunk)
@@ -1791,11 +1900,12 @@ class StreamingMixin:
             # #2674 finding 2: a strict (buffered) POST-TOOL continuation stopped
             # before its reviewed release withheld every byte and never audited
             # the partial synthesis. Discard the whole withheld buffer (prose,
-            # parts, tool_events, tool_results) and persist an EMPTY cancelled row
-            # — matching the strict cancel-before-dispatch path — instead of
-            # persisting the unfinished synthesis (which would resurface on reload
-            # and replay into the next turn's context). Nothing is released, so the
-            # endpoint surfaces its standard stop notice exactly once. Return
+            # parts, tool_events, tool_results). Ordinarily persist an EMPTY
+            # cancelled row, matching strict cancel-before-dispatch. If Stop
+            # interrupted an already-running batch, persist the fixed host-authored
+            # completion checkpoint instead: it reveals no tool bytes but prevents
+            # the next turn from repeating an external effect. Nothing is released,
+            # so the endpoint surfaces its standard stop notice exactly once. Return
             # before the audit fire / STOP hook / memory pipeline, none of which
             # should run over discarded content. Advisory turns already streamed
             # their partial, so this is gated on ``buffer_audit``. Inlined (not a
@@ -1805,10 +1915,12 @@ class StreamingMixin:
             if buffer_audit and request_id and self.is_request_cancelled(
                 request_id
             ):
-                await self._persist_assistant_turn_safely(
-                    "", metadata=None, session_id=session_id,
-                    request_id=request_id, response=tool_response,
-                )
+                await persist_strict_cancelled_tool_turn()
+                if deferred_tool_batch_cancellation is not None:
+                    raise_owned_outcome(
+                        deferred_tool_batch_cancellation.outcome,
+                        operation="side-effecting orchestrator tool batch",
+                    )
                 return
             # #2674 finding 2: a strict (buffered) continuation that TIMED OUT
             # withheld every byte and yielded no reviewable text. Discard the
@@ -1924,10 +2036,19 @@ class StreamingMixin:
             if buffer_audit and request_id and self.is_request_cancelled(
                 request_id
             ):
-                await self._persist_assistant_turn_safely(
-                    "", metadata=None, session_id=session_id,
-                    request_id=request_id, response=tool_response,
-                )
+                await persist_strict_cancelled_tool_turn()
+                # A Stop that registers DURING the post-response hook reaches
+                # this gate with a batch cancellation the first gate could not
+                # yet see. Returning here without re-raising it swallows the
+                # owner's CancelledError: the request is cleaned up as
+                # COMPLETED rather than STOPPED, and the durable delivery is
+                # ACKed as an ordinary success. The gates on either side of
+                # this one both re-raise; this one has to as well.
+                if deferred_tool_batch_cancellation is not None:
+                    raise_owned_outcome(
+                        deferred_tool_batch_cancellation.outcome,
+                        operation="side-effecting orchestrator tool batch",
+                    )
                 return
             # #2674: read the EXPLICIT audit verdict, not string equality.
             audit_denied = getattr(tool_final_text, "denied", False)
@@ -2009,7 +2130,13 @@ class StreamingMixin:
                 session_id=session_id,
                 request_id=request_id,
                 response=tool_response,
+                require_success=tool_batch_completed(),
             )
+            if deferred_tool_batch_cancellation is not None:
+                raise_owned_outcome(
+                    deferred_tool_batch_cancellation.outcome,
+                    operation="side-effecting orchestrator tool batch",
+                )
             # #2674: strict-audit release. Nothing visible was streamed live this
             # turn; now that the POST_RESPONSE verdict exists, release ONLY the
             # reviewed text (block message on DENY, reviewed prose on
@@ -2047,6 +2174,16 @@ class StreamingMixin:
             else:
                 stop_tool_calls = None
         elif inline_executed:
+            async def persist_strict_cancelled_inline_turn() -> None:
+                await self._persist_assistant_turn_safely(
+                    STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+                    metadata=_STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
+                    session_id=session_id,
+                    request_id=request_id,
+                    response=tool_response,
+                    require_success=True,
+                )
+
             # #2674 finding 2: a strict (buffered) inline-executed turn stopped
             # before its reviewed release withheld every byte and never audited
             # the synthesis. Discard the withheld buffer and persist an EMPTY
@@ -2057,10 +2194,7 @@ class StreamingMixin:
             if buffer_audit and request_id and self.is_request_cancelled(
                 request_id
             ):
-                await self._persist_assistant_turn_safely(
-                    "", metadata=None, session_id=session_id,
-                    request_id=request_id, response=tool_response,
-                )
+                await persist_strict_cancelled_inline_turn()
                 return
             # Inline-executed branch: the adapter ran tools mid-call
             # (codex app-server's item/tool/call RPC). No
@@ -2172,10 +2306,7 @@ class StreamingMixin:
             if buffer_audit and request_id and self.is_request_cancelled(
                 request_id
             ):
-                await self._persist_assistant_turn_safely(
-                    "", metadata=None, session_id=session_id,
-                    request_id=request_id, response=tool_response,
-                )
+                await persist_strict_cancelled_inline_turn()
                 return
             # #2674: read the EXPLICIT audit verdict, not string equality.
             inline_denied = getattr(final_text, "denied", False)
@@ -2231,6 +2362,7 @@ class StreamingMixin:
                 ),
                 session_id=session_id, request_id=request_id,
                 response=tool_response,
+                require_success=True,
             )
             # #2674: strict-audit release (inline-executed path) — only the
             # reviewed text; the withheld raw buffer is never replayed.
@@ -2464,6 +2596,7 @@ class StreamingMixin:
         response: Optional[LLMResponse] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
+        require_success: bool = False,
     ) -> None:
         """Persist the assistant turn under cancellation-safe handling.
 
@@ -2475,12 +2608,14 @@ class StreamingMixin:
         but the next turn's history loader can't find it. Surfaced by
         Meridian's "I don't see my own quantum response" report.
 
-        ``asyncio.shield`` keeps the persist task alive even when the
-        outer generator is cancelled. The exception handler logs and
+        An explicitly owned task keeps persistence alive and is joined even
+        when the outer generator is cancelled. The exception handler logs and
         emits a metric so production can detect this happening at all.
-        We never re-raise — the request is already over from the
-        client's perspective; raising here would only mask the original
-        cancellation.
+        Ordinary post-response writes remain best-effort because the response
+        may already be visible to the client. ``require_success`` is reserved
+        for a completed side-effecting tool batch: losing that checkpoint can
+        make a retry repeat the external action, so its storage failure is
+        propagated after telemetry instead of being mistaken for a clean Stop.
 
         When ``request_id`` is supplied and the request has been
         cancelled by the user (stop button), stamp ``cancelled: True``
@@ -2509,27 +2644,27 @@ class StreamingMixin:
             kwargs["model"] = resolved_model
         if resolved_provider is not None:
             kwargs["provider"] = resolved_provider
-        try:
-            await asyncio.shield(
-                self.privacy_agent.add_conversation(
-                    "assistant",
-                    text,
-                    **kwargs,
-                )
-            )
-        except asyncio.CancelledError:
-            # Outer task cancelled mid-persist. shield() means the
-            # add_conversation coroutine keeps running to completion in
-            # the background — we just don't get to await it. Re-raise
-            # so the cancellation propagates correctly.
-            raise
-        except Exception as exc:
+        persistence = asyncio.create_task(
+            self.privacy_agent.add_conversation(
+                "assistant",
+                text,
+                **kwargs,
+            ),
+            name="persist-assistant-turn",
+        )
+        outcome = await await_owned_task(persistence)
+        pending_cancellation = outcome.cancellation
+        if outcome.error is not None and not isinstance(
+            outcome.error,
+            asyncio.CancelledError,
+        ):
+            exc = outcome.error
             logging.error(
                 "Failed to persist assistant turn (session_id=%s): %s",
                 session_id, exc, exc_info=True,
             )
-            try:
-                await self.observability_store.log_metric(
+            telemetry = asyncio.create_task(
+                self.observability_store.log_metric(
                     agent_name=self.did,
                     metric_name="assistant_turn_persist_failed",
                     metric_value=1.0,
@@ -2538,13 +2673,41 @@ class StreamingMixin:
                         "error_type": type(exc).__name__,
                         "error_msg": str(exc)[:500],
                     },
-                )
-            except Exception:
+                ),
+                name="assistant-turn-persist-failure-telemetry",
+            )
+            telemetry_outcome = await await_owned_task(
+                telemetry,
+                pending_cancellation,
+            )
+            pending_cancellation = telemetry_outcome.cancellation
+            if (
+                telemetry_outcome.error is not None
+                and not isinstance(telemetry_outcome.error, asyncio.CancelledError)
+            ):
                 # Telemetry failures must never propagate from a
                 # post-response persist path. If observability is also
                 # broken, the logged ERROR above is the last line of
                 # defense.
                 pass
+        # A required checkpoint is the evidence that makes a completed
+        # external effect safe to stop/retry.  Its storage failure must win
+        # over a simultaneously pending caller cancellation: reporting only
+        # CancelledError would let the Stop lifecycle acknowledge a clean
+        # unwind even though the anti-repeat record never became durable.
+        if require_success and outcome.error is not None:
+            if pending_cancellation is not None:
+                outcome.error.add_note(
+                    "caller cancellation remained pending while the required "
+                    "assistant-turn checkpoint failed"
+                )
+            raise outcome.error
+        if outcome.error is None:
+            mark_current_invocation_effect_checkpointed()
+        if pending_cancellation is not None:
+            raise pending_cancellation
+        if isinstance(outcome.error, asyncio.CancelledError):
+            raise outcome.error
 
     async def _fire_post_response_hook(
         self,

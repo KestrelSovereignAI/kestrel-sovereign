@@ -84,6 +84,10 @@ AGENT_DEPENDENT_ROUTES = [
     ("GET", "/v1/models"),
     ("GET", "/api/storage/stats"),
     ("GET", "/api/sovereignty/exports"),
+    # The file browser binds to the routed agent's receipts (#3225).
+    ("GET", "/api/sovereignty/files"),
+    ("GET", "/api/sovereignty/files/some.cache"),
+    ("GET", "/api/sovereignty/files/some.cache/preview"),
 ]
 
 

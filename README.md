@@ -133,10 +133,11 @@ with `umask 077` so DB sidecars are private at creation. An insecure or
 ambiguous legacy store disables local tracing before the OTLP endpoint is
 auto-wired. See [Phoenix trace custody](docs/architecture/security/PHOENIX_TRACE_CUSTODY.md).
 
-Fleet-wide host-feature state uses the same private host-data root, in
-`host-features.db`, rather than writing `kestrel_host.db` into whichever source
-checkout launched the host. The directory is `0700`; the database and its
-SQLite WAL/SHM/journal family are `0600` from creation. An explicit
+Fleet-wide host-feature state lives in `host-data/host-features.db`, rather than
+writing `kestrel_host.db` into whichever source checkout launched the host. It
+follows the effective `KESTREL_DB_PATH` when that agent-data root is set, and
+otherwise uses the private host-data root. The directory is `0700`; the database
+and its SQLite WAL/SHM/journal family are `0600` from creation. An explicit
 `KESTREL_HOST_DB_PATH` remains supported when its parent is a dedicated `0700`
 directory. This feature-state database is intentionally separate from the
 payment/key vault at `agent_data/host.db`; Kestrel never falls back or copies
@@ -151,7 +152,7 @@ Your agent is now running. Two ports to know about, depending on which start for
 
 > **Port conflict?** Edit the agent's entry in `multi_agent.toml` to change its port, or recreate the agent with a chosen port (`kestrel create MyAgent --port 8899`). Edit `multi_agent.toml`'s `[host]` section to change the host port (default `8888`). `kestrel start` itself doesn't take a `--port` flag — runtime ports are read from `multi_agent.toml`.
 
-> **Test it:** Visit the URL the CLI printed on start (`http://localhost:8888` for the multi-agent host, or whatever per-agent port `kestrel start <name>` reported). The Sovereign Console is the default page; append `/health` for the public aggregate JSON readiness probe. Full `/health/detailed` diagnostics require the normal API key, JWT, or OAuth session.
+> **Test it:** Visit the URL the CLI printed on start (`http://localhost:8888` for the multi-agent host, or whatever per-agent port `kestrel start <name>` reported). The Sovereign Console is the default page. On a fresh multi-agent browser session, enter the `KESTREL_API_KEY` stored in the project `.env`; the password-style handoff keeps it out of URLs and launcher logs. Append `/health` for the public aggregate JSON readiness probe. Full `/health/detailed` diagnostics require the normal API key, JWT, or OAuth session.
 
 > **Windows users:** the CLI prints emoji. If you see `UnicodeEncodeError: 'charmap' codec can't encode character ...`, run `chcp 65001` once in your PowerShell session to switch the console to UTF-8. (As of v0.1.9 the CLI auto-reconfigures stdout, so a fresh install should not hit this.)
 
@@ -180,12 +181,21 @@ The default uv compute executor requires the Kestrel process itself to run
 inside a Python `venv` or `virtualenv`. This lets it pin an interpreter outside
 Kestrel's runtime while `uv run --isolated --no-project` creates a fresh,
 project-free script environment, so scripts cannot inherit Kestrel's installed
-packages. `uv tool install` and the source checkout's `uv sync` satisfy this
-automatically. For a plain pip installation, create and activate a Python
-virtual environment first. A system or `--user` install can run Kestrel, but
-the uv compute executor deliberately reports unavailable. A Conda environment
-alone is also insufficient because it does not provide the distinct
-`sys.prefix`/`sys.base_prefix` boundary this executor validates.
+packages. On Linux it also requires `bwrap` (bubblewrap). Linux compute receives
+a read-only view of the host filesystem, with only its freshly allocated
+executor workspace reopened for writes, plus a private PID/proc namespace;
+an external hard-link alias therefore cannot bypass Hold custody by using
+another pathname, including from native extensions rather than Python file
+APIs. `uv tool install` and the source checkout's `uv sync` satisfy the
+virtual environment requirement automatically. For a plain pip installation,
+create and activate a Python virtual environment first. A system or `--user`
+install or a Linux host without bubblewrap can run Kestrel, but the uv compute
+executor deliberately reports unavailable. It is also unavailable on macOS:
+Seatbelt path rules cannot make pre-existing external hard-link aliases to a
+protected inode read-only. Use the Docker
+executor there. A Conda environment alone is also insufficient because it does
+not provide the distinct `sys.prefix`/`sys.base_prefix` boundary this executor
+validates.
 
 **Where data lives.** `kestrel` resolves the project directory in this order: `KESTREL_HOME` → walk up from CWD looking for a `multi_agent.toml` / `kestrel.toml` / `.env` marker → `~/.kestrel/` for pip-installed users with no markers anywhere. A pure pip install with no `KESTREL_HOME` and no project in CWD lands on `~/.kestrel/` and creates it on first run. **Never** writes to `site-packages/` — `pip install --upgrade kestrel-sovereign` is safe and won't touch your agent data.
 
@@ -207,8 +217,10 @@ All commands work on Windows, macOS, and Linux. Pass the agent directory as an a
 kestrel doctor                       # Check prerequisites and readiness
 kestrel create MyAgent               # Create a new agent
 kestrel start MyAgent                # Start an agent
+kestrel stop MyAgent                 # Cooperatively stop in-flight work
+kestrel stop --all                   # Cooperatively stop all in-flight work
 kestrel terminate MyAgent            # Terminate an agent process
-kestrel restart MyAgent              # Restart (stop then start)
+kestrel restart MyAgent              # Restart (terminate then start)
 kestrel update [MyAgent]             # Pull + install + feature sync + restart (see below)
 kestrel status                       # Show all running agents
 kestrel list                         # List available agents
@@ -308,20 +320,23 @@ traffic with `KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE` and
 positive integers. These are independent host budgets: scheduler effect gates
 use the scheduler host's own storage pool, not the agents' advisory pool.
 
-#### SDK 0.37 release cascade
+#### SDK 0.37–0.38 release cascade
 
-Core requires `kestrel-sovereign-sdk[tracing]>=0.37.0,<0.38`; the
+Core requires `kestrel-sovereign-sdk[tracing]>=0.37.1,<0.39`; the
 `observability` extra carries the same SDK line with `metrics`. This is a
 runtime contract for durable isolated execution, provider-neutral private
 inference leases (including bounded owner-scoped idle renewal), and private
-host ingress, plus feature-owned operator contribution contracts. It is not a
-preference that a downstream package may relax. The Core-owned release-cascade
-contract is:
+host ingress, plus feature-owned operator and context-clause contribution
+contracts. SDK 0.38.1 adds the optional awaited preparation hook that Core
+invokes before synchronously rendering a context-clause batch; Core continues
+to resolve that hook defensively for features built against 0.37.1. It is not
+a preference that a downstream package may relax. The Core-owned
+release-cascade contract is:
 
 | Downstream release gate | Required published SDK constraint before Core ships | Core assertion |
 |---|---|---|
-| Frinz | `kestrel-sovereign-sdk>=0.37.0,<0.38` | External prerequisite; Core does not claim Frinz has changed. |
-| Observability fleet | `kestrel-sovereign-sdk>=0.37.0,<0.38` | External prerequisite; Core does not claim observability has changed. |
+| Frinz | `kestrel-sovereign-sdk>=0.37.1,<0.38` | External prerequisite; Core does not claim Frinz has changed. |
+| Observability fleet | `kestrel-sovereign-sdk>=0.37.1,<0.38` | External prerequisite; Core does not claim observability has changed. |
 
 Verify the published Frinz and observability constraints and tests before the
 Core publish. Do not weaken Core's requirement to make an older sibling
@@ -481,7 +496,7 @@ the complete precedence and managed-container behavior.
 <a id="web-ui-sovereign-console"></a>
 ## 🖥️ Web UI (Sovereign Console)
 
-Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open the URL the CLI printed on start — `http://localhost:8888` for the multi-agent host (default `kestrel start` mode), or the per-agent port for a single-agent start — in any browser; no additional software required.
+Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open the URL the CLI printed on start — `http://localhost:8888` for the multi-agent host (default `kestrel start` mode), or the per-agent port for a single-agent start — in any browser; no additional software required. A fresh multi-agent browser session asks for the project `.env`'s `KESTREL_API_KEY` in a password field and retains it only in that tab's session storage.
 
 The built-in console exposes the following panels; installed features may add
 their own contributions:

@@ -386,6 +386,7 @@ class ElasticTokenBudget(AdaptiveTokenBudget):
         if mandatory_system_tokens < 0:
             raise ValueError("mandatory_system_tokens must be non-negative")
         self._mandatory_system_tokens = mandatory_system_tokens
+        self._external_reserved_tokens: int = 0
         self._elastic_pool: int = 0
         self._finalized: set = set()
         # Validate priority: dedupe, strip non-trimmable / unknown
@@ -471,6 +472,70 @@ class ElasticTokenBudget(AdaptiveTokenBudget):
                     ),
                 )
             system_alloc.budget = self._mandatory_system_tokens
+
+    def reserve_external(self, tokens: int) -> None:
+        """Remove an LLM payload component from every allocatable slice.
+
+        Tool schemas are not a context section, but they occupy the same model
+        window. Reserving them only from ``system`` leaves history/RAG/memory
+        allocations and the later elastic pool free to spend the same tokens.
+        This pre-use operation reduces the complete allocation set while
+        preserving the mandatory system floor.
+        """
+
+        if tokens < 0:
+            raise ValueError("external reserved tokens must be non-negative")
+        if tokens == 0:
+            return
+        if self.total_used or self._finalized or self._elastic_pool:
+            raise RuntimeError(
+                "external payload tokens must be reserved before section use"
+            )
+        total_reserved = self._external_reserved_tokens + tokens
+        if self._mandatory_system_tokens + total_reserved > self.total_budget:
+            raise DegradedModeError(
+                self._mandatory_system_tokens,
+                self.total_budget,
+                self.model,
+                detail=(
+                    "mandatory floor plus external payload reserve "
+                    f"({total_reserved} tokens) exceeds the post-response budget"
+                ),
+            )
+
+        # Integer percentage allocations can leave a few tokens unassigned.
+        # Consume that gap first, then trim real slices only by the remainder.
+        reduction = max(
+            0,
+            sum(allocation.budget for allocation in self.allocations.values())
+            + total_reserved
+            - self.total_budget,
+        )
+        for source in reversed(self._priority):
+            if reduction <= 0:
+                break
+            allocation = self.allocations[source]
+            give = min(reduction, allocation.budget)
+            allocation.budget -= give
+            reduction -= give
+
+        if reduction > 0:
+            system = self.allocations["system"]
+            give = min(
+                reduction,
+                max(0, system.budget - self._mandatory_system_tokens),
+            )
+            system.budget -= give
+            reduction -= give
+
+        if reduction > 0:  # Defensive: the floor+reserve check proves this false.
+            raise DegradedModeError(
+                self._mandatory_system_tokens,
+                self.total_budget,
+                self.model,
+                detail=f"external payload reservation remains {reduction} tokens short",
+            )
+        self._external_reserved_tokens = total_reserved
 
     def can_fit(self, source: str, tokens: int) -> bool:
         """Allow borrowing from the elastic pool when the source's own
@@ -612,6 +677,7 @@ class ElasticTokenBudget(AdaptiveTokenBudget):
     def get_summary(self) -> dict:
         summary = super().get_summary()
         summary["mandatory_system_tokens"] = self._mandatory_system_tokens
+        summary["external_reserved_tokens"] = self._external_reserved_tokens
         summary["elastic_pool_remaining"] = self._elastic_pool
         summary["elastic_priority"] = list(self._priority)
         summary["finalized_sections"] = sorted(self._finalized)

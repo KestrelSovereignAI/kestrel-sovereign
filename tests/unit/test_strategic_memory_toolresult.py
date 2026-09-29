@@ -495,3 +495,227 @@ def test_strategic_memory_passes_toolresult_contract():
 
     feat = StrategicMemoryFeature(agent=MagicMock())
     assert_feature_returns_tool_result(feat)
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_invalid_mode_names_a_reason_code():
+    """The sixth failed return of the tool #3184 is about. The other five
+    carry a reason_code; a scheduled row whose args_json holds a bad mode
+    failed with none, so its dispatch failure read as cause-free."""
+    feat = _make_feature({}, agent=_dispatch_agent(registration=None))
+
+    result = await feat.signal_dispatch(mode="bogus")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["reason_code"] == "INVALID_DISPATCH_MODE"
+    assert result.data["dispatched"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["execute", "suggest"])
+async def test_signal_dispatch_does_not_call_an_unreachable_github_nothing_to_do(mode):
+    """#3280 review. Selection now asks GitHub before dispatching a blocker, so
+    it can fail on a network fault where it never could before. When every
+    blocker it tried came back unreadable, "No actionable issue found" would be
+    a claim about a ledger nobody looked at -- the same lie blocker_reconcile
+    is written to avoid."""
+    agent = _dispatch_agent(registration=None)
+    feat = _make_feature({}, agent=agent)
+
+    async def unreachable(view, diagnostics=None):
+        diagnostics.update(blockers_checked=3, blockers_unreadable=3)
+        return None
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=unreachable,
+    ):
+        result = await feat.signal_dispatch(mode=mode)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["reason_code"] == "BLOCKERS_UNCONFIRMED"
+    assert result.data["dispatched"] is False
+    assert "No actionable issue found" not in result.confirmation
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_still_says_nothing_to_do_when_github_answered():
+    """The control: blockers GitHub answered for -- closed, say -- are a real
+    answer, and an empty result then really is nothing to do."""
+    agent = _dispatch_agent(registration=None)
+    feat = _make_feature({}, agent=agent)
+
+    async def all_closed(view, diagnostics=None):
+        diagnostics.update(blockers_checked=3, blockers_unreadable=0)
+        return None
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=all_closed,
+    ):
+        result = await feat.signal_dispatch()
+
+    assert result.status is ToolResultStatus.OK
+    assert "No actionable issue found" in result.confirmation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["execute", "suggest"])
+async def test_signal_dispatch_does_not_call_unreadable_candidate_linkage_nothing_to_do(
+    mode, monkeypatch
+):
+    """#3367 acceptance, through the real selector: every backlog candidate's
+    PR-linkage read returns None. Nothing may be dispatched, and an outage
+    must not render as "No actionable issue found" with an OK status."""
+    from kestrel_sovereign.features.strategic_memory import issue_selection
+
+    monkeypatch.setattr(issue_selection, "get_github_token", lambda: "token")
+
+    async def fake_get(path, token):
+        if path == "/repos/o/r/issues?state=open&per_page=5&sort=updated":
+            return [
+                {"number": 1, "title": "a", "state": "open", "labels": []},
+                {"number": 2, "title": "b", "state": "open", "labels": []},
+            ]
+        raise RuntimeError(f"404 {path}")
+
+    async def unreadable_linkage(path, token, body):
+        return None
+
+    monkeypatch.setattr(issue_selection, "github_api_get", fake_get)
+    monkeypatch.setattr(issue_selection, "github_api_post", unreadable_linkage)
+    agent = _dispatch_agent(registration=SimpleNamespace(owner="feature:x"))
+    feat = _make_feature(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}}, agent=agent
+    )
+
+    result = await feat.signal_dispatch(mode=mode)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["reason_code"] == "CANDIDATES_UNCONFIRMED"
+    assert result.data["candidates_checked"] == 2
+    assert result.data["candidates_unreadable"] == 2
+    assert result.data["dispatched"] is False
+    assert "No actionable issue found" not in result.confirmation
+    assert "could not say" in result.confirmation
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_one_unreadable_candidate_is_still_unconfirmed():
+    """Candidates GitHub answered for (open PRs) plus one it could not: the
+    unreadable one is why nothing was picked, so the result is not OK."""
+    agent = _dispatch_agent(registration=None)
+    feat = _make_feature({}, agent=agent)
+
+    async def mixed(view, diagnostics=None):
+        diagnostics.update(
+            blockers_checked=0, candidates_checked=3, candidates_unreadable=1,
+        )
+        return None
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=mixed,
+    ):
+        result = await feat.signal_dispatch()
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["reason_code"] == "CANDIDATES_UNCONFIRMED"
+    assert "1 of 3" in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_says_nothing_to_do_when_candidate_linkage_answered():
+    """The control: every candidate checked, GitHub answered for each (they
+    are in flight), so the empty result really is nothing to do."""
+    agent = _dispatch_agent(registration=None)
+    feat = _make_feature({}, agent=agent)
+
+    async def all_in_flight(view, diagnostics=None):
+        diagnostics.update(candidates_checked=2, candidates_unreadable=0)
+        return None
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=all_in_flight,
+    ):
+        result = await feat.signal_dispatch()
+
+    assert result.status is ToolResultStatus.OK
+    assert "No actionable issue found" in result.confirmation
+
+
+_IN_FLIGHT = {
+    "repo": "o/r",
+    "issue_number": 3310,
+    "reason": "open_pr",
+    "pull_requests": [{"repo": "o/r", "number": 3311, "draft": False, "days_idle": 0}],
+    "stalled_after_days": 3,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["execute", "suggest"])
+async def test_signal_dispatch_says_why_an_in_flight_issue_was_not_selected(mode):
+    """#3317 acceptance: a board whose only issue has an open linked PR selects
+    nothing, and the output names the skip -- "skipped o/r#3310 -- PR #3311
+    open" -- rather than leaving an orchestrator to infer it from silence."""
+    agent = _dispatch_agent(registration=SimpleNamespace(owner="feature:x"))
+    feat = _make_feature({}, agent=agent)
+
+    async def only_in_flight(view, diagnostics=None):
+        diagnostics.update(
+            blockers_checked=1, blockers_unreadable=0,
+            open_pr_exclusions=[dict(_IN_FLIGHT)],
+        )
+        return None
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=only_in_flight,
+    ):
+        result = await feat.signal_dispatch(mode=mode)
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["dispatched"] is False
+    assert result.data["skipped"] == [_IN_FLIGHT]
+    assert "No actionable issue found." in result.confirmation
+    assert "skipped o/r#3310 -- PR #3311 open" in result.confirmation
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_reports_skips_alongside_the_issue_it_dispatched():
+    registration = SimpleNamespace(owner="feature:fixture-dispatch")
+    agent = _dispatch_agent(registration=registration)
+    feat = _make_feature({}, agent=agent)
+
+    async def skip_then_pick(view, diagnostics=None):
+        diagnostics.update(open_pr_exclusions=[dict(_IN_FLIGHT)])
+        return dict(_TOP_ISSUE)
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=skip_then_pick,
+    ):
+        result = await feat.signal_dispatch()
+
+    assert result.data["dispatched"] is True
+    assert result.data["skipped"] == [_IN_FLIGHT]
+    assert "skipped o/r#3310 -- PR #3311 open" in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_without_skips_reports_an_empty_list():
+    agent = _dispatch_agent(registration=None)
+    feat = _make_feature({}, agent=agent)
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=AsyncMock(return_value=_TOP_ISSUE),
+    ):
+        result = await feat.signal_dispatch(mode="suggest")
+
+    assert result.data["skipped"] == []
+    assert "Skipped" not in result.confirmation

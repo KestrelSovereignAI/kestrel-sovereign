@@ -59,10 +59,12 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from kestrel_sovereign.agent.sleep import SLEEP_FAILURE_REASONS
 from kestrel_sovereign.features.scheduler.constants import (
     MISSED_COGNITION_STATUS,
 )
@@ -81,6 +83,8 @@ from kestrel_sovereign.features.scheduler.runner import (
     ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
     SCHEDULER_PROTOCOL_VERSION,
     SCHEDULER_ROLLOUT_STATE_QUIESCING,
+    ScheduledTaskOwnerUnavailable,
+    SchedulerDispatchNotReady,
     SchedulerProtocolVersionIncompatible,
     SchedulerRunner,
     adopt_scheduler_registration_ownership,
@@ -92,6 +96,7 @@ from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.signals.sources.self_followup import (
     TASK_NAME as SELF_FOLLOWUP_TASK_NAME,
 )
+from kestrel_sovereign.storage.sync.targets import SYNC_TARGET_KINDS
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +108,19 @@ _RETIRED_BUILTIN_CRON_TASKS = frozenset({
     "cognition_retention",  # #1674 — superseded by [forgetting] in memory_consolidate
     "talon_monitor",  # #1860 Wave 2 — superseded by the generic wait_reconcile
 })
+
+# Tools whose contract requires endpoint-owned caller authority cannot be
+# executed by an unattended scheduler tick. Their separate background
+# coordinators remain valid built-in cron sources; only the authority-bearing
+# request surface is excluded here.
+_AUTHORITY_BOUND_TASKS = frozenset(
+    {
+        "request_restart",
+        "acknowledge_restart_escalation",
+        "grant_restart_delegation",
+        "revoke_restart_delegation",
+    }
+)
 
 # Stable namespace used to distinguish core-owned schedule rows from user rows.
 _BUILTIN_SCHEDULE_IDEMPOTENCY_PREFIX = "scheduler:builtin:v1:"
@@ -125,6 +143,36 @@ _SUPERSEDED_AUTOSEEDS = {
 }
 
 
+#: One code per shipped target kind, from ``SYNC_TARGET_KINDS``.
+_BACKUP_TARGET_FAILED_BY_KIND: dict[str, str] = {
+    kind: f"BACKUP_TARGET_FAILED_{kind.upper()}" for kind in SYNC_TARGET_KINDS
+}
+
+
+def backup_target_failure_code(kind: object) -> str:
+    """The ``backup_snapshot`` reason code naming a failed target of ``kind``.
+
+    ``kind`` is a ``SyncTarget.kind`` token. Only a kind in the census has a
+    code of its own; any other kind (empty, unknown to the census, or not a
+    string at all) yields the kind-less code, which is declared, so a
+    third-party target still reports as a failed target rather than being
+    dropped at the membership door into the bare failure this ticket removes.
+    """
+    key = kind.strip().lower() if isinstance(kind, str) else ""
+    return _BACKUP_TARGET_FAILED_BY_KIND.get(key, "BACKUP_TARGET_FAILED")
+
+
+#: The closed vocabulary ``_handle_backup_snapshot`` may return. Every failed
+#: pass is one of: every attempted target failed (there is no current
+#: snapshot), more than one but not every attempted target failed (a snapshot
+#: exists somewhere), or exactly one failed, named by its kind when the census
+#: knows it. A destination a policy denied, or the unchanged-DB placeholder,
+#: was not attempted (``SyncResult.attempted``) and counts on neither side.
+BACKUP_SNAPSHOT_REASON_CODES: frozenset[str] = frozenset(
+    {"BACKUP_ALL_TARGETS_FAILED", "BACKUP_TARGETS_FAILED", "BACKUP_TARGET_FAILED"}
+) | frozenset(_BACKUP_TARGET_FAILED_BY_KIND.values())
+
+
 class SchedulerFeature(Feature):
     """
     Cron/scheduler system for running agent tasks on a schedule.
@@ -133,6 +181,17 @@ class SchedulerFeature(Feature):
     Standalone polling is armed only from ``on_agent_ready``; a shared
     PostgreSQL host owns one fleet runner instead.
     """
+
+    #: The reason codes this feature's own built-in tasks may return in a
+    #: failed ScheduledTaskOutcome: the sleep cycle's closed vocabulary plus
+    #: SLEEP_FAILED, the raised-cycle code ``_handle_sleep`` sets itself. The
+    #: signal boundary admits a code by membership here (see
+    #: ``Feature.tool_reason_codes``), so the vocabulary lives with its owner,
+    #: not in the core signals module.
+    tool_reason_codes = {
+        "sleep": frozenset({"SLEEP_FAILED"}) | SLEEP_FAILURE_REASONS,
+        "backup_snapshot": BACKUP_SNAPSHOT_REASON_CODES,
+    }
 
     @property
     def tool_description(self) -> str:
@@ -220,15 +279,9 @@ class SchedulerFeature(Feature):
         if registry is not None:
             cron_registrations = build_cron_registrations(
                 tool_lookup=self._lookup_raw_tool_result,
-                builtin_handlers={
-                    "backup_snapshot": self._handle_backup_snapshot,
-                    "trash_retention": self._run_trash_retention,
-                    "github_pr_watch": self._run_github_pr_watch,
-                    "ecosystem_discovery_watch": self._run_ecosystem_discovery_watch,
-                    "sleep": self._handle_sleep,
-                    "wait_reconcile": self._run_wait_reconcile,
-                    "bootstrap_timeout_check": self._run_bootstrap_timeout_check,
-                },
+                reason_codes_lookup=self._declared_reason_codes,
+                builtin_handlers=self._builtin_cron_handlers(),
+                agent=self.agent,
             )
             from kestrel_sovereign.signals import RegistrationPolicy
 
@@ -298,6 +351,22 @@ class SchedulerFeature(Feature):
         )
         await self._runner.start(polling=False)
         logger.info("SchedulerFeature initialized; polling awaits agent readiness")
+
+    def _builtin_cron_handlers(self) -> Dict[str, Any]:
+        """Built-in cron tasks this feature executes itself, without a tool.
+
+        Every other ``CRON_TASKS`` entry delegates to a tool some feature
+        registers; see :meth:`_require_scheduled_tool_owner`.
+        """
+        return {
+            "backup_snapshot": self._handle_backup_snapshot,
+            "trash_retention": self._run_trash_retention,
+            "github_pr_watch": self._run_github_pr_watch,
+            "ecosystem_discovery_watch": self._run_ecosystem_discovery_watch,
+            "sleep": self._handle_sleep,
+            "wait_reconcile": self._run_wait_reconcile,
+            "bootstrap_timeout_check": self._run_bootstrap_timeout_check,
+        }
 
     async def on_agent_ready(self, agent) -> None:
         """Arm standalone polling only after every feature finished post-load."""
@@ -416,6 +485,62 @@ class SchedulerFeature(Feature):
         existing = await self.schedule_list()
         existing_tasks = (existing.data or {}).get("tasks", []) if existing.data else []
         existing_names = {t["task_name"] for t in existing_tasks}
+
+        # Older releases allowed endpoint-authorized mutation tools to be
+        # persisted as unattended cron rows.  Refusing new rows is not enough:
+        # an upgraded host would otherwise keep retrying the already-durable
+        # back door forever.  Remove every such row, including paused ones;
+        # the coordinator cron remains the only schedulable half of restart.
+        authority_bound = _AUTHORITY_BOUND_TASKS & existing_names
+        for task in existing_tasks:
+            if task["task_name"] in authority_bound:
+                task_id = task["id"]
+                removal = await self.schedule_remove(task_id)
+                if removal.status is not ToolResultStatus.OK:
+                    # A peer replica may have listed and removed the same
+                    # unsafe legacy row between our snapshot and delete.  That
+                    # is the desired terminal state, not a boot failure.  Only
+                    # accept it after a fresh authoritative list proves this
+                    # exact tenant-owned row is already absent; storage/list
+                    # failures and rows that remain visible still fail closed.
+                    refreshed = await self.schedule_list()
+                    refreshed_data = (
+                        refreshed.data if isinstance(refreshed.data, dict) else None
+                    )
+                    refreshed_tasks = (
+                        refreshed_data.get("tasks")
+                        if refreshed_data is not None
+                        else None
+                    )
+                    already_absent = (
+                        refreshed.status is ToolResultStatus.OK
+                        and isinstance(refreshed_tasks, list)
+                        and not any(
+                            current.get("id") == task_id
+                            for current in refreshed_tasks
+                            if isinstance(current, dict)
+                        )
+                    )
+                    if already_absent:
+                        logger.warning(
+                            "Authority-bound schedule '%s' (id=%s) was "
+                            "removed concurrently by another scheduler replica",
+                            task["task_name"],
+                            str(task_id)[:8],
+                        )
+                        continue
+                    raise RuntimeError(
+                        "Failed to remove authority-bound schedule "
+                        f"'{task['task_name']}' (id={task_id}): "
+                        f"{removal.error or 'unknown scheduler error'}"
+                    )
+                logger.warning(
+                    "Removed authority-bound schedule '%s' (id=%s): this "
+                    "request surface requires a live sovereign caller",
+                    task["task_name"],
+                    str(task_id)[:8],
+                )
+        existing_names -= authority_bound
 
         # One-time cutover cleanup: drop persisted schedule rows for built-in
         # cron tasks that no longer exist. An agent that booted on a prior
@@ -734,6 +859,13 @@ class SchedulerFeature(Feature):
             cron_source_name,
         )
 
+        # No tick may execute before the agent's post_all_features_loaded
+        # barrier (#2474): a tool owner that loads later would otherwise be
+        # indistinguishable from a missing one. Only an agent that explicitly
+        # reports the barrier as incomplete is deferred.
+        if getattr(self.agent, "_post_all_features_loaded_complete", None) is False:
+            raise SchedulerDispatchNotReady(self._agent_id, task_name)
+
         # Fail closed at EXECUTION as well as creation (#3112 P1 follow-up).
         # The creation-time refusal in _create_schedule cannot reach rows that
         # were persisted by an earlier release, when a recurring row targeting
@@ -852,7 +984,7 @@ class SchedulerFeature(Feature):
                 "SchedulerFeature: no dispatcher on agent, "
                 "executing %r directly", task_name,
             )
-            return await self._lookup_and_run_tool(task_name, args)
+            return await self._lookup_and_run_tool_under_hold(task_name, args)
 
         # A task that isn't in CRON_TASKS has no source registration — fall
         # back to direct tool execution rather than rejecting (preserves
@@ -863,7 +995,21 @@ class SchedulerFeature(Feature):
                 "SchedulerFeature: %r has no source registration, "
                 "executing directly", task_name,
             )
-            return await self._lookup_and_run_tool(task_name, args)
+            return await self._lookup_and_run_tool_under_hold(task_name, args)
+
+        if (
+            mode is not SignalMode.COGNITION
+            and task_name not in self._builtin_cron_handlers()
+        ):
+            # Checked here, outside the dispatcher, so the runner receives the
+            # typed failure and its actionable text rather than the fixed
+            # content-free text the source handler boundary substitutes. A
+            # COGNITION task delegates to no tool -- the dispatcher renders its
+            # prompt into a turn -- so it has no owner to require, and asking
+            # would fail every follow-up as owner-unavailable.
+            held_skip = await self._require_scheduled_tool_owner(task_name)
+            if held_skip is not None:
+                return held_skip
 
         payload = args or {}
         # A COGNITION cron task is a real turn, so it has to land somewhere a
@@ -891,6 +1037,41 @@ class SchedulerFeature(Feature):
         )
         result = await dispatcher.dispatch_signal(signal)
         return self._translate_signal_result(result, task_name)
+
+    async def _lookup_and_run_tool_under_hold(
+        self, task_name: str, args: dict
+    ) -> Any:
+        """Apply periodic-work Hold semantics to an unregistered tool unit."""
+
+        held_skip = await self._held_skip(task_name)
+        if held_skip is not None:
+            return held_skip
+        return await self._lookup_and_run_tool(task_name, args)
+
+    async def _held_skip(self, task_name: str) -> Optional[str]:
+        """Record and return the periodic-work held skip, or ``None`` if unheld.
+
+        Used where the scheduler decides a unit without the dispatcher, which
+        is otherwise where the Hold disposition is applied.
+        """
+
+        from kestrel_sovereign.hold import (
+            HeldWorkDisposition,
+            get_effective_hold_state,
+        )
+        from kestrel_sovereign.hold.metrics import record_held_work_disposition
+        from kestrel_sovereign.signals.sources.scheduler import cron_source_name
+
+        effective = await get_effective_hold_state(self.agent)
+        if effective is None or not effective.held:
+            return None
+        record_held_work_disposition(
+            disposition=HeldWorkDisposition.SKIPPED.value,
+            source=cron_source_name(task_name),
+        )
+        # Match the registered-signal translation so SchedulerRunner
+        # records a benign no-execution receipt, not a failed retry unit.
+        return "skipped: dropped_quiet_hours (hold_skipped)"
 
     @staticmethod
     def _translate_signal_result(result, task_name: str) -> Any:
@@ -1153,6 +1334,47 @@ class SchedulerFeature(Feature):
         """
         return bool(getattr(feature, "enabled", True))
 
+    def _declared_reason_codes(self, task_name: str) -> frozenset[str]:
+        """The ``reason_code`` vocabulary the owner of ``task_name`` declared.
+
+        This feature's own declaration applies by name (it owns every built-in
+        task and its own tools). Any other feature's applies only to a tool it
+        actually exposes, mirroring the ownership walk in
+        :meth:`_lookup_raw_tool_result`: a feature cannot widen the vocabulary
+        of a tool it does not own. ``tool_reason_codes`` is read by attribute
+        (see ``Feature.tool_reason_codes``), so an out-of-tree feature that
+        subclasses the SDK Feature declares it the same way. Nothing declared
+        means nothing crosses.
+        """
+        own = self._reason_codes_declared_by(self).get(task_name)
+        if own is not None:
+            return own
+        features = getattr(self.agent, "features", {})
+        for feature in features.values():
+            if not hasattr(feature, "get_tools") or not self._feature_enabled(feature):
+                continue
+            declared = self._reason_codes_declared_by(feature)
+            if task_name not in declared:
+                continue
+            try:
+                owned = {getattr(t, "name", None) for t in feature.get_tools()}
+            except Exception:  # noqa: BLE001 - a broken feature can't block others
+                continue
+            if task_name in owned:
+                return declared[task_name]
+        return frozenset()
+
+    @staticmethod
+    def _reason_codes_declared_by(feature: Any) -> Dict[str, frozenset[str]]:
+        declared = getattr(feature, "tool_reason_codes", None)
+        if not isinstance(declared, Mapping):
+            return {}
+        return {
+            str(name): frozenset(c for c in codes if isinstance(c, str))
+            for name, codes in declared.items()
+            if isinstance(codes, (frozenset, set, list, tuple))
+        }
+
     async def _lookup_and_run_tool(self, task_name: str, args: dict) -> Any:
         """Run a tool directly through the canonical scheduler result boundary.
 
@@ -1168,6 +1390,7 @@ class SchedulerFeature(Feature):
         return _prepare_scheduled_tool_result(
             task_name,
             await self._lookup_raw_tool_result(task_name, args),
+            declared_reason_codes=self._declared_reason_codes(task_name),
         )
 
     async def _lookup_raw_tool_result(self, task_name: str, args: dict) -> Any:
@@ -1184,6 +1407,47 @@ class SchedulerFeature(Feature):
             blocked = await self._training_cycle_semantic_maintenance_gate()
             if blocked is not None:
                 return blocked
+        owner_name, agent_tool, disabled_owner = self._resolve_scheduled_tool(
+            task_name
+        )
+        if agent_tool is not None:
+            return await self._run_tool_hook_gated(owner_name, agent_tool, args)
+
+        # A persisted schedule that names a tool owned by a NOW-disabled feature
+        # must not execute it. Skip benignly rather than raising, so a disable
+        # doesn't spam the execution log with a failure every tick; re-enabling
+        # the feature restores execution on the next tick. Resolution prefers an
+        # enabled owner, and a disabled one is distinguished from a genuinely
+        # unknown task so the operator sees the real reason.
+        if disabled_owner is not None:
+            logger.info(
+                "Scheduler: task %r is owned by disabled feature %r; "
+                "skipping this tick", task_name, disabled_owner,
+            )
+            return (
+                f"skipped: {task_name} owning feature {disabled_owner!r} "
+                "is disabled"
+            )
+
+        # Scheduler ticks run only after the post_all_features_loaded barrier
+        # (#2474), so an unresolvable built-in is not a late-loading owner:
+        # it is missing. Never report that as a (skipped) success.
+        from kestrel_sovereign.signals.sources.scheduler import CRON_TASKS
+
+        if task_name in {name for name, _mode, _res in CRON_TASKS}:
+            raise ScheduledTaskOwnerUnavailable(task_name)
+
+        raise ValueError(f"Unknown task: {task_name}")
+
+    def _resolve_scheduled_tool(
+        self, task_name: str
+    ) -> tuple[Optional[str], Optional[Any], Optional[str]]:
+        """Resolve the tool a scheduled task names, as the executor would.
+
+        Returns ``(owner_name, tool, disabled_owner_name)``: the enabled owner
+        and its tool when one exists (an enabled owner always wins), otherwise
+        the name of a disabled feature exposing the tool, otherwise all None.
+        """
         features = getattr(self.agent, "features", {})
 
         for feature in features.values():
@@ -1191,32 +1455,18 @@ class SchedulerFeature(Feature):
                 continue
             if not self._feature_enabled(feature):
                 # A disabled feature's tools are detached from every other live
-                # surface; the scheduler skips it too (handled benignly below if
-                # the task actually resolves to it).
+                # surface; the scheduler skips it too.
                 continue
             for agent_tool in feature.get_tools():
                 if agent_tool.name == task_name:
-                    result = await self._run_tool_hook_gated(
-                        type(feature).__name__, agent_tool, args,
-                    )
-                    return result
+                    return type(feature).__name__, agent_tool, None
 
         # Also check our own tools (SchedulerFeature has !schedule
         # commands but they're not typically scheduled themselves).
         for agent_tool in self.get_tools():
             if agent_tool.name == task_name:
-                result = await self._run_tool_hook_gated(
-                    type(self).__name__, agent_tool, args,
-                )
-                return result
+                return type(self).__name__, agent_tool, None
 
-        # A persisted schedule that names a tool owned by a NOW-disabled feature
-        # must not execute it. Skip benignly (like the startup-order race below)
-        # rather than raising, so a disable doesn't spam the execution log with a
-        # failure every tick; re-enabling the feature restores execution on the
-        # next tick. Detected AFTER the enabled-feature search so an enabled
-        # owner always wins, and distinguished from a genuinely-unknown task so
-        # the operator sees the real reason.
         for feature in features.values():
             if not hasattr(feature, "get_tools") or self._feature_enabled(feature):
                 continue
@@ -1225,39 +1475,32 @@ class SchedulerFeature(Feature):
             except Exception:  # noqa: BLE001 - a broken feature can't block others
                 continue
             if any(getattr(t, "name", None) == task_name for t in disabled_tools):
-                feature_name = getattr(feature, "name", type(feature).__name__)
-                logger.info(
-                    "Scheduler: task %r is owned by disabled feature %r; "
-                    "skipping this tick", task_name, feature_name,
-                )
                 return (
-                    f"skipped: {task_name} owning feature {feature_name!r} "
-                    "is disabled"
+                    None,
+                    None,
+                    getattr(feature, "name", type(feature).__name__),
                 )
+        return None, None, None
 
-        # A persisted built-in cron task (e.g. restart_coordinator) can
-        # fire on the first scheduler tick after a restart BEFORE its
-        # owning feature has finished loading and registered the tool —
-        # the runner starts polling in initialize() while feature load
-        # order is not guaranteed (#1796). That is a transient startup-
-        # order race, not a misconfiguration: a later tick (once the
-        # feature is loaded) runs the task normally. Skip it benignly
-        # this tick instead of raising "Unknown task", which would record
-        # a spurious one-time failure in the execution log.
-        from kestrel_sovereign.signals.sources.scheduler import CRON_TASKS
+    async def _require_scheduled_tool_owner(
+        self, task_name: str
+    ) -> Optional[str]:
+        """Fail a tool-delegating built-in whose owner is absent, before dispatch.
 
-        if task_name in {name for name, _mode, _res in CRON_TASKS}:
-            logger.info(
-                "Scheduler: built-in cron task %r not yet resolvable "
-                "(owning feature still loading); skipping this tick",
-                task_name,
-            )
-            return (
-                f"skipped: {task_name} owning feature not loaded yet "
-                "(transient startup-order race)"
-            )
-
-        raise ValueError(f"Unknown task: {task_name}")
+        A disabled owner is left to the lookup's benign disabled skip. A held
+        agent returns the held skip instead of failing (#3377): this preflight
+        runs before the dispatcher applies Hold, and no-execution under Hold is
+        a skip, not a failure. ``None`` means dispatch may proceed.
+        """
+        _owner, agent_tool, disabled_owner = self._resolve_scheduled_tool(
+            task_name
+        )
+        if agent_tool is None and disabled_owner is None:
+            held_skip = await self._held_skip(task_name)
+            if held_skip is not None:
+                return held_skip
+            raise ScheduledTaskOwnerUnavailable(task_name)
+        return None
 
     #: Keys inside a persisted ``args_json`` that hold conversation-derived
     #: text. A volatile privacy mode promises this content does not outlive
@@ -1382,7 +1625,7 @@ class SchedulerFeature(Feature):
         for agent_tool in self.get_tools():
             names.add(agent_tool.name)
 
-        return names
+        return names - _AUTHORITY_BOUND_TASKS
 
     async def _scheduled_task_denied(self, task_name: str) -> bool:
         """Return True if ``task_name`` resolves to a feature tool the
@@ -1454,6 +1697,12 @@ class SchedulerFeature(Feature):
                 target: {
                     "success": result.success,
                     "bytes": result.bytes_synced,
+                    "kind": result.kind,
+                    # A destination a policy denied, or the unchanged-DB
+                    # placeholder, was never called; it must not read as
+                    # backed up. (A target whose content was already current
+                    # was called and is a success.)
+                    "attempted": result.attempted,
                 }
                 for target, result in results.items()
             }
@@ -1464,15 +1713,43 @@ class SchedulerFeature(Feature):
                         "reason": "no sync targets configured",
                     }
                 )
-            success = all(
-                target["success"] is True for target in targets.values()
-            )
+            attempted = {
+                name: result
+                for name, result in results.items()
+                if result.attempted
+            }
+            failed = {
+                name: result
+                for name, result in attempted.items()
+                if result.success is not True
+            }
             payload: dict[str, Any] = {
-                "success": success,
+                "success": not failed,
                 "targets": targets,
             }
-            if not success:
-                payload["error"] = "backup_snapshot_failed"
+            if failed:
+                # On failure the signal boundary raises and discards this
+                # payload; two things survive it. The ``error`` string is
+                # logged at the local diagnostic boundary, so it names each
+                # failed target by kind with the error its target recorded
+                # (type and message). The ``reason_code`` crosses into
+                # signal_log.error, so it is one bounded token per shape,
+                # where a bare "failed" said nothing for eighty consecutive
+                # runs (#3189).
+                described = sorted(
+                    f"{result.kind or 'undeclared'} ({result.error})"
+                    if result.error
+                    else (result.kind or "undeclared")
+                    for result in failed.values()
+                )
+                payload["error"] = "backup_snapshot_failed: " + ", ".join(described)
+                if len(failed) == len(attempted):
+                    payload["reason_code"] = "BACKUP_ALL_TARGETS_FAILED"
+                elif len(failed) > 1:
+                    payload["reason_code"] = "BACKUP_TARGETS_FAILED"
+                else:
+                    (result,) = failed.values()
+                    payload["reason_code"] = backup_target_failure_code(result.kind)
             return json.dumps(payload, default=str)
         return json.dumps({
             "skipped": True,
@@ -1521,6 +1798,7 @@ class SchedulerFeature(Feature):
                 status="failed",
                 result_text=json.dumps({"error": "sleep_failed"}),
                 pause_schedule=False,
+                reason_code="SLEEP_FAILED",
             )
 
         data = report.to_dict() if hasattr(report, "to_dict") else {}
@@ -1561,10 +1839,17 @@ class SchedulerFeature(Feature):
             and not consolidation_skipped
             and not maintenance_skipped
         ):
+            # ``SleepReport.failure_reason()`` is the one resolution of "why
+            # did this cycle fail" (the phase's recorded code, else the
+            # maintenance unit's status); ``to_dict`` carries it. ``error``
+            # is the composed human string; the only thing read from it here
+            # is the exact skip token above, which ``_record_failure_code``
+            # deliberately never records.
             return ScheduledTaskOutcome(
                 status="failed",
                 result_text=result_text,
                 pause_schedule=False,
+                reason_code=str(data.get("failure_reason") or ""),
             )
         return result_text
 
@@ -1749,14 +2034,28 @@ class SchedulerFeature(Feature):
         db = getattr(raw_storage, "db", None)
         if db is None:
             return None
+        from kestrel_sovereign.features.storage_access import (
+            AgentIdentityUnavailable,
+            resolve_scoped_agent_did,
+        )
+
+        # Resolved outside the sweep's catch-all: a missing identity is a
+        # named refusal, not an empty scope that purges nothing and is
+        # reported as a failed sweep (#3251).
+        try:
+            agent_did = resolve_scoped_agent_did(self.agent)
+        except AgentIdentityUnavailable:
+            logger.warning(
+                "[retention] operator notice audit cleanup skipped: "
+                "agent identity unavailable"
+            )
+            return None
         try:
             from kestrel_sovereign.storage.operator_notice_store import (
                 OperatorNoticeAuditStore,
             )
 
-            store = OperatorNoticeAuditStore(
-                db, str(getattr(self.agent, "did", "") or "")
-            )
+            store = OperatorNoticeAuditStore(db, agent_did)
             return await store.purge_expired()
         except Exception as exc:  # noqa: BLE001 - never block the sweep
             logger.warning(

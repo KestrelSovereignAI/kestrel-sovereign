@@ -571,6 +571,7 @@ async def emit_runtime_status(
     db: Any,
     *,
     agent_ids: Collection[str],
+    complete_authority_snapshot: bool = True,
     owner_id: str,
     worker_state: str,
     last_tick_started_at: Optional[str],
@@ -579,7 +580,12 @@ async def emit_runtime_status(
     consecutive_failures: int,
     last_error_type: Optional[str],
 ) -> None:
-    """Emit one explicit report per authorized agent, including zero counts."""
+    """Emit one explicit report per authorized agent, including zero counts.
+
+    ``complete_authority_snapshot`` controls owner-row reaping. Bounded host
+    pages are partial snapshots and must retain this owner's reports for other
+    pages; those age out through the global retention rule if a DID is revoked.
+    """
 
     normalized_ids = tuple(sorted(set(agent_ids)))
     database_now = await scheduler_database_clock(db)
@@ -601,18 +607,20 @@ async def emit_runtime_status(
     # preserving every other runner's view of the same tenants. This also runs
     # for an empty fleet, so repeated create/remove cycles are immediately
     # bounded instead of waiting for the retention horizon.
-    if normalized_ids:
+    if complete_authority_snapshot and normalized_ids:
         placeholders = ", ".join("?" for _ in normalized_ids)
         await db.execute(
             f"DELETE FROM {RUNTIME_STATUS_TABLE} "
             f"WHERE owner_id = ? AND agent_id NOT IN ({placeholders})",
             (owner_id, *normalized_ids),
         )
-    else:
+    elif complete_authority_snapshot:
         await db.execute(
             f"DELETE FROM {RUNTIME_STATUS_TABLE} WHERE owner_id = ?",
             (owner_id,),
         )
+        return
+    elif not normalized_ids:
         return
 
     inventories = await _schedule_inventories(
@@ -661,6 +669,43 @@ async def emit_runtime_status(
             inventory["system_disabled_count"],
         ))
     await db.execute_many(upsert_sql, params_list)
+
+
+async def mark_runtime_owner_stopped(
+    db: Any,
+    *,
+    owner_id: str,
+    last_tick_started_at: Optional[str],
+    last_tick_completed_at: Optional[str],
+    restart_count: int,
+    consecutive_failures: int,
+    last_error_type: Optional[str],
+) -> None:
+    """Mark every existing page report for one runner lifetime stopped.
+
+    Paged hosts cannot enumerate their full fleet during shutdown. Updating by
+    the opaque owner UUID closes all already-published pages with constant
+    memory and parameter scope; rows never visited by this owner do not exist.
+    """
+
+    await db.execute(
+        f"""
+        UPDATE {RUNTIME_STATUS_TABLE}
+        SET worker_state = 'stopped',
+            reported_at = {scheduler_database_now_sql(db)},
+            last_tick_started_at = ?, last_tick_completed_at = ?,
+            restart_count = ?, consecutive_failures = ?, last_error_type = ?
+        WHERE owner_id = ?
+        """,
+        (
+            last_tick_started_at,
+            last_tick_completed_at,
+            restart_count,
+            consecutive_failures,
+            last_error_type,
+            owner_id,
+        ),
+    )
 
 
 async def scheduler_status(
@@ -989,6 +1034,7 @@ __all__ = [
     "classify_disablement",
     "emit_runtime_status",
     "ensure_runtime_status_table",
+    "mark_runtime_owner_stopped",
     "scheduler_status",
     "scheduler_status_parameters",
     "scheduler_tick_in_progress_limit_seconds",

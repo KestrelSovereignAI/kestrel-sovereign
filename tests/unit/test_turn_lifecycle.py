@@ -14,11 +14,17 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from kestrel_sdk.signals import CausationFrame, ResourceLock
 
-from kestrel_sovereign.agent.invocation import invocation_scope
+from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
+    bind_async_invocation,
+    invocation_scope,
+)
 from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.agent.turn_lifecycle import (
     TurnLifecycleMixin,
@@ -26,6 +32,7 @@ from kestrel_sovereign.agent.turn_lifecycle import (
     capture_turn_session_binding,
 )
 from kestrel_sovereign.signals import OrderedLockManager
+from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
 
 
 class _StubAgent(TurnLifecycleMixin):
@@ -35,6 +42,10 @@ class _StubAgent(TurnLifecycleMixin):
 
     def __init__(self) -> None:
         self._lock_manager = OrderedLockManager()
+        self._privacy_transition_lock = ReentrantTransitionLock()
+
+    def _get_privacy_transition_lock(self):
+        return self._privacy_transition_lock
 
 
 class _PrivateAccessorOnlyAgent(_StubAgent):
@@ -56,6 +67,27 @@ class _RequestTurnAgent(RequestLifecycleMixin, TurnLifecycleMixin):
         self._active_request_counts = {}
         self._active_request_started_at = {}
         self._cancelled_requests = set()
+
+
+class _IsolatedRequestTurnAgent(_RequestTurnAgent):
+    @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+    async def process_input(self, invocation_id=None):
+        async with self._turn_lifecycle():
+            return "ok"
+
+
+class _HostContextStubAgent(_StubAgent):
+    """Minimal host-context carrier using the real turn lifecycle boundary."""
+
+    def __init__(self, registry: object) -> None:
+        super().__init__()
+        self._host_context_clause_registry = registry
+
+    def validate_host_context_clause_registry(self, registry: object) -> None:
+        return None
+
+    def bind_host_context_clause_registry(self, registry: object) -> None:
+        self._host_context_clause_registry = registry
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +144,187 @@ async def test_three_concurrent_turns_serialize_in_order():
         assert order[i].split(":")[1] == order[i + 1].split(":")[1]
 
 
+@pytest.mark.asyncio
+async def test_turn_waits_for_host_context_publication_before_lock_entry():
+    """An overdue startup wake cannot assemble an agent-only prompt."""
+
+    agent = _StubAgent()
+    agent._host_context_publication_gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def turn() -> None:
+        async with agent._turn_lifecycle():
+            entered.set()
+
+    task = asyncio.create_task(turn())
+    await asyncio.sleep(0)
+    assert not entered.is_set()
+    assert not agent._lock_manager.is_held(ResourceLock.CONVERSATION)
+
+    agent._host_context_publication_gate.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_waiting_unregistered_turn_rebinds_current_host_context_at_gate():
+    """Gate release cannot expose an initializing agent's stale snapshot."""
+
+    old_registry = object()
+    current_registry = object()
+    publication_state = SimpleNamespace(registry=old_registry, generation=1)
+    agent = _HostContextStubAgent(old_registry)
+    agent._host_context_publication_state = publication_state
+    agent._host_context_publication_generation = 1
+    agent._host_context_publication_gate = asyncio.Event()
+    observed = []
+
+    async def initializing_turn() -> None:
+        async with agent._turn_lifecycle():
+            observed.append(agent._host_context_clause_registry)
+
+    task = asyncio.create_task(initializing_turn())
+    await asyncio.sleep(0)
+    assert not observed
+
+    # Host publication cannot fan out to this still-unregistered agent.  Its
+    # shared state advances before the server releases the cognition barrier.
+    publication_state.registry = current_registry
+    publication_state.generation = 2
+    agent._host_context_publication_gate.set()
+
+    await asyncio.wait_for(task, timeout=1)
+    assert observed == [current_registry]
+    assert agent._host_context_publication_generation == 2
+
+
+@pytest.mark.asyncio
+async def test_waiting_turn_rejects_new_host_context_before_cognition():
+    """A stale initializing agent fails closed on a newly-visible collision."""
+
+    old_registry = object()
+    rejected_registry = object()
+    publication_state = SimpleNamespace(registry=rejected_registry, generation=2)
+    agent = _HostContextStubAgent(old_registry)
+    agent._host_context_publication_state = publication_state
+    agent._host_context_publication_generation = 1
+    agent._host_context_publication_gate = asyncio.Event()
+    entered = False
+
+    def reject(registry: object) -> None:
+        assert registry is rejected_registry
+        raise ValueError("context namespace collision")
+
+    agent.validate_host_context_clause_registry = reject
+
+    async def initializing_turn() -> None:
+        nonlocal entered
+        async with agent._turn_lifecycle():
+            entered = True
+
+    task = asyncio.create_task(initializing_turn())
+    await asyncio.sleep(0)
+    agent._host_context_publication_gate.set()
+
+    with pytest.raises(ValueError, match="context namespace collision"):
+        await asyncio.wait_for(task, timeout=1)
+    assert entered is False
+    assert agent._host_context_clause_registry is old_registry
+    assert agent._host_context_publication_generation == 1
+
+
+@pytest.mark.asyncio
+async def test_feature_config_transition_serializes_with_turns():
+    """Config/context publication and a prompt/tool turn never overlap."""
+
+    agent = _StubAgent()
+    config_entered = asyncio.Event()
+
+    async def update() -> None:
+        async with agent.feature_config_transition():
+            config_entered.set()
+
+    async with agent._turn_lifecycle():
+        task = asyncio.create_task(update())
+        await asyncio.sleep(0)
+        assert not config_entered.is_set()
+
+    await asyncio.wait_for(task, timeout=1)
+    assert config_entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_external_privacy_transition_waits_for_complete_turn():
+    """A restrictive transition cannot overtake an old-policy prompt."""
+
+    agent = _StubAgent()
+    transition_entered = asyncio.Event()
+
+    async def transition() -> None:
+        async with agent.privacy_transition():
+            transition_entered.set()
+
+    async with agent._turn_lifecycle():
+        task = asyncio.create_task(transition())
+        await asyncio.sleep(0)
+        assert not transition_entered.is_set()
+
+    await asyncio.wait_for(task, timeout=1)
+    assert transition_entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_set_privacy_mode_uses_turn_serialized_transition():
+    """Production privacy-mode wiring cannot bypass CONVERSATION."""
+
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.privacy import PrivacyMode
+
+    agent = KestrelAgent(did="did:test:privacy-turn", storage_path=":memory:")
+    applied = asyncio.Event()
+
+    async def apply(_mode):
+        applied.set()
+        return object()
+
+    agent._set_privacy_mode_with_effects_locked = apply
+    async with agent._turn_lifecycle():
+        transition = asyncio.create_task(
+            agent.set_privacy_mode_with_effects(PrivacyMode.EPHEMERAL)
+        )
+        await asyncio.sleep(0)
+        assert not applied.is_set()
+
+    await asyncio.wait_for(transition, timeout=1)
+    assert applied.is_set()
+
+
+@pytest.mark.asyncio
+async def test_in_turn_privacy_transition_reenters_without_deadlock():
+    """The !privacy command keeps CONVERSATION -> privacy lock order."""
+
+    agent = _StubAgent()
+    async with agent._turn_lifecycle():
+        async with agent.privacy_transition():
+            assert agent._privacy_transition_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_explicit_provider_callback_can_reenter_privacy_transition():
+    """A bound cross-task tool belongs to the turn; an ambient child does not."""
+
+    agent = _StubAgent()
+    async with agent._turn_lifecycle():
+        binding = capture_turn_session_binding(agent)
+
+        async def provider_callback() -> None:
+            with bind_turn_session(binding):
+                async with agent.privacy_transition():
+                    assert agent._privacy_transition_lock.locked()
+
+        await asyncio.wait_for(asyncio.create_task(provider_callback()), timeout=1)
+
+
 # ---------------------------------------------------------------------------
 # Exception safety
 # ---------------------------------------------------------------------------
@@ -145,6 +358,18 @@ async def test_conversation_lock_is_held_inside_turn():
     assert not agent._lock_manager.is_held(ResourceLock.CONVERSATION)
     async with agent._turn_lifecycle():
         assert agent._lock_manager.is_held(ResourceLock.CONVERSATION)
+
+
+@pytest.mark.asyncio
+async def test_public_turn_address_keeps_full_uuid_entropy():
+    """Durable Stop addresses must not truncate UUID collision resistance."""
+
+    agent = _StubAgent()
+    async with agent._turn_lifecycle() as turn_id:
+        prefix, value = turn_id.split("_", 1)
+        assert prefix == "turn"
+        assert len(value) == 32
+        assert set(value) <= set("0123456789abcdef")
     assert not agent._lock_manager.is_held(ResourceLock.CONVERSATION)
 
 
@@ -200,6 +425,78 @@ async def test_turn_index_carries_the_exact_request_generation():
             }
 
     assert agent.active_turn_request_bindings() == {}
+
+
+@pytest.mark.asyncio
+async def test_turn_lifecycle_retains_durable_binding_until_request_settlement():
+    agent = _RequestTurnAgent()
+    registry = SimpleNamespace(
+        bind_public_turn=AsyncMock(return_value=True),
+        complete_soon=MagicMock(),
+    )
+    agent._distributed_invocation_registry = registry
+
+    with invocation_scope("durable-turn-request"):
+        generation = agent.register_active_request("durable-turn-request")
+        async with agent._turn_lifecycle() as turn_id:
+            registry.bind_public_turn.assert_awaited_once_with(
+                agent,
+                turn_id,
+                "durable-turn-request",
+                generation,
+            )
+
+    registry.bind_public_turn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_turn_lifecycle_refuses_cognition_when_public_binding_is_fenced():
+    agent = _RequestTurnAgent()
+    registry = SimpleNamespace(
+        bind_public_turn=AsyncMock(return_value=False),
+        complete_soon=MagicMock(),
+    )
+    agent._distributed_invocation_registry = registry
+    entered = False
+
+    with invocation_scope("fenced-turn-request"):
+        generation = agent.register_active_request("fenced-turn-request")
+        with pytest.raises(InvocationCancelledError):
+            async with agent._turn_lifecycle():
+                entered = True
+
+    assert entered is False
+    assert ("fenced-turn-request", generation) in (
+        agent._cancelled_request_generations
+    )
+
+
+@pytest.mark.asyncio
+async def test_isolated_invocation_preserves_committed_transition_authority():
+    agent = _IsolatedRequestTurnAgent()
+
+    async with agent.feature_config_transition():
+        with agent.committed_feature_transition_cognition():
+            assert await agent.process_input() == "ok"
+
+
+@pytest.mark.asyncio
+async def test_live_turn_trace_identity_is_optional_evidence_and_cleans_up():
+    agent = _RequestTurnAgent()
+    trace_id = "0123456789abcdef0123456789abcdef"
+    span_id = "0123456789abcdef"
+
+    with invocation_scope("observable-request"):
+        agent.register_active_request("observable-request")
+        async with agent._turn_lifecycle() as turn_id:
+            assert agent.get_current_turn_id() == turn_id
+            assert agent.bind_current_turn_trace_identity(trace_id, span_id)
+            assert agent.active_turn_trace_identities() == {
+                turn_id: (trace_id, span_id)
+            }
+
+    assert agent.active_turn_trace_identities() == {}
+    assert agent.get_current_turn_id() is None
 
 
 @pytest.mark.asyncio

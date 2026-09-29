@@ -23,6 +23,7 @@ from kestrel_sovereign.agent.context_builder import (
     MANDATORY_SYSTEM_SUBSECTIONS,
 )
 from kestrel_sovereign.agent.context_manager import ContextManager, ContextResult
+from kestrel_sovereign.agent.context_stages import EPHEMERAL_NOTICE
 from kestrel_sovereign.agent.token_budget import ElasticTokenBudget, RESPONSE_RESERVE
 
 
@@ -82,6 +83,22 @@ class TestMeasureMandatoryFloor:
         floor_b = cb_with_agents.measure_mandatory_system_tokens(constitution="Be kind.")
         assert floor_b > floor_a
 
+    def test_uses_effective_anchored_agents_policy(self):
+        cb = _real_builder_with_bootstrap(
+            {"AGENTS.md": "short bootstrap policy"}
+        )
+        bootstrap_floor = cb.measure_mandatory_system_tokens(
+            constitution="Be kind."
+        )
+        anchored_floor = cb.measure_mandatory_system_tokens(
+            constitution="Be kind.",
+            anchored_doctrine=OrderedDict(
+                [("AGENTS.md", "long anchored policy " * 200)]
+            ),
+        )
+
+        assert anchored_floor > bootstrap_floor
+
     def test_excludes_optional_bootstrap(self):
         """A non-mandatory bootstrap file (e.g. TOOLS.md) must NOT
         change the floor — only items in ``MANDATORY_SYSTEM_SUBSECTIONS``
@@ -110,6 +127,107 @@ class TestMeasureMandatoryFloor:
 
 
 class TestDegradedModeFlow:
+    @pytest.mark.asyncio
+    async def test_fallback_formatter_funds_its_exact_mandatory_floor(self):
+        """Optional legacy bytes cannot make a valid tracked fallback degrade."""
+
+        storage = MagicMock()
+        cb = ContextBuilder(storage)
+        cb._bootstrap_loader._cache = OrderedDict(
+            [("TOOLS.md", "optional tool notes")]
+        )
+        cb._bootstrap_loader._loaded = True
+        cm = ContextManager(storage=storage, context_builder=cb)
+        constitution = "word " * 5_000
+
+        result = await cm.build_context_plan(
+            query="",
+            constitution=constitution,
+            include_briefing=False,
+            include_memories=False,
+            include_rag=False,
+            conversation_history=[],
+        )
+
+        tracked_floor = cb.measure_mandatory_system_tokens(
+            constitution=constitution,
+            tracked_prompt=True,
+        )
+        assert result.degraded_mode is False
+        assert result.mandatory_system_tokens == tracked_floor
+        assert result.total_tokens <= result.total_budget
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_fallback_reports_tracked_mandatory_floor(self):
+        """EPHEMERAL fallback preflight and evidence use the renderer it sends."""
+
+        storage = MagicMock()
+        cb = ContextBuilder(storage)
+        cb._bootstrap_loader._cache = OrderedDict(
+            [
+                ("SOUL.md", "mandatory identity"),
+                ("TOOLS.md", "optional tool notes " * 100_000),
+            ]
+        )
+        cb._bootstrap_loader._loaded = True
+        cm = ContextManager(storage=storage, context_builder=cb)
+
+        result = await cm.build_context_plan(
+            query="",
+            constitution="C",
+            include_briefing=False,
+            privacy_mode="EPHEMERAL",
+        )
+
+        tracked_floor = cb.measure_mandatory_system_tokens(
+            constitution="C",
+            required_suffix=EPHEMERAL_NOTICE,
+            tracked_prompt=True,
+        )
+        assert result.degraded_mode is False
+        assert tracked_floor > 0
+        assert result.mandatory_system_tokens == tracked_floor
+
+    @pytest.mark.asyncio
+    async def test_optional_legacy_prompt_is_trimmed_for_tool_aware_ceiling(self):
+        """Large optional bootstrap text yields to required tool schemas.
+
+        Ordinary zero-contribution turns still start from the byte-stable
+        legacy renderer, but once that rendering exceeds the actual system
+        allocation it must use priority eviction instead of declaring the
+        whole otherwise-valid request degraded.
+        """
+
+        storage = MagicMock()
+        cb = ContextBuilder(storage)
+        cb._bootstrap_loader._cache = OrderedDict(
+            [
+                ("SOUL.md", "id"),
+                ("TOOLS.md", "optional " * 15_000),
+            ]
+        )
+        cb._bootstrap_loader._loaded = True
+        cm = ContextManager(storage=storage, context_builder=cb)
+
+        result = await cm.build_context_plan(
+            query="",
+            constitution="C",
+            include_briefing=False,
+            include_memories=False,
+            include_rag=False,
+            conversation_history=[],
+            tools=[
+                {
+                    "name": "large",
+                    "description": "schema " * 25_000,
+                }
+            ],
+        )
+
+        assert result.degraded_mode is False
+        assert "optional" not in result.assembly.system_prompt
+        assert result.total_tokens <= result.total_budget
+
     @pytest.mark.asyncio
     async def test_floor_exceeds_window_returns_degraded_result(self):
         """When the mandatory floor cannot fit, ``build_context``
@@ -163,6 +281,10 @@ class TestHistoryOverBudgetPrune:
         cb.get_episodes_for_context = AsyncMock(return_value=[])
         cb.retrieve_context = AsyncMock(return_value=None)
         cb.build_system_prompt = lambda **kw: "sys"
+        cb.build_system_prompt_with_subsections = lambda **kw: (
+            "sys",
+            [("assembled_system_prompt", "sys")],
+        )
 
         # Force the formatter to return a giant history that blows
         # both the static slice and the elastic pool. Return a fresh
@@ -214,6 +336,10 @@ class TestHistoryAbsorbsReleasedSlack:
 
         cb.format_conversation_history = fake_format
         cb.build_system_prompt = lambda **kw: "system body"
+        cb.build_system_prompt_with_subsections = lambda **kw: (
+            "system body",
+            [("assembled_system_prompt", "system body")],
+        )
 
         cm = ContextManager(storage=MagicMock(), context_builder=cb)
         cm.conversation_manager = MagicMock()

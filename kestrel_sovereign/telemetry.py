@@ -15,7 +15,11 @@ import json
 import logging
 import os
 from contextlib import contextmanager
+from contextvars import ContextVar
+from enum import Enum
 from typing import Any, Dict, Optional
+
+from kestrel_sovereign.turn_scope import turn_scoped
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +31,22 @@ _tracer = None
 # kestrel_sdk.tracing.configure(), so the whole process shares ONE
 # TracerProvider rather than standing up a second competing exporter pipeline.
 _kestrel_tracer = None
+
+# The canonical cooperative-Stop address for the task's live cognition turn.
+# It lives in telemetry rather than an agent module so every span builder can
+# stamp one source of truth without importing the agent package (and creating a
+# cycle). TurnLifecycleMixin owns the scope; child tasks inherit it naturally.
+_CURRENT_TURN_ID: ContextVar[Optional[str]] = ContextVar(
+    "kestrel_telemetry_current_turn_id",
+    default=None,
+)
+# Every enclosing capture, innermost last, each paired with the turn that was
+# live when it opened. A tuple rather than one list so a nested capture (a turn
+# entry point recording its own address) cannot shadow an outer one (the
+# dispatcher recording which turn its wake produced).
+_TURN_ID_CAPTURE: ContextVar[tuple[tuple[Optional[str], list[str]], ...]] = (
+    ContextVar("kestrel_telemetry_turn_id_capture", default=())
+)
 
 try:
     from opentelemetry import trace
@@ -147,8 +167,10 @@ def optional_span(name: str, attributes: Optional[Dict[str, Any]] = None):
         return
 
     with tracer.start_as_current_span(name) as span:
-        if attributes:
-            for key, value in attributes.items():
+        effective_attributes = dict(attributes or {})
+        effective_attributes.update(current_turn_span_attributes())
+        if effective_attributes:
+            for key, value in effective_attributes.items():
                 if value is not None:
                     span.set_attribute(key, value)
         try:
@@ -170,8 +192,10 @@ def start_span(name: str, attributes: Optional[Dict[str, Any]] = None):
         return None
 
     span = tracer.start_span(name)
-    if attributes:
-        for key, value in attributes.items():
+    effective_attributes = dict(attributes or {})
+    effective_attributes.update(current_turn_span_attributes())
+    if effective_attributes:
+        for key, value in effective_attributes.items():
             if value is not None:
                 span.set_attribute(key, value)
     return span
@@ -186,6 +210,86 @@ def end_span(span, error: Optional[Exception] = None):
         span.set_status(StatusCode.ERROR, str(error))
         span.record_exception(error)
     span.end()
+
+
+# ---------------------------------------------------------------------------
+# How a turn ENDED (issue #3159)
+#
+# A turn span that simply stops emitting says nothing: a cooperative Stop, a
+# client that walked away, and a host shutdown all used to read as "nothing
+# arrived", while a pre-admission Stop read as a failure. The outcome below is
+# the one attribute that distinguishes them, and it is computed from the
+# request lifecycle's own record rather than from the exception type — a Stop
+# and a disconnect can both surface as ``CancelledError``.
+# ---------------------------------------------------------------------------
+
+KESTREL_TURN_OUTCOME = "kestrel.turn.outcome"
+
+
+class TurnOutcome(str, Enum):
+    """The truthful terminal disposition of one cognition turn."""
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    STOPPED = "stopped"
+    DISCONNECTED = "disconnected"
+    INTERRUPTED = "interrupted"
+
+
+def annotate_turn_outcome(span, outcome: "TurnOutcome", *, error=None) -> None:
+    """Stamp ``kestrel.turn.outcome`` and the status that outcome implies.
+
+    Only ``failed`` is an ERROR. A stopped turn did exactly what an operator
+    asked of it, a disconnected turn lost its reader, and an interrupted turn
+    was cancelled by neither — marking any of them ERROR would put an operator
+    act, a browser tab closing, and a bug in one bucket. The exception is
+    recorded only for ``failed`` for the same reason.
+    """
+
+    if span is None:
+        return
+    if not isinstance(outcome, TurnOutcome):
+        raise TypeError("turn outcome must be a TurnOutcome")
+    set_attribute = getattr(span, "set_attribute", None)
+    if callable(set_attribute):
+        set_attribute(KESTREL_TURN_OUTCOME, outcome.value)
+    if outcome is not TurnOutcome.FAILED:
+        return
+    if _OTEL_AVAILABLE:
+        span.set_status(StatusCode.ERROR, str(error) if error is not None else "")
+    if error is not None:
+        record_exception = getattr(span, "record_exception", None)
+        if callable(record_exception):
+            record_exception(error)
+
+
+@contextmanager
+def turn_span(name: str, attributes: Optional[Dict[str, Any]] = None):
+    """A current-context turn span whose OUTCOME, not its exception, sets status.
+
+    ``optional_span`` lets OpenTelemetry mark any escaping ``BaseException`` as
+    ERROR. For a turn that is wrong: the pre-admission Stop path raises, and a
+    stopped turn is not a failed one. The span is still ended on every exit —
+    including ``BaseException`` — by the underlying context manager; the caller
+    supplies the outcome through :func:`annotate_turn_outcome` before it exits.
+    """
+
+    tracer = get_tracer()
+    if tracer is None:
+        yield None
+        return
+
+    with tracer.start_as_current_span(
+        name,
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        effective_attributes = dict(attributes or {})
+        effective_attributes.update(current_turn_span_attributes())
+        for key, value in effective_attributes.items():
+            if value is not None:
+                span.set_attribute(key, value)
+        yield span
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +350,11 @@ KESTREL_AGENT_NAME = "kestrel.agent_name"
 # the same to the consumer but only one of them is noise.
 KESTREL_SESSION_ID = "kestrel.session_id"
 
+# Canonical cooperative-Stop address. Unlike request_id (transport-local) and
+# turn_index/session display labels, this exact value resolves through the
+# live turn index and is therefore safe for Timeline/Navigator Stop controls.
+KESTREL_TURN_ID = "kestrel.turn_id"
+
 # A ``session_id`` in flight doubles as a source tag: callers with no
 # conversation session pass a sentinel ("orchestrator" is the dispatch
 # parameter's own default, "original" comes from the re-entrant chat path)
@@ -283,6 +392,93 @@ def session_span_attributes(session_id: Optional[str]) -> Dict[str, str]:
         return {}
     resolved = resolved.strip()
     return {KESTREL_SESSION_ID: resolved, OI_SESSION_ID: resolved}
+
+
+def current_turn_id() -> Optional[str]:
+    """Return the task-local canonical Stop turn address, when live."""
+
+    value = _CURRENT_TURN_ID.get()
+    return value if isinstance(value, str) and value.strip() else None
+
+
+@contextmanager
+def turn_span_scope(turn_id: str):
+    """Bind one lifecycle-owned turn address for all nested span builders."""
+
+    if not isinstance(turn_id, str) or not turn_id.strip():
+        raise ValueError("turn_id must be a concrete string")
+    enclosing_turn = _CURRENT_TURN_ID.get()
+    for opened_under, capture in _TURN_ID_CAPTURE.get():
+        # A capture records only the turns minted directly beneath it. A turn
+        # minted under ANOTHER turn — a background cognition task spawned
+        # from a live turn inherits this context by copy, captures included —
+        # belongs to that turn's subtree, not to a capture that opened before
+        # the other turn existed. Without this, a child's address could land
+        # in its parent's capture and be reported as the parent's own.
+        if opened_under == enclosing_turn:
+            capture.append(turn_id)
+    token = _CURRENT_TURN_ID.set(turn_id)
+    try:
+        yield turn_id
+    finally:
+        _CURRENT_TURN_ID.reset(token)
+
+
+@contextmanager
+def bind_current_turn_id(turn_id: Optional[str]):
+    """Re-present a captured turn id on a task whose context predates the turn.
+
+    Unlike :func:`turn_span_scope` this does not announce a new turn to
+    :func:`capture_turn_ids`: the turn already exists, a foreign task (the
+    codex app-server reader) is merely running work on its behalf. The value is
+    observability — span stamping, ``todo`` metadata, ``origin_turn_id`` — and
+    confers no authority: every live-turn gate consults the lifecycle's
+    ``_BOUND_TURN_SESSION`` pairing instead (#3114). Binding ``None`` clears a
+    stale id the foreign task inherited.
+    """
+    if turn_id is not None and (not isinstance(turn_id, str) or not turn_id.strip()):
+        raise ValueError("turn_id must be a concrete string or None")
+    token = _CURRENT_TURN_ID.set(turn_id)
+    try:
+        yield turn_id
+    finally:
+        _CURRENT_TURN_ID.reset(token)
+
+
+turn_scoped(
+    "turn_id",
+    variables=(_CURRENT_TURN_ID,),
+    capture=lambda _agent: current_turn_id(),
+    bind=bind_current_turn_id,
+)
+
+
+@contextmanager
+def capture_turn_ids():
+    """Capture lifecycle-created turn addresses in this task subtree.
+
+    Captures nest: an inner capture records into every enclosing one too, so a
+    dispatcher still learns the turn its wake produced when the turn entry
+    point opens its own capture. Only turns minted directly beneath the
+    capture are recorded — never a turn minted inside another turn, even one
+    running in a task that inherited this context (see ``turn_span_scope``).
+    """
+
+    captured: list[str] = []
+    token = _TURN_ID_CAPTURE.set(
+        (*_TURN_ID_CAPTURE.get(), (_CURRENT_TURN_ID.get(), captured))
+    )
+    try:
+        yield captured
+    finally:
+        _TURN_ID_CAPTURE.reset(token)
+
+
+def current_turn_span_attributes() -> Dict[str, str]:
+    """Return the canonical Stop address attribute, or an empty mapping."""
+
+    turn_id = current_turn_id()
+    return {KESTREL_TURN_ID: turn_id} if turn_id is not None else {}
 
 
 def _resolved_otlp_endpoint() -> Optional[str]:
@@ -471,12 +667,14 @@ def llm_span(
     cap (issue #2573; talon#71 convention).
     """
     tracer = get_kestrel_tracer()
+    effective_attributes = dict(attributes or {})
+    effective_attributes.update(current_turn_span_attributes())
     with tracer.llm_span(
         name,
         input_value=truncate_for_span(input_value),
         model_name=model_name,
         agent_name=agent_name,
-        attributes=attributes,
+        attributes=effective_attributes,
     ) as span:
         yield span
 
@@ -554,3 +752,34 @@ def record_llm_attempt_failure(provider_name, error, *, redact_content: bool = F
         )
     except Exception:  # pragma: no cover - events must never break the call
         logger.debug("Failed to record LLM attempt event", exc_info=True)
+
+
+def current_trace_identity() -> tuple[Optional[str], Optional[str]]:
+    """Return the current W3C trace/span identities when one is available."""
+
+    if not _OTEL_AVAILABLE:
+        return None, None
+    try:
+        span = trace.get_current_span()
+        context = span.get_span_context() if span is not None else None
+        if context is None or not context.is_valid:
+            return None, None
+        return f"{context.trace_id:032x}", f"{context.span_id:016x}"
+    except Exception:  # pragma: no cover - correlation is best-effort
+        logger.debug("Failed to read current trace identity", exc_info=True)
+        return None, None
+
+
+def span_trace_identity(span: Any) -> tuple[Optional[str], Optional[str]]:
+    """Return one concrete span's W3C identities without requiring it current."""
+
+    if span is None:
+        return None, None
+    try:
+        context = span.get_span_context()
+        if context is None or not context.is_valid:
+            return None, None
+        return f"{context.trace_id:032x}", f"{context.span_id:016x}"
+    except Exception:  # pragma: no cover - correlation is best-effort
+        logger.debug("Failed to read span trace identity", exc_info=True)
+        return None, None

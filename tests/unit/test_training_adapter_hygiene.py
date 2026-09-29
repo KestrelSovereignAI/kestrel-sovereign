@@ -1,10 +1,11 @@
+import asyncio
 import sys
 import types
 import zipfile
 from datetime import datetime, timezone
 from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -24,45 +25,90 @@ from kestrel_sovereign.features.training.types import (
 def _runpod_session(*, persistent: bool):
     return SimpleNamespace(
         pod_id="pod-123",
+        backend_base_url="https://pod.example",
         profile=SimpleNamespace(
             persistent_pod_id="${RUNPOD_POD_ID}" if persistent else None,
         ),
     )
 
 
-@pytest.mark.asyncio
-async def test_runpod_cleanup_pauses_persistent_pod():
-    manager = SimpleNamespace(
+def _runpod_manager(session):
+    async def never_submits(**_kwargs):
+        await asyncio.Event().wait()
+
+    # The pod as RunPod reports it after the release: the adapter reads it back.
+    released_state = "EXITED" if session.profile.persistent_pod_id else "TERMINATED"
+
+    return SimpleNamespace(
+        _session=None,
+        _lock=asyncio.Lock(),
         _expand_single_env_var=lambda value: "pod-123" if value else None,
+        start_training_pod=AsyncMock(return_value=session),
+        submit_training_job=never_submits,
         stop_session=AsyncMock(),
         terminate_session=AsyncMock(),
+        provider=SimpleNamespace(
+            stop_pod=Mock(return_value={"id": session.pod_id}),
+            terminate_pod=Mock(return_value=None),
+            get_status=Mock(
+                return_value={"id": session.pod_id, "desiredStatus": released_state}
+            ),
+        ),
     )
-    adapter = RunPodTrainingAdapter(manager=manager)
-    adapter._active_jobs["job-1"] = {"session": _runpod_session(persistent=True)}
 
-    await adapter.cleanup("job-1")
+
+@pytest.mark.asyncio
+async def test_runpod_cleanup_pauses_the_managers_current_persistent_pod():
+    session = _runpod_session(persistent=True)
+    manager = _runpod_manager(session)
+    manager._session = session
+    adapter = RunPodTrainingAdapter(manager=manager)
+    job = await adapter.start_training("companion", b"avatar")
+
+    await adapter.cleanup(job.job_id)
 
     manager.stop_session.assert_awaited_once_with()
     manager.terminate_session.assert_not_awaited()
-    assert "job-1" not in adapter._active_jobs
+    manager.provider.terminate_pod.assert_not_called()
+    manager.provider.get_status.assert_called_once_with("pod-123")
+    assert job.job_id not in adapter._active_jobs
+
+
+@pytest.mark.asyncio
+async def test_runpod_cleanup_pauses_a_persistent_pod_the_manager_no_longer_holds():
+    session = _runpod_session(persistent=True)
+    manager = _runpod_manager(session)
+    adapter = RunPodTrainingAdapter(manager=manager)
+    job = await adapter.start_training("companion", b"avatar")
+
+    await adapter.cleanup(job.job_id)
+
+    manager.stop_session.assert_not_awaited()
+    # terminate_session swallows stop failures, so the provider stop is used.
+    manager.terminate_session.assert_not_awaited()
+    manager.provider.stop_pod.assert_called_once_with("pod-123")
+    manager.provider.terminate_pod.assert_not_called()
+    manager.provider.get_status.assert_called_once_with("pod-123")
+    assert job.job_id not in adapter._active_jobs
 
 
 @pytest.mark.asyncio
 async def test_runpod_cleanup_terminates_on_demand_pod():
     session = _runpod_session(persistent=False)
-    manager = SimpleNamespace(
-        _expand_single_env_var=lambda value: "pod-123" if value else None,
-        stop_session=AsyncMock(),
-        terminate_session=AsyncMock(),
-    )
+    manager = _runpod_manager(session)
+    manager._session = session
     adapter = RunPodTrainingAdapter(manager=manager)
-    adapter._active_jobs["job-2"] = {"session": session}
+    job = await adapter.start_training("companion", b"avatar")
 
-    await adapter.cleanup("job-2")
+    await adapter.cleanup(job.job_id)
 
+    manager.provider.terminate_pod.assert_called_once_with("pod-123")
+    manager.provider.stop_pod.assert_not_called()
+    manager.provider.get_status.assert_called_once_with("pod-123")
     manager.stop_session.assert_not_awaited()
-    manager.terminate_session.assert_awaited_once_with(session)
-    assert "job-2" not in adapter._active_jobs
+    manager.terminate_session.assert_not_awaited()
+    assert manager._session is None
+    assert job.job_id not in adapter._active_jobs
 
 
 def test_replicate_training_zip_contains_avatar_bytes():

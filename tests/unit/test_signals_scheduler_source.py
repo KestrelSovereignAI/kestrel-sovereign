@@ -24,14 +24,18 @@ from kestrel_sdk.signals import (
     Signal,
     SignalMode,
     Status,
-    Trust,
-    Visibility,
 )
 from kestrel_sdk.tools.result import ToolResult
+
 from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
+
+
+def _NO_REASON_CODES(task_name: str) -> frozenset[str]:
+    """A registration built with no declared reason codes: nothing crosses."""
+    return frozenset()
 from kestrel_sovereign.signals import (
     OrderedLockManager,
     SignalDispatcher,
@@ -45,7 +49,6 @@ from kestrel_sovereign.signals.sources.scheduler import (
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -193,7 +196,7 @@ def test_build_cron_registrations_match_cron_tasks_table():
     async def _lookup(name, args):
         return None
 
-    regs = build_cron_registrations(tool_lookup=_lookup)
+    regs = build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=_lookup)
     assert len(regs) == len(CRON_TASKS)
     names = [r.name for r in regs]
     assert all(n.startswith("cron.") for n in names)
@@ -204,7 +207,7 @@ def test_action_registrations_have_handler_artifact_have_artifact_handler():
     async def _lookup(name, args):
         return f"lookup:{name}"
 
-    regs = build_cron_registrations(tool_lookup=_lookup)
+    regs = build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=_lookup)
     for reg in regs:
         if reg.default_mode == SignalMode.ACTION:
             assert reg.handler is not None, f"{reg.name} ACTION needs handler"
@@ -244,7 +247,7 @@ def test_builtin_handlers_override_tool_lookup():
         captured.append(("backup", args))
         return "backup-ok"
 
-    regs = build_cron_registrations(
+    regs = build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=lookup,
         builtin_handlers={"backup_snapshot": fake_backup},
     )
@@ -280,7 +283,7 @@ async def test_user_scheduled_signal_dispatch_uses_cron_action_source(
         captured.append((name, args))
         return f"ran:{name}"
 
-    for reg in build_cron_registrations(tool_lookup=fake_lookup):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=fake_lookup):
         registry.register(reg)
 
     signal = Signal(
@@ -316,7 +319,7 @@ async def test_artifact_task_dispatches_through_artifact_handler(
     async def fake_lookup(name, args):
         return f"briefing:{name}"
 
-    for reg in build_cron_registrations(tool_lookup=fake_lookup):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=fake_lookup):
         registry.register(reg)
 
     signal = Signal(
@@ -343,7 +346,7 @@ async def test_json_shaped_string_artifact_is_not_a_scheduler_envelope(
     async def fake_lookup(name, args):
         return artifact
 
-    for reg in build_cron_registrations(tool_lookup=fake_lookup):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=fake_lookup):
         registry.register(reg)
 
     signal = Signal(
@@ -369,7 +372,7 @@ async def test_handler_exception_becomes_failed_status(
     async def lookup_raises(name, args):
         raise RuntimeError("tool blew up")
 
-    for reg in build_cron_registrations(tool_lookup=lookup_raises):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup_raises):
         registry.register(reg)
 
     signal = Signal(
@@ -412,7 +415,8 @@ async def test_failed_tool_result_becomes_failed_status(
     scheduler_feature = SchedulerFeature(agent)
 
     for reg in build_cron_registrations(
-        tool_lookup=scheduler_feature._lookup_raw_tool_result
+        tool_lookup=scheduler_feature._lookup_raw_tool_result,
+        reason_codes_lookup=scheduler_feature._declared_reason_codes,
     ):
         registry.register(reg)
 
@@ -461,7 +465,7 @@ async def test_permission_block_is_expected_outcome_without_dispatcher_traceback
     async def lookup_blocked(name, args):
         return blocked
 
-    for reg in build_cron_registrations(tool_lookup=lookup_blocked):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup_blocked):
         registry.register(reg)
 
     signal = Signal(
@@ -530,9 +534,16 @@ async def test_dispatch_audit_and_scheduler_history_agree_end_to_end(
         raise AssertionError(f"unexpected lookup for {name}")
 
     agent.sleep = sleep
+    # Production restart_coordinator schedules always have a loaded owner; the
+    # scheduler refuses a tool-delegating built-in without one before dispatch.
+    agent.features = {
+        "RestartCoordinatorFeature": SimpleNamespace(
+            get_tools=lambda: [SimpleNamespace(name="restart_coordinator")]
+        )
+    }
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
         tool_lookup=lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -663,7 +674,7 @@ async def test_builtin_json_envelopes_follow_scheduler_result_contract(
     async def unused_lookup(name, args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=unused_lookup,
         builtin_handlers={task_name: handler},
     ):
@@ -742,7 +753,7 @@ async def test_backup_without_sync_service_is_a_successful_skipped_dispatch(
     async def unused_lookup(name, args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=unused_lookup,
         builtin_handlers={"backup_snapshot": feature._handle_backup_snapshot},
     ):
@@ -778,7 +789,7 @@ async def test_backup_without_targets_is_a_successful_skipped_dispatch(
     async def unused_lookup(name, args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=unused_lookup,
         builtin_handlers={"backup_snapshot": feature._handle_backup_snapshot},
     ):
@@ -805,10 +816,18 @@ async def test_backup_with_failed_targets_is_a_failed_dispatch(
 ):
     """A configured backup is successful only when every target succeeds."""
     agent, registry, dispatcher, _ = dispatcher_components
+    from kestrel_sovereign.storage.sync.targets import SyncResult
+
+    def failed(name):
+        return SyncResult(
+            success=False, target_name=name, bytes_synced=0, frames_synced=0,
+            timestamp=datetime.now(timezone.utc), error="ReadTimeout: ", kind="",
+        )
+
     agent._sync_service = SimpleNamespace(
         snapshot_if_changed=AsyncMock(return_value={
-            "gcs": SimpleNamespace(success=False, bytes_synced=0),
-            "ipfs": SimpleNamespace(success=False, bytes_synced=0),
+            "gcs": failed("gcs"),
+            "ipfs": failed("ipfs"),
         })
     )
     feature = SchedulerFeature(agent)
@@ -817,7 +836,7 @@ async def test_backup_with_failed_targets_is_a_failed_dispatch(
     async def unused_lookup(name, args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=unused_lookup,
         builtin_handlers={"backup_snapshot": feature._handle_backup_snapshot},
     ):
@@ -862,7 +881,7 @@ async def test_failed_sleep_audit_uses_bounded_error_not_raw_report(
     async def unused_lookup(name, args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
         tool_lookup=unused_lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -899,6 +918,50 @@ async def test_failed_sleep_audit_uses_bounded_error_not_raw_report(
         for record in caplog.records
         if record.name == "kestrel_sovereign.signals.sources.scheduler"
     )
+
+
+@pytest.mark.asyncio
+async def test_real_sleep_privacy_skip_then_export_failure_names_the_export(
+    dispatcher_components,
+):
+    """The one call site the structured code depends on, driven through the
+    real SleepMixin: a privacy-blocked consolidation followed by an export
+    exception composes ``consolidation_skipped; Export failed: ...``. The
+    cause that reaches signal_log.error must be the export, not the skip —
+    deleting the export phase's _record_failure_code left 402 tests green."""
+    agent, registry, dispatcher, _ = dispatcher_components
+    agent._consolidate_memories = AsyncMock(return_value={
+        "skipped": True,
+        "privacy_blocked": True,
+    })
+    agent._export_sovereignty = AsyncMock(
+        side_effect=RuntimeError("remote backup unavailable")
+    )
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+
+    async def unused_lookup(name, task_args):
+        raise AssertionError(f"unexpected tool lookup for {name}")
+
+    for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
+        tool_lookup=unused_lookup,
+        builtin_handlers={"sleep": feature._handle_sleep},
+    ):
+        registry.register(registration)
+
+    result = await dispatcher.dispatch_signal(Signal(
+        source=cron_source_name("sleep"),
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={"skip_reflection": True, "skip_export": False},
+        target_agent=agent.did,
+    ))
+
+    assert result.status == Status.FAILED
+    assert (result.error or "").endswith(
+        "scheduled task sleep returned failed (export_failed)"
+    )
+    assert "remote backup unavailable" not in (result.error or "")
 
 
 @pytest.mark.parametrize(
@@ -942,7 +1005,7 @@ async def test_real_sleep_nonterminal_reports_remain_successful_cron_dispatches(
     async def unused_lookup(name, task_args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
         tool_lookup=unused_lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -995,7 +1058,7 @@ async def test_privacy_skip_does_not_mask_artifact_sweep_failure(
     async def unused_lookup(name, task_args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
         tool_lookup=unused_lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -1010,8 +1073,10 @@ async def test_privacy_skip_does_not_mask_artifact_sweep_failure(
     ))
 
     assert result.status == Status.FAILED
+    # The code is the report's own content-free token (#3184); the private
+    # detail behind it still never crosses.
     assert (result.error or "").endswith(
-        "scheduled task sleep returned failed"
+        "scheduled task sleep returned failed (semantic_artifact_expiry_sweep_failed)"
     )
     assert "private storage detail" not in (result.error or "")
 
@@ -1026,7 +1091,7 @@ async def test_signal_log_writes_redacted_args(dispatcher_components):
     async def lookup(name, args):
         return "ok"
 
-    for reg in build_cron_registrations(tool_lookup=lookup):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup):
         registry.register(reg)
 
     signal = Signal(
@@ -1070,7 +1135,7 @@ async def test_concurrent_memory_tasks_serialize(dispatcher_components):
             order.append(f"end:{name}")
         return None
 
-    for reg in build_cron_registrations(tool_lookup=lookup):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup):
         registry.register(reg)
 
     sig_a = Signal(
@@ -1099,3 +1164,199 @@ async def test_concurrent_memory_tasks_serialize(dispatcher_components):
         ["start:memory_consolidate", "end:memory_consolidate",
          "start:trash_retention", "end:trash_retention"],
     ), order
+
+
+# ---------------------------------------------------------------------------
+# Feature-load barrier (#2474)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_due_schedule(db, agent_id, schedule_id, task_name, *, cron="@daily"):
+    due_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    await db.execute(
+        """
+        INSERT INTO scheduled_tasks
+            (id, agent_id, task_name, cron_expression, args_json,
+             enabled, next_run_at, created_at, scheduler_protocol_version)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?, 2)
+        """,
+        (schedule_id, agent_id, task_name, cron, "{}", due_at, due_at),
+    )
+    return due_at
+
+
+def _barrier_scheduler(agent, registry):
+    """A SchedulerFeature wired exactly as initialize() wires its sources."""
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+    for registration in build_cron_registrations(
+        tool_lookup=feature._lookup_raw_tool_result,
+        reason_codes_lookup=feature._declared_reason_codes,
+        builtin_handlers=feature._builtin_cron_handlers(),
+    ):
+        registry.register(registration)
+    return feature
+
+
+@pytest.mark.asyncio
+async def test_due_builtin_whose_owner_loads_later_runs_once_after_barrier(
+    dispatcher_components,
+):
+    """#2474: a due restart_coordinator whose owner has not loaded yet must
+    not be recorded as a (skipped) success nor advance its cron. Once the
+    owner loads and the post_all_features_loaded barrier completes, the SAME
+    occurrence executes exactly once and a later tick never re-runs it."""
+    agent, registry, dispatcher, backend = dispatcher_components
+    agent.dispatcher = dispatcher
+    agent.features = {}
+    agent._post_all_features_loaded_complete = False
+    feature = _barrier_scheduler(agent, registry)
+
+    owner_ran = asyncio.Event()
+    calls = []
+
+    async def execute(**kwargs):
+        calls.append(kwargs)
+        owner_ran.set()
+        return {"success": True, "restarted": False}
+
+    owner = SimpleNamespace(
+        name="RestartCoordinatorFeature",
+        get_tools=lambda: [SimpleNamespace(name="restart_coordinator", execute=execute)],
+    )
+
+    db = AsyncDatabase(backend)
+    runner = SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task)
+    await runner.start(polling=False)
+    due_at = await _seed_due_schedule(
+        db, agent.did, "restart-task", "restart_coordinator"
+    )
+
+    # A tick that reaches the scheduler before the barrier (the standalone
+    # runner is only armed from on_agent_ready; this is the defensive gate).
+    await runner._tick()
+
+    assert calls == []
+    assert await db.fetchone(
+        "SELECT next_run_at, last_run_at FROM scheduled_tasks WHERE id = ?",
+        ("restart-task",),
+    ) == (due_at, None)
+    history = await db.fetchall(
+        "SELECT status FROM task_execution_log WHERE task_id = ?",
+        ("restart-task",),
+    )
+    assert [row[0] for row in history] == ["claimed"]
+    assert await backend.fetch_one(
+        "SELECT status FROM signal_log WHERE source = ?",
+        (cron_source_name("restart_coordinator"),),
+    ) is None
+
+    # The owner finishes loading, then the lifecycle barrier completes.
+    agent.features = {"RestartCoordinatorFeature": owner}
+    agent._post_all_features_loaded_complete = True
+    # The deferred claim is recovered once its lease lapses (expire it in the
+    # database rather than sleeping out the lease interval).
+    expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    await db.execute(
+        "UPDATE scheduled_tasks SET lease_expires_at = ? WHERE id = ?",
+        (expired, "restart-task"),
+    )
+
+    await runner._tick()
+
+    assert owner_ran.is_set()
+    assert len(calls) == 1
+    history = await db.fetchall(
+        "SELECT status, result_text FROM task_execution_log WHERE task_id = ?",
+        ("restart-task",),
+    )
+    assert len(history) == 1
+    assert history[0][0] == "success"
+    assert "restarted" in history[0][1]
+    assert "skipped" not in history[0][1]
+    next_run_at, last_run_at = await db.fetchone(
+        "SELECT next_run_at, last_run_at FROM scheduled_tasks WHERE id = ?",
+        ("restart-task",),
+    )
+    assert last_run_at is not None
+    assert next_run_at > due_at
+
+    # A later poll (or a restarted runner) does not re-run the occurrence.
+    await runner._tick()
+    await SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task)._tick()
+    assert len(calls) == 1
+    assert len(await db.fetchall(
+        "SELECT id FROM task_execution_log WHERE task_id = ?", ("restart-task",),
+    )) == 1
+
+
+@pytest.mark.parametrize(
+    ("schedule_id", "cron", "enabled", "terminal_status"),
+    [
+        ("recurring-task", "@daily", 1, None),
+        ("one-shot-task", "", 0, "failed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_builtin_with_permanently_absent_owner_fails_honestly(
+    dispatcher_components, schedule_id, cron, enabled, terminal_status,
+):
+    """#2474: after the barrier an unresolvable built-in owner is missing.
+    The occurrence is recorded as failed with actionable text — never
+    success — and last_run_at stays untouched because nothing executed. A
+    recurring schedule moves to its next occurrence (one failure per
+    occurrence, no hot retry); a one-shot is terminal."""
+    agent, registry, dispatcher, backend = dispatcher_components
+    agent.dispatcher = dispatcher
+    agent.features = {}
+    agent._post_all_features_loaded_complete = True
+    feature = _barrier_scheduler(agent, registry)
+
+    db = AsyncDatabase(backend)
+    runner = SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task)
+    await runner.start(polling=False)
+    if not cron:
+        due_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json,
+                 enabled, next_run_at, created_at, scheduler_protocol_version,
+                 schedule_kind, run_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?, 2, 'one_shot', ?)
+            """,
+            (schedule_id, agent.did, "restart_coordinator", cron, "{}",
+             due_at, due_at, due_at),
+        )
+    else:
+        due_at = await _seed_due_schedule(
+            db, agent.did, schedule_id, "restart_coordinator", cron=cron
+        )
+
+    await runner._tick()
+    await runner._tick()
+
+    history = await db.fetchall(
+        "SELECT status, result_text FROM task_execution_log WHERE task_id = ?",
+        (schedule_id,),
+    )
+    assert len(history) == 1
+    status, result_text = history[0]
+    assert status == "failed"
+    assert "restart_coordinator" in result_text
+    assert "Install or enable the feature" in result_text
+    row = await db.fetchone(
+        "SELECT enabled, last_run_at, next_run_at, terminal_status "
+        "FROM scheduled_tasks WHERE id = ?",
+        (schedule_id,),
+    )
+    assert row[0] == enabled
+    assert row[1] is None
+    assert row[3] == terminal_status
+    if enabled:
+        assert row[2] > due_at
+    # The dispatcher was never asked to run a task with no owner.
+    assert await backend.fetch_one(
+        "SELECT status FROM signal_log WHERE source = ?",
+        (cron_source_name("restart_coordinator"),),
+    ) is None

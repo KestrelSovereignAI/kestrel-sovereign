@@ -9,14 +9,211 @@ This module provides SQLite-backed storage for tool permissions with:
 """
 
 import aiosqlite
+import asyncio
+import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.audit_time import utc_now_iso
+from kestrel_sovereign.features.security.args_summary import (
+    _MAX_REPAIR_TRIM,
+    mask_sensitive,
+    remask_summary,
+    repair_unparseable_summary,
+)
+
+#: The audit-search tool's own name. Its rows are excluded from every search
+#: (see ``_match_predicate``) because the security hook records the call, query
+#: and all, BEFORE the tool body runs. Defined here rather than in the feature
+#: so the exclusion and the ``@tool(name=...)`` cannot drift apart.
+SEARCH_TOOL_NAME = "security_audit_search"
+
+#: ``action`` value for a feature-as-subagent DISPATCH row, as opposed to the
+#: ``tool_execution`` rows its inner tool calls write. ``SecurityHook`` runs on
+#: PRE_SUBAGENT_CALL as well as PRE_TOOL_USE, and until #3107 both wrote
+#: "tool_execution", so a dispatch envelope was indistinguishable from the work
+#: it requested. The distinction is what lets a read-back exclude requests and
+#: keep actions.
+SUBAGENT_DISPATCH_ACTION = "subagent_dispatch"
+
+
+def fold_query(text):
+    """Canonicalise a QUERY for matching: decode escapes, casefold. No masking.
+
+    Split from :func:`fold_stored_summary` because the two answer different
+    questions and sharing one function was a defect (#3107 review round 8):
+    the stored side is parsed, masked and flattened (a JSON-shaped row folds
+    to its keys and values, decoded), while a query is the literal text a
+    human typed. A query containing a literal ``\\u00e9`` must match the
+    stored row's decoded ``é``, and a JSON-shaped query must match its own
+    literal text rather than being flattened into ``repo o/r``. The
+    round-8 shape (the stored rule emptying a query such as ``password
+    reset`` into the LIKE pattern ``%%``) went with the text scanner in
+    round 17; these two are the divergences that remain, and both are
+    pinned.
+    """
+    if not text:
+        return text
+    # The needle crosses into SQLite as a bound parameter exactly as the
+    # stored side's fold does; a lone surrogate in it (a cut emoji in
+    # model-emitted text) raised a codec error and failed the whole search
+    # (round 29 review). Same replacement, same reason.
+    return _decode_unicode_escapes(text).casefold().encode("utf-8", "replace").decode("utf-8")
+
+
+def fold_stored_summary(text):
+    """Decode JSON escaping and casefold, so a query and a stored summary can
+    be compared as the text a human wrote (#3107).
+
+    ``args_summary`` holds ``json.dumps`` output with the default
+    ``ensure_ascii=True``, so "Échec" is persisted as ``\\u00c9chec``. Neither
+    a literal comparison nor SQLite's ASCII-only ``LOWER`` can match that
+    against a query of "échec". Decoding first makes both sides the same kind
+    of thing before either is folded.
+
+    A truncated summary is not valid JSON — ``summarize_args`` cuts at 500
+    characters mid-structure — and those are exactly the long issue bodies the
+    motivating case searches. Folding the raw text there would leave every
+    escape undecoded and reintroduce the bug one row-shape over, so the
+    fallback repairs the cut JSON and parses it, which decodes the escapes
+    inside it the same way the parseable branch does; a prose-only row (no
+    JSON at all) is folded as written. Returning nothing for every unparseable
+    row is not an option either: it would silently shrink the corpus the
+    caller believes it searched — only a row whose JSON cannot be repaired is
+    withheld, because it cannot be masked.
+    """
+    if not isinstance(text, str):
+        # A BLOB (the column has TEXT affinity, but bytes are stored as
+        # bytes) would raise inside the registered scalar function, and a
+        # raised scalar fails the WHOLE query — one such row and every search
+        # errors permanently, the same hazard round 5 closed for a lone
+        # surrogate. Nothing here can read it, so it matches nothing.
+        return ""
+    if not text:
+        return text
+    try:
+        return _fold_text(text)
+    except RecursionError:
+        # A row nested past the interpreter's limit cannot be walked or
+        # masked; inside the registered scalar function a raise fails the
+        # WHOLE query, so it matches nothing instead (round 23 review).
+        return ""
+
+
+def _fold_text(text: str) -> str:
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        # Truncated past parsing. Repair the cut JSON and mask it structurally
+        # — the same masker and the same walk the parseable branch below
+        # applies — rather than scan the raw text: a scanner has to know every
+        # value shape (a container, an escaped nested string, a quoted key in
+        # prose) and rounds 13–16 each found one it did not. A row whose JSON
+        # cannot be repaired cannot be masked, so it is not searchable; a
+        # prose-only row has no key position and folds as it is (#3107).
+        prefix, masked, _altered = repair_unparseable_summary(text)
+        folded = prefix if masked is None else prefix + " " + _flatten_json(masked)
+        return folded.casefold().encode("utf-8", "replace").decode("utf-8")
+
+    if isinstance(parsed, (dict, list)):
+        # MASK BEFORE FOLDING. Masking only on the way out closes the display
+        # and leaves the MATCH open: a caller could compare the query against a
+        # raw legacy secret and read it back one character at a time from
+        # hit/no-hit, while every returned row dutifully showed ***MASKED***
+        # (#3107 review round 7). The searchable projection has to be the
+        # masked one, so matching and display are the same text.
+        # READ path: a nested payload cut inside a row that parses needs the
+        # repair slack the unparseable branch already has, or its secret
+        # stays in the searchable projection (round 20 review).
+        parsed = mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM)
+        # Walk the VALUES rather than re-serializing: json.dumps would put back
+        # the standard escapes (\", \n, doubled backslashes) that summarize_args
+        # introduced, so `say "hello"`, multiline text and Windows paths would
+        # not match their own stored form. ensure_ascii=False happens to fix
+        # \uXXXX and nothing else.
+        # Same hazard round 5 closed on the unparseable branch: json.dumps
+        # happily stores a lone surrogate (a cut emoji in model-emitted
+        # arguments), and handing one back to SQLite from inside the scalar
+        # function raises — which fails the WHOLE query, so one poisoned row
+        # made every search return an error, permanently. Replace here, at
+        # the one place the value crosses back into SQLite.
+        return _flatten_json(parsed).casefold().encode("utf-8", "replace").decode("utf-8")
+    if isinstance(parsed, str):
+        # A row that is itself a JSON string may carry a JSON-encoded payload
+        # one level up from where the walker sees it (round 21 review); the
+        # same masker, the same read-path slack.
+        parsed = mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM)
+        # Decode its escapes as the leaf walk does (round 22): a row that is
+        # itself a JSON string keeps ``\\u2014``/``\\u00e9`` past the outer
+        # decode, and the query side is decoded — neither spelling matched
+        # (round 26 review).
+        return _decode_unicode_escapes(parsed).casefold().encode("utf-8", "replace").decode("utf-8")
+    return str(parsed).casefold()
+
+
+def _flatten_json(value):
+    """Concatenate every key and string value, decoded, for matching."""
+    parts = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                parts.append(str(k))
+                walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        else:
+            # A string value that is itself a JSON document serialized by the
+            # caller (an args_json, an HTTP payload) still carries literal
+            # ``\\u2014``/``\\u00c9`` after the OUTER row is decoded, while
+            # fold_query decodes the query side — neither spelling matched
+            # (round 22 review). Decode the leaf so both sides are the same
+            # kind of thing; only ``\\uXXXX``, so the round-10 ``\\b`` bug
+            # stays closed.
+            parts.append(_decode_unicode_escapes(node) if isinstance(node, str) else str(node))
+
+    walk(value)
+    return " ".join(parts)
+
+
+_UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+_SURROGATE_PAIR = re.compile(
+    r"\\u(d[89ab][0-9a-fA-F]{2})\\u(d[c-f][0-9a-fA-F]{2})", re.IGNORECASE
+)
+
+
+def _decode_unicode_escapes(text):
+    """Decode only ``\\uXXXX`` (and surrogate pairs) in a QUERY.
+
+    The stored side of a parseable row comes out of ``json.loads`` already
+    decoded, so a query must be treated the same way — decoding the standard
+    escapes too turned ``\\b`` in a grep the agent just ran into a backspace,
+    and the search for that exact command reported a false absence, with a
+    message telling the caller absence is weak evidence (#3107 round 10).
+    The stored side of a TRUNCATED row is now repaired and parsed too, so the
+    same decoding applies to both sides of every comparison.
+    """
+    def _one(match):
+        code = int(match.group(1), 16)
+        if 0xD800 <= code <= 0xDFFF:
+            return match.group(0)
+        return chr(code)
+
+    paired = _SURROGATE_PAIR.sub(
+        lambda m: chr(
+            0x10000
+            + ((int(m.group(1), 16) - 0xD800) << 10)
+            + (int(m.group(2), 16) - 0xDC00)
+        ),
+        text,
+    )
+    return _UNICODE_ESCAPE.sub(_one, paired)
+
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +508,21 @@ class PermissionStore:
         """
         self.db_path = db_path
         self._session_overrides: Dict[str, PermissionLevel] = {}
+        # Tool names that are feature-as-subagent DISPATCH entries — see
+        # :meth:`mark_dispatch_entry`. The in-memory set is the union of what
+        # this boot's feature registration marked and the durable
+        # ``security_dispatch_entries`` table (``sync_dispatch_entries``), so
+        # a feature removed or renamed since still filters its historical
+        # envelope rows.
+        self._dispatch_entries: set = set()
+        # Marked this boot but not yet persisted — a flush task writes them to
+        # the durable table as soon as a loop is running, and the next read
+        # flushes anything still pending, so registration itself stays
+        # synchronous and cheap.
+        self._dispatch_entries_dirty: set = set()
+        # Flush tasks are held here so a running flush is never garbage
+        # collected mid-await (asyncio keeps only weak references).
+        self._dispatch_flush_tasks: set = set()
         # Global Auto has two tiers backing one effective state:
         #   - _global_auto_session: in-memory, cleared on session reset.
         #   - _global_auto_always:  persisted in security_global_settings,
@@ -351,6 +563,20 @@ class PermissionStore:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(feature_name, tool_name)
+                )
+            """)
+
+            # Names that have ever denoted a feature-as-subagent DISPATCH
+            # entry (#3107). Durable and append-only on purpose: the in-memory
+            # set is rebuilt from CURRENTLY LOADED features, so a feature that
+            # is removed or renamed takes its name out of the exclusion while
+            # its historical envelope rows stay in the table — and text from an
+            # old subagent REQUEST then reads as a prior attempt. The audit log
+            # outlives the feature list, so the filter has to as well.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS security_dispatch_entries (
+                    tool_name TEXT PRIMARY KEY,
+                    first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
@@ -809,6 +1035,85 @@ class PermissionStore:
             for name, tools in features_dict.items()
         ]
 
+    def mark_dispatch_entry(self, tool_name: str) -> None:
+        """Record that ``tool_name`` is a feature-as-subagent DISPATCH entry.
+
+        The audit table cannot tell a dispatch envelope from a tool call by
+        inspection, and it needs to: an envelope records what a task ASKED FOR,
+        the inner rows record what was DONE, and a read-back that confuses them
+        reports a request as prior work (#3107).
+
+        Labelling by hook event was not enough. ``orchestrator_engine`` fires
+        PRE_SUBAGENT_CALL for the dispatch AND a second PRE_TOOL_USE around
+        ``execute_as_subagent`` with the same arguments — deliberately, so
+        PRE_TOOL_USE-only hooks see chat-path and inline-path dispatches alike
+        (PR #1385). Only the first carries the dispatch event, so a rule keyed
+        on the event misses the second by construction.
+
+        This is keyed on the NAME instead, which both rows share and which the
+        feature itself declares at registration. The name goes into the
+        in-memory set for this boot AND, durably, into the
+        ``security_dispatch_entries`` table (flushed eagerly here, and on the
+        next read): the audit log outlives the feature list, so a name that
+        ever denoted a dispatch entry must keep filtering after its feature is
+        removed or renamed — the in-memory set alone lost that (round 28
+        review corrected the earlier claim that no durable record was needed).
+        """
+        if tool_name:
+            self._dispatch_entries.add(tool_name)
+            self._dispatch_entries_dirty.add(tool_name)
+            # Durability cannot wait for the first search. A feature that
+            # writes envelope rows, is then removed, and whose process restarts
+            # before anyone searches would lose the name entirely — and its
+            # historical REQUESTS would start reading as prior actions, which
+            # is the failure this table exists to prevent. Flushed on a task so
+            # registration stays synchronous; the read path still syncs, so a
+            # lost task degrades to the old behaviour rather than an error.
+            try:
+                task = asyncio.get_running_loop().create_task(
+                    self.sync_dispatch_entries()
+                )
+                self._dispatch_flush_tasks.add(task)
+                task.add_done_callback(self._dispatch_flush_tasks.discard)
+            except RuntimeError:
+                # No loop (sync construction in a test): the read path flushes.
+                pass
+
+    @property
+    def dispatch_entries(self) -> frozenset:
+        """Tool names registered as feature-as-subagent dispatch entries."""
+        return frozenset(self._dispatch_entries)
+
+    async def sync_dispatch_entries(self) -> frozenset:
+        """Persist names marked this boot, then return the FULL durable set.
+
+        The union matters, not this boot's list: a feature removed or renamed
+        since the rows were written is absent from the live feature map but its
+        envelope rows are still in the audit log, and an exclusion built only
+        from what is loaded now would stop covering them.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            # Snapshot, then discard only what was written: a name marked
+            # while the executemany/commit awaits were in flight is still
+            # dirty and goes out with the next flush. Clearing the whole set
+            # dropped it, and a feature removed before the next boot would then
+            # have its envelope rows read as prior actions.
+            pending = sorted(self._dispatch_entries_dirty)
+            if pending:
+                await db.executemany(
+                    "INSERT OR IGNORE INTO security_dispatch_entries "
+                    "(tool_name) VALUES (?)",
+                    [(name,) for name in pending],
+                )
+                await db.commit()
+                self._dispatch_entries_dirty.difference_update(pending)
+            cursor = await db.execute(
+                "SELECT tool_name FROM security_dispatch_entries"
+            )
+            rows = await cursor.fetchall()
+        self._dispatch_entries.update(r[0] for r in rows)
+        return frozenset(self._dispatch_entries)
+
     async def register_tool(
         self,
         feature_name: str,
@@ -940,11 +1245,243 @@ class PermissionStore:
                 "action": row["action"],
                 "decision": row["decision"],
                 "user_choice": row["user_choice"],
-                "args_summary": row["args_summary"],
+                # Re-masked here too: this is the store's OTHER read path over
+                # the same column (/api/security/audit), and "one door in the
+                # store" is only true if both doors mask (round 17 review).
+                "args_summary": remask_summary(row["args_summary"]),
                 "timestamp": row["created_at"],
             }
             for row in rows
         ]
+
+    def _match_predicate(
+        self,
+        needle: str,
+        *,
+        tool_name: Optional[str],
+        days: Optional[int],
+    ) -> Tuple[str, List[Any]]:
+        """Build the WHERE clause for a match, and its parameters.
+
+        One builder, so the page and its headroom row (the breadth signal
+        ``search_audit_log`` reads instead of a count query) come from the
+        same predicate and cannot disagree.
+        """
+        def _escape_like(text: str) -> str:
+            """Neutralise LIKE metacharacters in a literal."""
+            return (
+                text.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+
+        def _like_prefix(text: str) -> str:
+            """Match ``text`` and anything suffixed to it, e.g. ``.outcome``."""
+            return _escape_like(text) + "%"
+
+        def _like(text: str) -> str:
+            # LIKE wildcards in the needle would silently widen the match — a
+            # caller searching for a literal "%" must not get everything.
+            return "%" + _escape_like(text) + "%"
+
+        # Two problems with matching this column, and one answer to both.
+        #
+        # ``summarize_args`` persists ``json.dumps(...)`` output, and json.dumps
+        # defaults to ensure_ascii=True — so a title stored from "Échec — café"
+        # is on disk as "\u00c9chec \u2014 caf\u00e9". A LIKE built from the
+        # literal query finds nothing for exactly the natural-language
+        # fragments a caller reaches for; both real filings behind #3107
+        # carried an em dash. And SQLite's built-in LOWER folds ASCII only, so
+        # matching the ESCAPED form case-insensitively does not work either:
+        # "É" and "é" escape to \u00c9 and \u00e9, which differ in a
+        # character LOWER will not touch.
+        #
+        # So neither side is compared raw. ``py_fold`` (registered on the
+        # connection) decodes the JSON escaping and casefolds, and both the
+        # column and the needle go through it. Measured 2026-09-03 at about
+        # 0.7 s for a full scan of 86,000 rows with an eighth of them
+        # truncated (repair costs more than a parse), and under 2 s if every
+        # row is — this table has no index for LIKE anyway.
+        clauses = [
+            (
+                "(py_fold(args_summary) LIKE ? ESCAPE '\\' "
+                "OR py_fold(tool_name) LIKE ? ESCAPE '\\')"
+            ),
+            # A dispatch is a REQUEST, not an action. ``SecurityHook`` also
+            # runs on PRE_SUBAGENT_CALL, so a feature-as-subagent dispatch
+            # writes a row carrying the whole task text — including, when the
+            # dispatch is what reached this very tool, the search phrase
+            # itself. Left in, the enclosing call returns as prior work and a
+            # novel search reads as already done. Excluding dispatch envelopes
+            # generally is the honest rule rather than a special case: what a
+            # task ASKED for is not evidence of what was DONE, and the inner
+            # tool rows are what record that.
+            # COALESCE on every exclusion: the schema declares action and
+            # tool_name without NOT NULL, and under three-valued logic
+            # `NULL <> x`, `NULL NOT LIKE x` and `NULL NOT IN (...)` are all
+            # NULL — the row silently leaves the corpus the caller believes it
+            # searched (round 21 review). A NULL is "not the excluded value".
+            "COALESCE(action, '') <> ?",
+            # A search must never return its own act of searching. The security
+            # hook writes its PRE_TOOL_USE row — carrying this very query inside
+            # ``args_summary`` — BEFORE the tool body runs, so without this the
+            # current invocation always matches itself: the no-match branch is
+            # unreachable in production and a brand-new search reads as prior
+            # work. That is exactly the failure this tool exists to prevent,
+            # manufactured by the tool. Prefix match takes the paired
+            # ``.outcome`` row with it.
+            # ESCAPE is not optional here: the pattern escapes the literal
+            # underscores in the tool name, and without declaring the escape
+            # character SQLite reads "\\_" as backslash-then-wildcard and the
+            # exclusion silently matches nothing.
+            "COALESCE(tool_name, '') NOT LIKE ? ESCAPE '\\'",
+        ]
+        folded = _like(fold_query(needle))
+        params: List[Any] = [
+            folded, folded, SUBAGENT_DISPATCH_ACTION,
+            # Escaped: SEARCH_TOOL_NAME contains underscores, and an unescaped
+            # LIKE would treat each as "any character" — excluding unrelated
+            # tools such as `security-audit-search-index` and making them
+            # unfindable even with an exact tool_name filter. Same wildcard bug
+            # already fixed for the query, still present in the exclusion.
+            _like_prefix(SEARCH_TOOL_NAME),
+        ]
+
+        # ...and by NAME, which is what actually covers the case. The
+        # orchestrator fires PRE_SUBAGENT_CALL for a dispatch AND a second
+        # PRE_TOOL_USE around ``execute_as_subagent`` carrying the same
+        # arguments, so only the first row gets the dispatch ACTION. Both name
+        # the feature's dispatch entry, and that is the fact both share.
+        dispatch_names = sorted(self._dispatch_entries)
+        if dispatch_names:
+            placeholders = ", ".join("?" for _ in dispatch_names)
+            clauses.append(f"COALESCE(tool_name, '') NOT IN ({placeholders})")
+            params.extend(dispatch_names)
+
+        if tool_name:
+            clauses.append("tool_name = ?")
+            params.append(tool_name.encode("utf-8", "replace").decode("utf-8"))
+
+        if days is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
+            # created_at is ISO ("...T...+00:00") today, but legacy rows are
+            # space-separated and offset-less (F092). Comparing the two forms as
+            # text is wrong in a way that silently DROPS rows: " " (32) sorts
+            # below "T" (84), so EVERY legacy row on the cutoff's own date
+            # compares below an ISO cutoff regardless of the time it carries.
+            # Normalize both to "YYYY-MM-DD HH:MM:SS" first.
+            # An undated row (NULL or '' created_at — a documented real shape,
+            # #2146/P9) cannot be proven out of the window; it stays in the
+            # corpus like the two COALESCE'd exclusions above, rather than
+            # silently leaving it (round 30 review).
+            clauses.append(
+                "(created_at IS NULL OR created_at = '' "
+                "OR substr(replace(created_at, 'T', ' '), 1, 19) >= ?)"
+            )
+            params.append(cutoff.strftime("%Y-%m-%d %H:%M:%S"))
+
+        return " AND ".join(clauses), params
+
+    async def search_audit_log(
+        self,
+        query: str,
+        *,
+        tool_name: Optional[str] = None,
+        days: Optional[int] = None,
+        limit: int = 20,
+    ) -> Tuple[List[Dict], bool]:
+        """Return audit rows whose recorded call matches ``query`` (#3107).
+
+        The sibling of :meth:`get_audit_log`, and deliberately not a variant of
+        it. ``get_audit_log`` answers "what happened recently" and is what the
+        operator's ``/api/security/audit`` page renders. This answers a
+        different question — *"have I already done this?"* — which a listing
+        cannot answer at all: the write that matters may be a hundred rows back,
+        and the only handle the caller has on it is a description of the thing
+        itself.
+
+        That difference is what makes returning ``args_summary`` here
+        defensible where returning it from an unbounded listing was not, and it
+        holds only while the query is a description. ``limit`` is therefore
+        fetched with ONE row of headroom and the caller is told whether that
+        row existed. A separate COUNT could pass at the bound while the page
+        query — on its own connection, so its own SQLite snapshot — saw more
+        rows and returned their arguments anyway. One statement cannot
+        disagree with itself.
+
+        **A row is an AUTHORIZATION, not a completion.** The security hook logs
+        at ``PRE_TOOL_USE``, so a row records that the call was allowed to run —
+        including ``auto_denied`` and timed-out attempts. Callers must read
+        ``decision`` rather than treating presence as proof the work happened.
+
+        Args:
+            query: Substring to look for. Must be non-empty after stripping.
+            tool_name: Restrict to one tool (exact match).
+            days: Only rows from the last N days.
+            limit: Maximum rows returned, newest first.
+        """
+        needle = (query or "").strip()
+        if not needle:
+            return [], False
+
+        # Durable union, not this boot's registrations: an envelope written by
+        # a feature since removed must still be excluded.
+        await self.sync_dispatch_entries()
+
+        where, params = self._match_predicate(
+            needle, tool_name=tool_name, days=days,
+        )
+        # One row of headroom: whether it came back IS the "too broad"
+        # signal, read from the same statement rather than a racing COUNT.
+        params.append(int(limit) + 1)
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            # The fold has to happen inside the query: SQLite cannot express
+            # it, so Python is registered as a scalar function on this
+            # connection. Deterministic, so SQLite may cache per-value.
+            await db.create_function(
+                "py_fold", 1, fold_stored_summary, deterministic=True
+            )
+            # id DESC for the same reason get_audit_log uses it: legacy rows
+            # carry a space-separated timestamp that sorts incorrectly against
+            # the ISO ones (F092), and id ordering is format-agnostic.
+            cursor = await db.execute(
+                f"""
+                SELECT feature_name, tool_name, action, decision,
+                       user_choice, args_summary, created_at
+                FROM security_audit_log
+                WHERE {where}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            )
+            rows = await cursor.fetchall()
+
+        has_more = len(rows) > int(limit)
+        rows = rows[: int(limit)]
+
+        return [
+            {
+                "feature": row["feature_name"],
+                "tool": row["tool_name"],
+                "action": row["action"],
+                "decision": row["decision"],
+                "user_choice": row["user_choice"],
+                # Re-masked HERE, in the store's own read path: the searchable
+                # projection is masked (fold_stored_summary), and the row that
+                # comes back must be the same text, whoever calls this. A
+                # re-mask that lived only in the tool left the store
+                # disagreeing with itself about its own rows, and the next
+                # caller (an endpoint, another feature) would have leaked a
+                # legacy row the tool had been hiding (round 14 review).
+                # get_audit_log applies the same re-mask.
+                "args_summary": remask_summary(row["args_summary"]),
+                "timestamp": row["created_at"],
+            }
+            for row in rows
+        ], has_more
 
     # ------------------------------------------------------------------
     # Auto-approve allowlist (Sovereign-curated, revocable)

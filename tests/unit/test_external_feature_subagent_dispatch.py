@@ -158,7 +158,14 @@ def test_subagent_dispatch_closure_is_complete():
 
 
 def _self_call_names(func) -> set[str]:
-    """Names invoked as ``self.<name>(...)`` in ``func``'s own source.
+    """Names referenced as ``self.<name>`` in ``func``'s own source.
+
+    Calls *and* bare attribute reads. #3245 added a class attribute the
+    cluster read as ``self._SUBAGENT_CONTEXT_FRACTION`` and the walk below,
+    which then saw only ``self.<name>(...)`` calls, let it through; every
+    external feature's subagent died on its first budget check (#3298). A
+    borrowed method may only touch what the SDK base provides or what is
+    borrowed with it, however it touches it.
 
     Parsed under a synthetic block header rather than dedented: these methods
     embed prompt literals whose continuation lines sit at a shallower indent
@@ -168,12 +175,11 @@ def _self_call_names(func) -> set[str]:
     """
     tree = ast.parse("if True:\n" + inspect.getsource(func))
     return {
-        node.func.attr
+        node.attr
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "self"
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
     }
 
 
@@ -192,3 +198,195 @@ async def test_external_feature_executes_as_subagent_end_to_end():
     assert result["success"] is True
     assert result["result"] == "all done"
     fake_agent.llm_service.generate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_external_feature_legacy_no_argument_prompt_override_dispatches():
+    """Published visual features still implement the old prompt override.
+
+    Core must not fail the whole subagent before its tool can run merely
+    because the injected dispatch loop gained a runtime-toolset argument.
+    """
+
+    class LegacyVisualPrompt(_ExternalFeature):
+        def _get_subagent_prompt(self) -> str:
+            return "legacy visual identity prompt"
+
+    cls = ensure_subagent_dispatch(LegacyVisualPrompt)
+    fake_agent = SimpleNamespace(
+        llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
+        hooks_manager=None,
+    )
+    feature = cls(agent=fake_agent)
+
+    result = await feature.execute_as_subagent(task="make a selfie")
+
+    assert result["success"] is True, result
+    assert result["result"] == "all done"
+    assert fake_agent.llm_service.generate.await_args.kwargs["system_prompt"] == (
+        "legacy visual identity prompt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_prompt_does_not_advertise_a_policy_denied_tool():
+    """A hard-coded old prompt must not contradict the executable palette."""
+
+    class LegacyVisualPrompt(_ExternalFeature):
+        @property
+        def tool_description(self) -> str:
+            return "Generate selfies and avatars"
+
+        @sdk_tool(
+            name="generate_selfie",
+            description="Generate a selfie",
+            category=ToolCategory.DATA_ACCESS,
+        )
+        async def generate_selfie(self) -> str:
+            return "selfie"
+
+        @sdk_tool(
+            name="generate_avatar",
+            description="Generate an avatar",
+            category=ToolCategory.DATA_ACCESS,
+        )
+        async def generate_avatar(self) -> str:
+            return "avatar"
+
+        def _get_subagent_prompt(self) -> str:
+            return "Available tools: generate_selfie, generate_avatar"
+
+    cls = ensure_subagent_dispatch(LegacyVisualPrompt)
+    fake_agent = SimpleNamespace(
+        llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
+        hooks_manager=None,
+    )
+    feature = cls(agent=fake_agent)
+
+    result = await feature.execute_as_subagent(
+        task="make an avatar", denied_tools={"ping", "generate_selfie"}
+    )
+
+    assert result["success"] is True, result
+    prompt = fake_agent.llm_service.generate.await_args.kwargs["system_prompt"]
+    assert "Available tools: generate_avatar" in prompt
+    assert "ping" not in prompt
+    assert "selfie" not in prompt.lower()
+    assert "Markdown image" in prompt
+
+
+@pytest.mark.asyncio
+async def test_filtered_current_prompt_overrides_cannot_advertise_denied_tools():
+    """Current positional and keyword-only overrides also yield to policy."""
+    called = []
+
+    class PositionalPrompt(_ExternalFeature):
+        @property
+        def tool_description(self) -> str:
+            return "Use ping and generate_avatar"
+
+        @sdk_tool(
+            name="generate_avatar",
+            description="Generate an avatar",
+            category=ToolCategory.DATA_ACCESS,
+        )
+        async def generate_avatar(self) -> str:
+            return "avatar"
+
+        def _get_subagent_prompt(self, runtime_tools) -> str:
+            called.append("positional")
+            return "Use ping and generate_avatar"
+
+    class KeywordPrompt(PositionalPrompt):
+        def _get_subagent_prompt(self, *, runtime_tools) -> str:
+            called.append("keyword")
+            return "Use ping and generate_avatar"
+
+    for prompt_class in (PositionalPrompt, KeywordPrompt):
+        cls = ensure_subagent_dispatch(prompt_class)
+        fake_agent = SimpleNamespace(
+            llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
+            hooks_manager=None,
+        )
+        result = await cls(agent=fake_agent).execute_as_subagent(
+            task="make an avatar", denied_tools={"ping"}
+        )
+        assert result["success"] is True, result
+        prompt = fake_agent.llm_service.generate.await_args.kwargs["system_prompt"]
+        assert "Available tools: generate_avatar" in prompt
+        assert "ping" not in prompt
+        assert "Markdown image" in prompt
+
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_external_feature_keyword_only_runtime_prompt_receives_toolset():
+    seen = []
+
+    class KeywordPrompt(_ExternalFeature):
+        def _get_subagent_prompt(self, *, runtime_tools) -> str:
+            seen.append([tool.name for tool in runtime_tools])
+            return "keyword-only prompt"
+
+    cls = ensure_subagent_dispatch(KeywordPrompt)
+    fake_agent = SimpleNamespace(
+        llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
+        hooks_manager=None,
+    )
+
+    result = await cls(agent=fake_agent).execute_as_subagent(task="ping")
+
+    assert result["success"] is True, result
+    assert seen == [["ping"]]
+    assert fake_agent.llm_service.generate.await_args.kwargs["system_prompt"] == (
+        "keyword-only prompt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_builder_internal_type_error_is_not_signature_fallback():
+    class BrokenPrompt(_ExternalFeature):
+        def _get_subagent_prompt(self, runtime_tools=None) -> str:
+            raise TypeError("internal prompt builder defect")
+
+    cls = ensure_subagent_dispatch(BrokenPrompt)
+    fake_agent = SimpleNamespace(
+        llm_service=SimpleNamespace(generate=AsyncMock(return_value="not reached")),
+        hooks_manager=None,
+    )
+
+    result = await cls(agent=fake_agent).execute_as_subagent(task="ping")
+
+    assert result["success"] is False
+    assert "internal prompt builder defect" in result["error"]
+    fake_agent.llm_service.generate.assert_not_awaited()
+
+
+def test_external_feature_gets_a_subagent_context_budget():
+    """The exact door #3298 opened: a borrowed budget check on an SDK feature.
+
+    ``_subagent_context_budget`` is borrowed onto external features; anything
+    it reads through ``self`` must come with it. A model whose context limit
+    resolves yields an integer budget rather than an ``AttributeError``
+    swallowed into ``success: False`` at runtime.
+    """
+    from unittest.mock import patch
+
+    from kestrel_sovereign.features.base import SUBAGENT_CONTEXT_FRACTION
+
+    cls = ensure_subagent_dispatch(_ExternalFeature)
+    feature = cls.__new__(cls)
+    feature.name = "external"
+    counter = SimpleNamespace(resolved_context_limit=lambda: 200_000)
+
+    # The limit is resolved through the token counter; pin it so the test
+    # measures the borrowed budget arithmetic, not model discovery.
+    with patch(
+        "kestrel_sovereign.agent.token_counter.get_token_counter",
+        return_value=counter,
+    ):
+        budget = feature._subagent_context_budget("any-model")
+
+    assert budget == int(200_000 * SUBAGENT_CONTEXT_FRACTION)
+    assert 0 < SUBAGENT_CONTEXT_FRACTION < 1

@@ -50,6 +50,8 @@ class TestObservabilityEndpoints:
         app = FastAPI()
         app.include_router(observability_router)
         app.state.agent = MagicMock(
+            # Scoped by the agent's DID (#3229); a fabricated attribute is refused.
+            did="did:test:observability",
             observability_store=MagicMock(query_events=AsyncMock(side_effect=RuntimeError("boom")))
         )
 

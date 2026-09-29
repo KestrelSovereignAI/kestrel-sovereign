@@ -42,6 +42,7 @@ from kestrel_sovereign.storage.providers.base import (
 )
 from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
+from kestrel_sovereign.paths import CACHE_DIR_ENV, runtime_path_env
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +100,7 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
         if cache_dir:
             self.cache_dir = Path(cache_dir)
         else:
-            self.cache_dir = Path(os.environ.get("KESTREL_CACHE_DIR", "./storage_cache"))
+            self.cache_dir = Path(runtime_path_env(CACHE_DIR_ENV, "./storage_cache"))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize async REST client

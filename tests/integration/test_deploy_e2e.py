@@ -353,8 +353,8 @@ class TestCloudRunDeployE2E:
             service_url = result["service_url"]
 
             # Verify health with short timeout
-            is_healthy = await manager._verify_health(service_url, timeout=60)
-            assert is_healthy is True
+            readiness = await manager._verify_health(service_url, timeout=60)
+            assert readiness.ready is True
 
         finally:
             # Cleanup

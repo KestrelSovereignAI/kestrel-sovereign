@@ -349,7 +349,8 @@ async def test_forged_empty_feature_scope_cannot_bypass_privileged_allow(tmp_pat
     requested: list[tuple[str, str]] = []
 
     async def _auto_deny(
-        feature_name, tool_name, tool_args, timeout=None, *, allow_blocking=True
+        feature_name, tool_name, tool_args, timeout=None, *,
+        allow_blocking=True, audit_action="tool_execution",
     ):
         # Stand in for "no approver present": the ASK rail must fail closed.
         requested.append((feature_name, tool_name))

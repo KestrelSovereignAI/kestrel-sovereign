@@ -8,10 +8,20 @@ management.
 
 import asyncio
 import logging
+import os
+import shlex
 import subprocess
+import tempfile
 import uuid
-from datetime import datetime, timezone
 from typing import Optional
+
+from ._session_training_lifecycle import (
+    ReleaseIntent,
+    SessionLifecycleTimeouts,
+    SessionProviderHooks,
+    SessionTrainingLifecycle,
+    SessionTrainingRecord,
+)
 
 from ..protocol import (
     TrainingProviderError,
@@ -31,6 +41,15 @@ from ..types import (
 logger = logging.getLogger(__name__)
 
 
+def _is_not_found(error: Exception) -> bool:
+    """Whether a Compute Engine call failed because the resource is gone."""
+    try:
+        from google.api_core.exceptions import NotFound
+    except ImportError:
+        return False
+    return isinstance(error, NotFound)
+
+
 class GCPComputeTrainingAdapter:
     """
     Adapter wrapping GCPComputeEngineManager for TrainingProvider protocol.
@@ -48,15 +67,36 @@ class GCPComputeTrainingAdapter:
     provider_name = "gcp_compute"
     provider_type = ProviderType.SESSION_BASED
 
-    def __init__(self, manager=None):
+    def __init__(
+        self,
+        manager=None,
+        *,
+        lifecycle_timeouts: Optional[SessionLifecycleTimeouts] = None,
+    ):
         """
         Initialize with optional pre-configured manager.
 
         Args:
             manager: GCPComputeManager instance (lazy loaded if not provided)
+            lifecycle_timeouts: Teardown bounds (defaults from kestrel_config)
         """
         self._manager = manager
-        self._active_jobs: dict[str, dict] = {}  # job_id -> {session, companion_id, ...}
+        self._lifecycle = SessionTrainingLifecycle(
+            SessionProviderHooks(
+                provider_name=self.provider_name,
+                display_name="GCP Compute",
+                acquire_session=self._acquire_session,
+                session_id=lambda session: session.instance_name,
+                submit_job=self._submit_job,
+                release_session=self._release_session,
+            ),
+            lifecycle_timeouts,
+        )
+
+    @property
+    def _active_jobs(self) -> dict[str, SessionTrainingRecord]:
+        """Live custody registry: a job stays here until its instance is released."""
+        return self._lifecycle.records
 
     def _get_manager(self):
         """Lazy load the GCP Compute Engine manager.
@@ -106,6 +146,9 @@ class GCPComputeTrainingAdapter:
         2. Upload training image to instance
         3. Submit training job via SSH
 
+        Steps 2-3 run in a background submission task owned by the shared
+        session lifecycle, so this returns as soon as the instance is up.
+
         Args:
             companion_id: Companion being trained
             avatar_data: Training image bytes
@@ -115,62 +158,16 @@ class GCPComputeTrainingAdapter:
             TrainingJob with session tracking info
         """
         config = config or TrainingConfig()
-        job_id = str(uuid.uuid4())
         trigger_word = config.trigger_word or f"TOK{companion_id[:8]}"
-        now = datetime.now(timezone.utc)
 
         try:
-            manager = self._get_manager()
-
-            # Step 1: Start or reuse a session
-            session_result = await manager.start_session(
-                task_profile=config.profile,
-                ttl_seconds=config.ttl_seconds,
-                use_spot=config.use_spot,
-                metadata={"companion_id": companion_id, "job_id": job_id},
-            )
-
-            session = manager._session
-            if session is None:
-                raise TrainingSubmissionError("Failed to get active session")
-
-            # Track this job with PENDING state - training not yet started
-            self._active_jobs[job_id] = {
-                "session": session,
-                "companion_id": companion_id,
-                "trigger_word": trigger_word,
-                "started_at": now,
-                "config": config,
-                "avatar_data": avatar_data,  # Store for background submission
-                "state": "pending",  # Not yet submitted
-            }
-
-            # Launch background task to upload and submit training
-            asyncio.create_task(
-                self._submit_training_when_ready(
-                    job_id=job_id,
-                    manager=manager,
-                    session=session,
-                    avatar_data=avatar_data,
-                    companion_id=companion_id,
-                    trigger_word=trigger_word,
-                    config=config,
-                )
-            )
-
-            return TrainingJob(
-                job_id=job_id,
+            record = await self._lifecycle.start(
+                job_id=str(uuid.uuid4()),
                 companion_id=companion_id,
-                provider=self.provider_name,
-                state=TrainingState.PENDING,  # PENDING until upload+submit
                 trigger_word=trigger_word,
-                created_at=now,
-                started_at=None,  # Not started yet
                 config=config,
-                provider_job_id=None,  # Will be set when submitted
-                provider_session_id=session.instance_name,
+                avatar_data=avatar_data,
             )
-
         except TrainingProviderError:
             raise
         except (subprocess.SubprocessError, OSError) as e:
@@ -183,78 +180,91 @@ class GCPComputeTrainingAdapter:
             logger.error(f"GCP Compute training submission failed: {e}", exc_info=True)
             raise TrainingSubmissionError(f"Failed to start GCP training: {e}")
 
-    async def _submit_training_when_ready(
-        self,
-        job_id: str,
-        manager,
-        session,
-        avatar_data: bytes,
-        companion_id: str,
-        trigger_word: str,
-        config: TrainingConfig,
-    ) -> None:
-        """
-        Background task: Upload image and submit training.
+        return self._lifecycle.training_job(record)
 
-        This runs asynchronously so the HTTP endpoint can return immediately.
-        """
-        import tempfile
-        import os
+    # -- Provider hooks for the shared session lifecycle -------------------
+
+    async def _acquire_session(
+        self, job_id: str, companion_id: str, config: TrainingConfig
+    ):
+        """Start or reuse the instance for one job."""
+        manager = self._get_manager()
+        await manager.start_session(
+            task_profile=config.profile,
+            ttl_seconds=config.ttl_seconds,
+            use_spot=config.use_spot,
+            metadata={"companion_id": companion_id, "job_id": job_id},
+        )
+        session = manager._session
+        if session is None:
+            raise TrainingSubmissionError("Failed to get active session")
+        return session
+
+    async def _submit_job(self, record: SessionTrainingRecord, avatar_data: bytes) -> str:
+        """Upload the training image over SSH, then start training on the instance."""
+        manager = self._get_manager()
+        session = record.session
+        companion_id = record.companion_id
+        config = record.config
+
+        # Save avatar_data to a temp file, then upload via SSH
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            f.write(avatar_data)
+            temp_path = f.name
 
         try:
-            logger.info(f"[{job_id}] Background: uploading training image...")
+            mount_path = manager.disk_config.get("mount_path", "/workspace")
+            remote_dir = f"{mount_path}/training_data/{companion_id}"
+            remote_path = f"{remote_dir}/image_001.png"
 
-            # Save avatar_data to a temp file, then upload via SSH
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                f.write(avatar_data)
-                temp_path = f.name
+            # Create directory and upload
+            await manager._ssh_command(session, f"mkdir -p {shlex.quote(remote_dir)}")
+            await manager._scp_upload(session, temp_path, remote_path)
+        finally:
+            os.unlink(temp_path)
 
-            try:
-                mount_path = manager.disk_config.get("mount_path", "/workspace")
-                remote_path = f"{mount_path}/training_data/{companion_id}/image_001.png"
+        logger.info(f"[{record.job_id}] Background: submitting training job...")
 
-                # Create directory and upload
-                await manager._ssh_command(
-                    session,
-                    f"mkdir -p {mount_path}/training_data/{companion_id}",
-                )
-                await manager._scp_upload(session, temp_path, remote_path)
-            finally:
-                os.unlink(temp_path)
+        # The manager keys GCP training jobs by companion ID.
+        return await manager.submit_training_job(
+            session=session,
+            image_url=f"file://{remote_path}",
+            companion_id=companion_id,
+            trigger_word=record.trigger_word,
+            network_dim=config.lora_rank,
+            learning_rate=config.learning_rate,
+        )
 
-            logger.info(f"[{job_id}] Background: submitting training job...")
+    async def _release_session(self, session) -> None:
+        """Delete the instance, which also stops any training job on it.
 
-            # Submit training job
-            await manager.submit_training_job(
-                session=session,
-                image_url=f"file://{remote_path}",
-                companion_id=companion_id,
-                trigger_word=trigger_word,
-                network_dim=config.lora_rank,
-                learning_rate=config.learning_rate,
+        Raises unless the delete operation completed without error. The
+        manager's ``terminate_session`` logs a failed delete and returns, so it
+        cannot prove the instance stopped billing; the delete is issued and
+        awaited here instead. An instance that no longer exists (a retry after
+        an earlier delete completed) counts as released.
+        """
+        manager = self._get_manager()
+        client = manager._get_instances_client()
+        try:
+            operation = await asyncio.to_thread(
+                client.delete,
+                project=manager.project_id,
+                zone=session.zone,
+                instance=session.instance_name,
             )
+        except Exception as error:
+            if not _is_not_found(error):
+                raise
+            logger.info(f"GCP instance {session.instance_name} is already deleted")
+        else:
+            await manager._wait_for_operation(operation.name, session.zone)
+            logger.info(f"Deleted GCP instance {session.instance_name}")
+        current = getattr(manager, "_session", None)
+        if current is not None and current.instance_name == session.instance_name:
+            manager._session = None
 
-            # Update job state
-            if job_id in self._active_jobs:
-                self._active_jobs[job_id]["state"] = "training"
-                self._active_jobs[job_id]["started_at"] = datetime.now(timezone.utc)
-                logger.info(f"[{job_id}] Training submitted successfully")
-
-        except (subprocess.SubprocessError, OSError) as e:
-            logger.error(f"[{job_id}] Background training system error: {e}")
-            if job_id in self._active_jobs:
-                self._active_jobs[job_id]["state"] = "failed"
-                self._active_jobs[job_id]["error"] = str(e)
-        except (ConnectionError, TimeoutError) as e:
-            logger.error(f"[{job_id}] Background training connection error: {e}")
-            if job_id in self._active_jobs:
-                self._active_jobs[job_id]["state"] = "failed"
-                self._active_jobs[job_id]["error"] = str(e)
-        except Exception as e:
-            logger.error(f"[{job_id}] Background training submission failed: {e}", exc_info=True)
-            if job_id in self._active_jobs:
-                self._active_jobs[job_id]["state"] = "failed"
-                self._active_jobs[job_id]["error"] = str(e)
+    # -- TrainingProvider --------------------------------------------------
 
     async def get_status(self, job_id: str) -> TrainingStatus:
         """
@@ -267,35 +277,19 @@ class GCPComputeTrainingAdapter:
             TrainingStatus with current progress
         """
         try:
-            if job_id not in self._active_jobs:
-                raise TrainingStatusError(f"Unknown job: {job_id}")
-
-            job_info = self._active_jobs[job_id]
-            session = job_info["session"]
-            companion_id = job_info["companion_id"]
-            manager = self._get_manager()
-
-            # Check if still in background submission phase
-            job_state = job_info.get("state", "pending")
-            if job_state == "pending":
-                return TrainingStatus(
-                    job_id=job_id,
-                    state=TrainingState.PREPARING,
-                    progress=0.0,
-                    message="Uploading training image and submitting job...",
-                )
-            elif job_state == "failed":
-                return TrainingStatus(
-                    job_id=job_id,
-                    state=TrainingState.FAILED,
-                    progress=0.0,
-                    error=job_info.get("error", "Background submission failed"),
-                )
+            lookup = self._lifecycle.local_status(
+                job_id,
+                preparing_message="Uploading training image and submitting job...",
+            )
+            if lookup.poll is None:
+                return lookup.status
+            record = lookup.poll
 
             # Poll the training status via manager
+            manager = self._get_manager()
             status_result = await manager.poll_training_status(
-                session=session,
-                job_id=companion_id,
+                session=record.session,
+                job_id=record.provider_job_id,
             )
 
             # Map GCP status to unified status
@@ -311,16 +305,12 @@ class GCPComputeTrainingAdapter:
             else:
                 state = TrainingState.PREPARING
 
-            elapsed = None
-            if job_info.get("started_at"):
-                elapsed = (datetime.now(timezone.utc) - job_info["started_at"]).total_seconds()
-
             return TrainingStatus(
                 job_id=job_id,
                 state=state,
                 progress=progress,
                 message=status_result.get("message"),
-                elapsed_seconds=elapsed,
+                elapsed_seconds=record.elapsed_seconds(),
                 provider_details=status_result,
             )
 
@@ -347,18 +337,17 @@ class GCPComputeTrainingAdapter:
             LoRA weights as bytes, or None if not ready
         """
         try:
-            if job_id not in self._active_jobs:
+            record = self._lifecycle.get(job_id)
+            if record is None:
                 raise DownloadError(f"Unknown job: {job_id}")
-
-            job_info = self._active_jobs[job_id]
-            session = job_info["session"]
-            companion_id = job_info["companion_id"]
-            manager = self._get_manager()
+            if record.provider_job_id is None:
+                raise DownloadError(f"Job {job_id} was never submitted to GCP Compute")
 
             # Download via manager
+            manager = self._get_manager()
             lora_bytes = await manager.download_lora(
-                session=session,
-                job_id=companion_id,
+                session=record.session,
+                job_id=record.provider_job_id,
             )
 
             return lora_bytes
@@ -374,64 +363,36 @@ class GCPComputeTrainingAdapter:
 
     async def cancel(self, job_id: str) -> bool:
         """
-        Cancel a running training job.
+        Cancel a training job and delete its instance.
 
-        For session-based providers, this terminates the session.
+        Stops the background upload/submission, then deletes the instance
+        (which also stops any job on it). Concurrent and repeated calls share
+        one teardown.
 
         Args:
             job_id: Job to cancel
 
         Returns:
-            True if cancelled successfully
+            True once no instance or task of the job remains; False if the job
+            is unknown or its instance could not be released (custody retained).
         """
-        try:
-            if job_id not in self._active_jobs:
-                return False
-
-            job_info = self._active_jobs[job_id]
-            session = job_info["session"]
-            manager = self._get_manager()
-
-            # Terminate the session (which cancels the job)
-            await manager.terminate_session(session)
-
-            # Clean up tracking
-            del self._active_jobs[job_id]
-
-            return True
-
-        except (subprocess.SubprocessError, OSError, ConnectionError, TimeoutError) as e:
-            logger.error(f"Failed to cancel GCP training: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to cancel GCP training: {e}", exc_info=True)
-            return False
+        return await self._lifecycle.release(job_id, ReleaseIntent.CANCEL)
 
     async def cleanup(self, job_id: str) -> None:
         """
         Clean up resources for a completed job.
 
-        For session-based providers, this terminates the instance to stop
-        billing.
+        Deletes the instance to stop billing. A failed release keeps the job
+        tracked so it can be retried.
 
         Args:
             job_id: Job to clean up
         """
-        try:
-            if job_id not in self._active_jobs:
-                return
+        if self._lifecycle.get(job_id) is None:
+            return
+        if not await self._lifecycle.release(job_id, ReleaseIntent.CLEANUP):
+            logger.warning(f"Failed to cleanup GCP session for job {job_id}; custody retained")
 
-            job_info = self._active_jobs[job_id]
-            session = job_info["session"]
-            manager = self._get_manager()
-
-            # Terminate the session
-            await manager.terminate_session(session)
-
-            # Clean up tracking
-            del self._active_jobs[job_id]
-
-        except (subprocess.SubprocessError, OSError, ConnectionError, TimeoutError) as e:
-            logger.warning(f"Failed to cleanup GCP session: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to cleanup GCP session: {e}", exc_info=True)
+    async def close(self) -> None:
+        """Drain background submissions and release every instance this adapter holds."""
+        await self._lifecycle.close()

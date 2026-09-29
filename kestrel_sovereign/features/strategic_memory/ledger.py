@@ -29,11 +29,15 @@ Two properties this file is responsible for, both absent before:
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import itertools
 import logging
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from types import MappingProxyType
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +152,56 @@ def active_blockers(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [r for r in rows if isinstance(r, dict) and is_active_blocker(r)]
 
 
+#: Process-wide order of confirmed ledger states. Monotonic across every
+#: :class:`StrategyLedger` object, not per object: a restarted feature builds a
+#: fresh ledger over the same file, and its first snapshot must still order
+#: AFTER everything the previous object persisted.
+_PERSIST_SEQUENCE = itertools.count(1)
+
+#: Only this module can vouch that a snapshot's rows are the file's rows. A
+#: snapshot built anywhere else carries no witness and is therefore unconfirmed,
+#: whatever sequence number it claims.
+_PERSISTED_WITNESS = object()
+
+
+@dataclass(frozen=True)
+class LedgerSnapshot:
+    """An immutable copy of the ledger as it stands ON DISK (#3051, #3320).
+
+    The canonical-assertion producer retracts terminally, so the state it
+    reconciles against must be one the file actually holds. Handing it the live
+    :class:`StrategyLedger` let it read mutations that were never persisted --
+    a supersede whose ``save()`` failed still sat in the shared in-memory data,
+    and an overlapping projection retracted the row permanently while the file
+    still called it active. A snapshot is taken only where the ledger can vouch
+    for it: after :meth:`StrategyLedger.save` succeeds, or on a :meth:`load`
+    that minted nothing. The rows are deep-copied at that instant, so no later
+    mutation of the ledger can reach them.
+
+    ``readable`` and ``has_canonical_file`` travel with the rows because "no
+    rows", "could not be read" and "never existed" are three different facts,
+    and the latter two must never authorize a retraction sweep.
+    ``persisted_sequence`` orders confirmed states, so a consumer can refuse a
+    snapshot older than one it has already acted on; ``path`` names the file
+    the order is over.
+    """
+
+    path: Optional[Path]
+    data: Mapping[str, Any]
+    readable: bool
+    has_canonical_file: bool
+    persisted_sequence: Optional[int] = None
+    _witness: Any = field(default=None, repr=False, compare=False)
+
+    @property
+    def confirmed_persisted(self) -> bool:
+        """Whether the ledger itself vouched that these rows are on disk."""
+        return (
+            self._witness is _PERSISTED_WITNESS
+            and self.persisted_sequence is not None
+        )
+
+
 def _rows(data: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
     value = data.get(key)
     if not isinstance(value, list):
@@ -179,6 +233,10 @@ class StrategyLedger:
         #: returned-and-discarded, because a mint the caller forgot to persist
         #: is an address that changes on the next restart.
         self._unsaved_normalization = 0
+        #: The last state this ledger confirmed is on disk. Deliberately NOT
+        #: refreshed by a mutation, and not by a failed save: see
+        #: :class:`LedgerSnapshot`.
+        self._persisted_snapshot: Optional[LedgerSnapshot] = None
 
     # ------------------------------------------------------------------
     # Persistence
@@ -195,9 +253,49 @@ class StrategyLedger:
         return self.load_error is None
 
     @property
+    def has_canonical_file(self) -> bool:
+        """Whether a canonical file was actually there to be read.
+
+        :meth:`load` treats a missing file as a NEW ledger rather than an
+        error, which is right -- that is how an agent that has never recorded a
+        pattern starts. But "new" and "empty" are the same in-memory state, and
+        a consumer that reconciles against this ledger cannot tell them apart
+        from :attr:`readable` alone: an unmounted volume, a wiped data
+        directory, or a ``StrategyLedger(None)`` all present as a readable
+        ledger with zero rows, which reads as "every row was deleted".
+
+        The graph index tolerates that because its writes are upserts and the
+        next projection rebuilds what it removed. The canonical assertion
+        producer does not: retraction is terminal for it, so a keep-set derived
+        from a file that was never opened destroys the projection permanently.
+        A consumer whose removals are irreversible must check this too.
+        """
+        return self.path is not None and self.path.exists()
+
+    @property
     def needs_save(self) -> bool:
         """Whether normalization minted ids that are still only in memory."""
         return self._unsaved_normalization > 0
+
+    @property
+    def persisted_snapshot(self) -> Optional[LedgerSnapshot]:
+        """The last confirmed on-disk state, or ``None`` if none exists yet.
+
+        Never the live rows. A mutation whose save failed is invisible here,
+        which is the whole point: a consumer that acts irreversibly on the
+        ledger must only ever see what the file holds.
+        """
+        return self._persisted_snapshot
+
+    def _capture_snapshot(self, confirmed: bool) -> None:
+        self._persisted_snapshot = LedgerSnapshot(
+            path=self.path,
+            data=MappingProxyType(copy.deepcopy(self.data)),
+            readable=self.readable,
+            has_canonical_file=self.has_canonical_file,
+            persisted_sequence=next(_PERSIST_SEQUENCE) if confirmed else None,
+            _witness=_PERSISTED_WITNESS if confirmed else None,
+        )
 
     def load(self) -> None:
         """Read the ledger from disk, tolerating absence but not malformation.
@@ -213,6 +311,18 @@ class StrategyLedger:
         rows were gone. The failure is now recorded in :attr:`load_error`, and
         every subsequent write refuses until a human resolves it.
         """
+        self._load()
+        # A load that minted ids describes a state the file does not hold yet,
+        # and an unreadable or absent file describes no state at all. Each
+        # still yields a snapshot -- the consumer needs to be told WHY it may
+        # not act -- but only a clean read is confirmed.
+        self._capture_snapshot(
+            confirmed=(
+                self.readable and self.has_canonical_file and not self.needs_save
+            )
+        )
+
+    def _load(self) -> None:
         self.load_error = None
         self._unsaved_normalization = 0
         if not self.path or not self.path.exists():
@@ -306,6 +416,7 @@ class StrategyLedger:
             logger.error("Failed to save %s: %s", self.path, e)
             return f"Failed to save {LEDGER_FILENAME}: {e}"
         self._unsaved_normalization = 0
+        self._capture_snapshot(confirmed=True)
         return None
 
     # ------------------------------------------------------------------

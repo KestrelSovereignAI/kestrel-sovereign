@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Callable, Dict, List, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
+from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from kestrel_sdk.hooks.base import Hook
@@ -39,12 +39,40 @@ from kestrel_sdk.features.ui import UIContributions
 # F003). The two former in-tree copies were verified behaviourally identical to
 # these across every feature docstring in the tree before removal.
 from kestrel_sdk.features.base import tool, parse_docstring_params
+from kestrel_sovereign.turn_completion import (
+    settle_repaired_content,
+    turn_completion_repair_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
 # Maximum tool call iterations (configurable via environment variable)
 # Increased to 50 for long-running tasks like code analysis and multi-step operations
 MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "50"))
+
+
+# Fraction of the model's context window a subagent may fill before the loop
+# refuses to continue. The remainder covers the response and the provider's
+# own accounting slack. A module constant, not a class attribute: the dispatch
+# cluster is grafted onto external features method by method
+# (``subagent_dispatch.ensure_subagent_dispatch``), and a class attribute
+# read through ``self`` is not carried across — #3298, where every external
+# feature's subagent died on its first budget check.
+SUBAGENT_CONTEXT_FRACTION = 0.85
+
+
+class SubagentContextBudgetExceeded(RuntimeError):
+    """A subagent's accumulated messages no longer fit its model's window.
+
+    Raised rather than returned as a string so the failure reaches the
+    envelope honestly. ``execute_as_subagent``'s boundary turns an exception
+    into ``{"success": False, "error": ...}``; a returned ``"Error: ..."``
+    string would have been wrapped as ``{"success": True}``, which
+    ``infer_tool_result_status`` reads as a successful dispatch and
+    ``_result_indicates_failure`` reads as no failure -- so an outage-class
+    event would be invisible on both the dispatch log and the narration
+    audit, the two surfaces an operator would check.
+    """
 
 CONTINUATION_INTENT_RE = re.compile(
     r"\b("
@@ -58,12 +86,7 @@ CONTINUATION_INTENT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-TURN_COMPLETION_REPAIR_PROMPT = """You just wrote text that indicates this task is still in progress, but you did not emit a tool call.
-
-Continue the same task now:
-- If the work requires an available tool, emit the tool call now.
-- If no tool is needed or available, provide the final answer now.
-- Do not describe a future tool call without making it."""
+TURN_COMPLETION_REPAIR_PROMPT = turn_completion_repair_prompt("task")
 
 
 def is_flat_toolresult_envelope(value: Any) -> bool:
@@ -86,6 +109,71 @@ def is_flat_toolresult_envelope(value: Any) -> bool:
     if status == "partial":
         return "confirmation" in value and "error" in value
     return False
+
+
+def orchestrator_result_cap() -> int:
+    """The orchestrator's per-tool-result cap (``MAX_TOOL_RESULT_CHARS``).
+
+    Read from the orchestrator constant rather than hardcoded so the two can
+    never drift back into conflict (F086): a serialized result larger than
+    this cap is silently replaced downstream with a head+tail preview, and a
+    feature that does not size against it can have its most important bytes
+    fall in the discarded middle.
+    """
+    try:
+        from kestrel_sovereign.kestrel_agent import MAX_TOOL_RESULT_CHARS
+    except Exception:  # pragma: no cover - defensive import fallback
+        MAX_TOOL_RESULT_CHARS = 8000
+    return max(1000, int(MAX_TOOL_RESULT_CHARS))
+
+
+def serialized_result_len(result: Any, *, tool_name: str = "") -> int:
+    """Length of a result exactly as the orchestrator measures it.
+
+    The cap is applied to ``len(json.dumps(...))`` of what the orchestrator
+    receives, so callers size against that same shape rather than a raw
+    character count — JSON escaping of quotes, backslashes and non-ASCII can
+    expand a body several-fold past its ``len()``.
+
+    What it receives is not the bare ToolResult: ``DynamicTool.execute``
+    wraps it, adding ``tool`` and ``success`` on top of ``to_dict()``.
+    Measuring the unwrapped form is short by those keys, which is invisible
+    until a result lands in the gap — measured, 7,967 unwrapped against an
+    8,000 cap became 8,001 wrapped, and the orchestrator discarded output
+    from a result that called itself complete. ``tool_name`` is the caller's
+    own name; leaving it empty still counts the keys.
+    """
+    import json as _json
+
+    payload = _serialize_tool_result(result)
+    if isinstance(payload, dict):
+        payload = {**payload, "tool": tool_name, "success": True}
+    return len(_json.dumps(payload))
+
+
+def _invoke_subagent_prompt(
+    prompt_builder: Callable[..., str],
+    runtime_tools: list[Any],
+) -> str:
+    """Call a feature prompt override through its published signature.
+
+    The SDK's external-feature contract allowed ``_get_subagent_prompt(self)``
+    before Core supplied the filtered runtime toolset. Published features such
+    as VisualIdentityFeature still use that override. Inspect the *bound*
+    method before calling it; do not catch a TypeError raised inside a prompt
+    builder, which would disguise a real feature bug as an old signature.
+    """
+    signature = inspect.signature(prompt_builder)
+    try:
+        signature.bind(runtime_tools)
+    except TypeError:
+        try:
+            signature.bind(runtime_tools=runtime_tools)
+        except TypeError:
+            signature.bind()
+            return prompt_builder()
+        return prompt_builder(runtime_tools=runtime_tools)
+    return prompt_builder(runtime_tools)
 
 
 def _serialize_tool_result(result: Any) -> Any:
@@ -215,6 +303,16 @@ class Feature(_SdkFeature):
     # Node type used for persisting feature config in the knowledge graph.
     _CONFIG_NODE_TYPE = "feature_config"
 
+    #: The closed vocabulary of ``data["reason_code"]`` values each of this
+    #: feature's tools may return in a failed result, keyed by tool name.
+    #: When a scheduled tool fails, the scheduler names the cause in the
+    #: dispatch failure — text that leaves the redaction/cap boundary for
+    #: ``signal_log.error`` — only by membership here, never by shape (#3184).
+    #: A code that is not declared is dropped and logged as undeclared. Read
+    #: by attribute name, so an out-of-tree feature (subclassing the SDK
+    #: Feature) declares it the same way.
+    tool_reason_codes: ClassVar[Mapping[str, frozenset[str]]] = {}
+
     def __init__(self, agent):
         self.agent = agent
         self.name = self.__class__.__name__
@@ -310,13 +408,25 @@ class Feature(_SdkFeature):
             "[SUBAGENT %s] Model signaled continuation without tool_calls; issuing one repair turn",
             self.name,
         )
-        return await self.agent.llm_service.generate_with_messages(
+        repaired = await self.agent.llm_service.generate_with_messages(
             messages=self._append_missing_tool_call_repair(messages, content),
             tools=tools if tools else None,
             tool_executor=tool_executor,
             model_override=model_override,
             invocation_context=_subagent_turn_identity(session_id),
         )
+        # A repair that neither calls a tool nor ran one inline either confirms
+        # the message was the subagent's answer (keep it, followed by anything
+        # the repair adds) or is a new answer. Settled on the response itself,
+        # not a copy, so the runtime attributes adapters attach to it
+        # (``model``, ``executed_tool_calls``) survive.
+        if (
+            not isinstance(repaired, str)
+            and not getattr(repaired, "tool_calls", None)
+            and not getattr(repaired, "executed_tool_calls", None)
+        ):
+            repaired.content = settle_repaired_content(content, repaired.content)
+        return repaired
 
     # =========================================================================
     # Lifecycle Methods
@@ -1358,11 +1468,16 @@ class Feature(_SdkFeature):
         # happenstance.
         subagent_parts: List[dict] = []
         try:
-            # Get feature's own tools, excluding any denied by security policy
-            available_tools = self.get_tools()
+            # The canonical runtime toolset for this invocation: the feature's
+            # own tools minus anything security denied, plus the framework's
+            # lent context-retrieval tools. The advertised schemas, the prompt
+            # and the loop's executable map all derive from THIS list.
+            available_tools = self._compose_subagent_runtime_tools(denied_tools)
             if denied_tools:
-                available_tools = [t for t in available_tools if t.name not in denied_tools]
-                logger.info(f"Feature {self.name}: stripped {len(denied_tools)} denied tools, {len(available_tools)} remaining")
+                logger.info(
+                    f"Feature {self.name}: stripped {len(denied_tools)} denied tools, "
+                    f"{len(available_tools)} remaining"
+                )
 
             # If ALL tools are denied, return immediately with denial
             if not available_tools and denied_tools:
@@ -1379,8 +1494,24 @@ class Feature(_SdkFeature):
             ]
             logger.debug(f"Feature {self.name} has {len(feature_tools)} tools available")
 
-            # Feature-specific system prompt
-            system_prompt = self._get_subagent_prompt()
+            # Core's prompt receives the canonical runtime toolset. Existing
+            # external features may still override the old no-argument
+            # signature. A policy-filtered feature cannot trust ANY override
+            # or tool_description to avoid mentioning the denied capability;
+            # use the canonical prompt with only the executable palette.
+            filtered_feature_tools = bool(denied_tools) and any(
+                tool.name in denied_tools for tool in self.get_tools()
+            )
+            if filtered_feature_tools:
+                system_prompt = Feature._get_subagent_prompt(
+                    self,
+                    available_tools,
+                    capability_description="Only the available tools listed below",
+                )
+            else:
+                system_prompt = _invoke_subagent_prompt(
+                    self._get_subagent_prompt, available_tools
+                )
 
             # Build user prompt with task and context
             user_prompt = f"Task: {task}"
@@ -1399,7 +1530,9 @@ class Feature(_SdkFeature):
             # translation and break Gemini/Vertex routes — codex
             # round 3 P2 on #1461 follow-up.
             tool_executor = (
-                self._make_feature_inline_tool_executor(parts_sink=subagent_parts)
+                self._make_feature_inline_tool_executor(
+                    parts_sink=subagent_parts, runtime_tools=available_tools
+                )
                 if feature_tools else None
             )
             # The subagent reasons on behalf of the turn that dispatched it, so
@@ -1446,6 +1579,7 @@ class Feature(_SdkFeature):
                 model_override=model_override,
                 parts_sink=subagent_parts,
                 session_id=turn_session_id,
+                runtime_tools=available_tools,
             )
 
             # Debug: Log what we're returning to the orchestrator
@@ -1467,11 +1601,21 @@ class Feature(_SdkFeature):
                 err_envelope["parts"] = subagent_parts
             return err_envelope
 
-    def _make_feature_inline_tool_executor(self, parts_sink: Optional[List[dict]] = None):
+    def _make_feature_inline_tool_executor(
+        self,
+        parts_sink: Optional[List[dict]] = None,
+        runtime_tools: Optional[List[Any]] = None,
+    ):
         """Build an inline ``(name, args) -> result_dict`` async callable
-        bound to this feature's OWN tool palette, gated by the same
+        bound to this invocation's runtime tool palette, gated by the same
         ``PRE_TOOL_USE`` hooks the non-inline ``_handle_feature_tool_calls``
         path enforces.
+
+        ``runtime_tools`` is the same list the non-inline loop executes
+        against. Both paths must resolve a name identically: this one was
+        rebuilding the map from an unfiltered ``self.get_tools()``, so the
+        two doors to the same tool palette disagreed about which tools
+        security had denied.
 
         ``parts_sink`` (#2641) is the subagent-local typed-parts buffer:
         threaded into ``_execute_subagent_tool`` so parts emitted by inline
@@ -1499,93 +1643,36 @@ class Feature(_SdkFeature):
         — without this, hook-gated policies were bypassed by the
         inline-execution path).
 
-        NESTED cross-task bindings (#2672 review P1 follow-up, #2928). This
-        executor is BUILT while ``execute_as_subagent`` runs on the PARENT inline
-        executor's reader task, INSIDE that executor's
-        ``bind_transition_lock_reentry`` scope, so the owning turn's
-        transition-lock reentry token is visible in the ContextVar here. But the
-        codex app-server dispatches THIS subagent's OWN inline tools on a
-        SEPARATE, freshly-spawned reader task that does NOT inherit that binding
-        — so a nested durable-identity write (rename / description / discovery
-        history / user name / SOUL) invoked by the subagent would
-        re-acquire the transition lock from a token-less foreign task and DEADLOCK
-        against the turn that holds it (the turn is blocked awaiting the app-server
-        result; the write is blocked acquiring the lock the turn holds). Capture the
-        bound token here and re-present it around the subagent tool call — the exact
-        cross-task seam ``OrchestratorEngineMixin._make_inline_tool_executor``
-        installs for the parent turn — so that one write re-enters the owning turn's
-        span. The parent executor also carries the lifecycle-authorized turn/session
-        binding; capture and re-present that binding here so a nested lifecycle tool
-        (notably ``request_restart``) can name the originating window after this
-        second reader-task boundary. An executor built outside a live turn captures
-        an explicit unbound value, so neither binding grants authority to unrelated
-        background work.
+        NESTED cross-task bindings (#2672 review P1 follow-up, #2928, #3114).
+        This executor is BUILT while ``execute_as_subagent`` runs either on the
+        turn's own task tree or on the PARENT inline executor's reader task,
+        inside that executor's re-presented turn scope. The codex app-server
+        dispatches THIS subagent's OWN inline tools on a SEPARATE,
+        freshly-spawned reader task that inherits none of it — so without
+        re-presentation a nested durable-identity write would re-acquire the
+        transition lock from a token-less foreign task and DEADLOCK against the
+        turn that holds it, a nested ``request_restart`` could not name the
+        originating window, and ``turn_id`` / the causation chain / the
+        dispatching signal would read empty. Capture the whole declared turn
+        scope here (``kestrel_sovereign.turn_scope``) and re-present it around
+        the subagent tool call — the same seam
+        ``OrchestratorEngineMixin._make_inline_tool_executor`` installs for the
+        parent turn. Authority-bearing values keep their own rules: an executor
+        built outside a live turn captures an explicit unbound value, so it
+        grants nothing to unrelated background work.
         """
-        from kestrel_sovereign.agent.turn_lifecycle import (
-            bind_current_chain,
-            bind_turn_session,
-            capture_current_chain,
-            capture_turn_session_binding,
-        )
-        from kestrel_sovereign.storage.privacy_wrapper import (
-            bind_transition_lock_reentry,
-            current_bound_reentry_token,
-        )
-        from kestrel_sovereign.signals.context import (
-            bind_current_signal,
-            get_current_signal,
-        )
-        transition_reentry_token = current_bound_reentry_token()
-        turn_session_binding = capture_turn_session_binding(self.agent)
-        # The waking Signal is the fourth turn-scoped binding this boundary
-        # drops (#3112; the parent-turn twin is in
-        # ``OrchestratorEngineMixin._make_inline_tool_executor``). Guards that
-        # ask "what woke this turn?" — notably the scheduler's single-hop
-        # self_followup refusal — read ``get_current_signal()``; on the codex
-        # app-server route this subagent's inline tools run on a freshly
-        # spawned reader task whose frozen snapshot has no signal, so the
-        # guard's ``is not None`` test short-circuits and the refusal never
-        # fires. Capture on the owning task and re-present. An executor built
-        # off-turn captures ``None``, so this never manufactures a waking
-        # signal where there was none.
-        turn_signal = get_current_signal()
-        # SIXTH instance, and the twin of the fifth: the parent-turn boundary
-        # in ``OrchestratorEngineMixin._make_inline_tool_executor`` re-presents
-        # the scheduler execution scope, and this subagent boundary did not.
-        # A ``self_followup`` turn that delegates to a subagent whose inline
-        # tool is isolated/effectful therefore stamps NO idempotency key, and
-        # an occurrence retried after lease/finalization uncertainty repeats
-        # the effect -- the "merge PR N once CI settles" example merging twice,
-        # one reader-task boundary further out.
-        #
-        # Imported here rather than at module scope: features/base.py must not
-        # take a hard import dependency on an optional feature package.
-        from kestrel_sovereign.features.scheduler.runner import (
-            bind_scheduler_execution_scope,
-            capture_scheduler_execution_scope,
-        )
+        from kestrel_sovereign.turn_scope import capture_turn_scope
 
-        turn_scheduler_scope = capture_scheduler_execution_scope()
-        # And the causation chain, twin of the parent boundary's capture: a
-        # delegated inline tool that sends an A2A task must carry the owning
-        # turn's lineage, or the peer's completion wakes a depth-1 turn that
-        # may schedule a second ``self_followup`` (#3112 gate-2 P1). Built on
-        # the parent executor's reader task, which re-presents the chain, so
-        # the capture sees the owning turn's value.
-        turn_chain = capture_current_chain()
+        turn_scope = capture_turn_scope(self.agent)
 
         async def _exec(name: str, args: Dict[str, Any]):
-            with (
-                bind_transition_lock_reentry(transition_reentry_token),
-                bind_turn_session(turn_session_binding),
-                bind_current_signal(turn_signal),
-                bind_scheduler_execution_scope(turn_scheduler_scope),
-                bind_current_chain(turn_chain),
-            ):
+            with turn_scope.bind():
                 return await self._execute_subagent_tool(
                     tool_name=name,
                     args=args or {},
-                    tools_by_name={t.name: t for t in self.get_tools()},
+                    tools_by_name={
+                        t.name: t for t in (runtime_tools or self.get_tools())
+                    },
                     return_with_effective_args=True,
                     parts_sink=parts_sink,
                 )
@@ -1760,14 +1847,57 @@ class Feature(_SdkFeature):
                     parts_sink.extend(envelope_parts)
             return _shape(effective_args, serialized)
 
-    def _get_subagent_prompt(self) -> str:
+    def _compose_subagent_runtime_tools(
+        self, denied_tools: Optional[Any] = None
+    ) -> List[Any]:
+        """The canonical tool set for ONE subagent invocation.
+
+        Three things have to agree — the schemas advertised to the model, the
+        "your tools are" line in the subagent prompt, and ``tools_by_name``,
+        the map the loop executes against. Before this they were derived
+        separately and disagreed in two ways:
+
+        * ``execute_as_subagent`` filtered ``denied_tools`` out of the
+          advertised schemas, but both the prompt and ``tools_by_name`` were
+          rebuilt from an unfiltered ``self.get_tools()``. A denied tool was
+          therefore still *executable* if its name reached the loop — the
+          model was not offered it, which is why this had not bitten, but the
+          policy was enforced only by omission.
+        * The prompt listed tools the model was not given, and (once tools are
+          lent) would omit tools it was.
+
+        Deriving all three from this one list is what keeps them from drifting
+        again.
+        """
+        denied = set(denied_tools or ())
+        return [t for t in self.get_tools() if t.name not in denied]
+
+    def _get_subagent_prompt(
+        self,
+        runtime_tools: Optional[List[Any]] = None,
+        *,
+        capability_description: Optional[str] = None,
+    ) -> str:
         """
         Get the system prompt for this feature's subagent context.
 
+        ``runtime_tools`` is the toolset the model will actually be given for
+        this invocation (see ``_compose_subagent_runtime_tools``). It is passed
+        rather than re-derived so the prompt cannot name a different set from
+        the one the loop advertises and executes. Omitted, it falls back to
+        ``get_tools()`` for callers and subclasses that predate this. The
+        dispatch boundary also accepts a feature's older no-argument override.
+
         Override this in subclasses for more specialized prompts.
         """
-        tool_names = [t.name for t in self.get_tools()]
+        source = runtime_tools if runtime_tools is not None else self.get_tools()
+        tool_names = [t.name for t in source]
         tools_list = ", ".join(tool_names) if tool_names else "None"
+        description = (
+            capability_description
+            if capability_description is not None
+            else self.tool_description
+        )
 
         return f"""EXECUTION MODE: You are now executing as the {self.name} subagent.
 
@@ -1776,7 +1906,7 @@ DO NOT ask clarifying questions. DO NOT respond with greetings or pleasantries.
 DO NOT say you are "awaiting task input" - you already have a task.
 EXECUTE THE TASK IMMEDIATELY using your tools.
 
-Your capabilities: {self.tool_description}
+Your capabilities: {description}
 Available tools: {tools_list}
 
 EXECUTION PROTOCOL:
@@ -1787,6 +1917,9 @@ EXECUTION PROTOCOL:
 5. Use function calling to invoke tools - do not describe actions, DO THEM
 6. If multiple tools are needed, call them in sequence
 7. After getting tool results (success or failure), provide a brief summary
+8. For an image requested by the task and actually generated by a permitted
+   tool, include its returned user-visible URL as a Markdown image in the final
+   response. Never invent an image URL or expose a non-user-visible URL.
 
 CRITICAL: You have ONE task. Execute it now. Do not wait for more input.
 
@@ -1795,6 +1928,99 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
 - NEVER generate a plausible-looking result without actually calling a tool
 - If a tool call fails or is not available, say so explicitly - do not fill in fake values
 - A fabricated cryptographic value is a lie and a constitutional violation"""
+
+    def _subagent_context_budget(self, model: Optional[str]) -> Optional[int]:
+        """Token ceiling for one subagent's message array, or None to skip.
+
+        Uses ``resolved_context_limit`` -- the limit actually KNOWN for this
+        model -- not ``get_context_limit``, which substitutes a 32768 default
+        for anything it cannot resolve. Enforcing against that default would
+        refuse a subagent at ~28k while it is really running on a
+        1,000,000-token window. None means "do not enforce"; the provider's
+        own limit still backstops.
+        """
+        if not model:
+            return None
+        try:
+            from kestrel_sovereign.agent.token_counter import get_token_counter
+
+            limit = get_token_counter(model).resolved_context_limit()
+        except Exception as e:
+            logger.debug(f"{self.name}: no context limit for {model!r}: {e}")
+            return None
+        if not limit or limit <= 0:
+            return None
+        return int(limit * SUBAGENT_CONTEXT_FRACTION)
+
+    @staticmethod
+    def _subagent_wire_chars(messages: List[Dict[str, Any]]) -> str:
+        """The array serialised the way it goes on the wire.
+
+        ``count_messages`` reads only ``content``, so it cannot see a tool
+        call's ``arguments`` or an assistant turn's ``reasoning_content`` --
+        both of which are resent every iteration and, on a thinking model,
+        can be the larger share. Serialising the whole message measures what
+        is actually sent.
+        """
+        import json as _json
+
+        try:
+            return _json.dumps(messages, default=str)
+        except (TypeError, ValueError):
+            return "".join(str(m) for m in messages)
+
+    def _subagent_context_overflow(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str],
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
+        """Return an operator-facing reason when ``messages`` will not fit.
+
+        Why this refuses instead of trimming. Trimming is model-visible
+        pruning, and salvage.py's invariant forbids that without "a
+        synchronous durable artifact or lossless pointer". For conversation
+        history that machinery exists. For TOOL RESULTS it does not: they are
+        never written to ``conversation_history``, so they have no row id to
+        salvage; ``_log_tool_dispatch`` records only ``result_status`` and
+        ``result_size_bytes``; and the orchestrator's own cap calls
+        ``_build_persisted_preview``, which despite its name persists nothing
+        -- it keeps a head and a tail and discards the middle irrecoverably.
+
+        So there is nowhere to put what trimming would drop. Refusing loudly
+        is the only behaviour that neither loses data nor sends a request the
+        provider will certainly reject. Once tool results have a durable home,
+        this is the seam that becomes a microcompact-and-salvage step.
+        """
+        budget = self._subagent_context_budget(model)
+        if budget is None:
+            return None
+        try:
+            from kestrel_sovereign.agent.token_counter import get_token_counter
+
+            counter = get_token_counter(model)
+            # Count the SERIALISED payload, not `count_messages`: that helper
+            # reads only `content`, missing tool-call `arguments` and
+            # `reasoning_content`, and never sees the tool schemas that are
+            # resent with every request. See _subagent_wire_chars.
+            payload = self._subagent_wire_chars(messages)
+            if tools:
+                payload += self._subagent_wire_chars(tools)
+            used = counter.count(payload)
+        except Exception as e:
+            logger.debug(f"{self.name}: could not measure subagent context: {e}")
+            return None
+        if used <= budget:
+            return None
+        return (
+            f"Subagent {self.name!r} exceeded its context budget: {used:,} tokens "
+            f"against a {budget:,} ceiling for model {model!r}. The tool-call "
+            f"loop accumulates every tool result and resends them, and tool "
+            f"results have no durable store to be salvaged into, so the loop "
+            f"stops here rather than dropping them silently or sending a "
+            f"request the provider will reject. Narrow the task, or have the "
+            f"tool return less."
+        )
 
     async def _handle_feature_tool_calls(
         self,
@@ -1807,6 +2033,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         model_override: Optional[str] = None,
         parts_sink: Optional[List[dict]] = None,
         session_id: Optional[str] = None,
+        runtime_tools: Optional[List[Any]] = None,
     ) -> str:
         """
         Handle tool calls within this feature's context.
@@ -1848,6 +2075,15 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         if isinstance(response, str):
             return response
 
+        # The model this subagent is ACTUALLY running on. Neither
+        # execute_as_subagent call site passes ``model_override``
+        # (orchestrator_engine.py:1299 and :1891), so relying on it would
+        # leave the budget resolving "auto" -> the 32768 default and refusing
+        # a subagent on a 1,000,000-token window at ~28k. ``LLMResponse``
+        # carries the model the provider actually served, so the loop learns
+        # it from the response it already has.
+        effective_model = model_override or getattr(response, "model", None)
+
         # Build message history for multi-turn tool calling
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1873,7 +2109,11 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         messages.append(self._build_subagent_assistant_tool_history_msg(response))
 
         # Get tools by name for execution
-        tools_by_name = {t.name: t for t in self.get_tools()}
+        # The executable map is the RUNTIME toolset, not an unfiltered
+        # re-derivation: rebuilding from ``self.get_tools()`` here put every
+        # security-denied tool back into the map (the model was not offered
+        # them, so policy held by omission alone) and left lent tools out.
+        tools_by_name = {t.name: t for t in (runtime_tools or self.get_tools())}
 
         for iteration in range(max_iterations):
             # Warn when approaching iteration limit
@@ -1917,6 +2157,18 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     "content": json.dumps(result)
                 })
 
+            # Refuse before sending rather than after being rejected. The
+            # array grows by a full tool result every iteration and is resent
+            # whole, so this is where an unbounded run is caught -- see
+            # ``_subagent_context_overflow`` for why it refuses instead of
+            # trimming.
+            overflow = self._subagent_context_overflow(
+                messages, effective_model, tools
+            )
+            if overflow is not None:
+                logger.error(f"[SUBAGENT {self.name}] {overflow}")
+                raise SubagentContextBudgetExceeded(overflow)
+
             # Continue conversation with tool results — thread the
             # ``tool_executor`` through so codex-routed continuation
             # turns don't hit the same "requires a tool_executor"
@@ -1933,11 +2185,21 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 invocation_context=_subagent_turn_identity(session_id),
             )
 
+            effective_model = (
+                model_override or getattr(response, "model", None) or effective_model
+            )
+
             # If response is string or has no more tool calls, we're done
             if isinstance(response, str):
                 return response
 
             if not hasattr(response, 'tool_calls') or not response.tool_calls:
+                overflow = self._subagent_context_overflow(
+                    messages, effective_model, tools
+                )
+                if overflow is not None:
+                    logger.error(f"[SUBAGENT {self.name}] {overflow}")
+                    raise SubagentContextBudgetExceeded(overflow)
                 response = await self._repair_subagent_premature_yield(
                     response,
                     messages,

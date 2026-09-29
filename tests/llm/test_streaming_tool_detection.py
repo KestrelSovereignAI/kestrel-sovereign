@@ -21,6 +21,7 @@ from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
 from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter
+from tests.utils.anthropic_client import install_models_api
 
 
 # =============================================================================
@@ -444,6 +445,7 @@ class TestAnthropicStreamingToolDetectionUnit:
 
         mock_client = MagicMock()
         mock_client.messages.stream = MagicMock(return_value=mock_stream)
+        install_models_api(mock_client)
 
         results = []
         async for item in adapter.get_streaming_response_with_tools(
@@ -516,6 +518,7 @@ class TestAnthropicStreamingToolDetectionUnit:
 
         mock_client = MagicMock()
         mock_client.messages.stream = MagicMock(return_value=mock_stream)
+        install_models_api(mock_client)
 
         results = []
         async for item in adapter.get_streaming_response_with_tools(

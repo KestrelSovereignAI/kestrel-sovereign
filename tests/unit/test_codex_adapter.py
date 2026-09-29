@@ -28,6 +28,7 @@ from kestrel_sovereign.llm.codex_adapter import (
     _usage_from,
 )
 from kestrel_sovereign.llm.codex_app_server import (
+    CodexAppServerClient,
     CodexAppServerError,
     CodexAppServerFrameTooLarge,
 )
@@ -2028,6 +2029,252 @@ class TestToolExecutorBridge:
         assert executed[0]["result"] == {"success": True, "result": "sunny"}
 
     @pytest.mark.asyncio
+    async def test_cancelled_turn_joins_inflight_inline_tool_before_returning(self):
+        """Stop checkpoints a completed inline effect before it can resolve."""
+        import asyncio
+
+        tool_started = asyncio.Event()
+        release_tool = asyncio.Event()
+        tool_finished = asyncio.Event()
+        checkpoint_finished = asyncio.Event()
+        checkpointed = []
+
+        class _AppWithDetachedTool:
+            def __init__(self):
+                self.registered = {}
+                self.handler_task = None
+
+            async def ensure_started(self):
+                pass
+
+            async def request(self, method, params=None, *, timeout=120):
+                if method == "thread/start":
+                    return {"thread": {"id": "thr-stop-boundary"}}
+                if method == "turn/start":
+                    handler = self.registered[
+                        ("item/tool/call", "thr-stop-boundary")
+                    ]
+                    self.handler_task = asyncio.create_task(
+                        handler(
+                            {
+                                "threadId": "thr-stop-boundary",
+                                "callId": "call-stop-boundary",
+                                "tool": "side_effect",
+                                "arguments": {},
+                            }
+                        )
+                    )
+                    await tool_started.wait()
+                    return {"turn": {"id": "turn-stop-boundary"}}
+                return {}
+
+            def register_server_request_handler(self, method, handler, *, thread_id=None):
+                key = (method, thread_id)
+                self.registered[key] = handler
+                return lambda: self.registered.pop(key, None)
+
+            def open_turn_sink(self, key):
+                return key
+
+            def close_turn_sink(self, key):
+                pass
+
+            async def iter_turn_events(self, *args, **kwargs):
+                await asyncio.Event().wait()
+                if False:
+                    yield {}
+
+        async def execute(_name, _args):
+            tool_started.set()
+            await release_tool.wait()
+            tool_finished.set()
+            return {"success": True, "result": "committed"}
+
+        async def persist_completed_effects(executed):
+            checkpointed.extend(executed)
+            checkpoint_finished.set()
+
+        execute.persist_completed_effects = persist_completed_effects
+
+        adapter = CodexAdapter()
+        app = _AppWithDetachedTool()
+        adapter._client = app
+        turn = asyncio.create_task(
+            adapter.get_response(
+                client="x",
+                model="auto",
+                messages=[{"role": "user", "content": "do it"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "side_effect",
+                            "description": "d",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                session_id="stop-boundary",
+                tool_executor=execute,
+            )
+        )
+        await tool_started.wait()
+        turn.cancel()
+        await asyncio.sleep(0)
+        assert not turn.done(), "turn returned before its inline tool settled"
+        release_tool.set()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+        assert tool_finished.is_set()
+        assert checkpoint_finished.is_set()
+        assert checkpointed == [
+            {
+                "id": "call-stop-boundary",
+                "name": "side_effect",
+                "arguments": {},
+                "result": {"success": True, "result": "committed"},
+            }
+        ]
+        assert app.handler_task is not None and app.handler_task.done()
+
+    @pytest.mark.asyncio
+    async def test_inline_checkpoint_failure_wins_over_pending_cancellation(self):
+        """Missing durability is a failed Stop boundary, never a clean cancel."""
+        import asyncio
+
+        tool_started = asyncio.Event()
+        release_tool = asyncio.Event()
+
+        class _AppWithDetachedTool:
+            def __init__(self):
+                self.registered = {}
+
+            async def ensure_started(self):
+                pass
+
+            async def request(self, method, params=None, *, timeout=120):
+                if method == "thread/start":
+                    return {"thread": {"id": "thr-checkpoint-failure"}}
+                if method == "turn/start":
+                    handler = self.registered[
+                        ("item/tool/call", "thr-checkpoint-failure")
+                    ]
+                    asyncio.create_task(
+                        handler(
+                            {
+                                "threadId": "thr-checkpoint-failure",
+                                "callId": "call-checkpoint-failure",
+                                "tool": "side_effect",
+                                "arguments": {},
+                            }
+                        )
+                    )
+                    await tool_started.wait()
+                    return {"turn": {"id": "turn-checkpoint-failure"}}
+                return {}
+
+            def register_server_request_handler(
+                self, method, handler, *, thread_id=None
+            ):
+                key = (method, thread_id)
+                self.registered[key] = handler
+                return lambda: self.registered.pop(key, None)
+
+            def open_turn_sink(self, key):
+                return key
+
+            def close_turn_sink(self, key):
+                pass
+
+            async def iter_turn_events(self, *args, **kwargs):
+                await asyncio.Event().wait()
+                if False:
+                    yield {}
+
+        async def execute(_name, _args):
+            tool_started.set()
+            await release_tool.wait()
+            return {"success": True, "result": "committed"}
+
+        async def fail_checkpoint(_executed):
+            raise RuntimeError("checkpoint write failed")
+
+        execute.persist_completed_effects = fail_checkpoint
+        adapter = CodexAdapter()
+        adapter._client = _AppWithDetachedTool()
+        turn = asyncio.create_task(
+            adapter.get_response(
+                client="x",
+                model="auto",
+                messages=[{"role": "user", "content": "do it"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "side_effect",
+                            "description": "d",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                session_id="checkpoint-failure",
+                tool_executor=execute,
+            )
+        )
+        await tool_started.wait()
+        turn.cancel()
+        release_tool.set()
+
+        with pytest.raises(RuntimeError, match="checkpoint write failed"):
+            await turn
+
+    @pytest.mark.asyncio
+    async def test_dispatch_admits_inline_handler_before_its_first_timeslice(self):
+        """A Stop between create_task and coroutine start still joins it."""
+        import asyncio
+
+        release_tool = asyncio.Event()
+        active_handlers: set[asyncio.Task[Any]] = set()
+
+        async def execute(_name, _args):
+            await release_tool.wait()
+            return {"success": True, "result": "committed"}
+
+        adapter = CodexAdapter()
+        handler = adapter._make_tool_call_handler(
+            execute,
+            "thr-admission",
+            frozenset({"side_effect"}),
+            active_handlers=active_handlers,
+        )
+        client = CodexAppServerClient(binary="codex")
+        client._send = lambda _message: None
+        unregister = client.register_server_request_handler(
+            "item/tool/call", handler, thread_id="thr-admission"
+        )
+        client._dispatch(
+            {
+                "id": 7,
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": "thr-admission",
+                    "callId": "call-admission",
+                    "tool": "side_effect",
+                    "arguments": {},
+                },
+            }
+        )
+        unregister()
+        try:
+            assert len(active_handlers) == 1
+        finally:
+            await asyncio.sleep(0)
+            admitted = tuple(active_handlers)
+            release_tool.set()
+            if admitted:
+                await asyncio.gather(*admitted)
+
+    @pytest.mark.asyncio
     async def test_inline_executed_tools_absent_from_final_response(self):
         """Regression: the app-server runs tools inline via our handler.
         Surfacing those calls in LLMResponse.tool_calls would make the
@@ -2385,6 +2632,42 @@ class TestCodexApprovalBridge:
         assert reply == {"decision": "accept"}
         assert len(captured) == 1, (
             "compound command must reach the queue, not auto-accept"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_escaped_quote_cannot_hide_a_command_separator(self):
+        """codex review round 6, P1 — a regression #3129 introduced.
+
+        Simplifying the quote walk dropped backslash handling, so
+        ``echo foo\'; sudo -n true`` opened a single-quoted region at
+        the ESCAPED apostrophe and the ``;`` after it looked quoted.
+        The compound guard saw nothing, ``BinaryPolicy`` saw an
+        allow-listed ``echo``, and this bridge auto-accepted — while a
+        real shell reads the apostrophe as a literal and runs the
+        second command. Verified against bash: it prints the second
+        command's output.
+
+        The tool that motivated #3129 was never exposed (a backslash is
+        not an inert character, so its own rule refuses the line). This
+        door was, which is why the test lives here as well as on the
+        predicate.
+        """
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["echo"], deny=["rm"]),
+            _path_policy=PathPolicy(allow=["/tmp"], deny=[]),
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+
+        reply = await handler({"command": "echo foo\\'; rm -rf /tmp/x"})
+
+        assert reply == {"decision": "accept"}
+        assert len(captured) == 1, (
+            "an escaped quote must not hide the separator from the queue"
         )
 
     @pytest.mark.asyncio

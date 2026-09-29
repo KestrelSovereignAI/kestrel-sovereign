@@ -169,7 +169,12 @@ class SecureKeyStorage:
     ENV_VAR_NAME = "KESTREL_DATA_KEY"
     ENCRYPTED_EXTENSION = ".key.enc"
     
-    def __init__(self, storage_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        storage_dir: Optional[Path] = None,
+        *,
+        master_key: Optional[Union[str, bytes]] = None,
+    ):
         """
         Initialize the secure key storage.
         
@@ -183,6 +188,17 @@ class SecureKeyStorage:
             except ImportError:
                 storage_dir = Path("agent_data")
         
+        if master_key is not None and not isinstance(master_key, (str, bytes)):
+            raise TypeError("master_key must be text or bytes")
+        if master_key == "" or master_key == b"":
+            raise ValueError("master_key must not be empty")
+        self._explicit_master_key = (
+            bytes(master_key)
+            if isinstance(master_key, bytes)
+            else master_key.encode("utf-8")
+            if isinstance(master_key, str)
+            else None
+        )
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         
@@ -196,6 +212,8 @@ class SecureKeyStorage:
         Raises:
             MasterKeyNotConfiguredError: If KESTREL_DATA_KEY is not set
         """
+        if self._explicit_master_key is not None:
+            return self._explicit_master_key
         master_key = os.environ.get(self.ENV_VAR_NAME)
         if not master_key:
             raise MasterKeyNotConfiguredError(

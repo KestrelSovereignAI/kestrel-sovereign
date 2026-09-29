@@ -22,6 +22,7 @@ from .context import (
     FleetSessionFactory,
     SovereignHostContext,
     build_host_context,
+    close_host_context,
 )
 from .discovery import (
     DEFAULT_ENABLED_KEY,
@@ -57,6 +58,7 @@ __all__ = [
     "FleetSessionFactory",
     "SovereignHostContext",
     "build_host_context",
+    "close_host_context",
     "DEFAULT_ENABLED_KEY",
     "HOST_FEATURE_ENTRY_POINT_GROUP",
     "HOST_MANIFEST_FILENAME",

@@ -401,6 +401,9 @@ def test_compute_tool_inventory_and_schemas_are_byte_stable() -> None:
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
+    # The payload is ``asdict`` of the SDK's parameter type, so it moves when
+    # the SDK adds a field even though no compute schema changed. SDK 0.38.2
+    # added ``nullable`` (false on every compute parameter).
     assert hashlib.sha256(payload).hexdigest() == (
-        "de94dff728a430174564f2071f69fc076e3ade123c69164045eb5b3bacfec615"
+        "9bb3ad373302e41a138a32b0782595c1e95827b4babdb023b243b316323364e6"
     )

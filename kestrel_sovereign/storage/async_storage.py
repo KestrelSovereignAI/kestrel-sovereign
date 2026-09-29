@@ -52,6 +52,7 @@ from .conversation_created_at import (
 from .legacy_session_stamp import stamp_legacy_sessions
 from .session_id_column import column_session_id
 from kestrel_sovereign.knowledge import Visibility
+from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 from .db import ConnectionError, DatabaseBackend, SQLiteBackend, create_backend
 
 logger = logging.getLogger(__name__)
@@ -113,7 +114,9 @@ def _parse_utc_datetime(value) -> Optional[datetime]:
 
 def get_default_agent_data_dir() -> str:
     """Get the default agent data directory."""
-    return os.environ.get("KESTREL_DB_PATH", os.path.join(os.getcwd(), "agent_data"))
+    return runtime_path_env(
+        AGENT_DB_PATH_ENV, os.path.join(os.getcwd(), "agent_data")
+    )
 
 
 class AsyncStorage:

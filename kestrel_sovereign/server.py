@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,11 +37,19 @@ from dotenv import load_dotenv
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
+from kestrel_sovereign.security.sovereign_key import mark_ephemeral_sovereign_key
 from kestrel_sovereign.api_errors import (
     api_error_response,
     api_unhandled_exception_handler,
     register_api_error_handlers,
 )
+from kestrel_sovereign.a2a.transport_auth import (
+    A2A_TRANSPORT_KEY_HEADER,
+    ensure_a2a_transport_key,
+    is_a2a_transport_path,
+    is_a2a_transport_only_process,
+)
+from kestrel_sovereign.auth import normalize_api_key
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from kestrel_sovereign.telemetry import setup_tracing
@@ -80,6 +88,11 @@ from kestrel_sovereign.logging_config import (
     session_id_var,
     agent_name_var,
     resolve_correlation_id,
+)
+from kestrel_sovereign.paths import (
+    AGENT_DB_PATH_ENV,
+    MULTI_AGENT_CONFIG_ENV,
+    runtime_path_env,
 )
 
 setup_logging()
@@ -128,6 +141,11 @@ SSE_PATHS = {
     "/agent/stream",
 }
 
+# Stop receipts execute short primary-key lookups and serial inserts. One
+# dedicated PostgreSQL connection keeps this evidence lane independent without
+# consuming the host's operational/advisory pool budget a second time.
+STOP_RECEIPT_POSTGRES_POOL_SIZE = 1
+
 
 def resolve_multi_agent_path(env: dict | os._Environ) -> Path:
     """Compute the multi_agent.toml path the lifespan should load (#868).
@@ -164,11 +182,13 @@ def resolve_multi_agent_path(env: dict | os._Environ) -> Path:
         caller still uses ``.exists()`` to decide whether to enter
         multi-agent mode.
     """
-    multi_agent_path = Path(env.get("KESTREL_MULTI_AGENT_CONFIG", "multi_agent.toml"))
+    multi_agent_path = Path(
+        runtime_path_env(MULTI_AGENT_CONFIG_ENV, "multi_agent.toml", environ=env)
+    )
     demo_server_env = env.get("KESTREL_DEMO_SERVER", "").lower() in (
         "1", "true", "yes",
     )
-    multi_agent_explicit = "KESTREL_MULTI_AGENT_CONFIG" in env
+    multi_agent_explicit = MULTI_AGENT_CONFIG_ENV in env
     if demo_server_env and not multi_agent_explicit and multi_agent_path.exists():
         logger.warning(
             "[demo-server] KESTREL_DEMO_SERVER=1 with no explicit "
@@ -418,6 +438,49 @@ def _active_scheduler_workers_available(app: FastAPI, agent, manager) -> bool:
         return False
 
 
+def _distributed_invocation_owner_status(agent) -> str:
+    """Read the registry's current lifecycle state without invoking proxies."""
+
+    try:
+        namespace = vars(agent)
+    except TypeError:  # pragma: no cover - health must not crash
+        return "self_fenced"
+    registry = namespace.get("_distributed_invocation_registry")
+    if registry is None:
+        return "healthy"
+    try:
+        status = registry.owner_lifecycle_status
+    except Exception:  # pragma: no cover - health must not crash
+        return "self_fenced"
+    return status if status in {"healthy", "self_fenced"} else "self_fenced"
+
+
+def _distributed_invocation_owner_fence_reason(agent) -> Optional[str]:
+    """The registry's named reason for a fenced owner, when it reports one."""
+
+    try:
+        registry = vars(agent).get("_distributed_invocation_registry")
+        reason = getattr(registry, "owner_fence_reason", None)
+    except Exception:  # pragma: no cover - health must not crash
+        return None
+    return reason if isinstance(reason, str) and reason.strip() else None
+
+
+def _distributed_invocation_owners_healthy(agent, manager) -> bool:
+    """Whether every loaded agent's shared invocation owner can admit work."""
+
+    candidates = [agent] if agent is not None else []
+    if manager is not None:
+        try:
+            candidates.extend(manager.list_agents().values())
+        except Exception:  # pragma: no cover - public health must not crash
+            return False
+    for candidate in candidates:
+        if _distributed_invocation_owner_status(candidate) != "healthy":
+            return False
+    return True
+
+
 def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
     """Return a controlled operator-readiness record for a restricted agent."""
     safe_mode = getattr(agent, "_safe_mode", False) is True
@@ -461,6 +524,7 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
         "state_not_persisted": "restricted_by_unsaved_state",
         "identity_missing": "identity_missing",
         "memory_unreadable": "memory_unreadable",
+        "feature_lifecycle_uncertain": "feature_lifecycle_uncertain",
         "unrecorded": "cause_unrecorded",
     }
     cause = getattr(agent, "_safe_mode_cause", None)
@@ -482,6 +546,7 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
         "identity_missing",
         "bootstrap_incomplete",
         "memory_unreadable",
+        "feature_lifecycle_uncertain",
         "restricted_by_unsaved_state",
         "cause_unrecorded",
         "state_unavailable",
@@ -516,7 +581,7 @@ def _constitution_safe_mode_records(agent, manager) -> list[dict]:
     return records
 
 
-def _oauth_required() -> bool:
+def _oauth_required(environ: Mapping[str, str] | None = None) -> bool:
     """Return whether OAuth is the required auth mode.
 
     Set KESTREL_REQUIRE_OAUTH=true in Cloud Run deploy scripts to force
@@ -525,28 +590,47 @@ def _oauth_required() -> bool:
 
     This is the single source of truth for auth mode.
     """
-    return os.environ.get("KESTREL_REQUIRE_OAUTH", "").lower() in {
+    source = os.environ if environ is None else environ
+    return source.get("KESTREL_REQUIRE_OAUTH", "").lower() in {
         "1", "true", "yes", "on"
     }
 
 
 def _bootstrap_key_enabled() -> bool:
     """Localhost API-key bootstrap is available when OAuth is not required."""
-    return not _oauth_required()
+    return not _oauth_required() and not is_a2a_transport_only_process()
+
+
+def _require_multi_agent_host_api_key(environ: Mapping[str, str]) -> str:
+    """Return the out-of-band sovereign credential required by a fleet host.
+
+    A runtime-generated key cannot be handed to local clients safely once
+    managed peers share the host's loopback namespace. Fleet launchers and the
+    server therefore meet on the project-provisioned key. OAuth authenticates
+    an operator account but intentionally does not grant sovereign authority,
+    so it cannot replace this mandate-holder credential. Localhost bootstrap
+    remains a standalone-only compatibility lane.
+    """
+    api_key = normalize_api_key(environ.get("KESTREL_API_KEY")) or ""
+    if api_key.strip():
+        return api_key
+    raise RuntimeError(
+        "Multi-agent hosts require a stable KESTREL_API_KEY for sovereign "
+        "authority, provisioned "
+        "out of band; run `kestrel setup keys` before startup"
+    )
 
 
 def get_api_key():
     """Get or generate the API key."""
-    api_key = os.environ.get("KESTREL_API_KEY")
+    api_key = normalize_api_key(os.environ.get("KESTREL_API_KEY"))
     if not api_key:
         generated_key = secrets.token_urlsafe(32)
         os.environ["KESTREL_API_KEY"] = generated_key
+        mark_ephemeral_sovereign_key(generated_key)
         logger.warning("⚠️  NO KESTREL_API_KEY SET. A temporary key has been generated.")
         logger.warning("Please set KESTREL_API_KEY in your environment for persistence.")
         return generated_key
-    # Strip surrounding quotes (Docker --env-file includes them literally)
-    if len(api_key) >= 2 and api_key[0] == api_key[-1] and api_key[0] in ('"', "'"):
-        api_key = api_key[1:-1]
     return api_key
 
 
@@ -587,7 +671,14 @@ async def verify_api_key(
 
 
 def _is_webhook_receiver(receiver) -> bool:
-    """Duck-typed webhook-receiver check (keeps core decoupled from the class)."""
+    """Duck-typed webhook-receiver check (keeps core decoupled from the class).
+
+    ``handle_webhook`` + ``webhooks`` is the whole required contract.
+    ``record_refusal`` (auditing a refused ambiguous-ownership request,
+    #3216) is optional: the dispatch router calls it only when present, so a
+    receiver without it is still dispatched and still refused with the same
+    404, just without an audit row of its own.
+    """
     return (
         receiver is not None
         and hasattr(receiver, "handle_webhook")
@@ -664,6 +755,102 @@ def _current_feature_router_route(feature, selector: tuple):
     ):
         return None
     return current
+
+
+def _stable_agent_did(agent) -> Optional[str]:
+    """The agent's DID through the shared guard, or None when it has none.
+
+    Used to recognise a mount owner that was reloaded under a new object.
+    A test double with no string DID has no stable identity here and is
+    only ever matched by object.
+    """
+    from kestrel_sovereign.features.storage_access import (
+        AgentIdentityUnavailable,
+        resolve_scoped_agent_did,
+    )
+
+    try:
+        return resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
+        return None
+
+
+def _live_feature_route(agent, feature_name: str, selector: tuple):
+    """The current child route ``agent`` serves for one mounted shape, or None.
+
+    One check for "this agent still serves this route": the feature is
+    present, enabled, and exposes the mounted shape now. The owner
+    resolution and both request paths ask the same question; three copies
+    of it drifted once already.
+    """
+
+    features = getattr(agent, "features", None) or {}
+    feature = features.get(feature_name) if hasattr(features, "get") else None
+    if feature is None or not bool(getattr(feature, "enabled", True)):
+        return None
+    return _current_feature_router_route(feature, selector)
+
+
+def _resolve_live_route_agent(
+    app: FastAPI,
+    scope,
+    mount_agent,
+    feature_name: str,
+    selector: tuple,
+):
+    """Resolve a live owner for one physically shared feature route.
+
+    Request-scoped routing is authoritative.  For unprefixed routes, retain
+    the original mount owner while it is managed — the same object, or the
+    same agent reloaded under a new object (readiness rollback then retry,
+    DELETE then re-create, a scheduler cold wake): the manager keeps one
+    routing name per DID, so the DID is the owner's stable identity and the
+    object is not.  If that owner is gone, the route may rebind only when
+    exactly one managed agent still serves it: an unprefixed address names
+    no agent, so with two or more candidates the executor would be chosen
+    by ``list_agents()`` order, invisible to the caller (#3240, the shape of
+    #3216). Refuse instead; the agent-prefixed form stays the unambiguous
+    address.
+    """
+
+    state = scope.get("state") or {}
+    scoped_agent = state.get("agent")
+    manager = getattr(app.state, "agent_manager", None)
+    if manager is None:
+        return scoped_agent if scoped_agent is not None else mount_agent
+    managed = manager.list_agents()
+    managed_agents = tuple(
+        managed.values() if hasattr(managed, "values") else (managed or ())
+    )
+    if scoped_agent is not None:
+        # The routing middleware resolved this object before Starlette matched
+        # the preserved dynamic route. DELETE or an authority-expiry fence can
+        # win in between; the request prefix remains authoritative, so close
+        # the route instead of invoking that stale object or rebinding to a peer.
+        return (
+            scoped_agent
+            if any(current is scoped_agent for current in managed_agents)
+            else None
+        )
+    if any(current is mount_agent for current in managed_agents):
+        return mount_agent
+    mount_did = _stable_agent_did(mount_agent)
+    if mount_did is not None:
+        reloaded = [
+            current
+            for current in managed_agents
+            if _stable_agent_did(current) == mount_did
+        ]
+        if len(reloaded) == 1:
+            return reloaded[0]
+    survivors = [
+        candidate
+        for candidate in managed_agents
+        if _live_feature_route(candidate, feature_name, selector) is not None
+    ]
+    if len(survivors) == 1:
+        return survivors[0]
+    return None
 
 
 async def _feature_route_gone_response(scope, receive, send) -> None:
@@ -804,35 +991,39 @@ def _gate_feature_route(
     app, and a WebSocket route would receive an invalid HTTP ``JSONResponse``.
     Returning :class:`starlette.routing.Match.NONE` removes a disabled route
     from both HTTP and WebSocket matching before either protocol is handled.
+
+    Starlette's own match runs first. The live-owner and live-route checks
+    — which call ``feature.get_router()`` and, for a withdrawn mount owner,
+    scan every managed agent — run only for a request whose path this
+    route matches at all (#3253). Every request that reached the end of the
+    route table used to pay one router construction per gated feature
+    route, matching or not — every 404 (twice, via the trailing-slash
+    retry) and every request Starlette could only match PARTIAL; a request
+    a core route matched FULL never got this far. A path match with the
+    wrong method (``Match.PARTIAL``) still consults the gate, so a
+    disabled feature answers NONE there too, never 405.
     """
     original_matches = route.matches
     host_dependencies = _feature_route_host_dependencies(route, initial_current)
 
     def _gated_matches(scope):
-        agent = _resolve_route_agent(scope, mount_agent)
+        matched = original_matches(scope)
+        if matched[0] is Match.NONE:
+            return matched
+        agent = _resolve_live_route_agent(
+            app, scope, mount_agent, feature_name, selector
+        )
         # Dynamic feature routes stay physically mounted so a live feature can
         # be disabled/re-enabled without route churn.  When their mount owner
         # has been DELETEd, however, an unprefixed request must not keep using
         # that stale captured object while a scheduler races to cold-wake it.
         # Request-scoped routes still work for another currently managed agent
         # that exposes the same feature.
-        manager = getattr(app.state, "agent_manager", None)
-        if manager is not None and agent is mount_agent:
-            managed = manager.list_agents()
-            managed_agents = (
-                managed.values() if hasattr(managed, "values") else (managed or ())
-            )
-            if not any(current is mount_agent for current in managed_agents):
-                return Match.NONE, {}
-        features = getattr(agent, "features", None) or {}
-        feature = features.get(feature_name) if hasattr(features, "get") else None
-        if (
-            feature is None
-            or not bool(getattr(feature, "enabled", True))
-            or _current_feature_router_route(feature, selector) is None
-        ):
+        if agent is None:
             return Match.NONE, {}
-        return original_matches(scope)
+        if _live_feature_route(agent, feature_name, selector) is None:
+            return Match.NONE, {}
+        return matched
 
     route.matches = _gated_matches
     # Do not call the copied ``route.app`` directly: it retains the first
@@ -840,13 +1031,13 @@ def _gate_feature_route(
     # child bypasses the app's dependency overrides and host dependencies.
     # Rebind the current endpoint through a fresh app-owned FastAPI route.
     async def _dispatch_current_feature_route(scope, receive, send):
-        agent = _resolve_route_agent(scope, mount_agent)
-        features = getattr(agent, "features", None) or {}
-        feature = features.get(feature_name) if hasattr(features, "get") else None
-        if feature is None or not bool(getattr(feature, "enabled", True)):
+        agent = _resolve_live_route_agent(
+            app, scope, mount_agent, feature_name, selector
+        )
+        if agent is None:
             await _feature_route_gone_response(scope, receive, send)
             return
-        current = _current_feature_router_route(feature, selector)
+        current = _live_feature_route(agent, feature_name, selector)
         if current is None:
             await _feature_route_gone_response(scope, receive, send)
             return
@@ -989,11 +1180,20 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
     # /api/agents/{name}/webhooks/{name} request sees ONLY that agent's enabled
     # receivers (so it can't dispatch to another agent's identically-named
     # webhook), while the unprefixed /webhooks/{name} form aggregates across
-    # every agent (#2522). Mounted when at least one enabled webhook receiver
-    # exists at startup; the provider itself stays live thereafter.
-    if _live_webhook_receivers(app) and not getattr(
-        app.state, "_feature_webhook_dispatch_mounted", False
-    ):
+    # every agent (#2522) and the router refuses a name that more than one of
+    # them owns, so iteration order never picks the target (#3216). Mounted
+    # when at least one enabled webhook receiver exists at startup; the
+    # provider itself stays live thereafter.
+    candidate_webhook_receivers = []
+    if agents is not None:
+        for candidate in agents:
+            if candidate is not None:
+                candidate_webhook_receivers.extend(
+                    _agent_webhook_receivers(candidate)
+                )
+    if (
+        _live_webhook_receivers(app) or candidate_webhook_receivers
+    ) and not getattr(app.state, "_feature_webhook_dispatch_mounted", False):
         try:
             from kestrel_sovereign.features.webhooks.receiver import (
                 build_webhook_dispatch_router,
@@ -1052,12 +1252,14 @@ def _agent_webhook_receivers(agent) -> list:
     Deduplicated by identity; a disabled/removed feature's receiver is dropped.
     """
     receivers: list = []
+    seen: set[int] = set()
     features = getattr(agent, "features", {}) or {}
     for feature in features.values():
         if not bool(getattr(feature, "enabled", True)):
             continue
         receiver = getattr(feature, "receiver", None)
-        if _is_webhook_receiver(receiver) and receiver not in receivers:
+        if _is_webhook_receiver(receiver) and id(receiver) not in seen:
+            seen.add(id(receiver))
             receivers.append(receiver)
     return receivers
 
@@ -1078,14 +1280,22 @@ def _live_webhook_receivers(app: FastAPI, agent=None) -> list:
     unprefixed ``/webhooks/{name}`` form, or single-agent mode) the aggregate
     of every current agent's enabled receivers is returned. Deduplicated by
     identity because one receiver can be reached through multiple agents.
+    The dispatch router refuses a name owned by more than one receiver in
+    the returned set (#3216); this provider only decides the scope. The
+    dedupe is by ``id()``, never ``==``: a receiver is admitted on a
+    two-attribute duck-typed contract, and an out-of-tree class with value
+    equality (a dataclass, a pydantic model) would otherwise collapse two
+    distinct owners into one and hand the target back to iteration order.
     """
     if agent is not None:
         return _agent_webhook_receivers(agent)
 
     receivers: list = []
+    seen: set[int] = set()
     for current in _iter_current_agents(app):
         for receiver in _agent_webhook_receivers(current):
-            if receiver not in receivers:
+            if id(receiver) not in seen:
+                seen.add(id(receiver))
                 receivers.append(receiver)
     return receivers
 
@@ -1291,6 +1501,9 @@ def _hosted_peer_directory_context(
         if not callable(refresh):
             return None, None
         local_cancel = None
+        local_stop = None
+        local_get = None
+        local_subscribe = None
         if manager is not None:
             async def local_cancel(requester, peer, task_id, payload):
                 return await manager.cancel_host_attested_local_a2a_task(
@@ -1301,10 +1514,37 @@ def _hosted_peer_directory_context(
                     payload=payload,
                 )
 
+            async def local_stop(requester, peer, payload):
+                return await manager.stop_host_attested_local_peer(
+                    sender=agent,
+                    requester=requester,
+                    peer=peer,
+                    payload=payload,
+                )
+
+            async def local_get(requester, peer, task_id):
+                return await manager.get_host_attested_local_a2a_task(
+                    sender=agent,
+                    requester=requester,
+                    peer=peer,
+                    task_id=task_id,
+                )
+
+            def local_subscribe(requester, peer, task_id):
+                return manager.subscribe_host_attested_local_a2a_task(
+                    sender=agent,
+                    requester=requester,
+                    peer=peer,
+                    task_id=task_id,
+                )
+
         refreshed = refresh(
             host_url=host_url,
-            api_key=get_api_key(),
+            transport_key=ensure_a2a_transport_key(),
             local_cancel=local_cancel,
+            local_stop=local_stop,
+            local_get=local_get,
+            local_subscribe=local_subscribe,
         )
         return refreshed if refreshed is not None else (None, None)
     return (
@@ -1313,22 +1553,235 @@ def _hosted_peer_directory_context(
     )
 
 
-async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent) -> None:
-    """Apply host-owned integration to every newly registered agent.
+async def _onboard_host_registered_agent(
+    app: FastAPI,
+    manager,
+    name: str,
+    agent,
+) -> Callable[[], Awaitable[None]]:
+    """Apply host-owned integration to a private, verified agent candidate.
 
     Initial fleet startup and scheduler cold wakes share ``AgentManager``'s
-    registration seam.  Keeping this work in the app (rather than the
+    prepublication seam.  Keeping this work in the app (rather than the
     scheduler) makes a dynamically loaded tenant indistinguishable from an
     autostart tenant for same-host A2A verification and feature HTTP/UI
     exposure.  Failure is intentionally propagated to the manager, which
-    unpublishes the partially onboarded agent instead of dispatching work to
-    an incompletely integrated tenant.
+    discards the partially onboarded agent instead of dispatching work to an
+    incompletely integrated tenant. Feature-route gates resolve through the
+    manager and therefore remain closed until the later registration commit.
     """
     from kestrel_sovereign.a2a.did_registry import install_a2a_did_resolver
     from kestrel_sovereign.a2a.inbound_authorization import (
         install_a2a_inbound_sender_authorizer,
         mark_a2a_inbound_scoped_policy,
     )
+
+    missing = object()
+    rollback_state_fields = (
+        "_feature_routes",
+        "_feature_route_count",
+        "_feature_router_keys",
+        "_feature_webhook_dispatch_mounted",
+        "_feature_ui_mounts",
+        "_feature_ui_mount_paths",
+    )
+    initially_missing_state_fields = {
+        field
+        for field in rollback_state_fields
+        if getattr(app.state, field, missing) is missing
+    }
+    prior_route_ids = {id(route) for route in app.routes}
+    prior_openapi_schema = app.openapi_schema
+    prior_feature_route_ids = {
+        id(route) for route in getattr(app.state, "_feature_routes", ())
+    }
+    prior_router_keys = set(
+        getattr(app.state, "_feature_router_keys", ())
+    )
+    prior_ui_mount_ids = {
+        id(route) for route in getattr(app.state, "_feature_ui_mounts", ())
+    }
+    prior_ui_mount_paths = set(
+        getattr(app.state, "_feature_ui_mount_paths", ())
+    )
+    prior_webhook_mounted = bool(
+        getattr(app.state, "_feature_webhook_dispatch_mounted", False)
+    )
+    prior_demo_mode = getattr(app.state, "demo_mode", missing)
+    prior_managed_agent_ids = {
+        id(current) for current in manager.list_agents().values()
+    }
+    owned_route_ids: set[int] = set()
+    owned_feature_route_ids: set[int] = set()
+    owned_router_keys: set[tuple] = set()
+    owned_router_route_ids: dict[tuple, set[int]] = {}
+    owned_ui_mount_ids: set[int] = set()
+    owned_ui_mount_paths: set[str] = set()
+    owned_ui_mount_route_ids: dict[str, set[int]] = {}
+    owns_webhook_dispatch = False
+    agent_fields = (
+        "_scoped_policy_required",
+        "_a2a_host_manager",
+        "a2a_did_resolver",
+        "a2a_inbound_sender_authorizer",
+    )
+    prior_agent_state = {
+        field: vars(agent).get(field, missing)
+        for field in agent_fields
+    }
+
+    async def rollback_host_onboarding() -> None:
+        """Remove only app/agent state introduced by this private candidate."""
+
+        current_agents = dict(manager.list_agents())
+        other_agent_map = {
+            current_name: current
+            for current_name, current in current_agents.items()
+            if current is not agent
+        }
+        other_agents = list(other_agent_map.values())
+
+        # A later agent can reuse a router/static/webhook mount first created
+        # by this candidate. Transfer that shared physical mount instead of
+        # deleting it; gates and live receiver lookup already resolve the
+        # request to the current owning agent.
+        shared_router_keys: set[tuple] = set()
+        for current in other_agents:
+            for feature_name, feature in (
+                getattr(current, "features", {}) or {}
+            ).items():
+                if _is_webhook_receiver(getattr(feature, "receiver", None)):
+                    continue
+                try:
+                    router = feature.get_router()
+                except Exception:
+                    continue
+                if router is not None:
+                    key = _feature_router_signature(feature_name, router)
+                    if key in owned_router_keys:
+                        shared_router_keys.add(key)
+        shared_ui_paths: set[str] = set()
+        if owned_ui_mount_paths:
+            from kestrel_sovereign.ui_contributions import feature_static_mounts
+
+            for current in other_agents:
+                for mount_path, _directory in feature_static_mounts(
+                    current,
+                    include_disabled=True,
+                ):
+                    if mount_path in owned_ui_mount_paths:
+                        shared_ui_paths.add(mount_path)
+        preserve_webhook = owns_webhook_dispatch and any(
+            _agent_webhook_receivers(current) for current in other_agents
+        )
+        preserved_route_ids: set[int] = set()
+        for key in shared_router_keys:
+            preserved_route_ids.update(owned_router_route_ids.get(key, ()))
+        for mount_path in shared_ui_paths:
+            preserved_route_ids.update(
+                owned_ui_mount_route_ids.get(mount_path, ())
+            )
+        if preserve_webhook:
+            preserved_route_ids.update(
+                id(route)
+                for route in app.routes
+                if id(route) in owned_feature_route_ids
+                and "webhook" in str(getattr(route, "path", "")).lower()
+            )
+
+        removable_route_ids = owned_route_ids - preserved_route_ids
+        app.routes[:] = [
+            route for route in app.routes if id(route) not in removable_route_ids
+        ]
+
+        tracked_routes = [
+            route
+            for route in getattr(app.state, "_feature_routes", ())
+            if id(route) not in (
+                owned_feature_route_ids - preserved_route_ids
+            )
+        ]
+        app.state._feature_routes = tracked_routes
+        app.state._feature_route_count = len(tracked_routes)
+        current_router_keys = set(
+            getattr(app.state, "_feature_router_keys", ())
+        )
+        current_router_keys.difference_update(
+            owned_router_keys - shared_router_keys
+        )
+        app.state._feature_router_keys = current_router_keys
+
+        current_ui_mounts = [
+            route
+            for route in getattr(app.state, "_feature_ui_mounts", ())
+            if id(route) not in (owned_ui_mount_ids - preserved_route_ids)
+        ]
+        app.state._feature_ui_mounts = current_ui_mounts
+        current_ui_paths = set(
+            getattr(app.state, "_feature_ui_mount_paths", ())
+        )
+        current_ui_paths.difference_update(
+            owned_ui_mount_paths - shared_ui_paths
+        )
+        app.state._feature_ui_mount_paths = current_ui_paths
+        if owns_webhook_dispatch and not preserve_webhook:
+            app.state._feature_webhook_dispatch_mounted = prior_webhook_mounted
+
+        empty_state_fields = {
+            "_feature_routes": not tracked_routes,
+            "_feature_route_count": not tracked_routes,
+            "_feature_router_keys": not current_router_keys,
+            "_feature_webhook_dispatch_mounted": not bool(
+                getattr(
+                    app.state,
+                    "_feature_webhook_dispatch_mounted",
+                    False,
+                )
+            ),
+            "_feature_ui_mounts": not current_ui_mounts,
+            "_feature_ui_mount_paths": not current_ui_paths,
+        }
+        for field in initially_missing_state_fields:
+            if empty_state_fields[field]:
+                try:
+                    delattr(app.state, field)
+                except (AttributeError, KeyError):
+                    pass
+
+        remaining_route_ids = {id(route) for route in app.routes}
+        app.openapi_schema = (
+            prior_openapi_schema
+            if remaining_route_ids == prior_route_ids
+            else None
+        )
+
+        later_agents = [
+            current
+            for current in other_agents
+            if id(current) not in prior_managed_agent_ids
+        ]
+        if later_agents:
+            from kestrel_sovereign.security.demo_isolation import (
+                classify_server_mode,
+            )
+
+            app.state.demo_mode = classify_server_mode(other_agent_map)
+        elif prior_demo_mode is missing:
+            try:
+                delattr(app.state, "demo_mode")
+            except (AttributeError, KeyError):
+                pass
+        else:
+            app.state.demo_mode = prior_demo_mode
+        for field, value in prior_agent_state.items():
+            if value is missing:
+                vars(agent).pop(field, None)
+            else:
+                setattr(agent, field, value)
+
+    # Seed rollback custody before the first mutation so a hook exception is
+    # cleaned by AgentManager even though this coroutine cannot return it.
+    agent._host_onboarding_rollback = rollback_host_onboarding
 
     federated = os.environ.get("KESTREL_A2A_FEDERATED_DID", "").lower() in (
         "1", "true", "yes",
@@ -1362,16 +1815,78 @@ async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent
         router=peer_router,
         requester=peer_requester,
     )
+    _attach_stop_runtime(app, agent)
     _mount_feature_ui_assets(app, agents=(agent,))
     _mount_feature_routers(app, agents=(agent,))
+    owned_route_ids.update(
+        id(route) for route in app.routes if id(route) not in prior_route_ids
+    )
+    owned_feature_route_ids.update(
+        id(route)
+        for route in getattr(app.state, "_feature_routes", ())
+        if id(route) not in prior_feature_route_ids
+    )
+    owned_router_keys.update(
+        set(getattr(app.state, "_feature_router_keys", ())) - prior_router_keys
+    )
+    owned_feature_routes = [
+        route
+        for route in getattr(app.state, "_feature_routes", ())
+        if id(route) in owned_feature_route_ids
+    ]
+    for key in owned_router_keys:
+        _feature_name, _prefix, route_shapes = key
+        # APIRouter stores its prefix in every child route's ``path`` already;
+        # ``include_router`` copies that exact path into the app.  The stable
+        # signature is therefore also the physical mounted shape.
+        expected_shapes = set(route_shapes)
+        owned_router_route_ids[key] = {
+            id(route)
+            for route in owned_feature_routes
+            if (
+                type(route).__name__,
+                getattr(route, "path", None),
+                tuple(sorted(getattr(route, "methods", ()) or ())),
+            )
+            in expected_shapes
+        }
+    owned_ui_mount_ids.update(
+        id(route)
+        for route in getattr(app.state, "_feature_ui_mounts", ())
+        if id(route) not in prior_ui_mount_ids
+    )
+    owned_ui_mount_paths.update(
+        set(getattr(app.state, "_feature_ui_mount_paths", ()))
+        - prior_ui_mount_paths
+    )
+    owned_ui_mounts = [
+        route
+        for route in getattr(app.state, "_feature_ui_mounts", ())
+        if id(route) in owned_ui_mount_ids
+    ]
+    for mount_path in owned_ui_mount_paths:
+        owned_ui_mount_route_ids[mount_path] = {
+            id(route)
+            for route in owned_ui_mounts
+            if getattr(route, "path", None) == mount_path
+        }
+    owns_webhook_dispatch = (
+        not prior_webhook_mounted
+        and bool(
+            getattr(app.state, "_feature_webhook_dispatch_mounted", False)
+        )
+    )
 
     # The host-level demo classification is a live fleet property.  Refresh it
     # on dynamic registration rather than leaving a cold-woken demo tenant
     # classified from the startup snapshot.
     from kestrel_sovereign.security.demo_isolation import classify_server_mode
 
-    app.state.demo_mode = classify_server_mode(manager.list_agents())
+    visible_after_commit = dict(manager.list_agents())
+    visible_after_commit[name] = agent
+    app.state.demo_mode = classify_server_mode(visible_after_commit)
     logger.info("Completed host onboarding for dynamically registered agent %r", name)
+    return rollback_host_onboarding
 
 
 def _host_config_mapping(config) -> dict:
@@ -1577,6 +2092,195 @@ async def _shutdown_single_agent(agent: KestrelAgent) -> None:
         raise asyncio.CancelledError()
 
 
+def _attach_stop_runtime(app: FastAPI, agent) -> None:
+    """Bind the host's Stop services to one agent before it accepts work.
+
+    The distributed registry lets cooperative cancellation reach turns owned
+    by other replicas; the receipt store and cleanup registry let the agent's
+    ``a2a.peer_stop`` handler record every peer Stop durably (#3169).
+    """
+
+    from kestrel_sovereign.signals.sources.peer_stop import attach_stop_evidence
+    from kestrel_sovereign.stop import StopCleanupRegistry
+
+    distributed_stop = getattr(app.state, "distributed_invocation_registry", None)
+    if distributed_stop is not None:
+        distributed_stop.attach(agent)
+    receipt_store = getattr(app.state, "stop_receipt_store", None)
+    if receipt_store is None:
+        return
+    circuit = getattr(app.state, "peer_stop_circuit", None)
+    if circuit is None:
+        # Receipts without a circuit would honor peer Stops uncounted -- the
+        # back door #3170 closes. The two open together or not at all.
+        raise RuntimeError("peer Stop circuit breaker is not initialized")
+    cleanup_registry = getattr(app.state, "stop_cleanup_registry", None)
+    if cleanup_registry is None:
+        cleanup_registry = StopCleanupRegistry()
+        app.state.stop_cleanup_registry = cleanup_registry
+    attach_stop_evidence(
+        agent,
+        receipt_store=receipt_store,
+        cleanup_registry=cleanup_registry,
+        circuit=circuit,
+    )
+
+
+async def _initialize_stop_receipts(app: FastAPI) -> None:
+    """Open the host-owned evidence store before any agent can accept work."""
+
+    app.state.stop_receipt_store = None
+    app.state.stop_receipt_db = None
+    app.state.stop_receipt_store_error = ""
+    app.state.peer_stop_circuit = None
+    app.state.distributed_invocation_registry = None
+    db = None
+    distributed_stop = None
+    try:
+        from kestrel_sovereign.host_features.storage import (
+            prepare_host_database,
+            validate_sqlite_family_private,
+        )
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.signals.sources.peer_stop import (
+            resolve_peer_stop_circuit_policy,
+        )
+        from kestrel_sovereign.stop import (
+            DistributedInvocationRegistry,
+            DistributedInvocationStore,
+            PeerStopCircuitStore,
+            StopReceiptStore,
+        )
+
+        backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
+        if backend == "postgres":
+            dsn = os.environ.get("KESTREL_DATABASE_URL")
+            if not dsn:
+                raise RuntimeError(
+                    "PostgreSQL Stop receipt storage requires KESTREL_DATABASE_URL"
+                )
+            db = await AsyncDatabase.create(
+                {
+                    "backend": "postgres",
+                    "dsn": dsn,
+                    "min_pool_size": STOP_RECEIPT_POSTGRES_POOL_SIZE,
+                    "max_pool_size": STOP_RECEIPT_POSTGRES_POOL_SIZE,
+                }
+            )
+        else:
+            path = prepare_host_database()
+            db = await AsyncDatabase.sqlite(str(path))
+            validate_sqlite_family_private(path)
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        circuit = PeerStopCircuitStore(
+            db, policy=resolve_peer_stop_circuit_policy()
+        )
+        await circuit.ensure_schema()
+        invocation_store = DistributedInvocationStore(db)
+        await invocation_store.ensure_schema()
+        distributed_stop = DistributedInvocationRegistry(invocation_store)
+        distributed_stop.start()
+        app.state.stop_receipt_db = db
+        app.state.stop_receipt_store = store
+        app.state.peer_stop_circuit = circuit
+        app.state.distributed_invocation_registry = distributed_stop
+    except (Exception, asyncio.CancelledError) as error:
+        cleanup_cancelled = isinstance(error, asyncio.CancelledError)
+        cleanup_failures: list[BaseException] = []
+        if distributed_stop is not None:
+            close_registry = asyncio.create_task(
+                distributed_stop.close(),
+                name="stop_receipts_startup:close_registry",
+            )
+            cancelled, failure = await await_lifecycle_task_completion(
+                close_registry
+            )
+            cleanup_cancelled = cleanup_cancelled or cancelled
+            if failure is not None:
+                cleanup_failures.append(failure)
+        if db is not None:
+            close_db = asyncio.create_task(
+                db.close(),
+                name="stop_receipts_startup:close_database",
+            )
+            cancelled, failure = await await_lifecycle_task_completion(close_db)
+            cleanup_cancelled = cleanup_cancelled or cancelled
+            if failure is not None:
+                cleanup_failures.append(failure)
+        app.state.stop_receipt_store_error = type(error).__name__
+        for failure in cleanup_failures:
+            error.add_note(
+                "Durable Stop startup cleanup also failed: "
+                f"{type(failure).__name__}: {failure}"
+            )
+        if cleanup_cancelled:
+            cancellation = (
+                error
+                if isinstance(error, asyncio.CancelledError)
+                else asyncio.CancelledError()
+            )
+            if cancellation is not error:
+                cancellation.add_note(
+                    "Durable Stop startup failed before cancellation: "
+                    f"{type(error).__name__}: {error}"
+                )
+            raise cancellation
+        logger.error(
+            "Durable Stop receipt storage failed to initialize (%s); "
+            "the host will not become ready",
+            type(error).__name__,
+            exc_info=True,
+        )
+        raise RuntimeError(
+            "Durable Stop evidence failed to initialize"
+        ) from error
+
+
+async def _shutdown_stop_receipts(app: FastAPI) -> None:
+    # Keep this primitive safe for focused tests and recovery callers that do
+    # not drive the full ordered server teardown.
+    registry = getattr(app.state, "distributed_invocation_registry", None)
+    app.state.distributed_invocation_registry = None
+    if registry is not None:
+        await registry.close()
+    db = getattr(app.state, "stop_receipt_db", None)
+    # Teardown retires a failed startup too. Left behind, its error would make
+    # an app reused without its lifespan answer 503 for a failure that belongs
+    # to a lifespan already gone (#3286).
+    app.state.stop_receipt_store_error = ""
+    app.state.stop_receipt_store = None
+    app.state.peer_stop_circuit = None
+    app.state.stop_receipt_db = None
+    if db is not None:
+        await db.close()
+
+
+async def _shutdown_distributed_invocations(app: FastAPI) -> None:
+    """Retire this process's ownership rows after agents finish cleanup."""
+
+    registry = getattr(app.state, "distributed_invocation_registry", None)
+    app.state.distributed_invocation_registry = None
+    if registry is not None:
+        await registry.close()
+
+
+async def _shutdown_stop_cleanup(app: FastAPI) -> None:
+    """Drain application-owned Stop tails before their agents are released."""
+
+    from kestrel_sovereign.stop import StopCleanupRegistry
+
+    registry = getattr(app.state, "stop_cleanup_registry", None)
+    if registry is None:
+        return
+    if not isinstance(registry, StopCleanupRegistry):
+        raise TypeError("app Stop cleanup registry has an invalid type")
+    try:
+        await registry.drain()
+    finally:
+        app.state.stop_cleanup_registry = None
+
+
 async def _shutdown_phoenix(app: FastAPI) -> bool:
     """Release all server-owned Phoenix work before lifespan teardown returns.
 
@@ -1676,14 +2380,9 @@ async def _shutdown_host_features(app: FastAPI) -> None:
     except Exception as exc:  # noqa: BLE001 - preserve the existing best effort
         logger.warning("Host feature shutdown failed: %s", exc)
     finally:
-        # Router/UI state must not outlive a failed feature shutdown.  Each
+        # Router/UI state must not outlive a failed feature shutdown. Each
         # following cleanup is in a ``finally`` so one bad unmount cannot leave
-        # the host session factory or database live.
-        session_factory = (
-            getattr(host_context, "session_factory", None)
-            if host_context is not None
-            else None
-        )
+        # the host context's independently-owned resources live.
         try:
             _hf.unmount_host_features(app)
         finally:
@@ -1693,26 +2392,8 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                 try:
                     _unmount_feature_ui_assets(app)
                 finally:
-                    try:
-                        if session_factory is not None:
-                            await session_factory.close()
-                    except Exception as exc:  # noqa: BLE001 - close host DB too
-                        logger.warning(
-                            "Host feature session-factory shutdown failed: %s", exc
-                        )
-                    finally:
-                        host_db = (
-                            getattr(host_context, "db", None)
-                            if host_context is not None
-                            else None
-                        )
-                        if host_db is not None and hasattr(host_db, "close"):
-                            try:
-                                await host_db.close()
-                            except Exception as exc:  # noqa: BLE001 - terminal cleanup
-                                logger.warning(
-                                    "Host feature database shutdown failed: %s", exc
-                                )
+                    if host_context is not None:
+                        await _hf.close_host_context(host_context)
 
 
 _SHARED_AGENT_POSTGRES_MAX_POOL_SIZE_ENV = (
@@ -2242,12 +2923,22 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
 
     for name, operation in (
         ("host-scheduler", lambda: _shutdown_host_scheduler(app)),
-        # A shared PostgreSQL runner can still complete a cold wake's
-        # registration/onboarding path while stop() drains owned work. Drain
-        # it before unmounting host and feature surfaces, otherwise that late
-        # onboarding can remount routes or UI after their only teardown pass.
-        ("host-features", lambda: _shutdown_host_features(app)),
+        # The scheduler is now drained, so no cold wake can remount host
+        # surfaces while teardown proceeds. Finish application-owned Stop
+        # tails before their agent instances are released.
+        ("stop-cleanup", lambda: _shutdown_stop_cleanup(app)),
         ("agents", lambda: _shutdown_server_agents(app)),
+        # HostContext owns the fleet Hold store. Agent heartbeats, signals and
+        # feature cleanup may still enter the universal turn seam until agent
+        # shutdown is terminal, so that context must remain live through the
+        # agents phase. The host scheduler above is already drained, preventing
+        # late cold onboarding from remounting feature surfaces during teardown.
+        ("host-features", lambda: _shutdown_host_features(app)),
+        (
+            "distributed-stop-invocations",
+            lambda: _shutdown_distributed_invocations(app),
+        ),
+        ("stop-receipts", lambda: _shutdown_stop_receipts(app)),
         (
             "shared-agent-postgres",
             lambda: _shutdown_shared_agent_postgres_backend(app),
@@ -2293,6 +2984,23 @@ async def _lifespan_teardown_owner(app: FastAPI):
                 raise teardown_failure
 
 
+async def _build_host_control_context(app: FastAPI, host_config) -> object:
+    """Publish validated Hold state before any agent or scheduler can run."""
+
+    from kestrel_sovereign import host_features as _hf
+    from kestrel_sovereign.host_features.context import close_host_context_resources
+
+    ctx = await _hf.build_host_context(config=_host_config_mapping(host_config))
+    if getattr(ctx, "hold_store", None) is None:
+        reason = str(getattr(ctx, "backend_error", "") or "unknown backend failure")
+        await close_host_context_resources(ctx)
+        raise RuntimeError(
+            "Host Hold control state is unavailable before work admission: " + reason
+        )
+    app.state.host_context = ctx
+    return ctx
+
+
 @asynccontextmanager
 async def _lifespan_startup(app: FastAPI):
     """Initialize server resources; outer lifespan ownership handles teardown."""
@@ -2305,6 +3013,21 @@ async def _lifespan_startup(app: FastAPI):
     # On a failed rollback this private owner remains reachable only to
     # teardown. It must never become the public routing manager.
     app.state.startup_cleanup_agent_manager = None
+    app.state.host_features = []
+    app.state.host_context = None
+    app.state.host_ui_manifest = []
+    await _initialize_stop_receipts(app)
+
+    # Establish the authentication boundary before launching any host-owned
+    # resources. Direct uvicorn starts must obey the same fail-closed rule as
+    # `kestrel start`; otherwise get_api_key() would mint an undiscoverable key
+    # after the peer-visible bootstrap endpoint has already been disabled.
+    multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in (
+        "1", "true", "yes"
+    )
+    multi_agent_path = resolve_multi_agent_path(os.environ)
+    if multi_agent_env or multi_agent_path.exists():
+        _require_multi_agent_host_api_key(os.environ)
 
     # --- Host-supervised Phoenix trace backend (issue #2570) ---
     # Launch Phoenix BEFORE agents so the OTLP endpoint is on os.environ when
@@ -2416,10 +3139,6 @@ async def _lifespan_startup(app: FastAPI):
         app.state.phoenix = None
         app.state.phoenix_disabled_reason = reason
 
-    # Detect multi-agent mode
-    multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in ("1", "true", "yes")
-    multi_agent_path = resolve_multi_agent_path(os.environ)
-
     if multi_agent_env or multi_agent_path.exists():
         # --- Multi-agent mode ---
         manager = None
@@ -2427,17 +3146,42 @@ async def _lifespan_startup(app: FastAPI):
             from kestrel_sovereign.multi_agent.agent_manager import AgentManager
             from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 
+            multi_agent_runtime_base = Path.cwd()
+            multi_agent_runtime_env = os.environ
             config = MultiAgentConfig.load(
                 str(multi_agent_path) if multi_agent_path.exists() else None,
                 auto_discover_fallback=True,
+                runtime_env=multi_agent_runtime_env,
+                runtime_base=multi_agent_runtime_base,
             )
             _apply_platform_host_port(config, os.environ)
-            shared_postgres_backend = await _start_shared_agent_postgres_backend(app)
             manager = AgentManager(
-                base_data_dir=Path.cwd(),
-                shared_postgres_backend=shared_postgres_backend,
+                base_data_dir=multi_agent_runtime_base,
+                startup_config_path=(
+                    multi_agent_path if multi_agent_path.exists() else None
+                ),
+                startup_runtime_env=multi_agent_runtime_env,
             )
+            # Registry persistence is deliberately ordered before roster
+            # persistence during spawn. Repair and contextually validate that
+            # crash window before creating Hold custody: a registry-only child
+            # is part of the effective writable roster even when TOML has not
+            # caught up yet. Doing this inside load_from_config is too late for
+            # both custody creation and scheduler preflight.
+            config = manager.reconcile_spawn_authority_restart_roster(config)
+            host_context = await _build_host_control_context(app, config)
+            manager.bind_hold_store(host_context.hold_store)
+            shared_postgres_backend = await _start_shared_agent_postgres_backend(app)
+            if shared_postgres_backend is not None:
+                manager.bind_shared_postgres_backend(shared_postgres_backend)
             app.state.agent_manager = manager
+            host_context_publication_gate = asyncio.Event()
+            app.state.host_context_publication_gate = host_context_publication_gate
+            set_host_context_gate = getattr(
+                manager, "set_host_context_publication_gate", None
+            )
+            if callable(set_host_context_gate):
+                set_host_context_gate(host_context_publication_gate)
             # Persistence context for runtime agent creation (#2358): when the
             # deployment is DRIVEN BY a multi_agent.toml, a UI-created agent
             # must be appended there or it vanishes on restart (startup loads
@@ -2447,6 +3191,242 @@ async def _lifespan_startup(app: FastAPI):
             app.state.multi_agent_config_path = (
                 multi_agent_path if multi_agent_path.exists() else None
             )
+            # Endpoint roster reloads must validate against the same live
+            # environment and project base as startup. Reconstructing the
+            # context from the config file lets a project .env override an
+            # already-exported host custody path and makes one valid roster
+            # alternate between accepted and rejected while the host runs.
+            app.state.multi_agent_runtime_env = multi_agent_runtime_env
+            app.state.multi_agent_runtime_base = multi_agent_runtime_base
+            if app.state.multi_agent_config_path is not None:
+                # Every read-modify-write of multi_agent.toml shares one async
+                # mutation boundary.  In particular, removal resolves the
+                # registered DID asynchronously; without this lock a concurrent
+                # spawn could commit while removal later saved its stale
+                # pre-await snapshot and silently erased the new registration.
+                created_agent_registry_lock = asyncio.Lock()
+
+                async def persist_created_agent_registration(
+                    name,
+                    agent_config,
+                    authority_chain,
+                ):
+                    """Merge a child only beneath a durable authority chain."""
+
+                    async with created_agent_registry_lock:
+                        current = MultiAgentConfig.from_file(
+                            app.state.multi_agent_config_path
+                        )
+                        child_matches = [
+                            existing
+                            for existing in current.agents
+                            if existing.casefold() == name.casefold()
+                        ]
+                        if child_matches and (
+                            child_matches != [name]
+                            or current.agents[name] != agent_config
+                        ):
+                            raise RuntimeError(
+                                f"Agent {name!r} conflicts with the startup registry"
+                            )
+                        if not authority_chain:
+                            raise RuntimeError(
+                                "Persistent child has no restart-registered "
+                                "authority chain"
+                            )
+                        from kestrel_sovereign.multi_agent.config import (
+                            LocalAgentConfig,
+                        )
+
+                        witnessed_registrations = []
+                        seen_names = set()
+                        seen_dids = set()
+                        for authority_name, authority_did in authority_chain:
+                            canonical_authority = authority_name.casefold()
+                            if (
+                                canonical_authority in seen_names
+                                or authority_did in seen_dids
+                            ):
+                                raise RuntimeError(
+                                    "Persistent child restart-registered authority "
+                                    "chain is ambiguous"
+                                )
+                            seen_names.add(canonical_authority)
+                            seen_dids.add(authority_did)
+                            matches = [
+                                existing
+                                for existing in current.agents
+                                if existing.casefold() == canonical_authority
+                            ]
+                            if len(matches) != 1:
+                                raise RuntimeError(
+                                    "Persistent child restart-registered authority "
+                                    "is missing or ambiguous"
+                                )
+                            registered_name = matches[0]
+                            registered_config = current.agents[registered_name]
+                            if not isinstance(registered_config, LocalAgentConfig):
+                                raise RuntimeError(
+                                    "Persistent child authority is not a local "
+                                    "restart-registered agent"
+                                )
+                            if registered_config.autostart is not True:
+                                raise RuntimeError(
+                                    "Persistent child authority must autostart so "
+                                    "its signed descendant can verify on cold restart"
+                                )
+                            registered_did = await manager.resolve_registered_agent_id(
+                                registered_name,
+                                registered_config,
+                                require_config_identity=True,
+                            )
+                            if registered_did != authority_did:
+                                raise RuntimeError(
+                                    "Persistent child restart-registered authority "
+                                    "identity does not match the verified runtime chain"
+                                )
+                            witnessed_registrations.append(
+                                (registered_name, registered_config)
+                            )
+
+                        # DID resolution performs storage I/O. Re-read and CAS
+                        # every witnessed ancestor before adding the child so an
+                        # operator edit cannot swap or remove authority during
+                        # the await and still receive a durable descendant.
+                        fresh = MultiAgentConfig.from_file(
+                            app.state.multi_agent_config_path
+                        )
+                        for registered_name, registered_config in (
+                            witnessed_registrations
+                        ):
+                            fresh_matches = [
+                                existing
+                                for existing in fresh.agents
+                                if existing.casefold() == registered_name.casefold()
+                            ]
+                            if (
+                                fresh_matches != [registered_name]
+                                or fresh.agents[registered_name] != registered_config
+                            ):
+                                raise RuntimeError(
+                                    "Persistent child restart-registered authority "
+                                    "changed during identity resolution"
+                                )
+                        fresh_child_matches = [
+                            existing
+                            for existing in fresh.agents
+                            if existing.casefold() == name.casefold()
+                        ]
+                        if fresh_child_matches and (
+                            fresh_child_matches != [name]
+                            or fresh.agents[name] != agent_config
+                        ):
+                            raise RuntimeError(
+                                f"Agent {name!r} conflicts with the "
+                                "startup registry"
+                            )
+                        if not fresh_child_matches:
+                            fresh.agents[name] = agent_config
+                            type(fresh).model_validate(fresh.model_dump())
+                            fresh.save(app.state.multi_agent_config_path)
+                        app.state.multi_agent_config = fresh
+
+                async def remove_created_agent_registration(
+                    name,
+                    expected_agent_id,
+                ):
+                    """CAS-remove one persistent child and return compensation."""
+
+                    async with created_agent_registry_lock:
+                        current = MultiAgentConfig.from_file(
+                            app.state.multi_agent_config_path
+                        )
+                        matches = [
+                            existing
+                            for existing in current.agents
+                            if existing.casefold() == name.casefold()
+                        ]
+                        if len(matches) != 1:
+                            raise RuntimeError(
+                                "Persistent spawned child startup registration is "
+                                "missing or ambiguous; destructive offboarding refused"
+                            )
+                        persisted_name = matches[0]
+                        registered_config = current.agents[persisted_name]
+                        from kestrel_sovereign.multi_agent.config import LocalAgentConfig
+
+                        if not isinstance(registered_config, LocalAgentConfig):
+                            raise RuntimeError(
+                                "Persistent spawned child is not a local hosted registration"
+                            )
+                        registered_agent_id = await manager.resolve_registered_agent_id(
+                            persisted_name,
+                            registered_config,
+                            require_config_identity=True,
+                        )
+                        if registered_agent_id != expected_agent_id:
+                            raise RuntimeError(
+                                "Persistent spawned child identity changed before "
+                                "startup-registration removal"
+                            )
+                        # DID resolution performs storage I/O. The in-process
+                        # lock excludes our own hooks but cannot exclude an
+                        # operator or another process editing multi_agent.toml.
+                        # Re-read and CAS the exact registration we witnessed;
+                        # saving the pre-await object would erase unrelated
+                        # concurrent edits.
+                        fresh = MultiAgentConfig.from_file(
+                            app.state.multi_agent_config_path
+                        )
+                        fresh_matches = [
+                            existing
+                            for existing in fresh.agents
+                            if existing.casefold() == persisted_name.casefold()
+                        ]
+                        if len(fresh_matches) != 1:
+                            raise RuntimeError(
+                                "Persistent spawned child startup registration "
+                                "changed during identity resolution"
+                            )
+                        fresh_name = fresh_matches[0]
+                        if fresh.agents[fresh_name] != registered_config:
+                            raise RuntimeError(
+                                "Persistent spawned child startup registration "
+                                "changed during identity resolution"
+                            )
+                        current = fresh
+                        persisted_name = fresh_name
+                        removed_config = current.agents.pop(persisted_name)
+                        type(current).model_validate(current.model_dump())
+                        current.save(app.state.multi_agent_config_path)
+                        app.state.multi_agent_config = current
+
+                    async def restore_registration() -> None:
+                        async with created_agent_registry_lock:
+                            fresh = MultiAgentConfig.from_file(
+                                app.state.multi_agent_config_path
+                            )
+                            if any(
+                                existing.casefold() == persisted_name.casefold()
+                                for existing in fresh.agents
+                            ):
+                                raise RuntimeError(
+                                    "Persistent child registration changed concurrently; "
+                                    "refusing compensation overwrite"
+                                )
+                            fresh.agents[persisted_name] = removed_config
+                            type(fresh).model_validate(fresh.model_dump())
+                            fresh.save(app.state.multi_agent_config_path)
+                            app.state.multi_agent_config = fresh
+
+                    return restore_registration
+
+                manager.set_created_agent_persistence_hook(
+                    persist_created_agent_registration
+                )
+                manager.set_created_agent_registration_removal_hook(
+                    remove_created_agent_registration
+                )
             app.state.agent = None  # No single default agent
             # Registration is the one path shared by autostart, runtime
             # creation, spawning, and scheduler cold wakes.  Install the
@@ -2457,11 +3437,30 @@ async def _lifespan_startup(app: FastAPI):
                     app, manager, name, agent
                 )
             )
+            distributed_stop = getattr(
+                app.state, "distributed_invocation_registry", None
+            )
+            if distributed_stop is not None:
+                set_pre_initialize = getattr(
+                    type(manager), "set_agent_pre_initialize_hook", None
+                )
+                if callable(set_pre_initialize):
+                    set_pre_initialize(
+                        manager,
+                        lambda _name, agent: _attach_stop_runtime(app, agent),
+                    )
             # Seed the database-global scheduler provenance and every local
             # DID's durable protocol row before concurrent agent
             # initialization and post-load default seeding.
             await _prepare_shared_postgres_scheduler_protocol(app, manager, config)
-            loaded = await manager.load_from_config(config)
+            # Scheduler preflight seeded authority from this exact reconciled
+            # roster. Do not let load_from_config re-read multi_agent.toml after
+            # that await and switch runtime tenants without re-seeding the
+            # scheduler's authorization map.
+            loaded = await manager.load_from_config(
+                config,
+                restart_roster_reconciled=True,
+            )
             logger.info(f"Multi-agent mode: {loaded} agent(s) loaded")
 
             # Fleet-idleness (#F235) is wired at the AgentManager's single
@@ -2558,18 +3557,28 @@ async def _lifespan_startup(app: FastAPI):
         try:
             db_backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite")
             database_url = os.environ.get("KESTREL_DATABASE_URL")
+            storage_dir = runtime_path_env(AGENT_DB_PATH_ENV, os.getcwd())
+            db_path = os.path.join(storage_dir, "kestrel_prime.db")
 
             if db_backend.lower() == "postgres" and database_url:
                 logger.info("Using PostgreSQL backend for Kestrel")
-                storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
-                db_path = os.path.join(storage_dir, "kestrel_prime.db")
                 agent_did = await get_agent_did_async(
                     storage_dir,
                     db_backend="postgres",
                     database_url=database_url,
                 )
-                verify_identity_isolation(agent_did)
-                llm_service = LLMService()
+            else:
+                agent_did = await get_agent_did_async(storage_dir)
+
+            # Identity/database verification must precede the first Hold schema
+            # or custody write. A misconfigured single-agent process must not
+            # bind another deployment's pre-Hold database to this host's
+            # evidence service before refusing the DID mismatch.
+            verify_identity_isolation(agent_did)
+            host_context = await _build_host_control_context(app, None)
+
+            llm_service = LLMService()
+            if db_backend.lower() == "postgres" and database_url:
                 app.state.agent = KestrelAgent(
                     did=agent_did,
                     storage_path=db_path,
@@ -2578,17 +3587,22 @@ async def _lifespan_startup(app: FastAPI):
                     db_backend="postgres",
                 )
             else:
-                storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
-                db_path = os.path.join(storage_dir, "kestrel_prime.db")
-                agent_did = await get_agent_did_async(storage_dir)
-                verify_identity_isolation(agent_did)
-                llm_service = LLMService()
                 app.state.agent = KestrelAgent(
                     did=agent_did,
                     storage_path=db_path,
                     llm_service=llm_service,
                 )
                 logger.info(f"Using SQLite backend for Kestrel: {db_path}")
+
+            app.state.agent._hold_store = host_context.hold_store
+
+            host_context_publication_gate = asyncio.Event()
+            app.state.host_context_publication_gate = host_context_publication_gate
+            app.state.agent._host_context_publication_gate = (
+                host_context_publication_gate
+            )
+            app.state.agent.defer_agent_readiness_to_host()
+            _attach_stop_runtime(app, app.state.agent)
 
             # Lifecycle hardening: provider availability (#377) is verified
             # inside KestrelAgent.initialize so every boot path — including
@@ -2655,27 +3669,22 @@ async def _lifespan_startup(app: FastAPI):
     # --- Host-scoped features (issue #2293, consolidated onto server:app in
     # #2382) ---
     # Discover + mount host features at the host root (no agent prefix, no
-    # get_agent dependency), aggregate their host-scoped UI, build the fleet
-    # HostContext, and run their host lifecycle. Mounted UNCONDITIONALLY after
-    # agent setup — host features are host-scoped and independent of single- vs
-    # multi-agent mode. Reversible imperative failures remain isolated; an
+    # get_agent dependency), aggregate their host-scoped UI, and run their host
+    # lifecycle on the fleet HostContext already validated before agent work
+    # admission. Contributions mount after agent setup, but Hold custody does
+    # not wait for them. Reversible imperative failures remain isolated; an
     # invalid complete contribution set fails startup before mounted state is
     # changed.
-    from kestrel_sovereign import host_features as _hf
     from kestrel_sdk.features import ContributionContractError
+
+    from kestrel_sovereign import host_features as _hf
     from kestrel_sovereign.features.contribution_runtime import (
         FeatureContributionRuntimeError,
     )
     from kestrel_sovereign.paths import project_dir as _host_project_dir
 
-    if not hasattr(app.state, "host_features"):
-        app.state.host_features = []
-    if not hasattr(app.state, "host_context"):
-        app.state.host_context = None
-    if not hasattr(app.state, "host_ui_manifest"):
-        app.state.host_ui_manifest = []
     replacing_host_state = bool(app.state.host_features)
-    candidate_ctx = None
+    candidate_ctx = app.state.host_context
     candidate_started = []
     try:
         # Resolve the host manifest from the resolved PROJECT_DIR (KESTREL_HOME /
@@ -2686,12 +3695,12 @@ async def _lifespan_startup(app: FastAPI):
         features = _hf.instantiate_host_features(
             manifest_path=_host_project_dir() / _hf.HOST_MANIFEST_FILENAME,
         )
-        if features:
-            host_cfg = getattr(app.state, "multi_agent_config", None)
-            ctx = await _hf.build_host_context(
-                config=_host_config_mapping(host_cfg)
+        ctx = candidate_ctx
+        if ctx is None:
+            raise RuntimeError(
+                "Host features cannot start without validated Hold control state"
             )
-            candidate_ctx = ctx
+        if features:
             # Validate and activate the complete prospective contribution set
             # before changing any already-valid mounted host surface.
             started_features = await _hf.start_host_features(features, ctx)
@@ -2701,13 +3710,26 @@ async def _lifespan_startup(app: FastAPI):
             if started_features is None:
                 started_features = features
             candidate_started = list(started_features)
+            runtime = getattr(ctx, "feature_contribution_runtime", None)
+            host_context_registry = (
+                None if runtime is None else runtime.context_clause_registry
+            )
+            manager = getattr(app.state, "agent_manager", None)
+            default_agent = getattr(app.state, "agent", None)
+            if manager is not None:
+                manager.validate_host_context_clause_registry(
+                    host_context_registry
+                )
+            elif default_agent is not None:
+                default_agent.validate_host_context_clause_registry(
+                    host_context_registry
+                )
             if replacing_host_state:
                 _hf.unmount_host_features(app)
             _hf.mount_host_feature_routers(app, candidate_started)
             _hf.mount_host_feature_ui(app, candidate_started)
             app.state.host_features = list(started_features)
             app.state.host_context = ctx
-            runtime = getattr(ctx, "feature_contribution_runtime", None)
             if runtime is not None:
                 app.state.host_operator_registry = runtime.operator_registry
                 app.state.host_wait_registry = runtime.wait_registry
@@ -2716,21 +3738,98 @@ async def _lifespan_startup(app: FastAPI):
                     runtime.permission_defaults_registry
                 )
                 app.state.host_setup_step_registry = runtime.setup_step_registry
+                app.state.host_context_clause_registry = host_context_registry
+                if manager is not None:
+                    manager.bind_host_context_clause_registry(
+                        host_context_registry
+                    )
+                elif default_agent is not None:
+                    default_agent.bind_host_context_clause_registry(
+                        host_context_registry
+                    )
             logger.info("Host features initialized: %d", len(started_features))
-    except (ContributionContractError, FeatureContributionRuntimeError):
-        # Complete prospective-set rejection is a startup failure, not an
-        # optional-feature warning. No candidate was mounted and prior valid
-        # state remains visible.
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Host feature initialization failed: %s", exc)
-        if candidate_ctx is not None and candidate_started:
-            await _hf.stop_host_features(candidate_started, candidate_ctx)
+        else:
+            # The fleet control store is host infrastructure, not an optional
+            # feature side effect. Hold authority must therefore exist on the
+            # default zero-feature installation as well.
+            app.state.host_features = []
+            app.state.host_context = ctx
+            logger.info("Host features initialized: 0")
+    except BaseException as exc:  # noqa: BLE001 - close unpublished context
+        fatal = isinstance(
+            exc,
+            (ContributionContractError, FeatureContributionRuntimeError),
+        ) or not isinstance(exc, Exception)
+        if not fatal:
+            logger.warning("Host feature initialization failed: %s", exc)
+        try:
+            if candidate_ctx is not None and candidate_started:
+                await _hf.stop_host_features(candidate_started, candidate_ctx)
+        finally:
+            # A future replacement context might still fail before publication;
+            # close only that unpublished candidate. The boot Hold context is
+            # published before agents start and remains teardown-owned even when
+            # an optional contribution fails to mount.
+            if (
+                candidate_ctx is not None
+                and getattr(app.state, "host_context", None) is not candidate_ctx
+            ):
+                from kestrel_sovereign.host_features.context import (
+                    close_host_context_resources,
+                )
+
+                await close_host_context_resources(candidate_ctx)
+        if fatal:
+            # Complete prospective-set rejection is a startup failure, not an
+            # optional-feature warning. Prior valid state remains visible.
+            raise
+
+    # No cognition turn may cross startup with the agent-only clause view.
+    # This includes overdue standalone schedules armed from on_agent_ready and
+    # the shared PostgreSQL runner, which may already have claimed work.  Host
+    # contribution validation/binding above is the publication boundary.
+    host_context_publication_gate = getattr(
+        app.state, "host_context_publication_gate", None
+    )
+    if host_context_publication_gate is not None:
+        host_context_publication_gate.set()
+    await _complete_deferred_agent_readiness(app)
 
     # Initialize OpenTelemetry tracing (no-op if packages not installed)
     setup_tracing(app)
 
     yield
+
+
+async def _complete_deferred_agent_readiness(app: FastAPI) -> None:
+    """Run ready hooks postponed until host prompt policy was published."""
+
+    manager = getattr(app.state, "agent_manager", None)
+    if manager is not None:
+        complete_manager_readiness = getattr(
+            manager,
+            "complete_deferred_agent_readiness",
+            None,
+        )
+        if callable(complete_manager_readiness):
+            await complete_manager_readiness()
+            return
+        agents = [
+            manager.get_agent(name)
+            for name in manager.list_agents()
+        ]
+    else:
+        agent = getattr(app.state, "agent", None)
+        agents = [] if agent is None else [agent]
+
+    seen: set[int] = set()
+    for agent in agents:
+        if agent is None or id(agent) in seen:
+            continue
+        seen.add(id(agent))
+        complete = getattr(agent, "complete_deferred_agent_readiness", None)
+        if callable(complete):
+            await complete()
 
 
 @asynccontextmanager
@@ -2760,6 +3859,24 @@ register_api_error_handlers(app)
 
 
 _AGENT_PATH_RE_ASGI = re.compile(r"^/api/agents/([^/]+)/(.+)$")
+_ENCODED_AGENT_PATH_RE_ASGI = re.compile(r"^/api/agent-routes/([^/]+)/(.+)$")
+
+
+def _routed_agent_path(path: str) -> tuple[str, str] | None:
+    """Resolve legacy literal or lossless encoded host-agent paths."""
+
+    match = _AGENT_PATH_RE_ASGI.match(path)
+    if match:
+        return match.group(1), match.group(2)
+    match = _ENCODED_AGENT_PATH_RE_ASGI.match(path)
+    if not match:
+        return None
+    from kestrel_sovereign.multi_agent.route_name import decode_agent_route_name
+
+    try:
+        return decode_agent_route_name(match.group(1)), match.group(2)
+    except ValueError:
+        return None
 
 
 def _agent_not_found_response(
@@ -2797,11 +3914,11 @@ class MultiAgentAgentRoutingMiddleware:
             return await self.app(scope, receive, send)
 
         path = scope.get("path", "")
-        match = _AGENT_PATH_RE_ASGI.match(path)
-        if not match:
+        routed = _routed_agent_path(path)
+        if routed is None:
             return await self.app(scope, receive, send)
 
-        agent_name = match.group(1)
+        agent_name, remaining_path = routed
         agent = agent_manager.get_agent(agent_name)
         if agent is None:
             if scope["type"] == "http":
@@ -2818,7 +3935,7 @@ class MultiAgentAgentRoutingMiddleware:
         # Mutate scope so downstream routes match the prefix-stripped path
         # and the handler can find the agent on `request.state` /
         # `websocket.state`. Starlette wires scope["state"] → both.
-        scope["path"] = "/" + match.group(2)
+        scope["path"] = "/" + remaining_path
         scope["raw_path"] = scope["path"].encode("utf-8")
         scope.setdefault("state", {})["agent"] = agent
 
@@ -2910,6 +4027,8 @@ from kestrel_sovereign.endpoints import (
     features_router,
     ui_router,
     github_router,
+    hold_router,
+    host_stop_router,
 )
 from kestrel_sovereign.endpoints.rasa_shim import router as rasa_shim_router
 
@@ -2936,6 +4055,8 @@ app.include_router(features_router)
 app.include_router(ui_router)
 app.include_router(rasa_shim_router)
 app.include_router(github_router)
+app.include_router(host_stop_router)
+app.include_router(hold_router)
 
 
 # Regex for multi-agent path routing: /api/agents/{name}/{remaining_path}
@@ -3034,10 +4155,10 @@ async def agent_routing_middleware(request: Request, call_next):
         return await call_next(request)
 
     path = request.url.path
-    match = _AGENT_PATH_RE.match(path)
-    if match:
-        agent_name = match.group(1)
-        remaining_path = "/" + match.group(2)
+    routed = _routed_agent_path(path)
+    if routed is not None:
+        agent_name, remaining = routed
+        remaining_path = "/" + remaining
 
         agent = agent_manager.get_agent(agent_name)
         if agent is None:
@@ -3080,7 +4201,16 @@ async def auth_middleware(request: Request, call_next):
     # like every other /api/ endpoint.
     static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/ui/"]
 
-    if request.url.path in public_paths or request.url.path in auth_paths:
+    transport_only_process = is_a2a_transport_only_process()
+    if request.url.path in public_paths:
+        return await call_next(request)
+    if request.url.path in auth_paths:
+        if transport_only_process:
+            return api_error_response(
+                status_code=404,
+                code="not_found",
+                message="Not found",
+            )
         return await call_next(request)
     # Webhooks authenticate themselves (HMAC, bearer, etc.) — bypass API key auth.
     # Matches the bare /webhooks/{name} AND the per-agent
@@ -3137,6 +4267,46 @@ async def auth_middleware(request: Request, call_next):
             request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
             return await call_next(request)
 
+    # Automatic peers authenticate on a separate, route-limited lane. The
+    # discriminator is evaluated before the sovereign key and never falls
+    # through: adding both headers cannot promote peer transport to operator
+    # authority. Signed envelopes inside the admitted task routes establish
+    # the actual creator/recipient principal.
+    transport_credential = request.headers.get(A2A_TRANSPORT_KEY_HEADER)
+    if transport_credential is not None:
+        from kestrel_sovereign.auth import CallerContext
+
+        expected_transport = ensure_a2a_transport_key()
+        if not secrets.compare_digest(
+            transport_credential.encode("utf-8"),
+            expected_transport.encode("utf-8"),
+        ):
+            return api_error_response(
+                status_code=401,
+                code="authentication_required",
+                message="Invalid or missing A2A transport key",
+            )
+        if not is_a2a_transport_path(request.method, request.url.path):
+            return api_error_response(
+                status_code=403,
+                code="a2a_transport_scope_denied",
+                message="A2A transport is not authorized for this route",
+            )
+        request.state.caller = CallerContext.a2a_transport()
+        return await call_next(request)
+
+    # A host-managed child is a peer transport endpoint, never an operator
+    # authority domain. Do not call ``get_api_key`` here: an empty child
+    # sentinel would otherwise mint a fresh sovereign key, and localhost
+    # bootstrap or child code could recover it. Standalone launches set this
+    # marker false and retain their normal API-key/OAuth surfaces.
+    if transport_only_process:
+        return api_error_response(
+            status_code=401,
+            code="authentication_required",
+            message="Managed peer processes accept only A2A transport",
+        )
+
     # Credential evaluation only happens inside this try. Dispatch of an
     # authenticated (or deliberately unauthenticated) request stays OUTSIDE
     # it, so an unhandled downstream application fault keeps FastAPI's
@@ -3151,7 +4321,10 @@ async def auth_middleware(request: Request, call_next):
         # Check X-API-Key header
         api_key_header = request.headers.get(API_KEY_NAME)
         if api_key_header and secrets.compare_digest(api_key_header, expected_key):
-            caller = CallerContext.sovereign(AuthMethod.API_KEY)
+            caller = CallerContext.sovereign(
+                AuthMethod.API_KEY,
+                credential=api_key_header,
+            )
 
         # Check Bearer token (API key OR JWT)
         if caller is None:
@@ -3160,7 +4333,10 @@ async def auth_middleware(request: Request, call_next):
                 token = auth_header[7:]
                 # First try: API key match
                 if secrets.compare_digest(token, expected_key):
-                    caller = CallerContext.sovereign(AuthMethod.API_KEY)
+                    caller = CallerContext.sovereign(
+                        AuthMethod.API_KEY,
+                        credential=token,
+                    )
                 else:
                     # Second try: JWT token
                     try:
@@ -3191,7 +4367,10 @@ async def auth_middleware(request: Request, call_next):
             ) or _scope_path.endswith("/link-qr.png")
             if api_key_query and _query_key_ok:
                 if secrets.compare_digest(api_key_query, expected_key):
-                    caller = CallerContext.sovereign(AuthMethod.API_KEY)
+                    caller = CallerContext.sovereign(
+                        AuthMethod.API_KEY,
+                        credential=api_key_query,
+                    )
 
         # Check OAuth session cookie
         if caller is None:
@@ -3410,7 +4589,15 @@ if SERVE_UI:
 @limiter.limit("5/minute")
 async def get_bootstrap_key(request: Request):
     """Return API key for initial frontend setup (localhost / Docker gateway only)."""
-    if not _bootstrap_key_enabled():
+    # A same-host managed peer is indistinguishable from a browser by source
+    # address: both reach this endpoint over loopback. Once this process owns a
+    # fleet, localhost therefore is not an authority boundary and the host key
+    # must be provisioned out of band instead of returned by a public route.
+    multi_agent_host = (
+        getattr(request.app.state, "agent_manager", None) is not None
+        or getattr(request.app.state, "multi_agent_config", None) is not None
+    )
+    if not _bootstrap_key_enabled() or multi_agent_host:
         raise HTTPException(status_code=404, detail="API key bootstrap endpoint is disabled")
 
     # Narrowed from the whole 172.16.0.0/12 bridge range to loopback + the
@@ -3481,6 +4668,9 @@ def health_check(request: Request):
     scheduler_workers_available = _active_scheduler_workers_available(
         request.app, agent, manager
     )
+    invocation_owners_healthy = _distributed_invocation_owners_healthy(
+        agent, manager
+    )
     scheduler_failures = getattr(
         request.app.state,
         "scheduler_readiness_failures",
@@ -3494,6 +4684,7 @@ def health_check(request: Request):
         or constitution_safe_mode
         or scheduler_failures
         or not scheduler_workers_available
+        or not invocation_owners_healthy
     ):
         return JSONResponse(
             status_code=503,
@@ -3667,7 +4858,35 @@ def _contribution_rejection_records(agent, manager) -> list[dict]:
 
 async def _agent_detailed_health(agent) -> dict:
     """Detailed health for one agent, including any refused contributions."""
-    return _with_contribution_rejections(agent, await _agent_health_result(agent))
+    result = _with_contribution_rejections(
+        agent, await _agent_health_result(agent)
+    )
+    if _distributed_invocation_owner_status(agent) == "healthy":
+        return result
+    merged = dict(result)
+    checks = list(merged.get("checks", []))
+    message = "Invocation owner lease was lost; replica is fenced"
+    # Name the cause: a bare "fenced" cannot tell a transient re-acquisition
+    # window from a Stop database that has been unreachable for hours (#3337).
+    reason = _distributed_invocation_owner_fence_reason(agent)
+    if reason is not None:
+        message = f"{message} ({reason})"
+    checks.append(
+        {
+            "name": "distributed_invocation_owner",
+            "status": "fail",
+            "message": message,
+            "duration_ms": 0.0,
+        }
+    )
+    merged.update(
+        {
+            "status": "unhealthy",
+            "overall_healthy": False,
+            "checks": checks,
+        }
+    )
+    return merged
 
 
 async def _agent_health_result(agent) -> dict:
@@ -3937,9 +5156,14 @@ def _enforce_host_csrf(request: Request):
     # cookie-authenticated request cannot bypass host-feature CSRF simply by
     # spelling the same route through an agent prefix (#2382 review).
     path = request.scope.get("path", request.url.path)
-    match = _AGENT_PATH_RE.match(path)
-    if match:
-        path = "/" + match.group(2)
+    # Resolve through the SAME function the routing middleware uses, not a
+    # second regex. #2382 normalized only the literal /api/agents/{name}
+    # spelling; the lossless /api/agent-routes/{encoded} alias reaches exactly
+    # the same host-feature routes, so a private regex here silently stopped
+    # covering half of them the moment that alias was added.
+    routed = _routed_agent_path(path)
+    if routed is not None:
+        path = "/" + routed[1]
     if not is_host_feature_path(request.app, path):
         return None
     try:

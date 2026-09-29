@@ -93,3 +93,22 @@ test('stop(id, null) targets standalone (un-prefixed) endpoint', async () => {
     assert.equal(calls[0].url, '/api/agent/stop',
         'stop(id, null) must NOT prefix — null is the standalone-mode signal');
 });
+
+test('stop forwards a caller-stable durable correlation identity', async () => {
+    const calls = [];
+    const client = createApiClient({
+        fetchFn: fakeFetch(calls),
+        sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+        location: { href: '/', search: '' },
+        AbortControllerCtor: globalThis.AbortController || class { abort(){} signal={} },
+        TextDecoderCtor: globalThis.TextDecoder || class { decode(){return '';} },
+        authProvider: makeAuthProvider(),
+    });
+
+    await client.stop('turn-7', 'agent-a', 'stop-operation-7');
+
+    assert.deepEqual(JSON.parse(calls[0].opts.body), {
+        request_id: 'turn-7',
+        correlation_id: 'stop-operation-7',
+    });
+});

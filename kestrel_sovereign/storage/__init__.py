@@ -9,8 +9,9 @@ Provides async storage interfaces:
 The codebase is fully async - no sync storage interfaces.
 """
 
-import os
 import logging
+
+from kestrel_sovereign.paths import LEGACY_AGENT_DATA_DIR_ENV, runtime_path_env
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +118,12 @@ from .memory_consolidator import MemoryConsolidator
 from .memory_system import MemorySystem
 
 def get_default_agent_data_dir():
-    """Returns the default agent data directory."""
-    return os.environ.get("AGENT_DATA_DIR", "agent_data")
+    """Returns the default identity/key data directory.
+
+    Not the same resolver as ``async_storage.get_default_agent_data_dir``,
+    which reads ``KESTREL_DB_PATH``; both are guarded (#3286).
+    """
+    return runtime_path_env(LEGACY_AGENT_DATA_DIR_ENV, "agent_data")
 
 
 # Backward compatibility alias

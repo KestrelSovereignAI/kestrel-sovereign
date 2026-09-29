@@ -19,6 +19,11 @@ one row per ``(agent_id, kind, handle)`` the reconciler has observed, tracking
   - ``pending_signal_*`` — the two-phase harvest set: a signal we enqueued
     but have not yet confirmed delivered. ``record_pending`` sets them;
     ``record_delivery``/``clear_pending`` clear them.
+  - ``delivery_deferred_until`` / ``delivery_deferrals`` — a wake whose
+    cognition could not run because the model provider named its own retry
+    time is PARKED until then, and that attempt is refunded (#3302). The
+    retry cap guards against a signal the dispatcher will always reject; it
+    must not be spent waiting out a rate limit the provider has dated.
 
 Like :class:`PendingA2AQuestionStore`, every query is filtered by
 ``agent_id`` so a shared backend (e.g. Postgres) cannot leak rows between
@@ -43,6 +48,24 @@ logger = logging.getLogger(__name__)
 
 # Accept either a datetime or an ISO string for any timestamp argument.
 TimeArg = Union[datetime, str, None]
+
+# Synthetic delivery status the reconciler writes when a transition's retry
+# cap is reached and the transition is locked without ever being delivered.
+MAX_ATTEMPTS_EXCEEDED = "max_attempts_exceeded"
+# Delivery status for a wake parked until a provider-advised retry time
+# (#3302). Not a failure of the wake: its attempt was refunded.
+DEFERRED_RATE_LIMITED = "deferred_rate_limited"
+
+# The one column list every read selects, in ``_row_to_dc`` order.
+_STATE_COLUMNS = """
+    kind, handle, last_signaled_outcome, last_delivery_status,
+    last_delivery_error, last_delivery_attempts,
+    last_delivery_attempt_at, pending_signal_id,
+    pending_signaled_target, pending_signal_enqueued_at,
+    watching, last_surface_status,
+    attempts_signaled_target, last_attempt_started_at,
+    delivery_deferred_until, delivery_deferrals
+"""
 
 
 def _coerce_ts(value: TimeArg) -> Optional[datetime]:
@@ -96,6 +119,33 @@ class WaitSignalState:
     # When the current attempt was DISPATCHED, as opposed to
     # ``last_delivery_attempt_at``, which the harvest rewrites.
     last_attempt_started_at: Optional[str] = None
+    # The provider-advised time this wake is parked until (#3302), or None.
+    delivery_deferred_until: Optional[str] = None
+    # How many times this transition's wake has been parked that way.
+    delivery_deferrals: int = 0
+
+    def deferred_until_utc(self) -> Optional[datetime]:
+        """``delivery_deferred_until`` as an aware UTC datetime, or ``None``.
+
+        The column holds naive UTC (see :func:`_coerce_ts`). A value that does
+        not parse is treated as no deferral: failing open delivers the wake,
+        which is the safe direction.
+        """
+        raw = self.delivery_deferred_until
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            logger.warning(
+                "wait_signal_state %s:%s has an unparseable "
+                "delivery_deferred_until %r; ignoring it",
+                self.kind, self.handle, raw,
+            )
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
 
 class WaitSignalStore:
@@ -122,13 +172,8 @@ class WaitSignalStore:
 
     async def get(self, kind: str, handle: str) -> Optional[WaitSignalState]:
         rows = await self._db.fetchall(
-            """
-            SELECT kind, handle, last_signaled_outcome, last_delivery_status,
-                   last_delivery_error, last_delivery_attempts,
-                   last_delivery_attempt_at, pending_signal_id,
-                   pending_signaled_target, pending_signal_enqueued_at,
-                   watching, last_surface_status,
-                   attempts_signaled_target, last_attempt_started_at
+            f"""
+            SELECT {_STATE_COLUMNS}
             FROM wait_signal_state
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
@@ -142,13 +187,8 @@ class WaitSignalStore:
         """All rows with an un-harvested enqueued signal for THIS agent —
         the reconciler's Phase-0 harvest input set."""
         rows = await self._db.fetchall(
-            """
-            SELECT kind, handle, last_signaled_outcome, last_delivery_status,
-                   last_delivery_error, last_delivery_attempts,
-                   last_delivery_attempt_at, pending_signal_id,
-                   pending_signaled_target, pending_signal_enqueued_at,
-                   watching, last_surface_status,
-                   attempts_signaled_target, last_attempt_started_at
+            f"""
+            SELECT {_STATE_COLUMNS}
             FROM wait_signal_state
             WHERE agent_id = ? AND pending_signal_id IS NOT NULL
             """,
@@ -204,7 +244,10 @@ class WaitSignalStore:
         """Stash an enqueued (but not yet confirmed) signal.
 
         Sets the three ``pending_signal_*`` fields plus the attempt
-        accounting. Preserves ``last_signaled_outcome`` (this is an in-flight
+        accounting, and spends any provider-advised deferral (the wake is
+        being dispatched now). ``delivery_deferrals`` carries over within one
+        transition and restarts at 0 for a new one, like the attempt counter.
+        Preserves ``last_signaled_outcome`` (this is an in-flight
         record, not a confirmed delivery). Upsert via try-UPDATE / fallback
         INSERT so an existing row keeps its prior ``last_signaled_outcome``
         instead of an ``INSERT OR REPLACE`` blowing it away.
@@ -220,8 +263,13 @@ class WaitSignalStore:
                 pending_signal_enqueued_at = ?,
                 last_delivery_attempts = ?,
                 last_delivery_attempt_at = ?,
+                delivery_deferrals = CASE
+                    WHEN attempts_signaled_target = ? THEN delivery_deferrals
+                    ELSE 0
+                END,
                 attempts_signaled_target = ?,
                 last_attempt_started_at = ?,
+                delivery_deferred_until = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
@@ -231,6 +279,7 @@ class WaitSignalStore:
                 attempt_dt,
                 int(attempts),
                 attempt_dt,
+                target,
                 target,
                 attempt_dt,
                 self._agent_id,
@@ -368,6 +417,110 @@ class WaitSignalStore:
                 ),
             )
 
+    async def record_deferral(
+        self,
+        kind: str,
+        handle: str,
+        *,
+        target: str,
+        retry_at: TimeArg,
+        delivery_error: Optional[str] = None,
+        attempt_at: TimeArg = None,
+    ) -> None:
+        """Park a harvested wake until a provider-advised ``retry_at`` (#3302).
+
+        The wake's cognition could not run because every model route declined
+        a wait the provider itself named. That is not the dispatcher rejecting
+        the signal, so the attempt :meth:`record_pending` charged for this
+        dispatch is refunded — only while the row is still counting
+        ``target``'s transition — and the wake is re-emitted once
+        ``retry_at`` passes. Clears the ``pending_signal_*`` harvest fields and
+        leaves ``last_signaled_outcome`` unset, exactly like a soft fail.
+        """
+        attempt_dt = _coerce_ts(attempt_at) or datetime.now(timezone.utc).replace(
+            tzinfo=None
+        )
+        rowcount = await self._db.execute(
+            """
+            UPDATE wait_signal_state
+            SET last_delivery_status = ?,
+                last_surface_status = NULL,
+                last_delivery_error = ?,
+                last_delivery_attempt_at = ?,
+                last_delivery_attempts = CASE
+                    WHEN attempts_signaled_target = ?
+                         AND last_delivery_attempts > 0
+                    THEN last_delivery_attempts - 1
+                    ELSE last_delivery_attempts
+                END,
+                delivery_deferred_until = ?,
+                delivery_deferrals = delivery_deferrals + 1,
+                pending_signal_id = NULL,
+                pending_signaled_target = NULL,
+                pending_signal_enqueued_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE agent_id = ? AND kind = ? AND handle = ?
+            """,
+            (
+                DEFERRED_RATE_LIMITED,
+                delivery_error,
+                attempt_dt,
+                target,
+                _coerce_ts(retry_at),
+                self._agent_id,
+                kind,
+                handle,
+            ),
+        )
+        if rowcount == 0:
+            await self._db.execute(
+                """
+                INSERT INTO wait_signal_state
+                    (agent_id, kind, handle, last_delivery_status,
+                     last_delivery_error, last_delivery_attempt_at,
+                     attempts_signaled_target, delivery_deferred_until,
+                     delivery_deferrals, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                """,
+                (
+                    self._agent_id,
+                    kind,
+                    handle,
+                    DEFERRED_RATE_LIMITED,
+                    delivery_error,
+                    attempt_dt,
+                    target,
+                    _coerce_ts(retry_at),
+                ),
+            )
+
+    async def list_undelivered(self, limit: int = 50) -> List[WaitSignalState]:
+        """Wakes for THIS agent that have not reached it and will not soon.
+
+        Two kinds, most recently updated first:
+
+          * locked — the retry cap was reached and the transition was locked
+            as ``max_attempts_exceeded`` without ever being delivered;
+          * parked — the wake is deferred until a provider-advised retry time.
+
+        The read surface behind ``wait_status`` (#3302): before it, the only
+        way to learn that a job's completion wake had been locked away was to
+        query the database by hand.
+        """
+        rows = await self._db.fetchall(
+            f"""
+            SELECT {_STATE_COLUMNS}
+            FROM wait_signal_state
+            WHERE agent_id = ?
+                  AND (last_delivery_status = ?
+                       OR delivery_deferred_until IS NOT NULL)
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (self._agent_id, MAX_ATTEMPTS_EXCEEDED, int(limit)),
+        )
+        return [self._row_to_dc(r) for r in rows]
+
     async def clear_pending(self, kind: str, handle: str) -> None:
         """Null the three ``pending_signal_*`` fields without touching the
         signaled/delivery state. Used on a restart-lost harvest so the next
@@ -436,13 +589,8 @@ class WaitSignalStore:
         application-level dedup the active_handles loop applies.
         """
         rows = await self._db.fetchall(
-            """
-            SELECT kind, handle, last_signaled_outcome, last_delivery_status,
-                   last_delivery_error, last_delivery_attempts,
-                   last_delivery_attempt_at, pending_signal_id,
-                   pending_signaled_target, pending_signal_enqueued_at,
-                   watching, last_surface_status,
-                   attempts_signaled_target, last_attempt_started_at
+            f"""
+            SELECT {_STATE_COLUMNS}
             FROM wait_signal_state
             WHERE agent_id = ? AND watching = 1
                   AND last_signaled_outcome IS NULL
@@ -472,4 +620,6 @@ class WaitSignalStore:
             last_surface_status=str(r[11]) if r[11] is not None else None,
             attempts_signaled_target=str(r[12]) if r[12] is not None else "",
             last_attempt_started_at=str(r[13]) if r[13] is not None else None,
+            delivery_deferred_until=str(r[14]) if r[14] is not None else None,
+            delivery_deferrals=int(r[15]) if r[15] is not None else 0,
         )

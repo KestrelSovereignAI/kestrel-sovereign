@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 SOURCE_NAME = "a2a.task_submitted"
+DURABLE_COGNITION_CONSUMER_ID = "core.a2a-task-submitted-cognition-v1"
 PROMPT_TEMPLATE = (
     # Inside the package (#1415); see a2a.py for the full rationale.
     Path(__file__).resolve().parents[2]

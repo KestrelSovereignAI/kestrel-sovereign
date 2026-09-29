@@ -32,8 +32,10 @@ logger = logging.getLogger(__name__)
 # Held-turn ceiling for a handle wait. A handle wait polls (cheap) rather
 # than sleeping idle, so it inherits the larger of the legacy caps
 # (talon_wait's 3600s) rather than the dumb-sleep cap. Waits that need to
-# run longer than this should use the signal-resume path (Wave 2), not a
-# held turn.
+# run longer than this must not hold a turn at all: they park and resume on
+# the handle's durable wake via
+# ``kestrel_sovereign.waits.reconciler.register_wait_resume_consumer``.
+# Raising this ceiling only moves the cliff (#3295).
 MAX_HANDLE_WAIT_SECONDS = 3600
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 

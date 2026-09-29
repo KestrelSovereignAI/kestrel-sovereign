@@ -24,8 +24,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kestrel_sovereign.agent.boot import AgentBootError, BootContext, BootPhaseState
+from kestrel_sovereign.agent.boot import (
+    AgentBootError,
+    BootContext,
+    BootPhase,
+    BootPhaseState,
+)
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.multi_agent.config import LocalAgentConfig
+from kestrel_sovereign.spawn.authority_registry import SpawnAuthorityRegistry
+from kestrel_sovereign.spawn.mandate import SpawnMandate
 from kestrel_sovereign.signals import DurableSignalStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -34,21 +42,254 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 # of these to raise so the earlier phases run their real bodies first.
 PHASE_METHODS = [
     "_boot_phase_storage_privacy",
+    "_boot_phase_host_authority_preflight",
     "_boot_phase_a2a_observability_signals",
     "_boot_phase_providers_payer_sync",
     "_boot_phase_identity_constitution_features",
     "_boot_phase_memory_bootstrap_context",
     "_boot_phase_periodic_services_readiness",
+    "_boot_phase_host_authority_deadline",
 ]
 
 PHASE_NAMES = [
     "storage_privacy",
+    "host_authority_preflight",
     "a2a_observability_signals",
     "providers_payer_sync",
     "identity_constitution_features",
     "memory_bootstrap_context",
     "periodic_services_readiness",
+    "host_authority_deadline",
 ]
+
+
+@pytest.mark.asyncio
+async def test_hosted_ephemeral_deadline_cancels_remainder_of_active_boot(tmp_path):
+    """A valid preflight cannot leave later boot phases running past expiry."""
+
+    agent = _make_agent(tmp_path)
+    agent.storage = None
+    agent._persisted_spawn_mandate = SpawnMandate(
+        parent_did="did:test:parent",
+        child_did=agent.agent_id,
+        ttl_seconds=60,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        parent_signature="verified-by-host",
+    )
+    agent._host_authority_preflight = AsyncMock()
+    slow_phase_stopped = asyncio.Event()
+
+    async def slow_phase(_ctx):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            slow_phase_stopped.set()
+
+    agent._boot_phases = lambda: [
+        BootPhase(
+            "host_authority_preflight",
+            agent._boot_phase_host_authority_preflight,
+        ),
+        BootPhase("slow_active_boot", slow_phase),
+        BootPhase(
+            "host_authority_deadline",
+            agent._boot_phase_host_authority_deadline,
+        ),
+    ]
+
+    with patch(
+        "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
+        return_value=0.05,
+    ), pytest.raises(RuntimeError, match="expired during active agent boot"):
+        await asyncio.wait_for(agent.initialize(), timeout=1)
+
+    assert slow_phase_stopped.is_set()
+    assert agent._boot_state is BootPhaseState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_hosted_ephemeral_deadline_does_not_cancel_loader_after_boot(tmp_path):
+    """Post-boot expiry is an admission failure, not caller cancellation."""
+
+    agent = _make_agent(tmp_path)
+    agent.storage = None
+    agent._persisted_spawn_mandate = SpawnMandate(
+        parent_did="did:test:parent",
+        child_did=agent.agent_id,
+        ttl_seconds=60,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        parent_signature="verified-by-host",
+    )
+    agent._host_authority_preflight = AsyncMock()
+    agent._boot_phases = lambda: [
+        BootPhase(
+            "host_authority_preflight",
+            agent._boot_phase_host_authority_preflight,
+        ),
+        BootPhase(
+            "host_authority_deadline",
+            agent._boot_phase_host_authority_deadline,
+        ),
+    ]
+    boot_completed = asyncio.Event()
+    release_loader = asyncio.Event()
+
+    async def loader():
+        await agent.initialize()
+        boot_completed.set()
+        await release_loader.wait()
+        return "loader survived post-boot expiry"
+
+    with patch(
+        "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
+        return_value=0.05,
+    ):
+        loader_task = asyncio.create_task(loader())
+        await asyncio.wait_for(boot_completed.wait(), timeout=1)
+        await asyncio.sleep(0.1)
+        assert not loader_task.done()
+        release_loader.set()
+        assert await asyncio.wait_for(loader_task, timeout=1) == (
+            "loader survived post-boot expiry"
+        )
+
+
+@pytest.mark.asyncio
+async def test_signed_child_refuses_direct_boot_without_host_authority_verifier(
+    tmp_path,
+):
+    """A durable signed child cannot become a standalone ungoverned root."""
+
+    agent = _make_agent(tmp_path)
+    agent.storage = None
+    agent._persisted_spawn_mandate = SpawnMandate(
+        parent_did="did:test:live-parent",
+        child_did=agent.agent_id,
+        ttl_seconds=3600,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        parent_signature="requires-live-host-verification",
+    )
+    agent._host_authority_preflight = None
+
+    with pytest.raises(RuntimeError, match="without a host authority verifier"):
+        await agent._boot_phase_host_authority_preflight(BootContext())
+
+
+@pytest.mark.asyncio
+async def test_host_witness_refuses_direct_boot_after_local_receipt_loss(tmp_path):
+    """Deleting child-owned lineage cannot promote a spawned DID to root."""
+
+    storage_path = (
+        tmp_path / "agent_data" / "WitnessedChild" / "kestrel_prime.db"
+    )
+    with patch(
+        "kestrel_sovereign.llm.service.LLMService._load_from_disk_cache",
+        return_value=False,
+    ):
+        agent = KestrelAgent(
+            did="did:test:boot",
+            storage_path=str(storage_path),
+            db_backend="sqlite",
+            sync_enabled=True,
+        )
+    agent.storage = None
+    agent._persisted_spawn_mandate = None
+    agent._host_authority_preflight = None
+    mandate = SpawnMandate(
+        parent_did="did:test:live-parent",
+        child_did=agent.agent_id,
+        ttl_seconds=3600,
+        parent_signature="durable-host-witness",
+    )
+    # Every AgentManager places a child at <manager-base>/agent_data/<name>.
+    # Direct boot must therefore recover the producing manager's witness rail,
+    # not the private manager this child could create for its own descendants.
+    SpawnAuthorityRegistry(tmp_path).record_active(
+        child_name="WitnessedChild",
+        child_did=agent.agent_id,
+        mandate=mandate,
+        config=LocalAgentConfig(data_dir="agent_data/WitnessedChild", port=8802),
+    )
+
+    with pytest.raises(RuntimeError, match="host spawn witness"):
+        await agent._boot_phase_host_authority_preflight(BootContext())
+
+
+@pytest.mark.asyncio
+async def test_pending_spawn_authority_refuses_direct_boot_by_data_slot(tmp_path):
+    """A pre-inception reservation still denies boot after the child DB appears."""
+
+    child_name = "PendingDirectChild"
+    storage_path = tmp_path / "agent_data" / child_name / "kestrel_prime.db"
+    storage_path.parent.mkdir(parents=True)
+    storage_path.touch()
+    with patch(
+        "kestrel_sovereign.llm.service.LLMService._load_from_disk_cache",
+        return_value=False,
+    ):
+        agent = KestrelAgent(
+            did="did:test:pending-direct-child",
+            storage_path=str(storage_path),
+            db_backend="sqlite",
+            sync_enabled=True,
+        )
+    agent.storage = None
+    agent._persisted_spawn_mandate = None
+    agent._host_authority_preflight = None
+    SpawnAuthorityRegistry(tmp_path).reserve_pending(
+        child_name=child_name,
+        parent_did="did:test:pending-direct-parent",
+        mandate=SpawnMandate(parent_did="did:test:pending-direct-parent"),
+        config=LocalAgentConfig(
+            data_dir=f"agent_data/{child_name}",
+            port=8802,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="pending spawn authority"):
+        await agent._boot_phase_host_authority_preflight(BootContext())
+
+
+@pytest.mark.asyncio
+async def test_host_witness_refuses_replacement_did_direct_boot_by_data_slot(
+    tmp_path,
+):
+    """Replacing the DID in an active host-owned slot cannot create a new root."""
+
+    child_name = "ReplacedDirectChild"
+    storage_path = tmp_path / "agent_data" / child_name / "kestrel_prime.db"
+    storage_path.parent.mkdir(parents=True)
+    storage_path.touch()
+    with patch(
+        "kestrel_sovereign.llm.service.LLMService._load_from_disk_cache",
+        return_value=False,
+    ):
+        agent = KestrelAgent(
+            did="did:test:replacement-direct-child",
+            storage_path=str(storage_path),
+            db_backend="sqlite",
+            sync_enabled=True,
+        )
+    agent.storage = None
+    agent._persisted_spawn_mandate = None
+    agent._host_authority_preflight = None
+    original_did = "did:test:original-direct-child"
+    SpawnAuthorityRegistry(tmp_path).record_active(
+        child_name=child_name,
+        child_did=original_did,
+        mandate=SpawnMandate(
+            parent_did="did:test:replacement-direct-parent",
+            child_did=original_did,
+            parent_signature="durable-host-witness",
+        ),
+        config=LocalAgentConfig(
+            data_dir=f"agent_data/{child_name}",
+            port=8802,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="host spawn witness"):
+        await agent._boot_phase_host_authority_preflight(BootContext())
 
 
 def _durable_backend_double() -> MagicMock:
@@ -132,7 +373,7 @@ def _boot_mocks():
     """
     with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage, patch(
         "kestrel_sovereign.kestrel_agent.discover_features", return_value=[]
-    ), patch("kestrel_sovereign.kestrel_agent.verify_mandatory_feature_set"), patch(
+    ) as discover_features, patch("kestrel_sovereign.kestrel_agent.verify_mandatory_feature_set"), patch(
         "kestrel_sovereign.kestrel_agent.MemorySystem"
     ) as MockMemorySystem, patch(
         "kestrel_sovereign.kestrel_agent.TaskManager"
@@ -171,7 +412,10 @@ def _boot_mocks():
         MockTaskManager.return_value = task_manager
 
         yield SimpleNamespace(
-            storage=storage, memory=memory, task_manager=task_manager
+            storage=storage,
+            memory=memory,
+            task_manager=task_manager,
+            discover_features=discover_features,
         )
 
 
@@ -286,6 +530,17 @@ def test_boot_phase_order_is_the_documented_dependency_sequence(tmp_path):
 @pytest.mark.asyncio
 async def test_clean_boot_reaches_ready(tmp_path):
     agent = _make_agent(tmp_path)
+    started_when_reconciled = None
+
+    async def capture_reconciliation_order():
+        nonlocal started_when_reconciled
+        started_when_reconciled = set(
+            agent.dispatcher._started_durable_cognition_consumers
+        )
+
+    agent.reconcile_a2a_cognition_wakes = AsyncMock(
+        side_effect=capture_reconciliation_order
+    )
     try:
         with _boot_mocks():
             await agent.initialize()
@@ -295,6 +550,20 @@ async def test_clean_boot_reaches_ready(tmp_path):
         # The Workflows built-in is registrable without Talon or any other
         # domain feature: core hosts its six provider-neutral source contracts.
         assert all(name in agent.signal_registry for name in SOURCE_NAMES)
+        assert "a2a.peer_stop" in agent.signal_registry
+        from kestrel_sovereign.signals.sources.a2a import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_COMPLETE_CONSUMER,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_CONSUMER,
+        )
+
+        assert {
+            A2A_COMPLETE_CONSUMER,
+            A2A_SUBMITTED_CONSUMER,
+        } <= agent.dispatcher._started_durable_cognition_consumers
+        agent.reconcile_a2a_cognition_wakes.assert_awaited_once_with()
+        assert started_when_reconciled == set()
     finally:
         await _cleanup(agent)
 
@@ -310,6 +579,41 @@ async def test_second_initialize_when_ready_is_a_noop(tmp_path):
         # before touching AsyncStorage, so this neither raises nor re-runs.
         await agent.initialize()
         assert agent._boot_state is BootPhaseState.READY
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_host_authority_preflight_refuses_before_feature_discovery(tmp_path):
+    """A bad configured receipt cannot start even one feature worker."""
+
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    agent = _make_agent(tmp_path)
+    mandate = SpawnMandate(
+        parent_did="did:test:parent",
+        child_did=agent.did,
+        parent_signature="00",
+    )
+    observed = []
+
+    def refuse_unverified_receipt(candidate):
+        assert candidate is agent
+        observed.append(agent._persisted_spawn_mandate)
+        raise RuntimeError("invalid persisted authority")
+
+    agent._host_authority_preflight = refuse_unverified_receipt
+    try:
+        with _boot_mocks() as mocks, patch(
+            "kestrel_sovereign.spawn.mandate_reload.read_spawn_mandate",
+            new=AsyncMock(return_value=mandate),
+        ):
+            with pytest.raises(RuntimeError, match="invalid persisted authority"):
+                await agent.initialize()
+
+        assert observed == [mandate]
+        mocks.discover_features.assert_not_called()
+        assert agent._boot_state is BootPhaseState.FAILED
     finally:
         await _cleanup(agent)
 
@@ -394,15 +698,16 @@ async def test_injected_phase_failure_rolls_back_and_fails_terminally(
                 # Storage phase itself failed before opening anything.
                 assert agent._raw_storage is None
 
-            # A2A task manager (phase 2) + core signal sources.
-            if fail_index >= 2:
+            # A2A task manager (phase 3) + core signal sources.
+            if fail_index >= 3:
                 mocks.task_manager.close.assert_awaited()
                 assert agent.task_manager is None
                 # Core signal sources were unregistered on rollback.
                 assert "a2a.task_complete" not in agent.signal_registry
+                assert "a2a.peer_stop" not in agent.signal_registry
 
-            # Memory system (phase 5).
-            if fail_index >= 5:
+            # Memory system (phase 6).
+            if fail_index >= 6:
                 mocks.memory.shutdown.assert_awaited()
                 assert getattr(agent, "memory_system", None) is None
 
@@ -1228,5 +1533,64 @@ async def test_a_rejected_feature_is_absent_from_the_mandatory_readiness_check(t
         assert feature not in (
             checked.values() if hasattr(checked, "values") else checked
         )
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_after_post_load", [False, True])
+async def test_post_all_features_loaded_barrier_flag(tmp_path, fail_after_post_load):
+    """#2474: the scheduler defers every tick until this barrier completes.
+
+    The flag is False while any feature is still in post-load wiring, True by
+    the time ready hooks run, and a later boot failure's rollback clears it so
+    a torn-down agent never reports its features as loaded.
+    """
+    from types import SimpleNamespace as _NS
+
+    from kestrel_sovereign.features.base import Feature as _SovereignFeature
+
+    observed: dict = {}
+
+    class _BarrierProbeFeature(_SovereignFeature):
+        tool_name = "barrier_probe_feature"
+        tool_description = "records the feature-load barrier as seen by hooks"
+
+        async def initialize(self):
+            return None
+
+        async def post_all_features_loaded(self, agent):
+            observed["post_load"] = agent._post_all_features_loaded_complete
+
+        async def on_agent_ready(self, agent):
+            observed["ready"] = agent._post_all_features_loaded_complete
+
+        def get_agent_card(self):
+            return _NS(name=self.name, skills=[])
+
+    agent = _make_agent(tmp_path)
+    assert agent._post_all_features_loaded_complete is False
+    boom = AsyncMock(side_effect=RuntimeError("injected@memory"))
+    try:
+        with _boot_mocks(), patch(
+            "kestrel_sovereign.kestrel_agent.discover_features",
+            side_effect=lambda a, **_kw: [_BarrierProbeFeature(a)],
+        ):
+            if fail_after_post_load:
+                with patch.object(
+                    agent, "_boot_phase_memory_bootstrap_context", boom
+                ):
+                    with pytest.raises(RuntimeError, match="injected@memory"):
+                        await agent.initialize()
+            else:
+                await agent.initialize()
+
+        assert observed["post_load"] is False
+        if fail_after_post_load:
+            assert agent._boot_state is BootPhaseState.FAILED
+            assert agent._post_all_features_loaded_complete is False
+        else:
+            assert observed["ready"] is True
+            assert agent._post_all_features_loaded_complete is True
     finally:
         await _cleanup(agent)

@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi import APIRouter
 
 from kestrel_sdk.features import (
+    ContextClauseRegistration,
     FeaturePermissionDefaults,
     PermissionLevel,
     SetupStepClassification,
@@ -67,7 +68,10 @@ class _FixtureContributions:
             "workflows": 0,
             "permissions": 0,
             "setup": 0,
+            "context": 0,
         }
+        self.context_renderer_calls = 0
+        self.context_text = f"stable context from {self.contribution_prefix}"
         owner = self.contribution_owner
         self.service = object()
         self.wait_provider = FixtureWaitProvider(f"{self.contribution_prefix}-wait")
@@ -116,6 +120,16 @@ class _FixtureContributions:
             step=self.setup_step,
             classification=SetupStepClassification.OPTIONAL,
         )
+        self.context_registration = ContextClauseRegistration(
+            owner=owner,
+            name=f"{self.contribution_prefix}-context",
+            priority=20,
+            renderer=self._render_context_clause,
+        )
+
+    def _render_context_clause(self):
+        self.context_renderer_calls += 1
+        return self.context_text
 
     def get_service_registrations(self):
         self.contribution_calls["services"] += 1
@@ -136,6 +150,10 @@ class _FixtureContributions:
     def get_setup_step_registrations(self):
         self.contribution_calls["setup"] += 1
         return (self.setup_registration,)
+
+    def get_context_clause_registrations(self):
+        self.contribution_calls["context"] += 1
+        return (self.context_registration,)
 
     def get_router(self):
         router = APIRouter()

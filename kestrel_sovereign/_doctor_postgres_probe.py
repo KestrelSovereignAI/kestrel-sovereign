@@ -42,6 +42,7 @@ async def _fetch_rows(
     params: tuple | list,
     *,
     connect=None,
+    expected_cluster_identity: str | None = None,
 ) -> list:
     if connect is None:
         try:
@@ -60,7 +61,25 @@ async def _fetch_rows(
 
     _emit_phase(connected=True)
     try:
+        if expected_cluster_identity is not None:
+            actual_cluster_identity = await connection.fetchval(
+                "SELECT system_identifier::text "
+                "FROM pg_catalog.pg_control_system()"
+            )
+            if (
+                not isinstance(actual_cluster_identity, str)
+                or not actual_cluster_identity.strip()
+                or actual_cluster_identity != expected_cluster_identity
+            ):
+                raise ProbeQueryError(
+                    "diagnostic query connection is not on the expected "
+                    "PostgreSQL cluster"
+                )
         records = await connection.fetch(sql, *params)
+    except ProbeQueryError:
+        with contextlib.suppress(Exception):
+            await connection.close()
+        raise
     except Exception as exc:
         with contextlib.suppress(Exception):
             await connection.close()
@@ -82,9 +101,18 @@ def fetch_rows_in_process(
     params: tuple | list,
     *,
     connect=None,
+    expected_cluster_identity: str | None = None,
 ) -> list:
     """Connect and query through asyncpg in the current process."""
-    return asyncio.run(_fetch_rows(dsn, sql, params, connect=connect))
+    return asyncio.run(
+        _fetch_rows(
+            dsn,
+            sql,
+            params,
+            connect=connect,
+            expected_cluster_identity=expected_cluster_identity,
+        )
+    )
 
 
 def main() -> None:
@@ -95,6 +123,7 @@ def main() -> None:
             request["dsn"],
             request["sql"],
             request.get("params", []),
+            expected_cluster_identity=request.get("expected_cluster_identity"),
         )
         output = json.dumps({"ok": True, "rows": rows})
     except ProbeConnectionError as exc:

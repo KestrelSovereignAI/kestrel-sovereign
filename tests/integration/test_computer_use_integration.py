@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import AsyncIterator
@@ -29,6 +30,7 @@ from kestrel_sdk.tools.result import ToolResultStatus
 import pytest_asyncio
 
 from kestrel_sovereign.features.computer_use import ComputerUseFeature
+from kestrel_sovereign.features.computer_use.backends.local import LocalSandboxBackend
 from kestrel_sovereign.features.computer_use.path_safety import PathSafetyError
 from kestrel_sovereign.features.security import SecurityFeature
 from kestrel_sovereign.hooks import HooksManager
@@ -367,6 +369,38 @@ async def test_deny_path_short_circuits_before_approval(
 # =============================================================================
 # Shell exec
 # =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_local_shell_does_not_inherit_host_credentials(monkeypatch):
+    monkeypatch.setenv("KESTREL_API_KEY", "sovereign-secret-must-not-leak")
+    monkeypatch.setenv("KESTREL_PEER_API_KEY", "peer-secret-must-not-leak")
+    backend = LocalSandboxBackend(
+        {"shell_execution_sandboxed", "shell_execution_host"}
+    )
+
+    result = await backend.exec(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os; "
+                "print('sovereign=' + str('KESTREL_API_KEY' in os.environ)); "
+                "print('peer=' + str('KESTREL_PEER_API_KEY' in os.environ)); "
+                "print('path=' + str('PATH' in os.environ))"
+            ),
+        ],
+        cwd=None,
+        env=None,
+        timeout=5,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == [
+        "sovereign=False",
+        "peer=False",
+        "path=True",
+    ]
 
 
 @pytest.mark.asyncio

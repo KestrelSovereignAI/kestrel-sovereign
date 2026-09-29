@@ -33,6 +33,9 @@ def _make_mock_agent(db=None):
     """Build a mock agent with storage.db and llm_service."""
     agent = MagicMock()
     agent.agent_id = "did:test:consent-agent"
+    # The feature writes and reads consent_log under `agent.did` (#3229); a
+    # MagicMock attribute is not an identity and the feature refuses it.
+    agent.did = "did:test:consent-agent"
     agent.features = {}
 
     mock_db = db or AsyncMock()

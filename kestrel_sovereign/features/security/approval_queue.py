@@ -72,6 +72,13 @@ class ApprovalRequest:
     # user decision). Distinct from the operator/auto policy "denied" that
     # ``request_approval`` early-returns without ever creating a request.
     user_decision: Optional[str] = None
+    # Which kind of call this was: a tool execution, or a feature-as-subagent
+    # DISPATCH (#3107). Carried on the request because the decision may be
+    # persisted minutes later, on a different task, long after the hook that
+    # knew which event fired has returned. Both writers must agree — a search
+    # that excludes dispatch envelopes is only correct if EVERY door labels
+    # them.
+    audit_action: str = "tool_execution"
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -252,6 +259,7 @@ class ApprovalQueue:
         timeout: Optional[float] = None,
         *,
         allow_blocking: bool = True,
+        audit_action: str = "tool_execution",
     ) -> tuple[bool, str]:
         """
         Queue a request and wait for user decision.
@@ -307,7 +315,7 @@ class ApprovalQueue:
                     await self._permission_store.log_decision(
                         feature_name=feature_name,
                         tool_name=tool_name,
-                        action="tool_execution",
+                        action=audit_action,
                         decision="auto_denied",
                         args_summary=summarize_args(tool_args),
                     )
@@ -324,7 +332,7 @@ class ApprovalQueue:
                     await self._permission_store.log_decision(
                         feature_name=feature_name,
                         tool_name=tool_name,
-                        action="tool_execution",
+                        action=audit_action,
                         decision="auto_mode_allowed",
                         user_choice="constitutional_honesty_unflagged",
                         args_summary=summarize_args(tool_args),
@@ -379,7 +387,7 @@ class ApprovalQueue:
                     await self._permission_store.log_decision(
                         feature_name=feature_name,
                         tool_name=tool_name,
-                        action="tool_execution",
+                        action=audit_action,
                         decision="auto_denied",
                         user_choice="canonical_deny",
                         args_summary=summarize_args(tool_args),
@@ -412,7 +420,7 @@ class ApprovalQueue:
                     await self._permission_store.log_decision(
                         feature_name=feature_name,
                         tool_name=tool_name,
-                        action="tool_execution",
+                        action=audit_action,
                         decision="auto_approved",
                         user_choice=f"auto_approve:{match.rule.source}",
                         args_summary=summarize_args(tool_args),
@@ -461,6 +469,7 @@ class ApprovalQueue:
                 tool_args=tool_args,
                 approved=False,
                 scope="no_approver",
+                audit_action=audit_action,
             )
             logger.warning(
                 "ApprovalQueue: %s.%s requires approval but no interactive "
@@ -481,6 +490,7 @@ class ApprovalQueue:
             tool_args=tool_args,
             created_at=datetime.now(timezone.utc),
             timeout_seconds=timeout,
+            audit_action=audit_action,
         )
 
         self._pending[request.id] = request
@@ -545,6 +555,7 @@ class ApprovalQueue:
                 tool_args=tool_args,
                 approved=False,
                 scope="timeout",
+                audit_action=audit_action,
             )
             return (False, "timeout")
 
@@ -610,6 +621,7 @@ class ApprovalQueue:
         tool_args: Dict,
         approved: bool,
         scope: str,
+        audit_action: str = "tool_execution",
     ) -> Optional[str]:
         """Persist the user's scope choice and write an audit row.
 
@@ -670,7 +682,7 @@ class ApprovalQueue:
             await self._permission_store.log_decision(
                 feature_name=feature_name,
                 tool_name=tool_name,
-                action="tool_execution",
+                action=audit_action,
                 decision=decision,
                 user_choice=scope,
                 args_summary=args_summary,
@@ -758,6 +770,7 @@ class ApprovalQueue:
             tool_args=request.tool_args,
             approved=approved,
             scope=scope,
+            audit_action=request.audit_action,
         )
 
         # Re-read status after the persist await: a concurrent awaiter

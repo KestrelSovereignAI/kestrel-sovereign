@@ -130,7 +130,36 @@ class PersonMatch:
 # =============================================================================
 
 
+#: Concept categories the linker gives people.
+PERSON_CATEGORIES = frozenset({"person", "proper_noun"})
+#: Property on a mention's own concept node naming the person the user
+#: confirmed it means. Single-valued by construction: a later confirmation
+#: overwrites an earlier one, so there is never a second answer to pick
+#: between (#3259).
+RESOLVED_TO_PROPERTY = "resolved_to"
+
+
+def _is_person_node(node: Any) -> bool:
+    """A stamped person, or an unstamped legacy node no keyword pass claims
+    for another category."""
+    from kestrel_sovereign.storage.associative_linker import classify_label
+
+    category = (node.properties or {}).get("category")
+    if category is not None:
+        return category in PERSON_CATEGORIES
+    return classify_label(node.label) in (None, "person")
+
+
 class PersonResolver:
+    """Three-pass person resolution for a mention the linker already noded.
+
+    Pass 0 is a user-confirmed answer recorded on the mention's own node.
+    Pass 1 is an exact normalised-label match to a DIFFERENT node. Passes 2
+    and 3 (single first-name match, or several and therefore pending) run
+    only for a bare first-name mention: they compare first tokens, so a
+    full name that matched nothing exactly is a new person, never merged
+    into someone who shares the first name (#3259). Never silently merge.
+    """
     """Three-pass person concept resolution.
 
     Pass 1 — exact match on normalized name.
@@ -145,14 +174,38 @@ class PersonResolver:
     def __init__(self, graph: AsyncGraphStore):
         self.graph = graph
 
-    async def resolve(self, name: str, agent_id: str) -> PersonMatch:
-        """Resolve a mentioned person name to a concept_id or a pending flag."""
+    async def resolve(
+        self, name: str, agent_id: str, *, self_node_id: Optional[str] = None
+    ) -> PersonMatch:
+        """Resolve a mentioned person name to a concept_id or a pending flag.
+
+        ``self_node_id`` is the mention's OWN concept node. The linker creates
+        that node before the router runs, so without excluding it pass 1
+        always matched the mention to itself and the fuzzy and pending passes
+        were unreachable on the production path; ``confirm_person_match``
+        rewrites the ambiguous edge from exactly that node to the chosen
+        candidate, so the candidates must be the OTHER people (#3259).
+        """
         normalized = _normalize_person_name(name)
         if not normalized:
             return PersonMatch(concept_id=None, status="new", candidates=[])
 
-        # Pull all existing person concepts for this agent.
-        existing = await self._list_person_concepts(agent_id)
+        # Pass 0: a mention the user already resolved. ``confirm_person_match``
+        # records ``resolved_to`` on the mention's own node, and that answer
+        # stands for every later mention; without it the same ambiguity
+        # re-prompted forever (#3259).
+        if self_node_id:
+            canonical = await self._confirmed_resolution(self_node_id)
+            if canonical:
+                return PersonMatch(concept_id=canonical, status="exact", candidates=[])
+
+        # Pull all existing person concepts for this agent, less the mention's
+        # own node.
+        existing = [
+            (cid, label)
+            for cid, label in await self._list_person_concepts(agent_id)
+            if cid != self_node_id
+        ]
 
         # Pass 1 — exact
         exact_id = next(
@@ -162,7 +215,14 @@ class PersonResolver:
         if exact_id:
             return PersonMatch(concept_id=exact_id, status="exact", candidates=[])
 
-        # Pass 2/3 — first-name fuzzy + collision
+        # Pass 2/3 — first-name fuzzy + collision, for a BARE first-name
+        # mention only. The predicate compares first tokens, so a fully named
+        # "jon lee" would otherwise fuzzy-match "jon doe" and, now that the
+        # router writes the resolved edge, file one person's message under
+        # the other; a full name that matched nothing exactly is a new
+        # person (#3259 round 3).
+        if " " in normalized:
+            return PersonMatch(concept_id=None, status="new", candidates=[])
         first = normalized.split()[0] if normalized else ""
         if not first:
             return PersonMatch(concept_id=None, status="new", candidates=[])
@@ -185,16 +245,39 @@ class PersonResolver:
 
         return PersonMatch(concept_id=None, status="new", candidates=[])
 
+    async def _confirmed_resolution(self, node_id: str) -> Optional[str]:
+        """The person a mention node was confirmed to mean, or ``None``."""
+        node = await self.graph.get_node(node_id)
+        if node is None:
+            return None
+        value = (node.properties or {}).get(RESOLVED_TO_PROPERTY)
+        return value if isinstance(value, str) and value and value != node_id else None
+
     async def _list_person_concepts(self, agent_id: str) -> List[Tuple[str, str]]:
-        """Return list of (concept_id, label) for person concepts of this agent."""
-        rows = await self.graph.db.fetchall(
-            """
-            SELECT node_id, label FROM graph_nodes
-            WHERE node_type = 'concept' AND node_id LIKE ?
-            """,
-            (f"concept:{agent_id}:%",),
-        )
-        return [(row[0], row[1]) for row in rows]
+        """Return list of (concept_id, label) for person concepts of this agent.
+
+        Only nodes the linker categorised as ``person`` or ``proper_noun``
+        are candidates; a month or a place is never a person. A node written
+        before the linker stored categories carries none: it is classified
+        on read with the linker's own keyword passes over its label, and
+        admitted only when they do not claim it for another category, so a
+        legacy "march" is refused without waiting for a re-mention (#3259).
+
+        Read through the graph facade's own typed query, never a raw ``db``
+        handle: the privacy-governing graph proxy forwards
+        ``get_nodes_by_type`` and refuses ``db`` (#2672), and a tenant-bound
+        store scopes that query to the agent's own nodes. Reaching for
+        ``graph.db`` made every resolution fail on a real agent, silently,
+        as a logged warning (#3228). The ``concept:{agent_id}:`` prefix is
+        the same selection the SQL ``LIKE`` made.
+        """
+        prefix = f"concept:{agent_id}:"
+        nodes = await self.graph.get_nodes_by_type("concept")
+        return [
+            (node.node_id, node.label)
+            for node in nodes
+            if node.node_id.startswith(prefix) and _is_person_node(node)
+        ]
 
 
 def _normalize_person_name(name: str) -> str:
@@ -565,11 +648,13 @@ class SchemaRouter:
         epistemic = _extract_epistemic_fields(metadata)
 
         # 1. Action items (graph nodes)
+        # Each lane counts a write into ``summary`` as it lands, so a
+        # failure part-way through a lane leaves a truthful count of what is
+        # in the graph rather than a zero over committed rows (#3228).
         try:
             items = self.action_extractor.extract_with_evidence(content)
             if items:
-                await self._persist_action_items(items, message_id, epistemic)
-                summary["action_items"] = len(items)
+                await self._persist_action_items(items, message_id, epistemic, summary)
         except Exception as e:
             logger.warning("Action item routing failed: %s", e)
 
@@ -577,19 +662,14 @@ class SchemaRouter:
         try:
             decisions = self.decision_extractor.extract(content)
             if decisions:
-                await self._persist_decisions(decisions, message_id, epistemic)
-                summary["decisions"] = len(decisions)
+                await self._persist_decisions(decisions, message_id, epistemic, summary)
         except Exception as e:
             logger.warning("Decision routing failed: %s", e)
 
         # 3. Interaction enrichment (edge properties) + person resolution.
         # Operates on person-type concepts the linker already created.
         try:
-            enriched, pending = await self._enrich_person_interactions(
-                concepts, content, message_id
-            )
-            summary["interactions"] = enriched
-            summary["pending_person_matches"] = pending
+            await self._enrich_person_interactions(concepts, content, message_id, summary)
         except Exception as e:
             logger.warning("Interaction enrichment failed: %s", e)
 
@@ -604,8 +684,12 @@ class SchemaRouter:
         items: List[str],
         message_id: Optional[str],
         epistemic: Optional[Dict[str, Any]] = None,
+        summary: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Idempotent action item persistence as graph nodes.
+
+        ``summary["action_items"]`` is advanced after each node lands, so a
+        failure part-way through reports the nodes that exist.
 
         Deterministic node_id from (agent, message, text) means reprocessing
         the same message upserts the same node — the graph's
@@ -648,6 +732,8 @@ class SchemaRouter:
                 label=text[:120],
                 properties=properties,
             ))
+            if summary is not None:
+                summary["action_items"] = summary.get("action_items", 0) + 1
             if message_id:
                 source = f"message:{self.agent_id}:{message_id}"
                 await self.graph.add_edge(source, node_id, "records_action")
@@ -661,8 +747,12 @@ class SchemaRouter:
         decisions: List[str],
         message_id: Optional[str],
         epistemic: Optional[Dict[str, Any]] = None,
+        summary: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Idempotent decision node creation.
+
+        ``summary["decisions"]`` is advanced after each node lands, so a
+        failure part-way through reports the nodes that exist.
 
         Uses a deterministic node id from (agent, message, text) so that
         reprocessing the same message upserts the same node instead of
@@ -690,6 +780,8 @@ class SchemaRouter:
                 label=text[:120],
                 properties=properties,
             ))
+            if summary is not None:
+                summary["decisions"] = summary.get("decisions", 0) + 1
             if message_id:
                 source = f"message:{self.agent_id}:{message_id}"
                 await self.graph.add_edge(source, node_id, "records_decision")
@@ -703,6 +795,7 @@ class SchemaRouter:
         concepts: List[LinkedConcept],
         content: str,
         message_id: Optional[str],
+        summary: Optional[Dict[str, Any]] = None,
     ) -> Tuple[int, List[Dict[str, Any]]]:
         """Enrich message→person mentions edges with sentiment + topics.
 
@@ -721,16 +814,40 @@ class SchemaRouter:
             return 0, []
 
         sentiment, topics = extract_interaction_sentiment(content)
-        enriched_count = 0
         pending: List[Dict[str, Any]] = []
-
         message_node = f"message:{self.agent_id}:{message_id}"
-
         _person_categories = {"person", "proper_noun"}
-        for concept in concepts:
-            if concept.category not in _person_categories:
-                continue
+        people = [c for c in concepts if c.category in _person_categories]
+        # Every target this message will have an edge to: the people it
+        # names, plus each resolved person as its edge lands. add_edge
+        # upserts, so a second write to the same target is not a new edge
+        # and must not be counted as one.
+        written_targets = {c.node_id for c in people}
 
+        # Resolve every person BEFORE writing any edge. A resolution that
+        # raises then leaves nothing behind, and the caller's zero summary is
+        # the truth; resolving between edge writes left a multi-person
+        # message half-enriched under a summary that said zero (#3228).
+        resolved: Dict[str, str] = {}
+        for concept in people:
+            match = await self.person_resolver.resolve(
+                concept.label, self.agent_id, self_node_id=concept.node_id
+            )
+            if match.status == "pending":
+                pending.append({
+                    "mentioned_label": concept.label,
+                    "candidates": match.candidates,
+                    "message_id": message_id,
+                })
+            elif match.concept_id and match.concept_id != concept.node_id:
+                resolved[concept.node_id] = match.concept_id
+        if summary is not None:
+            summary["pending_person_matches"] = pending
+
+        # Count each edge as it lands: a write that fails part-way leaves the
+        # edges before it committed, and the summary must say so.
+        enriched_count = 0
+        for concept in people:
             # Attach interaction properties to the existing mentions edge.
             properties = {
                 "sentiment": sentiment,
@@ -741,15 +858,22 @@ class SchemaRouter:
                 message_node, concept.node_id, "mentions", properties=properties
             )
             enriched_count += 1
-
-            # 3-pass resolution against other person concepts of this agent.
-            match = await self.person_resolver.resolve(concept.label, self.agent_id)
-            if match.status == "pending":
-                pending.append({
-                    "mentioned_label": concept.label,
-                    "candidates": match.candidates,
-                    "message_id": message_id,
-                })
+            if summary is not None:
+                summary["interactions"] = enriched_count
+            # A mention that resolved to another person (confirmed, or an
+            # exact/fuzzy match) is that person's interaction too: without
+            # this edge a confirmed person stopped accumulating mentions after
+            # the one confirmation (#3259).
+            canonical = resolved.get(concept.node_id)
+            if canonical and canonical not in written_targets:
+                await self.graph.add_edge(
+                    message_node, canonical, "mentions",
+                    properties={**properties, "resolved_from": concept.label},
+                )
+                written_targets.add(canonical)
+                enriched_count += 1
+                if summary is not None:
+                    summary["interactions"] = enriched_count
 
         return enriched_count, pending
 

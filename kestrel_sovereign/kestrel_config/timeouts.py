@@ -24,6 +24,24 @@ STATUS_CHECK_INTERVAL = int(os.getenv("STATUS_CHECK_INTERVAL", "5"))
 # GPU instance startup timeout (seconds)
 GPU_STARTUP_TIMEOUT = int(os.getenv("GPU_STARTUP_TIMEOUT", "300"))  # 5 minutes
 
+# How long a session-training release waits for its cancelled background
+# submission task to stop before compensating anyway (seconds)
+TRAINING_SUBMISSION_DRAIN_TIMEOUT = float(
+    os.getenv("TRAINING_SUBMISSION_DRAIN_TIMEOUT", "10")
+)
+
+# Bound on one provider teardown call: compensating job cancellation or
+# session termination (seconds)
+TRAINING_SESSION_RELEASE_TIMEOUT = float(
+    os.getenv("TRAINING_SESSION_RELEASE_TIMEOUT", "120")
+)
+
+# Overall bound on a session-training adapter close() draining every owned
+# task and releasing every billable session (seconds)
+TRAINING_SESSION_CLOSE_DEADLINE = float(
+    os.getenv("TRAINING_SESSION_CLOSE_DEADLINE", "300")
+)
+
 
 # =============================================================================
 # Storage Timeouts

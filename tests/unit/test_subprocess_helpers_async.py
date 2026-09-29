@@ -260,3 +260,26 @@ async def test_cancellation_during_launch_cleans_eventual_process(monkeypatch):
         assert captured["creationflags"]
     else:
         assert captured["start_new_session"] is True
+
+
+@pytest.mark.asyncio
+async def test_timeout_includes_delayed_launch_and_cleans_eventual_process(
+    monkeypatch,
+):
+    proc = MagicMock(pid=4242, returncode=None)
+    cleanup = AsyncMock()
+
+    async def delayed_launch(*_args, **_kwargs):
+        await asyncio.sleep(0.05)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_launch)
+    monkeypatch.setattr(process_helpers, "terminate_process_tree", cleanup)
+
+    started = time.monotonic()
+    result = await run_bounded_subprocess(["fake-command"], timeout=0.01)
+
+    assert result.timed_out is True
+    assert result.returncode == -1
+    assert time.monotonic() - started < 1.0
+    cleanup.assert_awaited_once_with(proc)

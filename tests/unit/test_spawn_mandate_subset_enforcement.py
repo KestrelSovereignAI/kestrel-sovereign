@@ -1,10 +1,11 @@
 """F277: a SpawnMandate must only RESTRICT the child relative to the parent.
 
-The manager must (a) refuse a mandate that grants features the parent lacks or
-adds capability-granting constraints, and (b) actually forward the mandate to
-inception so the delegation edge records it (previously dropped)."""
+The manager must refuse a mandate that grants features the parent lacks or adds
+capability-granting constraints. A mandate-bearing creation must also remain
+inside ``spawn_agent`` so its final child-DID receipt is signed before publish."""
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -87,29 +88,27 @@ def test_refuses_capability_granting_constraint():
 
 
 @pytest.mark.asyncio
-async def test_create_agent_forwards_mandate_to_inception(monkeypatch, tmp_path):
+async def test_direct_create_rejects_mandate_before_inception(monkeypatch, tmp_path):
     mgr = AgentManager(base_data_dir=tmp_path)
-    captured = {}
-
-    async def fake_inception(**kwargs):
-        captured.update(kwargs)
-
-    async def fake_load(name, config):
-        return SimpleNamespace(agent_id="did:key:child", features={})
+    inception = AsyncMock()
 
     monkeypatch.setattr(
         "kestrel_sovereign.inception_service.create_kestrel_identity_async",
-        fake_inception,
+        inception,
     )
-    monkeypatch.setattr(mgr, "load_agent", fake_load)
 
     mandate = _mandate(features_allowed=["WebSearchFeature"], purpose="research")
-    await mgr.create_agent("child", parent_did="did:key:parent",
-                           features=["WebSearchFeature"], mandate=mandate)
+    with pytest.raises(ValueError, match="spawn_agent"):
+        await mgr.create_agent(
+            "child",
+            parent_did="did:key:parent",
+            features=["WebSearchFeature"],
+            mandate=mandate,
+        )
 
-    # Previously the mandate never reached inception (F277).
-    assert captured.get("spawn_mandate") is mandate
-    assert captured.get("parent_did") == "did:key:parent"
+    inception.assert_not_awaited()
+    assert not (tmp_path / "agent_data" / "child").exists()
+    assert mgr._spawn_authority_registry.pending() == ()
 
 
 @pytest.mark.asyncio

@@ -95,11 +95,32 @@ class ReflectionSleepHook:
                 "applied_count": 0,
             })
 
+        from kestrel_sovereign.features.storage_access import (
+            AgentIdentityUnavailable,
+            resolve_scoped_agent_did,
+        )
+
+        # The memory scope is the agent's DID through the shared guard. This
+        # read ``agent_id`` first and fell back to an empty string, which
+        # selected no rows and reported a successful reflection over
+        # nothing (#3251).
+        try:
+            agent_did = resolve_scoped_agent_did(agent)
+        except AgentIdentityUnavailable:
+            return self._finish_pre_sleep(SleepHookStatus.SKIPPED, {
+                "success": False,
+                "skipped": True,
+                "reason": "identity_unavailable",
+                "insights_generated": 0,
+                "candidates": 0,
+                "applied_count": 0,
+            })
+
         cutoff = self._session_cutoff(agent)
         candidates = await self._recently_retrieved_memories(
             db,
             conversation=self._resolve_conversation(agent),
-            agent_id=getattr(agent, "agent_id", None) or getattr(agent, "did", ""),
+            agent_id=agent_did,
             cutoff=cutoff,
         )
         if not candidates:

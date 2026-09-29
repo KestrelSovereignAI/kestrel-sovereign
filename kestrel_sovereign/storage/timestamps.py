@@ -1,9 +1,13 @@
-"""Backend-neutral binding for durable UTC timestamp columns.
+"""Backend-neutral binding and reading of timestamp columns.
 
 SQLite stores durable timestamps as explicit ISO-8601 text, while asyncpg
 requires a :class:`datetime.datetime` for PostgreSQL ``TIMESTAMP`` parameters.
 Storage code that owns a typed timestamp column must use this adapter rather
 than relying on either driver's implicit coercions.
+
+The read direction has the same split: a SQLite ``TIMESTAMP`` column comes back
+as ISO-8601 text, while ``PostgresBackend.fetch_all`` returns asyncpg's native
+``datetime``. :func:`timestamp_column_value` is the one place that accepts both.
 """
 
 from __future__ import annotations
@@ -43,4 +47,24 @@ def utc_timestamp_parameter(backend_type: str, value: Any) -> datetime | str:
     raise ValueError(f"unsupported timestamp backend: {backend_type!r}")
 
 
-__all__ = ["utc_timestamp_parameter"]
+def timestamp_column_value(value: Any) -> datetime:
+    """Return a ``TIMESTAMP`` column value read from either backend as a datetime.
+
+    SQLite yields ISO-8601 text (``CURRENT_TIMESTAMP`` stores
+    ``YYYY-MM-DD HH:MM:SS``); asyncpg yields a native ``datetime``. Calling
+    ``datetime.fromisoformat`` on the latter raises ``TypeError``, which is the
+    PostgreSQL defect this helper exists to prevent. The value is returned as
+    stored: no timezone is attached or removed. ``NULL`` is not a timestamp, so
+    callers decide what an absent value means before calling this.
+    """
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value)
+    raise TypeError(
+        "timestamp column value must be ISO-8601 text or a datetime, "
+        f"not {type(value).__name__}"
+    )
+
+
+__all__ = ["timestamp_column_value", "utc_timestamp_parameter"]

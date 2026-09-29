@@ -50,6 +50,7 @@ import logging
 import os
 import sys
 from typing import Any, Dict, Optional, Tuple
+from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +224,7 @@ def _resolve_db_target(
             )
         return (None, None, os.path.join(resolved, "kestrel_prime.db"))
 
-    db_path_dir = os.environ.get("KESTREL_DB_PATH")
+    db_path_dir = runtime_path_env(AGENT_DB_PATH_ENV)
     if db_path_dir:
         # KESTREL_DB_PATH must NOT silently override a multi-agent roster
         # (#2327). Production hosts set KESTREL_DB_PATH in .env; in a home

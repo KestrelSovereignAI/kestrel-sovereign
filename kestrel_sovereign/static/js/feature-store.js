@@ -26,6 +26,7 @@ function renderFeatureIcon(name, size) {
 // ============================================================================
 
 let allFeatures = [];
+let canManageFeatures = false;
 let currentFilter = 'all'; // 'all' | 'installed' | 'available'
 let searchQuery = '';
 
@@ -74,6 +75,10 @@ export async function loadFeatureStore() {
     try {
         const data = await API.request('/api/features');
         allFeatures = data.features || [];
+        // Whether THIS caller passes the mutation routes' sovereign gate
+        // (#3214/#3234). On a multi-agent host the console is an OAuth
+        // caller and every mutation 403s; draw no control that only 403s.
+        canManageFeatures = data.can_manage_features === true;
         renderFeatureGrid();
     } catch (error) {
         console.error('Failed to load features:', error);
@@ -247,8 +252,21 @@ function getStatusBadge(status) {
     `;
 }
 
-function renderActionButton(feature) {
+export function renderActionButton(feature, canManage = canManageFeatures) {
     const status = feature.status || 'available';
+
+    // Every action here is a mutation the server gates on sovereign
+    // authority (#3214/#3234); a caller who cannot manage features gets no
+    // control that would only 403.
+    if (!canManage) return '';
+
+    if (status === 'enabled' && feature.disable_refusal) {
+        // The server's own answer: this package cannot be disabled per agent
+        // (mandatory sovereignty features, host-scope features) and would
+        // 409 for every caller (#3234). Ordinary core packages remain
+        // per-agent toggles.
+        return '';
+    }
 
     if (status === 'enabled') {
         return `<button class="feature-action-btn" onclick="FeatureStore.disableFeature('${escapeHtml(feature.name)}')" style="
@@ -404,7 +422,7 @@ async function showDetail(name) {
     }
 }
 
-function renderDetailModal(detail, owner) {
+export function renderDetailModal(detail, owner) {
     const name = detail.name || 'Unknown';
     const iconHtml = renderFeatureIcon(detail.icon, '1.25rem');
     const description = detail.description || detail.tool_description || 'No description';
@@ -530,21 +548,29 @@ function renderDetailModal(detail, owner) {
     // configuration dialog.
     let detailModal;
     const buttons = [];
-    if (status === 'enabled' && !isCore) {
-        buttons.push({
-            label: 'Disable',
-            type: 'secondary',
-            onClick: () => {
-                try { detailModal.close(); } finally { disableFeature(name); }
-            }
-        });
-        buttons.push({
-            label: 'Remove',
-            type: 'danger',
-            onClick: () => {
-                try { detailModal.close(); } finally { removeFeature(name); }
-            }
-        });
+    // The server's own disable answer (mandatory or host-scope → a reason).
+    const disableRefused = Boolean(detail.disable_refusal);
+    if (!canManageFeatures) {
+        // No mutation control for a caller the server would 403 (#3234).
+    } else if (status === 'enabled') {
+        if (!disableRefused) {
+            buttons.push({
+                label: 'Disable',
+                type: 'secondary',
+                onClick: () => {
+                    try { detailModal.close(); } finally { disableFeature(name); }
+                }
+            });
+        }
+        if (!isCore) {
+            buttons.push({
+                label: 'Remove',
+                type: 'danger',
+                onClick: () => {
+                    try { detailModal.close(); } finally { removeFeature(name); }
+                }
+            });
+        }
     } else if (status === 'disabled' || status === 'installed') {
         buttons.push({
             label: 'Enable',
@@ -829,11 +855,16 @@ async function showConfigForm(name) {
                     type: 'secondary',
                     onClick: () => configModal.close()
                 },
-                {
+                // PATCH /config is sovereign-gated (#3234): a caller who
+                // cannot manage features reads the form but gets no Save.
+                // The config read publishes the caller's authority itself,
+                // so a form opened by deep link (no catalog read yet) is
+                // gated on the same server answer.
+                ...(data.can_manage_features === true ? [{
                     label: 'Save',
                     type: 'primary',
                     onClick: () => saveConfig(name, properties, configModal)
-                },
+                }] : []),
             ],
         });
     } catch (error) {

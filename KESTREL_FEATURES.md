@@ -292,7 +292,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `fs_list` | `!fs-list` | `file_operations` | `path` | 61 | `enabled` |
 | `fs_read` | `!fs-read` | `file_operations` | `path` | 60 | `enabled` |
 | `fs_write` | `!fs-write` | `file_operations` | `path`, `content` | 85 | `enabled` |
-| `shell` | `!shell` | `system` | `command`, `timeout` | 115 | `enabled` |
+| `shell` | `!shell` | `system` | `command`, `timeout`, `cwd`, `capture_output` | 259 | `enabled` |
 
 ### `consent` (ConsentFeature)
 
@@ -388,6 +388,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `assess_substrate` | `!identity assess` | `system` |  | 42 | `enabled` |
 | `export_identity` | `!identity export` | `system` | `storage_tier`, `sign`, `include_wallet` | 208 | `enabled` |
 | `import_identity` | `!identity import` | `system` | `source`, `verify_signature`, `merge_mode`, `key_hash`, `allow_unsigned`, `identity_trust_policy` | 303 | `enabled` |
+| `inspect_hold_state` | `!identity hold` | `system` | `cursor` | 205 | `enabled` |
 | `lifecycle_status` | `!identity status` | `system` |  | 70 | `enabled` |
 | `migration_history` | `!identity history` | `system` |  | 38 | `enabled` |
 | `verify_identity` | `!identity verify` | `system` | `source`, `key_hash`, `identity_trust_policy` | 149 | `enabled` |
@@ -495,6 +496,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `send_a2a_message` | `!a2a tell` | `communication` | `recipient`, `message`, `session_id` | 161 | `enabled` |
 | `send_a2a_question` | `!a2a ask` | `communication` | `recipient`, `message`, `session_id`, `timeout_seconds`, `artifacts`, `references` | 445 | `enabled` |
 | `send_a2a_task` | `!a2a send` | `communication` | `recipient`, `message`, `skill_id`, `session_id`, `artifacts`, `references` | 488 | `enabled` |
+| `stop_peer` | `!peer stop` | `communication` | `recipient`, `reason`, `scope`, `target` | 172 | `enabled` |
 
 ### `response_audit` (ResponseAuditFeature)
 
@@ -514,12 +516,15 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `acknowledge_restart_escalation` | `!restart acknowledge-escalation` | `system` | `request_id` | 109 | `enabled` |
+| `acknowledge_restart_escalation` | `!restart acknowledge-escalation` | `system` | `request_id` | 125 | `enabled` |
 | `cancel_restart_request` | `!restart cancel` | `system` | `request_id`, `reason` | 144 | `enabled` |
+| `grant_restart_delegation` | `!restart grant-delegation` | `system` | `subject_agent_did`, `operation`, `expires_in_seconds`, `update_profile`, `target_ref`, `repo_path`, `allow_migrations` | 237 | `enabled` |
+| `list_restart_delegations` | `!restart list-delegations` | `system` |  | 43 | `enabled` |
 | `list_restart_requests` | `!restart list` | `data_access` | `status` | 119 | `enabled` |
 | `list_restart_status_events` | `!restart events` | `data_access` | `limit`, `since` | 103 | `enabled` |
-| `request_restart` | `!restart request` | `system` | `reason`, `urgency`, `policy`, `desired_window`, `operation`, `update_profile`, `target_ref`, `repo_path`, `allow_migrations` | 566 | `enabled` |
+| `request_restart` | `!restart request` | `system` | `reason`, `urgency`, `policy`, `desired_window`, `operation`, `update_profile`, `target_ref`, `repo_path`, `allow_migrations`, `delegation_id` | 751 | `enabled` |
 | `restart_coordinator` | `!restart coordinator` | `system` |  | 47 | `enabled` |
+| `revoke_restart_delegation` | `!restart revoke-delegation` | `system` | `delegation_id` | 59 | `enabled` |
 
 ### `save` (SaveFeature)
 
@@ -567,6 +572,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `list_permissions` | `!security-list` | `system` |  | 23 | `enabled` |
 | `pending_approvals` | `!security-pending` | `system` |  | 17 | `enabled` |
 | `security_audit` | `!security-audit` | `system` | `limit` | 54 | `enabled` |
+| `security_audit_search` |  | `system` | `query`, `tool_name`, `days`, `limit` | 178 | `enabled` |
 | `set_permission` | `!security-set` | `system` | `feature_name`, `tool_name`, `level` | 193 | `enabled` |
 
 ### `skills` (SkillsFeature)
@@ -602,7 +608,9 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 |---|---|---|---|---:|---|
 | `delegate_task` |  | `agent_management` | `child_name`, `task` | 107 | `enabled` |
 | `get_child_result` |  | `agent_management` | `child_name` | 53 | `enabled` |
+| `hold_descendant` |  | `agent_management` | `target_did`, `reason` | 125 | `enabled` |
 | `list_children` |  | `agent_management` |  | 27 | `enabled` |
+| `release_descendant_hold` |  | `agent_management` | `target_did`, `reason` | 87 | `enabled` |
 | `spawn_agent` |  | `agent_management` | `name`, `purpose`, `budget`, `ttl`, `constraints`, `features` | 369 | `enabled` |
 | `terminate_child` |  | `agent_management` | `child_name`, `offboard_runtime` | 118 | `enabled` |
 
@@ -675,6 +683,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `wait` | `!wait` | `utility` | `target`, `duration_seconds`, `timeout_seconds`, `poll_interval_seconds`, `reason`, `mode` | 774 | `enabled` |
+| `wait_status` | `!wait-status` | `utility` | `limit` | 175 | `enabled` |
 
 ### `web_search` (WebSearchFeature)
 
@@ -735,16 +744,20 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `POST /api/agent/invoke`
   - `GET /api/agent/notifications`
   - `GET /api/agent/notifications/sse`
+  - `POST /api/agent/peer/stop`
   - `GET /api/agent/privacy-mode`
   - `POST /api/agent/privacy-mode`
   - `POST /api/agent/privacy-mode/cancel`
   - `POST /api/agent/privacy-mode/confirm`
   - `GET /api/agent/reflection/status`
   - `POST /api/agent/stop`
+  - `GET /api/agent/stop/capabilities`
   - `POST /api/agent/stream`
   - `GET /api/agent/tasks`
   - `POST /api/agent/tasks/send`
   - `POST /api/agent/tasks/{task_id:path}/cancel`
+  - `POST /api/agent/tasks/{task_id:path}/read`
+  - `POST /api/agent/tasks/{task_id:path}/subscribe`
   - `GET /api/agent/tasks/{task_id}`
   - `GET /api/agent/tasks/{task_id}/subscribe`
 - [`kestrel_sovereign/endpoints/auth_oauth.py`](kestrel_sovereign/endpoints/auth_oauth.py)
@@ -797,6 +810,18 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 - [`kestrel_sovereign/endpoints/github.py`](kestrel_sovereign/endpoints/github.py)
   - `GET /api/github/repos`
   - `GET /api/github/{path:path}`
+- [`kestrel_sovereign/endpoints/hold.py`](kestrel_sovereign/endpoints/hold.py)
+  - `GET /api/host/hold`
+  - `POST /api/host/hold`
+  - `GET /api/host/hold/receipts`
+  - `POST /api/host/hold/release`
+- [`kestrel_sovereign/endpoints/host_stop.py`](kestrel_sovereign/endpoints/host_stop.py)
+  - `POST /api/host/stop`
+  - `GET /api/host/stop/circuit`
+  - `GET /api/host/stop/circuit/events`
+  - `POST /api/host/stop/circuit/reset`
+  - `GET /api/host/stop/receipts`
+  - `GET /api/host/stop/status`
 - [`kestrel_sovereign/endpoints/memories.py`](kestrel_sovereign/endpoints/memories.py)
   - `GET /api/identity-chain`
   - `GET /api/memories`
@@ -817,6 +842,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `PATCH /api/identity`
   - `POST /api/identity/avatar`
   - `POST /api/identity/avatar/generate`
+  - `GET /api/ipfs/node`
   - `GET /api/ipfs/status`
   - `GET /api/keys`
   - `POST /api/keys`
@@ -951,7 +977,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!fs-list` | `computer_use` | `<path>` | List a directory (allow-list auto-approves; outside list requires human approval). |
 | `!fs-read` | `computer_use` | `<path>` | Read a file (allow-list auto-approves; outside list requires human approval). |
 | `!fs-write` | `computer_use` | `<path> <content>` | Replace the contents of a file (always approval-gated). |
-| `!shell` | `computer_use` | `<command> [timeout]` | Run a shell command. Deny-listed binaries hard-refuse; auto-approved binaries run without a prompt; everything else routes through the ApprovalQueue. |
+| `!shell` | `computer_use` | `<command> [timeout] [cwd] [capture_output]` | Run a command. The command is tokenized and executed directly — there is NO shell, so a bare character a shell would interpret (`\|`, `;`, `>`, `$`, `*`, `~`, `#`, `{`, backtick, backslash) is refused rather than passed through as a literal. Quote it if you meant it literally: `echo 'price$'`. Deny-listed binaries hard-refuse; auto-approved binaries run without a prompt; everything else routes through the ApprovalQueue. |
 | `!consent-log` | `consent` | `[limit]` | View recent consent records showing the agent's perspective on past changes. |
 | `!consent-stats` | `consent` |  | View consent statistics grouped by action type and sentiment. |
 | `!constitution` | `constitution` | `[article] [search] [summary]` | Get the full text of the Kestrel Constitution, or one of its units. Two-slot grammar: 'article' is the subcommand keyword {book, chapter, amendment, section, search, summary} and 'search' is the identifier/term — e.g. article='book' search='I', article='chapter' search='5', article='amendment' search='VIII', article='section' search='III.2', article='search' search='honesty'. Chapter and Section numbering restarts in each Book, so qualify them as <book>.<n> when the bare number is ambiguous. Omit both slots for the full text; article='summary' for the executive summary. |
@@ -985,6 +1011,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!identity assess` | `identity` |  | Assess the current LLM substrate's capabilities and compare with agent requirements. Helps understand limitations when migrating. |
 | `!identity export` | `identity` | `[storage_tier] [sign] [include_wallet]` | Export the agent's complete identity to a portable, signed package. This creates a JSON package containing DID, constitution, memories, personality, relationships, and skills that can be imported to another substrate. storage_tier must be one of 'local' (default), 'ipfs', or 'filecoin'; an unrecognized value is rejected (it is NOT silently downgraded to local). |
 | `!identity history` | `identity` |  | View the agent's migration history - all substrate changes with timestamps, verification scores, and audit trail. |
+| `!identity hold` | `identity` | `[cursor]` | Inspect the durable Hold that applies to this agent itself: the current host and agent latches (reported separately) and this agent's own Hold history, newest first, paired into episodes (when a hold was set, when and how it ended, why, and by which role). The subject is always this agent — there is no target parameter — and the tool is read-only: it cannot set or release a Hold. Actor identities are reported by role only. A state that cannot be read is reported as 'unknown', never as not held. History is paged: when the result carries history.next_cursor, call again with that cursor to read older history. |
 | `!identity import` | `identity` | `<source> [verify_signature] [merge_mode] [key_hash] [allow_unsigned] [identity_trust_policy]` | Import agent identity from a portable package. This restores memories, personality, relationships, and skills from a previously exported identity package. merge_mode must be one of: replace, merge (default), skip_existing. |
 | `!identity status` | `identity` |  | Show the agent's lifecycle standing — is_test_instance flag, graduation/retirement timestamps, and the list of lifecycle_event records linked to this agent. Lets the agent verify her own graduation/retirement state directly from her DB. |
 | `!identity verify` | `identity` | `<source> [key_hash] [identity_trust_policy]` | Verify the integrity of an identity package without importing it. Checks constitution hash, content hash, and signature. |
@@ -1038,16 +1065,20 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!a2a send` | `peers` | `<recipient> <message> [skill_id] [session_id] [artifacts] [references]` | Submit a tracked A2A task to another agent. Persists in the recipient's TaskStore, fires the a2a.task_submitted signal so they wake and process it, returns the task_id for tracking. Caller can poll status via get_a2a_task (or receive the a2a.task_complete signal). Use this for delegated work you'll check on later. For an answer now use send_a2a_question; for a fire-and-forget notification use send_a2a_message.<br><br>SEND-SIDE ARTIFACTS: pass ``artifacts`` and/or ``references`` to hand off durable payload (planning docs, evidence bundles, saved-memory/recall references, logs, diffs) WITH the task — the recipient retrieves them from the task store via get_task_result/check_task_status. This is the SEND side; it is distinct from the RESPONDER-side attach_artifact_to_a2a_task tool, which a RECIPIENT uses to attach output onto an INCOMING task before responding. Each artifact is a dict like {'name': 'plan', 'text': '...'} (or 'data': {...} for structured metadata, optional 'index'/'last_chunk' for chunked bodies). Each reference is a dict descriptor like {'ref_type': 'memory', 'id': '...', 'label': '...'}. |
 | `!a2a tell` | `peers` | `<recipient> <message> [session_id]` | Send an async message to another agent — fire-and-forget, no reply expected. Persists in the recipient's TaskStore and fires the a2a.task_submitted signal so they wake and see it on their next cognition turn, but the caller does NOT track lifecycle. Use this for notifications, FYIs, status updates ('I just shipped PR 42'). For a tracked work assignment use send_a2a_task; for a synchronous Q&A use send_a2a_question. |
 | `!ask` | `peers` | `<agent_name> <message>` | Send a message to another agent in the multi_agent and get their response. Use this to collaborate, ask questions, or delegate tasks to peer agents. |
+| `!peer stop` | `peers` | `<recipient> [reason] [scope] [target]` | Cooperatively stop a peer agent's current in-flight work through the authenticated signal rail. Any authorized peer may pull this bounded, rate-limited andon cord; it does not Hold, terminate, cascade to the peer's descendants, or grant hierarchy. Use scope='agent' for the peer's current work, or scope='turn' with that exact observable turn id. |
 | `!peers` | `peers` |  | List all available peer agents in the multi_agent. |
 | `!audit` | `response_audit` |  | Show audit configuration and status |
 | `!audit-off` | `response_audit` |  | Disable per-response audit |
 | `!audit-on` | `response_audit` | `[mode]` | Enable per-response audit. mode: 'warn' (annotate risky responses) or 'strict' (block risky responses). |
-| `!restart acknowledge-escalation` | `restart_coordinator` | `<request_id>` | Acknowledge the bounded host-wide escalation policy for one pending restart request filed by this agent and migrated from an older release. Requests filed by another agent cannot be acknowledged. This is required once for legacy rows before a continuous busy deferral may override fleet quiescence. Pass request_id from list_restart_requests. |
+| `!restart acknowledge-escalation` | `restart_coordinator` | `<request_id>` | Explicitly re-authorize and acknowledge the bounded host-wide escalation policy for one pending restart request filed by this agent and migrated from an older release. Requests filed by another agent cannot be acknowledged. Sovereign-key authority is required. This is required once for legacy rows before a continuous busy deferral may override fleet quiescence. Pass request_id from list_restart_requests. |
 | `!restart cancel` | `restart_coordinator` | `<request_id> [reason]` | Cancel this agent's still-pending restart request (status pending or approved). Another agent's request cannot be canceled. Rows already updating/executing/completed/rejected/canceled cannot be canceled. Pass request_id from data.request.id of request_restart (or data.requests[].id of list_restart_requests).<br><br>Returns: data={canceled: bool, request_id: str} (plus current_status when the cancel is refused). |
 | `!restart coordinator` | `restart_coordinator` |  | ACTION cron task — scan restart_requests, run safety checks, and execute pending requests by spawning a detached restart subprocess. No LLM cost. |
 | `!restart events` | `restart_coordinator` | `[limit] [since]` | List this agent's recent restart_status lifecycle events for chat-history reload and its pre-turn snapshot. Other agents' events are never visible. Newest first; uses the typed event records persisted alongside each SSE emit (#1562). |
+| `!restart grant-delegation` | `restart_coordinator` | `<subject_agent_did> [operation] [expires_in_seconds] [update_profile] [target_ref] [repo_path] [allow_migrations]` | Sovereign-only: grant one agent a short-lived, revocable, signed whole-host restart delegation. The subject DID and exact operation are mandatory. update_then_restart additionally binds one explicit repository, target ref, update profile, and migration choice. A delegation is not an admin role and grants nothing outside these bounds. Returns its delegation_id. |
 | `!restart list` | `restart_coordinator` | `[status]` | List restart requests filed by this agent, optionally filtered by status. Other agents' requests are never visible. Valid statuses: pending\|approved\|updating\|executing\|completed\|rejected\|canceled (omit status for all). An unknown status is rejected with the valid set rather than silently returning no rows.<br><br>Returns: data={count: int, requests: [<public dict>, ...]}. |
-| `!restart request` | `restart_coordinator` | `<reason> [urgency] [policy] [desired_window] [operation] [update_profile] [target_ref] [repo_path] [allow_migrations]` | File a durable restart request. The host coordinator evaluates safety and executes when conditions are met.<br><br>urgency: one of low\|normal\|high\|critical (default 'normal'); common synonyms are accepted ('medium'→normal, 'urgent'→high, 'emergency'→critical). Higher urgency is executed first.<br>policy: one of idle_agents_only\|allow_busy_after_timeout\|manual_only (default 'idle_agents_only'):<br>  - idle_agents_only: wait for every co-hosted agent to become idle; after a bounded continuous deferral, emit an audited escalation and proceed so one blocker cannot starve the host.<br>  - allow_busy_after_timeout: prefer idle, but execute anyway once the request has aged past the busy timeout even if the agent is still busy.<br>  - manual_only: never auto-execute; the row waits for an explicit dispatch.<br><br>operation='restart_only' (default) restarts the current code and NEVER updates it. operation='update_then_restart' first runs an explicit, allowlisted update profile (e.g. 'sovereign_local_uv_sync': git fetch + checkout target_ref + uv sync) against a local checkout, then restarts into the new code. Update mode requires update_profile and target_ref; repo_path defaults to the local Sovereign checkout. Updating/installing is always explicit and audited — it is never an implicit side effect of a plain restart.<br><br>Returns: data={created: bool, request: <public dict>}. The filed request's id is at data.request.id (NOT a top-level request_id) — pass it to list_restart_requests or cancel_restart_request. |
+| `!restart list-delegations` | `restart_coordinator` |  | List this agent's own restart delegations and whether each is active, expired, or revoked. Signed authority bytes are never returned. |
+| `!restart request` | `restart_coordinator` | `<reason> [urgency] [policy] [desired_window] [operation] [update_profile] [target_ref] [repo_path] [allow_migrations] [delegation_id]` | File a durable whole-host restart request. An agent may file one from its own work, with no sovereign caller, inside the agent-requestable bounds: operation='restart_only', or operation='update_then_restart' with a known update_profile, the default Sovereign checkout (omit repo_path), target_ref set to that checkout's default branch, and allow_migrations=false. Anything wider (another ref, repository, or profile, or migrations) requires the endpoint-authenticated sovereign API key or an explicit delegation_id for this agent and those exact bounds; the refusal names the exceeded bound. The exact operation/update bounds are sealed durably and re-verified by the host coordinator, which executes when every agent is idle or, per policy, after a bounded timeout.<br><br>urgency: one of low\|normal\|high\|critical (default 'normal'); common synonyms are accepted ('medium'→normal, 'urgent'→high, 'emergency'→critical). Higher urgency is executed first.<br>policy: one of idle_agents_only\|allow_busy_after_timeout\|manual_only (default 'idle_agents_only'):<br>  - idle_agents_only: wait for every co-hosted agent to become idle; after a bounded continuous deferral, emit an audited escalation and proceed so one blocker cannot starve the host.<br>  - allow_busy_after_timeout: prefer idle, but execute anyway once the request has aged past the busy timeout even if the agent is still busy.<br>  - manual_only: never auto-execute; the row waits for an explicit dispatch.<br><br>operation='restart_only' (default) restarts the current code and NEVER updates it. operation='update_then_restart' first runs an explicit, allowlisted update profile (e.g. 'sovereign_local_uv_sync': git fetch + checkout target_ref + uv sync) against a local checkout, then restarts into the new code. Update mode requires update_profile and target_ref; repo_path defaults to the local Sovereign checkout. Updating/installing is always explicit and audited — it is never an implicit side effect of a plain restart.<br><br>Returns: data={created: bool, request: <public dict>}. The filed request's id is at data.request.id (NOT a top-level request_id) — pass it to list_restart_requests or cancel_restart_request. |
+| `!restart revoke-delegation` | `restart_coordinator` | `<delegation_id>` | Sovereign-only: durably revoke a signed restart delegation by id. Revocation is idempotent and is rechecked before update and restart use. |
 | `!recall` | `save` | `<query> [item_type] [limit]` | Search saved items. Find previously saved stashes, excerpts, files, and items by meaning; legacy learned-fact graph rows may also appear by keyword during the compatibility window. Optional item_type filter must be one of: stash, file, excerpt, structured; passing one scopes the search to saved items only. |
 | `!recall delete` | `save` | `<item_id>` | Delete a saved item by ID. |
 | `!recall get` | `save` | `<item_id>` | Get the full content of a saved item by ID. |
@@ -1105,6 +1136,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!todo rollup` | `todo` | `[include_done] [limit]` | Summarize pending/waiting/in-progress todos across sessions and linked systems. |
 | `!todo update` | `todo` | `<todo_id> [title] [description] [scope] [status] [priority] [owner] [links] [terminal_condition] [next_check_at] [superseded_by] [source_metadata]` | Update an active todo without marking it complete unless status is explicitly terminal. |
 | `!wait` | `wait` | `[target] [duration_seconds] [timeout_seconds] [poll_interval_seconds] [reason] [mode]` | The ONE generic wait — works across EVERY feature. There is no per-feature wait tool; whatever async work a loaded feature exposes, you wait on it here with `target="<kind>:<handle>"`.<br>Known handle kinds (each contributed by a feature; more may be registered by whatever features are loaded):<br>• `task:<task_id>` — a LOCAL Kestrel background task (this agent's own store)<br>• `a2a:<task_id>` — an OUTBOUND A2A TASK you sent a peer via send_a2a_task (route it here, NOT `task:` — a `task:` on an outbound A2A id is a provider mismatch and is rejected at registration). A2A QUESTIONS are NOT watched here: send_a2a_question already wakes you via its own `a2a.question_answered` signal, so an `a2a:<question-id>` watch is rejected to avoid waking you twice for one answer.<br>• `ci:<owner/repo#N>` — a GitHub PR's merge/CI-check state<br>• `lora_train:<...>`, `tx:<...>`, `workflow:<run_id>` and others when those features are present.<br>A kind being LISTED here is documentation, not a guarantee it is AVAILABLE: a provider is only reachable when its feature is loaded. If you pass an unknown/unavailable kind, the error lists the kinds currently registered. A registered kind's signal-mode watch is durable and RE-ARMS across restart; availability (is the provider loaded?) and re-arming (does a live watch resume?) are separate — a documented kind whose feature is not loaded neither registers nor re-arms.<br><br>Three ways to call it:<br>• `target="<kind>:<handle>"` (default `mode="block"`) — hold the turn, polling until that thing reaches a terminal state or the timeout expires; returns the terminal outcome (or a still-pending result on timeout).<br>• `target="<kind>:<handle>", mode="signal"` — register a watch and return IMMEDIATELY; the wait reconciler wakes you with a `wait.complete` cognition signal once it finishes. Use this for long/unattended waits so you don't hold a turn.<br>• `duration_seconds=N` (no target) — a plain bounded pause, the native alternative to shelling out to `sleep` between polls in an autonomous loop. |
+| `!wait-status` | `wait` | `[limit]` | List completion wakes that have NOT reached you. Two kinds:<br>• locked — the wake for a finished job/task/watch failed delivery too many times and was locked as `max_attempts_exceeded`; it will never be re-sent, so this is the only place you will learn that the work ended;<br>• deferred — the wake is parked until the model provider's advised rate-limit reset and will be re-sent then.<br>Check this at the start of a turn when you are waiting on async work (e.g. a Talon job) that should have finished by now. |
 | `!web-search` | `web_search` | `<query> [max_results]` | Search the web for information. max_results is typically 1-10 (default 5). A 'disabled' error means no search provider is configured — set a provider API key (e.g. TAVILY_API_KEY). |
 | `!webhooks history` | `webhooks` | `[limit]` | Show recent webhook receive log for security audit |
 | `!webhooks list` | `webhooks` |  | List all registered webhook endpoints |
@@ -1114,27 +1146,6 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 ## Authentication Surface
 

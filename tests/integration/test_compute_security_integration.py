@@ -553,8 +553,15 @@ class TestToolEnumCaseNormalization:
         )
         script_id = write.data["script_id"]
         result = await compute_feature.run_script(script_id=script_id, executor="UV")
-        # The case-variant must NOT trip the "Executor 'UV' not available" path.
-        assert "not available" not in (result.error or "")
+        # Normalization is the subject, not availability. UvExecutor.is_available
+        # now also requires a usable OS filesystem sandbox, so on a runner
+        # without one uv is LEGITIMATELY unavailable and says so -- naming the
+        # normalized 'uv'. The old assertion matched "not available" and so
+        # conflated the two causes. What must never happen is the raw
+        # case-variant reaching the resolver, which would name 'UV'.
+        assert "Executor 'UV'" not in (result.error or ""), (
+            f"executor name was not normalized: {result.error}"
+        )
 
     @pytest.mark.asyncio
     async def test_list_scripts_state_case_insensitive(self, compute_feature):

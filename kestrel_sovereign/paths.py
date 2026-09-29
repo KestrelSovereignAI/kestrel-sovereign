@@ -51,8 +51,10 @@ that want full control: tests pass an explicit value, Docker images pin
 from __future__ import annotations
 
 import os
+import sys
 from functools import lru_cache
 from pathlib import Path
+from typing import Mapping
 
 #: Marker files that identify a directory as a Kestrel project root.
 #: Order matters only for documentation — any one match is enough.
@@ -89,8 +91,10 @@ def project_dir() -> Path:
     ask for.
     """
     cwd = Path.cwd()
-    explicit_home = os.environ.get("KESTREL_HOME")
-    return _resolve_cached(explicit_home, str(cwd))
+    explicit_home = runtime_path_env(HOME_ENV)
+    return guard_storage_path(
+        _resolve_cached(explicit_home, str(cwd)), source="project directory"
+    )
 
 
 def load_project_env(home: Path, *, exclude: tuple[str, ...] = ()) -> None:
@@ -182,6 +186,164 @@ def spawned_agent_data_key(env: dict, agent_name: str) -> str | None:
     )
 
 
+#: The project home (see :func:`project_dir`).
+HOME_ENV = "KESTREL_HOME"
+
+#: Explicit host-feature database path (see ``host_features.storage``).
+HOST_DB_PATH_ENV = "KESTREL_HOST_DB_PATH"
+
+#: Launcher pins describing how a child's host database was derived (see
+#: ``host_features.storage.pin_host_database_launch_context``).
+DERIVED_HOST_DB_PATH_ENV = "KESTREL_DERIVED_HOST_DB_PATH"
+HOST_DB_PREVIOUS_DEFAULT_ENV = "KESTREL_HOST_DB_LAUNCH_PREVIOUS_DEFAULT"
+HOST_DB_LEGACY_PATH_ENV = "KESTREL_HOST_DB_LAUNCH_LEGACY_PATH"
+
+#: The agent data root.
+AGENT_DB_PATH_ENV = "KESTREL_DB_PATH"
+
+#: Legacy agent data root read by ``storage.get_default_agent_data_dir``, the
+#: default for identity keys, DID documents and exports.
+LEGACY_AGENT_DATA_DIR_ENV = "AGENT_DATA_DIR"
+
+#: Standalone data-root override (identity exports, local training output).
+DATA_DIR_ENV = "KESTREL_DATA_DIR"
+
+#: A process-managed child's resolved identity-export root.
+IDENTITY_EXPORT_DIR_ENV = "KESTREL_IDENTITY_EXPORT_DIR"
+
+#: Explicit operator override for the Phoenix trace-store working directory.
+#: Deliberately separate from Phoenix's own environment variables: Kestrel is
+#: the custody owner and must validate the directory before it starts Phoenix.
+PHOENIX_WORKING_DIR_ENV = "KESTREL_PHOENIX_WORKING_DIR"
+
+#: Local cache for decentralized-storage providers.
+CACHE_DIR_ENV = "KESTREL_CACHE_DIR"
+
+#: Compute safe-delete trash.
+TRASH_DIR_ENV = "KESTREL_TRASH_DIR"
+
+#: ``kestrel serve`` model-server state and logs.
+SERVE_STATE_DIR_ENV = "KESTREL_SERVE_STATE_DIR"
+
+#: Operator override for the source project root holding anchored doctrine.
+PROJECT_ROOT_ENV = "KESTREL_PROJECT_ROOT"
+
+#: Local MPS training working directory (datasets, configs, outputs, cache).
+#: Not ``KESTREL_``-prefixed, which is why the storage-root census matches on
+#: a variable's shape, not its prefix.
+TRAINING_WORKING_DIR_ENV = "LOCAL_MPS_WORKING_DIR"
+
+#: The ``multi_agent.toml`` a host loads (see ``server.resolve_multi_agent_path``).
+#: A file, not a root, but it names every hosted agent's data and
+#: identity-export directory, so choosing it chooses where agent state lives.
+MULTI_AGENT_CONFIG_ENV = "KESTREL_MULTI_AGENT_CONFIG"
+
+#: The guarded registry: every variable that selects where host or agent
+#: runtime state lives. Each is read through :func:`runtime_path_env` (or
+#: beside a direct :func:`guard_storage_path` call), and the test harness
+#: derives its per-test pins from this tuple. ``tests/unit/test_runtime_path_census.py`` fails on a storage-root
+#: variable read anywhere in the package that is not registered here.
+RUNTIME_PATH_ENV_NAMES: tuple[str, ...] = (
+    HOME_ENV,
+    HOST_DB_PATH_ENV,
+    DERIVED_HOST_DB_PATH_ENV,
+    HOST_DB_PREVIOUS_DEFAULT_ENV,
+    HOST_DB_LEGACY_PATH_ENV,
+    AGENT_DB_PATH_ENV,
+    LEGACY_AGENT_DATA_DIR_ENV,
+    DATA_DIR_ENV,
+    IDENTITY_EXPORT_DIR_ENV,
+    PHOENIX_WORKING_DIR_ENV,
+    CACHE_DIR_ENV,
+    TRASH_DIR_ENV,
+    SERVE_STATE_DIR_ENV,
+    PROJECT_ROOT_ENV,
+    MULTI_AGENT_CONFIG_ENV,
+    TRAINING_WORKING_DIR_ENV,
+)
+
+#: Test-harness seam (#3286): ``os.pathsep``-separated roots that every
+#: resolved runtime path must lie inside. Unset in production, where the guard
+#: is a no-op. ``tests/conftest.py`` sets it to the test session's temporary
+#: roots, so spawned children inherit it. An allow-list rather than a list of
+#: operator roots: a configuration file can name any path, so the operator's
+#: roots cannot be enumerated, but the test's own can.
+STORAGE_ROOTS_ENV = "KESTREL_TEST_STORAGE_ROOTS"
+
+#: Audit event raised (PEP 578) on every refusal, so a harness can see a
+#: refusal that a broad ``except`` swallowed.
+STORAGE_PATH_REFUSED_AUDIT_EVENT = "kestrel.paths.storage_path_refused"
+
+
+class StoragePathOutsideTestRootsError(RuntimeError):
+    """A runtime path resolved outside every root the test harness allows."""
+
+    def __init__(self, path: Path, source: str) -> None:
+        self.path = path
+        self.source = source
+        super().__init__(
+            f"{source} {path} lies outside every root {STORAGE_ROOTS_ENV} "
+            f"allows; a test reached state outside its temporary roots, such "
+            f"as the operator's real runtime state (#3286)"
+        )
+
+
+def _comparable(path: Path) -> Path:
+    return Path(os.path.realpath(os.path.abspath(Path(path).expanduser())))
+
+
+def guard_storage_path(path: Path, *, source: str) -> Path:
+    """Return ``path`` unless the test harness forbids it.
+
+    Called by every resolver that turns a path-shaped variable or
+    configuration into a storage path. With :data:`STORAGE_ROOTS_ENV` unset
+    (production) it returns ``path`` untouched; set, it raises
+    :class:`StoragePathOutsideTestRootsError` unless ``path`` lies inside one
+    of the listed roots, so a test that reaches any other state fails at the
+    point of access, in-process or in a child.
+    """
+    configured = os.environ.get(STORAGE_ROOTS_ENV)
+    if configured is None:
+        return path
+    candidate = _comparable(path)
+    for entry in configured.split(os.pathsep):
+        if not entry:
+            continue
+        root = _comparable(Path(entry))
+        if candidate == root or root in candidate.parents:
+            return path
+    sys.audit(STORAGE_PATH_REFUSED_AUDIT_EVENT, str(path), source)
+    raise StoragePathOutsideTestRootsError(path, source)
+
+
+def runtime_path_env(
+    name: str,
+    default: str | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    base: Path | None = None,
+) -> str | None:
+    """Read a registered runtime-path variable through :func:`guard_storage_path`.
+
+    Exactly ``(environ or os.environ).get(name, default)``, except that a
+    non-empty result (the default included) is first checked by
+    :func:`guard_storage_path`, resolved against ``base`` (the current
+    directory by default) when relative. ``name`` must be in
+    :data:`RUNTIME_PATH_ENV_NAMES`, so the registry stays the one list.
+    Outside the test harness it is only the lookup: nothing is resolved.
+    """
+    if name not in RUNTIME_PATH_ENV_NAMES:
+        raise ValueError(f"{name} is not a registered runtime-path variable")
+    source = os.environ if environ is None else environ
+    value = source.get(name, default)
+    if value and STORAGE_ROOTS_ENV in os.environ:
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = (base or Path.cwd()) / candidate
+        guard_storage_path(candidate, source=name)
+    return value
+
+
 def host_data_dir() -> Path:
     """Resolve the dedicated host-runtime root without source discovery.
 
@@ -191,13 +353,15 @@ def host_data_dir() -> Path:
     Resolution has no filesystem side effects; each storage owner must securely
     create and validate the returned directory before writing.
     """
-    explicit_home = os.environ.get("KESTREL_HOME")
+    explicit_home = runtime_path_env(HOME_ENV)
     base = (
         Path(explicit_home).expanduser()
         if explicit_home
         else Path.home() / ".kestrel"
     )
-    return Path(os.path.abspath(base / "host-data"))
+    return guard_storage_path(
+        Path(os.path.abspath(base / "host-data")), source="host data root"
+    )
 
 
 @lru_cache(maxsize=64)
@@ -224,7 +388,10 @@ def _resolve_cached(kestrel_home: str | None, cwd_str: str) -> Path:
         # Source / editable install: parent of the package is the repo.
         return pkg.parent
 
-    fallback = Path.home() / ".kestrel"
+    # Refused before it is created: this branch makes its own directory.
+    fallback = guard_storage_path(
+        Path.home() / ".kestrel", source="project directory fallback"
+    )
     fallback.mkdir(parents=True, exist_ok=True)
     return fallback.resolve()
 

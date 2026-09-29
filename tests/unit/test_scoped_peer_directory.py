@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -24,7 +26,10 @@ from kestrel_sovereign.features.peers.directory import (
     PeerTaskConflictError,
     PeerTransportError,
 )
-from kestrel_sovereign.features.peers.feature import PeersFeature
+from kestrel_sovereign.features.peers.feature import (
+    OutboundSigningError,
+    PeersFeature,
+)
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 
@@ -506,6 +511,256 @@ async def test_local_host_cancellation_preserves_recipient_lifecycle_conflict():
 
     with pytest.raises(PeerTaskConflictError):
         await adapter.cancel_a2a_task(requester, peer, "already-terminal", {})
+
+
+@pytest.mark.asyncio
+async def test_local_task_reads_use_nonserializable_host_capabilities():
+    """Creator identity reaches local GET/SSE without a spoofable HTTP claim."""
+
+    directory_response = MagicMock(status_code=200)
+    directory_response.raise_for_status.return_value = None
+    directory_response.json.return_value = [{
+        "id": "did:local:recipient",
+        "name": "Recipient",
+        "routing_name": "current-route",
+    }]
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = directory_response
+    local_get = AsyncMock(return_value={"id": "private", "status": "completed"})
+
+    async def local_subscribe(requester, peer, task_id):
+        assert requester.identity == "did:local:creator"
+        assert peer.agent_id == "did:local:recipient"
+        assert task_id == "private"
+        yield PeerSubscriptionEvent(event="status", data='{"final":true}')
+
+    adapter = LocalHostPeerDirectory(
+        "http://local-host",
+        client_factory=lambda *args, **kwargs: client,
+        local_get=local_get,
+        local_subscribe=local_subscribe,
+    )
+    requester = PeerRequester("did:local:creator", object())
+    peer = PeerIdentity(
+        agent_id="did:local:recipient",
+        slug="recipient",
+        routing_key="current-route",
+    )
+
+    result = await adapter.get_a2a_task(requester, peer, "private")
+    events = [
+        event async for event in adapter.subscribe_a2a_task(
+            requester,
+            peer,
+            "private",
+            timeout_seconds=5,
+        )
+    ]
+
+    assert result["id"] == "private"
+    assert events[0].event == "status"
+    assert local_get.await_args.args[0] is requester
+    assert local_get.await_args.args[1].agent_id == peer.agent_id
+    assert local_get.await_args.args[1].routing_key == peer.routing_key
+    assert local_get.await_args.args[2] == "private"
+    # Two directory reauthorizations, and no serialized task read.
+    assert client.get.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_local_subscription_honors_total_deadline():
+    directory_response = MagicMock(status_code=200)
+    directory_response.raise_for_status.return_value = None
+    directory_response.json.return_value = [{
+        "id": "did:local:recipient",
+        "routing_name": "current-route",
+    }]
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = directory_response
+    stream_closed = asyncio.Event()
+
+    async def local_subscribe(_requester, _peer, _task_id):
+        try:
+            await asyncio.Event().wait()
+            yield PeerSubscriptionEvent(event="status", data="never")
+        finally:
+            stream_closed.set()
+
+    adapter = LocalHostPeerDirectory(
+        "http://local-host",
+        client_factory=lambda *args, **kwargs: client,
+        local_subscribe=local_subscribe,
+    )
+    requester = PeerRequester("did:local:creator", object())
+    peer = PeerIdentity(
+        agent_id="did:local:recipient",
+        slug="recipient",
+        routing_key="current-route",
+    )
+    started = asyncio.get_running_loop().time()
+
+    events = [
+        event async for event in adapter.subscribe_a2a_task(
+            requester,
+            peer,
+            "private",
+            timeout_seconds=0.02,
+        )
+    ]
+
+    assert events == []
+    assert asyncio.get_running_loop().time() - started < 0.2
+    assert stream_closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_local_task_read_has_no_unsigned_transport_only_http_fallback():
+    directory_response = MagicMock(status_code=200)
+    directory_response.raise_for_status.return_value = None
+    directory_response.json.return_value = [{
+        "id": "did:local:recipient",
+        "routing_name": "recipient",
+    }]
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = directory_response
+    adapter = LocalHostPeerDirectory(
+        "http://local-host",
+        transport_key="shared-host-key-is-not-a-principal",
+        client_factory=lambda *args, **kwargs: client,
+    )
+    requester = PeerRequester("did:local:creator", object())
+    peer = PeerIdentity(
+        agent_id="did:local:recipient",
+        slug="recipient",
+        routing_key="recipient",
+    )
+
+    with pytest.raises(PeerAccessDeniedError):
+        await adapter.get_a2a_task(requester, peer, "guessed-task")
+    stream = adapter.subscribe_a2a_task(
+        requester,
+        peer,
+        "guessed-task",
+        timeout_seconds=5,
+    )
+    with pytest.raises(PeerAccessDeniedError):
+        await anext(stream)
+
+    # Only directory reauthorization used HTTP; no task row was requested.
+    assert client.get.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_subprocess_task_reads_use_signed_http_principal_envelopes():
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json=[{
+                    "id": "did:local:recipient",
+                    "routing_name": "recipient-route",
+                }],
+            )
+        payload = json.loads(request.content)
+        assert payload["id"] == "private-task"
+        assert payload["metadata"]["signature"] == {"proof": "signed"}
+        if request.url.path.endswith("/read"):
+            assert payload["metadata"]["a2a_verb"] == "read_task"
+            return httpx.Response(
+                200,
+                json={"id": "private-task", "status": "completed"},
+            )
+        assert request.url.path.endswith("/subscribe")
+        assert payload["metadata"]["a2a_verb"] == "subscribe_task"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                'event: status\n'
+                'data: {"id":"private-task","final":true}\n\n'
+            ),
+        )
+
+    def payload_factory(task_id: str, verb: str):
+        return {
+            "id": task_id,
+            "sessionId": f"a2a-{verb}:{task_id}",
+            "message": {
+                "role": "user",
+                "parts": [{"type": "text", "text": f"{verb}:{task_id}"}],
+            },
+            "metadata": {
+                "sender": "did:local:creator",
+                "a2a_verb": verb,
+                "signature": {"proof": "signed"},
+            },
+        }
+
+    transport = httpx.MockTransport(handler)
+    adapter = LocalHostPeerDirectory(
+        "http://local-host",
+        transport_key="transport-key",
+        client_factory=lambda *args, **kwargs: httpx.AsyncClient(
+            *args,
+            transport=transport,
+            **kwargs,
+        ),
+        principal_payload_factory=payload_factory,
+    )
+    requester = PeerRequester("did:local:creator", object())
+    peer = PeerIdentity(
+        agent_id="did:local:recipient",
+        slug="recipient",
+        routing_key="recipient-route",
+    )
+
+    result = await adapter.get_a2a_task(requester, peer, "private-task")
+    events = [
+        event async for event in adapter.subscribe_a2a_task(
+            requester,
+            peer,
+            "private-task",
+            timeout_seconds=5,
+        )
+    ]
+
+    assert result["id"] == "private-task"
+    assert [(event.event, event.data) for event in events] == [
+        ("status", '{"id":"private-task","final":true}')
+    ]
+    assert [request.method for request in requests] == [
+        "GET", "POST", "GET", "POST"
+    ]
+    assert requests[1].url.path.endswith("/private-task/read")
+    assert requests[3].url.path.endswith("/private-task/subscribe")
+    assert all(
+        request.headers["X-Kestrel-A2A-Key"] == "transport-key"
+        for request in requests
+    )
+    assert all("X-API-Key" not in request.headers for request in requests)
+
+
+def test_subprocess_principal_payload_refuses_unsigned_identity():
+    agent = SimpleNamespace(
+        identity=None,
+        did="did:local:legacy",
+        _agent_name="legacy",
+    )
+    feature = PeersFeature(agent)
+    feature._own_name = "legacy"
+
+    with pytest.raises(OutboundSigningError) as exc_info:
+        feature._build_principal_action_payload("private-task", "read_task")
+    assert exc_info.value.code == "principal_signature_required"
 
 
 @pytest.mark.asyncio

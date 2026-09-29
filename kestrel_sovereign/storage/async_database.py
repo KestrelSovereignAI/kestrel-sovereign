@@ -8,8 +8,10 @@ import asyncio
 import hashlib
 import logging
 import re
-from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, Set, Tuple
+import sqlite3
+from contextlib import asynccontextmanager, closing
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from .db import (
     ConnectionError,
@@ -38,6 +40,38 @@ logger = logging.getLogger(__name__)
 
 
 _BACKFILL_LOCK_DOMAIN = b"kestrel:schema-backfill-lock:v1\0"
+
+
+async def _close_failed_database_initialization(db: "AsyncDatabase") -> None:
+    """Finish closing an owned backend even if its caller is cancelled again."""
+
+    cleanup = asyncio.create_task(
+        db.close(), name="failed-database-initialization-cleanup"
+    )
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+        except Exception:  # noqa: BLE001 - inspect and log below
+            # The task is now complete with an error.  Do not let a secondary
+            # close failure replace the schema-initialization failure whose
+            # cleanup brought us here; the final await below records it.
+            continue
+    try:
+        await cleanup
+    except asyncio.CancelledError:
+        cancelled = True
+    except Exception as close_exc:  # noqa: BLE001 - preserve initialization error
+        logger.warning(
+            "Could not close backend after database initialization failed: %s",
+            close_exc,
+        )
+    if cancelled:
+        raise asyncio.CancelledError()
+
 
 #: ``(name, table, columns)`` of the index that makes the #2959 projection worth
 #: having — Phase C lists an agent's sessions newest-activity-first.
@@ -484,8 +518,9 @@ CREATE INDEX IF NOT EXISTS idx_user_byok_keys_agent ON user_byok_service_keys(ag
 CREATE INDEX IF NOT EXISTS idx_user_byok_keys_provider ON user_byok_service_keys(provider_id);
 
 -- Host (operator) master credentials for the HOST_MASTER_PROVISIONED
--- payer-policy path. Single host per deployment. Sponsor and
--- user-master variants are modeled separately if/when needed. See
+-- payer-policy path. Single host per deployment. The user-master and
+-- sponsor variants follow. All three are written through
+-- kestrel_sovereign.security.principal_master_key_store. See
 -- kestrel_sovereign.security.host_key_storage.HostKeyStorage.
 CREATE TABLE IF NOT EXISTS host_service_keys (
     id TEXT PRIMARY KEY,
@@ -751,6 +786,12 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     -- rewritten at harvest time, so it answers "when did we last look", not
     -- "when did we try" — a difference measured at 41 minutes live.
     last_attempt_started_at TIMESTAMP,
+    -- A wake whose cognition could not run because the model provider named
+    -- its own retry time (#3302) is parked until then instead of spending
+    -- delivery attempts inside that window. NULL when nothing is parked.
+    delivery_deferred_until TIMESTAMP,
+    -- How many times this transition's wake was parked that way.
+    delivery_deferrals INTEGER NOT NULL DEFAULT 0,
     pending_signal_id TEXT,
     pending_signaled_target TEXT,
     pending_signal_enqueued_at TIMESTAMP,
@@ -831,19 +872,40 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_agent
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_status
   ON graph_nodes(json_extract(properties, '$.status'))
   WHERE node_type = 'action_item';
-CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created
-  ON graph_nodes(json_extract(properties, '$.created_at'))
-  WHERE node_type = 'action_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_status
   ON graph_nodes(json_extract(properties, '$.status'))
   WHERE node_type = 'todo_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_scope
   ON graph_nodes(json_extract(properties, '$.scope'))
   WHERE node_type = 'todo_item';
-CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_created
-  ON graph_nodes(json_extract(properties, '$.created_at'))
-  WHERE node_type = 'todo_item';
 """
+
+#: The two created-at partial indexes on ``graph_nodes``, as (index family,
+#: node_type). They are NOT in the DDL blocks beside this: their definition is
+#: computed per backend and goes through ``ensure_index``, which fingerprints
+#: the name, serializes initializers, creates before it retires, and retires
+#: the bare legacy index as a member of the same family (#3255).
+_GRAPH_CREATED_AT_INDEXES = (
+    ("idx_graph_nodes_action_created", "action_item"),
+    ("idx_graph_nodes_todo_created", "todo_item"),
+)
+
+
+def graph_created_at_index_columns(backend_type: str) -> str:
+    """The created-at index expression that matches the created-ordered
+    graph query (``ORDER BY created_at DESC NULLS LAST``) on ``backend_type``.
+
+    On Postgres a plain ``ORDER BY expr DESC`` is DESC NULLS FIRST, which a
+    backward scan of an ASC index serves, but ``DESC NULLS LAST`` matches
+    neither direction of that index and the planner falls back to a
+    sequential scan (measured at 200k rows: 0.04 ms to 122 ms), so the index
+    is stored DESC NULLS LAST. SQLite's DESC is already NULLS LAST and its
+    ``CREATE INDEX`` rejects a NULLS clause, so its expression carries none.
+    """
+    if backend_type == "postgres":
+        return "((properties::jsonb->>'created_at')) DESC NULLS LAST"
+    return "json_extract(properties, '$.created_at')"
+
 
 _POSTGRES_JSON_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_agent
@@ -851,17 +913,11 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_agent
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_status
   ON graph_nodes((properties::jsonb->>'status'))
   WHERE node_type = 'action_item';
-CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created
-  ON graph_nodes((properties::jsonb->>'created_at'))
-  WHERE node_type = 'action_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_status
   ON graph_nodes((properties::jsonb->>'status'))
   WHERE node_type = 'todo_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_scope
   ON graph_nodes((properties::jsonb->>'scope'))
-  WHERE node_type = 'todo_item';
-CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_created
-  ON graph_nodes((properties::jsonb->>'created_at'))
   WHERE node_type = 'todo_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
   ON graph_nodes USING GIN ((properties::jsonb));
@@ -928,6 +984,44 @@ def core_schema_sql(backend_type: str) -> str:
     )
 
 
+def validate_sqlite_core_schema_readiness(db_path: str | Path) -> None:
+    """Prove core host schema DDL can initialize without mutating the store.
+
+    ``CREATE TABLE IF NOT EXISTS`` accepts an existing table without checking
+    its columns; a later mandatory index statement then fails startup. Clone a
+    consistent read-only snapshot into memory and run the same core DDL there,
+    so Doctor detects that incompatibility while leaving live custody bytes
+    untouched. An absent database remains a valid first-boot target.
+    """
+
+    database = Path(db_path).expanduser().resolve(strict=False)
+    if not database.exists():
+        return
+    # Match Hold's diagnostic-open contract.  Opening a lone WAL in read-only
+    # mode can still create the missing shared-memory sidecar.  Reject the
+    # incomplete pair before SQLite is called so Doctor remains non-mutating.
+    wal_present = Path(f"{database}-wal").exists()
+    shm_present = Path(f"{database}-shm").exists()
+    if wal_present != shm_present:
+        raise ValueError(
+            "SQLite core host schema cannot be inspected with an incomplete "
+            "WAL sidecar pair"
+        )
+    flags = "mode=ro" if wal_present else "mode=ro&immutable=1"
+    try:
+        with closing(
+            sqlite3.connect(f"{database.as_uri()}?{flags}", uri=True)
+        ) as source, closing(sqlite3.connect(":memory:")) as snapshot:
+            source.execute("PRAGMA query_only = ON")
+            source.backup(snapshot)
+            snapshot.executescript(core_schema_sql("sqlite"))
+            snapshot.executescript(_SQLITE_JSON_INDEXES)
+    except sqlite3.Error as exc:
+        raise ValueError(
+            f"SQLite core host schema cannot initialize: {exc}"
+        ) from exc
+
+
 class AsyncDatabase:
     """
     Async database manager supporting SQLite and PostgreSQL.
@@ -953,6 +1047,46 @@ class AsyncDatabase:
         # dialect-specific connection retirement have completed.
         self._sovereign_sqla_factory = None
         self._sovereign_sqla_retirement_owner = None
+
+    @classmethod
+    async def from_connected_backend(
+        cls,
+        backend: DatabaseBackend,
+        *,
+        initialization_guard: Any = None,
+        schema_initializer: Optional[
+            Callable[["AsyncDatabase"], Awaitable[None]]
+        ] = None,
+    ) -> "AsyncDatabase":
+        """Take ownership of a connected backend and initialize its schema.
+
+        Callers that must inspect a specific connected pool before any schema
+        mutation use this boundary rather than discarding that pool and opening
+        a second one through :meth:`postgres`. ``initialization_guard`` may be
+        an async context manager that serializes the first schema publication;
+        it is exited before failure cleanup closes the owned backend. A narrow
+        subsystem may supply ``schema_initializer`` when the connected database
+        intentionally carries only that subsystem's schema; the default remains
+        the complete Kestrel core initializer.
+        """
+
+        db = cls(backend)
+        initialize_schema = (
+            db._init_schema
+            if schema_initializer is None
+            else lambda: schema_initializer(db)
+        )
+        try:
+            if initialization_guard is None:
+                await initialize_schema()
+            else:
+                async with initialization_guard:
+                    await initialize_schema()
+        except BaseException:
+            await _close_failed_database_initialization(db)
+            raise
+        db._initialized = True
+        return db
     
     @classmethod
     async def create(cls, config: Optional[Dict[str, Any]] = None) -> "AsyncDatabase":
@@ -967,31 +1101,35 @@ class AsyncDatabase:
             Connected AsyncDatabase instance
         """
         backend = await get_backend(config)
-        db = cls(backend)
-        await db._init_schema()
-        db._initialized = True
-        return db
+        return await cls.from_connected_backend(backend)
     
     @classmethod
     async def sqlite(cls, db_path: str) -> "AsyncDatabase":
         """Create SQLite database at given path."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
-        db = cls(backend)
-        await db._init_schema()
-        db._initialized = True
+        db = await cls.from_connected_backend(backend)
         logger.info(f"SQLite database connected: {db_path}")
         return db
     
     @classmethod
-    async def postgres(cls, dsn: str) -> "AsyncDatabase":
-        """Create PostgreSQL database with given DSN."""
+    async def postgres(
+        cls,
+        dsn: str,
+        *,
+        min_pool_size: int = 2,
+        max_pool_size: int = 10,
+    ) -> "AsyncDatabase":
+        """Create a PostgreSQL database with an explicitly bounded pool."""
         from .db.postgres import PostgresBackend
-        backend = PostgresBackend(dsn=dsn)
+
+        backend = PostgresBackend(
+            dsn=dsn,
+            min_pool_size=min_pool_size,
+            max_pool_size=max_pool_size,
+        )
         await backend.connect()
-        db = cls(backend)
-        await db._init_schema()
-        db._initialized = True
+        db = await cls.from_connected_backend(backend)
         logger.info("PostgreSQL database connected")
         return db
 
@@ -1043,6 +1181,19 @@ class AsyncDatabase:
     def backend_type(self) -> str:
         """Get backend type: 'sqlite' or 'postgres'."""
         return self._backend.backend_type
+
+    @property
+    def nested_transaction_strategy(self) -> str | None:
+        """How this backend isolates a same-task nested transaction.
+
+        ``savepoint`` means an inner failure rolls back independently;
+        ``joined`` means the inner scope shares its caller's transaction and
+        must compensate any partial work before propagating an error.
+        Unknown backends return ``None`` so durability-sensitive callers fail
+        closed instead of guessing from a backend name.
+        """
+        strategy = getattr(self._backend, "nested_transaction_strategy", None)
+        return strategy if strategy in {"savepoint", "joined"} else None
     
     async def _init_schema(self) -> None:
         """Create database tables if they don't exist."""
@@ -1067,6 +1218,17 @@ class AsyncDatabase:
             statement = statement.strip()
             if statement:
                 await self._backend.execute(statement)
+        # The created-at partial indexes go through ensure_index: the bare
+        # DDL above is idempotent in sequence but not in parallel, and the
+        # definition is computed per backend, so the fingerprinted name is
+        # what tells a changed ordering from the index that served the old
+        # one (#3255).
+        created_at_columns = graph_created_at_index_columns(self.backend_type)
+        for family, node_type in _GRAPH_CREATED_AT_INDEXES:
+            await self.ensure_index(
+                family, "graph_nodes", created_at_columns,
+                where=f"node_type = '{node_type}'",
+            )
 
         # Cache-effectiveness observability (#3019). Existing model_usage
         # databases predate these provider-reported counters, so the greenfield
@@ -1270,6 +1432,15 @@ class AsyncDatabase:
         )
         await self._migrate_add_column(
             "wait_signal_state", "last_attempt_started_at", "TIMESTAMP"
+        )
+        # Provider-advised deferral (#3302), same reasoning again. Legacy rows
+        # read as "nothing parked, never deferred", which is true of them.
+        await self._migrate_add_column(
+            "wait_signal_state", "delivery_deferred_until", "TIMESTAMP"
+        )
+        await self._migrate_add_column(
+            "wait_signal_state", "delivery_deferrals",
+            "INTEGER NOT NULL DEFAULT 0",
         )
         # Both indexes go through ``ensure_index`` rather than a bare
         # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
@@ -3057,6 +3228,17 @@ class AsyncDatabase:
             return False
         return _collapse_ws(expression) in _collapse_ws(row[0])
 
+    async def rebuild_sqlite_table(self, table: str, canonical_ddl: str) -> None:
+        """Rebuild ``table`` from ``canonical_ddl`` inside the caller's lock.
+
+        For a schema owner that changes a SQLite constraint no ``ALTER`` can
+        reach. The caller must already hold its ``migration_lock`` transaction.
+        """
+
+        if self.backend_type != "sqlite":
+            raise RuntimeError("rebuild_sqlite_table is SQLite-only")
+        await self._sqlite_rebuild_table(table, canonical_ddl)
+
     async def _sqlite_rebuild_table(self, table: str, canonical_ddl: str) -> None:
         """Rebuild a SQLite table into its canonical shape, preserving rows.
 
@@ -3233,6 +3415,27 @@ class AsyncDatabase:
             )
         return bool(row) and not bool(row[0])
 
+    async def _column_has_default(self, table: str, column: str) -> bool:
+        """Whether ``table.column`` has a database-side default.
+
+        An absent column returns ``False``. PostgreSQL resolves the same
+        search-path relation as unqualified DDL via ``to_regclass``; SQLite
+        reports the live default through ``pragma_table_info``.
+        """
+        if self.backend_type == "postgres":
+            row = await self._backend.fetch_one(
+                "SELECT atthasdef FROM pg_attribute "
+                "WHERE attrelid = to_regclass(?) AND attname = ? "
+                "AND attnum > 0 AND NOT attisdropped",
+                (table, column),
+            )
+            return bool(row and row[0])
+        row = await self._backend.fetch_one(
+            f"SELECT dflt_value FROM pragma_table_info('{table}') "
+            f"WHERE name='{column}'"
+        )
+        return bool(row and row[0] is not None)
+
     # ─────────────────────────────────────────────────────────────────
     # Query methods - delegate to backend
     # ─────────────────────────────────────────────────────────────────
@@ -3315,6 +3518,26 @@ class AsyncDatabase:
     async def table_exists(self, table_name: str) -> bool:
         """Check if a table exists."""
         return await self._backend.table_exists(table_name)
+
+    async def column_exists(self, table_name: str, column_name: str) -> bool:
+        """Check whether a column exists using backend-safe catalog lookup."""
+        return await self._column_exists(table_name, column_name)
+
+    async def column_accepts_null(self, table_name: str, column_name: str) -> bool:
+        """Check whether an existing column accepts NULL.
+
+        Returns ``False`` when the column is absent. Callers that must
+        distinguish an absent column from a NOT NULL column must first call
+        :meth:`column_exists`.
+        """
+        return await self._column_accepts_null(table_name, column_name)
+
+    async def column_has_default(self, table_name: str, column_name: str) -> bool:
+        """Check whether an existing column has a database-side default.
+
+        Returns ``False`` when the column is absent.
+        """
+        return await self._column_has_default(table_name, column_name)
 
     async def table_exists_diagnostic(self, table_name: str) -> bool:
         """Check schema state without waiting on SQLite cleanup."""

@@ -283,6 +283,19 @@ permission. Removing an agent revokes that authority under the same per-DID
 lifecycle lock used for a cold wake, so a due occurrence cannot resurrect an
 administratively removed tenant. Every cold registration also receives the
 same app-owned A2A, feature-route, and asset onboarding as an autostart agent.
+
+Large hosts need not materialize the complete tenant fleet. They can pass an
+empty fixed scope plus `authorized_agent_ids_page_provider(after, limit)`, a
+positive `authorized_agent_ids_page_size`, and `is_agent_authorized(agent_id)`.
+The page provider must return unique DIDs in ascending keyset order, strictly
+after `after`, and no more than `limit` values. The runner uses only one page
+for rollout reconciliation, due selection, runtime status, and claim
+membership, then advances the cursor only after that batch completes. An empty
+page wraps the next batch to the start. Cancellation retries the uncommitted
+page, while the required live callback makes removal between selection and a
+rollout or claim effect fail closed. The legacy full-snapshot provider remains
+available for small fleets and compatibility.
+
 Protocol failures and unresolved scheduler identities are safety outages: they
 are latched into public readiness as a sanitized HTTP 503, with detailed
 diagnostics exposed only through the authenticated readiness surface.

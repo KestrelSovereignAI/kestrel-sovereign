@@ -23,6 +23,7 @@ from kestrel_sovereign.security.exceptions import (
     KeyNotConfiguredError,
 )
 from kestrel_sovereign.storage.db.interface import QueryError
+from kestrel_sovereign.storage.timestamps import timestamp_column_value
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -53,9 +54,7 @@ def _as_datetime(value: Any) -> datetime:
     """
     if value is None:
         return datetime.utcnow()
-    if isinstance(value, datetime):
-        return value
-    return datetime.fromisoformat(value)
+    return timestamp_column_value(value)
 
 
 # Exception classes imported from kestrel_sovereign.security.exceptions

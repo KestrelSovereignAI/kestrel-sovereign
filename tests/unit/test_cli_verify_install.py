@@ -402,3 +402,41 @@ def test_run_streaming_does_not_capture(monkeypatch):
     assert rc == 0
     assert "capture_output" not in captured_kwargs
     assert captured_kwargs.get("check") is False
+
+
+def test_verify_server_pins_host_control_state_inside_agent_sandbox(
+    monkeypatch,
+    tmp_path,
+):
+    """The clean-install server must never open the operator's live Hold DB."""
+
+    from kestrel_sovereign import cli_verify_install as mod
+
+    captured = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setenv("KESTREL_HOST_DB_PATH", "/srv/live/host-features.db")
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://primary/live")
+    monkeypatch.setenv(
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+        "postgresql://evidence/live",
+    )
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "postgres")
+    monkeypatch.setattr(mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(mod, "_is_windows", lambda: False)
+    agent_dir = tmp_path / "agent"
+
+    mod._start_uvicorn(tmp_path / "venv", tmp_path / "repo", 18548, agent_dir)
+
+    assert captured["env"]["KESTREL_HOST_DB_PATH"] == str(
+        agent_dir / "host-data" / "host-features.db"
+    )
+    assert captured["env"]["KESTREL_DB_BACKEND"] == "sqlite"
+    assert "KESTREL_DATABASE_URL" not in captured["env"]
+    assert "KESTREL_HOLD_EVIDENCE_DATABASE_URL" not in captured["env"]
+    assert "KESTREL_HOLD_BACKEND" not in captured["env"]

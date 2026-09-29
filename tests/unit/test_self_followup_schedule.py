@@ -888,6 +888,7 @@ def test_scheduler_execution_scope_capture_preserves_revocation():
     to -- a stale key is worse than no key, because it looks authoritative.
     """
     from kestrel_sovereign.features.scheduler.runner import (
+        SchedulerAuthorityRevoked,
         _SchedulerExecutionScope,
         bind_scheduler_execution_scope,
         get_current_scheduler_execution,
@@ -899,9 +900,11 @@ def test_scheduler_execution_scope_capture_preserves_revocation():
     with bind_scheduler_execution_scope(scope):
         assert get_current_scheduler_execution() is execution
         scope.active = False
-        assert get_current_scheduler_execution() is None, (
-            "a revoked scope must stop yielding an execution identity"
-        )
+        # A revoked scope refuses loudly rather than reading as "not scheduler
+        # work", so the re-bound task can neither use the stale key nor
+        # proceed as if it were interactive.
+        with pytest.raises(SchedulerAuthorityRevoked):
+            get_current_scheduler_execution()
 
 
 def test_legacy_schedule_mutating_refusal_is_structured():

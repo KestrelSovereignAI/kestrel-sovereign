@@ -152,7 +152,7 @@ async def test_hybrid_signer_exception_aborts_every_dispatch_without_http(
     identity, _, _ = _hybrid_identity()
     feature = _feature(identity)
     feature._host_url = "http://multi-agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = "emma"
     client_factory = MagicMock()
 
@@ -185,7 +185,7 @@ async def test_hybrid_signing_failure_cannot_retry_as_unsigned():
     identity, _, _ = _hybrid_identity()
     feature = _feature(identity)
     feature._host_url = "http://multi-agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = "emma"
     client_factory = MagicMock()
 
@@ -214,7 +214,7 @@ async def test_public_hybrid_dispatch_posts_envelope_verifying_both_halves():
     identity, _, vms = _hybrid_identity()
     feature = _feature(identity)
     feature._host_url = "http://multi-agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = "emma"
     # A volatile rename changes the legacy public display identity, but a
     # hybrid envelope must retain its signing DID as the authenticated sender.

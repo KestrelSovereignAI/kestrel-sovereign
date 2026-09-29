@@ -263,7 +263,7 @@ class CloudRunProvider(DeployProvider):
             # the freshly-created service returns 401 to public traffic
             # and the app's OAuth flow / /health endpoint can't be
             # reached. Codex review on PR #1064 caught the regression.
-            await self._allow_unauthenticated(client, service_path)
+            iam_warning = await self._allow_unauthenticated(client, service_path)
 
             # Get service URL
             service_url = result.uri
@@ -274,6 +274,8 @@ class CloudRunProvider(DeployProvider):
                 "service_url": service_url,
                 "revision": result.latest_ready_revision,
                 "status": "active",
+                "operation": "update" if is_update else "create",
+                "warnings": [iam_warning] if iam_warning else [],
             }
 
         except ImportError as e:
@@ -282,7 +284,7 @@ class CloudRunProvider(DeployProvider):
             logger.error(f"Deployment failed: {e}", exc_info=True)
             raise DeployManagerError(f"Deployment failed: {e}") from e
 
-    async def _allow_unauthenticated(self, client, service_path: str) -> None:
+    async def _allow_unauthenticated(self, client, service_path: str) -> Optional[str]:
         """Bind ``allUsers`` to ``roles/run.invoker`` on the service.
 
         Equivalent to ``gcloud run deploy --allow-unauthenticated``,
@@ -292,10 +294,16 @@ class CloudRunProvider(DeployProvider):
         for new services or services recreated after teardown.
 
         We fetch the current IAM policy, add the binding only if it's
-        not already present (idempotent), and set it back. Logs at
-        WARNING if the operation fails so the deploy itself doesn't
-        regress on transient IAM API errors — the operator can grant
-        the role manually as a backstop.
+        not already present (idempotent), and set it back. A failure is
+        logged and returned as a warning rather than raised so the deploy
+        itself doesn't regress on transient IAM API errors — the operator
+        can grant the role manually as a backstop. That is safe only
+        because the manager's readiness gate probes the service
+        unauthenticated afterwards: a missing binding surfaces there as an
+        unready deploy, not as success.
+
+        Returns:
+            None when the binding is in place, else a warning message.
         """
         try:
             from google.iam.v1 import iam_policy_pb2
@@ -309,7 +317,7 @@ class CloudRunProvider(DeployProvider):
             )
             if already_set:
                 logger.debug("allUsers already has run.invoker; no IAM change needed")
-                return
+                return None
 
             policy.bindings.add(
                 role="roles/run.invoker",
@@ -323,17 +331,27 @@ class CloudRunProvider(DeployProvider):
                 f"Granted allUsers run.invoker on {service_path} "
                 f"(equivalent to --allow-unauthenticated)"
             )
+            return None
         except ImportError as e:  # protobuf module missing
             logger.warning(
                 "Could not import google.iam.v1 — skipping "
                 f"allUsers/run.invoker binding: {e}. The service may "
                 "require manual IAM granting before public traffic works."
             )
+            return (
+                "allUsers/run.invoker was not granted (google.iam.v1 is not "
+                "installed); the service may reject public traffic"
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "Failed to grant allUsers/run.invoker (the service is "
                 "deployed but may not accept public traffic until you "
                 f"run `gcloud run services add-iam-policy-binding`): {e}"
+            )
+            return (
+                f"allUsers/run.invoker could not be granted ({type(e).__name__}); "
+                "the service may reject public traffic until you run "
+                "`gcloud run services add-iam-policy-binding`"
             )
 
     async def get_status(self, service_name: str) -> Dict[str, Any]:

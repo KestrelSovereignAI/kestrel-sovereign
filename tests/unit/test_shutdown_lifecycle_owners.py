@@ -1,4 +1,14 @@
-"""Production shutdown callers retain deferred durable cleanup ownership."""
+"""Production shutdown callers retain deferred durable cleanup ownership.
+
+Observation bounds in this module are deliberately generous (30s). The
+SHUTDOWN_TIMEOUT values these tests patch are tiny ON PURPOSE -- forcing the
+shutdown deadline to expire and then proving completion is still joined is the
+property under test. The test's own ``wait_for`` bounds are a different thing:
+they only decide how long we watch for a result, and under ``-n auto`` a
+one-second budget expired on scheduling delay rather than on the behavior.
+A genuine regression never reaches the barrier at all, so a larger ceiling
+costs patience, not coverage.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +26,7 @@ from fastapi import FastAPI, HTTPException
 from starlette.routing import Mount, Route
 
 from kestrel_sovereign import cli, main, server
+from kestrel_sovereign.inception_service import generate_secp256k1_keypair
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
     await_agent_shutdown_completion,
@@ -32,6 +43,7 @@ from kestrel_sovereign.spawn.delegated_wallet import (
     BudgetExceededError,
     DelegatedWallet,
 )
+from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
 from kestrel_sovereign.spawn.mandate import SpawnMandate
 
 
@@ -187,7 +199,7 @@ class _LateStartingPhoenixSupervisor:
     def start(self, *, wait_for_health: bool = False) -> bool:
         assert wait_for_health is False
         self.start_entered.set()
-        assert self.allow_start.wait(timeout=1.0)
+        assert self.allow_start.wait(timeout=30.0)
         self.started = True
         return True
 
@@ -210,13 +222,13 @@ class _LateStartingPhoenixSupervisor:
 async def test_completion_join_survives_repeated_cancellation() -> None:
     agent = _DeferredShutdownAgent()
     join = asyncio.create_task(await_agent_shutdown_completion(agent))
-    await asyncio.wait_for(agent.completion_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(agent.completion_entered.wait(), timeout=30.0)
     join.cancel()
     await asyncio.sleep(0)
     join.cancel()
     agent.allow_completion.set()
 
-    assert await asyncio.wait_for(join, timeout=1.0) is True
+    assert await asyncio.wait_for(join, timeout=30.0) is True
     assert agent.completion_calls == 1
 
 
@@ -232,14 +244,14 @@ async def test_completion_join_classifies_simultaneous_owned_and_caller_cancella
 
     owned = asyncio.create_task(owned_work())
     join = asyncio.create_task(await_lifecycle_task_completion(owned))
-    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    await asyncio.wait_for(entered.wait(), timeout=30.0)
 
     # Same event-loop turn: this was previously reported as only owned-task
     # cancellation, allowing lifecycle callers to swallow their own signal.
     owned.cancel()
     join.cancel()
 
-    cancelled, failure = await asyncio.wait_for(join, timeout=1.0)
+    cancelled, failure = await asyncio.wait_for(join, timeout=30.0)
     assert cancelled is True
     assert isinstance(failure, asyncio.CancelledError)
 
@@ -257,11 +269,11 @@ async def test_completion_join_returns_a_live_owned_task_failure() -> None:
 
     owned = asyncio.create_task(owned_work())
     join = asyncio.create_task(await_lifecycle_task_completion(owned))
-    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    await asyncio.wait_for(entered.wait(), timeout=30.0)
     assert not join.done()
 
     release_failure.set()
-    cancelled, failure = await asyncio.wait_for(join, timeout=1.0)
+    cancelled, failure = await asyncio.wait_for(join, timeout=30.0)
 
     assert cancelled is False
     assert isinstance(failure, RuntimeError)
@@ -281,14 +293,14 @@ async def test_completion_join_preserves_repeated_cancellation_with_owned_failur
 
     owned = asyncio.create_task(owned_work())
     join = asyncio.create_task(await_lifecycle_task_completion(owned))
-    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    await asyncio.wait_for(entered.wait(), timeout=30.0)
 
     join.cancel()
     await asyncio.sleep(0)
     join.cancel()
     release_failure.set()
 
-    cancelled, failure = await asyncio.wait_for(join, timeout=1.0)
+    cancelled, failure = await asyncio.wait_for(join, timeout=30.0)
     assert cancelled is True
     assert isinstance(failure, RuntimeError)
     assert str(failure) == "owned failure after caller cancellation"
@@ -311,7 +323,7 @@ async def test_completion_join_propagates_grouped_process_control_after_cancella
     )
 
     with pytest.raises(BaseExceptionGroup) as exc_info:
-        await asyncio.wait_for(join, timeout=1.0)
+        await asyncio.wait_for(join, timeout=30.0)
     assert len(exc_info.value.exceptions) == 1
     assert isinstance(exc_info.value.exceptions[0], GeneratorExit)
 
@@ -353,16 +365,32 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
         phases.append("phoenix")
         return False
 
+    async def finish_stop_receipts(_app) -> None:
+        phases.append("stop-receipts")
+
+    async def finish_stop_cleanup(_app) -> None:
+        phases.append("stop-cleanup")
+
     monkeypatch.setattr(server, "_shutdown_host_features", fail_host)
     monkeypatch.setattr(server, "_shutdown_server_agents", fail_agents)
+    monkeypatch.setattr(server, "_shutdown_stop_cleanup", finish_stop_cleanup)
+    monkeypatch.setattr(server, "_shutdown_stop_receipts", finish_stop_receipts)
     monkeypatch.setattr(server, "_shutdown_phoenix", finish_phoenix)
 
     cancelled, failure = await server._shutdown_server_resources(app)
 
-    assert phases == ["host", "agents", "phoenix"]
+    # Stop tails drain while their agents and the host-owned Hold context are
+    # still live. Agents drain next; only then may host features close Hold.
+    assert phases == [
+        "stop-cleanup",
+        "agents",
+        "host",
+        "stop-receipts",
+        "phoenix",
+    ]
     assert cancelled is False
     assert isinstance(failure, RuntimeError)
-    assert str(failure) == "host failure"
+    assert str(failure) == "agent failure"
 
 
 @pytest.mark.asyncio
@@ -469,7 +497,7 @@ async def test_host_scheduler_drains_cold_onboarding_before_feature_unmount(
         events.append("cold_onboarding_remounted")
 
     onboarding = asyncio.create_task(cold_onboarding_remount())
-    await asyncio.wait_for(onboarding_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(onboarding_entered.wait(), timeout=30.0)
 
     class _DrainingRunner:
         def __init__(self) -> None:
@@ -503,11 +531,11 @@ async def test_host_scheduler_drains_cold_onboarding_before_feature_unmount(
     monkeypatch.setattr(server, "_shutdown_host_features", host_feature_teardown)
 
     shutdown = asyncio.create_task(server._shutdown_server_resources(app))
-    await asyncio.wait_for(runner.stop_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(runner.stop_entered.wait(), timeout=30.0)
     assert "host_features_unmounted" not in events
 
     release_onboarding.set()
-    cancelled, failure = await asyncio.wait_for(shutdown, timeout=1.0)
+    cancelled, failure = await asyncio.wait_for(shutdown, timeout=30.0)
 
     assert cancelled is False
     assert failure is None
@@ -539,13 +567,13 @@ async def test_phoenix_cleanup_survives_repeated_cancellation() -> None:
     app.state.phoenix_task = supervisor_task
 
     shutdown = asyncio.create_task(server._shutdown_phoenix(app))
-    await asyncio.wait_for(supervisor.close_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(supervisor.close_entered.wait(), timeout=30.0)
     shutdown.cancel()
     await asyncio.sleep(0)
     shutdown.cancel()
     supervisor.allow_close.set()
 
-    assert await asyncio.wait_for(shutdown, timeout=1.0) is True
+    assert await asyncio.wait_for(shutdown, timeout=30.0) is True
     assert supervisor_task.cancelled()
     assert supervisor.stopped is True
     assert app.state.phoenix_task is None
@@ -586,7 +614,7 @@ async def test_phoenix_shutdown_joins_late_executor_start_before_stop() -> None:
     assert supervisor.stopped is False
 
     supervisor.allow_start.set()
-    assert await asyncio.wait_for(shutdown, timeout=1.0) is False
+    assert await asyncio.wait_for(shutdown, timeout=30.0) is False
     assert supervisor.stopped is True
     assert supervisor.started_when_stopped is True
     assert app.state.phoenix_start_task is None
@@ -632,11 +660,11 @@ async def test_lifespan_cancellation_at_yield_runs_every_teardown_phase(
             await never.wait()
 
     task = asyncio.create_task(run_lifespan())
-    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    await asyncio.wait_for(entered.wait(), timeout=30.0)
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(task, timeout=30.0)
     assert manager.shutdown_calls == 1
     assert supervisor.close_entered.is_set()
     assert supervisor.stopped is True
@@ -705,11 +733,23 @@ async def test_lifespan_reaps_phoenix_after_agent_manager_cancellation(
     class _CancelledManager:
         init_failures = []
 
+        def reconcile_spawn_authority_restart_roster(self, config):
+            return config
+
+        def bind_hold_store(self, store) -> None:
+            assert store is not None
+
         def set_agent_registration_hook(self, _hook) -> None:
             return None
 
-        async def load_from_config(self, config) -> int:
+        async def load_from_config(
+            self,
+            config,
+            *,
+            restart_roster_reconciled,
+        ) -> int:
             assert config is fake_config
+            assert restart_roster_reconciled is True
             return 0
 
         def list_agents(self):
@@ -769,11 +809,29 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
             self._agents = {"already-loaded": loaded_agent}
             self.shutdown_calls = 0
 
+        def reconcile_spawn_authority_restart_roster(self, config):
+            return config
+
+        def set_created_agent_persistence_hook(self, _hook) -> None:
+            return None
+
+        def set_created_agent_registration_removal_hook(self, _hook) -> None:
+            return None
+
+        def bind_hold_store(self, store) -> None:
+            assert store is not None
+
         def set_agent_registration_hook(self, _hook) -> None:
             return None
 
-        async def load_from_config(self, config) -> int:
+        async def load_from_config(
+            self,
+            config,
+            *,
+            restart_roster_reconciled,
+        ) -> int:
             assert config is fake_config
+            assert restart_roster_reconciled is True
             return 1
 
         def list_agents(self):
@@ -786,6 +844,7 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
 
     manager = _Manager()
     monkeypatch.setenv("KESTREL_MULTI_AGENT", "1")
+    monkeypatch.setenv("KESTREL_API_KEY", "shutdown-host-test-key")
     monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
     monkeypatch.setattr(server, "resolve_multi_agent_path", lambda _env: config_path)
     monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *_a, **_k: fake_config)
@@ -849,13 +908,13 @@ async def test_host_scheduler_cancellation_closes_storage_published_before_initi
     )
 
     startup = asyncio.create_task(server._start_host_scheduler(app, manager, object()))
-    await asyncio.wait_for(entered_initialize.wait(), timeout=1.0)
+    await asyncio.wait_for(entered_initialize.wait(), timeout=30.0)
     assert app.state.host_scheduler_storage is storage_instances[0]
     assert app.state.host_scheduler_runner is None
 
     startup.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(startup, timeout=1.0)
+        await asyncio.wait_for(startup, timeout=30.0)
 
     assert storage_instances[0].closed is True
     assert app.state.host_scheduler_storage is None
@@ -1059,11 +1118,11 @@ async def test_server_timeout_keeps_lifecycle_owner_until_completion(monkeypatch
     monkeypatch.setattr(server, "SHUTDOWN_TIMEOUT", 0.01)
 
     shutdown = asyncio.create_task(server._shutdown_single_agent(agent))
-    await asyncio.wait_for(agent.completion_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(agent.completion_entered.wait(), timeout=30.0)
     assert not shutdown.done()
 
     agent.allow_completion.set()
-    await asyncio.wait_for(shutdown, timeout=1.0)
+    await asyncio.wait_for(shutdown, timeout=30.0)
     assert agent.shutdown_calls == 1
     assert agent.completion_calls == 1
 
@@ -1079,10 +1138,10 @@ async def test_main_timeout_joins_completion_before_returning(tmp_path, monkeypa
     monkeypatch.setattr("builtins.input", lambda _prompt: "!quit")
 
     task = asyncio.create_task(main.main())
-    await asyncio.wait_for(agent.completion_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(agent.completion_entered.wait(), timeout=30.0)
     assert not task.done()
     agent.allow_completion.set()
-    await asyncio.wait_for(task, timeout=1.0)
+    await asyncio.wait_for(task, timeout=30.0)
     assert agent.completion_calls == 1
 
 
@@ -1107,10 +1166,10 @@ async def test_cli_shell_timeout_joins_completion_before_returning(
     task = asyncio.create_task(
         cli._run_shell(Path(tmp_path), SimpleNamespace(app=None))
     )
-    await asyncio.wait_for(agent.completion_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(agent.completion_entered.wait(), timeout=30.0)
     assert not task.done()
     agent.allow_completion.set()
-    assert await asyncio.wait_for(task, timeout=1.0) == 0
+    assert await asyncio.wait_for(task, timeout=30.0) == 0
     assert agent.completion_calls == 1
 
 
@@ -1127,20 +1186,20 @@ async def test_manager_removal_and_unregistered_cleanup_join_timeout_tails(
     manager._agents["managed"] = managed
     manager._agent_names[managed.agent_id] = "managed"
     removal = asyncio.create_task(manager.remove_agent("managed"))
-    await asyncio.wait_for(managed.completion_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(managed.completion_entered.wait(), timeout=30.0)
     assert not removal.done()
     managed.allow_completion.set()
-    assert await asyncio.wait_for(removal, timeout=1.0) is True
+    assert await asyncio.wait_for(removal, timeout=30.0) is True
     assert managed.completion_calls == 1
 
     unregistered = _DeferredShutdownAgent()
     cleanup = asyncio.create_task(
         AgentManager._shutdown_unregistered_agent("unregistered", unregistered)
     )
-    await asyncio.wait_for(unregistered.completion_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(unregistered.completion_entered.wait(), timeout=30.0)
     assert not cleanup.done()
     unregistered.allow_completion.set()
-    await asyncio.wait_for(cleanup, timeout=1.0)
+    await asyncio.wait_for(cleanup, timeout=30.0)
     assert unregistered.completion_calls == 1
 
 
@@ -1160,9 +1219,9 @@ async def test_manager_unpublishes_a_cancelled_terminal_shutdown_without_continu
     manager._child_mandates = {"terminal": object()}
 
     removal = asyncio.create_task(manager.remove_agent("terminal"))
-    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
 
-    assert await asyncio.wait_for(removal, timeout=1.0) is True
+    assert await asyncio.wait_for(removal, timeout=30.0) is True
     assert agent.storage_closed.is_set()
     assert manager.get_agent("terminal") is None
     assert manager._parent_children == {}
@@ -1200,7 +1259,7 @@ async def test_manager_quarantines_cancellation_hostile_cognition_within_shutdow
 
     manager._release_child_budget = release_budget
     removal = asyncio.create_task(manager.remove_agent("hostile"))
-    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
 
     assert await asyncio.wait_for(removal, timeout=0.2) is True
     assert manager.get_agent("hostile") is None
@@ -1291,9 +1350,9 @@ async def test_quarantined_removal_fences_blocked_wallet_transfer_then_refunds_o
     manager._child_budgets["hostile"] = (delegated, parent_wallet)
 
     spending = asyncio.create_task(delegated.spend(Decimal("3"), "blocked debit", "FIL"))
-    await asyncio.wait_for(child_wallet.transfer_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(child_wallet.transfer_entered.wait(), timeout=30.0)
     removal = asyncio.create_task(manager.remove_agent("hostile"))
-    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
 
     assert await asyncio.wait_for(removal, timeout=0.2) is True
     assert manager.get_agent("hostile") is None
@@ -1302,7 +1361,7 @@ async def test_quarantined_removal_fences_blocked_wallet_transfer_then_refunds_o
     assert parent_wallet.deposits == []
 
     child_wallet.allow_transfer.set()
-    assert await asyncio.wait_for(spending, timeout=1.0) is True
+    assert await asyncio.wait_for(spending, timeout=30.0) is True
     for _ in range(100):
         if parent_wallet.deposits:
             break
@@ -1507,9 +1566,9 @@ async def test_terminal_quarantine_drain_seals_late_bounded_removal_handoffs() -
     # later startup/server retry can proceed.
     drain = asyncio.create_task(manager.drain_quarantined_shutdowns())
     try:
-        await asyncio.wait_for(wait_for_seal(), timeout=1.0)
+        await asyncio.wait_for(wait_for_seal(), timeout=30.0)
         assert (
-            await asyncio.wait_for(manager.remove_agent("raced"), timeout=1.0)
+            await asyncio.wait_for(manager.remove_agent("raced"), timeout=30.0)
             is False
         )
         assert not agent.shutdown_entered.is_set()
@@ -1517,7 +1576,7 @@ async def test_terminal_quarantine_drain_seals_late_bounded_removal_handoffs() -
     finally:
         allow_drain_finish.set()
         if not drain.done():
-            assert await asyncio.wait_for(drain, timeout=1.0) is False
+            assert await asyncio.wait_for(drain, timeout=30.0) is False
 
     assert manager._quarantined_shutdown_reapers == {}
     assert manager._quarantined_shutdown_handoffs_sealed is False
@@ -1576,7 +1635,7 @@ async def test_terminal_drain_seal_atomically_refuses_cold_identity_offboarding(
     )
     drain = asyncio.create_task(manager.drain_quarantined_shutdowns())
     try:
-        await asyncio.wait_for(seal_visible.wait(), timeout=1.0)
+        await asyncio.wait_for(seal_visible.wait(), timeout=30.0)
         if identity_kind == "registered":
             registered_config = LocalAgentConfig(
                 data_dir=f"agent_data/{identity_kind}",
@@ -1607,7 +1666,7 @@ async def test_terminal_drain_seal_atomically_refuses_cold_identity_offboarding(
     finally:
         allow_drain_scan.set()
 
-    assert await asyncio.wait_for(drain, timeout=1.0) is False
+    assert await asyncio.wait_for(drain, timeout=30.0) is False
     assert manager._quarantined_shutdown_handoffs_sealed is False
     assert manager._inflight_runtime_offboardings == {}
     cleanup.assert_not_called()
@@ -1720,11 +1779,11 @@ async def test_quarantined_shutdown_drain_finishes_cleanup_after_cancellation() 
         task=asyncio.create_task(cleanup()),
     )
     drain = asyncio.create_task(manager.drain_quarantined_shutdowns())
-    await asyncio.wait_for(cleanup_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(cleanup_entered.wait(), timeout=30.0)
     drain.cancel()
     allow_cleanup.set()
 
-    assert await asyncio.wait_for(drain, timeout=1.0) is True
+    assert await asyncio.wait_for(drain, timeout=30.0) is True
     assert manager._quarantined_shutdown_reapers == {}
 
 
@@ -1747,12 +1806,12 @@ async def test_quarantine_drain_preserves_cancellation_after_reaper_failure() ->
         task=asyncio.create_task(fail_after_cancellation()),
     )
     drain = asyncio.create_task(manager.drain_quarantined_shutdowns())
-    await asyncio.wait_for(cleanup_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(cleanup_entered.wait(), timeout=30.0)
     drain.cancel()
     allow_failure.set()
 
     with pytest.raises(BaseExceptionGroup) as exc_info:
-        await asyncio.wait_for(drain, timeout=1.0)
+        await asyncio.wait_for(drain, timeout=30.0)
     leaves: list[BaseException] = []
 
     def collect(error: BaseException) -> None:
@@ -1821,11 +1880,11 @@ async def test_terminal_drain_sanitizes_cancelled_worker_with_prior_failure(
         observe_join,
     )
     drain = asyncio.create_task(manager.drain_quarantined_shutdowns())
-    await asyncio.wait_for(cleanup_join_started.wait(), timeout=1.0)
+    await asyncio.wait_for(cleanup_join_started.wait(), timeout=30.0)
     cleanup_task.cancel()
 
     with pytest.raises(ExceptionGroup) as exc_info:
-        await asyncio.wait_for(drain, timeout=1.0)
+        await asyncio.wait_for(drain, timeout=30.0)
 
     leaves: list[BaseException] = []
 
@@ -1963,9 +2022,9 @@ async def test_manager_shutdown_all_drains_quarantined_reaper_before_returning(
 
     shutdown = asyncio.create_task(manager.shutdown_all())
     try:
-        await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
-        await asyncio.wait_for(agent.reaper_handed_off.wait(), timeout=1.0)
-        await asyncio.wait_for(removal_completed.wait(), timeout=1.0)
+        await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
+        await asyncio.wait_for(agent.reaper_handed_off.wait(), timeout=30.0)
+        await asyncio.wait_for(removal_completed.wait(), timeout=30.0)
 
         # The per-agent control plane still unpublishes promptly, but the
         # terminal manager owner remains live until its retained reaper can
@@ -1974,16 +2033,168 @@ async def test_manager_shutdown_all_drains_quarantined_reaper_before_returning(
         assert not shutdown.done()
 
         agent.allow_shutdown_finish.set()
-        await asyncio.wait_for(shutdown, timeout=1.0)
+        await asyncio.wait_for(shutdown, timeout=30.0)
     finally:
         agent.allow_shutdown_finish.set()
         if not shutdown.done():
-            await asyncio.wait_for(shutdown, timeout=1.0)
+            await asyncio.wait_for(shutdown, timeout=30.0)
 
     assert all(
         not item["pending"] for item in manager.quarantined_shutdowns().values()
     )
     manager._offboard_agent_runtime_namespace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ttl_retirement_completes_after_quarantined_shutdown(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """The reaper completion owns deferred TTL authority retirement."""
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT",
+        0.01,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    agent = _CancellationHostileShutdownAgent()
+    child_name = "ExpiringChild"
+    parent_did = "did:test:ttl-parent"
+    manager._agents[child_name] = agent
+    manager._agent_names[agent.agent_id] = child_name
+    manager._parent_children[parent_did] = [child_name]
+    manager._child_mandates[child_name] = SpawnMandate(
+        parent_did=parent_did,
+        child_did=agent.agent_id,
+    )
+    data_dir = tmp_path / "agent_data" / child_name
+    data_dir.mkdir(parents=True)
+    (data_dir / "kestrel_prime.db").touch()
+
+    await lifecycle.register(
+        child_name=child_name,
+        child_did=agent.agent_id,
+        parent_did=parent_did,
+        ttl_seconds=0.01,
+    )
+    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
+    for _ in range(100):
+        if manager._quarantined_shutdown_reapers:
+            break
+        await asyncio.sleep(0.01)
+    assert manager._quarantined_shutdown_reapers
+    reaper = next(iter(manager._quarantined_shutdown_reapers.values())).task
+
+    try:
+        agent.allow_shutdown_finish.set()
+        await asyncio.wait_for(asyncio.shield(reaper), timeout=30.0)
+        for _ in range(100):
+            if (
+                not lifecycle.is_tracked(child_name)
+                and (data_dir / ".kestrel-spawn-retired").is_file()
+            ):
+                break
+            await asyncio.sleep(0.01)
+        snapshot = {
+            "children": manager.get_children(parent_did),
+            "mandate": manager.get_mandate(child_name),
+            "lifecycle_tracked": lifecycle.is_tracked(child_name),
+            "retirement_marker": (
+                data_dir / ".kestrel-spawn-retired"
+            ).is_file(),
+        }
+    finally:
+        agent.allow_shutdown_finish.set()
+        if manager._quarantined_shutdown_reapers:
+            await asyncio.wait_for(
+                manager.drain_quarantined_shutdowns(),
+                timeout=1.0,
+            )
+
+    assert snapshot == {
+        "children": [],
+        "mandate": None,
+        "lifecycle_tracked": False,
+        "retirement_marker": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ttl_retirement_completes_after_quarantined_refund(tmp_path) -> None:
+    """TTL retirement also joins the child's delegated-refund owner."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    child_name = "RefundingExpiredChild"
+    child_did = "did:test:refunding-expired-child"
+    parent_did = "did:test:refunding-expired-parent"
+    child = SimpleNamespace(agent_id=child_did)
+    budget_entry = (object(), object())
+    manager._agents[child_name] = child
+    manager._agent_names[child_did] = child_name
+    manager._parent_children[parent_did] = [child_name]
+    manager._child_mandates[child_name] = SpawnMandate(
+        parent_did=parent_did,
+        child_did=child_did,
+    )
+    manager._child_budgets[child_name] = budget_entry
+    data_dir = tmp_path / "agent_data" / child_name
+    data_dir.mkdir(parents=True)
+    (data_dir / "kestrel_prime.db").touch()
+    refund_started = asyncio.Event()
+    allow_refund = asyncio.Event()
+
+    async def hand_off_refund(
+        requested_parent: str,
+        requested_child: str,
+        *,
+        offboard_runtime: bool = False,
+    ) -> bool:
+        assert requested_parent == parent_did
+        assert requested_child == child_name
+        assert offboard_runtime is False
+        manager._agents.pop(child_name)
+        manager._agent_names.pop(child_did)
+        assert manager._child_budgets.pop(child_name) is budget_entry
+
+        async def finish_refund() -> None:
+            refund_started.set()
+            await allow_refund.wait()
+
+        manager._retain_quarantined_cleanup(
+            name=child_name,
+            agent_id=child_did,
+            task=asyncio.create_task(finish_refund()),
+        )
+        return True
+
+    manager.terminate_child = hand_off_refund
+    await lifecycle.register(
+        child_name=child_name,
+        child_did=child_did,
+        parent_did=parent_did,
+        ttl_seconds=0.01,
+    )
+    await asyncio.wait_for(refund_started.wait(), timeout=30.0)
+    assert lifecycle.is_tracked(child_name)
+    assert not (data_dir / ".kestrel-spawn-retired").exists()
+
+    allow_refund.set()
+    for _ in range(100):
+        if (
+            not lifecycle.is_tracked(child_name)
+            and (data_dir / ".kestrel-spawn-retired").is_file()
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    assert manager.get_children(parent_did) == []
+    assert manager.get_mandate(child_name) is None
+    assert lifecycle.get_result(child_name).status.value == "timed_out"
+    assert (data_dir / ".kestrel-spawn-retired").read_text() == f"{child_did}\n"
 
 
 @pytest.mark.asyncio
@@ -2018,10 +2229,10 @@ async def test_explicit_offboarding_intent_survives_quarantined_reaper_handoff(
         manager.remove_agent("hostile", offboard_runtime=True)
     )
     try:
-        await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
-        await asyncio.wait_for(agent.reaper_handed_off.wait(), timeout=1.0)
+        await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
+        await asyncio.wait_for(agent.reaper_handed_off.wait(), timeout=30.0)
         with pytest.raises(RuntimeOffboardingRetainedError) as raised:
-            await asyncio.wait_for(removal, timeout=1.0)
+            await asyncio.wait_for(removal, timeout=30.0)
         assert raised.value.metadata["agent_removed"] is True
         assert raised.value.metadata["runtime_cleanup_pending"] is True
         assert raised.value.metadata["runtime_cleanup_state"] == "pending"
@@ -2033,7 +2244,7 @@ async def test_explicit_offboarding_intent_survives_quarantined_reaper_handoff(
     finally:
         agent.allow_shutdown_finish.set()
         if not removal.done():
-            await asyncio.wait_for(removal, timeout=1.0)
+            await asyncio.wait_for(removal, timeout=30.0)
 
     manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
 
@@ -2069,10 +2280,10 @@ async def test_handed_off_offboarding_failure_is_owned_once_and_remains_visible(
         manager.remove_agent("hostile", offboard_runtime=True)
     )
     try:
-        await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
-        await asyncio.wait_for(agent.reaper_handed_off.wait(), timeout=1.0)
+        await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
+        await asyncio.wait_for(agent.reaper_handed_off.wait(), timeout=30.0)
         with pytest.raises(RuntimeOffboardingRetainedError) as pending:
-            await asyncio.wait_for(removal, timeout=1.0)
+            await asyncio.wait_for(removal, timeout=30.0)
         assert pending.value.metadata["runtime_cleanup_state"] == "pending"
         assert manager._inflight_runtime_offboardings == {}
 
@@ -2083,7 +2294,7 @@ async def test_handed_off_offboarding_failure_is_owned_once_and_remains_visible(
         agent.allow_shutdown_finish.set()
         if not removal.done():
             with pytest.raises(RuntimeOffboardingRetainedError):
-                await asyncio.wait_for(removal, timeout=1.0)
+                await asyncio.wait_for(removal, timeout=30.0)
 
     manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
     assert manager.get_agent("hostile") is None
@@ -2284,7 +2495,7 @@ async def test_manager_shutdown_all_drains_ordinary_release_admitted_before_boun
     removal = asyncio.create_task(manager.remove_agent("ordinary"))
     shutdown = None
     try:
-        await asyncio.wait_for(release_entered.wait(), timeout=1.0)
+        await asyncio.wait_for(release_entered.wait(), timeout=30.0)
         assert manager.get_agent("ordinary") is None
         assert "ordinary" not in manager._child_budgets
         assert manager._quarantined_shutdown_reapers == {}
@@ -2302,9 +2513,9 @@ async def test_manager_shutdown_all_drains_ordinary_release_admitted_before_boun
     finally:
         allow_release.set()
 
-    assert await asyncio.wait_for(removal, timeout=1.0) is True
+    assert await asyncio.wait_for(removal, timeout=30.0) is True
     assert shutdown is not None
-    await asyncio.wait_for(shutdown, timeout=1.0)
+    await asyncio.wait_for(shutdown, timeout=30.0)
     assert manager._inflight_removal_budget_releases == {}
 
 
@@ -2343,7 +2554,7 @@ async def test_shutdown_all_coalesces_release_already_admitted_by_concurrent_rem
     removal = asyncio.create_task(manager.remove_agent("ordinary"))
     shutdown = None
     try:
-        await asyncio.wait_for(release_entered.wait(), timeout=1.0)
+        await asyncio.wait_for(release_entered.wait(), timeout=30.0)
         assert manager.get_agent("ordinary") is None
         assert "ordinary" in manager._child_budgets
 
@@ -2358,9 +2569,9 @@ async def test_shutdown_all_coalesces_release_already_admitted_by_concurrent_rem
     finally:
         allow_release.set()
 
-    assert await asyncio.wait_for(removal, timeout=1.0) is True
+    assert await asyncio.wait_for(removal, timeout=30.0) is True
     assert shutdown is not None
-    await asyncio.wait_for(shutdown, timeout=1.0)
+    await asyncio.wait_for(shutdown, timeout=30.0)
     assert calls == 1
     assert credits == 1
     assert manager._inflight_removal_budget_releases == {}
@@ -2387,13 +2598,13 @@ async def test_terminal_drain_retains_prelinearization_ordinary_release_failure(
         # Keep the manager lock through both task completion and its done
         # callback. The drain is blocked before its sealing linearization
         # point, so this reproduces the former task-discard window exactly.
-        await asyncio.wait_for(release_failed.wait(), timeout=1.0)
+        await asyncio.wait_for(release_failed.wait(), timeout=30.0)
         await asyncio.sleep(0)
         assert not drain.done()
         assert manager._inflight_removal_budget_releases == {}
 
     with pytest.raises(ExceptionGroup, match="ordinary budget releases") as first:
-        await asyncio.wait_for(drain, timeout=1.0)
+        await asyncio.wait_for(drain, timeout=30.0)
     rendered_failure = str(first.value.exceptions[0])
     assert "ordinary-budget-release:1" in rendered_failure
     assert "unacknowledged cleanup failure" in rendered_failure
@@ -2627,15 +2838,15 @@ async def test_shutdown_all_fences_late_registration_after_empty_fleet_shutdown(
     manager._initialize_agent = initialize
     config = LocalAgentConfig(data_dir="late", port=8801)
     registration = asyncio.create_task(manager.load_agent("late", config))
-    await asyncio.wait_for(initialize_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(initialize_entered.wait(), timeout=30.0)
 
     # Schedule terminal teardown while the fleet is still empty, immediately
     # before the pending initializer reaches its publication critical section.
-    await asyncio.wait_for(manager.shutdown_all(), timeout=1.0)
+    await asyncio.wait_for(manager.shutdown_all(), timeout=30.0)
     allow_initialization.set()
 
     with pytest.raises(RuntimeError, match="manager is shutting down"):
-        await asyncio.wait_for(registration, timeout=1.0)
+        await asyncio.wait_for(registration, timeout=30.0)
     assert manager.get_agent("late") is None
     assert agent.shutdown_calls == 1
 
@@ -2677,8 +2888,8 @@ async def test_shutdown_all_waits_for_a_concurrent_terminal_drain_before_removal
     assert not shutdown.done()
 
     allow_drain_finish.set()
-    assert await asyncio.wait_for(drain, timeout=1.0) is False
-    assert await asyncio.wait_for(shutdown, timeout=1.0) is None
+    assert await asyncio.wait_for(drain, timeout=30.0) is False
+    assert await asyncio.wait_for(shutdown, timeout=30.0) is None
     assert agent.shutdown_calls == 1
     assert manager.get_agent("live") is None
 
@@ -2711,14 +2922,14 @@ async def test_simultaneous_shutdown_all_calls_serialize_live_agent_sweeps() -> 
     }
 
     first = asyncio.create_task(manager.shutdown_all())
-    await asyncio.wait_for(first_agent.shutdown_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(first_agent.shutdown_entered.wait(), timeout=30.0)
     second = asyncio.create_task(manager.shutdown_all())
     await asyncio.sleep(0)
     assert not second.done()
 
     first_agent.allow_shutdown.set()
-    assert await asyncio.wait_for(first, timeout=1.0) is None
-    assert await asyncio.wait_for(second, timeout=1.0) is None
+    assert await asyncio.wait_for(first, timeout=30.0) is None
+    assert await asyncio.wait_for(second, timeout=30.0) is None
     assert first_agent.shutdown_calls == 1
     assert second_agent.shutdown_calls == 1
     assert manager.list_agents() == {}
@@ -2770,27 +2981,27 @@ async def test_shutdown_all_accepts_false_after_concurrent_removal_fully_removed
         manager.shutdown_all(), name="fleet-shutdown"
     )
     try:
-        await asyncio.wait_for(shutdown_waiting_to_remove_b.wait(), timeout=1.0)
+        await asyncio.wait_for(shutdown_waiting_to_remove_b.wait(), timeout=30.0)
         assert first.shutdown_calls == 1
         assert second.shutdown_calls == 0
 
         # B's DELETE queued first on the per-DID writer and now fully removes
         # B before this sweep's snapped B attempt is allowed to run.
         second_lifecycle_lock.release()
-        assert await asyncio.wait_for(direct_removal, timeout=1.0) is True
+        assert await asyncio.wait_for(direct_removal, timeout=30.0) is True
         assert second.shutdown_calls == 1
         assert manager.get_agent("B") is None
 
         allow_shutdown_to_remove_b.set()
-        assert await asyncio.wait_for(fleet_shutdown, timeout=1.0) is None
+        assert await asyncio.wait_for(fleet_shutdown, timeout=30.0) is None
     finally:
         allow_shutdown_to_remove_b.set()
         if second_lifecycle_lock.locked():
             second_lifecycle_lock.release()
         if not direct_removal.done():
-            await asyncio.wait_for(direct_removal, timeout=1.0)
+            await asyncio.wait_for(direct_removal, timeout=30.0)
         if not fleet_shutdown.done():
-            await asyncio.wait_for(fleet_shutdown, timeout=1.0)
+            await asyncio.wait_for(fleet_shutdown, timeout=30.0)
 
     assert first.shutdown_calls == 1
     assert second.shutdown_calls == 1
@@ -3033,11 +3244,11 @@ async def test_manager_unpublishes_and_releases_before_propagating_cancellation(
     manager._child_mandates = {"terminal": object()}
 
     removal = asyncio.create_task(manager.remove_agent("terminal"))
-    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
     removal.cancel()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(removal, timeout=1.0)
+        await asyncio.wait_for(removal, timeout=30.0)
     assert agent.storage_closed.is_set()
     assert manager.get_agent("terminal") is None
     assert manager._parent_children == {}
@@ -3068,14 +3279,14 @@ async def test_manager_retries_budget_release_join_before_propagating_cancellati
 
     manager._release_child_budget = slow_release
     removal = asyncio.create_task(manager.remove_agent("terminal"))
-    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
     removal.cancel()
-    await asyncio.wait_for(release_started.wait(), timeout=1.0)
+    await asyncio.wait_for(release_started.wait(), timeout=30.0)
     removal.cancel()
     allow_release.set()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(removal, timeout=1.0)
+        await asyncio.wait_for(removal, timeout=30.0)
     assert released == ["terminal"]
     assert manager.get_agent("terminal") is None
 
@@ -3176,7 +3387,7 @@ async def test_shutdown_all_sweeps_after_joined_spawn_cancellation_rollback_grou
     allow_failure.set()
 
     with pytest.raises(BaseExceptionGroup) as exc_info:
-        await asyncio.wait_for(shutdown, timeout=1.0)
+        await asyncio.wait_for(shutdown, timeout=30.0)
 
     def leaf_errors(error: BaseException):
         if isinstance(error, BaseExceptionGroup):
@@ -3199,7 +3410,9 @@ async def test_shutdown_all_sweeps_after_joined_spawn_cancellation_rollback_grou
 
 
 @pytest.mark.asyncio
-async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit() -> None:
+async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit(
+    tmp_path,
+) -> None:
     """A fenced spawn cannot return a dead child or add state after shutdown."""
 
     class Child:
@@ -3211,19 +3424,39 @@ async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit()
         async def shutdown(self) -> None:
             self.shutdown_calls += 1
 
-    manager = AgentManager()
+    manager = AgentManager(base_data_dir=tmp_path)
     child = Child()
     parent = SimpleNamespace(
         agent_id="did:test:spawn-fenced-parent",
-        _private_key=None,
+        _private_key=generate_secp256k1_keypair()[0],
         identity=None,
         features={},
         wallet=None,
+        shutdown=AsyncMock(),
     )
+    manager._agents["spawn-fenced-parent"] = parent
+    manager._agent_names[parent.agent_id] = "spawn-fenced-parent"
     budget_entered = asyncio.Event()
     allow_budget = asyncio.Event()
 
-    async def create_child(name, **_kwargs):
+    async def create_child(name, **kwargs):
+        child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
+        admission = manager._agent_operations[manager._canonical_agent_name(name)]
+        assert admission.before_publish is not None
+        admission.spawn_candidate_config = LocalAgentConfig(
+            data_dir=Path("agent_data") / name,
+            port=8802,
+        )
+        pending = manager._spawn_authority_registry.reserve_pending(
+            child_name=name,
+            parent_did=kwargs["parent_did"],
+            mandate=kwargs["mandate"],
+            config=admission.spawn_candidate_config,
+        )
+        admission.spawn_authority_pending_id = pending.reservation_id
+        await admission.before_publish(child)
         manager._agents[name] = child
         manager._agent_names[child.agent_id] = name
         return child
@@ -3241,7 +3474,7 @@ async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit()
             SpawnMandate(parent_did=parent.agent_id, purpose="race"),
         )
     )
-    await asyncio.wait_for(budget_entered.wait(), timeout=1.0)
+    await asyncio.wait_for(budget_entered.wait(), timeout=30.0)
 
     shutdown = asyncio.create_task(manager.shutdown_all())
     while not manager._agent_registration_sealed:
@@ -3250,8 +3483,8 @@ async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit()
     allow_budget.set()
 
     with pytest.raises(RuntimeError, match="Spawn was fenced"):
-        await asyncio.wait_for(spawn, timeout=1.0)
-    assert await asyncio.wait_for(shutdown, timeout=1.0) is None
+        await asyncio.wait_for(spawn, timeout=30.0)
+    assert await asyncio.wait_for(shutdown, timeout=30.0) is None
     assert child.shutdown_calls == 1
     assert manager.list_agents() == {}
     assert manager._child_budgets == {}
@@ -3298,7 +3531,7 @@ async def test_quarantined_refund_failure_restores_exact_hold_for_retry(monkeypa
     )
     # The reaper owns this withdrawn name while the hold is temporarily out of
     # the normal map.  A new identity cannot slip into that restoration gap.
-    await asyncio.wait_for(release_started.wait(), timeout=1.0)
+    await asyncio.wait_for(release_started.wait(), timeout=30.0)
     with pytest.raises(RuntimeError, match="unresolved quarantined cleanup"):
         await manager.load_agent(
             "quarantined", LocalAgentConfig(data_dir="new", port=8801)
@@ -3388,6 +3621,11 @@ async def test_terminate_child_keeps_tracking_until_quarantined_refund_drains() 
     manager._child_budgets[child_name] = entry
     manager._parent_children[parent_did] = [child_name]
     manager._child_mandates[child_name] = mandate
+    # This lifecycle-ownership fixture intentionally uses object sentinels,
+    # not signed authority receipts. Keep it focused on quarantine tracking.
+    manager.get_authoritative_spawn_relations = AsyncMock(
+        return_value={child.agent_id: (parent_did, child_name)}
+    )
     refund_started = asyncio.Event()
     allow_refund = asyncio.Event()
 
@@ -3395,9 +3633,11 @@ async def test_terminate_child_keeps_tracking_until_quarantined_refund_drains() 
         name: str,
         *,
         offboard_runtime: bool = False,
+        _lifecycle_cleanup_expected_agent_id: str | None = None,
     ) -> bool:
         assert offboard_runtime is False
         assert name == child_name
+        assert _lifecycle_cleanup_expected_agent_id == child.agent_id
         assert manager._agents.pop(name) is child
         assert manager._agent_names.pop(child.agent_id) == name
         assert manager._child_budgets.pop(name) is entry
@@ -3415,7 +3655,7 @@ async def test_terminate_child_keeps_tracking_until_quarantined_refund_drains() 
 
     manager.remove_agent = hand_off_pending_refund
     assert await manager.terminate_child(parent_did, child_name) is True
-    await asyncio.wait_for(refund_started.wait(), timeout=1.0)
+    await asyncio.wait_for(refund_started.wait(), timeout=30.0)
     assert manager.get_children(parent_did) == [child_name]
     assert manager.get_mandate(child_name) is mandate
 
@@ -3440,6 +3680,11 @@ async def test_terminate_child_keeps_tracking_when_quarantined_refund_restores_h
     manager._child_budgets[child_name] = entry
     manager._parent_children[parent_did] = [child_name]
     manager._child_mandates[child_name] = mandate
+    # This lifecycle-ownership fixture intentionally uses object sentinels,
+    # not signed authority receipts. Keep it focused on quarantine tracking.
+    manager.get_authoritative_spawn_relations = AsyncMock(
+        return_value={child.agent_id: (parent_did, child_name)}
+    )
     refund_started = asyncio.Event()
     allow_failure = asyncio.Event()
 
@@ -3447,9 +3692,11 @@ async def test_terminate_child_keeps_tracking_when_quarantined_refund_restores_h
         name: str,
         *,
         offboard_runtime: bool = False,
+        _lifecycle_cleanup_expected_agent_id: str | None = None,
     ) -> bool:
         assert offboard_runtime is False
         assert name == child_name
+        assert _lifecycle_cleanup_expected_agent_id == child.agent_id
         assert manager._agents.pop(name) is child
         assert manager._agent_names.pop(child.agent_id) == name
         assert manager._child_budgets.pop(name) is entry
@@ -3469,7 +3716,7 @@ async def test_terminate_child_keeps_tracking_when_quarantined_refund_restores_h
 
     manager.remove_agent = hand_off_then_restore
     assert await manager.terminate_child(parent_did, child_name) is True
-    await asyncio.wait_for(refund_started.wait(), timeout=1.0)
+    await asyncio.wait_for(refund_started.wait(), timeout=30.0)
     assert manager.get_children(parent_did) == [child_name]
     assert manager.get_mandate(child_name) is mandate
 
@@ -3483,7 +3730,7 @@ async def test_terminate_child_keeps_tracking_when_quarantined_refund_restores_h
 
 
 @pytest.mark.asyncio
-async def test_batch_onboarding_cancellation_wins_after_claimed_cleanup_settles() -> None:
+async def test_batch_onboarding_cancellation_wins_after_claimed_cleanup_settles(tmp_path) -> None:
     """A failed onboarding cannot hide caller cancellation behind cleanup work."""
 
     class BlockingCleanupAgent:
@@ -3499,7 +3746,7 @@ async def test_batch_onboarding_cancellation_wins_after_claimed_cleanup_settles(
             self.cleanup_started.set()
             await self.allow_cleanup.wait()
 
-    manager = AgentManager()
+    manager = AgentManager(base_data_dir=tmp_path)
     agent = BlockingCleanupAgent()
     config = LocalAgentConfig(data_dir="batch-cancel", port=8801)
 
@@ -3512,22 +3759,22 @@ async def test_batch_onboarding_cancellation_wins_after_claimed_cleanup_settles(
     manager._initialize_agent = initialize
     manager.set_agent_registration_hook(reject_onboarding)
     batch = asyncio.create_task(manager.load_from_config(MultiAgentConfig(agents={"B": config})))
-    await asyncio.wait_for(agent.cleanup_started.wait(), timeout=1.0)
+    await asyncio.wait_for(agent.cleanup_started.wait(), timeout=30.0)
     batch.cancel()
     assert not batch.done()
     agent.allow_cleanup.set()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(batch, timeout=1.0)
+        await asyncio.wait_for(batch, timeout=30.0)
     assert agent.shutdown_calls == 1
     assert manager.list_agents() == {}
 
 
 @pytest.mark.asyncio
-async def test_batch_claims_failed_onboarding_result_before_cleanup_failure() -> None:
+async def test_batch_claims_failed_onboarding_result_before_cleanup_failure(tmp_path) -> None:
     """One failed cleanup is aggregated once; it never gets a second shutdown."""
 
-    manager = AgentManager()
+    manager = AgentManager(base_data_dir=tmp_path)
     agent = SimpleNamespace(agent_id="did:test:batch-cleanup-once")
     config = LocalAgentConfig(data_dir="batch-once", port=8801)
     cleanup_calls = 0
@@ -3586,12 +3833,12 @@ async def test_remove_agent_cancellation_wins_over_settled_refund_failure(
         fail_refund,
     )
     removal = asyncio.create_task(manager.remove_agent("refund-cancel"))
-    await asyncio.wait_for(refund_started.wait(), timeout=1.0)
+    await asyncio.wait_for(refund_started.wait(), timeout=30.0)
     removal.cancel()
     allow_failure.set()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(removal, timeout=1.0)
+        await asyncio.wait_for(removal, timeout=30.0)
     await asyncio.sleep(0)
     assert manager.get_agent("refund-cancel") is None
     assert manager._child_budgets["refund-cancel"] is entry

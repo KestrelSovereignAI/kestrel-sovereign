@@ -28,6 +28,7 @@ from kestrel_sdk.signals import (
     Trust,
 )
 from kestrel_sovereign.signals import (
+    CLAIM_CONTRIBUTION,
     RegistrationError,
     RegistrationOutcome,
     RegistrationPolicy,
@@ -88,6 +89,43 @@ def test_new_source_is_registered():
     assert outcome.state is RegistrationState.REGISTERED
     assert outcome.ok
     assert "a" in reg
+
+
+def test_quarantine_removes_exact_unheld_source_when_claim_ledger_is_missing():
+    registry = SourceRegistry()
+    owner = object()
+    source = _action_reg("orphaned")
+    registry.register(source, owner=owner)
+    registry._claims.pop(source.name)
+
+    assert registry.quarantine_claims(owner, (source,)) == ()
+    assert registry.get(source.name) is None
+    assert registry.owners_of(source.name) == ()
+
+
+def test_quarantine_removes_equivalent_incumbent_after_final_claim():
+    """A distinct equivalent source cannot survive with no remaining owners."""
+
+    registry = SourceRegistry()
+    first_owner = object()
+    final_owner = object()
+    incumbent = _action_reg("shared")
+    declared = _action_reg("shared")
+    assert incumbent is not declared
+    assert SourceRegistry.contract_equivalent(incumbent, declared)
+    registry.register(incumbent, owner=first_owner)
+    registry.register_with_policy(
+        declared,
+        RegistrationPolicy.MANDATORY,
+        owner=final_owner,
+        role=CLAIM_CONTRIBUTION,
+    )
+    assert registry.release(incumbent.name, first_owner) is False
+    assert registry.owners_of(incumbent.name) == (final_owner,)
+
+    assert registry.quarantine_claims(final_owner, (declared,)) == ("shared",)
+    assert registry.get(incumbent.name) is None
+    assert registry.owners_of(incumbent.name) == ()
 
 
 def test_equivalent_reregistration_is_a_noop_success():

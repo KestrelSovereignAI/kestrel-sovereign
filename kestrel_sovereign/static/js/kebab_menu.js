@@ -15,6 +15,12 @@
  *     accelerator — e.g. a row `contextmenu` (right-click) handler — so
  *     right-click is never the ONLY path to the actions.
  *
+ * Every element is created in an OWNING document — `opts.ownerDocument` on
+ * both entry points, defaulting to the module-global `document`. A host
+ * that embeds a list in another document (Frinz's shared pane) derives its
+ * nodes from `containerEl.ownerDocument`, and a kebab built in a different
+ * document than the row it sits in belongs to no tree the host can see.
+ *
  * Menu items: `{ label, labelKey?, danger?, separatorBefore?, onSelect }`.
  * Item buttons are real, focusable buttons; the menu is keyboard-accessible
  * (ArrowUp/Down move focus, Escape closes, Enter/click activates). Labels are
@@ -37,6 +43,16 @@ function escapeHtmlSafe(str) {
         .replaceAll("'", '&#39;');
 }
 
+/**
+ * The document a kebab's nodes belong to. Callers that own a container element
+ * pass its `ownerDocument`; everyone else keeps the module-global `document`,
+ * which is the console's own.
+ */
+function resolveOwnerDocument(candidate) {
+    if (candidate && typeof candidate.createElement === 'function') return candidate;
+    return typeof document !== 'undefined' ? document : null;
+}
+
 /** Tear down any open menu and its outside-click/Escape listeners. */
 export function closeKebabMenu() {
     if (openMenuEl) {
@@ -57,12 +73,16 @@ function focusableItems() {
 /**
  * Open a menu built from `items` at the given viewport position. Returns the
  * menu element (mostly for tests). Any already-open menu is closed first so at
- * most one menu is live at a time.
+ * most one menu is live at a time. `opts.ownerDocument` names the document the
+ * menu is built and mounted in; it defaults to the module-global `document`.
  */
-export function openMenuAt(items, position = {}) {
+export function openMenuAt(items, position = {}, opts = {}) {
     closeKebabMenu();
 
-    const menu = document.createElement('div');
+    const doc = resolveOwnerDocument(opts.ownerDocument);
+    if (!doc) throw new Error('openMenuAt requires a document');
+
+    const menu = doc.createElement('div');
     menu.className = 'kebab-menu';
     menu.setAttribute('role', 'menu');
     menu.style.cssText = `
@@ -81,13 +101,13 @@ export function openMenuAt(items, position = {}) {
 
     (items || []).filter(Boolean).forEach((item) => {
         if (item.separatorBefore) {
-            const sep = document.createElement('div');
+            const sep = doc.createElement('div');
             sep.className = 'kebab-menu-separator';
             sep.setAttribute('role', 'separator');
             sep.style.cssText = 'height: 1px; margin: 0.25rem 0; background: var(--border-color);';
             menu.appendChild(sep);
         }
-        const btn = document.createElement('button');
+        const btn = doc.createElement('button');
         btn.type = 'button';
         btn.className = `kebab-menu-item${item.danger ? ' kebab-menu-item-danger' : ''}`;
         btn.setAttribute('role', 'menuitem');
@@ -116,7 +136,7 @@ export function openMenuAt(items, position = {}) {
         menu.appendChild(btn);
     });
 
-    document.body.appendChild(menu);
+    doc.body.appendChild(menu);
     openMenuEl = menu;
 
     // Keyboard: Arrow navigation between items, Escape closes.
@@ -146,11 +166,11 @@ export function openMenuAt(items, position = {}) {
     };
     const onDocKey = (e) => { if (e.key === 'Escape') closeKebabMenu(); };
     setTimeout(() => {
-        document.addEventListener('click', onDocClick);
-        document.addEventListener('keydown', onDocKey);
+        doc.addEventListener('click', onDocClick);
+        doc.addEventListener('keydown', onDocKey);
     }, 0);
-    cleanupFns.push(() => document.removeEventListener('click', onDocClick));
-    cleanupFns.push(() => document.removeEventListener('keydown', onDocKey));
+    cleanupFns.push(() => doc.removeEventListener('click', onDocClick));
+    cleanupFns.push(() => doc.removeEventListener('keydown', onDocKey));
 
     // Focus the first item so keyboard users land inside the menu.
     const first = focusableItems()[0];
@@ -180,9 +200,15 @@ export function positionFromEvent(event) {
  * accessible label; menu items are focusable too (keyboard-accessible per
  * #2149). Clicks stop propagation so the owning row's click handler (which
  * usually loads the conversation) does not also fire.
+ *
+ * `opts.ownerDocument` names the document the button — and the menu it opens —
+ * are built in. It defaults to the module-global `document`, so callers that
+ * live in the console's own document are unaffected.
  */
 export function createKebabButton(getItems, opts = {}) {
-    const btn = document.createElement('button');
+    const doc = resolveOwnerDocument(opts.ownerDocument);
+    if (!doc) throw new Error('createKebabButton requires a document');
+    const btn = doc.createElement('button');
     btn.type = 'button';
     btn.className = `kebab-btn${opts.className ? ' ' + opts.className : ''}`;
     btn.setAttribute('aria-haspopup', 'menu');
@@ -195,7 +221,7 @@ export function createKebabButton(getItems, opts = {}) {
     btn.addEventListener('click', (e) => {
         if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
         if (e && typeof e.preventDefault === 'function') e.preventDefault();
-        openMenuAt(getItems(), positionFromEvent(e));
+        openMenuAt(getItems(), positionFromEvent(e), { ownerDocument: doc });
     });
     return btn;
 }

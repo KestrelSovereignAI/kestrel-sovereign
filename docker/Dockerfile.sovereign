@@ -54,6 +54,7 @@ WORKDIR /app
 #   gcc + python3-dev — needed to compile native extensions for core deps
 #                        like webrtcvad that don't ship arm64 wheels.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    bubblewrap \
     curl \
     git \
     gcc \

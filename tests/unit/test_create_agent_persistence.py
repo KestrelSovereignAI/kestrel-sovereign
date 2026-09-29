@@ -49,6 +49,59 @@ async def test_create_agent_persists_into_toml_driven_config(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_create_reload_reuses_runtime_host_custody_context(tmp_path):
+    """A roster accepted at boot stays valid when creation reloads it."""
+
+    config_path = tmp_path / "multi_agent.toml"
+    config = MultiAgentConfig(
+        agents={
+            "Kestrel": LocalAgentConfig(
+                data_dir=Path("agent_data/Kestrel"),
+                port=8801,
+            )
+        }
+    )
+    config.save(config_path)
+    # The exported value won at process boot. Reloading the file with
+    # spawned_agent_env() would instead let this conflicting .env value win.
+    (tmp_path / ".env").write_text(
+        "KESTREL_HOST_DB_PATH=agent_data/Kestrel/host-data/host-features.db\n"
+    )
+    runtime_env = {"KESTREL_HOST_DB_PATH": str(tmp_path / "host" / "host.db")}
+    created_cfg = LocalAgentConfig(
+        data_dir=Path("agent_data/Newbie"),
+        port=8802,
+    )
+    manager = MagicMock()
+    manager.create_agent = AsyncMock(
+        return_value=SimpleNamespace(agent_id="did:x:newbie")
+    )
+    manager._created_configs = {"Newbie": created_cfg}
+    manager._reserved_ports = set()
+    request = _request_with_state(
+        agent_manager=manager,
+        multi_agent_config=config,
+        multi_agent_config_path=config_path,
+        multi_agent_runtime_env=runtime_env,
+        multi_agent_runtime_base=tmp_path,
+    )
+
+    result = await create_agent.__wrapped__(
+        request,
+        CreateAgentRequest(name="Newbie"),
+    )
+
+    assert result["persisted"] is True
+    assert set(
+        MultiAgentConfig.from_file(
+            config_path,
+            runtime_env=runtime_env,
+            runtime_base=tmp_path,
+        ).agents
+    ) == {"Kestrel", "Newbie"}
+
+
+@pytest.mark.asyncio
 async def test_create_agent_skips_persistence_for_auto_discovered_deployments():
     manager = MagicMock()
     manager.create_agent = AsyncMock(return_value=SimpleNamespace(agent_id="did:x:a"))

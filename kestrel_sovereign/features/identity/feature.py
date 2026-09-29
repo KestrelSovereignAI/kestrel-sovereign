@@ -21,7 +21,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.base import (
+    Feature,
+    orchestrator_result_cap,
+    serialized_result_len,
+    tool,
+)
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.identity.package_intake import (
@@ -141,6 +146,70 @@ def _parse_identity_trust_policy(raw: Optional[Dict[str, Any]]):
     )
 
 
+def _hold_state_tool_result(
+    data: Dict[str, Any], *, first_page: bool, cap: int
+) -> ToolResult:
+    """The tool envelope for one rendered self-Hold page."""
+
+    if data["state"] == "unknown":
+        return ToolResult.failed(
+            "Hold state could not be read, so whether this agent is held "
+            f"is unknown ({data['cause_type']}).",
+            data=data,
+        )
+
+    if data["held"]:
+        current = "This agent is held by: " + ", ".join(data["sources"]) + "."
+    else:
+        current = "No host or agent Hold currently applies to this agent."
+    history = data["history"]
+    if history["status"] == "unknown":
+        return ToolResult.partial(
+            confirmation=current,
+            error=(
+                "Hold history could not be read "
+                f"({history['cause_type']}); past holds are unknown."
+            ),
+            data=data,
+        )
+    next_cursor = history["next_cursor"]
+    more = (
+        f" Older history remains: call again with cursor={next_cursor!r}."
+        if next_cursor is not None
+        else ""
+    )
+    if history["status"] == "withheld_oversize":
+        return ToolResult.partial(
+            confirmation=current + more,
+            error=(
+                "The next Hold history receipt does not fit in one tool result "
+                f"({cap} characters), so it was withheld rather than cut."
+            ),
+            data=data,
+        )
+    episodes = history["episodes"]
+    if not episodes:
+        if first_page and next_cursor is None:
+            summary = " No Hold episodes are recorded."
+        else:
+            summary = " No Hold episode begins or ends in this page of history."
+        return ToolResult.ok(confirmation=current + summary + more, data=data)
+    latest = episodes[0]
+    summary = (
+        f"{'Most recent' if first_page else 'Newest on this page'}: "
+        f"{latest['scope']} hold set {latest['set_at']} by "
+        f"{latest['set_by_role']} for {latest['reason']!r}"
+    )
+    if latest["ended_at"] is not None:
+        summary += (
+            f", {latest['status']} {latest['ended_at']} by "
+            f"{latest['ended_by_role']}"
+        )
+    else:
+        summary += f" ({latest['status']})"
+    return ToolResult.ok(confirmation=f"{current} {summary}.{more}", data=data)
+
+
 class IdentityFeature(Feature):
     """
     Feature for managing agent identity portability.
@@ -160,6 +229,75 @@ class IdentityFeature(Feature):
     async def initialize(self):
         """Initialize the identity feature."""
         logger.info("Initializing IdentityFeature")
+
+    @tool(
+        name="inspect_hold_state",
+        description=(
+            "Inspect the durable Hold that applies to this agent itself: the "
+            "current host and agent latches (reported separately) and this "
+            "agent's own Hold history, newest first, paired into episodes "
+            "(when a hold was set, when and how it ended, why, and by which "
+            "role). The subject is always this agent — there is no target "
+            "parameter — and the tool is read-only: it cannot set or release "
+            "a Hold. Actor identities are reported by role only. A state that "
+            "cannot be read is reported as 'unknown', never as not held. "
+            "History is paged: when the result carries history.next_cursor, "
+            "call again with that cursor to read older history."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!identity hold",
+    )
+    async def inspect_hold_state(self, cursor: Optional[str] = None) -> ToolResult:
+        """Report the Hold state and history bound to this agent's own DID.
+
+        Args:
+            cursor: ``history.next_cursor`` from a previous call, to continue
+                into older history. Omit it to start from the newest.
+        """
+
+        from kestrel_sovereign.hold import (
+            SELF_HOLD_HISTORY_LIMIT,
+            InvalidHoldHistoryCursor,
+            read_self_hold,
+        )
+
+        try:
+            snapshot = await read_self_hold(self.agent, cursor=cursor)
+        except InvalidHoldHistoryCursor as error:
+            return ToolResult.failed(
+                f"{error}: pass a history.next_cursor this tool returned, or "
+                "omit the cursor to start from the newest history."
+            )
+
+        # The page is sized against the orchestrator's per-result cap, as the
+        # orchestrator measures it: a larger result is silently replaced with
+        # a head+tail preview that discards the middle of the history while
+        # still reading as success. What does not fit stays reachable by the
+        # cursor rather than being cut.
+        cap = orchestrator_result_cap()
+
+        def fits(result: ToolResult) -> bool:
+            return (
+                serialized_result_len(result, tool_name="inspect_hold_state")
+                <= cap
+            )
+
+        for page_size in range(SELF_HOLD_HISTORY_LIMIT, 0, -1):
+            result = _hold_state_tool_result(
+                snapshot.render(page_size), first_page=cursor is None, cap=cap
+            )
+            if fits(result):
+                return result
+        result = _hold_state_tool_result(
+            snapshot.render(1, withhold=True), first_page=cursor is None, cap=cap
+        )
+        if not fits(result):
+            logger.warning(
+                "inspect_hold_state result exceeds the %d-character tool result "
+                "cap even with its history withheld",
+                cap,
+            )
+        return result
 
     def _load_import_package(self, package_json: str):
         """Parse a loaded export into an AgentIdentityPackage.

@@ -64,10 +64,17 @@ class KeyResolutionService:
         from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
         from kestrel_sovereign.security.agent_encryption import MasterKeyNotConfiguredError
 
-        # Get agent DID - REQUIRED for key storage
-        agent_did = getattr(agent, "did", None) or getattr(agent, "agent_id", None)
+        from kestrel_sovereign.features.storage_access import (
+            AgentIdentityUnavailable,
+            resolve_scoped_agent_did,
+        )
 
-        if not agent_did:
+        # The key-storage scope is the agent's DID through the shared guard.
+        # This fell back to ``agent_id``, so a display id could become the
+        # scope service keys were stored under (#3251).
+        try:
+            agent_did = resolve_scoped_agent_did(agent)
+        except AgentIdentityUnavailable:
             logger.warning("KeyResolutionService: No agent DID available")
             return cls(storage=None, agent_did=None)
 

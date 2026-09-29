@@ -891,6 +891,8 @@ def _load_born_hybrid(
 def load_agent_identity(
     legacy_key_id: Optional[str] = None,
     storage_dir: Optional[Path] = None,
+    *,
+    master_key: str | bytes | None = None,
 ) -> AgentIdentity:
     """Load an agent's full runtime identity from disk.
 
@@ -910,6 +912,8 @@ def load_agent_identity(
             agents; None for born-hybrid agents.
         storage_dir: Agent data dir. Defaults to
             ``get_default_agent_data_dir()``.
+        master_key: Explicit custody key for launcher-side validation. When
+            omitted, ``SecureKeyStorage`` reads ``KESTREL_DATA_KEY`` as usual.
 
     Returns:
         :class:`AgentIdentity`. ``is_hybrid`` is ``True`` for rotated and
@@ -926,7 +930,7 @@ def load_agent_identity(
     else:
         storage_dir = Path(storage_dir)
 
-    storage = SecureKeyStorage(storage_dir=storage_dir)
+    storage = SecureKeyStorage(storage_dir=storage_dir, master_key=master_key)
 
     # Born-hybrid path: no legacy key id supplied. A succession
     # statement without legacy material is an inconsistent state (a

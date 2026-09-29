@@ -1232,6 +1232,120 @@ async def test_dispatcher_passes_budget_to_agent_when_accepted(
 
 
 @pytest.mark.asyncio
+async def test_contributed_clause_names_persist_to_signal_log(
+    tmp_path, template_path
+):
+    """Round-trip real context assembly through the dispatcher's audit store."""
+
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kestrel_sdk.features import ContextClauseRegistration
+
+    from kestrel_sovereign.agent.context_builder import ContextBuilder
+    from kestrel_sovereign.agent.context_manager import ContextManager
+    from kestrel_sovereign.features.contribution_runtime import (
+        ContextClauseRegistry,
+        ResolvedContextClause,
+    )
+
+    registration = ContextClauseRegistration(
+        owner="tests:signal-audit",
+        name="audited-feature-clause",
+        priority=10,
+        renderer=lambda: "feature clause body",
+    )
+    registry = ContextClauseRegistry()
+    registry.register_batch(
+        (
+            ResolvedContextClause(
+                owner=registration.owner,
+                name=registration.name,
+                priority=registration.priority,
+                body=registration.renderer(),
+                registration=registration,
+            ),
+        )
+    )
+    storage = MagicMock()
+    storage.search_chunks = AsyncMock(return_value=[])
+    agent_data = tmp_path / "agent-data"
+    agent_data.mkdir()
+    builder = ContextBuilder(
+        storage,
+        agent_data_path=agent_data,
+        context_clause_registry=registry,
+    )
+    manager = ContextManager(storage=storage, context_builder=builder)
+
+    class _ContextBuildingAgent(_AuditingAgent):
+        async def process_input(
+            self,
+            prompt: str,
+            *,
+            system_prompt_budget_bytes=None,
+            **_kwargs,
+        ):
+            self.process_input_calls.append(prompt)
+            await manager.build_context(
+                query=prompt,
+                constitution="C",
+                include_briefing=False,
+                include_memories=False,
+                include_rag=False,
+                conversation_history=[],
+                system_prompt_budget_bytes=system_prompt_budget_bytes,
+            )
+            return "ok"
+
+    agent = _ContextBuildingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="clause_included",
+            constitution_injection="full",
+            system_prompt_budget_bytes=100_000,
+        )
+    )
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="clause_dropped",
+            constitution_injection="full",
+            # Fits the mandatory constitution block but not the optional
+            # contributed clause joined after it.
+            system_prompt_budget_bytes=80,
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("clause_included"))
+    await _drain(env)
+    await env.dispatcher.dispatch_signal(_signal("clause_dropped"))
+    await _drain(env)
+
+    rows = await env.backend.fetch_all(
+        "SELECT source, injected_clauses_json, dropped_clauses_json "
+        "FROM signal_log WHERE source IN (?, ?) ORDER BY source",
+        ("clause_dropped", "clause_included"),
+    )
+    by_source = {
+        source: (
+            json.loads(injected_json) if injected_json else [],
+            json.loads(dropped_json) if dropped_json else [],
+        )
+        for source, injected_json, dropped_json in rows
+    }
+    assert "audited-feature-clause" in by_source["clause_included"][0]
+    assert "audited-feature-clause" in by_source["clause_dropped"][1]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_does_not_retry_on_internal_typeerror(
     tmp_path, template_path
 ):
@@ -1541,6 +1655,105 @@ async def test_constitution_mixin_get_anchored_files_skips_duplicate_basenames(
     assert files["AGENTS.md"].startswith("original ")
     # The basename "AGENTS.md" appears exactly once.
     assert sum(1 for k in files if k == "AGENTS.md") == 1
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_rejects_reserved_anchored_audit_name(
+    tmp_path, monkeypatch,
+):
+    """Invalid operator doctrine fails before prompt assembly, with its name."""
+
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.agent.doctrine_bundle import (
+        DEFAULT_ANCHORED_PATHS,
+        PROP_BUNDLE_ANCHORED_PATHS,
+    )
+    from unittest.mock import AsyncMock, MagicMock
+
+    for rel in DEFAULT_ANCHORED_PATHS:
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"original {rel}", encoding="utf-8")
+    reserved = tmp_path / "operator" / "KESTREL_CONSTITUTION"
+    reserved.parent.mkdir()
+    reserved.write_text("must not collide", encoding="utf-8")
+    monkeypatch.setenv("KESTREL_PROJECT_ROOT", str(tmp_path))
+
+    class _Agent(ConstitutionMixin):
+        agent_id = "test"
+
+        def __init__(self):
+            self.storage = MagicMock()
+            node = MagicMock()
+            node.properties = {
+                PROP_BUNDLE_ANCHORED_PATHS: ["operator/KESTREL_CONSTITUTION"],
+            }
+            self.storage.get_node = AsyncMock(return_value=node)
+
+    with pytest.raises(
+        ValueError,
+        match="anchored doctrine.*reserved host audit name",
+    ):
+        await _Agent().get_anchored_doctrine_files()
+
+
+@pytest.mark.asyncio
+async def test_reserved_doctrine_failure_unwinds_receipt_tool_and_chain(
+    tmp_path, template_path
+):
+    """Validation after ephemeral setup cannot leak state into a later turn."""
+
+    from kestrel_sovereign.agent.system_prompt_assembler import (
+        SystemPromptNamespaceError,
+    )
+
+    class _StateTrackingAgent(_AuditingAgent):
+        def __init__(self):
+            super().__init__(
+                constitution_hash="constitution-hash",
+                anchored_bundle_hash="bundle-hash",
+                live_bundle_hash="bundle-hash",
+            )
+            self.receipt_tool_registered = False
+            self.chain = None
+
+        def register_constitution_receipt_tool(self, *, canary, signal_id):
+            self.receipt_tool_registered = True
+
+        def clear_constitution_receipt_tool(self):
+            self.receipt_tool_registered = False
+
+        def _set_current_chain(self, chain):
+            prior = self.chain
+            self.chain = list(chain)
+            return prior
+
+        def _clear_current_chain(self, token=None):
+            self.chain = token
+
+        async def get_anchored_doctrine_files(self):
+            raise SystemPromptNamespaceError("reserved doctrine collision")
+
+    agent = _StateTrackingAgent()
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="reserved_doctrine",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="claude_code",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("reserved_doctrine"))
+    await _drain(env)
+
+    assert result.status == Status.FAILED
+    assert agent.receipt_tool_registered is False
+    assert agent.chain is None
+    assert agent.process_input_calls == []
+    await env.backend.close()
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,10 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.deploy.manager import DeployManager
 from kestrel_sovereign.features.deploy.models import DeployManagerError
+from kestrel_sovereign.security.host_authority import (
+    HostAuthorityError,
+    require_sovereign_caller,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +124,19 @@ class DeployFeature(Feature):
 
         action_normalized = (action or "status").lower()
 
+        # Deploying or tearing down a multi-agent profile mutates the whole
+        # configured fleet's hosting, not this agent's. That is host
+        # administration (#3223): it requires the turn's endpoint-bound
+        # sovereign caller, and tool consent — ASK, AUTO, or a scoped
+        # auto-approval — is not that authority. Decided here, before the
+        # manager is asked, so no provider call is made on a refusal. The
+        # operator CLI reaches the manager directly and is outside the agent
+        # hierarchy by design.
+        if action_normalized in {"deploy", "start", "teardown", "stop", "delete"}:
+            refusal = self._fleet_authority_refusal(action_normalized, profile)
+            if refusal is not None:
+                return refusal
+
         # Internal helpers (_status, _deploy, etc.) still return
         # legacy dicts with {"success": True/False, ...}. Wrap the
         # outcome at the @tool boundary based on the success flag.
@@ -164,6 +181,36 @@ class DeployFeature(Feature):
             confirmation=confirmation,
             data=result_dict if isinstance(result_dict, dict) else {"raw": result_dict},
         )
+
+    def _fleet_authority_refusal(self, action: str, profile_name: str) -> "ToolResult | None":
+        """Refuse a multi-agent profile mutation without sovereign authority.
+
+        A missing or unknown profile is left to the action handler, which
+        already answers "profile required" / "unknown profile" — the profile
+        list is host configuration the ``list`` action publishes, so there
+        is nothing for the ordering to hide.
+        """
+        profile = self.manager.profiles.get(profile_name) if profile_name else None
+        if profile is None or not profile.is_multi_agent:
+            return None
+        try:
+            require_sovereign_caller(
+                f"{action} of the multi-agent deployment profile {profile_name!r}"
+            )
+        except HostAuthorityError as error:
+            logger.warning(f"Refused fleet {action} of profile {profile_name!r}: {error}")
+            return ToolResult.failed(
+                str(error),
+                data={
+                    "success": False,
+                    "action": action,
+                    "profile": profile_name,
+                    "deployment_mode": profile.deployment_mode,
+                    "authority": "sovereign",
+                    "error": str(error),
+                },
+            )
+        return None
 
     @staticmethod
     def _format_deploy_confirmation(action: str, payload: Any) -> str:

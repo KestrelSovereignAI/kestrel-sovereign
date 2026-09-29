@@ -4,7 +4,7 @@ Tests for database backend abstraction layer.
 import asyncio
 import threading
 from contextlib import suppress
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
@@ -117,6 +117,10 @@ class TestSQLiteBackend:
     @pytest.mark.asyncio
     async def test_backend_type(self, backend):
         assert backend.backend_type == "sqlite"
+
+    @pytest.mark.asyncio
+    async def test_nested_transaction_strategy_is_joined(self, backend):
+        assert backend.nested_transaction_strategy == "joined"
     
     @pytest.mark.asyncio
     async def test_is_connected(self, backend):
@@ -1833,6 +1837,51 @@ class TestAsyncDatabase:
     """Test the AsyncDatabase facade."""
 
     @pytest.mark.asyncio
+    async def test_column_shape_helpers_delegate_to_backend_safe_probes(self):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        database = AsyncDatabase(MagicMock())
+        database._column_accepts_null = AsyncMock(return_value=True)
+        database._column_has_default = AsyncMock(return_value=True)
+
+        assert await database.column_accepts_null("widgets", "note") is True
+        assert await database.column_has_default("widgets", "note") is True
+        database._column_accepts_null.assert_awaited_once_with("widgets", "note")
+        database._column_has_default.assert_awaited_once_with("widgets", "note")
+
+    def test_nested_transaction_strategy_allow_list_and_backend_contracts(self):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+        unknown_backend = MagicMock()
+        unknown_backend.nested_transaction_strategy = "future-strategy"
+        assert AsyncDatabase(unknown_backend).nested_transaction_strategy is None
+        assert SQLiteBackend(":memory:").nested_transaction_strategy == "joined"
+        assert PostgresBackend(
+            "postgresql://test:test@127.0.0.1/test"
+        ).nested_transaction_strategy == "savepoint"
+
+    @pytest.mark.asyncio
+    async def test_column_shape_helpers_define_missing_column_semantics(self):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        database = await AsyncDatabase.sqlite(":memory:")
+        try:
+            await database.execute(
+                "CREATE TABLE widgets (nullable TEXT DEFAULT 'note', "
+                "required TEXT NOT NULL)"
+            )
+
+            assert await database.column_accepts_null("widgets", "nullable")
+            assert not await database.column_accepts_null("widgets", "required")
+            assert not await database.column_accepts_null("widgets", "missing")
+            assert await database.column_has_default("widgets", "nullable")
+            assert not await database.column_has_default("widgets", "required")
+            assert not await database.column_has_default("widgets", "missing")
+        finally:
+            await database.close()
+
+    @pytest.mark.asyncio
     async def test_cancelled_cached_sqla_disposal_still_closes_primary_worker(
         self, tmp_path,
     ):
@@ -1965,7 +2014,13 @@ class TestAsyncDatabase:
 
                 # The factory timeout is observable, but only after the
                 # primary backend close was attempted and its worker exited.
+                # Join rather than assert on the instant: the worker's exit is
+                # a real thread teardown, and on a loaded 2-core runner it had
+                # simply not been scheduled yet by the time this line ran. The
+                # deadline under test is the FACTORY's, asserted above; this is
+                # only an observation bound, so it is generous.
                 assert not db.backend.is_connected
+                primary_worker.join(timeout=30.0)
                 assert not primary_worker.is_alive()
                 assert factory_worker.is_alive()
                 assert workers == [factory_worker]
@@ -2546,7 +2601,10 @@ class TestAsyncDatabase:
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.sqla import make_session_factory
 
-        timeout_seconds = 0.03
+        # Shared close+join deadline; the worker here is held, so the JOIN is
+        # the stage that must expire. Too small and a loaded machine cannot
+        # finish the CLOSE either, which is why this file's siblings flaked.
+        timeout_seconds = 0.5
         monkeypatch.setattr(
             sqlite_backend_module,
             "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
@@ -2681,9 +2739,18 @@ class TestAsyncDatabase:
                 worker_exit_delayed,
                 should_delay=lambda candidate: candidate is factory_worker,
             ) as workers, patch(
+                # 0.5s, not tens of milliseconds. This budget is a DEADLINE
+                # SHARED by two stages (sqlite.py: deadline = now + this + one
+                # poll): first aiosqlite's own close, then the worker join. The
+                # worker here is held deliberately, so the join is what must
+                # expire -- but at 0.01s a loaded machine could not finish the
+                # CLOSE either, and whichever stage lost the race decided the
+                # error message and whether the primary worker had exited yet.
+                # That is what made this test flaky under `-n auto`. Keep this
+                # comfortably above a real close and below the 2.0s watchdog.
                 "kestrel_sovereign.storage.db.sqlite."
                 "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-                0.01,
+                0.5,
             ):
                 factory = make_session_factory(db)
                 # Keep the SQLAlchemy connection checked out.  Engine disposal
@@ -2813,10 +2880,14 @@ class TestAsyncDatabase:
         from kestrel_sovereign.storage.async_storage import AsyncStorage
         from kestrel_sovereign.storage.sqla import make_session_factory
 
+        # See the note above: this is a shared close+join deadline, and the
+        # join is the stage this test holds open. 0.05s was small enough that a
+        # loaded machine spent the whole budget inside the close and the test
+        # timed out instead of asserting. Below the 2.0s watchdog.
         monkeypatch.setattr(
             sqlite_backend_module,
             "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-            0.05,
+            0.5,
         )
         storage = AsyncStorage(str(tmp_path / "storage-retained-worker.db"))
         await storage.initialize()

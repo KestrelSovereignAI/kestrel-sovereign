@@ -1,7 +1,7 @@
 """RestartCoordinatorFeature — durable, host-mediated restart requests.
 
-Four agent-facing @tool entry points (request / list / cancel / escalation
-acknowledgement) plus an ACTION-mode
+Seven agent-facing @tool entry points (request / list / cancel / escalation
+acknowledgement plus grant / list / revoke delegation) and an ACTION-mode
 ``restart_coordinator`` cron entry that scans the durable table and
 spawns a detached subprocess to actually restart Kestrel once safety
 checks pass. After restart, ``initialize`` sweeps any in-flight
@@ -37,9 +37,22 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    AgentIdentityUnavailable,
+    resolve_feature_database,
+    resolve_scoped_agent_did,
+)
 from kestrel_sovereign.storage.database_clock import database_clock
+from kestrel_sovereign.storage.db.interface import TransactionError
 
+from .authority import (
+    RestartAuthorityError,
+    agent_request_bounds_violation,
+    agent_request_refusal,
+    agent_update_boundary_violation,
+    is_agent_request_seal,
+    require_restart_request_authority,
+)
 from .event_store import (
     ensure_restart_status_events_table,
     list_recent_events_for_history,
@@ -54,24 +67,31 @@ from .store import (
     PENDING_STATES,
     acknowledge_escalation,
     cancel_request_if_owned,
+    claim_request_for_execution,
     clear_deferral_started,
     ensure_restart_requests_table,
     get_request,
     get_request_for_agent,
     insert_request,
+    insert_restart_delegation,
     list_requests,
+    list_restart_delegations,
     list_requests_needing_wake,
     mark_deferral_started,
     mark_wake_delivered,
     mark_wake_dispatched,
     record_update_log,
+    resolve_restart_delegation,
+    revoke_restart_delegation as revoke_restart_delegation_record,
     update_status,
+    verify_restart_authority_at_use,
 )
 from .update_profiles import (
     KNOWN_UPDATE_PROFILES,
     default_sovereign_repo_path,
     get_update_profile,
     is_valid_target_ref,
+    origin_has_tag,
     repo_is_git_checkout,
 )
 
@@ -105,6 +125,23 @@ _DISPATCH_POLL_SECONDS = 0.5
 # stops retrying and rejects it. A permanently broken ``kestrel restart`` would
 # otherwise spawn a doomed subprocess every cron tick indefinitely.
 MAX_RESTART_DISPATCH_ATTEMPTS = 3
+
+# Delegated whole-host authority is deliberately short lived. The sovereign
+# can reissue it, but an agent cannot turn one approval into an indefinite
+# administrative role.
+MAX_RESTART_DELEGATION_SECONDS = 86_400
+
+
+def _canonical_update_repo_path(path: str) -> Optional[str]:
+    """Resolve one repository path without leaking malformed input failures."""
+
+    try:
+        return str(Path(path).expanduser().resolve())
+    except (OSError, RuntimeError, ValueError):
+        # ``ValueError`` covers embedded NULs; ``RuntimeError`` covers path
+        # resolution failures such as symlink loops on supported platforms.
+        return None
+
 
 # An ``executing`` row stamped with THIS boot older than this never had its
 # restart happen — the process it was going to kill is still running it. The
@@ -186,8 +223,8 @@ def _tail(raw: Any) -> str:
 
 
 # Background-task name prefixes for *infrastructure* work that must never
-# hold off an idle restart (#1626). Six shapes all wedged
-# ``idle_agents_only`` forever by being counted as "busy":
+# hold off an idle restart (#1626). Each of these shapes held
+# ``idle_agents_only`` off by being counted as "busy" — most of them forever:
 #   - ``durable_signal_log`` — fire-and-forget log writes that complete in
 #     well under a second but are minted continuously by heartbeats/scheduler
 #     ticks, so one is almost always alive when the idle check runs. Covers
@@ -226,6 +263,28 @@ def _tail(raw: Any) -> str:
 #   - ``isolated-runtime-telemetry:`` — advisory, coalesced telemetry delivery.
 #     It neither admits user work nor owns lifecycle progress, and shutdown
 #     cancels the exact tracked task before restart.
+#   - ``wait_fallback_reconcile`` — the mandatory WaitFeature's permanent
+#     ``while True`` fallback driver for the wait reconciler (#2729). Because
+#     WaitFeature is mandatory, EVERY booted agent carries this task for its
+#     whole lifetime, so from #2729 on no agent was ever idle to this gate:
+#     every ``idle_agents_only`` restart waited out
+#     ``MAX_IDLE_ONLY_DEFERRAL_SECONDS`` and the reason blamed whichever
+#     co-hosted agent the fleet walk reached first (#3347). It stays in the
+#     agent set on purpose — it is feature-owned and must be cancelled on
+#     disable and at shutdown. Excluding it loses nothing a restart could
+#     harm: a reconcile tick is the same bookkeeping the ``wait_reconcile``
+#     cron performs inline (which this gate never saw), signal-mode watches
+#     are durable and re-arm after restart, and any wake a tick enqueues is a
+#     separate ``signal_dispatch:*`` task that still defers.
+#   - ``durable_signal_owner_heartbeat:`` — the durable dispatcher's owner
+#     liveness tick (#2713). A fresh short task every third of the owner
+#     stale window (~40s), forever, so one is often alive when this check
+#     runs — and it can sit on a contended storage write for longer. It stays
+#     tracked because the dispatcher cancels and drains it before closing
+#     storage. Its only work is renewing this process's owner row and
+#     requeueing stale foreign leases, which a restart's own startup recovery
+#     repeats; any cognition it wakes runs as ``durable_cognition:*``, which
+#     still defers.
 # None is user/signal work; real work (``signal_dispatch:*``) still
 # defers a restart. The name is already stamped on the task at creation —
 # it was just never read here. New long-lived/bookkeeping daemons must be
@@ -237,6 +296,8 @@ _INFRA_TASK_PREFIXES = (
     "isolated-feature:",
     "isolated-feature-idle:",
     "isolated-runtime-telemetry:",
+    "wait_fallback_reconcile",
+    "durable_signal_owner_heartbeat:",
 )
 
 
@@ -279,7 +340,9 @@ def _format_age(seconds: Optional[float]) -> str:
     return f"{int(seconds // 3600)}h"
 
 
-def _describe_background_tasks(tasks, now: Optional[float] = None) -> str:
+def _describe_background_tasks(
+    tasks, now: Optional[float] = None, *, kinds_only: bool = False,
+) -> str:
     """Describe the tasks blocking an idle restart, not just how many (#2665).
 
     A bare count ("2 background tasks in flight") cannot be reconciled against
@@ -296,6 +359,12 @@ def _describe_background_tasks(tasks, now: Optional[float] = None) -> str:
       truncated away by the volume of another.
     - Age is what separates "busy" from "wedged", and #2665's symptom was a
       duration symptom. Oldest first puts the likely culprit at the front.
+
+    ``kinds_only`` labels each group by its KIND alone — never an example
+    name — for a co-hosted agent's tasks (#3347). The per-instance tail is
+    where a name carries a signal id, a peer counterparty or a DID; the kind
+    names a code path, not a counterparty. Hiding even that left a sibling's permanent task unidentifiable from
+    outside for two months while it held every restart off.
     """
     now = time.monotonic() if now is None else now
     kinds: Dict[str, Dict[str, Any]] = {}
@@ -326,8 +395,8 @@ def _describe_background_tasks(tasks, now: Optional[float] = None) -> str:
     ordered = sorted(kinds.items(), key=_sort_key)
     shown = ordered[:_MAX_NAMED_BUSY_KINDS]
     parts = []
-    for _kind, entry in shown:
-        label = entry["example"]
+    for kind, entry in shown:
+        label = kind if kinds_only else entry["example"]
         if entry["count"] > 1:
             label = f"{label} x{entry['count']}"
         parts.append(f"{label} ({_format_age(entry['oldest'])})")
@@ -350,6 +419,15 @@ class RestartCoordinatorFeature(Feature):
             "explicit, allowlisted update profile — that step is always "
             "explicit and audited, never an implicit side effect of restart."
         )
+
+
+    def _scoped_agent_did(self) -> str:
+        """This agent's DID through the shared guard, the scope every
+        restart-coordinator read and write is bound to (#3251). Raises
+        ``AgentIdentityUnavailable``; callers turn that into their own
+        refusal rather than binding an empty subject.
+        """
+        return resolve_scoped_agent_did(self.agent)
 
     async def initialize(self):
         # Request ids whose restart.completed wake is currently being
@@ -491,10 +569,233 @@ class RestartCoordinatorFeature(Feature):
             return []
 
     @tool(
+        name="grant_restart_delegation",
+        description=(
+            "Sovereign-only: grant one agent a short-lived, revocable, signed "
+            "whole-host restart delegation. The subject DID and exact "
+            "operation are mandatory. update_then_restart additionally binds "
+            "one explicit repository, target ref, update profile, and "
+            "migration choice. A delegation is not an admin role and grants "
+            "nothing outside these bounds. Returns its delegation_id."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!restart grant-delegation",
+    )
+    async def grant_restart_delegation(
+        self,
+        subject_agent_did: str,
+        operation: str = "restart_only",
+        expires_in_seconds: int = 3600,
+        update_profile: str = "",
+        target_ref: str = "",
+        repo_path: str = "",
+        allow_migrations: bool = False,
+    ) -> ToolResult:
+        try:
+            require_restart_request_authority()
+        except RestartAuthorityError as error:
+            return ToolResult.failed(
+                str(error), data={"created": False, "authority": "required"}
+            )
+        subject_agent_did = (subject_agent_did or "").strip()
+        if not subject_agent_did or not subject_agent_did.startswith("did:"):
+            return ToolResult.failed(
+                "subject_agent_did must be an explicit DID",
+                data={"created": False},
+            )
+        try:
+            local_agent_did = self._scoped_agent_did()
+        except AgentIdentityUnavailable:
+            return ToolResult.failed(
+                "Restart coordinator requires the agent's durable identity",
+                data={"created": False},
+            )
+        if subject_agent_did != local_agent_did:
+            return ToolResult.failed(
+                "subject_agent_did must identify this agent; restart "
+                "delegations are stored in the subject agent's authority store",
+                data={"created": False},
+            )
+        if operation not in KNOWN_OPERATIONS:
+            return ToolResult.failed(
+                f"operation must be one of {sorted(KNOWN_OPERATIONS)}; "
+                f"got {operation!r}",
+                data={"created": False},
+            )
+        if (
+            not isinstance(expires_in_seconds, int)
+            or isinstance(expires_in_seconds, bool)
+            or not 1 <= expires_in_seconds <= MAX_RESTART_DELEGATION_SECONDS
+        ):
+            return ToolResult.failed(
+                "expires_in_seconds must be an integer between 1 and "
+                f"{MAX_RESTART_DELEGATION_SECONDS}",
+                data={"created": False},
+            )
+        update_repo_path = ""
+        update_target_ref = ""
+        if operation == "restart_only":
+            if any((update_profile, target_ref, repo_path, allow_migrations)):
+                return ToolResult.failed(
+                    "restart_only delegation cannot carry update bounds",
+                    data={"created": False},
+                )
+        else:
+            if update_profile not in KNOWN_UPDATE_PROFILES:
+                return ToolResult.failed(
+                    "update_then_restart delegation requires a known "
+                    f"update_profile; got {update_profile!r}",
+                    data={"created": False},
+                )
+            update_target_ref = (target_ref or "").strip()
+            if not is_valid_target_ref(update_target_ref):
+                return ToolResult.failed(
+                    "update_then_restart delegation requires a valid target_ref",
+                    data={"created": False},
+                )
+            if not (repo_path or "").strip():
+                return ToolResult.failed(
+                    "update_then_restart delegation requires an explicit repo_path",
+                    data={"created": False},
+                )
+            canonical_repo_path = _canonical_update_repo_path(repo_path)
+            if canonical_repo_path is None:
+                return ToolResult.failed(
+                    "update_then_restart delegation repo_path is invalid",
+                    data={"created": False},
+                )
+            update_repo_path = canonical_repo_path
+            if not repo_is_git_checkout(update_repo_path):
+                return ToolResult.failed(
+                    "update_then_restart delegation repo_path must be a local "
+                    "git checkout",
+                    data={"created": False},
+                )
+            profile = get_update_profile(update_profile)
+            if allow_migrations and (
+                profile is None or not profile.supports_migrations
+            ):
+                return ToolResult.failed(
+                    f"update profile {update_profile!r} does not allow migrations",
+                    data={"created": False},
+                )
+        if self._db is None:
+            return ToolResult.failed(
+                "Restart coordinator storage unavailable",
+                data={"created": False},
+            )
+        try:
+            delegation = await insert_restart_delegation(
+                self._db,
+                subject_agent_did=subject_agent_did,
+                operation=operation,
+                update_repo_path=update_repo_path,
+                update_target_ref=update_target_ref,
+                update_profile=(
+                    update_profile if operation == "update_then_restart" else ""
+                ),
+                update_allow_migrations=bool(allow_migrations),
+                expires_in_seconds=expires_in_seconds,
+            )
+        except RestartAuthorityError as error:
+            return ToolResult.failed(
+                str(error), data={"created": False, "authority": "required"}
+            )
+        return ToolResult.ok(
+            confirmation=(
+                "Granted scoped restart delegation "
+                f"{delegation.delegation_id} to {subject_agent_did}"
+            ),
+            data={"created": True, "delegation": delegation.to_public_dict()},
+        )
+
+    @tool(
+        name="list_restart_delegations",
+        description=(
+            "List this agent's own restart delegations and whether each is "
+            "active, expired, or revoked. Signed authority bytes are never returned."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!restart list-delegations",
+    )
+    async def list_restart_delegations(self) -> ToolResult:
+        if self._db is None:
+            return ToolResult.failed("Restart coordinator storage unavailable")
+        try:
+            subject = self._scoped_agent_did()
+        except AgentIdentityUnavailable:
+            return ToolResult.failed(
+                "Restart coordinator requires the agent's durable identity"
+            )
+        delegations = await list_restart_delegations(
+            self._db, subject_agent_did=subject
+        )
+        return ToolResult.ok(
+            confirmation=f"Found {len(delegations)} restart delegation(s)",
+            data={"count": len(delegations), "delegations": delegations},
+        )
+
+    @tool(
+        name="revoke_restart_delegation",
+        description=(
+            "Sovereign-only: durably revoke a signed restart delegation by id. "
+            "Revocation is idempotent and is rechecked before update and restart use."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!restart revoke-delegation",
+    )
+    async def revoke_restart_delegation(self, delegation_id: str) -> ToolResult:
+        try:
+            require_restart_request_authority()
+        except RestartAuthorityError as error:
+            return ToolResult.failed(
+                str(error), data={"revoked": False, "authority": "required"}
+            )
+        if self._db is None:
+            return ToolResult.failed(
+                "Restart coordinator storage unavailable",
+                data={"revoked": False},
+            )
+        normalized = (delegation_id or "").strip()
+        try:
+            revoked, receipt = await revoke_restart_delegation_record(
+                self._db, normalized
+            )
+        except RestartAuthorityError as error:
+            return ToolResult.failed(
+                str(error),
+                data={"revoked": False, "authority": "required"},
+            )
+        if not revoked:
+            return ToolResult.failed(
+                "Restart delegation not found",
+                data={"revoked": False, "delegation_id": normalized},
+            )
+        return ToolResult.ok(
+            confirmation=f"Revoked restart delegation {normalized}",
+            data={
+                "revoked": True,
+                "delegation_id": normalized,
+                **(receipt or {}),
+            },
+        )
+
+    @tool(
         name="request_restart",
         description=(
-            "File a durable restart request. The host coordinator "
-            "evaluates safety and executes when conditions are met.\n\n"
+            "File a durable whole-host restart request. An agent may file one "
+            "from its own work, with no sovereign caller, inside the "
+            "agent-requestable bounds: operation='restart_only', or "
+            "operation='update_then_restart' with a known update_profile, "
+            "the default Sovereign checkout (omit repo_path), target_ref set "
+            "to that checkout's default branch, and allow_migrations=false. "
+            "Anything wider (another ref, repository, or profile, or "
+            "migrations) requires the endpoint-authenticated sovereign API "
+            "key or an explicit delegation_id for this agent and those exact "
+            "bounds; the refusal names the exceeded bound. The exact "
+            "operation/update bounds are sealed durably and re-verified by "
+            "the host coordinator, which executes when every agent is idle "
+            "or, per policy, after a bounded timeout.\n\n"
             "urgency: one of low|normal|high|critical (default 'normal'); "
             "common synonyms are accepted ('medium'→normal, 'urgent'→high, "
             "'emergency'→critical). Higher urgency is executed first.\n"
@@ -536,6 +837,7 @@ class RestartCoordinatorFeature(Feature):
         target_ref: str = "",
         repo_path: str = "",
         allow_migrations: bool = False,
+        delegation_id: str = "",
     ) -> ToolResult:
         if not reason or not reason.strip():
             return ToolResult.failed(
@@ -563,6 +865,60 @@ class RestartCoordinatorFeature(Feature):
                 data={"created": False},
             )
 
+        if self._db is None:
+            return ToolResult.failed(
+                "Restart coordinator storage unavailable",
+                data={"created": False},
+            )
+        try:
+            agent_id = self._scoped_agent_did()
+        except AgentIdentityUnavailable:
+            return ToolResult.failed(
+                "Restart coordinator requires the agent's durable identity",
+                data={"created": False},
+            )
+        delegation_id = (delegation_id or "").strip()
+        agent_request = False
+        if not delegation_id:
+            # Authority is checked before update-mode path discovery or checkout
+            # inspection. A caller who cannot request a whole-host mutation must
+            # not be able to use its validation errors as a filesystem oracle.
+            try:
+                require_restart_request_authority()
+            except RestartAuthorityError:
+                # No sovereign caller: this is the agent's own request (#3339),
+                # allowed only inside the agent-requestable bounds. Screen the
+                # values the row would store. A caller-supplied repo_path is
+                # compared lexically to the default checkout, never resolved or
+                # inspected, so an out-of-bounds path learns nothing about the
+                # filesystem; the seal and every executor re-check the bounds.
+                updating = operation == "update_then_restart"
+                requested_repo = (repo_path or "").strip() if updating else ""
+                if updating and not requested_repo:
+                    requested_repo = default_sovereign_repo_path()
+                exceeded = agent_request_bounds_violation(
+                    operation=operation,
+                    policy=policy,
+                    update_repo_path=(
+                        os.path.normpath(requested_repo) if requested_repo else ""
+                    ),
+                    update_target_ref=(
+                        (target_ref or "").strip() if updating else ""
+                    ),
+                    update_profile=update_profile if updating else "",
+                    update_allow_migrations=bool(allow_migrations),
+                )
+                if exceeded is not None:
+                    return ToolResult.failed(
+                        agent_request_refusal(*exceeded),
+                        data={
+                            "created": False,
+                            "authority": "required",
+                            "exceeded_bound": exceeded[0],
+                        },
+                    )
+                agent_request = True
+
         # Validate and normalise the update-mode parameters up front so an
         # unsafe/unknown profile never reaches the durable table.
         update_repo_path = ""
@@ -584,8 +940,49 @@ class RestartCoordinatorFeature(Feature):
                     data={"created": False},
                 )
             update_repo_path = (repo_path or "").strip()
-            if not update_repo_path:
+            if not update_repo_path and not delegation_id:
                 update_repo_path = default_sovereign_repo_path()
+            if delegation_id and not update_repo_path:
+                return ToolResult.failed(
+                    "delegated update_then_restart requires the explicit "
+                    "repo_path bound by its delegation",
+                    data={"created": False, "authority": "required"},
+                )
+
+        if delegation_id:
+            delegation, authority_reason = await resolve_restart_delegation(
+                self._db,
+                delegation_id,
+                subject_agent_did=agent_id,
+                operation=operation,
+                update_repo_path=update_repo_path,
+                update_target_ref=update_target_ref,
+                update_profile=(
+                    update_profile if operation == "update_then_restart" else ""
+                ),
+                update_allow_migrations=bool(allow_migrations),
+            )
+            if delegation is None:
+                return ToolResult.failed(
+                    authority_reason,
+                    data={"created": False, "authority": "required"},
+                )
+
+        if operation == "update_then_restart":
+            canonical_repo_path = _canonical_update_repo_path(update_repo_path)
+            if canonical_repo_path is None:
+                return ToolResult.failed(
+                    "update_then_restart repo_path is invalid",
+                    data={"created": False},
+                )
+            # A delegated path is signed in canonical form; refusing aliases
+            # prevents a symlink retarget from widening the signed repository.
+            if delegation_id and canonical_repo_path != update_repo_path:
+                return ToolResult.failed(
+                    "delegated repo_path no longer resolves to its signed bound",
+                    data={"created": False, "authority": "required"},
+                )
+            update_repo_path = canonical_repo_path
             if not repo_is_git_checkout(update_repo_path):
                 return ToolResult.failed(
                     "update_then_restart requires repo_path to be a local "
@@ -594,13 +991,6 @@ class RestartCoordinatorFeature(Feature):
                     data={"created": False},
                 )
 
-        if self._db is None:
-            return ToolResult.failed(
-                "Restart coordinator storage unavailable",
-                data={"created": False},
-            )
-
-        agent_id = getattr(self.agent, "did", "") or ""
         # Record the in-flight chat/agent turn that filed this request so
         # the coordinator can ignore the requester's own active-request
         # marker when judging idleness — that marker should not block the
@@ -617,22 +1007,39 @@ class RestartCoordinatorFeature(Feature):
         # query/header value and is not the turn's routing authority.
         # CLI/system/session-less requests remain explicitly unbound.
         origin_session_id = self._turn_session_id() or ""
-        req = await insert_request(
-            self._db,
-            requested_by_agent=str(agent_id),
-            reason=reason.strip(),
-            urgency=urgency,
-            policy=policy,
-            desired_window=desired_window,
-            operation=operation,
-            update_repo_path=update_repo_path,
-            update_target_ref=update_target_ref,
-            update_profile=(update_profile if operation == "update_then_restart"
-                            else ""),
-            update_allow_migrations=bool(allow_migrations),
-            requester_request_id=str(requester_request_id),
-            origin_session_id=origin_session_id,
-        )
+        try:
+            req = await insert_request(
+                self._db,
+                requested_by_agent=str(agent_id),
+                reason=reason.strip(),
+                urgency=urgency,
+                policy=policy,
+                desired_window=desired_window,
+                operation=operation,
+                update_repo_path=update_repo_path,
+                update_target_ref=update_target_ref,
+                update_profile=(
+                    update_profile if operation == "update_then_restart" else ""
+                ),
+                update_allow_migrations=bool(allow_migrations),
+                requester_request_id=str(requester_request_id),
+                origin_session_id=origin_session_id,
+                delegation_id=delegation_id,
+                allow_agent_request=agent_request,
+            )
+        except (RestartAuthorityError, TransactionError) as error:
+            authority_error = (
+                error.__cause__
+                if isinstance(error, TransactionError)
+                and isinstance(error.__cause__, RestartAuthorityError)
+                else error
+            )
+            if not isinstance(authority_error, RestartAuthorityError):
+                raise
+            return ToolResult.failed(
+                str(authority_error),
+                data={"created": False, "authority": "required"},
+            )
         logger.info(
             "Restart request filed: id=%s op=%s urgency=%s policy=%s "
             "profile=%s ref=%s reason=%s",
@@ -747,11 +1154,11 @@ class RestartCoordinatorFeature(Feature):
     @tool(
         name="acknowledge_restart_escalation",
         description=(
-            "Acknowledge the bounded host-wide escalation policy for one "
-            "pending restart request filed by this agent and migrated from "
-            "an older release. Requests filed by another agent cannot be "
-            "acknowledged. This "
-            "is required once for legacy rows before a continuous busy "
+            "Explicitly re-authorize and acknowledge the bounded host-wide "
+            "escalation policy for one pending restart request filed by this "
+            "agent and migrated from an older release. Requests filed by "
+            "another agent cannot be acknowledged. Sovereign-key authority "
+            "is required. This is required once for legacy rows before a continuous busy "
             "deferral may override fleet quiescence. Pass request_id from "
             "list_restart_requests."
         ),
@@ -776,11 +1183,31 @@ class RestartCoordinatorFeature(Feature):
                 "Restart request access requires this agent's durable identity",
                 data={"acknowledged": False, "request_id": normalized},
             )
-        if not await acknowledge_escalation(
-            self._db,
-            normalized,
-            requested_by_agent=requester,
-        ):
+        try:
+            require_restart_request_authority()
+            acknowledged = await acknowledge_escalation(
+                self._db,
+                normalized,
+                requested_by_agent=requester,
+            )
+        except RestartAuthorityError as error:
+            return ToolResult.failed(
+                str(error),
+                data={
+                    "acknowledged": False,
+                    "request_id": normalized,
+                    "authority": "required",
+                },
+            )
+        except TransactionError:
+            return ToolResult.failed(
+                "Restart authority acknowledgement did not commit atomically",
+                data={
+                    "acknowledged": False,
+                    "request_id": normalized,
+                },
+            )
+        if not acknowledged:
             row = await get_request_for_agent(self._db, normalized, requester)
             if row is not None and row.status not in PENDING_STATES:
                 return ToolResult.failed(
@@ -876,12 +1303,17 @@ class RestartCoordinatorFeature(Feature):
         )
 
     def _agent_requester_id(self) -> Optional[str]:
-        """Return the trusted durable principal bound to this feature instance."""
+        """Return the trusted durable principal bound to this feature instance,
+        or ``None`` when the agent has no durable identity.
 
-        value = getattr(self.agent, "did", None)
-        if not isinstance(value, str) or not value.strip():
+        The same guard as every other self-scoped read in this feature
+        (#3251); the readers that call this already treat ``None`` as
+        "no requester", so the refusal keeps that shape.
+        """
+        try:
+            return self._scoped_agent_did()
+        except AgentIdentityUnavailable:
             return None
-        return value.strip()
 
     @tool(
         name="restart_coordinator",
@@ -937,6 +1369,16 @@ class RestartCoordinatorFeature(Feature):
         executed: List[Dict[str, Any]] = []
         deferred: List[Dict[str, Any]] = []
         for req in candidates:
+            # Reject unsigned legacy, forged, tampered, or key-revoked rows
+            # before policy/safety can defer them indefinitely. This is the
+            # explicit legacy migration policy: no automatic authority
+            # backfill and no inference from historical approval state. The
+            # sovereign acknowledgement tool is the only re-authorization door.
+            if await self._reject_invalid_authority(
+                req,
+                expected_current_status=req.status,
+            ):
+                continue
             req, decision = await self._evaluate_and_track_safety(req)
             if not decision["safe"]:
                 if decision.get("deferable", True):
@@ -959,16 +1401,27 @@ class RestartCoordinatorFeature(Feature):
                     )
                     continue
                 # Hard reject.
-                await update_status(
+                rejected = await update_status(
                     self._db, req.id,
                     status="rejected",
                     status_reason=decision["reason"],
                     completed_at=datetime.now(timezone.utc).isoformat(),
                     expected_current_status=req.status,
+                    expected_authority_signature=req.authority_signature,
                 )
-                await self._emit_status_event(
-                    req, state="rejected", status_reason=decision["reason"],
-                )
+                if rejected:
+                    await self._emit_status_event(
+                        req, state="rejected", status_reason=decision["reason"],
+                    )
+                continue
+
+            # Safety checks can await fleet state. Re-verify immediately before
+            # crossing into update/execution so key rotation during that wait
+            # revokes the request before any host mutation begins.
+            if await self._reject_invalid_authority(
+                req,
+                expected_current_status=req.status,
+            ):
                 continue
 
             # Move out of the pending state BEFORE doing work. A plain
@@ -994,15 +1447,15 @@ class RestartCoordinatorFeature(Feature):
                 # very much alive. Popped again below if the transition loses
                 # its race.
                 self._executing_since[req.id] = time.monotonic()
-            moved = await update_status(
-                self._db, req.id,
+            claim_result = await claim_request_for_execution(
+                self._db,
+                req,
                 status=initial_state,
                 status_reason=(
                     "running update profile before restart"
                     if initial_state == "updating"
                     else "dispatched to detached restart subprocess"
                 ),
-                expected_current_status=req.status,
                 # Stamp the live process only when crossing straight to
                 # ``executing`` (#1796); an ``updating`` row has not yet
                 # reached the restart, so it carries no boot stamp.
@@ -1010,12 +1463,41 @@ class RestartCoordinatorFeature(Feature):
                     _PROCESS_BOOT_ID if initial_state == "executing" else None
                 ),
             )
-            if not moved:
+            if claim_result != "claimed":
                 if initial_state == "executing":
                     self._executing_since.pop(req.id, None)
+                if claim_result in {"consumed", "invalid"}:
+                    replay_reason = (
+                        "restart authority lifecycle generation was already "
+                        "consumed; refusing replay"
+                        if claim_result == "consumed"
+                        else "restart authority issuance is absent or does not "
+                        "match the signed lifecycle generation; refusing execution"
+                    )
+                    rejected = await update_status(
+                        self._db,
+                        req.id,
+                        status="rejected",
+                        status_reason=replay_reason,
+                        completed_at=datetime.now(timezone.utc).isoformat(),
+                        expected_current_status=req.status,
+                        expected_authority_signature=req.authority_signature,
+                    )
+                    if rejected:
+                        req.status = "rejected"
+                        await self._emit_status_event(
+                            req,
+                            state="rejected",
+                            status_reason=replay_reason,
+                        )
+                    continue
                 deferred.append({
                     "request_id": req.id,
-                    "reason": "lost race against another transition",
+                    "reason": (
+                        "invalid restart authority"
+                        if claim_result == "invalid"
+                        else "lost race against another transition"
+                    ),
                 })
                 continue
             req.status = initial_state
@@ -1040,6 +1522,14 @@ class RestartCoordinatorFeature(Feature):
             # here records the audit log and decides retryable vs
             # terminal; only a clean update proceeds to the spawn.
             if req.operation == "update_then_restart":
+                # The transition and status event both await external work.
+                # Re-verify at the actual mutation boundary so key rotation
+                # during either await revokes the update as well as restart.
+                if await self._reject_invalid_authority(
+                    req,
+                    expected_current_status="updating",
+                ):
+                    continue
                 handled = await self._handle_update_then_restart(req)
                 if handled is not None:
                     # Either deferred (retryable) or rejected (terminal).
@@ -1061,6 +1551,15 @@ class RestartCoordinatorFeature(Feature):
                                 deferral_reason=handled.get("reason", ""),
                             )
                     continue
+                # The update is the longest awaited mutation in this path.
+                # Recheck the seal before any safety-state write: if the key
+                # rotated, trying to reseal a new deferral timestamp would
+                # lose its CAS and strand the row in ``updating`` forever.
+                if await self._reject_invalid_authority(
+                    req,
+                    expected_current_status="updating",
+                ):
+                    continue
                 # Re-run the safety gate before the restart now that the
                 # (possibly slow) update has completed.
                 req, decision = await self._evaluate_and_track_safety(req)
@@ -1071,7 +1570,7 @@ class RestartCoordinatorFeature(Feature):
                             "reason": decision["reason"],
                         })
                         continue
-                    await update_status(
+                    moved = await update_status(
                         self._db, req.id,
                         status="pending",
                         status_reason=(
@@ -1079,7 +1578,23 @@ class RestartCoordinatorFeature(Feature):
                             f"restart: {decision['reason']}"
                         ),
                         expected_current_status="updating",
+                        expected_authority_signature=req.authority_signature,
                     )
+                    if not moved:
+                        await self._recover_failed_restart_dispatch(
+                            req.id,
+                            reason=(
+                                "update succeeded but post-update safety "
+                                "deferral could not be committed"
+                            ),
+                            active_status="updating",
+                            authority_context="post-update safety deferral",
+                        )
+                        deferred.append({
+                            "request_id": req.id,
+                            "reason": "lost race after update safety check",
+                        })
+                        continue
                     deferred.append({
                         "request_id": req.id,
                         "reason": (
@@ -1112,6 +1627,7 @@ class RestartCoordinatorFeature(Feature):
                     status="executing",
                     status_reason="update complete; dispatching restart",
                     expected_current_status="updating",
+                    expected_authority_signature=req.authority_signature,
                     executing_boot_id=_PROCESS_BOOT_ID,
                 )
                 if not moved:
@@ -1134,21 +1650,26 @@ class RestartCoordinatorFeature(Feature):
                     )
                 await self._emit_status_event(req, state="executing")
 
+            # Re-verify at the actual restart boundary. This catches key
+            # rotation/revocation during safety waits or a long update and
+            # prevents a check/use split from turning stale evidence into a
+            # fleet-wide process interruption.
+            if await self._reject_invalid_authority(
+                req,
+                expected_current_status="executing",
+            ):
+                self._executing_since.pop(req.id, None)
+                continue
+
             try:
                 proc = self._spawn_restart_subprocess()
             except Exception as e:
                 logger.error(
                     "restart_coordinator: spawn failed: %s", e,
                 )
-                await update_status(
-                    self._db, req.id,
-                    status="pending",
-                    status_reason=f"spawn failed: {e}",
-                    expected_current_status="executing",
-                )
-                await self._emit_status_event(
-                    req, state="pending",
-                    deferral_reason=f"spawn failed: {e}",
+                await self._recover_failed_restart_dispatch(
+                    req.id,
+                    reason=f"spawn failed: {e}",
                 )
                 continue
 
@@ -1182,6 +1703,154 @@ class RestartCoordinatorFeature(Feature):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    async def _reject_invalid_authority(
+        self,
+        req,
+        *,
+        expected_current_status: str,
+    ) -> bool:
+        """Stop processing unless the exact durable sovereign seal is current.
+
+        Safety-state writes reseal a row without changing its lifecycle status.
+        Re-reading only to verify the stale caller object therefore leaves a
+        check/use gap: another coordinator can clear or start a deferral clock
+        after safety evaluation and before execution.  A changed, valid seal is
+        not rejected; pending work is deferred for a fresh evaluation, while a
+        row already crossed into a mutation state is returned to ``pending``.
+        """
+
+        fresh = await get_request(self._db, req.id)
+        if fresh is None or fresh.status != expected_current_status:
+            return True
+
+        verified, reason = await verify_restart_authority_at_use(self._db, fresh)
+        if verified:
+            if fresh.authority_signature == req.authority_signature:
+                return False
+            if expected_current_status not in PENDING_STATES:
+                recovered = await update_status(
+                    self._db,
+                    fresh.id,
+                    status="pending",
+                    status_reason=(
+                        "signed safety state changed during restart dispatch; "
+                        "returned to pending for reevaluation"
+                    ),
+                    expected_current_status=expected_current_status,
+                    expected_authority_signature=fresh.authority_signature,
+                )
+                if recovered:
+                    fresh.status = "pending"
+                    await self._emit_status_event(
+                        fresh,
+                        state="pending",
+                        deferral_reason=(
+                            "signed safety state changed during restart dispatch; "
+                            "reevaluating"
+                        ),
+                    )
+            return True
+        landed = await update_status(
+            self._db,
+            fresh.id,
+            status="rejected",
+            status_reason=f"authority denied: {reason}",
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            expected_current_status=expected_current_status,
+            expected_authority_signature=fresh.authority_signature,
+        )
+        if landed:
+            rejected = await get_request(self._db, fresh.id)
+            await self._emit_status_event(
+                rejected or fresh,
+                state="rejected",
+                status_reason=f"authority denied: {reason}",
+            )
+        return True
+
+    async def _recover_failed_restart_dispatch(
+        self,
+        request_id: str,
+        *,
+        reason: str,
+        active_status: str = "executing",
+        authority_context: str = "failed restart dispatch",
+        emit_status: bool = True,
+    ) -> Optional[str]:
+        """Make a demonstrably failed dispatch retryable or terminal.
+
+        An active mutation request owns a one-shot retry capability. If its
+        sovereign seal was revoked while the host mutation was in flight,
+        rotating that capability back to ``pending`` must fail. Leaving the
+        row active would strand it outside both polling and cancel
+        surfaces, so invalid or missing retry authority is terminalized with
+        exact evidence instead.
+        """
+
+        current = await get_request(self._db, request_id)
+        if current is None or current.status != active_status:
+            return None
+
+        verified, authority_reason = await verify_restart_authority_at_use(
+            self._db, current
+        )
+        if verified:
+            moved = await update_status(
+                self._db,
+                request_id,
+                status="pending",
+                status_reason=reason,
+                expected_current_status=active_status,
+                expected_authority_signature=current.authority_signature,
+            )
+            if moved:
+                self._executing_since.pop(request_id, None)
+                current.status = "pending"
+                if emit_status:
+                    await self._emit_status_event(
+                        current,
+                        state="pending",
+                        deferral_reason=reason,
+                    )
+                return "pending"
+
+            # The verification/update boundary may itself cross a sovereign
+            # key rotation. Re-read before deciding whether this was a benign
+            # concurrent state transition or revoked authority.
+            current = await get_request(self._db, request_id)
+            if current is None or current.status != active_status:
+                return None
+            verified, authority_reason = await verify_restart_authority_at_use(
+                self._db, current
+            )
+
+        terminal_reason = (
+            f"{reason}; authority revoked during {authority_context}: "
+            f"{authority_reason}"
+            if not verified
+            else f"{reason}; no durable retry authority remains"
+        )
+        moved = await update_status(
+            self._db,
+            request_id,
+            status="rejected",
+            status_reason=terminal_reason,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            expected_current_status=active_status,
+            expected_authority_signature=current.authority_signature,
+        )
+        if not moved:
+            return None
+        self._executing_since.pop(request_id, None)
+        current.status = "rejected"
+        if emit_status:
+            await self._emit_status_event(
+                current,
+                state="rejected",
+                status_reason=terminal_reason,
+            )
+        return "rejected"
+
     async def _emit_status_event(
         self,
         req,
@@ -1208,7 +1877,14 @@ class RestartCoordinatorFeature(Feature):
         non-instructional state (#1562). The persistence is the audit
         primary; the SSE emit is the live-paint side-channel.
         """
-        agent_did = getattr(self.agent, "did", "") or ""
+        try:
+            agent_did = self._scoped_agent_did()
+        except AgentIdentityUnavailable:
+            logger.warning(
+                "restart status event for %s not emitted: agent identity unavailable",
+                getattr(req, "id", "?"),
+            )
+            return
         requested_by_agent = str(
             getattr(req, "requested_by_agent", "") or agent_did
         )
@@ -1364,12 +2040,51 @@ class RestartCoordinatorFeature(Feature):
             # A genuinely idle observation breaks the continuous-deferral
             # interval. An escalation that proceeds while busy deliberately
             # retains its evidence if dispatch later fails and the row retries.
-            if await clear_deferral_started(
+            cleared = await clear_deferral_started(
                 self._db,
                 req.id,
                 expected_current_status=req.status,
-            ):
-                req.first_blocked_at = ""
+            )
+            if cleared is not None:
+                # The clear reseals authority evidence. Continue with that
+                # exact durable row, never the pre-clear in-memory signature.
+                req = cleared
+            else:
+                refreshed = await get_request(self._db, req.id)
+                verified = (
+                    (await verify_restart_authority_at_use(self._db, refreshed))[0]
+                    if refreshed is not None
+                    else False
+                )
+                if (
+                    not verified
+                    or refreshed is None
+                    or refreshed.status != req.status
+                    or refreshed.first_blocked_at
+                ):
+                    current_status = (
+                        refreshed.status if refreshed is not None else "missing"
+                    )
+                    return req, {
+                        "safe": False,
+                        "deferable": True,
+                        "lost_race": True,
+                        "reason": (
+                            "lost race while clearing restart deferral: "
+                            f"expected {req.status!r}, found "
+                            f"{current_status!r}"
+                        ),
+                        "blocker": None,
+                        "request_age_seconds": self._request_age_seconds(
+                            req,
+                            database_now,
+                        ),
+                        "deferral_age_seconds": self._deferral_age_seconds(
+                            req,
+                            database_now,
+                        ),
+                    }
+                req = refreshed
         return req, decision
 
     def _evaluate_safety(
@@ -1522,6 +2237,22 @@ class RestartCoordinatorFeature(Feature):
                     continue
         return None
 
+    @staticmethod
+    def _fleet_agent_label(agent: Any) -> str:
+        """Name a fleet member in a deferral reason: display name AND DID.
+
+        ``KestrelAgent`` has no ``name`` attribute — its display name lives in
+        ``agent_name`` / ``_agent_name`` — so reading ``name`` alone rendered
+        every real co-hosted blocker as a bare DID that had to be decoded by
+        hand (#3347). The DID stays: it is the unambiguous identity.
+        """
+        did = str(getattr(agent, "did", "") or "")
+        for attr in ("name", "agent_name", "_agent_name"):
+            name = str(getattr(agent, attr, "") or "")
+            if name and name != did:
+                return f"{name} ({did})" if did else name
+        return did or "?"
+
     def _fleet_idle(self, ignore_request_id: str = "") -> Dict[str, Any]:
         """Idleness across all agents before a whole-host restart (#F235).
 
@@ -1539,20 +2270,22 @@ class RestartCoordinatorFeature(Feature):
             return self._agent_appears_idle(ignore_request_id=ignore_request_id)
         for other in agents:
             excl = ignore_request_id if other is self.agent else ""
-            # Name tasks only for OUR agent. This reason is persisted to the
-            # coordinator agent's event store and pushed on its SSE stream, so
-            # enumerating a sibling's tasks would publish that agent's
-            # topology — peer counterparties, active integrations, DIDs — to a
-            # different tenant. On a multi-tenant host that is a disclosure,
-            # and #2665 is a self-diagnosis: nothing here needs sibling task
-            # identity, only that the sibling is busy.
+            # Name individual tasks only for OUR agent. This reason is
+            # persisted to the coordinator agent's event store and pushed on
+            # its SSE stream, so a sibling's full task names would publish
+            # its topology — peer counterparties, signal ids, DIDs live in
+            # the per-instance tail — to a different tenant. A sibling's
+            # background tasks are still described by KIND and age (#3347):
+            # "busy" alone left a permanent task on one agent holding every
+            # host restart off with nobody able to see what it was. A
+            # sibling's request ids and dispatcher load stay hidden.
             state = self._agent_appears_idle(
                 ignore_request_id=excl,
                 agent=other,
                 name_tasks=(other is self.agent),
             )
             if not state["idle"]:
-                name = getattr(other, "name", None) or getattr(other, "did", "?")
+                name = self._fleet_agent_label(other)
                 blocker = dict(state.get("blocker") or {})
                 blocker["scope"] = (
                     "requesting_agent" if other is self.agent
@@ -1585,6 +2318,10 @@ class RestartCoordinatorFeature(Feature):
         must not block the very restart it requested, so it is excluded
         from the active-request count for that specific row (#1561). All
         other active requests still count as busy.
+
+        ``name_tasks`` is False for a co-hosted sibling: its request ids and
+        dispatcher load are withheld, and its background tasks are described
+        by kind and age rather than by full name (#3347).
 
         Optional dispatcher hooks ``in_flight_signals`` /
         ``active_count`` are consulted first if present (gives feature
@@ -1725,28 +2462,23 @@ class RestartCoordinatorFeature(Feature):
                     )
                     if age is not None
                 ]
-                detail = (
-                    f": {_describe_background_tasks(alive)}"
-                    if name_tasks else ""
+                # A co-hosted agent's tasks are described by KIND only; the
+                # requester's own keep their full names (#3347, see
+                # ``_describe_background_tasks``).
+                summary = _describe_background_tasks(
+                    alive, kinds_only=not name_tasks,
                 )
                 return {
                     "idle": False,
                     "reason": (
-                        f"{len(alive)} background task(s) in flight{detail}"
-                        if name_tasks
-                        else "background task(s) in flight"
+                        f"{len(alive)} background task(s) in flight: {summary}"
                     ),
                     "blocker": {
                         "scope": "requesting_agent",
                         "kind": "background_tasks",
-                        "count": len(alive) if name_tasks else None,
-                        "oldest_age_seconds": (
-                            max(ages) if name_tasks and ages else None
-                        ),
-                        "summary": (
-                            _describe_background_tasks(alive)
-                            if name_tasks else None
-                        ),
+                        "count": len(alive),
+                        "oldest_age_seconds": max(ages) if ages else None,
+                        "summary": summary,
                     },
                 }
 
@@ -1864,14 +2596,19 @@ class RestartCoordinatorFeature(Feature):
                 ),
                 completed_at=now(),
                 expected_current_status="updating",
+                expected_authority_signature=req.authority_signature,
             )
             return {
                 "request_id": req.id,
                 "reason": f"rejected: unknown update profile "
                           f"{req.update_profile!r}",
             }
-        if not is_valid_target_ref(req.update_target_ref) or \
-                not repo_is_git_checkout(req.update_repo_path):
+        canonical_repo_path = _canonical_update_repo_path(req.update_repo_path)
+        if (
+            not is_valid_target_ref(req.update_target_ref)
+            or canonical_repo_path != req.update_repo_path
+            or not repo_is_git_checkout(canonical_repo_path or "")
+        ):
             await update_status(
                 self._db, req.id,
                 status="rejected",
@@ -1882,11 +2619,17 @@ class RestartCoordinatorFeature(Feature):
                 ),
                 completed_at=now(),
                 expected_current_status="updating",
+                expected_authority_signature=req.authority_signature,
             )
             return {
                 "request_id": req.id,
                 "reason": "rejected: invalid update target_ref/repo_path",
             }
+
+        if is_agent_request_seal(req):
+            refused = await self._agent_update_boundary_refusal(req)
+            if refused is not None:
+                return refused
 
         update = await self._run_update(req, profile)
         try:
@@ -1902,24 +2645,97 @@ class RestartCoordinatorFeature(Feature):
         if not update["ok"]:
             # Fetch/checkout/install failed before any restart. Leave the
             # request retryable — the next poll re-runs the idempotent
-            # profile — with a clear reason naming the failed step.
-            await update_status(
-                self._db, req.id,
-                status="pending",
-                status_reason=(
-                    f"update failed at step {update.get('failed_step')!r}; "
-                    "left retryable (see update_log)"
-                ),
-                expected_current_status="updating",
+            # profile — unless sovereign rotation revoked its authority while
+            # the update was in flight. That case becomes terminal instead of
+            # remaining stranded in the unpolled ``updating`` state.
+            failure_reason = (
+                f"update failed at step {update.get('failed_step')!r}; "
+                "left retryable (see update_log)"
+            )
+            recovered_status = await self._recover_failed_restart_dispatch(
+                req.id,
+                reason=failure_reason,
+                active_status="updating",
+                authority_context="failed update",
+                # The coordinator caller reloads the landed row and emits its
+                # exact outcome. Emitting here as well duplicates the durable
+                # audit row and live SSE transition.
+                emit_status=False,
             )
             return {
                 "request_id": req.id,
                 "reason": (
                     f"update failed at step {update.get('failed_step')!r}; "
-                    "retryable"
+                    + (
+                        "retryable"
+                        if recovered_status == "pending"
+                        else "terminal: authority revoked"
+                        if recovered_status == "rejected"
+                        else "state changed concurrently"
+                    )
                 ),
             }
         return None
+
+    async def _agent_update_boundary_refusal(
+        self, req,
+    ) -> dict[str, Any] | None:
+        """Last agent-bounds check before an agent's update profile runs.
+
+        Per-tick verification may reuse a git answer for a few seconds; here,
+        immediately before the profile's ``git fetch``, ``origin/HEAD`` and the
+        local tag namespace are re-read uncached, and origin itself is asked
+        whether a tag shadows the branch (a tag created there since the last
+        fetch is not yet local, and ``fetch origin <name>`` would select it).
+        An exceeded bound is terminal; an origin that cannot be asked leaves
+        the row retryable, exactly like a failed fetch would.
+        """
+
+        def _reject_reason(bound: str, detail: str) -> str:
+            return (
+                "authority denied: agent-requested restart is outside the "
+                f"agent-requestable bound on {bound}: {detail}"
+            )
+
+        exceeded = await asyncio.to_thread(agent_update_boundary_violation, req)
+        if exceeded is None:
+            remote_tag = await asyncio.to_thread(
+                origin_has_tag, req.update_repo_path, req.update_target_ref,
+            )
+            if remote_tag is None:
+                reason = (
+                    "could not ask origin whether a tag shadows branch "
+                    f"{req.update_target_ref!r}; left retryable"
+                )
+                await self._recover_failed_restart_dispatch(
+                    req.id,
+                    reason=reason,
+                    active_status="updating",
+                    authority_context="agent update boundary",
+                    emit_status=False,
+                )
+                return {"request_id": req.id, "reason": reason}
+            if remote_tag:
+                exceeded = (
+                    "target_ref",
+                    (
+                        f"origin has a tag named {req.update_target_ref!r} "
+                        "beside the default branch; git fetch would land on "
+                        "the tag, not the branch"
+                    ),
+                )
+        if exceeded is None:
+            return None
+        reason = _reject_reason(*exceeded)
+        await update_status(
+            self._db, req.id,
+            status="rejected",
+            status_reason=reason,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            expected_current_status="updating",
+            expected_authority_signature=req.authority_signature,
+        )
+        return {"request_id": req.id, "reason": f"rejected: {reason}"}
 
     async def _run_update(self, req, profile) -> Dict[str, Any]:
         """Execute a profile's update steps, capturing each outcome.
@@ -2358,16 +3174,25 @@ class RestartCoordinatorFeature(Feature):
             if give_up else reason
         )
 
-        moved = await update_status(
-            self._db, request_id,
-            status=next_status,
-            status_reason=next_reason,
-            completed_at=(
-                datetime.now(timezone.utc).isoformat() if give_up else None
-            ),
-            expected_current_status="executing",
-        )
+        if give_up:
+            moved = await update_status(
+                self._db, request_id,
+                status=next_status,
+                status_reason=next_reason,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                expected_current_status="executing",
+            )
+        else:
+            recovered_status = await self._recover_failed_restart_dispatch(
+                request_id,
+                reason=next_reason,
+            )
+            moved = recovered_status is not None
         if not moved:
+            return
+        if not give_up:
+            if recovered_status == "rejected":
+                self._dispatch_failures.pop(request_id, None)
             return
         self._executing_since.pop(request_id, None)
         if give_up:
@@ -2441,21 +3266,17 @@ class RestartCoordinatorFeature(Feature):
                     f"after {STALE_EXECUTING_SECONDS}s; the restart did not "
                     "happen"
                 )
-            moved = await update_status(
-                self._db, row.id,
-                status="pending",
-                status_reason=reason,
-                expected_current_status="executing",
+            recovered_status = await self._recover_failed_restart_dispatch(
+                row.id,
+                reason=reason,
             )
-            if not moved:
+            if recovered_status is None:
                 continue
-            self._executing_since.pop(row.id, None)
+            if recovered_status == "rejected":
+                continue
             logger.error(
                 "restart_coordinator: recovered stranded executing row %s "
                 "(%s)", row.id, reason,
-            )
-            await self._emit_status_event(
-                row, state="pending", deferral_reason=reason,
             )
             reset.append(row.id)
         return reset
@@ -2476,14 +3297,15 @@ class RestartCoordinatorFeature(Feature):
         """
         if self._db is None:
             return
-        agent_id = getattr(self.agent, "did", "") or ""
-        if not agent_id:
+        try:
+            agent_id = self._scoped_agent_did()
+        except AgentIdentityUnavailable:
             return
         stuck = await list_requests(
             self._db, status="updating", agent_id=str(agent_id),
         )
         for row in stuck:
-            await update_status(
+            moved = await update_status(
                 self._db, row.id,
                 status="pending",
                 status_reason=(
@@ -2492,6 +3314,40 @@ class RestartCoordinatorFeature(Feature):
                 ),
                 expected_current_status="updating",
             )
+            if moved:
+                continue
+            # The request row is not its own authority. A valid execution
+            # claim grants a separate, one-shot retry permission; terminal
+            # transitions revoke it. If only the caller-editable row says an
+            # update is in flight, reject that forged/replayed state rather
+            # than minting a fresh lifecycle generation from it.
+            fresh = await get_request(self._db, row.id)
+            if fresh is None or fresh.status != "updating":
+                continue
+            reason = (
+                "interrupted update has no durable retry authority; refusing "
+                "to revive a consumed host mutation"
+            )
+            rejected = await update_status(
+                self._db,
+                fresh.id,
+                status="rejected",
+                status_reason=reason,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                expected_current_status="updating",
+                expected_authority_signature=fresh.authority_signature,
+            )
+            if rejected:
+                logger.error(
+                    "restart_coordinator: rejected unauthorized interrupted "
+                    "update row %s",
+                    fresh.id,
+                )
+                await self._emit_status_event(
+                    fresh,
+                    state="rejected",
+                    status_reason=reason,
+                )
 
     async def _reap_post_restart_rows(self) -> List[asyncio.Task[Any]]:
         """Sweep ``executing`` rows this agent filed and wake the
@@ -2526,8 +3382,9 @@ class RestartCoordinatorFeature(Feature):
         """
         if self._db is None:
             return []
-        agent_id = getattr(self.agent, "did", "") or ""
-        if not agent_id:
+        try:
+            agent_id = self._scoped_agent_did()
+        except AgentIdentityUnavailable:
             return []
         needing_wake = await list_requests_needing_wake(
             self._db, agent_id=str(agent_id),

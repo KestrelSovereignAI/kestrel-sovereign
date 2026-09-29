@@ -84,7 +84,7 @@ async def _make_feature(tmp_path, name="emma"):
     await feature.initialize()
     # initialize() doesn't set _host_url if no env var; force it.
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = name
     return feature, db
 
@@ -807,8 +807,7 @@ async def test_get_peer_task_result_stamps_terminal_state(tmp_path):
 
     # Then: fetch a completed result from the peer using the same
     # local id (production: peer echoes; here: we just use it).
-    get_resp = MagicMock(status_code=200)
-    get_resp.json.return_value = {
+    peer_result = {
         "id": local_id,
         "status": {
             "state": "completed",
@@ -816,12 +815,20 @@ async def test_get_peer_task_result_stamps_terminal_state(tmp_path):
                         "parts": [{"type": "text", "text": "done"}]},
         },
     }
-    client = _async_client_with(get_resp=get_resp)
+    local_get = AsyncMock(return_value=peer_result)
+    feature.refresh_local_host_peer_directory(
+        host_url="http://multi_agent",
+        transport_key="",
+        local_get=local_get,
+    )
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
     ):
         await feature.get_peer_task_result("claw", local_id)
+
+    local_get.assert_awaited_once()
 
     rows = await list_outbound_tasks(db, agent_id='emma')
     assert rows[0].terminal_state == "completed"
@@ -844,17 +851,23 @@ async def test_get_peer_task_result_does_not_stamp_non_terminal_state(
         result = await feature.send_a2a_task("claw", "wip")
     local_id = result.data["task_id"]
 
-    get_resp = MagicMock(status_code=200)
-    get_resp.json.return_value = {
+    local_get = AsyncMock(return_value={
         "id": local_id,
         "status": {"state": "working"},
-    }
-    client = _async_client_with(get_resp=get_resp)
+    })
+    feature.refresh_local_host_peer_directory(
+        host_url="http://multi_agent",
+        transport_key="",
+        local_get=local_get,
+    )
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
     ):
         await feature.get_peer_task_result("claw", local_id)
+
+    local_get.assert_awaited_once()
 
     rows = await list_outbound_tasks(db, agent_id='emma')
     assert rows[0].terminal_state is None
@@ -1019,7 +1032,7 @@ async def test_dispatch_without_db_does_not_break(tmp_path):
     feature = PeersFeature(agent)
     await feature.initialize()
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = "emma"
     assert feature._db is None
 

@@ -17,7 +17,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
-from .destructive_policy import DEFAULT_TRASH_DIR, DestructiveOperationPolicy
+from .destructive_policy import (
+    DEFAULT_TRASH_DIR,
+    AgentDataProtectionError,
+    DestructiveOperationPolicy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -555,6 +559,19 @@ class TrashManager:
                 continue
 
             if deleted_at < cutoff:
+                try:
+                    self._policy.assert_agent_data_deletion_allowed(
+                        subdir,
+                        "empty trash",
+                    )
+                except AgentDataProtectionError as exc:
+                    logger.warning(
+                        "Refusing to permanently delete protected trash "
+                        "directory %s: %s",
+                        subdir,
+                        exc,
+                    )
+                    continue
                 if self._contains_agent_database(subdir):
                     logger.warning(
                         "Refusing to permanently delete trash directory with agent database: %s",

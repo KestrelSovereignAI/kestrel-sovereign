@@ -486,6 +486,33 @@ class WebhookFeature(Feature):
             f"Registered webhook '{name}' (auth={auth_type}, "
             f"rate_limit={max(0, rate_limit)}/min, endpoint=/webhooks/{name})."
         )
+        # The unprefixed address is honoured only while this agent is the sole
+        # enabled owner of the name on the host: the shared dispatch router
+        # refuses it the moment another agent registers the same name
+        # (kestrel-sovereign#3216). This feature has no view of its peers —
+        # each agent owns its own database — so it cannot detect the
+        # collision here; what it CAN do is hand the caller the address that
+        # always dispatches to this agent. That is the agent-prefixed form,
+        # keyed by the ROUTING name the host's AgentManager registered this
+        # agent under — not ``agent_name``, which is a display name that
+        # equals the routing key only for a published hosted agent. Only a
+        # hosted agent carries ``_agent_manager``; a single-agent boot has no
+        # manager and serves no ``/api/agents/*`` route at all, and a fenced
+        # spawn route resolves to ``None``. In both cases no address is
+        # invented.
+        manager = getattr(self.agent, "_agent_manager", None)
+        routing_name = (
+            manager.get_agent_name(self._agent_id) if manager is not None else None
+        )
+        if isinstance(routing_name, str) and routing_name:
+            agent_endpoint = f"/api/agents/{routing_name}/webhooks/{name}"
+            data["agent_endpoint"] = agent_endpoint
+            confirmation += (
+                f" On a host running more than one agent, point the sender at "
+                f"{agent_endpoint}: the unprefixed /webhooks/{name} form is "
+                f"refused (404, no dispatch) whenever another agent also "
+                f"registers '{name}'."
+            )
 
         # Collect any conditions that warrant a PARTIAL (vs a clean OK).
         warnings: List[str] = []

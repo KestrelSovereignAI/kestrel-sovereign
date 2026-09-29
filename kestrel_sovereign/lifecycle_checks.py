@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,31 @@ class IdentityIsolationError(RuntimeError):
 
 EXPECTED_DID_ENV_VAR = "KESTREL_EXPECTED_DID"
 SKIP_REACHABILITY_PROBE_ENV_VAR = "KESTREL_SKIP_REACHABILITY_PROBE"
+
+_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+_PRODUCTION_ENVIRONMENTS = frozenset({"prod", "production"})
+
+
+def is_isolated_nonproduction_kite_environment(env: Mapping[str, str]) -> bool:
+    """Return whether ``env`` identifies Kite's disposable demo workload.
+
+    ``KESTREL_KITE_RELEASE_EVIDENCE`` is only a provenance marker; it is not
+    authority to downgrade a PostgreSQL runtime's durable Hold store. The
+    downgrade is valid only when the process is also the demo server and its
+    deployment contract is explicitly non-production and non-durable.
+    """
+
+    def truthy(name: str) -> bool:
+        return str(env.get(name, "")).strip().lower() in _TRUTHY_ENV_VALUES
+
+    environment = str(env.get("KESTREL_ENV", "")).strip().lower()
+    persistence = str(env.get("KESTREL_DEPLOYMENT_PERSISTENCE", "")).strip().lower()
+    return (
+        truthy("KESTREL_KITE_RELEASE_EVIDENCE")
+        and truthy("KESTREL_DEMO_SERVER")
+        and environment not in _PRODUCTION_ENVIRONMENTS
+        and persistence != "durable_sovereign"
+    )
 
 
 def verify_llm_providers_initialized(llm_service: Any) -> None:

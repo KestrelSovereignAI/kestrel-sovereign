@@ -16,6 +16,8 @@ Kestrel Sovereign is a Constitutional AI Agent Framework with cryptographic iden
 
 ## Code Indexes
 
+**Reach for these before searching the tree.** For "where does X live" or "what is in this area", read the index first — it is cheaper and more complete than a blind grep across 2400 files. Direct search is still right for call sites, string literals, and anything an index does not carry.
+
 - [docs/audit/REPO_MAP.md](docs/audit/REPO_MAP.md) — generated per-file index of this repo (every tracked file with a one-line purpose and its public Python symbols; regenerated nightly).
 - [docs/ECOSYSTEM.md](docs/ECOSYSTEM.md) — index of all sibling repositories (feature packages, providers, standalone tools), each with its own `AGENTS.md`.
 
@@ -53,6 +55,31 @@ uv run python -m kestrel_sovereign.server --host 127.0.0.1 --port 8888 &
 cd tests/e2e && npx playwright test
 ```
 
+### Testing a sibling feature repo: unset `VIRTUAL_ENV` first
+
+```bash
+cd /path/to/kestrel-feature-<name>
+env -u VIRTUAL_ENV uv run pytest -q     # NOT plain `uv run`
+```
+
+`uv run` syncs the **active** virtualenv to the project it is run from. When
+`VIRTUAL_ENV` points at this repo's `.venv` (as it does in any shell where
+core is active), running a sibling feature's tests silently re-resolves
+core's venv to that feature's dependency solution and downgrades whatever
+the two disagree on.
+
+Measured 2026-09-06: running the five feature suites in sequence downgraded
+`openinference-semantic-conventions` 0.1.35 → 0.1.30 in core's venv.
+`openinference-instrumentation` requires `>=0.1.33`, so `phoenix` then fails
+to import (`cannot import name 'AnnotationAttributes'`), pytest plugin
+autoload aborts before writing a JUnit report, and the release-evidence
+runner records a content-free `blocked` — the failure #2853 added
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` to work around.
+
+This is why manual `uv pip install` repairs to core's venv keep reverting:
+the next sibling test run undoes them. Unsetting `VIRTUAL_ENV` makes `uv`
+use (or create) the sibling's own `.venv` and leaves core's alone.
+
 ### Test Pyramid Strategy
 
 Run tests in order: Unit → Integration → E2E. Fix failures before moving up.
@@ -66,18 +93,143 @@ permission each time.
 
 ### 1. Review your own full diff before asking anyone else to
 
+The gate is **a full-diff review against `main` that printed a verdict**. Which
+reviewer produced it is not part of the requirement — name the tool you used.
+Two satisfy it:
+
 ```bash
 cd <worktree> && codex review --base main
 ```
+
+```bash
+cd <worktree> && claude -p --model <model> -- "Review this branch for
+correctness defects. Run: git diff main...HEAD. Be adversarial: name failure
+scenarios with file:line, and say plainly if you find nothing real rather than
+inventing style points." </dev/null
+```
+
+Two details in that line are load-bearing, both found the hard way:
+
+* **`</dev/null`** — `claude -p` blocks forever on inherited stdin. Without it
+  the run never starts and never fails, and the "silence is not a hang" advice
+  below turns a five-second mistake into a 45-minute wait for an empty result.
+  Probe it for five seconds before committing to the long form.
+* **`--` before the prompt** — `--allowed-tools` is variadic and will silently
+  swallow the prompt as one more tool name. The review then runs with no
+  instructions and returns something plausible.
+
+**Run the review on the strongest model available, and prove it.** A gate is
+only as strong as its reviewer, and substituting a weaker one silently makes
+the gate weaker without making it look weaker. Probe first — five seconds:
+
+```bash
+claude -p --model <model> -- "Reply with exactly: PROBE_OK" </dev/null
+```
+
+An unavailable model fails loudly and distinctively
+(`[claude-code:unrecognized_model]`), so a probe that returns `PROBE_OK`
+settles it and a probe that does not tells you to escalate, not to downgrade.
+Do not infer availability from the host's model catalog: that answers a
+different question, the two have disagreed, and on 2026-09-07 a 1269-line diff
+was reviewed on `claude-opus-4-6` because `claude-opus-5` was believed
+unavailable when a probe would have returned `PROBE_OK` for it.
+
+If you do end up on a weaker model, that is a gate condition to declare in the
+turn output alongside the verdict — not a detail to mention afterwards.
+
+**As of 2026-09-06 the Codex CLI is unavailable, so use the Claude form.** This
+is why the gate names the requirement and not a command: an outage in one
+reviewer must not make the merge gate unsatisfiable, and a rule written around
+one tool's argv stops being true the moment that tool changes or goes away.
+
+**The verdict must arrive whole, and that is a separate gate.** `shell`
+tokenizes with `shlex` and hands an argv vector to a backend — no shell
+interprets the string (#3129). So `> review.txt` is not a redirect, it is a
+literal argument; `... | tail` is not a pipe, it is three extra arguments to a
+command that then prints everything and exits 0; and `cd <worktree> && ...` is
+refused as shell grammar before anything runs.
+
+**#3243 gives `shell` the two constructs that line needed**, performed by the
+runtime rather than by a shell it does not have. Two parameters:
+
+* **`cwd=<worktree>`** — replaces `cd <worktree> &&`. Policy-checked, and
+  relative paths in the command resolve against it.
+* **`capture_output=true`** — replaces `> review.txt`. stdout and stderr are
+  written to runtime-owned files; the result carries `stdout_path`,
+  `stderr_path` and a `manifest_path`, and the inline text becomes a bounded
+  preview showing the head *and the tail*, so a verdict at the end of a long
+  review is visible without opening the file. On the **local** backend the
+  child writes to the file directly and there is no cap on it. On the
+  **docker** backend — which is the DEFAULT — there is: the capture is
+  written from a string the executor already clipped at `max_output_bytes`
+  (1 MiB unless `[features.computer_use.docker].max_output_bytes` says
+  otherwise), so a review past that ceiling still comes back clipped and
+  PARTIAL. Streaming it is #3277. Check `complete`, as below, rather than
+  assuming the file is whole.
+
+The manifest records what ran, where, how it ended, which backend ran it
+(`backend` — the result itself does not carry it), and the git `HEAD` before
+and after. **A verdict is about one tree.** During the 2026-08-31 run the head
+moved three times in eight hours; `git.head_moved` is how you can tell a
+verdict was about a tree that no longer exists, and re-running is the answer
+when it is `true`.
+
+**A truncated or timed-out review is a gate FAILURE, not a verdict** — the same
+shape as the dead-reviewer case above: plausible text, no completed judgement.
+Read **`complete`** on the result. It is the conjunction of every way the run
+could be less than whole — timed out, stdout clipped, stderr clipped, or a
+writer still holding the pipes (`writers_remaining` anything but `false`,
+which is what a review that daemonizes leaves behind) — so checking it cannot
+be satisfied by remembering only one of them, and the same field is on the
+manifest. All four are named here deliberately: a `complete: false` whose
+reason you cannot name is the case this paragraph exists for. Such a run now also comes back PARTIAL rather than
+OK even when the process exited 0 — "the process exited 0" and "the work
+finished" are different claims, and only the second is a verdict.
+
+Until #3243 shipped this paragraph asked you to check `truncated_stdout`, which
+`shell` computed in the backend and **never put in its result**. The rule was
+unfollowable, not merely hard. If a rule here names a field, and the field is
+not in what you get back, that is a defect to file, not an instruction to
+approximate.
+
+**Measured 2026-09-09, running the form once end to end on the LOCAL
+backend.** A 3.2 MB review captured to a file came back `complete: true` with
+the artifact at 3,348,905 bytes — past the 1 MiB ToolResult cap this was filed
+against — and a 4,222-character preview carrying both the opening line and the
+closing `VERDICT:` line, so the verdict was readable without opening the
+file. The
+same command killed at a 2-second timeout came back PARTIAL with
+`complete: false`, rc −9, and an error saying the output must not be read as a
+finished result. A run that committed while it ran recorded
+`git.head_moved: true` with differing before/after SHAs. Every field named in
+this section was present in the result with that spelling.
+
+What that run did NOT cover: it called `shell` directly rather than through
+the tool executor, so the approval queue and the LLM-facing schema are still
+unexercised; and it ran on the local backend, so it says nothing about the
+docker ceiling above. Review round 12 caught that generalisation — one
+backend's measurement written up as an unqualified promise — which is the same
+defect this section warns about two paragraphs down.
+
+Note when you first use this that `capture_output` is advertised to the model
+as a *string* (its annotation is `bool | str`, which no JSON schema type
+fits); `"true"` is accepted and coerced, and anything else is refused by name
+rather than silently read as false.
 
 **Against `main`, not against your last iteration.** Talon's per-run review sees
 only that run's diff, so a PR spanning a failed run plus a resume has never been
 seen whole by anything. Every defect a human reviewer found in agent-authored
 PRs through 2026-08-25 lived across exactly that boundary.
 
-It takes 10–45 minutes and **buffers its output**, so silence is not a hang. A
-review that times out exits 0 with no verdict — no findings printed is not the
-same as no findings, and only the second means clean.
+Either form takes 10–45 minutes and **buffers its output**, so silence is not a
+hang. A review that times out exits 0 with no verdict — no findings printed is
+not the same as no findings, and only the second means clean.
+
+Exit status is not a verdict anywhere on this surface, and it has produced at
+least five distinct false greens: a wrapper returning 0 while its own summary
+says `Blocked: 1`, `git ls-remote` returning 0 for "no match" exactly as for a
+hit, and a piped gate reporting the status of the last command in the pipe.
+Read the verdict, never the code.
 
 ### 2. Act on what it finds, and verify by mutation
 
@@ -101,8 +253,8 @@ demonstrate is worth less than an honest boundary.
 Squash-merge your own PR when **all** of these hold:
 
 - CI green (every required check, not just unit tests)
-- a full-diff `codex review --base main` came back with **a printed verdict**
-  and no unaddressed P1
+- a full-diff review against `main` (codex or claude — see above) came back
+  with **a printed verdict** and no unaddressed P1
 - every finding you fixed has a test that fails without the fix
 
 If a gate is not met, say which one and what you need. Do not sit silently on a
@@ -112,7 +264,7 @@ because a blocker nobody reads is a blocker nobody acts on.
 ### What you already have
 
 Unrestricted `shell` (arbitrary `timeout`, no upper clamp), `git`, `gh`, and
-`codex` on PATH. Almost nothing here is a capability you lack; it is a procedure
+both `codex` and `claude` on PATH. Almost nothing here is a capability you lack; it is a procedure
 that has to survive the turn boundary, which is why it is written down here
 rather than remembered.
 

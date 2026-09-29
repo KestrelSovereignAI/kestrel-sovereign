@@ -129,7 +129,14 @@ globalThis.CSS = { escape: (s) => String(s) };
 
 const { state, getOrCreateChatPane } = await import('../../kestrel_sovereign/static/js/ui.js');
 const chatModule = await import('../../kestrel_sovereign/static/js/chat.js');
-const { mountChatPane, wipeAgentChatPane, sendMessage, stopAgent } = chatModule;
+const {
+    mountChatPane,
+    wipeAgentChatPane,
+    sendMessage,
+    stopAgent,
+    stopAgentDetailed,
+    prepareHostStop,
+} = chatModule;
 const apiModule = await import('../../kestrel_sovereign/static/js/api.js');
 
 chatModule.initChat();
@@ -161,6 +168,192 @@ function setQueueMode(agent) {
     pane.composerMode = 'queue';
     return pane;
 }
+
+function hostStopEnvelope(agentId, {
+    correlationId = 'host-stop-correlation',
+    disposition = 'stopped',
+    receiptId = 'receipt-host-stop',
+} = {}) {
+    const confirmed = ['stopped', 'already_complete'].includes(disposition) ? 1 : 0;
+    return {
+        success: confirmed === 1,
+        state: confirmed === 1 ? 'confirmed' : 'unconfirmed',
+        correlation_id: correlationId,
+        target_count: 1,
+        confirmed_count: confirmed,
+        unconfirmed_count: 1 - confirmed,
+        stop_outcomes: [{
+            scope: 'host',
+            requested_target: null,
+            agent_id: agentId,
+            resolved_target: agentId,
+            disposition,
+            correlation_id: correlationId,
+            receipt_id: receiptId,
+        }],
+    };
+}
+
+test('host Stop fences queued follow-ups before I/O and settles typed local outcomes', () => {
+    const agent = 'host-stop-local';
+    const agentId = 'did:agent:host-stop-local';
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+    const pane = setQueueMode(agent);
+    pane.queuedMessage = 'must not restart after Stop All';
+    const chip = makeNode();
+    chip.className = 'queued-message-chip';
+    pane.element.appendChild(chip);
+    state.waitingAgents.add(agent);
+
+    const priorAbortLookup = apiModule.default.getStreamAbortController;
+    const priorRequestLookup = apiModule.default.getCurrentStreamRequestId;
+    let aborted = false;
+    apiModule.default.getStreamAbortController = (name) => (
+        name === agent ? { abort() { aborted = true; } } : null
+    );
+    apiModule.default.getCurrentStreamRequestId = () => 'host-stop-request';
+    state.unconfirmedStopCorrelationIds = new Map([[agent, 'prior-operation']]);
+
+    const settle = prepareHostStop([{ name: agent, id: agentId }]);
+
+    assert.equal(pane.queuedMessage, null, 'queue is cleared synchronously');
+    assert.equal(pane.element.querySelector('.queued-message-chip'), null, 'queue chip is removed');
+    assert.equal(aborted, true, 'browser stream is aborted synchronously');
+    assert.equal(state.unconfirmedStopAgents.has(agent), true, 'new turns remain fenced pending evidence');
+
+    settle(hostStopEnvelope(agentId));
+
+    assert.equal(state.unconfirmedStopAgents.has(agent), false);
+    assert.equal(state.waitingAgents.has(agent), false);
+    assert.equal(state.unconfirmedStopCorrelationIds.has(agent), false,
+        'successful Host Stop cannot leak an old operation id into the next turn');
+    apiModule.default.getStreamAbortController = priorAbortLookup;
+    apiModule.default.getCurrentStreamRequestId = priorRequestLookup;
+});
+
+test('an old host Stop receipt cannot clear a newer turn for the same agent', () => {
+    const agent = 'host-stop-newer-turn';
+    const agentId = 'did:agent:host-stop-newer-turn';
+    let currentRequestId = 'old-request';
+    const priorRequestLookup = apiModule.default.getCurrentStreamRequestId;
+    apiModule.default.getCurrentStreamRequestId = () => currentRequestId;
+    state.waitingAgents.add(agent);
+
+    const settleOldHostStop = prepareHostStop([{ name: agent, id: agentId }]);
+
+    // Model a successful per-agent reconciliation followed by a new turn while
+    // the fleet request is still waiting for some other target to settle.
+    state.unconfirmedStopAgents.delete(agent);
+    state.unconfirmedStopRequestIds.delete(agent);
+    state.unconfirmedStopCorrelationIds.delete(agent);
+    currentRequestId = 'new-request';
+    state.waitingAgents.add(agent);
+
+    settleOldHostStop(hostStopEnvelope(agentId));
+
+    assert.equal(state.waitingAgents.has(agent), true,
+        'evidence for the old request must not settle the newer active turn');
+    assert.equal(apiModule.default.getCurrentStreamRequestId(agent), 'new-request');
+    state.waitingAgents.delete(agent);
+    apiModule.default.getCurrentStreamRequestId = priorRequestLookup;
+});
+
+test('host Stop receipt remains valid when the same-turn retry token resets', () => {
+    const agent = 'host-stop-same-turn-retry';
+    const agentId = 'did:agent:host-stop-same-turn-retry';
+    const priorRequestLookup = apiModule.default.getCurrentStreamRequestId;
+    apiModule.default.getCurrentStreamRequestId = () => 'same-request';
+    state.waitingAgents.add(agent);
+    state.unconfirmedStopCorrelationIds = new Map([[agent, 'first-operation']]);
+
+    const settleHostStop = prepareHostStop([{ name: agent, id: agentId }]);
+
+    // A receipt-bearing per-agent stop_not_confirmed response starts a fresh
+    // retry identity while retaining the exact request fence.
+    state.unconfirmedStopCorrelationIds.delete(agent);
+    settleHostStop(hostStopEnvelope(agentId));
+
+    assert.equal(state.unconfirmedStopAgents.has(agent), false);
+    assert.equal(state.waitingAgents.has(agent), false);
+    state.unconfirmedStopRequestIds.delete(agent);
+    apiModule.default.getCurrentStreamRequestId = priorRequestLookup;
+});
+
+test('host Stop keeps local work fenced when receipt or envelope evidence is malformed', () => {
+    const agent = 'host-stop-malformed';
+    const agentId = 'did:agent:host-stop-malformed';
+    state.waitingAgents.add(agent);
+    state.unconfirmedStopCorrelationIds = new Map([[agent, 'retained-operation']]);
+
+    const settle = prepareHostStop([{ name: agent, id: agentId }]);
+    const malformed = hostStopEnvelope(agentId);
+    delete malformed.stop_outcomes[0].receipt_id;
+    settle(malformed);
+
+    assert.equal(state.unconfirmedStopAgents.has(agent), true,
+        'a disposition string without its durable receipt never releases the fence');
+    assert.equal(state.unconfirmedStopCorrelationIds.get(agent), 'retained-operation');
+    state.waitingAgents.delete(agent);
+    state.unconfirmedStopAgents.delete(agent);
+    state.unconfirmedStopCorrelationIds.delete(agent);
+});
+
+test('host Stop rejects a contradictory success envelope before releasing fences', () => {
+    const agent = 'host-stop-contradictory';
+    const agentId = 'did:agent:host-stop-contradictory';
+    state.waitingAgents.add(agent);
+
+    const settle = prepareHostStop([{ name: agent, id: agentId }]);
+    const contradictory = hostStopEnvelope(agentId);
+    contradictory.success = false;
+    contradictory.state = 'unconfirmed';
+    settle(contradictory, null, contradictory.correlation_id);
+
+    assert.equal(state.unconfirmedStopAgents.has(agent), true,
+        'envelope fields must agree with receipted dispositions');
+    state.waitingAgents.delete(agent);
+    state.unconfirmedStopAgents.delete(agent);
+});
+
+test('host Stop maps its one receipted outcome onto the standalone null chat key', () => {
+    const agentId = 'did:agent:standalone';
+    state.waitingAgents.add(null);
+    state.unconfirmedStopCorrelationIds = new Map([[null, 'standalone-operation']]);
+
+    const settle = prepareHostStop([{ name: 'Standalone', id: agentId }]);
+    settle(hostStopEnvelope(agentId));
+
+    assert.equal(state.unconfirmedStopAgents.has(null), false);
+    assert.equal(state.waitingAgents.has(null), false);
+    assert.equal(state.unconfirmedStopCorrelationIds.has(null), false);
+});
+
+test('host Stop generation cancels a send that was still awaiting its upload', async () => {
+    const agent = 'host-stop-upload-race';
+    const agentId = 'did:agent:host-stop-upload-race';
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+    const pane = getOrCreateChatPane(agent);
+    let finishUpload;
+    const upload = new Promise((resolve) => { finishUpload = resolve; });
+    pane.pendingUploads = new Set([upload]);
+    const dispatched = [];
+    apiModule.default.streamInvoke = (input) => (async function* () {
+        dispatched.push(input);
+    }());
+
+    messageInput.value = 'must remain outside the stopped host snapshot';
+    const send = sendMessage();
+    await Promise.resolve();
+    prepareHostStop([{ name: agent, id: agentId }]);
+    finishUpload();
+    await send;
+
+    assert.deepEqual(dispatched, [],
+        'a pre-fence send cannot resume and publish work after Host Stop');
+    pane.pendingUploads.clear();
+});
 
 
 test('queue mode: Enter-while-busy stores the message and renders a chip, no interrupt', async () => {
@@ -246,6 +439,72 @@ test('queued message dispatches when the in-flight turn finishes', async () => {
 
     ctrl2.end();
     await new Promise((r) => setTimeout(r, 5));
+});
+
+
+test('Host Stop between queue drain and its microtask prevents redispatch', async () => {
+    const agent = 'q-host-stop-microtask';
+    const agentId = 'did:agent:q-host-stop-microtask';
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+    setQueueMode(agent);
+
+    const ctrl = controlledStream();
+    const dispatched = [];
+    apiModule.default.streamInvoke = (input) => {
+        dispatched.push(input);
+        return ctrl.iter;
+    };
+    messageInput.value = 'first';
+    const first = sendMessage();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    messageInput.value = 'queued';
+    await sendMessage();
+
+    const pendingMicrotasks = [];
+    const priorQueueMicrotask = globalThis.queueMicrotask;
+    globalThis.queueMicrotask = (callback) => pendingMicrotasks.push(callback);
+    try {
+        ctrl.end();
+        await first;
+        assert.equal(pendingMicrotasks.length, 1, 'queue drain scheduled one dispatch');
+        prepareHostStop([{ name: agent, id: agentId }]);
+        pendingMicrotasks[0]();
+        await Promise.resolve();
+    } finally {
+        globalThis.queueMicrotask = priorQueueMicrotask;
+    }
+
+    assert.deepEqual(dispatched, ['first'],
+        'queued work retains the generation from before Host Stop');
+    state.waitingAgents.delete(agent);
+    state.unconfirmedStopAgents.delete(agent);
+});
+
+
+test('Host Stop during the pre-publication user-message await cancels dispatch', async () => {
+    const agent = 'q-host-stop-add-message';
+    const agentId = 'did:agent:q-host-stop-add-message';
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+    const pane = getOrCreateChatPane(agent);
+    const dispatched = [];
+    apiModule.default.streamInvoke = (input) => (async function* () {
+        dispatched.push(input);
+    }());
+
+    const capturedGeneration = state.hostStopGeneration || 0;
+    const send = sendMessage('queued', agent, capturedGeneration);
+    prepareHostStop([{ name: agent, id: agentId }]);
+    await send;
+
+    assert.deepEqual(dispatched, [], 'no request publishes after the host fence');
+    assert.equal(
+        pane.element.children.some((child) => child.classList.contains('user-message')),
+        false,
+        'the pre-publication user bubble is rolled back with the canceled send',
+    );
+    state.unconfirmedStopAgents.delete(agent);
 });
 
 
@@ -399,6 +658,62 @@ test('Stop while queued = stop everything: queue cleared, nothing dispatches', a
 
     assert.deepEqual(dispatched, ['turn one'],
         'no second dispatch — the queued message was cancelled by Stop');
+});
+
+test('detailed Stop preserves a typed refusal while the boolean wrapper stays false', async () => {
+    const agent = 'q-typed-refusal';
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+    apiModule.default.getStreamAbortController = () => null;
+    apiModule.default.getCurrentStreamRequestId = () => 'exact-request';
+    apiModule.default.stop = async (requestId, target) => {
+        assert.equal(requestId, 'exact-request');
+        assert.equal(target, agent);
+        return {
+            success: false,
+            stop_outcomes: [{
+                resolved_target: agent,
+                disposition: 'refused',
+                detail: 'receipt persistence unavailable',
+            }],
+        };
+    };
+
+    const detailed = await stopAgentDetailed(agent);
+    assert.equal(detailed.confirmed, false);
+    assert.equal(detailed.outcomes[0].disposition, 'refused');
+    assert.equal(await stopAgent(agent), false);
+});
+
+test('detailed Stop preserves typed outcomes from an HTTP error envelope', async () => {
+    const agent = 'q-http-typed-refusal';
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+    apiModule.default.getStreamAbortController = () => null;
+    apiModule.default.getCurrentStreamRequestId = () => 'exact-request';
+    apiModule.default.stop = async () => {
+        const error = new Error('Cooperative Stop could not be confirmed');
+        error.body = {
+            error: {
+                details: [{
+                    requested_target: 'exact-request',
+                    resolved_target: agent,
+                    disposition: 'refused',
+                    detail: 'receipt persistence unavailable',
+                }],
+            },
+        };
+        throw error;
+    };
+
+    const detailed = await stopAgentDetailed(agent);
+    assert.equal(detailed.confirmed, false);
+    assert.deepEqual(detailed.outcomes, [{
+        requested_target: 'exact-request',
+        resolved_target: agent,
+        disposition: 'refused',
+        detail: 'receipt persistence unavailable',
+    }]);
 });
 
 

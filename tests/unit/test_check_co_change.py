@@ -1,0 +1,1981 @@
+"""Tests for the co-change surfacing gate (``scripts/check_co_change.py``, #3124).
+
+Covers gate 4.1 of ``docs/development/DETERMINISTIC_DEV_GATES.md``:
+
+* a modified function body surfaces the call sites the diff did **not** touch,
+* a literal *removed* at one site surfaces the siblings still carrying the old
+  name — the ``action="tool_execution"`` shape, 5 sites, 1 changed,
+* a diff that touches every sharing site reports clean,
+* the search pattern is verified against a real ``git grep`` invocation, because
+  ``git grep -E`` accepts ``\\b``/``\\s`` and then matches nothing while exiting
+  0 — a silent-empty detector reports "all clear" forever,
+* ``DetectorBroken`` fires when a lookup finds nothing despite a known site,
+* advisory by default (exit 0), blocking only under ``--strict``.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from scripts import check_co_change as checker
+
+
+def _run(repo: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+
+@pytest.fixture
+def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A throwaway git repo that the checker treats as the project root."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    _run(root, "init", "-q")
+    _run(root, "config", "user.email", "test@example.invalid")
+    _run(root, "config", "user.name", "test")
+    monkeypatch.setattr(checker, "PROJECT_ROOT", root)
+    return root
+
+
+def _commit(repo: Path, message: str = "baseline") -> None:
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", message)
+
+
+def _findings(repo: Path) -> list[checker.Finding]:
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    findings, _, __ = checker.collect(new_map, old_map, "HEAD")
+    return findings
+
+
+def _structural(repo: Path) -> list[tuple[str, int]]:
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    _, structural, _unparseable = checker.collect(new_map, old_map, "HEAD")
+    return structural
+
+
+def _unparseable(repo: Path) -> list[str]:
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    _, __, unparseable = checker.collect(new_map, old_map, "HEAD")
+    return unparseable
+
+
+def _named(findings: list[checker.Finding], name: str) -> checker.Finding:
+    matches = [f for f in findings if f.name == name]
+    assert matches, f"{name!r} not surfaced; got {[f.name for f in findings]}"
+    return matches[0]
+
+
+# --------------------------------------------------------------------------
+# The detector must actually match. This is the regression guard for the bug
+# that made every symbol lookup silently return nothing.
+# --------------------------------------------------------------------------
+
+def test_candidate_prefilter_finds_the_file_under_real_git_grep(repo: Path) -> None:
+    """The ``git grep`` prefilter must actually match, through a real invocation.
+
+    An earlier implementation searched with ``\\bname\\s*\\(``. ``git grep -E``
+    accepts those escapes, matches NOTHING, and exits 0 — so the gate reported
+    "every site was touched" for every diff. Asserting through a real ``git
+    grep`` is the only way to catch it; a Python ``re`` test passes on the
+    broken pattern. grep no longer decides what counts, but if it returns no
+    candidate files the AST pass never runs and the result is the same silence.
+    """
+    (repo / "mod.py").write_text(
+        "def helper(x):\n    return x\n\n\ndef caller():\n    return helper(1)\n"
+    )
+    _commit(repo)
+
+    pattern = checker._word_pattern("helper")
+    result = subprocess.run(
+        ["git", "grep", "-l", "-E", "--", pattern, "*.py"],
+        cwd=repo, capture_output=True, text=True, check=False,
+    )
+    assert "mod.py" in result.stdout, (
+        f"prefilter {pattern!r} matched nothing; git grep said {result.stdout!r}"
+    )
+
+
+def test_detector_broken_raises_when_a_known_symbol_finds_nothing(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lookup that finds nothing must be loud, never a clean report."""
+    (repo / "mod.py").write_text("def helper(x):\n    return x\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def helper(x):\n    return x + 1\n")
+
+    monkeypatch.setattr(checker, "defines", lambda tree, name: False)
+    with pytest.raises(checker.DetectorBroken, match="helper"):
+        _findings(repo)
+
+
+# --------------------------------------------------------------------------
+# Gate 4.1 proper
+# --------------------------------------------------------------------------
+
+def test_modified_function_surfaces_untouched_call_sites(repo: Path) -> None:
+    (repo / "mod.py").write_text(
+        "def shared(x):\n"
+        "    return x\n"
+        "\n"
+        "\n"
+        "def door_one():\n"
+        "    return shared(1)\n"
+        "\n"
+        "\n"
+        "def door_two():\n"
+        "    return shared(2)\n"
+        "\n"
+        "\n"
+        "def door_three():\n"
+        "    return shared(3)\n"
+    )
+    _commit(repo)
+
+    # Change the shared function AND exactly one of its three call sites.
+    text = (repo / "mod.py").read_text()
+    text = text.replace("def shared(x):\n    return x", "def shared(x):\n    return x * 2")
+    text = text.replace("return shared(1)", "return shared(10)")
+    (repo / "mod.py").write_text(text)
+
+    finding = _named(_findings(repo), "shared")
+    assert len(finding.changed) == 1
+    assert {(o.path, o.line) for o in finding.unchanged} == {("mod.py", 10), ("mod.py", 14)}
+
+
+def test_removed_literal_surfaces_siblings_under_the_old_name(repo: Path) -> None:
+    """Renaming one of N sites leaves the rest under a name the new side never mentions."""
+    (repo / "mod.py").write_text(
+        'A = "tool_execution"\n'
+        'B = "tool_execution"\n'
+        'C = "tool_execution"\n'
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        'A = "subagent_dispatch"\n'
+        'B = "tool_execution"\n'
+        'C = "tool_execution"\n'
+    )
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("mod.py", 2), ("mod.py", 3)}
+
+
+def test_clean_when_the_diff_touches_every_sharing_site(repo: Path) -> None:
+    (repo / "mod.py").write_text(
+        'A = "tool_execution"\n'
+        'B = "tool_execution"\n'
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        'A = "subagent_dispatch"\n'
+        'B = "subagent_dispatch"\n'
+    )
+
+    assert _findings(repo) == []
+    assert "every site" in checker.render([])
+
+
+def test_short_and_noise_literals_are_not_surfaced(repo: Path) -> None:
+    (repo / "mod.py").write_text('A = "ab"\nB = "ab"\nC = "  "\nD = "  "\n')
+    _commit(repo)
+    (repo / "mod.py").write_text('A = "cd"\nB = "ab"\nC = "\\t"\nD = "  "\n')
+
+    assert [f.name for f in _findings(repo)] == []
+
+
+def test_changed_definition_line_is_not_counted_as_a_touched_call_site(
+    repo: Path,
+) -> None:
+    """A signature change puts the ``def`` line itself in the changed set.
+
+    Counting it as a *call* site would report the definition as the site that
+    was updated, hiding that no actual caller was visited.
+
+    This test previously asserted ``findings == []`` for this shape and passed.
+    That assertion was wrong: it enshrined the false-clean that codex round 2
+    found as a P1 — a changed definition with untouched callers is precisely
+    what this gate exists to report, not an empty result.
+    """
+    (repo / "mod.py").write_text(
+        "def shared(x):\n    return x\n\n\ndef caller():\n    return shared(1)\n"
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "def shared(x, y=None):\n    return x\n\n\ndef caller():\n    return shared(1)\n"
+    )
+
+    finding = _named(_findings(repo), "shared")
+    assert finding.changed == [], (
+        f"the changed `def` line was counted as a touched call site: {finding.changed}"
+    )
+    assert {(o.path, o.line) for o in finding.unchanged} == {("mod.py", 6)}
+
+
+# --------------------------------------------------------------------------
+# Exit-code contract
+# --------------------------------------------------------------------------
+
+def _prepare_dirty(repo: Path) -> None:
+    (repo / "mod.py").write_text('A = "tool_execution"\nB = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_text('A = "subagent_dispatch"\nB = "tool_execution"\n')
+
+
+def test_advisory_by_default_exits_zero(repo: Path, capsys: pytest.CaptureFixture) -> None:
+    _prepare_dirty(repo)
+    assert checker.main([]) == 0
+    assert "did not touch" in capsys.readouterr().out
+
+
+def test_strict_exits_nonzero_when_anything_is_surfaced(repo: Path) -> None:
+    _prepare_dirty(repo)
+    assert checker.main(["--strict"]) == 1
+
+
+def test_strict_exits_zero_when_clean(repo: Path) -> None:
+    (repo / "mod.py").write_text('A = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_text('A = "subagent_dispatch"\n')
+    assert checker.main(["--strict"]) == 0
+
+
+# --------------------------------------------------------------------------
+# Ordering: the signal must not sit below unrelated hits
+# --------------------------------------------------------------------------
+
+def test_unchanged_sites_in_the_edited_file_rank_above_distant_ones() -> None:
+    """Same file first, then same directory, then everywhere else.
+
+    Reproducing the #3107 round-2 mistake surfaced the four sibling sites in the
+    file being edited *below* thirty unrelated hits, because ``git grep``
+    returns path order. The listing is capped, so ordering decides whether the
+    answerable sites are visible at all.
+    """
+    changed = [checker.Occurrence("pkg/security/queue.py", 310)]
+    unchanged = [
+        checker.Occurrence("aaa/elsewhere.py", 1),
+        checker.Occurrence("pkg/security/hooks.py", 12),
+        checker.Occurrence("pkg/security/queue.py", 415),
+        checker.Occurrence("pkg/security/queue.py", 327),
+    ]
+
+    ordered = checker.rank_unchanged(unchanged, changed, {"pkg/security/queue.py"})
+
+    assert [(o.path, o.line) for o in ordered] == [
+        ("pkg/security/queue.py", 327),   # same file, by line
+        ("pkg/security/queue.py", 415),
+        ("pkg/security/hooks.py", 12),    # same directory
+        ("aaa/elsewhere.py", 1),          # everywhere else, despite sorting first
+    ]
+
+
+def test_ranking_uses_the_diffs_files_when_no_site_was_touched(repo: Path) -> None:
+    """A removed literal has zero touched sites; the diff's files still frame it."""
+    (repo / "near.py").write_text('A = "tool_execution"\nB = "tool_execution"\n')
+    (repo / "far.py").write_text('C = "tool_execution"\n')
+    _commit(repo)
+    (repo / "near.py").write_text('A = "subagent_dispatch"\nB = "tool_execution"\n')
+
+    finding = _named(_findings(repo), "tool_execution")
+    ordered = checker.rank_unchanged(finding.unchanged, finding.changed, {"near.py"})
+    assert (ordered[0].path, ordered[0].line) == ("near.py", 2)
+
+
+# --------------------------------------------------------------------------
+# Noise control — a gate people suppress is worse than no gate
+# --------------------------------------------------------------------------
+
+def test_module_private_names_do_not_match_unrelated_modules(repo: Path) -> None:
+    """Every test module defines its own ``_commit``; they are different functions.
+
+    Dogfooding this gate on its own diff reported ``_commit`` as having 33 call
+    sites across the repo. Scoping a leading-underscore name to its own module
+    is what makes the output readable.
+    """
+    (repo / "mine.py").write_text(
+        "def _helper(x):\n    return x\n\n\ndef a():\n    return _helper(1)\n"
+        "\n\ndef b():\n    return _helper(2)\n"
+    )
+    (repo / "stranger.py").write_text(
+        "def _helper(x):\n    return x * 99\n\n\ndef c():\n    return _helper(3)\n"
+    )
+    _commit(repo)
+    text = (repo / "mine.py").read_text().replace(
+        "def _helper(x):\n    return x", "def _helper(x):\n    return x + 1"
+    ).replace("return _helper(1)", "return _helper(11)")
+    (repo / "mine.py").write_text(text)
+
+    finding = _named(_findings(repo), "_helper")
+    paths = {o.path for o in finding.unchanged}
+    assert paths == {"mine.py"}, f"unrelated module's _helper surfaced: {paths}"
+
+
+def test_module_private_name_still_reaches_explicit_importers(repo: Path) -> None:
+    """Scoping must not hide a private helper someone actually imported."""
+    (repo / "mine.py").write_text(
+        "def _helper(x):\n    return x\n\n\ndef a():\n    return _helper(1)\n"
+    )
+    (repo / "user.py").write_text(
+        "from mine import _helper\n\n\ndef b():\n    return _helper(2)\n"
+    )
+    _commit(repo)
+    text = (repo / "mine.py").read_text().replace(
+        "def _helper(x):\n    return x", "def _helper(x):\n    return x + 1"
+    ).replace("return _helper(1)", "return _helper(11)")
+    (repo / "mine.py").write_text(text)
+
+    finding = _named(_findings(repo), "_helper")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+@pytest.mark.parametrize("value", ["has a space", "*.py", "%s/%s", "a b"])
+def test_literals_without_an_identifier_shape_are_ignored(
+    repo: Path, value: str
+) -> None:
+    """Prose and pathspecs are not invariants."""
+    (repo / "mod.py").write_text(f'A = "{value}"\nB = "{value}"\n')
+    _commit(repo)
+    (repo / "mod.py").write_text(f'A = "replaced_token"\nB = "{value}"\n')
+
+    assert value not in [f.name for f in _findings(repo)]
+
+
+def test_identifier_shaped_literals_are_still_surfaced(repo: Path) -> None:
+    """The rule must not swallow the case the gate exists for."""
+    (repo / "mod.py").write_text('A = "tool_execution"\nB = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_text('A = "subagent_dispatch"\nB = "tool_execution"\n')
+
+    assert "tool_execution" in [f.name for f in _findings(repo)]
+
+
+# --------------------------------------------------------------------------
+# Codex review round 1 — five P2s, one per test
+# --------------------------------------------------------------------------
+
+def test_editing_a_class_body_does_not_abort_the_gate(repo: Path) -> None:
+    """An ordinary ``class Worker:`` edit took the whole check down.
+
+    ``modified_symbols`` reported the ClassDef, the search demanded ``Worker(``,
+    an uninstantiated class matched nothing, and DetectorBroken aborted every
+    remaining finding. The positive control now asserts the *definition* is
+    findable, which does not depend on the symbol being used at all.
+    """
+    (repo / "mod.py").write_text("class Worker:\n    def run(self):\n        return 1\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("class Worker:\n    def run(self):\n        return 2\n")
+
+    assert _findings(repo) == []  # must not raise
+
+
+def test_class_references_count_as_sites_not_only_instantiations(repo: Path) -> None:
+    (repo / "mod.py").write_text(
+        "class Worker:\n    def run(self):\n        return 1\n\n\nw = Worker()\n"
+    )
+    (repo / "other.py").write_text("from mod import Worker\n\n\ndef f(x: Worker):\n    return x\n")
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "class Worker:\n    def run(self):\n        return 2\n\n\nw = Worker\n"
+    )
+
+    finding = _named(_findings(repo), "Worker")
+    assert ("other.py", 4) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_private_method_keeps_external_callers(repo: Path) -> None:
+    """``queue._dispatch()`` is reached by importing Queue, never ``_dispatch``.
+
+    Scoping every underscore name to its module plus importers-of-that-name
+    dropped exactly the external callers this gate exists to surface.
+    """
+    (repo / "mod.py").write_text(
+        "class Queue:\n"
+        "    def _dispatch(self, x):\n"
+        "        return x\n"
+        "\n"
+        "    def go(self):\n"
+        "        return self._dispatch(1)\n"
+    )
+    # Routed through a third module on purpose: ``user.py`` imports neither
+    # ``mod`` nor the name ``_dispatch``, so ``module_importers()`` cannot keep
+    # it in scope by accident — only the "methods are not module-private" rule
+    # can. With a direct ``from mod import Queue`` the test stayed green when
+    # that rule was deleted.
+    (repo / "hub.py").write_text("from mod import Queue\n")
+    (repo / "user.py").write_text(
+        "from hub import Queue\n\n\ndef run(q: Queue):\n    return q._dispatch(2)\n"
+    )
+    _commit(repo)
+    text = (repo / "mod.py").read_text()
+    text = text.replace("    def _dispatch(self, x):\n        return x",
+                        "    def _dispatch(self, x):\n        return x + 1")
+    text = text.replace("return self._dispatch(1)", "return self._dispatch(11)")
+    (repo / "mod.py").write_text(text)
+
+    finding = _named(_findings(repo), "_dispatch")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}, (
+        "external caller of a private method was scoped away"
+    )
+
+
+def test_literal_matching_is_exact_not_substring(repo: Path) -> None:
+    """``git grep -F "config"`` matches ``base_config`` — 8,241 hits repo-wide."""
+    (repo / "mod.py").write_text(
+        'A = "config_alpha"\n'
+        'B = "config_alpha"\n'
+        'base_config_alpha = 1\n'
+        'C = "prefix_config_alpha_suffix"\n'
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        'A = "config_beta"\n'
+        'B = "config_alpha"\n'
+        'base_config_alpha = 1\n'
+        'C = "prefix_config_alpha_suffix"\n'
+    )
+
+    finding = _named(_findings(repo), "config_alpha")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("mod.py", 2)}, (
+        "an identifier or a longer string was counted as an occurrence"
+    )
+
+
+def test_a_call_inside_a_string_literal_is_not_a_call_site(repo: Path) -> None:
+    """This repository's tests embed Python source as strings constantly."""
+    (repo / "mod.py").write_text(
+        "def helper(x):\n    return x\n\n\ndef caller():\n    return helper(1)\n"
+    )
+    (repo / "snippet.py").write_text('SOURCE = "helper(1)"\n# helper() in a comment\n')
+    # An untouched real caller, so a finding always exists and the assertion
+    # below runs unconditionally (it used to sit under `if findings:` and
+    # executed zero assertions on the correct implementation).
+    (repo / "other.py").write_text("from mod import helper\n\n\ndef g():\n    return helper(2)\n")
+    _commit(repo)
+    text = (repo / "mod.py").read_text().replace(
+        "def helper(x):\n    return x", "def helper(x):\n    return x + 1"
+    ).replace("return helper(1)", "return helper(11)")
+    (repo / "mod.py").write_text(text)
+
+    finding = _named(_findings(repo), "helper")
+    paths = [o.path for o in finding.unchanged]
+    assert "snippet.py" not in paths, "a string/comment was reported as a call site"
+    assert paths == ["other.py"]
+
+
+def test_removed_literal_counts_the_site_it_was_removed_from(repo: Path) -> None:
+    """The contract promises ``modified 1 of 3``; grep on the new tree saw 0 of 2."""
+    (repo / "mod.py").write_text(
+        'A = "tool_execution"\nB = "tool_execution"\nC = "tool_execution"\n'
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        'A = "subagent_dispatch"\nB = "tool_execution"\nC = "tool_execution"\n'
+    )
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert len(finding.changed) == 1, f"removed site not counted: {finding.changed}"
+    assert len(finding.changed) + len(finding.unchanged) == 3
+    assert "modified 1 of 3 occurrences" in checker.render([finding])
+
+
+def test_structural_names_are_named_in_a_footer_not_silently_dropped(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hidden cap reads as 'covered everything'."""
+    monkeypatch.setattr(checker, "MAX_TOTAL_SITES", 2)
+    body = "def shared(x):\n    return x\n"
+    calls = "".join(f"\n\ndef c{i}():\n    return shared({i})\n" for i in range(4))
+    (repo / "mod.py").write_text(body + calls)
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        body.replace("return x", "return x + 1") + calls.replace("shared(0)", "shared(9)")
+    )
+
+    structural = _structural(repo)
+    assert ("shared", 4) in structural
+    footer = checker.render([], structural=structural)
+    assert "shared (4)" in footer and "not reviewed site-by-site" in footer
+
+
+# --------------------------------------------------------------------------
+# Codex review round 2 — one P1 and six P2s
+# --------------------------------------------------------------------------
+
+def test_body_only_change_surfaces_every_caller(repo: Path) -> None:
+    """THE motivating case, and it reported clean.
+
+    Change a shared function's implementation, leave every call expression
+    alone, and ``touched and untouched`` discarded the symbol entirely — the
+    gate answered "every site sharing a changed symbol was touched" to the one
+    question it exists to ask. This is the round-7 ``fold_searchable`` shape.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    (repo / "b.py").write_text("from mod import shared\n\n\ndef g():\n    return shared(2)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert finding.changed == []
+    assert {o.path for o in finding.unchanged} == {"a.py", "b.py"}
+    assert "definition changed; 2 call sites untouched" in checker.render([finding])
+
+
+def test_deletion_only_body_edit_still_surfaces_callers(repo: Path) -> None:
+    """A hunk of pure deletions contributes no new-side line at all."""
+    (repo / "mod.py").write_text("def shared(x):\n    y = 1\n    return x\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+
+
+def test_import_alias_resolves_to_the_changed_symbol(repo: Path) -> None:
+    """``from mod import shared as alias`` then ``alias()`` is a call to shared."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "b.py").write_text(
+        "from mod import shared as alias\n\n\ndef g():\n    return alias(2)\n"
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("b.py", 5)}
+
+
+def test_a_multiline_call_is_touched_by_a_change_to_its_arguments(repo: Path) -> None:
+    """Only the callee-name line was compared, so an argument edit read untouched."""
+    (repo / "mod.py").write_text("def shared(x, y):\n    return x\n")
+    (repo / "a.py").write_text(
+        "from mod import shared\n\n\ndef f():\n    return shared(\n        1,\n        2,\n    )\n"
+    )
+    (repo / "b.py").write_text("from mod import shared\n\n\ndef g():\n    return shared(3, 4)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x, y):\n    return x + y\n")
+    (repo / "a.py").write_text(
+        "from mod import shared\n\n\ndef f():\n    return shared(\n        1,\n        99,\n    )\n"
+    )
+
+    finding = _named(_findings(repo), "shared")
+    assert [o.path for o in finding.changed] == ["a.py"], (
+        f"multiline call not marked touched by its argument change: {finding.changed}"
+    )
+    assert [o.path for o in finding.unchanged] == ["b.py"]
+
+
+def test_a_constructor_call_counts_once_not_twice(repo: Path) -> None:
+    """``ast.walk`` visits the Call and then its Name child; both matched."""
+    (repo / "mod.py").write_text("class Worker:\n    def run(self):\n        return 1\n")
+    (repo / "a.py").write_text("from mod import Worker\n\n\nw = Worker()\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("class Worker:\n    def run(self):\n        return 2\n")
+
+    finding = _named(_findings(repo), "Worker")
+    assert len(finding.unchanged) == 1, (
+        f"constructor counted more than once: {[(o.path, o.line) for o in finding.unchanged]}"
+    )
+
+
+def test_structural_results_do_not_report_clean(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symbol skipped for being too widely used is an unanswered question."""
+    monkeypatch.setattr(checker, "MAX_TOTAL_SITES", 1)
+    (repo / "mod.py").write_text(
+        "def shared(x):\n    return x\n\n\ndef a():\n    return shared(1)\n"
+        "\n\ndef b():\n    return shared(2)\n"
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "def shared(x):\n    return x + 1\n\n\ndef a():\n    return shared(1)\n"
+        "\n\ndef b():\n    return shared(2)\n"
+    )
+
+    structural = _structural(repo)
+    assert structural, "symbol was not classified structural"
+    report = checker.render([], structural=structural)
+    assert "every site" not in report, f"structural result claimed clean: {report}"
+    assert checker.main(["--strict"]) == 1
+
+
+def test_an_unparseable_changed_file_is_surfaced_not_swallowed(repo: Path) -> None:
+    """A half-written file yielded no symbols and rendered as a clean bill of health."""
+    (repo / "mod.py").write_text('A = "tool_execution"\nB = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        'A = "subagent_dispatch"\nB = "tool_execution"\ndef broken(\n'
+    )
+
+    assert _unparseable(repo) == ["mod.py"]
+    report = checker.render([], unparseable=_unparseable(repo))
+    assert "every site" not in report
+    assert "NOT ANALYSED" in report
+    assert checker.main(["--strict"]) == 1
+
+
+# --------------------------------------------------------------------------
+# Codex review round 3 — one P1 and three P2s, all false-clean paths
+# --------------------------------------------------------------------------
+
+def test_renaming_a_definition_surfaces_callers_of_the_old_name(repo: Path) -> None:
+    """The stranded-caller case, and it reported clean.
+
+    Round 2 added old-side symbol discovery but guarded it on the *working
+    tree* still defining the name. A renamed or deleted definition fails that
+    guard by construction — so the one shape that always strands callers was
+    the one always dropped. The defect was inside the previous round's fix.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def renamed(x):\n    return x\n")
+
+    finding = _named(_findings(repo), "shared")
+    # The import binding on line 1 is a site too: after the rename, importing
+    # a.py raises ImportError. That is a dependency on the NAME existing, which
+    # a body change would not touch and a rename breaks outright.
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 1), ("a.py", 5)}
+
+
+def test_deleting_a_definition_surfaces_callers_of_the_old_name(repo: Path) -> None:
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n\n\ndef kept():\n    return 1\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def kept():\n    return 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 1), ("a.py", 5)}
+
+
+def test_a_first_class_reference_is_a_dependent_site(repo: Path) -> None:
+    """``map(shared, items)`` is never the callee of an ``ast.Call``."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text(
+        "from mod import shared\n\n\nitems = [1]\nresult = list(map(shared, items))\n"
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+
+
+def test_a_property_access_is_a_dependent_site(repo: Path) -> None:
+    """``obj.status`` for an ``@property`` is a use with no call node."""
+    (repo / "mod.py").write_text(
+        "class Thing:\n"
+        "    @property\n"
+        "    def status(self):\n"
+        "        return 1\n"
+    )
+    (repo / "a.py").write_text("from mod import Thing\n\n\ndef f(t: Thing):\n    return t.status\n")
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "class Thing:\n"
+        "    @property\n"
+        "    def status(self):\n"
+        "        return 2\n"
+    )
+
+    finding = _named(_findings(repo), "status")
+    assert ("a.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_a_private_function_reached_through_its_module_is_kept(repo: Path) -> None:
+    """``import cli`` then ``cli._get_project_dir()`` imports the MODULE, not the name."""
+    (repo / "cli.py").write_text("def _get_project_dir():\n    return 1\n")
+    (repo / "cli_features.py").write_text(
+        "import cli\n\n\ndef f():\n    return cli._get_project_dir()\n"
+    )
+    _commit(repo)
+    (repo / "cli.py").write_text("def _get_project_dir():\n    return 2\n")
+
+    finding = _named(_findings(repo), "_get_project_dir")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("cli_features.py", 5)}
+
+
+def test_a_decorator_only_change_still_changes_the_definition(repo: Path) -> None:
+    """``FunctionDef.lineno`` is the ``def`` line; decorators sit above it."""
+    (repo / "mod.py").write_text(
+        "import functools\n\n\n@functools.cache\ndef shared(x):\n    return x\n"
+    )
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "import functools\n\n\n@functools.lru_cache\ndef shared(x):\n    return x\n"
+    )
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+
+
+# --------------------------------------------------------------------------
+# Codex review round 4 — one P1 and three P2s
+# --------------------------------------------------------------------------
+
+def test_a_re_exported_alias_reaches_the_downstream_caller(repo: Path) -> None:
+    """The caller's file never contains the original name at all.
+
+    ``bridge.py`` does ``from mod import shared as alias``; ``user.py`` does
+    ``from bridge import alias`` and calls ``alias()``. A prefilter on ``shared``
+    excludes user.py entirely, so a body change reported clean. One hop is not
+    enough — the binding that reaches the caller is the bridge's.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "bridge.py").write_text("from mod import shared as alias\n")
+    (repo / "user.py").write_text("from bridge import alias\n\n\ndef f():\n    return alias(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_a_dotted_module_import_is_still_an_import(repo: Path) -> None:
+    """``import pkg.cli as c`` — the prefilter excluded a preceding dot."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "pkg" / "cli.py").write_text("def _helper():\n    return 1\n")
+    (repo / "user.py").write_text("import pkg.cli as c\n\n\ndef f():\n    return c._helper()\n")
+    _commit(repo)
+    (repo / "pkg" / "cli.py").write_text("def _helper():\n    return 2\n")
+
+    finding = _named(_findings(repo), "_helper")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 5)}
+
+
+def test_a_package_initializer_resolves_to_the_package_name(repo: Path) -> None:
+    """``pkg/__init__.py`` has stem ``__init__``; nothing imports ``__init__``."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("def _helper():\n    return 1\n")
+    (repo / "user.py").write_text("import pkg\n\n\ndef f():\n    return pkg._helper()\n")
+    _commit(repo)
+    (repo / "pkg" / "__init__.py").write_text("def _helper():\n    return 2\n")
+
+    finding = _named(_findings(repo), "_helper")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 5)}
+
+
+def test_a_constant_equal_but_spelled_differently_is_found(repo: Path) -> None:
+    """``"tool\\x5fexecution"`` and ``"tool_" "execution"`` equal the value at runtime."""
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    (repo / "b.py").write_text('B = "tool\\x5fexecution"\n')
+    (repo / "c.py").write_text('C = ("tool_" "execution")\n')
+    _commit(repo)
+    (repo / "a.py").write_text('A = "subagent_dispatch"\n')
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert {o.path for o in finding.unchanged} == {"b.py", "c.py"}
+
+
+def test_widening_is_skipped_for_an_undistinctive_run(repo: Path) -> None:
+    """A short run matches most of the tree; the cost is paid on every run.
+
+    ``"__init__"`` widens to ``init``. Indexing that candidate set took the gate
+    from under a second to sixteen. Only a distinctive run earns the extra files.
+    """
+    assert checker.MIN_WIDENED_RUN >= 8
+    (repo / "a.py").write_text('A = "__init__"\nB = "__init__"\n')
+    _commit(repo)
+    (repo / "a.py").write_text('A = "renamed_marker"\nB = "__init__"\n')
+
+    # Still correct via the exact prefilter — widening is an addition, not the
+    # only path to a sibling.
+    finding = _named(_findings(repo), "__init__")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 2)}
+
+
+# --------------------------------------------------------------------------
+# Gaps found by surviving mutants — each guard's ONLY load-bearing case
+# --------------------------------------------------------------------------
+
+def test_a_symbol_defined_in_a_new_file_passes_the_positive_control(repo: Path) -> None:
+    """The positive control has two halves; only this case needs the first.
+
+    A mutant that broke the working-tree half survived, because every existing
+    test defines its symbol in a file the diff also changed — so the old-blob
+    half answered instead. A file added by the diff has no old-side entry at
+    all, which is the one shape that depends on the working-tree lookup.
+    """
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+
+    finding = _named(_findings(repo), "shared")  # must not raise DetectorBroken
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+
+
+def test_a_private_helper_re_exported_through_a_bridge_keeps_its_caller(
+    repo: Path,
+) -> None:
+    """Scoping needs the NAME's importers, not only the module's.
+
+    A mutant dropping ``import_sites`` survived: for a direct
+    ``from mine import _helper`` the caller also imports the module, so
+    ``module_importers`` answered. Through a bridge it does not — ``user.py``
+    imports ``bridge``, never ``mine`` — and only the name lookup keeps it.
+    """
+    (repo / "mine.py").write_text("def _helper(x):\n    return x\n")
+    (repo / "bridge.py").write_text("from mine import _helper\n")
+    (repo / "user.py").write_text("from bridge import _helper\n\n\ndef f():\n    return _helper(2)\n")
+    _commit(repo)
+    (repo / "mine.py").write_text("def _helper(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "_helper")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}, (
+        "a private helper's caller was scoped away because it imports the bridge, "
+        "not the defining module"
+    )
+
+
+def test_an_untracked_new_file_is_analysed(repo: Path) -> None:
+    """``git diff`` never mentions an untracked file.
+
+    Found by a surviving mutant: the test meant to cover a new file's symbol
+    could not, because a file created and not staged is absent from
+    ``git diff HEAD`` entirely — so a brand-new module was invisible and the
+    gate reported clean on it.
+    """
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")  # never staged
+
+    new_map, _ = checker.changed_line_map(["HEAD"])
+    assert "mod.py" in new_map, "an untracked Python file was not analysed at all"
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+
+
+# --------------------------------------------------------------------------
+# Codex review round 5 — three P1s and two P2s, all false-cleans
+# --------------------------------------------------------------------------
+
+def test_a_black_formatted_alias_import_is_discovered(repo: Path) -> None:
+    """``from mod import (\\n    shared as alias,\\n)`` is how this repo formats.
+
+    The aliasing prefilter required ``import`` and ``shared as`` on ONE line, so
+    the parenthesized form was never seen and the closure never learned ``alias``.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "bridge.py").write_text("from mod import (\n    shared as alias,\n)\n")
+    (repo / "user.py").write_text("from bridge import alias\n\n\ndef f():\n    return alias(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_an_untracked_files_occurrence_is_searched_not_only_mapped(repo: Path) -> None:
+    """Round 4 taught changed_line_map about untracked files and stopped there.
+
+    ``git grep`` skips untracked files by default, so the new file entered the
+    changed map but was never searched: its occurrence could not become
+    ``touched``, and the gate reported clean. A boundary has two ends.
+    """
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    _commit(repo)
+    (repo / "newfile.py").write_text('B = "tool_execution"\n')  # never staged
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.changed] == [("newfile.py", 1)]
+    assert [(o.path, o.line) for o in finding.unchanged] == [("a.py", 1)]
+
+
+def test_an_import_only_dependency_on_a_renamed_definition_is_surfaced(
+    repo: Path,
+) -> None:
+    """No call anywhere — but importing the file now raises ImportError."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "user.py").write_text("from mod import shared\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def renamed(x):\n    return x\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 1)}
+
+
+def test_an_import_binding_is_not_a_site_for_a_body_change(repo: Path) -> None:
+    """The other direction: a body change does not touch an import.
+
+    Counting import bindings unconditionally made every import an unreviewed
+    site and inflated eleven existing tests. The binding depends on the name
+    existing, not on what it does.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "user.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 5)}, (
+        "the import binding was counted as a site for a body-only change"
+    )
+
+
+def test_scope_follows_importers_of_a_discovered_alias(repo: Path) -> None:
+    """The closure can find a name the scope has never heard of."""
+    (repo / "mine.py").write_text("def _helper(x):\n    return x\n")
+    (repo / "bridge.py").write_text("from mine import _helper as h\n")
+    (repo / "user.py").write_text("from bridge import h\n\n\ndef f():\n    return h(2)\n")
+    _commit(repo)
+    (repo / "mine.py").write_text("def _helper(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "_helper")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_a_call_removed_by_the_diff_counts_as_touched(repo: Path) -> None:
+    """A deleted call is absent from the working tree, so the scan cannot see it."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    (repo / "b.py").write_text("from mod import shared\n\n\ndef g():\n    return shared(2)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return 0\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert [(o.path, o.line) for o in finding.changed] == [("a.py", 5)], (
+        f"the removed call was not counted: {finding.changed}"
+    )
+    assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 5)]
+
+
+# --------------------------------------------------------------------------
+# Codex review round 6 — two P1s and three P2s
+# --------------------------------------------------------------------------
+
+def test_a_nul_bearing_literal_does_not_kill_the_gate(repo: Path) -> None:
+    """This repository has 26 NUL-bearing string constants.
+
+    One is ``_SCHEDULER_BOOTSTRAP_LOCK_SCOPE = "\\0scheduler-bootstrap"`` in
+    ``features/scheduler/runner.py``. The raw value reached ``git grep`` as argv
+    and raised ``ValueError: embedded null byte``, taking down the whole
+    advisory run rather than producing output.
+    """
+    (repo / "a.py").write_text(
+        'SCOPE = "\\0scheduler-bootstrap"\nOTHER = "\\0scheduler-bootstrap"\n'
+    )
+    _commit(repo)
+    (repo / "a.py").write_text(
+        'SCOPE = "\\0renamed-bootstrap"\nOTHER = "\\0scheduler-bootstrap"\n'
+    )
+
+    finding = _named(_findings(repo), "\x00scheduler-bootstrap")  # must not raise
+    assert len(finding.changed) == 1
+    assert [(o.path, o.line) for o in finding.unchanged] == [("a.py", 2)]
+
+
+def test_import_consumer_surfaced_when_a_same_named_method_survives(
+    repo: Path,
+) -> None:
+    """``from mod import shared`` binds a MODULE-LEVEL name.
+
+    Checking the bare name against every definition in the file left it true
+    when the module-level function was deleted and a same-named method
+    survived — so the import consumer, which now raises ImportError, was
+    silently omitted.
+    """
+    (repo / "mod.py").write_text(
+        "def shared(x):\n    return x\n\n\nclass C:\n    def shared(self):\n        return 1\n"
+    )
+    (repo / "user.py").write_text("from mod import shared\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("class C:\n    def shared(self):\n        return 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 1)}
+
+
+def test_a_parenthesized_import_alias_records_its_own_line(repo: Path) -> None:
+    """``ImportFrom.lineno`` is the opening line, not the alias's."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "user.py").write_text("from mod import (\n    shared,\n)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def renamed(x):\n    return x\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 2)}, (
+        "the alias was recorded at the import's opening line"
+    )
+
+
+def test_a_shifted_call_is_not_counted_twice(repo: Path) -> None:
+    """Editing a call that also moves it recorded new AND old coordinates."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    (repo / "b.py").write_text("from mod import shared\n\n\ndef g():\n    return shared(2)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+    (repo / "a.py").write_text(
+        "from mod import shared\n\n\ndef f():\n    y = 0\n    return shared(1, y)\n"
+    )
+
+    finding = _named(_findings(repo), "shared")
+    total = len(finding.changed) + len(finding.unchanged)
+    assert total == 2, (
+        f"one logical caller counted twice: changed={finding.changed} "
+        f"unchanged={finding.unchanged}"
+    )
+    assert "modified 1 of 2" in checker.render([finding])
+
+
+def test_base_mode_diffs_against_the_working_tree_not_head(
+    repo: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``--base`` mapped ``base...HEAD`` while every scan read the working tree.
+
+    An unstaged edit that removed the only untouched caller made it vanish from
+    the scan while it still existed in HEAD, so the branch check printed clean.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo, "base")
+    _run(repo, "branch", "base-ref")
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+    _commit(repo, "change on branch")
+    # Unstaged: a NEW caller appears only in the working tree.
+    (repo / "c.py").write_text("from mod import shared\n\n\ndef h():\n    return shared(3)\n")
+    _run(repo, "add", "c.py")
+
+    # Through main(), because the defect is in which spec main CHOOSES —
+    # calling changed_line_map directly would pass with main still broken.
+    assert checker.main(["--base", "base-ref"]) == 0
+    output = capsys.readouterr().out
+    # c.py's call is a TOUCHED site, so it shows in the count rather than the
+    # unchanged listing. Mapping `base...HEAD` misses it entirely and the line
+    # reads "definition changed; 2 call sites untouched" instead.
+    assert "modified 1 of 2 call sites" in output, (
+        "base mode ignored a working-tree change while scanning the working "
+        f"tree; got:\n{output}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Codex review round 7 — two of these are defects introduced by round 6
+# --------------------------------------------------------------------------
+
+def test_a_multiline_literal_is_touched_by_a_change_to_its_continuation(
+    repo: Path,
+) -> None:
+    """``literals_on`` selected on end_lineno; the index stored only the opening line."""
+    (repo / "a.py").write_text('A = ("tool_"\n     "execution")\n')
+    (repo / "b.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "a.py").write_text('A = ("tool_"\n     "dispatch")\n')
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert len(finding.changed) == 1, (
+        f"the continuation-line change did not mark the literal touched: {finding.changed}"
+    )
+    assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 1)]
+
+
+def test_a_surviving_same_name_elsewhere_does_not_suppress_the_import_check(
+    repo: Path,
+) -> None:
+    """Symbols merge by bare name, so ANY was letting m2 answer for m1.
+
+    Deleting ``shared`` from m1.py while m2.py still defines its own ``shared``
+    left ``module_level_now`` true, and ``from m1 import shared`` — which now
+    raises ImportError — went unreported.
+    """
+    (repo / "m1.py").write_text("def shared(x):\n    return x\n")
+    (repo / "m2.py").write_text("def shared(x):\n    return x\n")
+    (repo / "u.py").write_text("from m1 import shared\n")
+    _commit(repo)
+    (repo / "m1.py").write_text("def other(x):\n    return x\n")
+    (repo / "m2.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert ("u.py", 1) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_a_deleted_call_is_recovered_even_when_the_file_has_an_edited_one(
+    repo: Path,
+) -> None:
+    """Round 6 fixed double-counting with a file-wide skip, which was too coarse.
+
+    One call edited and a second deleted in the same file: the edited call put
+    the path in ``touched`` and the skip then suppressed recovery of the deleted
+    one, reporting ``modified 1 of 2`` where three sites exist.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text(
+        "from mod import shared\n\n\ndef f():\n    return shared(1)\n"
+        "\n\ndef g():\n    return shared(2)\n"
+    )
+    (repo / "b.py").write_text("from mod import shared\n\n\ndef h():\n    return shared(3)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+    (repo / "a.py").write_text(
+        "from mod import shared\n\n\ndef f():\n    return shared(11)\n"
+        "\n\ndef g():\n    return 0\n"
+    )
+
+    finding = _named(_findings(repo), "shared")
+    total = len(finding.changed) + len(finding.unchanged)
+    assert (len(finding.changed), total) == (2, 3), (
+        f"changed={finding.changed} unchanged={finding.unchanged}"
+    )
+    assert "modified 2 of 3" in checker.render([finding])
+
+
+def test_base_mode_includes_untracked_files(
+    repo: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Round 6 pointed --base at the working tree and kept excluding untracked.
+
+    The scans read untracked files either way, so the map and the scan described
+    different revisions again — the exact false clean round 6 set out to fix.
+    """
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    _commit(repo, "base")
+    _run(repo, "branch", "base-ref")
+    (repo / "mod.py").write_text('M = "tool_execution"\n')
+    _commit(repo, "on branch")
+    (repo / "newfile.py").write_text('N = "tool_execution"\n')  # never staged
+
+    assert checker.main(["--base", "base-ref"]) == 0
+    output = capsys.readouterr().out
+    # newfile.py is a CHANGED site, so it shows in the count. Excluding it reads
+    # "modified 1 of 3" with two unchanged.
+    assert "modified 2 of 3 occurrences" in output, output
+
+
+# --------------------------------------------------------------------------
+# Codex review round 8 — three P2s, no P1s
+# --------------------------------------------------------------------------
+
+def test_a_re_export_alias_renamed_by_the_diff_still_reaches_its_caller(
+    repo: Path,
+) -> None:
+    """The closure read only the working tree, where the old alias is gone.
+
+    ``bridge.py`` changes ``as alias`` to ``as alias2``; the downstream
+    ``from bridge import alias; alias()`` then mentions neither ``shared`` nor
+    ``alias2``, so nothing considered it. Fourth instance in this file of the
+    same class — the old side holds the only evidence.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "bridge.py").write_text("from mod import shared as alias\n")
+    (repo / "user.py").write_text("from bridge import alias\n\n\ndef f():\n    return alias(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+    (repo / "bridge.py").write_text("from mod import shared as alias2\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_a_private_re_export_reached_through_the_bridge_module_is_kept(
+    repo: Path,
+) -> None:
+    """``import bridge; bridge.h()`` imports the MODULE, never the alias."""
+    (repo / "mine.py").write_text("def _helper(x):\n    return x\n")
+    (repo / "bridge.py").write_text("from mine import _helper as h\n")
+    (repo / "user.py").write_text("import bridge\n\n\ndef f():\n    return bridge.h(2)\n")
+    _commit(repo)
+    (repo / "mine.py").write_text("def _helper(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "_helper")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_a_filename_containing_a_space_is_mapped(repo: Path) -> None:
+    """Git appends a tab separator for paths with spaces.
+
+    Slicing ``--- a/`` kept the tab, so the later read targeted a path that does
+    not exist and the change was silently skipped — a clean report for a file
+    never looked at.
+    """
+    (repo / "space name.py").write_text('A = "tool_execution"\n')
+    (repo / "b.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "space name.py").write_text('A = "subagent_dispatch"\n')
+
+    new_map, _ = checker.changed_line_map(["HEAD"])
+    assert "space name.py" in new_map, f"path not decoded: {sorted(new_map)}"
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 1)]
+
+
+def test_a_c_quoted_filename_is_decoded(repo: Path) -> None:
+    """Git C-quotes a path containing non-ASCII, bypassing prefix checks."""
+    (repo / "café.py").write_text('A = "tool_execution"\n')
+    (repo / "b.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "café.py").write_text('A = "subagent_dispatch"\n')
+
+    new_map, _ = checker.changed_line_map(["HEAD"])
+    # Assert the EXACT decoded name, and that it names a file that exists.
+    # An earlier version asserted `any("caf" in path ...)`, which the undecoded
+    # `"caf\303\251.py"` also satisfies — so the test passed with the bug in
+    # place and a mutant survived. The decode is only useful if the mapped key
+    # can actually be opened, which is what the later file read needs.
+    assert "café.py" in new_map, f"quoted path not decoded: {sorted(new_map)}"
+    assert (repo / "café.py").exists()
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 1)]
+
+
+# --------------------------------------------------------------------------
+# A diff BODY line is never a header. With -U0 there are no context lines, but
+# removed lines still carry a `-` prefix, so a source line that itself starts
+# with `-- ` (a SQL comment at column zero) reads as `--- ...` — the shape of a
+# file header. Reading it as one re-keys the old-side map to a bogus path and
+# the rename-one-of-N sibling is never surfaced.
+# --------------------------------------------------------------------------
+
+def test_a_removed_source_line_that_looks_like_a_header_is_not_one(repo: Path) -> None:
+    (repo / "mod.py").write_text(
+        'SQL = """\n-- a sql comment at column zero\n"""\n'
+        'A = "tool_execution"\nB = "tool_execution"\n'
+    )
+    (repo / "other.py").write_text('C = "tool_execution"\n')
+    _commit(repo)
+    # Delete the comment line and rename the literal at both mod.py sites;
+    # other.py keeps the old name and must be surfaced.
+    (repo / "mod.py").write_text(
+        'SQL = """\n"""\nA = "subagent_dispatch"\nB = "subagent_dispatch"\n'
+    )
+
+    _, old_map = checker.changed_line_map(["HEAD"])
+    assert set(old_map) == {"mod.py"}, f"body line read as a header: {sorted(old_map)}"
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("other.py", 1)]
+
+
+def test_a_removed_line_naming_a_py_file_does_not_become_a_lookup_path(repo: Path) -> None:
+    """The spoofed header survives the ``.py`` filter and crashed ``collect``."""
+    (repo / "mod.py").write_text(
+        'SQL = """\n-- see docs in helper.py\n"""\nA = "tool_execution"\n'
+    )
+    (repo / "other.py").write_text('C = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_text('SQL = """\n"""\nA = "subagent_dispatch"\n')
+
+    finding = _named(_findings(repo), "tool_execution")  # must not raise
+    assert [(o.path, o.line) for o in finding.unchanged] == [("other.py", 1)]
+
+
+def test_a_c_quoted_filename_is_searched_for_unchanged_siblings(repo: Path) -> None:
+    """Round 9 (`_paths`, NUL-delimited git output) guards the OTHER end of the
+    boundary: the non-ASCII file is the untouched sibling, which only the
+    `git grep -l` prefilter can find — a C-quoted name there is a path that
+    does not exist, and the occurrence silently vanishes."""
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    (repo / "café.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "a.py").write_text('A = "subagent_dispatch"\n')
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("café.py", 1)]
+
+
+# --------------------------------------------------------------------------
+# An untouched CANDIDATE that cannot be parsed is NOT ANALYSED, not clean.
+# --------------------------------------------------------------------------
+
+def test_an_unparseable_sibling_is_reported_not_silently_dropped(repo: Path) -> None:
+    """``_tree_for`` swallowed a sibling's read/parse failure and returned no
+    tree, so its occurrences vanished and the gate printed "every site was
+    touched" — the second door of the invariant ``collect`` already guards for
+    a CHANGED file in the same state."""
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    (repo / "sib.py").write_text('B = "tool_execution"\ndef broken(\n')
+    _commit(repo)
+    (repo / "a.py").write_text('A = "subagent_dispatch"\n')
+
+    assert "sib.py" in _unparseable(repo)
+    assert checker.main(["--strict"]) == 1
+
+
+# --------------------------------------------------------------------------
+# Round 12: bytes the gate cannot read are NOT ANALYSED, never clean; method
+# edits do not drag unrelated importers in.
+# --------------------------------------------------------------------------
+
+def test_a_changed_file_that_cannot_be_decoded_is_not_analysed(repo: Path) -> None:
+    (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\n')  # latin-1, not UTF-8
+    (repo / "sib.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\nC = 1\n')
+
+    assert "mod.py" in _unparseable(repo)
+    assert checker.main(["--strict"]) == 1
+
+
+def test_an_untracked_file_that_cannot_be_decoded_is_not_analysed(repo: Path) -> None:
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    _commit(repo)
+    (repo / "new.py").write_bytes(b'# caf\xe9\nB = "tool_execution"\n')  # untracked, latin-1
+
+    assert "new.py" in _unparseable(repo)
+    # The only change in the tree is the unreadable one: main must not
+    # short-circuit past its own NOT ANALYSED report.
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_changed_file_git_renders_as_binary_is_still_analysed(repo: Path) -> None:
+    """`git diff` emits only "Binary files differ" — no hunks — for a path a
+    .gitattributes rule (or a NUL byte) marks binary, and the file vanished
+    from both maps: door four of the same false-clean invariant."""
+    (repo / ".gitattributes").write_text("mod.py -diff\n")
+    (repo / "mod.py").write_text('MARK = "tool_execution"\n')
+    (repo / "sib.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_text('MARK = "subagent_dispatch"\n')
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("sib.py", 1)]
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_removed_line_in_a_non_utf8_file_does_not_crash_the_gate(repo: Path) -> None:
+    """`git show` of a latin-1 blob used to raise UnicodeDecodeError inside
+    subprocess.run, where nothing could catch it."""
+    (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\nB = 2\n')
+    _commit(repo)
+    (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\n')  # a REMOVED line
+
+    _findings(repo)  # must not raise
+
+
+def test_an_old_side_blob_that_will_not_parse_is_not_analysed(repo: Path) -> None:
+    """surrogateescape keeps the bytes; ast.parse then raises. Dropping the old
+    side silently rendered its sites as touched and --strict passed."""
+    (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\n')  # latin-1 in HEAD
+    (repo / "sib.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_text('# cafe\nA = "subagent_dispatch"\n')  # repaired + renamed
+
+    assert "mod.py" in _unparseable(repo)
+    assert checker.main(["--strict"]) == 1
+
+
+def test_an_unrelated_edit_elsewhere_does_not_defeat_the_method_scope(repo: Path) -> None:
+    """`module_level_before` must ask about THIS symbol's files: an unrelated
+    module-level `dispatch` in another touched file answered for the method."""
+    (repo / "mod.py").write_text(
+        "class Queue:\n    def dispatch(self, x):\n        return x\n"
+    )
+    # z.py is in old_sources (a line of it changed) but NOT in the paths
+    # whose change touches `dispatch`'s span: the difference set that
+    # separates "ask THIS symbol's files" from "ask every touched file". It
+    # is unparseable after the edit, so nothing but the old side can answer.
+    (repo / "z.py").write_text("def dispatch(y):\n    return y\nX = 1\n")
+    (repo / "user.py").write_text("from z import dispatch\n")
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "class Queue:\n    def dispatch(self, x):\n        return x + 1\n"
+    )
+    (repo / "z.py").write_text("def dispatch(y):\n    return y\ndef broken(\n")
+
+    listed = {
+        (o.path, o.line)
+        for f in _findings(repo) if f.name == "dispatch" for o in f.unchanged
+    }
+    assert ("user.py", 1) not in listed
+
+
+def test_a_deleted_file_is_not_reported_as_unreadable(repo: Path) -> None:
+    (repo / "gone.py").write_text("def gone():\n    return 1\n")
+    _commit(repo)
+    _run(repo, "rm", "-q", "gone.py")
+
+    assert "gone.py" not in _unparseable(repo)
+
+
+def test_a_method_body_edit_does_not_pull_in_unrelated_module_level_importers(repo: Path) -> None:
+    (repo / "mod.py").write_text(
+        "class Queue:\n    def dispatch(self, x):\n        return x\n"
+    )
+    (repo / "other.py").write_text("def dispatch(y):\n    return y\n")
+    (repo / "user.py").write_text("from other import dispatch\n")
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "class Queue:\n    def dispatch(self, x):\n        return x + 1\n"
+    )
+
+    listed = {(o.path, o.line) for f in _findings(repo) if f.name == "dispatch" for o in f.unchanged}
+    assert ("user.py", 1) not in listed
+
+
+# --------------------------------------------------------------------------
+# Round 15: a pure rename is a change; the read-failure guard and the
+# literal-side double-count guard each get the test their twins already had.
+# --------------------------------------------------------------------------
+
+def test_a_pure_rename_is_analysed_not_invisible(repo: Path) -> None:
+    """``git mv`` emits no ``---``/``+++`` and no hunks, so both maps were
+    empty and ``--strict`` exited 0 while every importer of the old module
+    path was stranded. Past ``diff.renameLimit`` git falls back to delete+add
+    and the same edit WAS analysed — the gate contradicted itself."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "user.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    # No line is seeded for a rename: the change is the module path.
+    assert new_map == {} and old_map == {} and checker._RENAMES == {"mod.py": "newmod.py"}
+    finding = _named(_findings(repo), "shared")
+    assert any(o.path == "user.py" for o in finding.unchanged), finding
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_renamed_file_that_cannot_be_read_is_not_analysed(repo: Path) -> None:
+    # A PURE rename (identical bytes, so no hunks): collect's rename loop
+    # reads the OLD blob, and when that will not parse it must record the
+    # NEW path as NOT ANALYSED — the path the reader would look for.
+    (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\n')  # latin-1
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "moved.py")
+
+    assert "moved.py" in _unparseable(repo)
+    assert checker.main(["--strict"]) == 1
+
+
+def test_an_unreadable_sibling_is_reported_not_silently_dropped(repo: Path) -> None:
+    """The read-failure twin of the parse-failure test above: deleting the
+    ``_UNANALYSED.add`` in ``_tree_for``'s ``(OSError, ValueError)`` branch
+    printed "every site was touched" for a sibling that was never read."""
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    (repo / "sib.py").write_bytes(b'# caf\xe9\nB = "tool_execution"\n')  # latin-1, not UTF-8
+    _commit(repo)
+    (repo / "a.py").write_text('A = "subagent_dispatch"\n')
+
+    assert "sib.py" in _unparseable(repo)
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_surviving_literal_on_an_edited_line_is_not_counted_twice(repo: Path) -> None:
+    """The literal-side twin of ``test_a_shifted_call_is_not_counted_twice``:
+    a literal that survives on a line the diff changed for another reason is
+    one touched site, not one per side."""
+    (repo / "mod.py").write_text(
+        'def foo(a, b):\n    return b\n\n\nX = foo("tool_execution", 1)\n'
+    )
+    (repo / "b.py").write_text('from mod import foo\n\nY = foo("tool_execution", 9)\n')
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        'def foo(a, b):\n    return b\n\n\nX = foo("tool_execution", 2)\n'
+    )
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert len(finding.changed) == 1, f"one site counted per side: {finding.changed}"
+    assert "modified 1 of 2 occurrences" in checker.render([finding])
+
+
+def test_the_not_analysed_footer_names_what_it_lists() -> None:
+    # The list carries untouched siblings and unreadable files too, not only
+    # changed files that failed to parse; the footer must not say otherwise.
+    footer = checker.render([], unparseable=["sib.py"])
+    assert "could not be read or parsed" in footer
+    assert "changed files" not in footer
+
+
+@pytest.mark.parametrize("config", [
+    ("diff.mnemonicPrefix", "true"),   # --- c/mod.py / +++ w/mod.py
+    ("diff.srcPrefix", "src/"),
+    ("diff.noprefix", "true"),         # --- mod.py — and `a/` is a real directory below
+])
+def test_diff_path_prefixes_are_pinned_against_git_config(repo: Path, config) -> None:
+    """``_patch_path`` strips a literal ``a/``/``b/``. A prefix config either
+    keyed the maps to a path git cannot show (a traceback out of an advisory
+    gate) or, with ``noprefix`` in a repo that has a top-level ``a/``,
+    stripped a REAL directory and analysed a decoy file at the root — a clean
+    bill of health with nothing in NOT ANALYSED."""
+    (repo / "a").mkdir()
+    (repo / "a" / "foo.py").write_text('A = "tool_execution"\n')
+    (repo / "foo.py").write_text('DECOY = "unrelated_name"\n')
+    (repo / "sib.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    _run(repo, "config", *config)
+    (repo / "a" / "foo.py").write_text('A = "subagent_dispatch"\n')
+
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    assert set(new_map) == {"a/foo.py"} and set(old_map) == {"a/foo.py"}, (new_map, old_map)
+    finding = _named(_findings(repo), "tool_execution")
+    assert [o.path for o in finding.unchanged] == ["sib.py"]
+    assert checker.main(["--strict"]) == 1
+
+
+# --------------------------------------------------------------------------
+# Round 17: the copy header; three guards whose tests did not discriminate.
+# --------------------------------------------------------------------------
+
+def test_a_copied_file_is_analysed_under_diff_renames_copies(repo: Path) -> None:
+    """``copy from``/``copy to`` is the same zero-hunk header shape as a pure
+    rename; unhandled, the copied file was absent from both maps and the gate
+    exited 0 on an edit the default config reports. Only the NEW side is
+    seeded: a copy leaves its source in place."""
+    (repo / "a.py").write_text('GAMMA = "gamma_marker"\nPAD = 1\n')
+    _commit(repo)
+    _run(repo, "config", "diff.renames", "copies")
+    (repo / "b.py").write_text('GAMMA = "gamma_marker"\nPAD = 1\n')  # byte copy of HEAD a.py
+    _run(repo, "add", "b.py")
+    (repo / "a.py").write_text('GAMMA = "gamma_marker"\nPAD = 9\n')
+
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    assert new_map.get("b.py") == {1, 2}, new_map
+    assert "b.py" not in old_map
+    finding = _named(_findings(repo), "gamma_marker")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("a.py", 1)]
+    assert checker.main(["--strict"]) == 1
+
+
+def test_an_unparseable_changed_file_no_scan_reaches_is_still_surfaced(repo: Path) -> None:
+    """collect's own parse guard, isolated: the sibling test's file is also a
+    grep candidate for its literal, so _tree_for's guard answered for it and
+    deleting collect's guard left every test green."""
+    (repo / "mod.py").write_text("X = 1\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def broken(\n")
+
+    assert _unparseable(repo) == ["mod.py"]
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_multiline_attribute_is_touched_on_the_line_its_name_is_on(repo: Path) -> None:
+    """``t\n.status`` spans two lines; the site is the name's line, and a
+    diff that edits only that line must count it as touched, not print it
+    under ``unchanged:``."""
+    (repo / "thing.py").write_text(
+        "class Thing:\n    @property\n    def status(self):\n        return 1\n"
+    )
+    (repo / "a.py").write_text(
+        "from thing import Thing\n\n\ndef f(t: Thing):\n    return (\n        t\n        .status\n    )\n"
+    )
+    (repo / "b.py").write_text("from thing import Thing\n\n\ndef g(t: Thing):\n    return t.status\n")
+    _commit(repo)
+    (repo / "thing.py").write_text(
+        "class Thing:\n    @property\n    def status(self):\n        return 2\n"
+    )
+    (repo / "a.py").write_text(
+        "from thing import Thing\n\n\ndef f(t: Thing):\n    return (\n        t\n        .status  # touched\n    )\n"
+    )
+
+    finding = _named(_findings(repo), "status")
+    assert ("a.py", 7) in {(o.path, o.line) for o in finding.changed}, finding
+    assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 5)]
+
+
+# --------------------------------------------------------------------------
+# Round 18: a rename or copy is wholly changed only when its entry has no
+# hunks; a copy's `---` header names the source and must not key the old map.
+# --------------------------------------------------------------------------
+
+def test_a_rename_with_edits_keeps_its_untouched_in_file_siblings(repo: Path) -> None:
+    """Seeding every line of a rename target marked the untouched sites inside
+    it as touched: 1 of 3 literals edited plus a `git mv` reported clean with
+    --strict green — the gate's motivating case answered backwards."""
+    (repo / "mod.py").write_text(
+        'A = "tool_execution"\nB = "tool_execution"\nC = "tool_execution"\n'
+        "PAD_1 = 1\nPAD_2 = 2\nPAD_3 = 3\nPAD_4 = 4\nPAD_5 = 5\n"
+    )
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+    (repo / "newmod.py").write_text(
+        'A = "subagent_dispatch"\nB = "tool_execution"\nC = "tool_execution"\n'
+        "PAD_1 = 1\nPAD_2 = 2\nPAD_3 = 3\nPAD_4 = 4\nPAD_5 = 5\n"
+    )
+
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    assert new_map == {"newmod.py": {1}} and old_map == {"mod.py": {1}}, (new_map, old_map)
+    assert checker._RENAMES == {"mod.py": "newmod.py"}
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("newmod.py", 2), ("newmod.py", 3)]
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_renamed_functions_untouched_callers_in_the_same_file_are_surfaced(repo: Path) -> None:
+    body = "def shared(x):\n    return x\n" + "".join(
+        f"\n\ndef c{i}():\n    return shared({i})\n" for i in range(3)
+    ) + "PAD = 1\nPAD2 = 2\nPAD3 = 3\n"
+    (repo / "mod.py").write_text(body)
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+    (repo / "newmod.py").write_text(body.replace("    return x\n", "    return x + 1\n", 1))
+
+    finding = _named(_findings(repo), "shared")
+    assert {o.path for o in finding.unchanged} == {"newmod.py"}
+    assert len(finding.unchanged) == 3
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_copy_with_edits_records_no_removals_from_its_source(repo: Path) -> None:
+    """A copy entry's `---` header names the SOURCE, and its hunk lines were
+    recorded as removals from it: a.py:1 counted as modified and listed as
+    unchanged in one report, 6 sites claimed where 5 exist."""
+    (repo / "a.py").write_text(
+        'A = "tool_execution"\nB = "tool_execution"\nC = "tool_execution"\nPAD = 1\n'
+    )
+    (repo / "zz.py").write_text('Z = "tool_execution"\n')
+    _commit(repo)
+    _run(repo, "config", "diff.renames", "copies")
+    (repo / "b.py").write_text(
+        'A = "subagent_dispatch"\nB = "tool_execution"\nC = "tool_execution"\nPAD = 1\n'
+    )
+    _run(repo, "add", "b.py")
+    (repo / "a.py").write_text(
+        'A = "tool_execution"\nB = "tool_execution"\nC = "tool_execution"\nPAD = 9\n'
+    )
+
+    # A file sorting AFTER the copy target in git's entry order: the per-entry
+    # `is_copy` reset is what lets its `---` header key the old map again.
+    (repo / "zz.py").write_text('Z = "subagent_dispatch"\n')
+
+    new_map, old_map = changed = checker.changed_line_map(["HEAD"])
+    assert old_map == {"a.py": {4}, "zz.py": {1}}, changed
+    assert new_map.get("b.py") == {1} and new_map.get("a.py") == {4}, changed
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.changed] == [("zz.py", 1)], finding
+
+
+# --------------------------------------------------------------------------
+# Round 19: a rename is a module-path change. Its old path strands every
+# external reference, edits or not; sites that moved with the file are not
+# stranded; counts across the rename reconcile through it.
+# --------------------------------------------------------------------------
+
+def test_a_rename_with_edits_still_surfaces_every_stranded_importer(repo: Path) -> None:
+    """Gating the old-side treatment on 'no hunks' made `git mv` plus any edit
+    drop every stranded importer: user.py raised ImportError and --strict was
+    green, while git's own delete+add fallback surfaced both names."""
+    (repo / "mod.py").write_text(
+        "TIMEOUT = 30\n\n\ndef public_api(y):\n    return y\n\n\nclass Worker:\n    pass\n"
+    )
+    (repo / "user.py").write_text(
+        "from mod import public_api, Worker\n\n\ndef f():\n    return public_api(1), Worker()\n"
+    )
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+    (repo / "newmod.py").write_text(
+        "TIMEOUT = 60\n\n\ndef public_api(y):\n    return y\n\n\nclass Worker:\n    pass\n"
+    )
+
+    findings = _findings(repo)
+    for name in ("public_api", "Worker"):
+        finding = _named(findings, name)
+        assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 1), ("user.py", 5)}, finding
+    assert checker.main(["--strict"]) == 1
+
+
+def test_sites_that_moved_with_a_renamed_file_are_not_stranded(repo: Path) -> None:
+    """A pure rename questions references bound to the OLD path, not the
+    callers inside the file that moved with their definition."""
+    body = "def shared(x):\n    return x\n" + "".join(
+        f"\n\ndef c{i}():\n    return shared({i})\n" for i in range(3)
+    )
+    (repo / "mod.py").write_text(body)
+    (repo / "user.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(9)\n")
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 1), ("user.py", 5)}, finding
+    # ...and nothing else in the renamed file is surfaced for it.
+    assert not [o for o in finding.unchanged if o.path == "newmod.py"]
+
+
+def test_counts_across_a_rename_reconcile_through_it(repo: Path) -> None:
+    """The old-side reconciliation matched touched sites by PATH; a rename
+    puts the two sides on different paths, so every old site was appended a
+    second time: 'modified 2 of 4' for 3 callers with 1 edited."""
+    body = "def shared(x):\n    return x\n" + "".join(
+        f"\n\ndef c{i}():\n    return shared({i})\n" for i in range(3)
+    )
+    (repo / "mod.py").write_text(body)
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+    (repo / "newmod.py").write_text(
+        body.replace("    return x\n", "    return x + 1\n", 1).replace("shared(1)", "shared(11)")
+    )
+
+    finding = _named(_findings(repo), "shared")
+    assert len(finding.changed) == 1 and len(finding.unchanged) == 2, finding
+    assert "modified 1 of 3 call sites" in checker.render([finding])
+
+
+# --------------------------------------------------------------------------
+# Round 20: the module's own name is a stranded reference too; the literal
+# reconciliation, the copy target's read guard and the method filter get the
+# tests that discriminate them.
+# --------------------------------------------------------------------------
+
+def test_a_pure_rename_surfaces_bare_imports_of_the_module(repo: Path) -> None:
+    """``import mod`` and ``mod.TIMEOUT`` are bound to the module PATH, not to
+    any definition in it; a constants-only module has no definition at all.
+    Both read clean while user.py raised ModuleNotFoundError."""
+    (repo / "mod.py").write_text("TIMEOUT = 30\n")
+    (repo / "user.py").write_text("import mod\n\n\ndef f():\n    return mod.TIMEOUT\n")
+    (repo / "pkguser.py").write_text("from pkg import mod\n")
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+
+    finding = _named(_findings(repo), "mod")
+    assert {(o.path, o.line) for o in finding.unchanged} >= {("user.py", 1), ("user.py", 5), ("pkguser.py", 1)}, finding
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_pure_rename_of_a_class_only_module_surfaces_no_method(repo: Path) -> None:
+    """A method moves with its class, and attribute access does not depend on
+    the module path — reporting ``q.dispatch(1)`` for it is the noise the
+    docstring says trains suppression."""
+    (repo / "mod.py").write_text("class Queue:\n    def dispatch(self, x):\n        return x\n")
+    (repo / "user.py").write_text("from mod import Queue\n\nq = Queue()\nq.dispatch(1)\n")
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+
+    findings = _findings(repo)
+    assert "dispatch" not in {f.name for f in findings}, findings
+    assert {(o.path, o.line) for o in _named(findings, "Queue").unchanged} == {("user.py", 1), ("user.py", 3)}
+
+
+def test_literal_counts_across_a_rename_reconcile_through_it(repo: Path) -> None:
+    """The literal twin of the symbol reconciliation: reverting it to a path
+    match counted the old blob's sites a second time — 'modified 3 of 4' for
+    three occurrences with two edited."""
+    (repo / "mod.py").write_text(
+        'A = "tool_execution"\nB = ["tool_execution", 1]\n' + "".join(f"PAD{i} = {i}\n" for i in range(6))
+    )
+    (repo / "far.py").write_text('D = "tool_execution"\n')
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+    (repo / "newmod.py").write_text(
+        'A = "subagent_dispatch"\nB = ["tool_execution", 2]\n' + "".join(f"PAD{i} = {i}\n" for i in range(6))
+    )
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert len(finding.changed) == 2 and [(o.path, o.line) for o in finding.unchanged] == [("far.py", 1)], finding
+    assert "modified 2 of 3 occurrences" in checker.render([finding])
+
+
+def test_a_copied_file_that_cannot_be_read_is_not_analysed(repo: Path) -> None:
+    """The copy target is the one remaining whole-file seed; a target the gate
+    cannot read must land in NOT ANALYSED under its own path."""
+    latin1 = b'# caf\xe9\nA = "tool_execution"\nPAD = 1\n'
+    (repo / "a.py").write_bytes(latin1)
+    _commit(repo)
+    _run(repo, "config", "diff.renames", "copies")
+    (repo / "b.py").write_bytes(latin1)  # a byte copy: no hunks, so the seed is the only reader
+    _run(repo, "add", "b.py")
+    (repo / "a.py").write_bytes(latin1.replace(b"PAD = 1", b"PAD = 9"))
+
+    new_map, _ = checker.changed_line_map(["HEAD"])
+    assert "b.py" not in new_map and "b.py" in checker._UNANALYSED
+    assert "b.py" in _unparseable(repo)
+    assert checker.main(["--strict"]) == 1
+
+
+# --------------------------------------------------------------------------
+# Round 21: a deleted module strands the same references a renamed one does;
+# an empty module is a module; one rule turns a path into an import name.
+# --------------------------------------------------------------------------
+
+def test_a_deleted_module_surfaces_its_stranded_importers(repo: Path) -> None:
+    """`git rm mod.py` reported clean while `git mv mod.py newmod.py` reported
+    three stranded sites for the same importers — and git's own delete+add
+    fallback past diff.renameLimit IS the deletion shape."""
+    (repo / "mod.py").write_text("TIMEOUT = 30\n\n\ndef helper():\n    return 1\n")
+    (repo / "user.py").write_text("import mod\n\n\ndef f():\n    return mod.TIMEOUT, mod.helper()\n")
+    (repo / "bare.py").write_text("import mod\n")
+    _commit(repo)
+    _run(repo, "rm", "-q", "mod.py")
+
+    finding = _named(_findings(repo), "mod")
+    assert {(o.path, o.line) for o in finding.unchanged} >= {("user.py", 1), ("user.py", 5), ("bare.py", 1)}, finding
+    assert checker.main(["--strict"]) == 1
+
+
+def test_an_empty_module_renamed_is_analysed_not_withheld(repo: Path) -> None:
+    """An empty blob parses; conflating it with an unparseable one put a
+    package rename's `__init__.py` in NOT ANALYSED and withheld the answerable
+    sites. `__init__.py` is usually empty, so this was every package rename."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "user.py").write_text("import pkg\n\n\ndef f():\n    return pkg\n")
+    _commit(repo)
+    _run(repo, "mv", "pkg", "pkg2")
+
+    assert _unparseable(repo) == []
+    finding = _named(_findings(repo), "pkg")
+    assert {(o.path, o.line) for o in finding.unchanged} >= {("user.py", 1), ("user.py", 5)}, finding
+
+
+def test_a_package_rename_surfaces_the_package_name_not_init(repo: Path) -> None:
+    """The `__init__.py` -> package rule lived twice; the rename copy had no
+    test, so registering `__init__` instead of `pkg` left the suite green."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("VERSION = 1\n")
+    (repo / "user.py").write_text("import pkg\n\n\ndef f():\n    return pkg.VERSION\n")
+    _commit(repo)
+    _run(repo, "mv", "pkg", "pkg2")
+
+    names = {f.name for f in _findings(repo)}
+    assert "pkg" in names and "__init__" not in names, names
+    assert checker._module_name("pkg/__init__.py") == "pkg"
+    assert checker._module_name("a/b/mod.py") == "mod"
+
+
+# --------------------------------------------------------------------------
+# Round 22: an empty file's deletion has no header; `from pkg.mod import X`
+# is a module binding; the deleted-package name rule gets its test.
+# --------------------------------------------------------------------------
+
+def test_deleting_a_package_with_an_empty_init_surfaces_the_package(repo: Path) -> None:
+    """Git emits no ---/+++ and no hunk for an empty file's deletion, only
+    `deleted file mode`, so `_DELETED` read off the header never saw it: a
+    package removal reported only the sibling module while `import pkg`
+    raised ModuleNotFoundError — and its rename twin reported both."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "pkg" / "other.py").write_text("X = 1\n")
+    (repo / "user.py").write_text("import pkg\nfrom pkg import other\n\n\ndef f():\n    return pkg, other\n")
+    _commit(repo)
+    _run(repo, "rm", "-rq", "pkg")
+
+    names = {f.name for f in _findings(repo)}
+    assert {"pkg", "other"} <= names and "__init__" not in names, names
+    finding = _named(_findings(repo), "pkg")
+    assert ("user.py", 1) in {(o.path, o.line) for o in finding.unchanged}, finding
+    # A deletion that is the ONLY change is still a change.
+    assert checker.main(["--strict"]) == 1
+
+
+def test_from_dotted_module_import_is_a_binding_of_the_module(repo: Path) -> None:
+    """`from pkg.mod import TIMEOUT` is bound to mod's path exactly as
+    `import pkg.mod` is; a constants-only module has no definition name to
+    carry the binding, and both its rename and its deletion read clean."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "pkg" / "mod.py").write_text("TIMEOUT = 30\n")
+    (repo / "user.py").write_text("from pkg.mod import TIMEOUT\n")
+    _commit(repo)
+    _run(repo, "mv", "pkg/mod.py", "pkg/mod2.py")
+    finding = _named(_findings(repo), "mod")
+    assert ("user.py", 1) in {(o.path, o.line) for o in finding.unchanged}, finding
+
+    _run(repo, "checkout", "-q", "--", ".")
+    _run(repo, "reset", "-q", "--hard", "HEAD")
+    _run(repo, "rm", "-q", "pkg/mod.py")
+    finding = _named(_findings(repo), "mod")
+    assert ("user.py", 1) in {(o.path, o.line) for o in finding.unchanged}, finding
+
+
+def test_deleting_only_an_empty_module_is_still_a_change(repo: Path) -> None:
+    """With no hunk and no header, both line maps are empty; the early exit
+    'no changed lines to analyse' read that as clean while `import pkg` was
+    broken. The deletion set is a change in its own right."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "user.py").write_text("import pkg\n")
+    _commit(repo)
+    _run(repo, "rm", "-rq", "pkg")
+
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    assert new_map == {} and old_map == {} and checker._DELETED == {"pkg/__init__.py"}
+    assert checker.main(["--strict"]) == 1
+
+
+# --------------------------------------------------------------------------
+# Round 23: module identity is not symbol identity; the copy boundary flush.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("change", ["rename", "delete"])
+def test_a_module_whose_stem_matches_an_edited_symbol_still_surfaces_its_importers(
+    repo: Path, change: str
+) -> None:
+    """`symbols` is keyed by bare name: a `def dispatcher()` edited in a test
+    module blocked `dispatcher.py`'s registration as a module, the surviving
+    entry answered the import question about the OTHER file, and the
+    consumer bound to the module path read clean. 24 module stems in this
+    repo are also a def/class name in another file."""
+    (repo / "dispatcher.py").write_text("DEFAULT_TIMEOUT = 30\n")
+    (repo / "consumer.py").write_text("from dispatcher import DEFAULT_TIMEOUT\n")
+    (repo / "test_x.py").write_text("def dispatcher():\n    return 1\n")
+    _commit(repo)
+    if change == "rename":
+        _run(repo, "mv", "dispatcher.py", "dispatch.py")
+    else:
+        _run(repo, "rm", "-q", "dispatcher.py")
+    (repo / "test_x.py").write_text("def dispatcher():\n    return 2\n")  # the colliding edit
+
+    finding = _named(_findings(repo), "dispatcher")
+    assert ("consumer.py", 1) in {(o.path, o.line) for o in finding.unchanged}, finding
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_pure_copy_is_seeded_when_a_later_entry_follows_it(repo: Path) -> None:
+    """Every earlier copy fixture put the copy target last, so the end-of-loop
+    flush answered for the entry-boundary one; without the boundary flush a
+    later entry's hunks leave `in_hunk` set and the copy is seeded nowhere."""
+    (repo / "a.py").write_text('GAMMA = "gamma_marker"\nPAD = 1\n')
+    (repo / "zz.py").write_text("Z = 1\n")
+    _commit(repo)
+    _run(repo, "config", "diff.renames", "copies")
+    (repo / "b.py").write_text('GAMMA = "gamma_marker"\nPAD = 1\n')  # byte copy of HEAD a.py
+    _run(repo, "add", "b.py")
+    (repo / "a.py").write_text('GAMMA = "gamma_marker"\nPAD = 9\n')
+    (repo / "zz.py").write_text("Z = 2\n")  # sorts after b.py: its hunk follows the copy entry
+
+    new_map, _ = checker.changed_line_map(["HEAD"])
+    assert new_map.get("b.py") == {1, 2}, new_map
+    finding = _named(_findings(repo), "gamma_marker")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("a.py", 1)]
+
+
+# --------------------------------------------------------------------------
+# Round 24: a module name is repo-wide whatever the symbol table holds; a
+# literal the detector could not find is a report, not a silent clean.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("change", ["rename", "delete"])
+def test_a_private_module_colliding_with_a_private_function_keeps_repo_wide_scope(
+    repo: Path, change: str
+) -> None:
+    """`scope_for` read the colliding symbol's kind and paths: a module-level
+    `def _helpers()` edited elsewhere scoped the renamed `_helpers.py` to the
+    OTHER file's importers, and `import pkg._helpers` was intersected away."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "pkg" / "_helpers.py").write_text("TIMEOUT = 30\n")
+    (repo / "consumer.py").write_text("import pkg._helpers\n\n\ndef f():\n    return pkg._helpers.TIMEOUT\n")
+    (repo / "other.py").write_text("def _helpers():\n    return 1\n")
+    _commit(repo)
+    if change == "rename":
+        _run(repo, "mv", "pkg/_helpers.py", "pkg/_util.py")
+    else:
+        _run(repo, "rm", "-q", "pkg/_helpers.py")
+    (repo / "other.py").write_text("def _helpers():\n    return 2\n")
+
+    finding = _named(_findings(repo), "_helpers")
+    assert {("consumer.py", 1), ("consumer.py", 5)} <= {(o.path, o.line) for o in finding.unchanged}, finding
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_literal_the_detector_cannot_find_is_reported_not_dropped(repo: Path) -> None:
+    """A pure addition spelled by implicit concatenation, below the widened-run
+    threshold, is in neither the candidate files nor the old side, so
+    `touched` is empty; `touched and untouched` then dropped the finding and
+    two untouched siblings read clean."""
+    (repo / "a.py").write_text("A = 1\n")
+    (repo / "b.py").write_text('Z = "auto_allow"\n')
+    (repo / "c.py").write_text('W = "auto_allow"\n')
+    _commit(repo)
+    (repo / "a.py").write_text('A = 1\nX = "auto_" "allow"\n')
+
+    finding = _named(_findings(repo), "auto_allow")
+    assert finding.changed == [] and {o.path for o in finding.unchanged} == {"b.py", "c.py"}, finding
+    assert "modified 0 of 2 occurrences" in checker.render([finding])
+    assert checker.main(["--strict"]) == 1

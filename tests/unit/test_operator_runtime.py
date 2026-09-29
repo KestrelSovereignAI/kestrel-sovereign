@@ -254,6 +254,101 @@ def test_teardown_requires_exact_set_registration_and_implementation_identity() 
         registry.unregister(active)
 
 
+def test_quarantine_removes_exact_survivors_from_a_drifted_set() -> None:
+    registry = _registry()
+    service = _service("owner", "1.0.0", object())
+    workflow = WorkflowRegistration("owner", "workflow", lambda: None)
+    active = registry.register(
+        "owner",
+        services=(service,),
+        workflows=(workflow,),
+    )
+    del registry._services[service.reference]
+
+    assert registry.quarantine_registration_set(active) is True
+    assert registry.resolve_service(service.reference) is None
+    assert registry.resolve_workflow_actor(workflow.name) is None
+    assert registry.quarantine_registration_set(active) is False
+
+
+def test_quarantine_preserves_foreign_operator_replacements() -> None:
+    registry = _registry()
+    service = _service("owner", "1.0.0", object())
+    workflow = WorkflowRegistration("owner", "workflow", lambda: None)
+    active = registry.register(
+        "owner",
+        services=(service,),
+        workflows=(workflow,),
+    )
+    foreign_actor = lambda: "foreign"
+    registry._workflows[workflow.name] = WorkflowRegistration(
+        "foreign-owner", workflow.name, foreign_actor
+    )
+
+    assert registry.quarantine_registration_set(active) is True
+    assert registry.resolve_service(service.reference) is None
+    assert registry.resolve_workflow_actor(workflow.name) is foreign_actor
+
+
+def test_quarantine_removes_exact_survivors_when_set_ledger_is_missing() -> None:
+    registry = _registry()
+    service = _service("owner", "1.0.0", object())
+    workflow = WorkflowRegistration("owner", "workflow", lambda: None)
+    active = registry.register(
+        "owner",
+        services=(service,),
+        workflows=(workflow,),
+    )
+    del registry._active_sets[id(active)]
+
+    assert registry.quarantine_registration_set(active) is True
+    assert registry.resolve_service(service.reference) is None
+    assert registry.resolve_workflow_actor(workflow.name) is None
+    assert registry.quarantine_registration_set(active) is False
+
+
+def test_quarantine_rejects_forged_set_wrapping_public_registration() -> None:
+    registry = _registry()
+    workflow = WorkflowRegistration("victim", "workflow", lambda: None)
+    active = registry.register("victim", workflows=(workflow,))
+    public = registry.get_workflow_registration(workflow.name)
+    assert public is workflow
+    forged = OperatorRegistrationSet(owner="victim", workflows=(public,))
+
+    assert registry.quarantine_registration_set(forged) is False
+    assert registry.resolve_workflow_actor(workflow.name) is workflow.actor
+    registry.unregister(active)
+
+
+def test_quarantine_rejects_another_issued_sets_copied_seal() -> None:
+    registry = _registry()
+    attacker_workflow = WorkflowRegistration(
+        "attacker", "attacker-workflow", lambda: "attacker"
+    )
+    victim_workflow = WorkflowRegistration(
+        "victim", "victim-workflow", lambda: "victim"
+    )
+    attacker = registry.register("attacker", workflows=(attacker_workflow,))
+    victim = registry.register("victim", workflows=(victim_workflow,))
+    public_victim = registry.get_workflow_registration(victim_workflow.name)
+    assert public_victim is victim_workflow
+    forged = OperatorRegistrationSet(
+        owner="victim",
+        workflows=(public_victim,),
+    )
+    object.__setattr__(forged, "_registry_seal", attacker._registry_seal)
+
+    assert registry.quarantine_registration_set(forged) is False
+    assert registry.resolve_workflow_actor(victim_workflow.name) is (
+        victim_workflow.actor
+    )
+    assert registry.resolve_workflow_actor(attacker_workflow.name) is (
+        attacker_workflow.actor
+    )
+    registry.unregister(victim)
+    registry.unregister(attacker)
+
+
 def test_removing_middle_version_does_not_disturb_or_resurrect_other_sets() -> None:
     registry = _registry()
     first = _service("first", "1.0.0", object())

@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import toml
 
 from kestrel_sovereign.multi_agent.config import (
@@ -200,6 +201,26 @@ def test_create_agent_respects_explicit_port(tmp_path):
             port=9999,
         )
     assert result.port == 9999
+
+
+def test_create_agent_rejects_host_custody_name_before_inception(
+    tmp_path, monkeypatch
+):
+    """Setup cannot provision an agent over the derived host-data directory."""
+    monkeypatch.setenv("KESTREL_DB_PATH", "./agent_data")
+    monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+
+    with patch(
+        "kestrel_sovereign.inception_service.create_kestrel_identity_async"
+    ) as mock_inc, pytest.raises(ValueError, match="overlaps host Hold custody"):
+        agent.create_agent(
+            name="host-data",
+            project_dir=tmp_path,
+            agent_data_root=tmp_path / "agent_data",
+        )
+
+    mock_inc.assert_not_called()
+    assert not (tmp_path / "agent_data" / "host-data").exists()
 
 
 # --- --test plumbing: wizard surfaces is_test_instance to inception ----------

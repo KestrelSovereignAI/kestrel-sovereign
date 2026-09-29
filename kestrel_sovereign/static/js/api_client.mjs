@@ -10,7 +10,8 @@
  * Auth is delegated to an `authProvider` so a host can supply its own
  * (e.g. a JWT it minted) without modifying Kestrel. The default provider
  * preserves the standalone Kestrel-server behavior: try /api/auth/key,
- * fall back to /auth/me, redirect to /auth/login if both fail.
+ * fall back to /auth/me, then offer local password-style API-key entry before
+ * redirecting to /auth/login.
  */
 
 const HOST_LEVEL_AGENTS_RE = /^\/api\/agents\/[^/]+\/(start|stop|status|logs)/;
@@ -326,16 +327,147 @@ export function buildHostUrl(endpoint) {
     return endpoint;
 }
 
+export function requestApiKeyFromOperator({ documentRef = globalThis.document } = {}) {
+    const root = documentRef?.body || documentRef?.documentElement;
+    if (!root || typeof documentRef?.createElement !== 'function') {
+        return Promise.resolve(null);
+    }
+
+    return new Promise((resolve) => {
+        const overlay = documentRef.createElement('div');
+        overlay.id = 'kestrel-api-key-entry';
+        overlay.setAttribute('role', 'presentation');
+        Object.assign(overlay.style, {
+            position: 'fixed',
+            inset: '0',
+            zIndex: '2147483647',
+            display: 'grid',
+            placeItems: 'center',
+            padding: '1.5rem',
+            background: 'rgba(4, 8, 18, 0.82)',
+        });
+
+        const dialog = documentRef.createElement('section');
+        dialog.setAttribute('role', 'dialog');
+        dialog.setAttribute('aria-modal', 'true');
+        dialog.setAttribute('aria-labelledby', 'kestrel-api-key-entry-title');
+        Object.assign(dialog.style, {
+            width: 'min(32rem, 100%)',
+            padding: '1.5rem',
+            border: '1px solid rgba(148, 163, 184, 0.35)',
+            borderRadius: '0.9rem',
+            color: '#e2e8f0',
+            background: '#111827',
+            boxShadow: '0 24px 80px rgba(0, 0, 0, 0.55)',
+        });
+
+        const title = documentRef.createElement('h1');
+        title.id = 'kestrel-api-key-entry-title';
+        title.textContent = 'Unlock the Sovereign Console';
+        Object.assign(title.style, { margin: '0 0 0.75rem', fontSize: '1.35rem' });
+
+        const explanation = documentRef.createElement('p');
+        explanation.textContent = (
+            'Enter the KESTREL_API_KEY stored in this Kestrel project’s .env file. '
+            + 'The key stays in this browser tab and is never placed in the URL.'
+        );
+        Object.assign(explanation.style, {
+            margin: '0 0 1rem',
+            color: '#cbd5e1',
+            lineHeight: '1.5',
+        });
+
+        const form = documentRef.createElement('form');
+        Object.assign(form.style, { display: 'grid', gap: '0.75rem' });
+
+        const label = documentRef.createElement('label');
+        label.setAttribute('for', 'kestrel-api-key-input');
+        label.textContent = 'Sovereign API key';
+
+        const input = documentRef.createElement('input');
+        input.id = 'kestrel-api-key-input';
+        input.name = 'kestrel_api_key';
+        input.type = 'password';
+        input.autocomplete = 'off';
+        input.spellcheck = false;
+        input.required = true;
+        Object.assign(input.style, {
+            width: '100%',
+            boxSizing: 'border-box',
+            padding: '0.7rem 0.8rem',
+            border: '1px solid #475569',
+            borderRadius: '0.5rem',
+            color: '#f8fafc',
+            background: '#0f172a',
+        });
+
+        const error = documentRef.createElement('p');
+        error.setAttribute('role', 'alert');
+        error.textContent = 'Enter a non-empty KESTREL_API_KEY.';
+        error.hidden = true;
+        Object.assign(error.style, { margin: '0', color: '#fca5a5' });
+
+        const actions = documentRef.createElement('div');
+        Object.assign(actions.style, {
+            display: 'flex',
+            alignItems: 'center',
+            gap: '1rem',
+            flexWrap: 'wrap',
+        });
+
+        const submit = documentRef.createElement('button');
+        submit.type = 'submit';
+        submit.textContent = 'Unlock';
+        Object.assign(submit.style, {
+            padding: '0.65rem 1rem',
+            border: '0',
+            borderRadius: '0.5rem',
+            color: '#020617',
+            background: '#67e8f9',
+            cursor: 'pointer',
+            fontWeight: '700',
+        });
+
+        const oauth = documentRef.createElement('a');
+        oauth.href = '/auth/login';
+        oauth.textContent = 'Sign in with OAuth instead';
+        Object.assign(oauth.style, { color: '#93c5fd' });
+
+        actions.append(submit, oauth);
+        form.append(label, input, error, actions);
+        dialog.append(title, explanation, form);
+        overlay.append(dialog);
+        root.append(overlay);
+
+        form.addEventListener('submit', (event) => {
+            event.preventDefault();
+            const value = typeof input.value === 'string' ? input.value : '';
+            if (!value.trim()) {
+                error.hidden = false;
+                input.focus();
+                return;
+            }
+            overlay.remove();
+            resolve(value);
+        });
+        input.focus();
+    });
+}
+
 export function createKestrelStandaloneAuthProvider({
     fetchFn,
     sessionStorage,
     location,
+    history,
     logger,
+    requestApiKey = requestApiKeyFromOperator,
 } = {}) {
     const fetchImpl = getRequiredDependency('fetch', fetchFn);
     const sessionStore = getRequiredDependency('sessionStorage', sessionStorage);
     const locationRef = getRequiredDependency('location', location);
+    const historyRef = history || null;
     const log = getRequiredDependency('console', logger);
+    const requestApiKeyFn = typeof requestApiKey === 'function' ? requestApiKey : null;
 
     let apiKey = null;
     let oauthSession = false;
@@ -362,13 +494,35 @@ export function createKestrelStandaloneAuthProvider({
         }
     }
 
+    async function acceptExplicitApiKey() {
+        if (!requestApiKeyFn) return false;
+        const entered = await requestApiKeyFn();
+        if (typeof entered !== 'string' || !entered.trim()) return false;
+        apiKey = entered;
+        sessionStore.setItem('kestrel_api_key', apiKey);
+        log.log('API key accepted from explicit operator entry');
+        return true;
+    }
+
     return {
         async ensureAuthenticated() {
             const params = new URLSearchParams(locationRef.search || '');
-            if (params.get('key')) {
-                apiKey = params.get('key');
+            const fragmentParams = new URLSearchParams(
+                String(locationRef.hash || '').replace(/^#/, ''),
+            );
+            const fragmentKey = fragmentParams.get('key');
+            const suppliedKey = fragmentKey || params.get('key');
+            if (suppliedKey) {
+                apiKey = suppliedKey;
                 sessionStore.setItem('kestrel_api_key', apiKey);
-                log.log('API key set from URL parameter');
+                if (fragmentKey && typeof historyRef?.replaceState === 'function') {
+                    // The fragment never crosses the HTTP boundary. Remove it
+                    // after capture so the credential also leaves the visible
+                    // address bar/browser-history entry immediately.
+                    const cleanUrl = `${locationRef.pathname || '/'}${locationRef.search || ''}`;
+                    historyRef.replaceState(historyRef.state ?? null, '', cleanUrl);
+                }
+                log.log('API key set from browser handoff');
                 return;
             }
 
@@ -399,9 +553,13 @@ export function createKestrelStandaloneAuthProvider({
                 // OAuth session check failed; fall through to redirect/no-auth.
             }
 
+            if (bootstrapDisabled && await acceptExplicitApiKey()) {
+                return;
+            }
+
             if (!apiKey && !oauthSession) {
                 if (bootstrapDisabled) {
-                    log.warn('OAuth required — redirecting to login');
+                    log.warn('Authentication required — redirecting to login');
                     locationRef.href = '/auth/login';
                 } else {
                     log.warn('No authentication available');
@@ -424,6 +582,10 @@ export function createKestrelStandaloneAuthProvider({
             const status = await bootstrapApiKey();
             if (status === 'ok') {
                 log.log('API key refreshed - retrying request');
+                return 'refreshed';
+            }
+
+            if (status === 'disabled' && await acceptExplicitApiKey()) {
                 return 'refreshed';
             }
 
@@ -553,7 +715,9 @@ export function createApiClient({
     fetchFn = globalThis.fetch,
     sessionStorage = globalThis.sessionStorage,
     location = globalThis.location,
+    history = globalThis.history,
     logger = globalThis.console,
+    requestApiKey = requestApiKeyFromOperator,
     AbortControllerCtor = globalThis.AbortController,
     TextDecoderCtor = globalThis.TextDecoder,
     authProvider = null,
@@ -571,7 +735,9 @@ export function createApiClient({
         fetchFn: fetchImpl,
         sessionStorage: sessionStore,
         location: locationRef,
+        history,
         logger: log,
+        requestApiKey,
     });
 
     // Capabilities (#879, #2041).  ``capabilities`` carries host overrides
@@ -1037,6 +1203,10 @@ export function createApiClient({
         importSovereignty: (cid) => client.request('/api/sovereignty/import', { method: 'POST', body: JSON.stringify({ cid }) }),
         getSovereigntyFiles: () => client.request('/api/sovereignty/files'),
         getSovereigntyFilePreview: (filename) => client.request(`/api/sovereignty/files/${encodeURIComponent(filename)}/preview`),
+        // The download is a plain <a href>, not a request(): it must be routed
+        // to the selected host agent the same way the listing and preview are,
+        // or a multi-agent host answers 503 for an unrouted file (#3225).
+        sovereigntyFileUrl: (filename) => applyHostAgentPrefix(`/api/sovereignty/files/${encodeURIComponent(filename)}`, state.selectedHostAgent),
         // `cursor` continues a previous page; the response's `next_cursor` is
         // the token for the one after it, and null at the end of the list
         // (#2960). Opaque — it encodes the server's ordering keys, which is not
@@ -1148,6 +1318,8 @@ export function createApiClient({
             return client.requestForAgent(url, {}, agent);
         },
         getIpfsStatus: () => client.request('/api/ipfs/status'),
+        // Host view of the daemon (identity, version, every pin): sovereign only (#3226).
+        getIpfsNode: () => client.request('/api/ipfs/node'),
         getWallet: () => client.request('/api/wallet'),
         invoke: async (input, model = null, sessionId = null, provider = null) => {
             // Capture dispatchAgent BEFORE the await so the session_id
@@ -1207,23 +1379,13 @@ export function createApiClient({
             if (clientRequestId !== null) {
                 state.currentStreamRequestIds.set(dispatchAgent, clientRequestId);
             }
-            try {
-                const result = agent !== undefined
-                    ? await client.requestForAgent('/api/agent/invoke', opts, agent)
-                    : await client.request('/api/agent/invoke', opts);
-                if (result && typeof result === 'object' && result.session_id) {
-                    state.effectiveSessionIds.set(dispatchAgent, result.session_id);
-                }
-                return result;
-            } finally {
-                if (
-                    clientRequestId !== null
-                    && state.currentStreamRequestIds.get(dispatchAgent)
-                        === clientRequestId
-                ) {
-                    state.currentStreamRequestIds.delete(dispatchAgent);
-                }
+            const result = agent !== undefined
+                ? await client.requestForAgent('/api/agent/invoke', opts, agent)
+                : await client.request('/api/agent/invoke', opts);
+            if (result && typeof result === 'object' && result.session_id) {
+                state.effectiveSessionIds.set(dispatchAgent, result.session_id);
             }
+            return result;
         },
         // Two-arg overload: pass `agent` to target a specific agent's
         // /stop endpoint regardless of which agent is currently
@@ -1231,15 +1393,66 @@ export function createApiClient({
         // viewing Agent B would route the stop to B's backend (because
         // request() pins to state.selectedHostAgent), aborting client-
         // side but never telling A's server to halt.
-        stop: (requestId = null, agent) => {
+        stop: (requestId = null, agent, correlationId = null) => {
             const opts = {
                 method: 'POST',
-                body: JSON.stringify(requestId ? { request_id: requestId } : {}),
+                body: JSON.stringify({
+                    ...(requestId ? { request_id: requestId } : {}),
+                    ...(correlationId ? { correlation_id: correlationId } : {}),
+                }),
             };
             return agent !== undefined
                 ? client.requestForAgent('/api/agent/stop', opts, agent)
                 : client.request('/api/agent/stop', opts);
         },
+        // Fleet cooperative Stop is a host control-plane operation. It must
+        // never inherit the currently selected agent prefix and it never calls
+        // the process lifecycle API; the host resolves the live targets and
+        // returns one typed outcome for each of them (#3155).
+        stopHost: (payload = {}) => client.requestHost('/api/host/stop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload || {}),
+        }),
+        // Read-only, caller-scoped inventory for the component-owned Stop All
+        // affordance. The server supplies both authority and the live host
+        // count; browser-local stream state is not a fleet inventory.
+        getHostStopStatus: () => client.requestHost('/api/host/stop/status', {
+            cache: 'no-store',
+        }),
+        // Sovereign-only read of the open peer Stop circuits (#3170). Its own
+        // door, not a rider on the Stop All status: an inventory failure must
+        // not hide an open circuit, nor an unreadable breaker the inventory.
+        getPeerStopCircuits: () => client.requestHost('/api/host/stop/circuit', {
+            cache: 'no-store',
+        }),
+        // Sovereign-only reset of one agent's peer Stop circuit breaker
+        // (#3170). Receipted server-side with the caller and reason; it never
+        // stops, holds, or releases anything.
+        resetPeerStopCircuit: (payload = {}) => client.requestHost('/api/host/stop/circuit/reset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload || {}),
+        }),
+        // Hold is durable STATE, so its door is separate from Stop's (#3164).
+        // The three calls below never cancel work and never take the selected
+        // agent prefix: the host owns the latch table and names every agent it
+        // can latch, so a card can only ever hold an agent this host hosts.
+        getHostHoldState: () => client.requestHost('/api/host/hold', {
+            cache: 'no-store',
+        }),
+        setHostHold: (payload = {}) => client.requestHost('/api/host/hold', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload || {}),
+        }),
+        // The release carries the receipt id of the latch the caller SAW, so a
+        // Resume cannot release a hold somebody else set in the meantime.
+        releaseHostHold: (payload = {}) => client.requestHost('/api/host/hold/release', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload || {}),
+        }),
         getModels: (options = {}) => {
             const params = new URLSearchParams();
             if (options.featuredOnly !== undefined) params.append('featured_only', options.featuredOnly);
@@ -1258,6 +1471,18 @@ export function createApiClient({
         getCurrentStreamRequestId(agent) {
             const key = agent === undefined ? state.selectedHostAgent : agent;
             return state.currentStreamRequestIds.get(key) || null;
+        },
+        completeCurrentStreamRequestId(agent, requestId) {
+            const key = agent === undefined ? state.selectedHostAgent : agent;
+            if (
+                requestId !== null
+                && requestId !== undefined
+                && state.currentStreamRequestIds.get(key) === String(requestId)
+            ) {
+                state.currentStreamRequestIds.delete(key);
+                return true;
+            }
+            return false;
         },
         // Effective session_id surfaced by the server's most recent
         // /stream or /invoke for this agent. Returns null until the
@@ -1448,13 +1673,11 @@ export function createApiClient({
                 if (state.streamAbortControllers.get(dispatchAgent) === controller) {
                     state.streamAbortControllers.delete(dispatchAgent);
                 }
-                if (
-                    activeRequestId !== null
-                    && state.currentStreamRequestIds.get(dispatchAgent)
-                        === activeRequestId
-                ) {
-                    state.currentStreamRequestIds.delete(dispatchAgent);
-                }
+                // The fetch/body can settle before the chat owner clears its
+                // busy state. Retain the exact turn address until that same UI
+                // owner finishes; Stop in this window must not widen to agent
+                // scope. ``completeCurrentStreamRequestId`` performs the
+                // owner-checked release.
             }
         },
         getApiKey() {

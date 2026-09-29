@@ -47,6 +47,10 @@ const api = createChatComponent({ deps, container: containerEl });
   and returns the API **without** mounting/initializing.
 - `config.deps` is an optional dependency override (api client, toast,
   markdown renderer, …); omit it to use the built-in singletons.
+- The returned API exposes `prepareHostStop(items)`, the synchronous
+  browser-work fence an embedder passes as the shared agent pane's
+  `onPrepareStopAll` callback. Without that explicit callback the agent pane
+  does not render or poll the host-level Stop All control.
 
 > Floating overlays (command-autocomplete, toasts) are intentionally appended
 > to `document.body` and positioned `fixed`, so they are not scoped to the

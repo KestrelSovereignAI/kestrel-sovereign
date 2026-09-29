@@ -48,14 +48,16 @@ SECURITY_FLOORS = {
 }
 
 # Private inference leases require the owner-scoped idle-renewal and absolute
-# lifetime-bound contracts, #2755 adds typed private host ingress, and 0.36
-# adds the public operator contribution contracts. This remains a Core-only
+# lifetime-bound contracts, #2755 adds typed private host ingress, 0.36 adds
+# the public operator contribution contracts, 0.37.1 adds lifecycle-owned
+# context-clause contributions, and 0.38.1 adds awaited preparation before
+# synchronous context rendering. This remains a Core-only
 # release gate: sibling packages are released from their own repositories, but
 # Core must never
 # silently lower its declared/locked line to accommodate an older Frinz or
 # observability constraint. Their compatible releases remain a documented
 # release-cascade prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.37.0"), ("<", "0.38")})
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.37.1"), ("<", "0.39")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
     "base": frozenset({"tracing"}),
     "observability": frozenset({"metrics", "tracing"}),
@@ -64,8 +66,8 @@ SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS = {
     # These are release prerequisites, not declarations about sibling repos'
     # current branches. Each downstream must publish/test this line before a
     # Core release can be cut.
-    "frinz": ">=0.37.0,<0.38",
-    "observability fleet": ">=0.37.0,<0.38",
+    "frinz": ">=0.37.1,<0.38",
+    "observability fleet": ">=0.37.1,<0.38",
 }
 
 def _pyproject() -> dict:
@@ -241,8 +243,8 @@ def _sdk_contract_requirement(raw_requirements, *, extras):
     return requirement
 
 
-def test_sdk_037_release_cascade_contract_is_declared():
-    """Core and its observability extra must declare the v0.37 SDK line.
+def test_sdk_037_038_release_cascade_contract_is_declared():
+    """Core and its observability extra must admit the v0.37-v0.38 SDK line.
 
     This deliberately does not inspect sibling worktrees: their compatible
     Frinz/observability releases are an external release prerequisite, while
@@ -250,14 +252,18 @@ def test_sdk_037_release_cascade_contract_is_declared():
     """
 
     pyproject = _pyproject()
-    _sdk_contract_requirement(
+    base = _sdk_contract_requirement(
         pyproject["project"]["dependencies"],
         extras=SDK_RELEASE_CASCADE_CONTRACTS["base"],
     )
-    _sdk_contract_requirement(
+    observability = _sdk_contract_requirement(
         pyproject["project"]["optional-dependencies"]["observability"],
         extras=SDK_RELEASE_CASCADE_CONTRACTS["observability"],
     )
+    for requirement in (base, observability):
+        assert Version("0.37.1") in requirement.specifier
+        assert Version("0.38.1") in requirement.specifier
+        assert Version("0.39.0") not in requirement.specifier
 
     # The human release contract identifies downstream gates without probing
     # their (possibly dirty or unavailable) repositories from Core CI.
@@ -267,8 +273,8 @@ def test_sdk_037_release_cascade_contract_is_declared():
         assert f"kestrel-sovereign-sdk{specifier}" in readme
 
 
-def test_sdk_037_release_cascade_contract_is_locked():
-    """The resolved lock must carry the same v0.37 line before Core ships."""
+def test_sdk_037_038_release_cascade_contract_is_locked():
+    """The lock must exercise the awaited preparation hook on the v0.38 line."""
 
     root = _locked_root_package(_lock())
     locked_contracts = {
@@ -281,11 +287,11 @@ def test_sdk_037_release_cascade_contract_is_locked():
         if requirement["name"] == "kestrel-sovereign-sdk"
     }
     assert locked_contracts == {
-        (SDK_RELEASE_CASCADE_CONTRACTS["base"], None, ">=0.37.0,<0.38"),
+        (SDK_RELEASE_CASCADE_CONTRACTS["base"], None, ">=0.37.1,<0.39"),
         (
             SDK_RELEASE_CASCADE_CONTRACTS["observability"],
             "extra == 'observability'",
-            ">=0.37.0,<0.38",
+            ">=0.37.1,<0.39",
         ),
     }
 
@@ -296,5 +302,5 @@ def test_sdk_037_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.37.0") <= version < Version("0.38.0") for version in sdk_versions
+        Version("0.38.1") <= version < Version("0.39.0") for version in sdk_versions
     )

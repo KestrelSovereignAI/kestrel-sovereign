@@ -138,19 +138,51 @@ async def run_bounded_subprocess(
         raise ValueError("reap_timeout must be positive")
 
     started = time.monotonic()
-    proc = await start_async_process(
-        argv,
-        cwd=cwd,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    deadline = started + timeout
+    launch = asyncio.create_task(
+        start_async_process(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        ),
+        name="bounded-subprocess-launch",
     )
+    try:
+        launched, _pending = await asyncio.wait({launch}, timeout=timeout)
+    except asyncio.CancelledError as cancellation:
+        launch.cancel()
+        outcome = await await_owned_task(launch, cancellation)
+        raise_owned_outcome(outcome, operation="cancelled subprocess launch")
+        raise AssertionError("cancelled launch unexpectedly returned")
+    if not launched:
+        # ``start_async_process`` owns the cancellation gap: cancelling it
+        # waits for an in-flight OS launch, then terminates/reaps any process
+        # that appeared. Only after that terminal acknowledgement may this
+        # bounded operation report its launch timeout.
+        launch.cancel()
+        outcome = await await_owned_task(launch)
+        if outcome.error is not None and not isinstance(
+            outcome.error, asyncio.CancelledError
+        ):
+            raise outcome.error
+        return BoundedProcessResult(
+            argv=argv,
+            returncode=-1,
+            stdout=b"",
+            stderr=b"",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            timed_out=True,
+        )
+    proc = launch.result()
     completion = asyncio.create_task(
         _collect_process(proc, max_output_bytes),
         name=f"subprocess-{proc.pid}-completion",
     )
+    remaining = max(deadline - time.monotonic(), 0.0)
     try:
-        done, _pending = await asyncio.wait({completion}, timeout=timeout)
+        done, _pending = await asyncio.wait({completion}, timeout=remaining)
     except asyncio.CancelledError as cancellation:
         cleanup = asyncio.create_task(
             _terminate_and_await(

@@ -60,6 +60,38 @@ class ModelDiscoveryMixin:
     then enriches them with catalog data (featured, hidden, display names).
     """
 
+    def _note_discovery_outcome(
+        self, vendor: str, error: Optional[BaseException]
+    ) -> None:
+        """Record that ``vendor``'s discovery raised, for the health surface.
+
+        Deliberately records ONLY an observed exception. Earlier revisions also
+        tried to infer failure from the RETURNED VALUE — an empty list, or a
+        catalog that looked reduced — and that cannot work: every adapter
+        handles its own errors differently. ``AnthropicAdapter`` swallows a 401
+        and returns ``[]``; ``VertexAIAdapter`` swallows and returns a
+        non-empty STALE disk catalog; the OpenAI-compatible helpers raise. Five
+        review rounds each found one more convention, because the return value
+        does not carry the fact being inferred.
+
+        So this records the one thing it actually observes. A vendor that
+        swallows its own error is invisible here, and that is stated rather
+        than papered over: fixing THAT needs an explicit outcome contract from
+        the adapters, which is a larger change than this one.
+
+        Nothing gates routing on this. It drives the ``model_discovery`` health
+        check, so a dead credential is visible instead of living only in a log
+        line — which is the operator-facing gap #3190 was filed for.
+        """
+        failures = getattr(self, "_discovery_failures", None)
+        if failures is None:
+            # Bare harness / partially-constructed instance — nothing to record.
+            return
+        if error is None:
+            failures.pop(vendor, None)
+        else:
+            failures[vendor] = f"{type(error).__name__}: {error}"[:300]
+
     async def discover_all_models(
         self,
         use_cache: bool = True,
@@ -153,17 +185,23 @@ class ModelDiscoveryMixin:
         # Discovery runs PER VENDOR, not per route. A vendor may have multiple
         # routes (anthropic:api + anthropic:plan); they share the catalog, so
         # we pick the first route per vendor whose adapter can list models.
+        discovery_vendors: List[str] = []
         discovery_tasks = []
         for vendor, route in self._select_discovery_routes():
+            discovery_vendors.append(vendor)
             discovery_tasks.append(
                 self._discover_for_vendor_route(vendor, route)
             )
 
         results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
 
-        for result in results:
-            if isinstance(result, Exception):
-                logger.warning(f"Vendor discovery failed: {result}")
+        # Zip vendors back onto results (#3190): ``gather`` returns a bare list,
+        # so the previous loop could neither name the failing vendor in its
+        # warning nor record the outcome against it.
+        for vendor, result in zip(discovery_vendors, results):
+            if isinstance(result, BaseException):
+                logger.warning("%s: vendor discovery failed: %s", vendor, result)
+                self._note_discovery_outcome(vendor, result)
             elif isinstance(result, list):
                 all_models.extend(result)
 
@@ -1517,11 +1555,57 @@ class ModelDiscoveryMixin:
             if vendor == "openai" and not base_url:
                 return await self._safe_list_models(vendor, adapter, client)
             if base_url and is_local:
-                return await self._discover_local_openai_compatible(vendor, route_cfg)
+                return await self._record_discovery(
+                    vendor, self._discover_local_openai_compatible(vendor, route_cfg)
+                )
             if base_url:
-                return await self._discover_openai_compatible_remote(vendor, route_cfg)
+                return await self._record_discovery(
+                    vendor, self._discover_openai_compatible_remote(vendor, route_cfg)
+                )
 
         return await self._safe_list_models(vendor, adapter, client)
+
+    async def _record_discovery(self, vendor: str, coro) -> List[ModelInfo]:
+        """Await an OpenAI-compatible discovery helper, recording its outcome.
+
+        These two paths bypass ``_safe_list_models`` entirely, so before #3190
+        they recorded nothing: an outage on ollama, llama_cpp, xAI, Groq or
+        RunPod stayed absent from health, and their collapsed catalogs could
+        still veto a pinned model. RunPod's ``/models`` was in fact 404ing on
+        the production host while this fix claimed to surface exactly that.
+
+        One recorder wrapping both call sites rather than an edit inside each
+        helper: the helpers raise on a real discovery error and return ``[]``
+        only for absent configuration, so failure and "not attempted" stay
+        distinguishable at a single place.
+        """
+        try:
+            models = await coro
+        except Exception as e:  # noqa: BLE001 - discovery must never break init
+            logger.warning("%s: model discovery failed: %s", vendor, e)
+            self._note_discovery_outcome(vendor, e)
+            return []
+        if models is None:
+            # NOT ATTEMPTED. Leave the record exactly as it was: do not clear a
+            # standing failure (#3190 r10 P2 — unsetting a key would otherwise
+            # turn health green having fetched nothing) and do not invent one.
+            logger.debug("%s: discovery not attempted", vendor)
+            return []
+
+        # A request completed. Clear any prior failure even if the catalog came
+        # back EMPTY — a fresh local server with no models loaded is a
+        # successful fetch, and leaving it degraded reports a stale auth error
+        # until the provider happens to expose a model (#3190 r11 P2).
+        #
+        # Rounds 10 and 11 are the same finding from opposite sides, and both
+        # were right: list length cannot distinguish "no request" from "a
+        # request that found nothing". That is the conflation this entire
+        # change is about, reached one final time in my own code. The fix is
+        # the thing the ticket concluded was needed — an explicit outcome —
+        # scoped to the two helpers where both ends are under my control:
+        # ``None`` means not attempted, a list means fetched.
+        self._note_discovery_outcome(vendor, None)
+        return models
 
     async def _safe_list_models(self, vendor: str, adapter, client) -> List[ModelInfo]:
         """Call adapter.list_models(client) with full error tolerance.
@@ -1535,11 +1619,17 @@ class ModelDiscoveryMixin:
             if hasattr(adapter, 'list_models'):
                 models = await adapter.list_models(client)
                 logger.debug("%s: discovered %d models", vendor, len(models))
+                self._note_discovery_outcome(vendor, None)
                 return models
         except NotImplementedError:
+            # Not a failure: the adapter simply publishes no catalog. Recording
+            # it as one would excuse the serveability veto for every such
+            # vendor, which is broader than this fix intends — the veto is
+            # relaxed only where discovery was ATTEMPTED and failed.
             logger.debug("%s: adapter.list_models not implemented", vendor)
         except Exception as e:
             logger.warning("%s: model discovery failed: %s", vendor, e)
+            self._note_discovery_outcome(vendor, e)
         return []
 
     async def _discover_local_openai_compatible(
@@ -1548,7 +1638,7 @@ class ModelDiscoveryMixin:
         """Discover models from a local OpenAI-compatible server (llama.cpp, etc.)."""
         base_url = provider_config.get("base_url", "")
         if not base_url:
-            return []
+            return None  # NOT ATTEMPTED — see _record_discovery
 
         # Config-level context_limit override (most reliable for local servers)
         config_context_limit = provider_config.get("context_limit")
@@ -1591,8 +1681,13 @@ class ModelDiscoveryMixin:
             )
             return results
         except Exception as e:
-            logger.warning(f"{provider_name}: local model discovery failed ({models_url}): {e}")
-            return []
+            # Raise rather than return [] (#3190): an empty list is also what a
+            # server with no models returns, and the caller cannot tell those
+            # apart. _record_discovery logs and converts this to [] after
+            # recording the vendor as failed.
+            raise RuntimeError(
+                f"local model discovery failed ({models_url}): {e}"
+            ) from e
 
     async def _discover_openai_compatible_remote(
         self, provider_name: str, provider_config: dict
@@ -1606,14 +1701,14 @@ class ModelDiscoveryMixin:
         base_url = provider_config.get("base_url", "")
         if not base_url:
             logger.debug(f"{provider_name}: no base_url configured, skipping discovery")
-            return []
+            return None  # NOT ATTEMPTED — see _record_discovery
 
         # Resolve API key from config or convention
         api_key_env = provider_config.get("api_key_env", f"{provider_name.upper()}_API_KEY")
         api_key = os.environ.get(api_key_env, "")
         if not api_key:
             logger.debug(f"{provider_name}: {api_key_env} not set, skipping discovery")
-            return []
+            return None  # NOT ATTEMPTED — see _record_discovery
 
         import httpx
         models_url = f"{base_url.rstrip('/')}/models"
@@ -1646,8 +1741,11 @@ class ModelDiscoveryMixin:
             logger.info(f"{provider_name}: discovered {len(results)} models from {models_url}")
             return results
         except Exception as e:
-            logger.warning(f"{provider_name}: remote model discovery failed ({models_url}): {e}")
-            return []
+            # See _discover_local_openai_compatible: failure must be
+            # distinguishable from "serves nothing" (#3190).
+            raise RuntimeError(
+                f"remote model discovery failed ({models_url}): {e}"
+            ) from e
 
     @staticmethod
     async def _query_local_server_context(base_url: str, httpx_module) -> Optional[int]:

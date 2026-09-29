@@ -684,3 +684,65 @@ async def test_event_manager_callback_works_without_dispatcher(tmp_path):
     # Must not raise even though dispatcher is absent.
     agent._on_background_task_complete(real_task)
     assert len(agent._pending_task_notifications) == 1
+
+
+@pytest.mark.asyncio
+async def test_durable_consumer_guard_reads_registration_not_drainer_state(tmp_path):
+    """The guard is a registration fact, not "is a drainer running".
+
+    ``_started_durable_cognition_consumers`` is empty in the boot window
+    between ``register_durable_consumer`` and
+    ``start_durable_cognition_consumer``, is discarded by
+    ``deactivate_consumer``, and is cleared wholesale at shutdown. Gating the
+    a2a wake on it drops the wake back to a non-durable, non-retried
+    ``enqueue_signal`` during exactly the windows #3163 exists to close.
+    """
+    from kestrel_sovereign.signals.durable import DurableConsumerRegistration
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+        DURABLE_COGNITION_CONSUMER_ID,
+    )
+
+    backend = SQLiteBackend(str(tmp_path / "guard.db"))
+    await backend.connect()
+    try:
+        store = SignalLogStore(backend)
+        await store.initialize()
+        registry = SourceRegistry()
+        registry.register(build_a2a_task_complete_registration())
+
+        class _Agent:
+            did = "did:test:guard"
+
+            async def process_input(self, prompt):
+                return "ack"
+
+            def _track_background_task(self, coro, *, name):
+                return asyncio.create_task(coro, name=name)
+
+        agent = _Agent()
+        dispatcher = SignalDispatcher(
+            agent=agent,
+            registry=registry,
+            lock_manager=OrderedLockManager(),
+            store=store,
+        )
+
+        assert await dispatcher.has_durable_consumer(
+            DURABLE_COGNITION_CONSUMER_ID
+        ) is False
+
+        await dispatcher.register_durable_consumer(
+            DurableConsumerRegistration(
+                consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                source="a2a.task_complete",
+                agent_id=agent.did,
+            )
+        )
+
+        # The boot window: registered, but no drainer has started yet.
+        assert dispatcher._started_durable_cognition_consumers == set()
+        assert await dispatcher.has_durable_consumer(
+            DURABLE_COGNITION_CONSUMER_ID
+        ) is True, "a registered consumer must count before its drainer starts"
+    finally:
+        await backend.close()

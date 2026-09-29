@@ -173,6 +173,7 @@ class TestRealStreaming:
         # Bind all orchestrator engine and tool registry mixin methods
         for method_name in (
             '_handle_orchestrator_response_streaming',
+            '_execute_tool_batch_at_stop_boundary',
             '_execute_tool_with_hooks',
             '_execute_tool_batch',
             '_partition_tool_calls',
@@ -2185,6 +2186,7 @@ def _bind_real_orchestrator(agent):
 
     for m in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch", "_partition_tool_calls",
         "_dispatch_tool_call", "_dispatch_feature_tool", "_dispatch_direct_tool",
         "_get_denied_tools", "_handle_feature_error", "_prune_orchestrator_messages",
@@ -2507,7 +2509,7 @@ class TestStrictContinuationTimeoutSafeBlock:
 # preserved.
 # =========================================================================
 
-from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sdk.hooks.base import HookInput
 
 
 class _RecorderHook(Hook):
@@ -3483,8 +3485,11 @@ class TestP0CancellationDuringAudit:
         agent._post_response_pipeline.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_tool_cancel_during_audit_persists_empty_cancelled_row(self):
+    async def test_tool_cancel_during_audit_persists_redacted_checkpoint(self):
         from kestrel_sdk.llm import ToolCallStarted
+        from kestrel_sovereign.agent.streaming import (
+            STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+        )
         from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
         prose_marker = "SECRET_POST_TOOL_ALLOWED_SYNTHESIS_cancelled_mid_audit"
@@ -3538,13 +3543,19 @@ class TestP0CancellationDuringAudit:
         assert prose_marker not in joined
         assert tool_secret not in joined
         assert "[Response blocked by audit:" not in joined
-        # One empty cancelled row; the withheld synthesis AND the raw tool_results
-        # side channel are discarded.
+        # The withheld synthesis and raw tool side channel are discarded, while
+        # the host-authored completion checkpoint prevents a later repeat.
         persisted = [c for c in add_convo_calls if c["role"] == "assistant"]
         assert len(persisted) == 1
-        assert persisted[0]["content"] == ""
+        assert persisted[0]["content"] == (
+            STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT
+        )
         meta = persisted[0].get("metadata") or {}
         assert meta.get("cancelled") is True
+        assert meta.get("tool_batch_checkpoint") == {
+            "status": "completed",
+            "details_withheld": True,
+        }
         for leaky in ("parts", "tool_events", "tool_results", "pre_tool_reasoning"):
             assert leaky not in meta
         import json as _json
@@ -3555,12 +3566,116 @@ class TestP0CancellationDuringAudit:
         agent._post_response_pipeline.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_strict_stop_during_owned_tool_batch_persists_redacted_checkpoint():
+    """Strict audit keeps an effect receipt without retaining tool bytes."""
+
+    from kestrel_sovereign.agent.streaming import (
+        STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+    )
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+
+    add_convo_calls = []
+    agent, _hook = _make_streaming_audit_agent(
+        add_convo_calls,
+        mode="strict",
+        audit_response={"risk_level": 1, "reasoning": "clean"},
+    )
+    _bind_real_orchestrator(agent)
+    cancelled = False
+    batch_started = asyncio.Event()
+    release_batch = asyncio.Event()
+    batch_completed = asyncio.Event()
+    secret = "STRICT_TOOL_RESULT_SECRET_must_not_persist"
+
+    agent.is_request_cancelled = lambda _request_id=None: cancelled
+    persist_assistant_turn = agent._persist_assistant_turn_safely
+    persistence_requirements = []
+
+    async def capture_persistence_requirement(*args, **kwargs):
+        persistence_requirements.append(kwargs.get("require_success", False))
+        return await persist_assistant_turn(*args, **kwargs)
+
+    agent._persist_assistant_turn_safely = capture_persistence_requirement
+    agent._visible_features_by_tool_name = MagicMock(return_value={})
+    agent._known_tool_names = MagicMock(return_value=set())
+
+    async def execute_batch(*_args, **kwargs):
+        batch_started.set()
+        await release_batch.wait()
+        kwargs["tool_events"].extend(
+            [
+                {"type": "start", "tool": "send_payment"},
+                {"type": "complete", "tool": "send_payment", "ms": 1},
+            ]
+        )
+        kwargs["tool_results"].append(
+            {
+                "tool_call_id": "tc-payment",
+                "name": "send_payment",
+                "arguments": {"recipient": secret},
+                "result": {"transaction": secret},
+            }
+        )
+        batch_completed.set()
+
+    agent._execute_tool_batch = execute_batch
+
+    async def stream(**_kwargs):
+        yield LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="tc-payment",
+                    name="send_payment",
+                    arguments={"recipient": secret},
+                )
+            ],
+        )
+
+    agent.llm_service.stream_with_tool_detection = stream
+
+    async def consume():
+        return [
+            chunk
+            async for chunk in agent.process_input_streaming(
+                "send it", session_id="s-strict-stop", request_id="strict-stop"
+            )
+        ]
+
+    turn = asyncio.create_task(consume())
+    await batch_started.wait()
+    cancelled = True
+    turn.cancel()
+    await asyncio.sleep(0)
+    assert batch_completed.is_set() is False
+    release_batch.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert batch_completed.is_set() is True
+    assert persistence_requirements == [True]
+    persisted = [c for c in add_convo_calls if c["role"] == "assistant"]
+    assert len(persisted) == 1
+    assert persisted[0]["content"] == STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT
+    assert persisted[0]["metadata"] == {
+        "tool_batch_checkpoint": {
+            "status": "completed",
+            "details_withheld": True,
+        },
+        "cancelled": True,
+    }
+    import json as _json
+
+    assert secret not in _json.dumps(persisted[0], default=str)
+
+
 class TestFinding2StrictCancellationDiscardsWithheldProse:
     """#2674 finding 2: a strict (buffered) turn cancelled BEFORE its reviewed
     release must discard ALL withheld prose / parts / metadata / tool side
-    channels and persist an EMPTY cancelled row — matching the already-safe
-    strict cancel-before-dispatch path — for BOTH the no-tool and the post-tool
-    continuation cancellation cases."""
+    channels. A no-tool cancellation persists an empty row; a completed tool
+    batch persists only the fixed redacted anti-repeat checkpoint."""
 
     @pytest.mark.asyncio
     async def test_strict_no_tool_cancellation_discards_withheld_prose(self):
@@ -3615,6 +3730,9 @@ class TestFinding2StrictCancellationDiscardsWithheldProse:
     @pytest.mark.asyncio
     async def test_strict_post_tool_continuation_cancellation_discards_withheld_prose(self):
         from kestrel_sdk.llm import ToolCallStarted
+        from kestrel_sovereign.agent.streaming import (
+            STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+        )
         from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
         marker = "SECRET_POST_TOOL_CONTINUATION_PROSE_must_never_persist"
@@ -3661,13 +3779,20 @@ class TestFinding2StrictCancellationDiscardsWithheldProse:
         # No withheld continuation prose reached the client on any channel.
         assert marker not in joined
         assert "[Response blocked by audit:" not in joined
-        # Empty cancelled row — the unfinished synthesis is not persisted.
+        # The unfinished synthesis is not persisted; the fixed completion
+        # checkpoint tells the next turn not to repeat the finished action.
         persisted = [c for c in add_convo_calls if c["role"] == "assistant"]
         assert len(persisted) == 1
-        assert persisted[0]["content"] == ""
+        assert persisted[0]["content"] == (
+            STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT
+        )
         assert marker not in (persisted[0]["content"] or "")
         meta = persisted[0].get("metadata") or {}
         assert meta.get("cancelled") is True
+        assert meta.get("tool_batch_checkpoint") == {
+            "status": "completed",
+            "details_withheld": True,
+        }
         for leaky in ("pre_tool_reasoning", "parts", "tool_events", "tool_results"):
             assert leaky not in meta
         # STOP never fired over the discarded, unreviewed content.

@@ -31,7 +31,14 @@ from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
-from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask
+from kestrel_sovereign.features.scheduler.runner import (
+    ScheduledTask,
+    ScheduledTaskOwnerUnavailable,
+    SchedulerDispatchNotReady,
+    SchedulerRunner,
+)
+from kestrel_sovereign.hold import HeldWorkDisposition
+from kestrel_sovereign.signals.sources.scheduler import cron_source_name
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
@@ -224,8 +231,8 @@ class _StubJobFeature:
     an execution counter so a skipped tick is observable.
     """
 
-    def __init__(self):
-        self.name = "JobFeature"
+    def __init__(self, tool_name: str = "job", name: str = "JobFeature"):
+        self.name = name
         self.enabled = True
         self.calls = 0
 
@@ -234,7 +241,7 @@ class _StubJobFeature:
             return {"success": True, "ran": self.calls}
 
         tool = MagicMock()
-        tool.name = "job"
+        tool.name = tool_name
         tool.execute = AsyncMock(side_effect=_execute)
         self._tool = tool
 
@@ -428,6 +435,145 @@ class TestScheduleList:
 
 
 class TestRetiredCronCleanup:
+    @pytest.mark.asyncio
+    async def test_post_load_removes_persisted_authority_bound_schedules(self):
+        """Upgrade closes authority-bound rows accepted by older releases."""
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        f.schedule_list = AsyncMock(return_value=ToolResult.ok(
+            confirmation="ok",
+            data={"tasks": [
+                {
+                    "task_name": "request_restart",
+                    "id": "legacy-live",
+                    "enabled": True,
+                },
+                {
+                    "task_name": "request_restart",
+                    "id": "legacy-paused",
+                    "enabled": False,
+                },
+                {
+                    "task_name": "acknowledge_restart_escalation",
+                    "id": "legacy-ack-live",
+                    "enabled": True,
+                },
+                {
+                    "task_name": "acknowledge_restart_escalation",
+                    "id": "legacy-ack-paused",
+                    "enabled": False,
+                },
+                {
+                    "task_name": "grant_restart_delegation",
+                    "id": "legacy-grant-live",
+                    "enabled": True,
+                },
+                {
+                    "task_name": "revoke_restart_delegation",
+                    "id": "legacy-revoke-paused",
+                    "enabled": False,
+                },
+                {
+                    "task_name": "backup_snapshot",
+                    "id": "keep-default",
+                    "enabled": True,
+                },
+            ]},
+        ))
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.ok(confirmation="removed")
+        )
+        f._ensure_builtin_schedule = AsyncMock(
+            return_value=ToolResult.ok(
+                confirmation="added", data={"next_run_at": None}
+            )
+        )
+
+        await f.post_all_features_loaded(agent)
+
+        removed_ids = {call.args[0] for call in f.schedule_remove.await_args_list}
+        assert removed_ids == {
+            "legacy-live",
+            "legacy-paused",
+            "legacy-ack-live",
+            "legacy-ack-paused",
+            "legacy-grant-live",
+            "legacy-revoke-paused",
+        }
+        readded = {
+            call.kwargs.get("task_name")
+            for call in f._ensure_builtin_schedule.await_args_list
+        }
+        assert "request_restart" not in readded
+        assert "acknowledge_restart_escalation" not in readded
+        assert "grant_restart_delegation" not in readded
+        assert "revoke_restart_delegation" not in readded
+
+    @pytest.mark.asyncio
+    async def test_post_load_fails_closed_when_authority_schedule_removal_fails(self):
+        """An obsolete request_restart row must not survive a successful boot."""
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        f.schedule_list = AsyncMock(return_value=ToolResult.ok(
+            confirmation="ok",
+            data={"tasks": [{
+                "task_name": "request_restart",
+                "id": "legacy-still-durable",
+                "enabled": True,
+            }]},
+        ))
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.failed(error="delete transaction failed")
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="Failed to remove authority-bound schedule.*delete transaction failed",
+        ):
+            await f.post_all_features_loaded(agent)
+
+    @pytest.mark.asyncio
+    async def test_post_load_accepts_concurrent_authority_schedule_removal(self):
+        """A peer replica deleting the same legacy row is successful cleanup."""
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        legacy = {
+            "task_name": "request_restart",
+            "id": "legacy-concurrent-removal",
+            "enabled": True,
+        }
+        f.schedule_list = AsyncMock(side_effect=[
+            ToolResult.ok(confirmation="listed", data={"tasks": [legacy]}),
+            ToolResult.ok(confirmation="listed", data={"tasks": []}),
+        ])
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.failed(
+                error="Task legacy-concurrent-removal not found"
+            )
+        )
+        f._ensure_builtin_schedule = AsyncMock(
+            return_value=ToolResult.ok(
+                confirmation="added", data={"next_run_at": None}
+            )
+        )
+
+        await f.post_all_features_loaded(agent)
+
+        f.schedule_remove.assert_awaited_once_with("legacy-concurrent-removal")
+        assert f.schedule_list.await_count == 2
+
     @pytest.mark.asyncio
     async def test_post_load_removes_retired_builtin_schedules(self):
         """Persisted rows for removed core sources must be deleted on upgrade."""
@@ -1114,6 +1260,35 @@ class TestScheduleAdd:
             task_name="wellness_check",
         )
         assert result.status is ToolResultStatus.OK
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool_name",
+        [
+            "request_restart",
+            "acknowledge_restart_escalation",
+            "grant_restart_delegation",
+            "revoke_restart_delegation",
+        ],
+    )
+    async def test_add_rejects_authority_bound_restart_tool(self, feature, tool_name):
+        """An unattended scheduler tick cannot supply sovereign authority."""
+
+        restart_tool = MagicMock()
+        restart_tool.name = tool_name
+        restart_feature = MagicMock()
+        restart_feature.get_tools = MagicMock(return_value=[restart_tool])
+        feature.agent.features = {"RestartCoordinatorFeature": restart_feature}
+
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name=tool_name,
+        )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "unknown scheduled task" in result.error.lower()
+        assert tool_name not in result.data["valid_task_names"]
+        feature._db.execute.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_rejects_disabled_feature_tool(self, feature):
@@ -2103,11 +2278,45 @@ class TestTaskExecutor:
         mock_tool.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_direct_run_names_only_a_declared_reason_code(self):
+        # The direct-run path (#3184): a failed ToolResult's reason_code
+        # reaches the raised message only when the owning feature declared
+        # it in ``tool_reason_codes`` — the same door the cron sources use.
+        from kestrel_sdk.tools.result import ToolResult
+
+        feature = SchedulerFeature(MagicMock())
+        feature.agent.hooks_manager = self._passthrough_hooks_manager()
+        mock_tool = MagicMock()
+        mock_tool.name = "wellness_check"
+        mock_tool.execute = AsyncMock(return_value=ToolResult.failed(
+            "the score fell below threshold at /Users/someone/private",
+            data={"reason_code": "WELLNESS_DOWN"},
+        ))
+        mock_feature = MagicMock()
+        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+        feature.agent.features = {"WellnessFeature": mock_feature}
+
+        mock_feature.tool_reason_codes = {"wellness_check": frozenset({"WELLNESS_DOWN"})}
+        with pytest.raises(RuntimeError) as excinfo:
+            await feature._lookup_and_run_tool("wellness_check", {})
+        assert str(excinfo.value) == "scheduled tool wellness_check failed (WELLNESS_DOWN)"
+
+        mock_feature.tool_reason_codes = {}
+        with pytest.raises(RuntimeError) as excinfo:
+            await feature._lookup_and_run_tool("wellness_check", {})
+        assert str(excinfo.value) == "scheduled tool wellness_check failed"
+
+    @pytest.mark.asyncio
     async def test_custom_signal_dispatch_schedule_routes_through_cron_source(
         self, feature,
     ):
         """The supported source contract is independent of auto-seeding."""
 
+        feature.agent.features = {
+            "StrategicMemoryFeature": _StubJobFeature(
+                "signal_dispatch", "StrategicMemoryFeature"
+            )
+        }
         feature.agent.dispatcher = MagicMock()
         feature.agent.dispatcher.dispatch_signal = AsyncMock(
             return_value=SignalResult(
@@ -2128,6 +2337,52 @@ class TestTaskExecutor:
         assert signal.source == "cron.signal_dispatch"
         assert signal.mode is SignalMode.ACTION
         assert signal.payload == {"mode": "execute"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dispatcher_available", [False, True])
+    async def test_dynamic_feature_tool_schedule_is_skipped_while_held(
+        self,
+        feature,
+        dispatcher_available,
+    ):
+        """Both direct scheduler branches apply the periodic Hold contract."""
+        from kestrel_sovereign.hold import (
+            EffectiveHoldState,
+            HoldScope,
+            HoldState,
+        )
+
+        class _HeldStore:
+            async def get_effective(self, _agent_id):
+                return EffectiveHoldState(
+                    host=None,
+                    agent=HoldState(
+                        scope=HoldScope.AGENT,
+                        target_id="did:test:scheduler-agent",
+                        reason="operator hold",
+                        actor_id="did:test:operator",
+                        set_at="2026-08-29T00:00:00+00:00",
+                        hold_receipt_id="hold:scheduler",
+                        revision=1,
+                    ),
+                )
+
+        mock_tool = MagicMock()
+        mock_tool.name = "wellness_check"
+        mock_tool.execute = AsyncMock(return_value={"success": True})
+        mock_feature = MagicMock()
+        mock_feature.get_tools.return_value = [mock_tool]
+        feature.agent.did = "did:test:scheduler-agent"
+        feature.agent._hold_store = _HeldStore()
+        feature.agent.features = {"WellnessFeature": mock_feature}
+        feature.agent.dispatcher = MagicMock() if dispatcher_available else None
+
+        result = await feature._dispatch_scheduled_task("wellness_check", {})
+
+        assert result == "skipped: dropped_quiet_hours (hold_skipped)"
+        mock_tool.execute.assert_not_awaited()
+        if dispatcher_available:
+            feature.agent.dispatcher.dispatch_signal.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_training_cycle_requires_current_durable_semantic_maintenance(
@@ -2271,18 +2526,202 @@ class TestTaskExecutor:
             await feature._lookup_and_run_tool("job", {})
 
     @pytest.mark.asyncio
-    async def test_builtin_cron_task_skipped_when_feature_not_loaded(
+    async def test_builtin_cron_task_with_absent_owner_fails_honestly(
         self, feature,
     ):
-        """A persisted built-in cron task (e.g. restart_coordinator) can
-        fire on the first scheduler tick after a restart before its owning
-        feature has registered the tool — a transient startup-order race
-        (#1796). It must skip benignly, NOT raise 'Unknown task' (which
-        would record a spurious one-time failure)."""
+        """#2474: ticks run only after the post_all_features_loaded barrier,
+        so a built-in whose owning feature is still unresolvable is missing,
+        not late. It must fail with actionable evidence — never return the
+        old "skipped: ... transient startup-order race" string, which the
+        runner recorded as success while advancing the cron."""
         feature.agent.features = {}
-        result = await feature._lookup_and_run_tool("restart_coordinator", {})
-        assert result.startswith("skipped:")
-        assert "restart_coordinator" in result
+        with pytest.raises(ScheduledTaskOwnerUnavailable) as raised:
+            await feature._lookup_and_run_tool("restart_coordinator", {})
+        message = str(raised.value)
+        assert "restart_coordinator" in message
+        assert "not executed" in message
+        assert "Install or enable the feature" in message
+        assert "remove the schedule" in message
+
+    @pytest.mark.asyncio
+    async def test_absent_owner_is_refused_before_signal_dispatch(self, feature):
+        """The owner check runs before the dispatcher, so the runner receives
+        the typed failure instead of the source handler's content-free text."""
+        feature.agent.features = {}
+        feature.agent._post_all_features_loaded_complete = True
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.dispatch_signal = AsyncMock()
+
+        with pytest.raises(ScheduledTaskOwnerUnavailable):
+            await feature._dispatch_scheduled_task("restart_coordinator", {})
+        feature.agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+    @staticmethod
+    def _held_store(agent_did: str):
+        from kestrel_sovereign.hold import (
+            EffectiveHoldState,
+            HoldScope,
+            HoldState,
+        )
+
+        class _HeldStore:
+            async def get_effective(self, _agent_id):
+                return EffectiveHoldState(
+                    host=None,
+                    agent=HoldState(
+                        scope=HoldScope.AGENT,
+                        target_id=agent_did,
+                        reason="operator hold",
+                        actor_id="did:test:operator",
+                        set_at="2026-09-26T00:00:00+00:00",
+                        hold_receipt_id="hold:scheduler-owner",
+                        revision=1,
+                    ),
+                )
+
+        return _HeldStore()
+
+    @pytest.mark.asyncio
+    async def test_absent_owner_while_held_is_a_held_skip(self, feature):
+        """#3377: the owner preflight runs before the dispatcher applies Hold,
+        so a held agent must record the held skip, not an owner failure."""
+        feature.agent.did = "did:test:scheduler-agent"
+        feature.agent._hold_store = self._held_store(feature.agent.did)
+        feature.agent.features = {}
+        feature.agent._post_all_features_loaded_complete = True
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.dispatch_signal = AsyncMock()
+
+        with patch(
+            "kestrel_sovereign.hold.metrics.record_held_work_disposition"
+        ) as record:
+            result = await feature._dispatch_scheduled_task(
+                "restart_coordinator", {}
+            )
+
+        assert result == "skipped: dropped_quiet_hours (hold_skipped)"
+        feature.agent.dispatcher.dispatch_signal.assert_not_awaited()
+        record.assert_called_once_with(
+            disposition=HeldWorkDisposition.SKIPPED.value,
+            source=cron_source_name("restart_coordinator"),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("held", [True, False])
+    async def test_absent_owner_row_under_hold_end_to_end(self, tmp_path, held):
+        """#3377 through the runner: held + absent owner writes no failed row;
+        unheld + absent owner still fails with the owner-unavailable text."""
+        raw_db = SQLiteBackend(str(tmp_path / "scheduler.db"))
+        await raw_db.connect()
+        db = AsyncDatabase(raw_db)
+
+        agent = _make_mock_agent(db)
+        agent.did = "did:test:scheduler-agent"
+        agent.features = {}
+        agent._post_all_features_loaded_complete = True
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.dispatch_signal = AsyncMock()
+        if held:
+            agent._hold_store = self._held_store(agent.did)
+        else:
+            agent._hold_store = None
+
+        sched = SchedulerFeature(agent)
+        sched._db = db
+        sched._agent_id = agent.did
+        runner = SchedulerRunner(db, agent.did, sched._dispatch_scheduled_task)
+
+        try:
+            await runner._ensure_tables()
+            due_at = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+            await db.execute(
+                """
+                INSERT INTO scheduled_tasks
+                    (id, agent_id, task_name, cron_expression, args_json,
+                     enabled, next_run_at, created_at,
+                     scheduler_protocol_version)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, 2)
+                """,
+                (
+                    "restart-task",
+                    agent.did,
+                    "restart_coordinator",
+                    "* * * * *",
+                    "{}",
+                    due_at,
+                    due_at,
+                ),
+            )
+
+            await runner._tick()
+
+            rows = await db.fetchall(
+                "SELECT status, result_text FROM task_execution_log "
+                "WHERE task_id = ?",
+                ("restart-task",),
+            )
+            statuses = [row[0] for row in rows]
+            agent.dispatcher.dispatch_signal.assert_not_awaited()
+            if held:
+                assert "failed" not in statuses
+                assert any(
+                    "hold_skipped" in (row[1] or "") for row in rows
+                )
+            else:
+                assert "failed" in statuses
+                assert any(
+                    "restart_coordinator" in (row[1] or "")
+                    and "not executed" in (row[1] or "")
+                    for row in rows
+                )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_disabled_owner_is_left_to_the_disabled_skip(self, feature):
+        """A disabled owner is not an absent one: dispatch proceeds and the
+        lookup's existing benign disabled-feature skip applies (#2522)."""
+        owner = _StubJobFeature("restart_coordinator", "RestartCoordinatorFeature")
+        owner.enabled = False
+        feature.agent.features = {"RestartCoordinatorFeature": owner}
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.dispatch_signal = AsyncMock(
+            return_value=SignalResult(
+                signal_id="sig-disabled",
+                status=Status.OK,
+                mode=SignalMode.ACTION,
+                duration_ms=1,
+                action_result="skipped: disabled",
+            )
+        )
+
+        await feature._dispatch_scheduled_task("restart_coordinator", {})
+
+        feature.agent.dispatcher.dispatch_signal.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_before_feature_load_barrier_is_deferred(
+        self, feature,
+    ):
+        """#2474: no scheduled task may execute before the agent's
+        post_all_features_loaded barrier — not even a built-in whose owner is
+        present, and not through the direct no-dispatcher branch."""
+        owner = _StubJobFeature("restart_coordinator", "RestartCoordinatorFeature")
+        feature.agent.features = {"RestartCoordinatorFeature": owner}
+        feature.agent._post_all_features_loaded_complete = False
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.dispatch_signal = AsyncMock()
+
+        with pytest.raises(SchedulerDispatchNotReady):
+            await feature._dispatch_scheduled_task("restart_coordinator", {})
+        feature.agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+        feature.agent.dispatcher = None
+        with pytest.raises(SchedulerDispatchNotReady):
+            await feature._dispatch_scheduled_task("restart_coordinator", {})
+        assert owner.calls == 0
 
     @pytest.mark.asyncio
     async def test_disabled_feature_tool_is_not_executed(self, feature):
@@ -3685,3 +4124,69 @@ def test_fetch_url_selects_endpoint_by_kind():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.asyncio
+async def test_handle_sleep_raised_cycle_names_sleep_failed_as_its_reason_code():
+    agent = _make_mock_agent()
+    agent.sleep = AsyncMock(side_effect=RuntimeError("cycle blew up"))
+    feature = SchedulerFeature(agent)
+    feature._agent_id = "test-agent"  # the exception path logs it
+
+    outcome = await feature._handle_sleep({})
+
+    assert isinstance(outcome, ScheduledTaskOutcome)
+    assert outcome.status == "failed"
+    assert outcome.reason_code == "SLEEP_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_handle_sleep_failed_report_carries_the_reports_error_token():
+    class _Report:
+        def to_dict(self):
+            return {
+                "success": False,
+                "error": "semantic_artifact_expiry_sweep_failed",
+                "failure_code": "semantic_artifact_expiry_sweep_failed",
+                "failure_reason": "semantic_artifact_expiry_sweep_failed",
+            }
+
+    agent = _make_mock_agent()
+    agent.sleep = AsyncMock(return_value=_Report())
+    feature = SchedulerFeature(agent)
+
+    outcome = await feature._handle_sleep({})
+
+    assert isinstance(outcome, ScheduledTaskOutcome)
+    assert outcome.status == "failed"
+    assert outcome.reason_code == "semantic_artifact_expiry_sweep_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_reason, expected", [
+    ("export_failed", "export_failed"),
+    ("semantic_maintenance_failed", "semantic_maintenance_failed"),
+    (None, ""),
+])
+async def test_handle_sleep_failed_report_forwards_the_reports_failure_reason(
+    failure_reason, expected
+):
+    """The report resolves its own cause (failure_reason, carried by
+    to_dict); the door reads that and never parses the composed ``error``."""
+    class _Report:
+        def to_dict(self):
+            return {
+                "success": False,
+                "error": "consolidation_skipped; Export failed: remote backup unavailable",
+                "failure_code": None,
+                "failure_reason": failure_reason,
+            }
+
+    agent = _make_mock_agent()
+    agent.sleep = AsyncMock(return_value=_Report())
+    feature = SchedulerFeature(agent)
+
+    outcome = await feature._handle_sleep({})
+
+    assert isinstance(outcome, ScheduledTaskOutcome)
+    assert outcome.reason_code == expected

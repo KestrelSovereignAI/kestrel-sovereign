@@ -475,6 +475,20 @@ class ProviderRegistry:
             adapter = adapter_cls()
             if oauth_manager is not None:
                 adapter._oauth_token_manager = oauth_manager
+                # Name the credential this route bound to. Every agent builds
+                # its own LLMService and therefore its own credential source,
+                # and the keychain may hold a stale login beside the live one,
+                # so two agents in one process can bind to DIFFERENT accounts.
+                # That shows up as one agent failing on a billing error while
+                # another succeeds on the same route, model and host — which
+                # is unreadable unless the binding is recorded here.
+                try:
+                    logger.info(
+                        "%s:%s OAuth credential = %s",
+                        vendor, route, oauth_manager.credential_identity(),
+                    )
+                except Exception:  # never let reporting break provider setup
+                    pass
             return client, adapter
 
         # --- Codex / ChatGPT subscription via the official codex app-server ---

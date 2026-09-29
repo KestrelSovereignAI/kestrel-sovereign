@@ -10,12 +10,13 @@ Produces the full in-agent system prompt by combining:
 5. Other BootstrapLoader files (priority 6)
 6. Style reminder (priority 7)
 7. Caller-supplied additional context (priority 7)
+8. Lifecycle-resolved feature context (priority 8+)
 
-When the assembled prompt exceeds a configured byte budget, clauses
-are dropped highest-priority-number first (within a priority, in
-reverse emission order) until the prompt fits. The constitution is
-never droppable; if it alone exceeds budget the budget is honored
-in spirit (return whatever fits) but the constitution stays.
+When the assembled prompt exceeds a configured byte or token budget, optional
+clauses are dropped highest-priority-number first (within a priority, in
+reverse emission order) until the prompt fits. Mandatory governance clauses
+(constitution, identity, operator policy, and state of mind) stay intact; if
+their floor exceeds budget, the caller must fail closed during preflight.
 
 Both the kept and dropped clause lists are returned for forensic
 recording on `signal_log` (`injected_clauses_json`,
@@ -35,7 +36,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, Iterable, List, Optional
 
 
 # Priority ladder. Lower number = higher priority = kept first.
@@ -49,6 +50,7 @@ PRIORITY_SOUL = 4
 PRIORITY_STATE_OF_MIND = 5
 PRIORITY_OTHER_BOOTSTRAP = 6
 PRIORITY_STYLE_REMINDER = 7
+PRIORITY_CONTRIBUTED_CONTEXT = 8
 
 # Canonical clause names. Used in `signal_log.injected_clauses_json`
 # and `dropped_clauses_json`. Filenames stay literal (e.g. "AGENTS.md")
@@ -62,6 +64,42 @@ CLAUSE_STYLE_REMINDER = "STYLE_REMINDER"
 CLAUSE_ADDITIONAL_CONTEXT = "ADDITIONAL_CONTEXT"
 CLAUSE_SESSION_BRIEFING = "SESSION_BRIEFING"
 
+# Synthetic host-owned audit names can never be filenames or feature clause
+# names. Keep the namespace in this pure assembly module so every preflight
+# boundary consumes the same source of truth.
+SYNTHETIC_HOST_AUDIT_NAMES = frozenset(
+    {
+        CLAUSE_ADDITIONAL_CONTEXT,
+        CLAUSE_KESTREL_CONSTITUTION,
+        CLAUSE_PROMPT_ADAPTATION,
+        CLAUSE_SESSION_BRIEFING,
+        CLAUSE_STATE_OF_MIND,
+        CLAUSE_STYLE_REMINDER,
+    }
+)
+
+# The compatibility renderer and context-plan consumer publish these lowercase
+# subsection identities.  They are just as host-owned as the canonical tracked
+# names above: a feature using one would either impersonate mandatory content or
+# create an indistinguishable duplicate audit row.
+LEGACY_MANDATORY_SYSTEM_SUBSECTIONS = frozenset(
+    {"constitution", "soul", "bootstrap_agents", "state_of_mind"}
+)
+LEGACY_HOST_AUDIT_NAMES = frozenset(
+    {
+        *LEGACY_MANDATORY_SYSTEM_SUBSECTIONS,
+        "additional_context",
+        "prompt_adaptation",
+        "reflection_guidance",
+        "session_briefing",
+        "style_reminder",
+        "system_prompt_addendum",
+    }
+)
+HOST_OWNED_AUDIT_NAMES = frozenset(
+    SYNTHETIC_HOST_AUDIT_NAMES | LEGACY_HOST_AUDIT_NAMES
+)
+
 # The Tortoise Doctrine file is a special-cased anchored doctrine
 # entry that gets priority 2 (between constitution and AGENTS.md).
 # Other anchored files default to priority 3.
@@ -69,9 +107,65 @@ TORTOISE_DOCTRINE_FILENAME = "TORTOISE_DOCTRINE.md"
 AGENTS_FILENAME = "AGENTS.md"
 
 
-# Bytes added per joiner ("\n\n" between clauses).
 _JOINER = "\n\n"
-_JOINER_BYTES = len(_JOINER.encode("utf-8"))
+
+
+def legacy_bootstrap_audit_name(filename: str) -> str | None:
+    """Return the compatibility renderer's audit identity for one filename."""
+
+    if filename == "HEARTBEAT.md":
+        return None
+    if filename == "SOUL.md":
+        return "soul"
+    return f"bootstrap_{filename.replace('.md', '').lower()}"
+
+
+class SystemPromptNamespaceError(ValueError):
+    """A host-owned prompt source claims another reserved audit identity."""
+
+
+class MandatorySystemPromptBudgetError(ValueError):
+    """The non-droppable prompt floor exceeds an explicit ceiling."""
+
+    def __init__(
+        self,
+        *,
+        actual_bytes: int,
+        budget_bytes: Optional[int],
+        actual_tokens: Optional[int],
+        budget_tokens: Optional[int],
+    ) -> None:
+        self.actual_bytes = actual_bytes
+        self.budget_bytes = budget_bytes
+        self.actual_tokens = actual_tokens
+        self.budget_tokens = budget_tokens
+        overruns = []
+        if budget_bytes is not None and actual_bytes > budget_bytes:
+            overruns.append(f"byte budget ({actual_bytes} > {budget_bytes})")
+        if (
+            budget_tokens is not None
+            and actual_tokens is not None
+            and actual_tokens > budget_tokens
+        ):
+            overruns.append(f"token budget ({actual_tokens} > {budget_tokens})")
+        super().__init__(
+            "mandatory system prompt exceeds " + " and ".join(overruns)
+        )
+
+
+def validate_anchored_doctrine_names(names: Iterable[str]) -> tuple[str, ...]:
+    """Reject anchors that impersonate any host-owned audit identity."""
+
+    values = tuple(names)
+    conflict = next(
+        (name for name in values if name in HOST_OWNED_AUDIT_NAMES),
+        None,
+    )
+    if conflict is not None:
+        raise SystemPromptNamespaceError(
+            f"anchored doctrine name {conflict!r} is a reserved host audit name"
+        )
+    return values
 
 
 @dataclass(frozen=True)
@@ -84,15 +178,16 @@ class SystemPromptResult:
     to `signal_log.injected_clauses_json` / `dropped_clauses_json`.
 
     `injected_clauses` is in legacy emission order (the order the
-    clauses appear in `prompt`). `dropped_clauses` is in the order
-    the budget-fit loop removed them — useful for an auditor
-    reconstructing what would have been included next if the budget
-    were larger.
+    clauses appear in `prompt`). `dropped_clauses` starts with contributed
+    clauses displaced by same-name per-turn anchors, followed by the order the
+    budget-fit loop removed remaining optional clauses. This lets an auditor
+    reconstruct authority and what would fit under a larger budget.
     """
 
     prompt: str
     injected_clauses: List[str]
     dropped_clauses: List[str]
+    subsections: List[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -108,6 +203,7 @@ class _Clause:
     name: str
     priority: int
     body: str
+    mandatory: bool = False
     emit_index: int = 0
     bytes_size: int = field(init=False)
 
@@ -147,7 +243,11 @@ def assemble_system_prompt(
     state_of_mind_block: Optional[str] = None,
     style_reminder: Optional[str] = None,
     additional_context: Optional[str] = None,
+    context_clauses: Iterable[tuple[str, str, int, str]] = (),
     budget_bytes: Optional[int] = None,
+    budget_tokens: Optional[int] = None,
+    count_tokens: Optional[Callable[[str], int]] = None,
+    required_suffix: Optional[str] = None,
 ) -> SystemPromptResult:
     """Assemble the system prompt with priority-ordered truncation.
 
@@ -158,8 +258,8 @@ def assemble_system_prompt(
 
     `bootstrap_files` is the full `BootstrapLoader.load()` cache —
     SOUL.md is special-cased; HEARTBEAT.md is skipped (loaded
-    separately by the heartbeat runner); AGENTS.md is skipped IF
-    `anchored_doctrine` already supplies it (avoids duplication).
+    separately by the heartbeat runner); any filename also supplied by
+    `anchored_doctrine` is skipped so the anchored copy takes precedence.
 
     `anchored_doctrine` is an OrderedDict of `filename → content` for
     constitutional-injection bundle members. Order is the caller's
@@ -168,19 +268,38 @@ def assemble_system_prompt(
     `PRIORITY_ANCHORED_DOCTRINE` except `TORTOISE_DOCTRINE.md` which
     gets `PRIORITY_TORTOISE_DOCTRINE` per the design's two-tier rule.
 
-    If `budget_bytes` is None, no truncation is applied. If supplied,
-    clauses are dropped highest-priority-number first until the
-    assembled UTF-8 byte length ≤ `budget_bytes`. The constitution is
-    never droppable.
+    Byte and token budgets are independent optional ceilings. Clauses are
+    dropped highest-priority-number first until both supplied ceilings fit.
+    ``required_suffix`` participates in both measurements but is returned to
+    the caller separately; this lets a non-droppable canary/addendum reserve
+    its exact joined cost. Mandatory governance clauses are never droppable.
     """
     clauses: List[_Clause] = []
     emit_counter = 0
+    emitted_names: set[str] = set()
 
-    def add(name: str, priority: int, body: str) -> None:
+    def add(
+        name: str,
+        priority: int,
+        body: str,
+        *,
+        mandatory: bool = False,
+    ) -> None:
         nonlocal emit_counter
+        if name in emitted_names:
+            raise ValueError(
+                f"system prompt clause name {name!r} is not globally unique"
+            )
         clauses.append(
-            _Clause(name=name, priority=priority, body=body, emit_index=emit_counter)
+            _Clause(
+                name=name,
+                priority=priority,
+                body=body,
+                mandatory=mandatory,
+                emit_index=emit_counter,
+            )
         )
+        emitted_names.add(name)
         emit_counter += 1
 
     # --------------------------------------------------------------
@@ -190,22 +309,23 @@ def assemble_system_prompt(
 
     # Bootstrap files (priorities 4 / 6) — SOUL.md is priority 4 with
     # its identity wrapper; HEARTBEAT.md is loaded by the heartbeat
-    # runner separately and must NOT appear here. AGENTS.md is
-    # excluded if anchored_doctrine already supplies it (avoids
-    # duplication when the dispatcher passes AGENTS.md as anchored).
+    # runner separately and must NOT appear here. Any bootstrap file is
+    # excluded if anchored_doctrine already supplies the same audit name;
+    # the anchored copy has higher authority and priority.
     anchored = anchored_doctrine or OrderedDict()
-    skip_agents_from_bootstrap = AGENTS_FILENAME in anchored
+    validate_anchored_doctrine_names(anchored)
 
     for filename, content in bootstrap_files.items():
         if filename == "HEARTBEAT.md":
             continue
-        if filename == AGENTS_FILENAME and skip_agents_from_bootstrap:
+        if filename in anchored:
             continue
         if filename == "SOUL.md":
             add(
                 name="SOUL.md",
                 priority=PRIORITY_SOUL,
                 body=_wrap("YOUR IDENTITY", content),
+                mandatory=True,
             )
         else:
             label = filename.replace(".md", "").upper()
@@ -213,6 +333,7 @@ def assemble_system_prompt(
                 name=filename,
                 priority=PRIORITY_OTHER_BOOTSTRAP,
                 body=_wrap(label, content),
+                mandatory=filename == AGENTS_FILENAME,
             )
 
     # Session briefing (priority 6 — non-critical, droppable before
@@ -244,13 +365,19 @@ def assemble_system_prompt(
             else PRIORITY_ANCHORED_DOCTRINE
         )
         label = section_name_for_anchored_file(filename)
-        add(name=filename, priority=priority, body=_wrap(label, content))
+        add(
+            name=filename,
+            priority=priority,
+            body=_wrap(label, content),
+            mandatory=filename in {"SOUL.md", AGENTS_FILENAME},
+        )
 
     # Constitution (priority 1 — never droppable).
     add(
         name=CLAUSE_KESTREL_CONSTITUTION,
         priority=PRIORITY_CONSTITUTION,
         body=_wrap("GOVERNING CONSTITUTION", constitution),
+        mandatory=True,
     )
 
     # State of mind (priority 5) — pre-rendered by the caller.
@@ -259,6 +386,7 @@ def assemble_system_prompt(
             name=CLAUSE_STATE_OF_MIND,
             priority=PRIORITY_STATE_OF_MIND,
             body=state_of_mind_block.strip(),
+            mandatory=True,
         )
 
     # Style reminder (priority 7).
@@ -277,10 +405,47 @@ def assemble_system_prompt(
             body=_wrap("ADDITIONAL CONTEXT", additional_context),
         )
 
+    # Feature context is already rendered and cached by the contribution
+    # runtime. Sort by the SDK contract, never entry-point load order. Map the
+    # feature's arbitrary integer priorities into a host band strictly below
+    # STYLE_REMINDER while preserving their relative drop order.
+    ordered_context = sorted(
+        context_clauses,
+        key=lambda clause: (clause[2], clause[1], clause[0]),
+    )
+    priority_ranks = {
+        priority: rank
+        for rank, priority in enumerate(
+            sorted({clause[2] for clause in ordered_context})
+        )
+    }
+    shadowed_context_names: List[str] = []
+    for _owner, name, priority, body in ordered_context:
+        if not body:
+            continue
+        if name in anchored:
+            # Per-turn anchored doctrine has higher authority than lifecycle
+            # feature context. Keep the displaced contribution in the drop
+            # audit even though the authoritative anchor with the same stable
+            # audit name is injected.
+            shadowed_context_names.append(name)
+            continue
+        add(
+            name=name,
+            priority=PRIORITY_CONTRIBUTED_CONTEXT + priority_ranks[priority],
+            body=body,
+        )
+
     # --------------------------------------------------------------
     # Truncation.
     # --------------------------------------------------------------
-    kept, dropped_in_drop_order = _drop_to_fit(clauses, budget_bytes)
+    kept, dropped_in_drop_order = _drop_to_fit(
+        clauses,
+        budget_bytes,
+        budget_tokens=budget_tokens,
+        count_tokens=count_tokens,
+        required_suffix=required_suffix,
+    )
 
     # Re-emit kept clauses in original emission order.
     kept_sorted = sorted(kept, key=lambda c: c.emit_index)
@@ -289,47 +454,82 @@ def assemble_system_prompt(
     return SystemPromptResult(
         prompt=prompt,
         injected_clauses=[c.name for c in kept_sorted],
-        dropped_clauses=[c.name for c in dropped_in_drop_order],
+        dropped_clauses=shadowed_context_names
+        + [c.name for c in dropped_in_drop_order],
+        subsections=[(c.name, c.body) for c in kept_sorted],
     )
 
 
 def _drop_to_fit(
-    clauses: List[_Clause], budget_bytes: Optional[int]
+    clauses: List[_Clause],
+    budget_bytes: Optional[int],
+    *,
+    budget_tokens: Optional[int] = None,
+    count_tokens: Optional[Callable[[str], int]] = None,
+    required_suffix: Optional[str] = None,
 ) -> tuple[List[_Clause], List[_Clause]]:
-    """Walk clauses by descending priority, dropping until size <= budget.
+    """Walk clauses by descending priority, dropping until all budgets fit.
 
     Returns `(kept, dropped)`. `kept` retains original list order;
     `dropped` is in the order they were removed (drop-time order, not
     emission order — useful for forensics).
 
-    Budget None means no truncation. The constitution
-    (`PRIORITY_CONSTITUTION`) is never dropped even when its size
-    alone exceeds budget — the design treats constitutional integrity
-    as the load-bearing invariant; an oversized constitution is an
-    operator-config problem, not something the assembler should hide.
+    A missing byte/token budget disables only that measurement. Mandatory host
+    clauses (constitution, identity, operator policy, and state of mind) are
+    never dropped even when their combined size alone exceeds budget — the
+    design treats governance integrity as the load-bearing invariant; an
+    oversized mandatory floor is an operator-config problem, not something the
+    assembler should hide. Mandatory status is source metadata on ``_Clause``;
+    a contributed clause cannot promote itself by copying a host audit name.
     """
     kept = list(clauses)
     dropped: List[_Clause] = []
 
-    if budget_bytes is None:
+    if (budget_tokens is None) is not (count_tokens is None):
+        raise ValueError("budget_tokens and count_tokens must be supplied together")
+    if budget_bytes is None and budget_tokens is None:
         return kept, dropped
 
-    def total_bytes(items: List[_Clause]) -> int:
-        if not items:
-            return 0
-        body_total = sum(c.bytes_size for c in items)
-        joiner_total = _JOINER_BYTES * (len(items) - 1)
-        return body_total + joiner_total
+    def joined(items: List[_Clause]) -> str:
+        prompt = _JOINER.join(c.body for c in items)
+        if required_suffix:
+            return f"{prompt}{_JOINER if prompt else ''}{required_suffix}"
+        return prompt
 
-    while total_bytes(kept) > budget_bytes:
-        # Candidates: clauses with priority > CONSTITUTION, sorted
+    def over_budget(items: List[_Clause]) -> bool:
+        rendered = joined(items)
+        return bool(
+            (
+                budget_bytes is not None
+                and len(rendered.encode("utf-8")) > budget_bytes
+            )
+            or (
+                budget_tokens is not None
+                and count_tokens is not None
+                and count_tokens(rendered) > budget_tokens
+            )
+        )
+
+    while over_budget(kept):
+        # Candidates: non-mandatory clauses, sorted
         # so the highest-priority-number-and-latest-emit_index goes
         # first. Same priority → drop later-emitted first.
-        droppable = [c for c in kept if c.priority != PRIORITY_CONSTITUTION]
+        droppable = [c for c in kept if not c.mandatory]
         if not droppable:
-            # Only the constitution remains and it's still over budget.
-            # Honor the constitution; let the prompt exceed budget.
-            break
+            # Only mandatory governance remains and it is still over budget.
+            # Never return the oversized bytes as a normal result: callers
+            # convert this typed boundary into degraded mode and refuse the
+            # LLM request. Direct assembler callers get an explicit error.
+            rendered = joined(kept)
+            actual_tokens = (
+                count_tokens(rendered) if count_tokens is not None else None
+            )
+            raise MandatorySystemPromptBudgetError(
+                actual_bytes=len(rendered.encode("utf-8")),
+                budget_bytes=budget_bytes,
+                actual_tokens=actual_tokens,
+                budget_tokens=budget_tokens,
+            )
         droppable.sort(key=lambda c: (-c.priority, -c.emit_index))
         victim = droppable[0]
         kept.remove(victim)

@@ -23,11 +23,14 @@ from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_ROLLOUT_ACK_ENV,
     SCHEDULER_ROLLOUT_STATE_ACTIVE,
     SCHEDULER_SCHEMA_PROVENANCE_FRESH_V2,
+    SchedulerAuthorityRevoked,
     SchedulerProtocolVersionIncompatible,
     SchedulerRolloutQuiescenceRequired,
     SchedulerExecution,
     SchedulerRunner,
     ScheduledTask,
+    _current_execution,
+    _SchedulerExecutionScope,
     get_current_scheduler_execution,
 )
 from kestrel_sovereign.features.scheduler.status import (
@@ -3054,7 +3057,7 @@ async def test_host_runner_preserves_claim_when_cold_load_lacks_scheduler_featur
     db = await _database(tmp_path / "host-cold-missing-scheduler-feature.db")
     agent_id = "did:scheduler:cold-missing-feature"
     config = LocalAgentConfig(data_dir="cold-missing", port=8801, autostart=False)
-    manager = AgentManager()
+    manager = AgentManager(base_data_dir=tmp_path)
     manager._seed_scheduler_authority({agent_id: ("Cold", config)})
     cold_agent = SimpleNamespace(did=agent_id, agent_id=agent_id, features={})
     manager._initialize_agent = AsyncMock(return_value=cold_agent)
@@ -3420,6 +3423,204 @@ async def test_host_runner_cannot_claim_or_advance_foreign_fleet_rows(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_paged_host_authority_is_bounded_and_reaches_later_did(tmp_path):
+    """Keyset pages bound SQL scope without starving a later tenant."""
+
+    db = await _database(tmp_path / "scheduler-paged-authority.db")
+    authorized = tuple(f"agent-{number}" for number in range(1, 6))
+    provider_calls = []
+    observed_scope_sizes = []
+    original_fetchall = db.fetchall
+
+    async def page_provider(after, limit):
+        provider_calls.append((after, limit))
+        remaining = tuple(
+            agent_id
+            for agent_id in authorized
+            if after is None or agent_id > after
+        )
+        return remaining[:limit]
+
+    async def record_fetchall(query, params=()):
+        if "FROM scheduled_tasks" in query and "agent_id IN" in query:
+            scope_sql = query[: query.index("scheduler_protocol_version")]
+            observed_scope_sizes.append(scope_sql.count("?"))
+        return await original_fetchall(query, params)
+
+    executor = AsyncMock(return_value="paged delivery")
+    runner = SchedulerRunner(
+        db,
+        None,
+        executor,
+        authorized_agent_ids=(),
+        authorized_agent_ids_page_provider=page_provider,
+        authorized_agent_ids_page_size=2,
+        is_agent_authorized=lambda agent_id: agent_id in authorized,
+    )
+    db.fetchall = record_fetchall
+    try:
+        await runner._ensure_tables()
+        assert provider_calls == []
+        await _seed_due(db, task_id="later-page", agent_id="agent-5")
+        await _seed_due(db, task_id="foreign-before", agent_id="agent-0")
+        await _seed_due(db, task_id="foreign-between", agent_id="agent-3.5")
+
+        await runner._tick()
+        await runner._tick()
+        executor.assert_not_awaited()
+        await runner._tick()
+        executor.assert_awaited_once_with("test_task", {})
+
+        assert provider_calls == [(None, 2), ("agent-2", 2), ("agent-4", 2)]
+        assert observed_scope_sizes and max(observed_scope_sizes) <= 2
+        for task_id in ("foreign-before", "foreign-between"):
+            assert await db.fetchone(
+                "SELECT lease_owner FROM scheduled_tasks WHERE id = ?",
+                (task_id,),
+            ) == (None,)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_paged_host_authority_retries_cancelled_page(tmp_path):
+    """Cancellation cannot advance past an unprocessed authority page."""
+
+    db = await _database(tmp_path / "scheduler-paged-cancel.db")
+    provider_cursors = []
+
+    async def page_provider(after, _limit):
+        provider_cursors.append(after)
+        return ("agent-1",)
+
+    runner = SchedulerRunner(
+        db,
+        None,
+        AsyncMock(),
+        authorized_agent_ids=(),
+        authorized_agent_ids_page_provider=page_provider,
+        authorized_agent_ids_page_size=1,
+        is_agent_authorized=lambda _agent_id: True,
+    )
+    try:
+        await runner._ensure_tables()
+        original_rollout = runner._ensure_protocol_rollout
+        cancelled_once = False
+
+        async def cancel_first_rollout(**kwargs):
+            nonlocal cancelled_once
+            if not cancelled_once:
+                cancelled_once = True
+                raise asyncio.CancelledError
+            return await original_rollout(**kwargs)
+
+        runner._ensure_protocol_rollout = cancel_first_rollout
+        with pytest.raises(asyncio.CancelledError):
+            await runner._tick()
+        assert runner._authorized_agent_ids_page_cursor is None
+
+        await runner._tick()
+        assert provider_cursors == [None, None]
+        assert runner._authorized_agent_ids_page_cursor == "agent-1"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_paged_host_authority_removal_before_claim_fails_closed(tmp_path):
+    """A page cannot claim after its DID loses live host authority."""
+
+    db = await _database(tmp_path / "scheduler-paged-revocation.db")
+    authority = {"active": True}
+
+    class RevokingExecutor:
+        async def scheduler_dispatch_enabled(self, _agent_id):
+            authority["active"] = False
+            return True
+
+        async def execute_scheduled(self, _execution):
+            raise AssertionError("revoked tenant must not dispatch")
+
+    runner = SchedulerRunner(
+        db,
+        None,
+        RevokingExecutor(),
+        authorized_agent_ids=(),
+        authorized_agent_ids_page_provider=lambda _after, _limit: ("agent-1",),
+        authorized_agent_ids_page_size=1,
+        is_agent_authorized=lambda _agent_id: authority["active"],
+    )
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db, task_id="revoked-page", agent_id="agent-1")
+        await runner._tick()
+        assert await db.fetchone(
+            "SELECT enabled, lease_owner FROM scheduled_tasks WHERE id = ?",
+            ("revoked-page",),
+        ) == (1, None)
+        assert await db.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
+            ("revoked-page",),
+        ) == (0,)
+    finally:
+        await db.close()
+
+
+def test_paged_host_authority_requires_live_check_and_strict_configuration():
+    """Paged authority is explicit, hosted-only, and always revalidated."""
+
+    def page_provider(_after, _limit):
+        return ()
+
+    with pytest.raises(ValueError, match="requires is_agent_authorized"):
+        SchedulerRunner(
+            object(),
+            None,
+            AsyncMock(),
+            authorized_agent_ids=(),
+            authorized_agent_ids_page_provider=page_provider,
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SchedulerRunner(
+            object(),
+            None,
+            AsyncMock(),
+            authorized_agent_ids=(),
+            authorized_agent_ids_provider=lambda: (),
+            authorized_agent_ids_page_provider=page_provider,
+            is_agent_authorized=lambda _agent_id: True,
+        )
+    with pytest.raises(ValueError, match="cannot use paged"):
+        SchedulerRunner(
+            object(),
+            "agent-1",
+            AsyncMock(),
+            authorized_agent_ids_page_provider=page_provider,
+            is_agent_authorized=lambda _agent_id: True,
+        )
+
+    live_check = lambda _agent_id: True
+    failure_callback = lambda _error: None
+    compatible = SchedulerRunner(
+        object(),
+        None,
+        AsyncMock(),
+        5,
+        60,
+        1,
+        30,
+        "positional-owner",
+        (),
+        lambda: (),
+        live_check,
+        failure_callback,
+    )
+    assert compatible._is_agent_authorized is live_check
+    assert compatible._on_protocol_failure is failure_callback
+    assert compatible._authorized_agent_ids_page_provider is None
+
+
+@pytest.mark.asyncio
 async def test_renewal_exception_before_effect_fails_closed(tmp_path, caplog):
     """A renewal failure observed before dispatch never invokes the effect."""
     db = await _database(tmp_path / "scheduler.db")
@@ -3593,6 +3794,76 @@ async def test_renewal_loss_during_preparation_never_enters_effect(tmp_path):
         if tick is not None and not tick.done():
             tick.cancel()
             await asyncio.gather(tick, return_exceptions=True)
+        await db.close()
+
+
+def test_current_scheduler_execution_distinguishes_absent_active_and_revoked():
+    """``None`` means "not scheduler work"; revoked authority fails closed."""
+
+    execution = SchedulerExecution(
+        id="execution-1",
+        schedule_id="task-1",
+        agent_id="agent-1",
+        task_name="ping",
+        args={},
+        scheduled_for="2026-07-25T15:00:00+00:00",
+        idempotency_key="stable-effect",
+        attempt=1,
+        owner="owner-1",
+    )
+
+    assert get_current_scheduler_execution() is None
+
+    scope = _SchedulerExecutionScope(execution)
+    token = _current_execution.set(scope)
+    try:
+        assert get_current_scheduler_execution() is execution
+        scope.revoke()
+        with pytest.raises(SchedulerAuthorityRevoked) as revoked:
+            get_current_scheduler_execution()
+        assert revoked.value.execution_id == "execution-1"
+    finally:
+        _current_execution.reset(token)
+
+    assert get_current_scheduler_execution() is None
+
+
+@pytest.mark.asyncio
+async def test_detached_child_observes_runner_revocation_not_absence(tmp_path):
+    """A child that outlives dispatch sees revocation, never interactive absence."""
+
+    db = await _database(tmp_path / "detached-child.db")
+    child_started = asyncio.Event()
+    release_child = asyncio.Event()
+    child: asyncio.Task | None = None
+
+    async def late_read():
+        child_started.set()
+        await release_child.wait()
+        return get_current_scheduler_execution()
+
+    async def executor(_name, _args):
+        nonlocal child
+        assert get_current_scheduler_execution() is not None
+        child = asyncio.create_task(late_read())
+        await child_started.wait()
+        return "dispatched"
+
+    runner = SchedulerRunner(db, "agent-1", executor, owner_id="child-owner")
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db)
+        await runner._tick()
+        assert get_current_scheduler_execution() is None
+
+        release_child.set()
+        assert child is not None
+        with pytest.raises(SchedulerAuthorityRevoked):
+            await child
+    finally:
+        release_child.set()
+        if child is not None and not child.done():
+            child.cancel()
         await db.close()
 
 

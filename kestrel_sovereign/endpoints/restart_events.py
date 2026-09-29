@@ -17,7 +17,11 @@ from typing import Any, Dict
 from fastapi import APIRouter, Query, Request
 
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    AgentIdentityUnavailable,
+    resolve_feature_database,
+    resolve_scoped_agent_did,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +42,10 @@ async def get_restart_status_events(
     never repaints restart bubbles filed from conversation B.
     """
     agent = get_agent(request)
-    principal = getattr(agent, "did", None)
-    if not isinstance(principal, str) or not principal.strip():
+    try:
+        principal = resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
         return {"events": [], "count": 0}
-    principal = principal.strip()
     db = resolve_feature_database(agent)
     if db is None:
         return {"events": [], "count": 0}

@@ -7,6 +7,8 @@ It subsumes main.py's interactive chat into `kestrel shell <name>`.
 Commands:
     kestrel start                  # start all agents in-process (default)
     kestrel start <name>           # start just one agent (standalone process)
+    kestrel stop <name>            # cooperatively stop one agent's work
+    kestrel stop --all             # cooperatively stop all in-flight work
     kestrel terminate              # terminate everything (agents first, then host)
     kestrel terminate <name>       # terminate one agent process
     kestrel status                 # table: host + all agents with ports, PIDs, status
@@ -41,6 +43,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from kestrel_sovereign import __version__
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.paths import load_project_env, spawned_agent_env
 from kestrel_sovereign.multi_agent.config import (
     MultiAgentConfig,
@@ -218,6 +221,9 @@ def _detect_running_agent_server(
     agent_name: str,
     agent_cfg: LocalAgentConfig,
     multi_agent: MultiAgentConfig,
+    *,
+    operator_api_key: str = "",
+    operator_api_keys: tuple[str, ...] = (),
 ) -> Optional[tuple[str, str]]:
     """Probe for a running server that hosts this agent.
 
@@ -235,12 +241,22 @@ def _detect_running_agent_server(
        (``multi_agent.host.port``) under ``/api/agents/{name}/``. Base URL is
        host:port + that prefix.
 
-    Health probe uses ``GET /health`` (public, no auth). Key fetch uses
-    ``GET /api/auth/key`` (public). Network errors fall through silently
-    — no server is a normal case, not an error.
+    Health probes use ``GET /health`` (public, no auth). A standalone process
+    may still expose its localhost bootstrap endpoint, but an in-process fleet
+    host must be probed with the operator key resolved locally from the same
+    project environment used to launch it. A managed peer can also reach
+    loopback, so fetching the fleet host's sovereign key over HTTP would erase
+    the transport/authority boundary.
     """
     import httpx
 
+    fleet_api_keys = tuple(
+        dict.fromkeys(
+            key
+            for key in (*operator_api_keys, operator_api_key)
+            if isinstance(key, str) and key
+        )
+    )
     candidates = [
         (f"http://localhost:{agent_cfg.port}", ""),
         (
@@ -255,33 +271,64 @@ def _detect_running_agent_server(
             continue
         if health.status_code != 200:
             continue
-        try:
-            key_resp = httpx.get(f"{origin}/api/auth/key", timeout=2.0)
-        except httpx.RequestError:
-            continue
         api_key = ""
-        if key_resp.status_code == 200:
+        if not prefix:
+            try:
+                key_resp = httpx.get(f"{origin}/api/auth/key", timeout=2.0)
+            except httpx.RequestError:
+                continue
+            if key_resp.status_code != 200:
+                # A ProcessManager child is intentionally transport-only: its
+                # public health endpoint can answer on the configured agent
+                # port, but it cannot bootstrap an operator credential. Keep
+                # probing so the fleet host remains discoverable.
+                continue
             try:
                 api_key = key_resp.json().get("key", "") or ""
             except ValueError:
                 api_key = ""
-        # In multi-agent mode, confirm the named agent is actually routed
-        # by this server. The routing middleware returns 404 for unknown
-        # names; hit the prefix's /health proxy to verify before declaring
-        # success. (Standalone mode has no prefix, and /health above
-        # already confirmed the single-agent server is alive.)
-        if prefix:
+            if not api_key:
+                continue
+            return (origin, api_key)
+
+        # Fleet bootstrap is deliberately disabled. The CLI is an operator
+        # process and must arrive with an out-of-band project credential. Try
+        # both supported launch precedences: direct server startup keeps an
+        # exported value, while ``kestrel start`` lets the project file win.
+        for candidate_key in fleet_api_keys:
             try:
                 scoped = httpx.get(
-                    f"{origin}{prefix}/health", timeout=1.0,
-                    headers={"X-API-Key": api_key} if api_key else {},
+                    f"{origin}{prefix}/health",
+                    timeout=1.0,
+                    headers={"X-API-Key": candidate_key},
                 )
             except httpx.RequestError:
                 continue
-            if scoped.status_code != 200:
-                continue
-        return (f"{origin}{prefix}", api_key)
+            if scoped.status_code == 200:
+                return (f"{origin}{prefix}", candidate_key)
     return None
+
+
+def _operator_api_keys(project_dir: Path) -> tuple[str, ...]:
+    """Resolve credentials for both supported fleet-host launch paths."""
+    from kestrel_sovereign.auth import normalize_api_key
+
+    candidates: list[str] = []
+    # server.py loads the project file with ``override=False`` when launched
+    # directly, so the exported credential is the first candidate.
+    if "KESTREL_API_KEY" in os.environ:
+        exported = normalize_api_key(os.environ.get("KESTREL_API_KEY")) or ""
+        if exported:
+            candidates.append(exported)
+    # ProcessManager deliberately applies the opposite precedence. Retain the
+    # file-selected key as a fallback and let the authenticated health probe
+    # identify which launch path owns the live host.
+    launched = normalize_api_key(
+        spawned_agent_env(project_dir).get("KESTREL_API_KEY")
+    ) or ""
+    if launched and launched not in candidates:
+        candidates.append(launched)
+    return tuple(candidates)
 
 
 # Default read timeout (seconds) for talking to a running agent. An agentic
@@ -396,14 +443,37 @@ def cmd_shell(args) -> int:
     # HTTP routing when the user passed --app so extensions still work.
     use_extension = bool(getattr(args, "app", None))
     if not use_extension:
-        server = _detect_running_agent_server(args.name, agent_cfg, multi_agent)
+        server = _detect_running_agent_server(
+            args.name,
+            agent_cfg,
+            multi_agent,
+            operator_api_keys=_operator_api_keys(project_dir),
+        )
         if server is not None:
             base_url, api_key = server
             return _run_http_shell(args.name, base_url, api_key)
 
     # Fall back to in-process agent when no server is running (or when
     # an extension is requested — see comment above).
-    return asyncio.run(_run_shell(agent_dir, args))
+    from kestrel_sovereign.host_features.storage import (
+        resolve_host_database_launch_context,
+    )
+
+    # Resolve fleet custody from the same pre-agent launch environment used by
+    # ProcessManager. Applying the selected agent root first would partition an
+    # offline shell away from a Hold set through the normal host.
+    hold_launch_context = resolve_host_database_launch_context(
+        env=spawned_agent_env(project_dir),
+        base_dir=project_dir,
+        project_root=project_dir,
+    )
+    return asyncio.run(
+        _run_shell(
+            agent_dir,
+            args,
+            host_database_launch_context=hold_launch_context,
+        )
+    )
 
 
 def _run_http_ask(
@@ -472,7 +542,12 @@ def cmd_ask(args) -> int:
         return 1
 
     agent_cfg = local_agents[args.name]
-    server = _detect_running_agent_server(args.name, agent_cfg, multi_agent)
+    server = _detect_running_agent_server(
+        args.name,
+        agent_cfg,
+        multi_agent,
+        operator_api_keys=_operator_api_keys(project_dir),
+    )
     if server is None:
         print(
             f"No running server hosts agent '{args.name}'. "
@@ -495,7 +570,12 @@ def cmd_ask(args) -> int:
     )
 
 
-async def _run_shell(agent_dir: Path, args) -> int:
+async def _run_shell(
+    agent_dir: Path,
+    args,
+    *,
+    host_database_launch_context=None,
+) -> int:
     """Run the interactive chat shell for an agent."""
     from kestrel_sovereign.storage import AsyncStorage
     from kestrel_sovereign.security.encryption import DecryptionError
@@ -529,7 +609,21 @@ async def _run_shell(agent_dir: Path, args) -> int:
         storage_path=str(db_path),
         llm_service=llm_service,
     )
-    await agent.initialize()
+    from kestrel_sovereign.hold import (
+        close_bound_host_context,
+        initialize_with_bound_hold_context,
+    )
+
+    hold_binding_kwargs = {}
+    if host_database_launch_context is not None:
+        hold_binding_kwargs["host_database_launch_context"] = (
+            host_database_launch_context
+        )
+    hold_context = await initialize_with_bound_hold_context(
+        agent,
+        agent_data_root=agent_dir,
+        **hold_binding_kwargs,
+    )
 
     # Load extension if requested
     if hasattr(args, 'app') and args.app:
@@ -556,6 +650,8 @@ async def _run_shell(agent_dir: Path, args) -> int:
                 response = await agent.process_input(user_input)
                 decryption_error_count = 0
                 print(f"\nKestrel: {response}")
+            except HoldTurnRefusal as exc:
+                print(f"\n{exc.wire_json()}")
             except DecryptionError:
                 decryption_error_count += 1
                 print(f"\n\U0001f510 DECRYPTION ERROR: Cannot read encrypted data.")
@@ -601,6 +697,7 @@ async def _run_shell(agent_dir: Path, args) -> int:
         except Exception:
             print("Agent deactivated (with errors).")
         cancelled = await await_agent_shutdown_completion(agent) or cancelled
+        await close_bound_host_context(hold_context)
         if cancelled:
             raise asyncio.CancelledError()
 
@@ -1841,6 +1938,7 @@ from kestrel_sovereign.cli_lifecycle import (  # noqa: E402
     _run_uv_pip_install_editable,
     _GitFailedError,
 )
+from kestrel_sovereign.cli_stop import cmd_stop  # noqa: E402
 
 
 # Feature commands live in cli_features.py (#1678); re-export the public
@@ -1908,9 +2006,13 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_serve import add_serve_subparser
     add_serve_subparser(subparsers)
 
-    # kestrel start|stop|restart|update|status|logs
+    # kestrel start|terminate|restart|update|status|logs
     from kestrel_sovereign.cli_lifecycle import add_lifecycle_subparsers
     add_lifecycle_subparsers(subparsers)
+
+    # Cooperative Stop is intentionally outside process lifecycle.
+    from kestrel_sovereign.cli_stop import add_stop_subparser
+    add_stop_subparser(subparsers)
 
     # kestrel list
     subparsers.add_parser("list", help="List all agents in multi_agent")
@@ -2353,6 +2455,7 @@ def main() -> int:
 
     commands = {
         "start": cmd_start,
+        "stop": cmd_stop,
         "terminate": cmd_terminate,
         "restart": cmd_restart,
         "update": cmd_update,

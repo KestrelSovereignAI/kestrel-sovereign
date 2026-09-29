@@ -138,7 +138,16 @@ def test_allowlist_denies_write_edit_and_mutation_tools():
         assert fo.is_tool_denied(tool), f"{tool} must be denied"
 
     # Workflow-mutation tools are denied (only run/load/read are scoped in).
-    for tool in ("workflow_cancel", "workflow_force_abort", "workflow_define"):
+    for tool in (
+        "workflow_cancel",
+        "workflow_force_abort",
+        "workflow_define",
+        # #3195 — the scheduler's one-shot deadline target and the periodic
+        # delivery-reconciliation adapter; denied even where the
+        # WorkflowsFeature package is absent, so CI enforces it.
+        "workflow_await_signal_deadline",
+        "workflow_await_signal_delivery",
+    ):
         assert fo.is_tool_denied(tool)
 
     # Mandatory Features load regardless of the feature ceiling, but these

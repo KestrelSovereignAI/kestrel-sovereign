@@ -141,7 +141,13 @@ async def test_a2a_sent_inline_from_a_follow_up_keeps_the_single_hop_bound(
     # Spawned BEFORE either turn: its frozen context carries no chain.
     await harness.ensure_started()
 
-    async def follow_up_turn(prompt, **kwargs):
+    async def follow_up_turn(prompt, pre_turn_guard=None, **kwargs):
+        # A self_followup source declares a pre-turn guard, which the
+        # dispatcher only hands to a process_input that names the parameter
+        # (#3310). Evaluate it the way KestrelAgent does, first in the turn.
+        from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+        KestrelAgent._evaluate_pre_turn_guard(pre_turn_guard)
         agent.turn_prompts.append(prompt)
         async with agent._turn_lifecycle():
             executor = make_executor("")
@@ -356,7 +362,9 @@ def _reflection_agent():
     agent.sleep_hooks = []
     agent.features = {}
     agent._raw_storage = SimpleNamespace(db=db)
-    agent.agent_id = "did:test:agent"
+    # The route scopes its read through resolve_scoped_agent_did, which reads
+    # ``did`` and refuses a MagicMock's fabricated attribute (#3251).
+    agent.did = "did:test:agent"
     return agent
 
 

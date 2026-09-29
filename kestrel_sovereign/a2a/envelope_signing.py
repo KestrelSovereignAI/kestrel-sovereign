@@ -50,6 +50,9 @@ ENVELOPE_SIG_VERSION = 2
 ENVELOPE_SIG_ALG = "hybrid-v2"
 # Default replay window: a signed envelope older than this is rejected.
 DEFAULT_MAX_AGE_SECONDS = 300
+# Optional signed audience for recipient-bound A2A actions.  It is projected
+# only when present so ordinary v2 envelopes remain wire-compatible.
+A2A_AUDIENCE_METADATA_KEY = "a2a_audience"
 
 # A resolver maps a sender DID -> its DID document (or None if unknown). It may
 # be sync or async; ``verify_inbound_envelope`` awaits awaitables.
@@ -177,13 +180,21 @@ def bound_envelope_fields(
     ``TaskSendParams`` field, not part of ``metadata``.
     """
     md = metadata or {}
-    return {
+    bound = {
         "skill": str(md.get("skill") or md.get("skill_id") or ""),
         "a2a_verb": str(md.get("a2a_verb") or ""),
         "reply_expected": bool(md.get("reply_expected", False)),
         "causation_chain": _canonical_chain(md.get("causation_chain")),
         "artifacts": _canonical_artifacts(artifacts),
     }
+    # Audience was added without bumping the envelope version because only
+    # audience-bearing action envelopes opt in.  Omitting the key for all
+    # other v2 envelopes preserves their existing canonical bytes.
+    if A2A_AUDIENCE_METADATA_KEY in md:
+        bound[A2A_AUDIENCE_METADATA_KEY] = str(
+            md.get(A2A_AUDIENCE_METADATA_KEY) or ""
+        )
+    return bound
 
 
 def canonical_signing_bytes(

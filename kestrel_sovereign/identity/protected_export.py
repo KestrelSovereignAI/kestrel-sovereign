@@ -25,12 +25,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from kestrel_sovereign.paths import (
+    AGENT_DB_PATH_ENV,
+    DATA_DIR_ENV,
+    IDENTITY_EXPORT_DIR_ENV,
+    LEGACY_AGENT_DATA_DIR_ENV,
+    guard_storage_path,
+    runtime_path_env,
+)
+
 IDENTITY_EXPORT_PATTERN = "identity_*.json"
-IDENTITY_EXPORT_DIR_ENV = "KESTREL_IDENTITY_EXPORT_DIR"
 _IDENTITY_EXPORT_PATH_ENV_VARS = (
     IDENTITY_EXPORT_DIR_ENV,
-    "KESTREL_DATA_DIR",
-    "AGENT_DATA_DIR",
+    DATA_DIR_ENV,
+    LEGACY_AGENT_DATA_DIR_ENV,
 )
 _TEMP_PREFIX = ".identity-export-"
 _TEMP_SUFFIX = ".tmp"
@@ -83,13 +91,15 @@ def identity_export_directory(
     environ = os.environ if env is None else env
     candidate = (
         per_agent_override
-        or environ.get(IDENTITY_EXPORT_DIR_ENV)
-        or environ.get("KESTREL_DATA_DIR")
+        or runtime_path_env(IDENTITY_EXPORT_DIR_ENV, environ=environ)
+        or runtime_path_env(DATA_DIR_ENV, environ=environ)
         or agent_data_dir
-        or environ.get("KESTREL_DB_PATH")
+        or runtime_path_env(AGENT_DB_PATH_ENV, environ=environ)
         or "agent_data"
     )
-    return _absolute_path(candidate)
+    return guard_storage_path(
+        _absolute_path(candidate), source="identity export root"
+    )
 
 
 def configured_identity_export_roots(
@@ -109,12 +119,10 @@ def configured_identity_export_roots(
     environ = os.environ if env is None else env
     candidates: list[Path | str] = []
     candidates.append("agent_data")
-    if environ.get(IDENTITY_EXPORT_DIR_ENV):
-        candidates.append(environ[IDENTITY_EXPORT_DIR_ENV])
-    if environ.get("KESTREL_DATA_DIR"):
-        candidates.append(environ["KESTREL_DATA_DIR"])
-    if environ.get("AGENT_DATA_DIR"):
-        candidates.append(environ["AGENT_DATA_DIR"])
+    for name in _IDENTITY_EXPORT_PATH_ENV_VARS:
+        configured = runtime_path_env(name, environ=environ, base=base)
+        if configured:
+            candidates.append(configured)
     candidates.extend(_configured_agent_export_roots(base))
     candidates.extend(additional_roots)
 

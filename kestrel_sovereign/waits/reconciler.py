@@ -52,17 +52,28 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sdk.signals import Signal, SignalMode, Visibility
-from kestrel_sdk.tools import MonitorableWaitable, ToolResult
+from kestrel_sdk.tools import MonitorableWaitable, ToolResult, WaitStatus
 
+from kestrel_sovereign.signals.correlation import SignalWithDurableCorrelation
 from kestrel_sovereign.signals.dispatcher import (
     SURFACE_QUEUED,
     SURFACE_UNSURFACED_STATES,
 )
-from kestrel_sovereign.storage.async_wait_signal_store import WaitSignalStore
+from kestrel_sovereign.signals.durable import DurableConsumerRegistration
+from kestrel_sovereign.signals.sources.wait import (
+    SOURCE_NAME as WAIT_COMPLETE_SOURCE,
+)
+from kestrel_sovereign.storage.async_wait_signal_store import (
+    DEFERRED_RATE_LIMITED,
+    MAX_ATTEMPTS_EXCEEDED,
+    WaitSignalState,
+    WaitSignalStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +81,12 @@ logger = logging.getLogger(__name__)
 # not produce unbounded LLM turns (mirrors talon_monitor's cap). After this
 # many attempts, lock the transition and surface a synthetic
 # ``max_attempts_exceeded`` delivery status for operator review.
+#
+# The cap is for a signal the dispatcher will always reject. A wake whose
+# cognition failed because the model provider named its own retry time is not
+# that: it is parked until the provider's time and its attempt is refunded
+# (#3302), so a two-hour rate limit cannot burn ten one-minute retries and
+# lock the wake away before the route comes back.
 MAX_DELIVERY_ATTEMPTS = 10
 
 # Dispatcher result statuses that mean the wake was ACCEPTED and its turn ran
@@ -79,6 +96,12 @@ MAX_DELIVERY_ATTEMPTS = 10
 # stranded wake report success for months (#2877).
 _PERSISTED_STATES = {"ok", "coalesced"}
 _HARD_FAIL_STATES = {"dropped_validation", "dropped_cycle"}
+
+# Payload key carrying the ``"<kind>:<handle>"`` reference every wake
+# announces. The reconciler writes it authoritatively, so it is the one key a
+# durable consumer can correlate a wake on across every provider — including
+# those that share the generic ``wait.complete`` source (#3295).
+WAKE_REF_PAYLOAD_KEY = "ref"
 
 # ---------------------------------------------------------------------------
 # Visibility verdicts (#2922)
@@ -122,6 +145,17 @@ def compose_delivery_status(dispatch_status: str, visibility: str) -> str:
     return f"{dispatch_status}_{visibility}"
 
 
+def wake_source(provider: Any) -> str:
+    """The signal source a terminal transition of ``provider``'s handles
+    is announced on.
+
+    The provider's own ``signal`` name when it declares one (e.g. talon's
+    ``talon.job_complete``, which carries its own prompt template);
+    otherwise the generic ``wait.complete`` source.
+    """
+    return getattr(provider, "signal", None) or WAIT_COMPLETE_SOURCE
+
+
 class WaitReconciler:
     """Generic two-phase wait→signal reconciler over ``agent.wait_registry``.
 
@@ -145,16 +179,18 @@ class WaitReconciler:
         # from that map is already a ``lost_at_restart`` soft-fail that never
         # reaches the visibility accounting.
         self._pending_signal_bindings: Dict[Tuple[str, str], bool] = {}
-        agent_id = (
-            getattr(agent, "did", None)
-            or getattr(agent, "agent_id", None)
-            or ""
-        )
+        # The wait-signal scope is the agent's DID through the shared guard.
+        # A missing identity refuses construction: an empty scope would bind
+        # this agent's transitions to the solo-agent legacy bucket and read
+        # them back as another agent's on a shared backend (#3251).
+        from kestrel_sovereign.features.storage_access import resolve_scoped_agent_did
+
+        agent_id = resolve_scoped_agent_did(agent)
         # The agent's AsyncDatabase lives behind _raw_storage.db (same path
         # PendingA2AQuestionStore is wired through in kestrel_agent.py).
         raw_storage = getattr(agent, "_raw_storage", None)
         db = getattr(raw_storage, "db", None)
-        self._store = WaitSignalStore(db, str(agent_id))
+        self._store = WaitSignalStore(db, agent_id)
         # Serialize reconcile ticks so the TWO drivers that can call this — the
         # scheduler's ``wait_reconcile`` cron AND the mandatory WaitFeature
         # fallback loop (#2729) — can never race on the shared
@@ -211,6 +247,9 @@ class WaitReconciler:
         signals_hard_failed = 0
         # soft_fail = retriable (rate_limit/quiet_hours/failed/raised/lost).
         signals_soft_failed = 0
+        # deferred = cognition failed on a provider-advised wait; parked until
+        # the provider's retry time with its attempt refunded (#3302).
+        signals_deferred = 0
         signals_enqueued = 0
         signals_skipped_no_dispatcher = 0
         scanned = 0
@@ -325,6 +364,34 @@ class WaitReconciler:
                     "delivery_status": status_value,
                     "delivery_error": delivery_error or "",
                 })
+            elif (
+                retry_at := self._cognition_retry_at(
+                    dispatcher, getattr(handle_obj, "signal_id", None)
+                )
+            ) is not None and target:
+                # The wake's cognition could not run because every model route
+                # declined a wait the provider itself dated (#3302). Retrying
+                # before then cannot succeed, and it is not the dispatcher
+                # rejecting the signal, so it must not spend the retry cap:
+                # park the wake until the provider's time, refund the attempt.
+                await store.record_deferral(
+                    kind, handle,
+                    target=target,
+                    retry_at=retry_at,
+                    delivery_error=delivery_error,
+                    attempt_at=now,
+                )
+                signals_deferred += 1
+                logger.info(
+                    "wait_reconcile: %s:%s cognition declined a provider-advised "
+                    "wait; parked until %s without spending a delivery attempt",
+                    kind, handle, retry_at.isoformat(timespec="seconds"),
+                )
+                transitions.append({
+                    "kind": kind, "handle": handle, "outcome": target,
+                    "delivery_status": DEFERRED_RATE_LIMITED,
+                    "deferred_until": retry_at.isoformat(timespec="seconds"),
+                })
             else:
                 # Soft fail (rate_limit/quiet_hours/failed/dispatcher_raised).
                 # Don't set signaled_outcome — next tick re-detects and
@@ -358,6 +425,7 @@ class WaitReconciler:
             "signals_hard_failed": 0,
             "signals_soft_failed": 0,
             "signals_skipped_no_dispatcher": 0,
+            "signals_parked": 0,
         }
         # (kind, handle) processed this tick so a handle that is BOTH
         # monitorable-active AND explicitly watched isn't polled/emitted twice.
@@ -407,6 +475,7 @@ class WaitReconciler:
         signals_hard_failed += counters["signals_hard_failed"]
         signals_soft_failed += counters["signals_soft_failed"]
         signals_skipped_no_dispatcher += counters["signals_skipped_no_dispatcher"]
+        signals_parked = counters["signals_parked"]
 
         parts = [
             f"persisted={signals_persisted}",
@@ -429,6 +498,10 @@ class WaitReconciler:
             parts.append(f"hard_failed={signals_hard_failed}")
         if signals_soft_failed:
             parts.append(f"soft_failed={signals_soft_failed}")
+        if signals_deferred:
+            parts.append(f"deferred={signals_deferred}")
+        if signals_parked:
+            parts.append(f"parked={signals_parked}")
         if signals_skipped_no_dispatcher:
             parts.append(
                 f"skipped_no_dispatcher={signals_skipped_no_dispatcher}"
@@ -458,6 +531,10 @@ class WaitReconciler:
                 "signals_enqueued": signals_enqueued,
                 "signals_hard_failed": signals_hard_failed,
                 "signals_soft_failed": signals_soft_failed,
+                # Harvested this tick as a provider-advised deferral (#3302),
+                # and still parked awaiting the provider's retry time.
+                "signals_deferred": signals_deferred,
+                "signals_parked": signals_parked,
                 "signals_skipped_no_dispatcher": signals_skipped_no_dispatcher,
                 "pending_deliveries": len(self._pending_signal_tasks),
                 "transitions": transitions,
@@ -465,6 +542,42 @@ class WaitReconciler:
         )
 
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cognition_retry_at(
+        dispatcher: Any, signal_id: Optional[str]
+    ) -> Optional[datetime]:
+        """The provider-advised retry time the dispatcher recorded for this
+        wake's failed cognition, or ``None`` (#3302).
+
+        Only the dispatcher's own record counts: it is set when the turn failed
+        because every model route declined a dated wait. A dispatcher without
+        the ledger, or with no record, means the failure was ordinary and the
+        attempt stays spent — no guessing from the error text.
+        """
+        lookup = getattr(dispatcher, "cognition_retry_at", None)
+        if not callable(lookup) or not signal_id:
+            return None
+        try:
+            retry_at = lookup(signal_id)
+        except Exception as exc:  # a broken ledger is not advice
+            logger.debug(
+                "cognition_retry_at(%r) raised on the dispatcher: %s",
+                signal_id, exc,
+            )
+            return None
+        if not isinstance(retry_at, datetime):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return retry_at
+
+    async def undelivered_wakes(self, limit: int = 50) -> List[WaitSignalState]:
+        """Wakes that have not reached the agent and will not soon (#3302):
+        those locked as ``max_attempts_exceeded`` and those parked until a
+        provider-advised retry time. See ``WaitSignalStore.list_undelivered``.
+        """
+        return await self._store.list_undelivered(limit=limit)
 
     @staticmethod
     def _resolve_visibility(
@@ -581,6 +694,19 @@ class WaitReconciler:
         same_transition = bool(
             state and state.attempts_signaled_target == signaled_token
         )
+
+        # Parked until a provider-advised retry time (#3302): nothing emitted
+        # before then can run, so leave the wake — and its attempts — alone.
+        # The park belongs to the transition it was recorded for, like the
+        # attempts above (#3364): a corrected terminal state is a new wake and
+        # is not held behind the old one's ``retry_at``.
+        deferred_until = (
+            state.deferred_until_utc() if (state and same_transition) else None
+        )
+        if deferred_until is not None and deferred_until > datetime.now(timezone.utc):
+            counters["signals_parked"] += 1
+            return
+
         attempts_so_far = (
             state.last_delivery_attempts if (state and same_transition) else 0
         )
@@ -589,14 +715,24 @@ class WaitReconciler:
             # delivery status for operator review.
             await store.record_delivery(
                 kind, handle,
-                delivery_status="max_attempts_exceeded",
+                delivery_status=MAX_ATTEMPTS_EXCEEDED,
+                # Keep the last real failure: it is the only account of why
+                # the wake never landed, and ``wait_status`` reports it.
+                delivery_error=state.last_delivery_error if state else None,
                 signaled_outcome=signaled_token,
                 attempt_at=datetime.now(timezone.utc),
             )
             counters["signals_hard_failed"] += 1
+            logger.warning(
+                "wait_reconcile: %s:%s locked after %d delivery attempts "
+                "without reaching the agent (last error: %s); listed by "
+                "wait_status",
+                kind, handle, attempts_so_far,
+                (state.last_delivery_error if state else None) or "none",
+            )
             transitions.append({
                 "kind": kind, "handle": handle, "outcome": status.outcome.value,
-                "delivery_status": "max_attempts_exceeded",
+                "delivery_status": MAX_ATTEMPTS_EXCEEDED,
                 "delivery_attempts": attempts_so_far,
             })
             return
@@ -734,8 +870,14 @@ class WaitReconciler:
         is pinned to the agent rather than to a session, so emitting would
         paint a turn into whichever pane happens to be open.
         """
-        source = getattr(provider, "signal", None) or "wait.complete"
+        source = wake_source(provider)
         prior_status = getattr(prior_state, "last_delivery_status", None)
+        # A wake parked on a provider-advised wait (#3302) re-emits with its
+        # refunded attempt number, so ``attempts > 1`` alone no longer says
+        # "this is not the first try": a first attempt deferred for two hours
+        # is exactly the late wake #3105 exists to label.
+        deferrals = int(getattr(prior_state, "delivery_deferrals", 0) or 0)
+        retried = attempts > 1 or deferrals > 0
         # ``last_attempt_started_at``, not ``last_delivery_attempt_at``: the
         # latter is rewritten by Phase 0's harvest, so it answers "when did the
         # reconciler last look" rather than "when was the previous dispatch
@@ -748,6 +890,14 @@ class WaitReconciler:
             "outcome": status.outcome.value,
             "summary": status.summary,
             "origin_session_id": origin_session_id or "",
+            # The wait reference this wake announces (#3295) — the key a
+            # durable resume consumer selects on (see
+            # :func:`register_wait_resume_consumer`). Written after the
+            # ``status.data`` spread for the same reason as
+            # ``origin_session_id``: a provider forwarding third-party data
+            # must not be able to point one handle's completion at another
+            # handle's parked work.
+            WAKE_REF_PAYLOAD_KEY: f"{kind}:{handle}",
             # DELIVERY PROVENANCE (#3105). A retry after a soft-failed
             # dispatch re-describes the same terminal transition, so its
             # payload is byte-identical to the first attempt's — the reader
@@ -764,17 +914,21 @@ class WaitReconciler:
             "delivery_max_attempts": MAX_DELIVERY_ATTEMPTS,
             # Empty on a first attempt; on a retry, how the PREVIOUS dispatch
             # of this same transition ended and when it was tried.
-            "delivery_previous_status": str(prior_status or "") if attempts > 1 else "",
+            "delivery_previous_status": str(prior_status or "") if retried else "",
             "delivery_previous_attempt_at": (
-                str(prior_at or "") if attempts > 1 else ""
+                str(prior_at or "") if retried else ""
             ),
+            # How many times this wake was parked until a provider-advised
+            # retry time before this dispatch (#3302). Those do not count
+            # toward ``delivery_attempt``.
+            "delivery_deferrals": deferrals,
         }
         target_agent = (
             getattr(self._agent, "did", None)
             or getattr(self._agent, "agent_id", None)
             or ""
         )
-        return Signal(
+        return SignalWithDurableCorrelation(
             source=source,
             kind="inbound",
             mode=SignalMode.COGNITION,
@@ -791,9 +945,16 @@ class WaitReconciler:
             # against the prior failed attempt (talon_monitor codex round 1
             # P1). Application-level dedup via last_signaled_outcome still
             # prevents redundant emits across ticks.
+            # A deferral refunds its attempt, so the re-emit reuses the
+            # attempt number; the deferral count keeps its key unique.
             dedupe_key=(
                 f"{kind}:{handle}:{self._signaled_token(status)}:attempt-{attempts}"
+                + (f":deferral-{deferrals}" if deferrals else "")
             ),
+            # The ref is written by this reconciler, never by the provider,
+            # so ANONYMOUS storage keeps it verbatim for the resume
+            # consumer's selector (#3295).
+            durable_correlation_keys=frozenset({WAKE_REF_PAYLOAD_KEY}),
         )
 
 
@@ -819,6 +980,16 @@ def _get_reconciler(agent: Any) -> "WaitReconciler":
         reconciler = WaitReconciler(agent)
         agent._wait_reconciler = reconciler
     return reconciler
+
+
+async def list_undelivered_wakes(agent: Any, limit: int = 50) -> List[WaitSignalState]:
+    """The agent's wakes that are locked after the retry cap or parked until
+    a provider-advised retry time (#3302), most recently updated first.
+
+    The read behind the ``wait_status`` tool; builds the singleton reconciler
+    if needed but never runs a tick.
+    """
+    return await _get_reconciler(agent).undelivered_wakes(limit=limit)
 
 
 async def _provider_owns_handle(provider: Any, handle: str) -> Optional[bool]:
@@ -897,35 +1068,14 @@ async def _provider_origin_session(provider: Any, handle: str) -> Optional[str]:
     return result.strip()
 
 
-async def register_wait_watch(agent: Any, ref: str) -> None:
-    """Register an explicit watch on ``ref`` so the reconciler wakes the agent
-    when that handle reaches a terminal state.
+async def _resolve_owned_provider(agent: Any, ref: str) -> Tuple[str, str, Any]:
+    """Resolve ``ref`` to ``(kind, handle, provider)`` for a durable watch.
 
-    This is the durable backing for ``wait(target, mode="signal")``: it parses
-    the ``"<kind>:<handle>"`` ref, validates the kind is registered in
-    ``agent.wait_registry`` (so a typo'd or unloaded kind fails LOUD rather
-    than silently never waking), validates provider/handle OWNERSHIP whenever
-    the provider can (#2729), and records ``watching=1`` on the reconciler's
-    store. The reconciler's watched-handles loop then polls it every tick —
-    works for ANY Waitable, including poll-only providers (TaskWaitable) that
-    have no ``active_handles`` for the implicit auto-wake path.
-
-    Provider *availability* (a kind is registered) and provider *ownership*
-    (the handle actually belongs to that provider) are distinct. A registered
-    kind re-arms across restart; a handle that a foreign provider owns is a
-    mismatch that must fail synchronously HERE rather than becoming a durable
-    watch that the reconciler later converts into a misleading terminal
-    ``wait.complete`` failure. The canonical example (#2729): an outbound A2A
-    task id registered as ``task:<id>`` — the ``task`` provider is the LOCAL
-    background TaskStore, does not own the outbound id, and its poll would
-    read "not found" and emit a false terminal failure. Ownership validation
-    rejects it up front and, when another registered provider DOES own the
-    handle, names it so the caller can retry with the right kind.
-
-    Raises:
-        ValueError: on a malformed ref, a missing ``wait_registry``, a
-            ``kind`` with no registered provider, or a handle the named
-            provider affirmatively does not own.
+    The validation shared by :func:`register_wait_watch` and
+    :func:`register_wait_resume_consumer`: a malformed ref, a missing
+    registry, an unregistered kind, or a handle the provider affirmatively
+    does not own all raise ``ValueError`` here, before anything durable is
+    written.
     """
     from kestrel_sovereign.waits.engine import parse_ref
 
@@ -963,5 +1113,194 @@ async def register_wait_watch(agent: Any, ref: str) -> None:
             f"(the {kind!r} provider does not own it){hint}"
         )
 
-    reconciler = _get_reconciler(agent)
-    await reconciler._store.start_watch(kind, handle)
+    return kind, handle, provider
+
+
+async def register_wait_watch(agent: Any, ref: str) -> None:
+    """Register an explicit watch on ``ref`` so the reconciler wakes the agent
+    when that handle reaches a terminal state.
+
+    This is the durable backing for ``wait(target, mode="signal")``: it parses
+    the ``"<kind>:<handle>"`` ref, validates the kind is registered in
+    ``agent.wait_registry`` (so a typo'd or unloaded kind fails LOUD rather
+    than silently never waking), validates provider/handle OWNERSHIP whenever
+    the provider can (#2729), and records ``watching=1`` on the reconciler's
+    store. The reconciler's watched-handles loop then polls it every tick —
+    works for ANY Waitable, including poll-only providers (TaskWaitable) that
+    have no ``active_handles`` for the implicit auto-wake path.
+
+    Provider *availability* (a kind is registered) and provider *ownership*
+    (the handle actually belongs to that provider) are distinct. A registered
+    kind re-arms across restart; a handle that a foreign provider owns is a
+    mismatch that must fail synchronously HERE rather than becoming a durable
+    watch that the reconciler later converts into a misleading terminal
+    ``wait.complete`` failure. The canonical example (#2729): an outbound A2A
+    task id registered as ``task:<id>`` — the ``task`` provider is the LOCAL
+    background TaskStore, does not own the outbound id, and its poll would
+    read "not found" and emit a false terminal failure. Ownership validation
+    rejects it up front and, when another registered provider DOES own the
+    handle, names it so the caller can retry with the right kind.
+
+    Raises:
+        ValueError: on a malformed ref, a missing ``wait_registry``, a
+            ``kind`` with no registered provider, or a handle the named
+            provider affirmatively does not own.
+    """
+    kind, handle, _provider = await _resolve_owned_provider(agent, ref)
+    await _get_reconciler(agent)._store.start_watch(kind, handle)
+
+
+class DurableResumeUnsupportedError(ValueError):
+    """The agent's privacy mode cannot carry a durable resume (#3295).
+
+    EPHEMERAL, ISOLATED, and DEIDENTIFIED storage persist only a marker in
+    place of every durable signal payload, so no stored wake could ever
+    satisfy a ``payload.ref`` selector. A consumer registered anyway would
+    park work that never resumes. Nothing is registered and no watch is
+    armed; the caller keeps the non-durable ``wait(..., mode="signal")``
+    path instead.
+    """
+
+    reason = "unsupported_in_privacy_mode"
+
+    def __init__(self, ref: str, storage: str) -> None:
+        self.ref = ref
+        self.storage = storage
+        super().__init__(
+            f"{self.reason}: durable resume for {ref!r} is refused because "
+            f"privacy storage {storage!r} elides durable signal payloads, so "
+            "no wake could match its selector; use a non-durable signal-mode "
+            "wait instead"
+        )
+
+
+@dataclass(frozen=True)
+class WaitResumeRegistration:
+    """What :func:`register_wait_resume_consumer` established.
+
+    ``already_terminal`` is the handle's state as polled *after* the watch
+    and consumer were durably registered, when that state was already
+    terminal;
+    ``None`` means the handle was still in flight at that point, so its
+    terminal transition happens after the registration and will be delivered
+    to ``registration.consumer_id``.
+    """
+
+    registration: DurableConsumerRegistration
+    already_terminal: Optional[WaitStatus]
+
+
+async def register_wait_resume_consumer(
+    agent: Any,
+    ref: str,
+    *,
+    consumer_id: str,
+    max_attempts: int = 0,
+    lease_seconds: int = 60,
+) -> WaitResumeRegistration:
+    """Durably subscribe ``consumer_id`` to the wake announcing that ``ref``
+    reached a terminal state (#3295).
+
+    This is the signal-resume path for work that must outlive a held turn
+    (:data:`~kestrel_sovereign.waits.engine.MAX_HANDLE_WAIT_SECONDS`). A
+    caller that parked on a ``"<kind>:<handle>"`` reference — a workflow
+    stage waiting on the ``talon:<job_id>`` its dispatch stage returned, for
+    example — calls this once instead of holding a turn, then claims,
+    acts on, and acknowledges deliveries through the dispatcher's durable
+    consumer API.
+
+    It validates ``ref`` exactly as :func:`register_wait_watch` does, arms
+    the same watch (so a poll-only provider is reconciled too), and registers
+    a durable consumer on the provider's :func:`wake_source`, correlated on
+    the wake's authoritative ``payload.ref``. Correlating on the ref rather
+    than a provider field keeps it unique across every provider that shares
+    ``wait.complete``, and a provider's poll data cannot redirect it. The
+    wake names the ref as a durable correlation key, so ANONYMOUS storage
+    keeps it verbatim rather than anonymizing it out of the selector's reach.
+
+    The resume guarantee is the post-registration poll, not backfill.
+    After the watch and consumer are durable, the provider is polled once
+    more. If the handle is already terminal, that state is returned as
+    ``already_terminal`` and the caller must act on it directly: its wake
+    may have been committed before this registration in a form the selector
+    cannot match (a payload-eliding privacy mode persists only a marker in
+    place of the payload, and wakes older than ``payload.ref`` never carried
+    it),
+    and the reconciler never re-announces a transition it already delivered.
+    Otherwise the terminal transition happens after the registration, and
+    its wake gets a delivery directly. A matchable wake committed earlier
+    is also backfilled, so a caller may see both ``already_terminal`` and a
+    delivery for the same transition. Delivery is at least once — a retried
+    wake for the same transition is a second delivery.
+
+    A delivery is a *wake*, not a verdict. The consumer must poll the
+    provider for the handle's actual state on every delivery. When the
+    parked work is finished, retire the subscription with
+    ``dispatcher.deactivate_durable_consumer(consumer_id=...)``.
+
+    The watch is armed *before* the consumer exists, and that order is an
+    invariant. A consumer without a watch is an unrecoverable stall: an
+    interruption between the two writes (a crash, an OOM, a restart) would
+    leave a durable subscription for a poll-only provider (talon, CI) whose
+    handle the reconciler never polls again, so no wake ever comes and
+    nothing detects it. A watch without a consumer is harmless — it only
+    wakes the agent through the normal reconciler cognition path — and a
+    retry of this call, which is idempotent for the same ``consumer_id``,
+    completes the registration.
+
+    A privacy mode that elides durable payloads (EPHEMERAL, ISOLATED,
+    DEIDENTIFIED, as the dispatcher's ``durable_payload_elided_by`` reports)
+    is refused before anything is written: every wake would be stored as a
+    bare marker, so the selector could never match and a still-pending
+    handle would park forever. A switch to such a mode *after* registration
+    does not strand the consumer: the delivery is matched on the live
+    payload, and a claim that arrives after the emitter's first lease expired
+    receives it as marker-only retry work (#3370).
+
+    ``max_attempts`` defaults to ``0`` (retain until acknowledged): this wake
+    is the only thing that resumes the parked work, so a transient consumer
+    failure must not convert it into a terminal loss. The watch also wakes
+    the agent through the normal reconciler cognition path; that is the
+    existing behavior of every watched handle and is not suppressed here.
+
+    Returns:
+        The stored registration, and the handle's terminal state when it
+        was already terminal after registering.
+
+    Raises:
+        DurableResumeUnsupportedError: when the agent's privacy mode elides
+            durable signal payloads; no watch or consumer was written.
+        ValueError: on any :func:`register_wait_watch` validation failure,
+            or when the agent has no durable signal dispatcher.
+        Exception: whatever the provider's post-registration ``poll``
+            raises. The registration stands, but whether the handle was
+            already terminal is unknown, so the caller must not park on it;
+            re-registering the same ``consumer_id`` is idempotent.
+    """
+    kind, handle, provider = await _resolve_owned_provider(agent, ref)
+    dispatcher = getattr(agent, "dispatcher", None)
+    register = getattr(dispatcher, "register_durable_consumer", None)
+    elided_by = getattr(dispatcher, "durable_payload_elided_by", None)
+    if not callable(register) or not callable(elided_by):
+        raise ValueError(
+            "durable signal delivery unavailable: the agent's dispatcher "
+            "cannot register durable consumers"
+        )
+    storage = elided_by()
+    if storage is not None:
+        raise DurableResumeUnsupportedError(f"{kind}:{handle}", storage)
+    registration = DurableConsumerRegistration(
+        consumer_id=consumer_id,
+        source=wake_source(provider),
+        agent_id=str(getattr(agent, "did", None) or ""),
+        correlation_selector=f"payload.{WAKE_REF_PAYLOAD_KEY}={kind}:{handle}",
+        max_attempts=max_attempts,
+        lease_seconds=lease_seconds,
+    )
+    await _get_reconciler(agent)._store.start_watch(kind, handle)
+    await register(registration)
+    status = await provider.poll(handle)
+    return WaitResumeRegistration(
+        registration=registration,
+        already_terminal=status if status.outcome.is_terminal() else None,
+    )

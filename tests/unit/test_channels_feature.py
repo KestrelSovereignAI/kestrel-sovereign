@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from kestrel_sdk.channels import ChannelMessage as SDKChannelMessage
+from kestrel_sdk.signals import Status
 
 from kestrel_sovereign.features.channels.adapter import ChannelAdapter
 from kestrel_sovereign.features.channels.feature import (
@@ -1285,6 +1286,78 @@ class TestChannelFeature:
         assert admission.disposition is InboundAdmissionDisposition.RETRYABLE
         agent.dispatcher.enqueue_durable_cognition.assert_awaited_once()
         router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_returns_typed_held_without_acknowledging_cursor(self):
+        """Hold is an immediate refusal, not a durable provider ACK."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:test:channels"
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        handle = MagicMock()
+        handle.wait_for_durable_admission = AsyncMock(
+            return_value=DurableAdmissionResult(
+                disposition=DurableAdmissionDisposition.HELD,
+                signal_id="signal-held",
+            )
+        )
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock(return_value=handle)
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        admission = await feat.handle_inbound(
+            _cursor_owned_telegram(ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="555",
+                recipient="bot",
+                content="tell me the agent is held",
+            )),
+        )
+
+        assert admission.disposition is InboundAdmissionDisposition.HELD
+        assert admission.durably_admitted is False
+        router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_volatile_cursor_returns_typed_held_from_terminal_result(self):
+        """Privacy-gated ingress preserves the same synchronous Hold type."""
+
+        db = _make_db()
+        agent = _make_agent(db=db, privacy_preset="ephemeral")
+        agent.did = "did:test:channels"
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        handle = MagicMock()
+        handle.wait = AsyncMock(
+            return_value=SimpleNamespace(
+                status=Status.COALESCED,
+                error="hold_deferred",
+            )
+        )
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock(return_value=handle)
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        admission = await feat.handle_inbound(
+            _cursor_owned_telegram(ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="555",
+                recipient="bot",
+                content="remain private while held",
+            )),
+        )
+
+        assert admission.disposition is InboundAdmissionDisposition.HELD
+        assert admission.durably_admitted is False
+        agent.dispatcher.get_durable_delivery_for_event.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_telegram_host_rejects_forged_username_sender_before_durable_admission(self):

@@ -8,14 +8,76 @@ from .authority import (
     CooperativeStopTarget,
     StopCleanupRegistry,
 )
-from .types import StopDisposition, StopOutcome, StopRequest, StopScope
+from .circuit import (
+    PeerStopCircuit,
+    PeerStopCircuitDecision,
+    PeerStopCircuitError,
+    PeerStopCircuitEvent,
+    PeerStopCircuitEventKind,
+    PeerStopCircuitPolicy,
+    PeerStopCircuitStore,
+)
+from .fleet import execute_fleet_stop, fleet_in_flight_count
+from .invocation import (
+    DistributedInvocationRegistry,
+    DistributedInvocationStore,
+    DistributedStopTicket,
+    StopLegacyRegistrationsError,
+)
+from .receipt import (
+    StopOperationClaim,
+    StopReceipt,
+    StopReceiptConflict,
+    StopReceiptCorruptError,
+    StopReceiptError,
+    StopReceiptOutcomeRecord,
+    StopReceiptPage,
+    StopReceiptRecord,
+    StopReceiptStore,
+    UnavailableStopReceiptStore,
+)
+from .types import (
+    AuthoritativeStopDescendant,
+    MAX_STOP_CORRELATION_ID_BYTES,
+    StopDisposition,
+    StopDoor,
+    StopOutcome,
+    StopRequest,
+    StopScope,
+)
 
 __all__ = [
+    "MAX_STOP_CORRELATION_ID_BYTES",
+    "AuthoritativeStopDescendant",
     "CancellationAuthority",
     "CooperativeStopTarget",
-    "StopDisposition",
+    "DistributedInvocationRegistry",
+    "DistributedInvocationStore",
+    "DistributedStopTicket",
+    "PeerStopCircuit",
+    "PeerStopCircuitDecision",
+    "PeerStopCircuitError",
+    "PeerStopCircuitEvent",
+    "PeerStopCircuitEventKind",
+    "PeerStopCircuitPolicy",
+    "PeerStopCircuitStore",
     "StopCleanupRegistry",
+    "StopDisposition",
+    "StopDoor",
+    "StopLegacyRegistrationsError",
+    "StopOperationClaim",
     "StopOutcome",
+    "StopReceipt",
+    "StopReceiptConflict",
+    "StopReceiptCorruptError",
+    "StopReceiptError",
+    "StopReceiptOutcomeRecord",
+    "StopReceiptPage",
+    "StopReceiptRecord",
+    "StopReceiptStore",
     "StopRequest",
     "StopScope",
+    "UnavailableStopReceiptStore",
+    "execute_fleet_stop",
+    "fleet_in_flight_count",
 ]

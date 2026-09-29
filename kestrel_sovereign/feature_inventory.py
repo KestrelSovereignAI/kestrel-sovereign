@@ -117,11 +117,24 @@ def discover_entrypoint_feature_class_names() -> list[str]:
         return []
 
 
+# Modules that live beside the routers and mount none of their own. The
+# inventory names the files a route family is served FROM; a shared helper
+# listed there would advertise a surface that does not exist.
+ENDPOINT_HELPER_MODULES = frozenset(
+    {
+        "__init__.py",
+        "agent_helpers.py",
+        "closing_streaming_response.py",
+        "receipt_feed.py",
+    }
+)
+
+
 def discover_endpoint_router_files() -> list[str]:
     return sorted(
         path.name
         for path in ENDPOINTS_ROOT.glob("*.py")
-        if path.name not in {"__init__.py", "agent_helpers.py"}
+        if path.name not in ENDPOINT_HELPER_MODULES
     )
 
 
@@ -525,10 +538,32 @@ def render_inventory_json(inventory: Inventory) -> str:
 
 
 def replace_generated_inventory(existing: str, generated: str) -> str:
+    r"""Splice *generated* into *existing* between the region markers.
+
+    Idempotent by construction (#3116): the separators around the region
+    are rebuilt from scratch on every run rather than added to whatever
+    the previous run left. ``after`` still carries the newline that
+    terminated the END marker line, so appending one produced a file one
+    blank line longer each time ``--write`` ran. Nothing failed — the
+    sync test compares both sides ``.strip()``ed, so drift inside the
+    region is invisible to it — and the count of blank lines above
+    "## Authentication Surface" on ``main`` was the count of past runs.
+
+    The trailing newline is deliberately NOT normalised here. Trimming
+    the file's tail is what broke the first attempt at this: dropping
+    the last element of a ``split("\n")`` removes the final newline and
+    git reports ``\ No newline at end of file``. Only the region's own
+    boundary is rebuilt.
+    """
     if GENERATED_START in existing and GENERATED_END in existing:
         before, rest = existing.split(GENERATED_START, 1)
         _, after = rest.split(GENERATED_END, 1)
-        return before.rstrip() + "\n\n" + generated.rstrip() + "\n" + after
+        tail = after.lstrip("\n")
+        # One blank line between the END marker and whatever follows;
+        # a bare newline when the marker ends the file, so the file
+        # keeps its trailing newline without gaining a blank line.
+        separator = "\n\n" if tail else "\n"
+        return before.rstrip() + "\n\n" + generated.rstrip() + separator + tail
 
     insertion_heading = "\n## Authentication Surface\n"
     if insertion_heading in existing:

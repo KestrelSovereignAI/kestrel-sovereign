@@ -22,6 +22,7 @@ import pytest
 
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.llm.streaming import RoutingResolution, StreamingMixin
+from tests.utils.anthropic_client import models_api
 
 
 # --------------------------------------------------------------------------
@@ -54,7 +55,7 @@ def _ev(event_type: str, **fields: Any) -> SimpleNamespace:
 def _drive(adapter, events) -> List[Any]:
     fake_messages = MagicMock()
     fake_messages.stream = MagicMock(return_value=_FakeAnthropicStream(events))
-    fake_client = SimpleNamespace(messages=fake_messages)
+    fake_client = SimpleNamespace(messages=fake_messages, models=models_api())
     items: List[Any] = []
 
     async def _run():
@@ -773,7 +774,7 @@ def test_anthropic_populates_usage_sink_as_events_arrive():
     sink: dict = {}
     fake_messages = MagicMock()
     fake_messages.stream = MagicMock(return_value=_FakeAnthropicStream(events))
-    fake_client = SimpleNamespace(messages=fake_messages)
+    fake_client = SimpleNamespace(messages=fake_messages, models=models_api())
 
     async def _run():
         async for _ in AnthropicAdapter().get_streaming_response_with_tools(

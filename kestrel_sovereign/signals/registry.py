@@ -50,6 +50,9 @@ from kestrel_sdk.signals import (
     SourceRegistration,
     Trust,
 )
+from kestrel_sovereign.signals.in_flight_control import (
+    InFlightControlActionRegistration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -357,6 +360,55 @@ class SourceRegistry:
                 removed.append(name)
         return tuple(removed)
 
+    def quarantine_claims(
+        self,
+        owner,
+        registrations: Iterable[SourceRegistration],
+        role: str = CLAIM_CONTRIBUTION,
+    ) -> tuple[str, ...]:
+        """Release exact drifted claims without deleting replacement sources.
+
+        The ordinary ownership inverse removes the resident source when its
+        final claim is released. Recovery additionally knows the exact source
+        objects declared by the lifecycle. If the claim ledger is already
+        absent, an exact unheld resident is still removed. If a different,
+        non-equivalent object now occupies that name, release the stale claim
+        but preserve the replacement.
+        """
+
+        if owner is None:
+            raise TypeError("quarantine owner must not be None")
+        normalized_role = _claim_role_for(owner, role)
+        values = tuple(registrations)
+        if any(not isinstance(item, SourceRegistration) for item in values):
+            raise TypeError(
+                "quarantine registrations must be SourceRegistration values"
+            )
+        names = [registration.name for registration in values]
+        if len(set(names)) != len(names):
+            raise RegistrationError(
+                "duplicate source name in quarantine registration set"
+            )
+        key = (id(owner), normalized_role)
+        released = []
+        for registration in values:
+            holders = self._claims.get(registration.name)
+            if holders and key not in holders:
+                continue
+            if holders:
+                holders.remove(key)
+                released.append(registration.name)
+            if not holders:
+                self._claims.pop(registration.name, None)
+                resident = self._sources.get(registration.name)
+                if resident is registration or (
+                    resident is not None
+                    and self.contract_equivalent(resident, registration)
+                ):
+                    self._sources.pop(registration.name, None)
+        self._forget_owner_if_unreferenced(key)
+        return tuple(released)
+
     def unregister(self, name: str) -> bool:
         """Remove a source by name. Returns True if one was present.
 
@@ -507,23 +559,22 @@ class SourceRegistry:
         ownership + self-loop policy, the redaction policy's *flags and
         summarizer* (not merely its class), retention, the four
         constitutional-injection fields, the per-signal prompt-override
-        opt-in (``allow_prompt_override``), and the pre-turn guard. A
-        re-registration that changes any of them is therefore caught as a
-        MISMATCH instead of being silently accepted as equivalent.
+        opt-in (``allow_prompt_override``), the pre-turn admission guard
+        (``pre_turn_guard``), and whether the source is a typed in-flight
+        control ACTION (:class:`InFlightControlActionRegistration`, which
+        changes durable projection and Hold policy). A re-registration that
+        changes any of them is therefore caught as a MISMATCH instead of being
+        silently accepted as equivalent.
 
         ``allow_prompt_override`` is validated at registration time (only a
         ``bool`` is accepted) yet governs a real dispatch decision — whether a
         signal's ``prompt_template_override`` is honored — so two otherwise
         identical registrations that differ only in that flag are a genuine
         contract mismatch and must not compare equivalent (#2522 P1).
-
-        ``pre_turn_guard`` is the same shape of field and the same trap
-        (#3101 review P2): it decides whether a COGNITION dispatch is refused
-        at the handoff into the turn. Omitting it here made a guarded and an
-        unguarded registration compare equivalent, so an optional/idempotent
-        re-registration would keep the UNGUARDED one — silently dropping the
-        refusal — and report no mismatch. Guard identity is part of the
-        contract.
+        ``pre_turn_guard`` is in for the same reason and with more at stake: a
+        re-registration that swaps or drops the guard changes what admits the
+        source's turns, and comparing those equivalent would keep the OLD
+        admission decision in force (#3310).
 
         Callables are fingerprinted by :func:`_callable_identity`, which folds
         in a bound method's owner and a closure's *captured free variables* by
@@ -581,6 +632,7 @@ class SourceRegistry:
             reg.system_prompt_budget_bytes,
             getattr(reg, "allow_prompt_override", False),
             _callable_identity(getattr(reg, "pre_turn_guard", None)),
+            isinstance(reg, InFlightControlActionRegistration),
         )
 
     @classmethod
@@ -665,16 +717,67 @@ class SourceRegistry:
                 f"when declared, got {type(allow_prompt_override).__name__}."
             )
 
-        # A declared-but-uncallable pre-turn guard is a refusal that can never
-        # fire. The dispatcher calls it fail-closed, so a non-callable would
-        # turn EVERY dispatch of this source into a refusal at the handoff —
-        # far better caught here, at registration, than as a permanently
-        # silent source in production (#3101 review P2).
-        pre_turn_guard = getattr(reg, "pre_turn_guard", None)
-        if pre_turn_guard is not None and not callable(pre_turn_guard):
+        # Pre-turn admission — kestrel-sovereign#3310.
+        SourceRegistry._validate_pre_turn_guard(reg)
+
+        # In-flight control ACTIONs skip the privacy transition lock and Hold
+        # (#3169); keep that exemption to trusted, payload-free ACTIONs.
+        if isinstance(reg, InFlightControlActionRegistration):
+            if reg.allowed_modes != frozenset({SignalMode.ACTION}):
+                raise RegistrationError(
+                    f"Source '{reg.name}': an in-flight control registration "
+                    "must allow ACTION mode only."
+                )
+            if reg.trust is not Trust.TRUSTED:
+                raise RegistrationError(
+                    f"Source '{reg.name}': an in-flight control ACTION must be "
+                    "trusted."
+                )
+            if reg.log_redaction.store_raw_trusted:
+                raise RegistrationError(
+                    f"Source '{reg.name}': an in-flight control ACTION cannot "
+                    "retain raw trusted payloads in the outcome log."
+                )
+
+    @staticmethod
+    def _validate_pre_turn_guard(reg: SourceRegistration) -> None:
+        """A declared ``pre_turn_guard`` must be usable where it is evaluated.
+
+        The dispatcher hands the guard to ``process_input``, which runs it as
+        the first operation inside the turn's CONVERSATION -> privacy-transition
+        span (see `kestrel_sovereign/signals/pre_turn_guard.py`). Two invariants
+        are checked here rather than at dispatch time, because a guard that
+        cannot run is a source contract error and the registry is the v1
+        boundary:
+
+        * COGNITION-only. A guard exists to stop a turn; an ACTION or ARTIFACT
+          dispatch has no turn, so a guard declared there would never run — the
+          silent no-op this whole seam exists to avoid.
+        * Synchronous. The span's value is that it holds no suspension point
+          between the check and the prompt being consumed. A coroutine function
+          is rejected outright; a plain callable that returns an awaitable is
+          caught at call time by ``process_input``.
+        """
+        guard = getattr(reg, "pre_turn_guard", None)
+        if guard is None:
+            return
+        if not callable(guard):
             raise RegistrationError(
                 f"Source '{reg.name}': pre_turn_guard must be callable when "
-                f"declared, got {type(pre_turn_guard).__name__}."
+                f"declared, got {type(guard).__name__}."
+            )
+        if SignalMode.COGNITION not in reg.allowed_modes:
+            raise RegistrationError(
+                f"Source '{reg.name}' declares a pre_turn_guard but does not "
+                "allow COGNITION. A pre-turn guard admits or refuses a turn, "
+                "and ACTION / ARTIFACT dispatches have no turn to refuse."
+            )
+        if inspect.iscoroutinefunction(guard):
+            raise RegistrationError(
+                f"Source '{reg.name}': pre_turn_guard must be synchronous. It "
+                "runs inside the turn's privacy-transition span, whose whole "
+                "purpose is to contain no suspension point between the check "
+                "and the turn consuming its prompt."
             )
 
     @staticmethod

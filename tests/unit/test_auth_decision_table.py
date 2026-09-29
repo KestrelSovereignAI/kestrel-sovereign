@@ -1,6 +1,7 @@
 """Decision-table tests for auth classes in server.py."""
 
 from contextlib import asynccontextmanager
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI, Request
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 import pytest
 from starlette.middleware.sessions import SessionMiddleware
 
+from kestrel_sovereign.auth import normalize_api_key
 from kestrel_sovereign.server import auth_middleware
 
 
@@ -50,6 +52,7 @@ def _prepare_app():
         "lifespan": app.router.lifespan_context,
         "agent": getattr(app.state, "agent", None),
         "manager": getattr(app.state, "agent_manager", None),
+        "config": getattr(app.state, "multi_agent_config", None),
     }
     app.router.lifespan_context = noop_lifespan
     return app, original
@@ -59,6 +62,7 @@ def _restore_app(app, original):
     app.router.lifespan_context = original["lifespan"]
     app.state.agent = original["agent"]
     app.state.agent_manager = original["manager"]
+    app.state.multi_agent_config = original["config"]
 
 
 def test_root_html_is_public_when_oauth_not_required():
@@ -101,6 +105,173 @@ def test_bootstrap_key_is_localhost_only_when_enabled():
         assert denied_response.status_code == 403
     finally:
         _restore_app(app, original)
+
+
+def test_quoted_empty_api_key_cannot_authenticate_an_empty_bearer():
+    """Docker's literal quote characters must not turn empty into a key."""
+
+    app = FastAPI()
+    app.middleware("http")(auth_middleware)
+
+    @app.get("/protected")
+    async def protected(request: Request):
+        return {"role": request.state.caller.role.value}
+
+    with patch.dict(
+        "os.environ",
+        {"KESTREL_API_KEY": '""', "KESTREL_REQUIRE_OAUTH": "false"},
+    ):
+        with TestClient(app) as client:
+            response = client.get(
+                "/protected",
+                headers={"Authorization": "Bearer "},
+            )
+        generated_key = os.environ["KESTREL_API_KEY"]
+
+    assert response.status_code == 401
+    assert generated_key not in ("", '""')
+
+
+def test_normalize_api_key_treats_quoted_empty_as_absent():
+    assert normalize_api_key('""') is None
+    assert normalize_api_key("''") is None
+
+
+def test_managed_peer_process_cannot_bootstrap_or_use_sovereign_key():
+    """A transport-only child has no recoverable local operator lane."""
+
+    app, original = _prepare_app()
+    try:
+        with patch.dict(
+            "os.environ",
+            {
+                "KESTREL_A2A_TRANSPORT_ONLY": "true",
+                "KESTREL_API_KEY": "",
+                "KESTREL_REQUIRE_OAUTH": "false",
+            },
+        ):
+            with TestClient(app, client=("127.0.0.1", 55000)) as client:
+                bootstrap = client.get("/api/auth/key")
+                assert bootstrap.status_code == 404
+                assert os.environ["KESTREL_API_KEY"] == ""
+
+                # Even an accidentally configured child-local key must not
+                # recreate operator authority inside the managed process.
+                os.environ["KESTREL_API_KEY"] = "child-local-sovereign-key"
+                protected = client.get(
+                    "/api/agent/tasks",
+                    headers={"X-API-Key": "child-local-sovereign-key"},
+                )
+                assert protected.status_code == 401
+                assert protected.json()["error"]["code"] == (
+                    "authentication_required"
+                )
+    finally:
+        _restore_app(app, original)
+
+
+@pytest.mark.parametrize("host_state", ["manager", "config"])
+def test_multi_agent_host_never_bootstraps_sovereign_key_to_local_peer(host_state):
+    """Loopback cannot distinguish a browser from a managed peer process."""
+
+    app, original = _prepare_app()
+    try:
+        app.state.agent = None
+        app.state.agent_manager = (
+            _SessionAgentManager(_make_agent()) if host_state == "manager" else None
+        )
+        app.state.multi_agent_config = object() if host_state == "config" else None
+        with patch.dict(
+            "os.environ",
+            {
+                "KESTREL_API_KEY": "host-sovereign-key",
+                "KESTREL_REQUIRE_OAUTH": "false",
+            },
+        ):
+            with TestClient(app, client=("127.0.0.1", 55000)) as client:
+                response = client.get("/api/auth/key")
+
+        assert response.status_code == 404
+        assert "host-sovereign-key" not in response.text
+    finally:
+        _restore_app(app, original)
+
+
+def test_multi_agent_server_rejects_missing_out_of_band_host_key(monkeypatch):
+    """A fleet must never fall back to a peer-recoverable ephemeral key."""
+    from kestrel_sovereign import server
+
+    monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="kestrel setup keys"):
+        server._require_multi_agent_host_api_key(os.environ)
+
+
+def test_oauth_only_multi_agent_server_still_requires_sovereign_key(monkeypatch):
+    """Allowlisted OAuth authenticates users but does not mint mandate authority."""
+    from kestrel_sovereign import server
+
+    monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
+    monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "true")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "operator-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "operator-client-secret")
+    monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", "operator@example.com")
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="stable KESTREL_API_KEY"):
+        server._require_multi_agent_host_api_key(os.environ)
+
+
+def test_multi_agent_server_rejects_keyless_oauth_with_empty_allowlist(monkeypatch):
+    """OAuth credentials alone cannot leave a fleet with no admitted operator."""
+    from kestrel_sovereign import server
+
+    monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
+    monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "true")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "operator-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "operator-client-secret")
+    monkeypatch.delenv("KESTREL_ALLOWED_EMAILS", raising=False)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="stable KESTREL_API_KEY"):
+        server._require_multi_agent_host_api_key(os.environ)
+
+
+def test_multi_agent_server_rejects_keyless_unconfigured_oauth(monkeypatch):
+    """The OAuth flag alone must not create an inaccessible fleet host."""
+    from kestrel_sovereign import server
+
+    monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
+    monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "true")
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="stable KESTREL_API_KEY"):
+        server._require_multi_agent_host_api_key(os.environ)
+
+
+@pytest.mark.asyncio
+async def test_multi_agent_lifespan_checks_host_key_before_starting_resources(
+    monkeypatch,
+):
+    """The direct-uvicorn path must invoke the same fleet credential guard."""
+    from kestrel_sovereign import server
+
+    class GuardReached(RuntimeError):
+        pass
+
+    monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
+    monkeypatch.setattr(
+        server,
+        "_require_multi_agent_host_api_key",
+        lambda _environ: (_ for _ in ()).throw(GuardReached("guard reached")),
+    )
+
+    with pytest.raises(GuardReached, match="guard reached"):
+        async with server._lifespan_startup(FastAPI()):
+            pass
 
 
 def test_auth_me_rejects_api_key_without_session():

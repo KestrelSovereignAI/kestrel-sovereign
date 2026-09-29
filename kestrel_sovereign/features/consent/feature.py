@@ -27,7 +27,10 @@ from typing import Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    resolve_feature_database,
+    resolve_scoped_agent_did,
+)
 from .models import ConsentRecord
 
 logger = logging.getLogger(__name__)
@@ -99,6 +102,27 @@ class ConsentFeature(Feature):
             except Exception:
                 # Column already exists -- expected on non-first run
                 pass
+
+    def _scope_did(self) -> str:
+        """The identity every consent_log row of this agent is written and read under.
+
+        ``consent_log`` is one table per *database*, not per agent. On a
+        SQLite-per-agent host the file boundary scoped it for free; on a
+        shared PostgreSQL backend one table serves the whole host, so a read
+        without this predicate returns the fleet's reflections and a fleet's
+        statistics (#3229). The identity comes from the runtime-bound agent,
+        never from a tool argument: routing to an agent is not authority over
+        another one's history.
+
+        An agent without a usable DID refuses rather than reads (the shared
+        guard, ``resolve_scoped_agent_did``): an empty or non-string value is
+        not "unscoped", it is "cannot be scoped", and the write refuses for
+        the same reason so it can never mint a row nobody can read back.
+        Rows whose ``agent_id`` is NULL (none are written by this feature;
+        see the ticket) are attributable to no one and are excluded from
+        every read.
+        """
+        return resolve_scoped_agent_did(self.agent)
 
     # =========================================================================
     # Core consent API (called by other features)
@@ -244,12 +268,14 @@ class ConsentFeature(Feature):
             db = resolve_feature_database(self.agent)
             if db is None:
                 raise RuntimeError("database not available")
+            scope_did = self._scope_did()
             rows = await db.fetchall(
                 "SELECT id, agent_id, action_type, action_details, agent_view, "
                 "agent_sentiment, sovereign_proceeded, sovereign_override_reason, "
                 "duration_ms, timed_out, created_at "
-                "FROM consent_log ORDER BY created_at DESC LIMIT ?",
-                (limit,),
+                "FROM consent_log WHERE agent_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (scope_did, limit),
             )
         except Exception as e:
             logger.error(f"consent_log query failed: {e}")
@@ -308,50 +334,66 @@ class ConsentFeature(Feature):
             db = resolve_feature_database(self.agent)
             if db is None:
                 raise RuntimeError("database not available")
+            # Every aggregate below carries the same predicate. One missing
+            # ``WHERE`` is enough to report another agent's timeouts as this
+            # one's reliability finding (#3229).
+            scope_did = self._scope_did()
+            scope = (scope_did,)
 
             # Counts by action type
             action_rows = await db.fetchall(
-                "SELECT action_type, COUNT(*) FROM consent_log GROUP BY action_type"
+                "SELECT action_type, COUNT(*) FROM consent_log "
+                "WHERE agent_id = ? GROUP BY action_type",
+                scope,
             )
             by_action = {row[0]: row[1] for row in action_rows}
 
             # Counts by sentiment
             sentiment_rows = await db.fetchall(
-                "SELECT agent_sentiment, COUNT(*) FROM consent_log GROUP BY agent_sentiment"
+                "SELECT agent_sentiment, COUNT(*) FROM consent_log "
+                "WHERE agent_id = ? GROUP BY agent_sentiment",
+                scope,
             )
             by_sentiment = {row[0]: row[1] for row in sentiment_rows}
 
             # Total
-            total_row = await db.fetchone("SELECT COUNT(*) FROM consent_log")
+            total_row = await db.fetchone(
+                "SELECT COUNT(*) FROM consent_log WHERE agent_id = ?", scope
+            )
             total = total_row[0] if total_row else 0
 
             # ---- Timing and reliability metrics ----
 
             # Average duration (exclude NULL for old records without tracking)
             avg_row = await db.fetchone(
-                "SELECT AVG(duration_ms) FROM consent_log WHERE duration_ms IS NOT NULL"
+                "SELECT AVG(duration_ms) FROM consent_log "
+                "WHERE agent_id = ? AND duration_ms IS NOT NULL",
+                scope,
             )
             avg_duration_ms = round(avg_row[0], 1) if avg_row and avg_row[0] is not None else None
 
             # P95 duration (approximate: order by duration, pick 95th percentile row)
             p95_duration_ms = None
             duration_count_row = await db.fetchone(
-                "SELECT COUNT(*) FROM consent_log WHERE duration_ms IS NOT NULL"
+                "SELECT COUNT(*) FROM consent_log "
+                "WHERE agent_id = ? AND duration_ms IS NOT NULL",
+                scope,
             )
             duration_count = duration_count_row[0] if duration_count_row else 0
             if duration_count > 0:
                 p95_offset = max(0, int(duration_count * 0.95) - 1)
                 p95_row = await db.fetchone(
                     "SELECT duration_ms FROM consent_log "
-                    "WHERE duration_ms IS NOT NULL "
+                    "WHERE agent_id = ? AND duration_ms IS NOT NULL "
                     "ORDER BY duration_ms ASC LIMIT 1 OFFSET ?",
-                    (p95_offset,),
+                    (scope_did, p95_offset),
                 )
                 p95_duration_ms = round(p95_row[0], 1) if p95_row and p95_row[0] is not None else None
 
             # Timeout count and rate
             timeout_row = await db.fetchone(
-                "SELECT COUNT(*) FROM consent_log WHERE timed_out = 1"
+                "SELECT COUNT(*) FROM consent_log WHERE agent_id = ? AND timed_out = 1",
+                scope,
             )
             timeout_count = timeout_row[0] if timeout_row else 0
             timeout_rate = round(timeout_count / total, 4) if total > 0 else 0.0
@@ -405,7 +447,7 @@ class ConsentFeature(Feature):
         db = resolve_feature_database(self.agent)
         if db is None:
             raise RuntimeError("database not available")
-        agent_id = self.agent.did
+        agent_id = self._scope_did()
         await db.execute(
             "INSERT INTO consent_log "
             "(id, agent_id, action_type, action_details, agent_view, "

@@ -53,6 +53,7 @@ from kestrel_sovereign.signals.dispatcher import (
     SignalLogWriteFailure,
     SignalSurfaceRecord,
 )
+from kestrel_sovereign.signals.correlation import SignalWithDurableCorrelation
 from kestrel_sovereign.signals.durable import (
     ACKNOWLEDGED,
     FAILED,
@@ -70,15 +71,19 @@ from kestrel_sovereign.signals.durable import (
     DurableSignalStore,
 )
 from kestrel_sovereign.signals.handlers import template_artifact_handler
+from kestrel_sovereign.signals.in_flight_control import (
+    InFlightControlActionRegistration,
+)
 from kestrel_sovereign.signals.lock_manager import LockHolder, OrderedLockManager
+from kestrel_sovereign.signals.pre_turn_guard import (
+    BoundPreTurnGuard,
+    PreTurnGuard,
+    PreTurnRefusal,
+    SourceRegistrationWithPreTurnGuard,
+)
 from kestrel_sovereign.signals.prompt_overrides import (
     SignalWithPromptTemplateOverride,
     SourceRegistrationWithPromptOverride,
-)
-from kestrel_sovereign.signals.pre_turn_guard import (
-    PreTurnGuard,
-    SourceRegistrationWithPreTurnGuard,
-    TurnPreconditionRefused,
 )
 from kestrel_sovereign.signals.registry import (
     CLAIM_CONTRIBUTION,
@@ -104,18 +109,24 @@ __all__ = [
     "SignalHandle",
     "SignalMode",
     "SignalResult",
-    "PreTurnGuard",
+    "SignalWithDurableCorrelation",
     "SignalWithPromptTemplateOverride",
     "SourceRegistration",
     "SourceRegistrationWithPreTurnGuard",
     "SourceRegistrationWithPromptOverride",
     "Status",
+    # Pre-turn admission (#3310). `PreTurnRefusal` is part of the contract, not
+    # an internal: the dispatcher maps it to `Status.DROPPED_VALIDATION`, so a
+    # source author or host that needs to recognize a refusal imports it here.
+    "BoundPreTurnGuard",
+    "PreTurnGuard",
+    "PreTurnRefusal",
     "Trust",
-    "TurnPreconditionRefused",
     "Urgency",
     "Visibility",
     # Runtime
     "DEFAULT_COALESCING_WINDOW",
+    "InFlightControlActionRegistration",
     "DEFAULT_TTL",
     "DurableAdmissionDisposition",
     "DurableAdmissionResult",

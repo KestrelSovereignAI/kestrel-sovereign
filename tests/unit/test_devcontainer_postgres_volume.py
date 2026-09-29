@@ -125,15 +125,20 @@ def test_the_devcontainer_and_ci_agree_on_the_major():
     16-only mistake from the tier that gates merges.
     """
     devcontainer_major = _image_major(_compose()["services"]["postgres"]["image"])
-    ci_major = _image_major(
-        yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["integration-tests"][
-            "services"
-        ]["postgres"]["image"]
-    )
+    jobs = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]
+    ci_majors = {
+        name: _image_major(job["services"]["postgres"]["image"])
+        for name, job in jobs.items()
+        if "postgres" in (job.get("services") or {})
+    }
+    # Both test tiers run PostgreSQL cases (#3381); each must be on the floor.
+    assert {"unit-tests", "integration-tests"} <= set(ci_majors), ci_majors
 
-    assert devcontainer_major == ci_major, (
-        f"devcontainer runs pg{devcontainer_major} and CI runs pg{ci_major}"
-    )
+    for job, ci_major in ci_majors.items():
+        assert devcontainer_major == ci_major, (
+            f"devcontainer runs pg{devcontainer_major} and CI {job} runs "
+            f"pg{ci_major}"
+        )
     assert devcontainer_major >= MINIMUM_MAJOR, (
         f"#2958's session_id backfill needs `pg_input_is_valid(...,'jsonb')` "
         f"(PostgreSQL {MINIMUM_MAJOR}+); pg{devcontainer_major} would make that "

@@ -16,7 +16,9 @@ select a profile, never compose one.
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -60,6 +62,131 @@ def default_sovereign_repo_path() -> str:
         if (parent / ".git").exists():
             return str(parent)
     return ""
+
+
+# How long one resolved default branch (and its tag-collision answer) is
+# reused. The executor re-verifies an agent-filed update row at several
+# boundaries per coordinator tick, and the boot-time issuance adoption
+# re-verifies every stored row; one ``git`` process per verification would
+# block the event loop for ~10ms each. The check made immediately before an
+# update profile runs passes ``fresh=True`` and never uses this cache, so a
+# re-pointed ``origin/HEAD`` or a new tag cannot be missed where it matters.
+_DEFAULT_BRANCH_TTL_SECONDS = 30.0
+_default_branch_cache: dict[tuple[str, ...], tuple[float, object]] = {}
+
+
+def _git(repo_path: str, *args: str, timeout: float = 5):
+    try:
+        return subprocess.run(
+            ["git", "-C", repo_path, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _read_checkout_default_branch(repo_path: str) -> str:
+    result = _git(repo_path, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+    if result is None or result.returncode != 0:
+        return ""
+    ref = (result.stdout or "").strip()
+    # The full target (not ``--short``, which may keep a disambiguating
+    # prefix) is ``refs/remotes/origin/<branch>``. The update profile fetches
+    # from ``origin``, so only a branch of that remote is the default.
+    prefix = "refs/remotes/origin/"
+    if not ref.startswith(prefix):
+        return ""
+    branch = ref[len(prefix):]
+    return branch if is_valid_target_ref(branch) else ""
+
+
+def _read_local_tag_exists(repo_path: str, name: str) -> bool | None:
+    result = _git(repo_path, "show-ref", "--verify", "--quiet", f"refs/tags/{name}")
+    if result is None:
+        return None
+    if result.returncode == 0:
+        return True
+    # ``show-ref --verify`` exits 1 exactly when the ref is absent; anything
+    # else is a failure to read the namespace, which answers nothing.
+    return False if result.returncode == 1 else None
+
+
+def _cached(key: tuple[str, ...], fresh: bool, read):
+    now = time.monotonic()
+    cached = _default_branch_cache.get(key)
+    if (
+        not fresh
+        and cached is not None
+        and now - cached[0] < _DEFAULT_BRANCH_TTL_SECONDS
+    ):
+        return cached[1]
+    value = read()
+    _default_branch_cache[key] = (now, value)
+    return value
+
+
+def checkout_default_branch(repo_path: str, *, fresh: bool = False) -> str:
+    """The checkout's default branch as ``origin/HEAD`` names it, or ``""``.
+
+    The same source ``kestrel update`` reattaches a detached checkout to
+    (``cli_lifecycle._git_reattach_if_safely_detached``), but with no fallback:
+    this answers an authority question (#3339), so an unconfigured
+    ``origin/HEAD`` means "no default branch is known", never ``"main"``.
+    ``fresh=True`` re-reads ``origin/HEAD`` (and refreshes the cache).
+    """
+    if not repo_path:
+        return ""
+    return _cached(
+        ("branch", repo_path), fresh,
+        lambda: _read_checkout_default_branch(repo_path),
+    )
+
+
+def checkout_has_tag(
+    repo_path: str, name: str, *, fresh: bool = False,
+) -> bool | None:
+    """Whether the checkout's local tag namespace has ``refs/tags/<name>``.
+
+    ``None`` when the namespace could not be read. The profile's
+    ``git fetch --tags`` mirrors origin's tags into this namespace, so after
+    any update has run it reflects the remote; a tag created on origin since
+    the last fetch is seen only by :func:`origin_has_tag`.
+    """
+    if not repo_path or not name:
+        return None
+    return _cached(
+        ("tag", repo_path, name), fresh,
+        lambda: _read_local_tag_exists(repo_path, name),
+    )
+
+
+def origin_has_tag(repo_path: str, name: str) -> bool | None:
+    """Whether ``origin`` itself advertises ``refs/tags/<name>`` right now.
+
+    One read-only ``git ls-remote`` (network). ``None`` when origin could
+    not be asked, which is not evidence of absence.
+    """
+    if not repo_path or not name:
+        return None
+    result = _git(
+        repo_path, "ls-remote", "--tags", "origin", f"refs/tags/{name}",
+        timeout=30,
+    )
+    if result is None or result.returncode != 0:
+        return None
+    wanted = {f"refs/tags/{name}", f"refs/tags/{name}^{{}}"}
+    return any(
+        line.split("\t", 1)[-1].strip() in wanted
+        for line in (result.stdout or "").splitlines()
+    )
+
+
+def clear_checkout_default_branch_cache() -> None:
+    """Forget every cached default-branch and tag answer."""
+    _default_branch_cache.clear()
 
 
 @dataclass(frozen=True)

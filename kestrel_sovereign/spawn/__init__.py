@@ -8,6 +8,7 @@ and SpawnedAgentLifecycle for TTL monitoring and auto-cleanup.
 """
 
 from .mandate import (
+    PersistedSpawnMandateExpiredError,
     SpawnMandate,
     sign_mandate,
     verify_mandate,
@@ -30,6 +31,7 @@ from .lifecycle import (
 )
 
 __all__ = [
+    "PersistedSpawnMandateExpiredError",
     "SpawnMandate",
     "sign_mandate",
     "verify_mandate",

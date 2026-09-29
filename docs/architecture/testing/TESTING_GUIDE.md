@@ -227,12 +227,24 @@ npx playwright show-report
 
 The GitHub Actions workflow runs:
 
-1. Lint and import validation
+1. Syntax and import validation (the `lint-and-imports` job: ruff F811 on
+   changed files, Python 3.11 `compileall`, and module import checks)
 2. Unit tests
 3. Integration tests (with PostgreSQL/Redis services)
 4. LLM tests (with API keys from secrets)
 
 E2E tests require a running server and are run manually.
+
+The `lint-and-imports` job is not a repository-wide ruff or mypy gate. Broad
+lint and type enforcement is staged under the structural quality campaign
+([#2480](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2480)),
+which adds narrow regression gates as each baseline is paid down rather than an
+always-red tree-wide check.
+
+The `Typing :: Typed` classifier is backed by the PEP 561 marker
+`kestrel_sovereign/py.typed`. `tests/unit/test_packaging_typed_marker.py`
+builds the wheel, checks that its metadata and contents agree, and confirms a
+clean install exposes the marker.
 
 ## Troubleshooting
 

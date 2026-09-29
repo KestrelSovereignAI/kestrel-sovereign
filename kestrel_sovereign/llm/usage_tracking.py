@@ -9,11 +9,14 @@ import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List, Optional, TYPE_CHECKING
+from typing import Dict, Any, Iterable, List, Optional, Set, TYPE_CHECKING
+
+from kestrel_sovereign.security.host_authority import require_sovereign_caller
 
 from kestrel_sovereign.storage.db.postgres import (
     concurrent_write_retry_delay,
 )
+from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -38,11 +41,13 @@ class UsageTrackingMixin:
     _usage_db: Optional['AsyncDatabase']
     _db_backend: str
     _db_initialized: bool
+    _usage_db_owned: bool
 
     def _init_usage_tracking(
         self,
         database_url: Optional[str] = None,
         agent_data_dir: Optional[Any] = None,
+        usage_db: Optional['AsyncDatabase'] = None,
     ):
         """Initialize usage tracking state (async initialization done in _ensure_db_initialized).
 
@@ -52,9 +57,20 @@ class UsageTrackingMixin:
             agent_data_dir: The owning agent's data root. This is the strongest
                          signal for where SQLite usage rows belong — see the
                          precedence note in the body.
+            usage_db: Host-owned, initialized database shared with other services.
+                      Its connection lifecycle remains the host's responsibility.
         """
-        self._usage_db = None
-        self._db_initialized = False
+        self._usage_db = usage_db
+        self._usage_db_owned = usage_db is None
+        self._db_initialized = usage_db is not None
+
+        if usage_db is not None:
+            if usage_db.backend_type not in ("postgres", "sqlite"):
+                raise ValueError("usage_db must use a PostgreSQL or SQLite backend")
+            self._db_backend = usage_db.backend_type
+            self._usage_database_url = None
+            logger.info("Model usage tracking configured: shared %s database", self._db_backend)
+            return
         
         # Determine backend and connection info
         self._usage_database_url = (
@@ -89,7 +105,7 @@ class UsageTrackingMixin:
             db_path = (
                 os.fspath(agent_data_dir)
                 if agent_data_dir
-                else os.environ.get("KESTREL_DB_PATH", "./agent_data")
+                else runtime_path_env(AGENT_DB_PATH_ENV, "./agent_data")
             )
             self._usage_db_dir = db_path
             self._usage_db_path = os.path.join(db_path, "llm_usage.db")
@@ -321,7 +337,21 @@ class UsageTrackingMixin:
         auto_confirm: bool = True,
         progress_callback=None
     ) -> bool:
-        """Pull (download) an Ollama model."""
+        """Pull (download) an Ollama model.
+
+        The daemon is one per host and the download lands on shared disk, so
+        this is host administration, not an agent's own change: it requires
+        the turn's endpoint-bound sovereign caller (#3221). The check sits
+        here rather than in the tool because this method is also reached by
+        the silent auto-pull in ``get_response_with_model``; a scheduler
+        wake, an OAuth-driven turn, or the in-process ``kestrel shell`` (which
+        runs turns with no caller, like the restart authority before it) that
+        names a missing model must not install it host-wide as a side effect.
+        Operators pull through ``kestrel ask``/the console (sovereign key) or
+        ``ollama pull`` directly.
+        """
+        require_sovereign_caller("shared local model installation")
+
         ollama_provider = None
         for provider in self.providers:
             if provider.get("vendor") == "ollama":
@@ -392,14 +422,61 @@ class UsageTrackingMixin:
             logger.error(f"Failed to pull model {model_name}: {e}")
             raise RuntimeError(f"Failed to pull model: {e}")
 
+    def locally_protected_models(self) -> Set[str]:
+        """Local model names this service must keep: its Ollama providers,
+        its mandate defaults and mandates, and its active preference.
+
+        One agent's view. On a multi-agent host the daemon is shared, so a
+        deletion must union this over every co-hosted agent's service
+        (``ModelAgent.cleanup_models`` does), not just the caller's.
+        """
+        protected: Set[str] = set()
+        for provider in self.providers:
+            if provider.get("vendor") == "ollama" and provider.get("model"):
+                protected.add(provider["model"])
+
+        mandate_config = getattr(self, "mandate_config", None)
+        if mandate_config:
+            defaults = mandate_config.get("defaults", {})
+            if "preferred" in defaults:
+                protected.add(defaults["preferred"])
+            mandates = mandate_config.get("mandates", {})
+            for model in mandates.values():
+                if "ollama" in model or ":" in model:
+                    protected.add(model)
+
+        # The model this agent is pinned to right now. It was never in the
+        # protected set before, so an agent pinned to a local model could
+        # have it deleted under it by its own cleanup.
+        get_preference = getattr(self, "get_model_preference", None)
+        if callable(get_preference):
+            preferred = (get_preference() or {}).get("model")
+            if isinstance(preferred, str) and preferred:
+                protected.add(preferred)
+        return protected
+
     async def cleanup_unused_models(
         self,
         threshold_days: int = 30,
         min_free_space_pct: int = 10,
-        dry_run: bool = False
+        dry_run: bool = False,
+        protected_models: Iterable[str] = (),
     ) -> List[str]:
-        """Clean up unused Ollama models to free space."""
+        """Clean up unused Ollama models to free space.
+
+        ``protected_models`` are names other co-hosted agents still need,
+        unioned with this service's own; nothing named there is deleted.
+
+        A real deletion removes files every agent on the host loads from,
+        so it requires the turn's endpoint-bound sovereign caller (#3221) —
+        decided before any storage is inspected; the in-process
+        ``kestrel shell`` carries none and is refused too. A dry run is a
+        report and needs no authority.
+        """
         from datetime import timedelta
+
+        if not dry_run:
+            require_sovereign_caller("shared local model deletion")
 
         storage = await self.get_storage_info(use_cache=False)
         free_space_pct = (storage["available_gb"] / storage["total_gb"]) * 100
@@ -410,19 +487,9 @@ class UsageTrackingMixin:
 
         logger.info(f"Starting cleanup. Free space: {free_space_pct:.1f}%")
 
-        protected_models = set()
-        for provider in self.providers:
-            if provider.get("vendor") == "ollama":
-                protected_models.add(provider["model"])
-
-        if self.mandate_config:
-            defaults = self.mandate_config.get("defaults", {})
-            if "preferred" in defaults:
-                protected_models.add(defaults["preferred"])
-            mandates = self.mandate_config.get("mandates", {})
-            for model in mandates.values():
-                if "ollama" in model or ":" in model:
-                    protected_models.add(model)
+        protected_models = self.locally_protected_models() | {
+            name for name in protected_models if isinstance(name, str) and name
+        }
 
         logger.info(f"Protected models: {protected_models}")
 
@@ -501,7 +568,13 @@ class UsageTrackingMixin:
         return deleted_models
 
     async def _check_and_cleanup_if_needed(self):
-        """Check storage and automatically cleanup if space is low."""
+        """Check storage and automatically cleanup if space is low.
+
+        No production caller. The deletion it attempts requires the turn's
+        sovereign caller (#3221), so from any unattended path this logs
+        "Auto-cleanup failed" and deletes nothing — by design: an automatic
+        low-disk sweep of a daemon every agent shares is host administration.
+        """
         try:
             storage = await self.get_storage_info(use_cache=False)
             free_space_pct = (storage["available_gb"] / storage["total_gb"]) * 100
@@ -520,6 +593,10 @@ class UsageTrackingMixin:
 
     async def close_usage_db(self):
         """Close the usage tracking database connection."""
+        if not getattr(self, "_usage_db_owned", True):
+            # A host can share one database across many LLM services. Closing
+            # any one service must not retire the host's operational pool.
+            return
         if self._usage_db:
             try:
                 await self._usage_db.close()

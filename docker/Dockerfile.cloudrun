@@ -12,6 +12,7 @@ WORKDIR /app
 # RUN masks the failure — the venv ends up empty and Cloud Run revisions can't
 # start. Same fix that's already in Dockerfile.multi_agent.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    bubblewrap \
     curl \
     git \
     gcc \

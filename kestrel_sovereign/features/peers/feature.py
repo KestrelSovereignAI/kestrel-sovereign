@@ -32,6 +32,7 @@ import httpx
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.peers.directory import (
     LocalHostPeerDirectory,
@@ -50,6 +51,7 @@ from kestrel_sovereign.features.peers.directory import (
     PeerUnavailableError,
     iter_sse_events,
 )
+from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
 logger = logging.getLogger(__name__)
 
@@ -272,7 +274,36 @@ class PeersFeature(Feature):
 
     async def initialize(self):
         self._host_url = _discover_host_url()
-        self._api_key = os.environ.get("KESTREL_API_KEY", "")
+        self._transport_key = ensure_a2a_transport_key()
+        # ProcessManager children boot through the single-agent server branch
+        # and therefore never receive AgentManager's in-memory DID resolver.
+        # Their launcher supplies an authenticated public-material snapshot;
+        # install it before accepting signed peer actions.
+        from kestrel_sovereign.a2a.did_registry import (
+            install_process_a2a_did_resolver,
+        )
+
+        process_resolver = install_process_a2a_did_resolver(self.agent)
+        if process_resolver is None:
+            process_resolver = getattr(
+                self.agent,
+                "_a2a_process_did_resolver",
+                None,
+            )
+        from kestrel_sovereign.a2a.transport_auth import (
+            is_a2a_transport_only_process,
+        )
+
+        managed_subprocess = is_a2a_transport_only_process()
+        if managed_subprocess:
+            from kestrel_sovereign.a2a.inbound_authorization import (
+                mark_a2a_inbound_scoped_policy,
+            )
+
+            # This launch marker is authoritative even if registry or host
+            # wiring is absent. A broken managed child must deny A2A rather
+            # than silently regain standalone unsigned compatibility.
+            mark_a2a_inbound_scoped_policy(self.agent, required=True)
         self._own_name = self._get_own_name()
         # A hosted runtime injects both objects at agent construction.  The
         # requester scope is host-authenticated, opaque to this feature, and
@@ -294,6 +325,27 @@ class PeersFeature(Feature):
                 )
         elif self._host_url:
             self._install_local_host_router()
+
+        if managed_subprocess:
+            from kestrel_sovereign.a2a.inbound_authorization import (
+                install_a2a_inbound_sender_authorizer,
+            )
+
+            # The endpoint reads its immutable policy from the agent, while
+            # the subprocess compatibility router normally belongs to this
+            # feature. Publish the exact pair only for a launcher-marked child.
+            self.agent.peer_directory_router = self._peer_router
+            self.agent.peer_requester = self._peer_requester
+            sender_id_resolver = (
+                process_resolver.directory_agent_id
+                if process_resolver is not None
+                else lambda _signing_did: None
+            )
+            install_a2a_inbound_sender_authorizer(
+                None,
+                recipient=self.agent,
+                sender_id_resolver=sender_id_resolver,
+            )
 
         # #1576: every outbound A2A dispatch writes a sender-side audit
         # row. The receiver-side ``a2a_tasks`` row tells us what the
@@ -343,7 +395,7 @@ class PeersFeature(Feature):
             return self.agent._agent_name
 
         # Fall back to data dir basename
-        db_path = os.environ.get("KESTREL_DB_PATH", "")
+        db_path = runtime_path_env(AGENT_DB_PATH_ENV, "")
         if db_path:
             return Path(db_path).name
 
@@ -385,11 +437,15 @@ class PeersFeature(Feature):
         # the first operation that installed this adapter.
         self._peer_router = LocalHostPeerDirectory(
             host_url,
-            api_key=getattr(self, "_api_key", ""),
+            transport_key=getattr(self, "_transport_key", ""),
             client_factory=lambda *args, **kwargs: httpx.AsyncClient(
                 *args, **kwargs,
             ),
             local_cancel=getattr(self, "_local_host_cancel", None),
+            local_stop=getattr(self, "_local_host_stop", None),
+            local_get=getattr(self, "_local_host_get", None),
+            local_subscribe=getattr(self, "_local_host_subscribe", None),
+            principal_payload_factory=self._build_principal_action_payload,
         )
 
     def _peer_directory_context(
@@ -441,12 +497,15 @@ class PeersFeature(Feature):
         self,
         *,
         host_url: str,
-        api_key: str,
+        transport_key: str,
         local_cancel=None,
+        local_stop=None,
+        local_get=None,
+        local_subscribe=None,
     ) -> Optional[Tuple[PeerDirectoryRouter, PeerRequester]]:
         """Refresh only the local compatibility adapter for hosted policy.
 
-        Host registration can occur after platform port resolution or API-key
+        Host registration can occur after platform port resolution or peer-key
         generation. Those are host-owned runtime facts, so the local adapter
         must be reconstructed from them before the host freezes its inbound
         policy. An injected scoped router is intentionally never replaced.
@@ -462,8 +521,11 @@ class PeersFeature(Feature):
         if router is not None and not isinstance(router, LocalHostPeerDirectory):
             return self._peer_directory_context()
         self._host_url = host_url.rstrip("/")
-        self._api_key = api_key
+        self._transport_key = transport_key
         self._local_host_cancel = local_cancel
+        self._local_host_stop = local_stop
+        self._local_host_get = local_get
+        self._local_host_subscribe = local_subscribe
         self._peer_router = None
         self._peer_requester = None
         self._install_local_host_router()
@@ -755,6 +817,414 @@ class PeersFeature(Feature):
                 type(exc).__name__,
             )
             raise OutboundSigningError("hybrid_signer_error") from exc
+
+    def _build_principal_action_payload(
+        self,
+        task_id: str,
+        verb: str,
+    ) -> Dict[str, Any]:
+        """Build a signed creator-principal envelope for HTTP read/SSE.
+
+        Process-isolated peers cannot carry the host manager's in-memory
+        capability. Binding the action verb, task id, session id, and message
+        into the ordinary replay-protected A2A signature gives the recipient
+        the same durable creator principal without trusting the shared API key.
+        """
+
+        if verb not in {"read_task", "subscribe_task"}:
+            raise OutboundSigningError("unsupported_principal_action")
+        if not isinstance(task_id, str) or not task_id:
+            raise OutboundSigningError("invalid_principal_task_id")
+        session_id = f"a2a-{verb}:{task_id}"
+        message = f"{verb}:{task_id}"
+        payload: Dict[str, Any] = {
+            "id": task_id,
+            "sessionId": session_id,
+            "message": {
+                "role": "user",
+                "parts": [{"type": "text", "text": message}],
+            },
+            "metadata": {
+                "sender": self._current_legacy_outbound_sender(),
+                "a2a_verb": verb,
+            },
+        }
+        self._maybe_sign_outbound(
+            payload,
+            task_id=task_id,
+            sess_id=session_id,
+            message=message,
+        )
+        metadata = payload.get("metadata") or {}
+        if not isinstance(metadata, Mapping) or not metadata.get("signature"):
+            raise OutboundSigningError("principal_signature_required")
+        return payload
+
+    @tool(
+        name="stop_peer",
+        description=(
+            "Cooperatively stop a peer agent's current in-flight work through "
+            "the authenticated signal rail. Any authorized peer may pull this "
+            "bounded, rate-limited andon cord; it does not Hold, terminate, "
+            "cascade to the peer's descendants, or grant hierarchy. Use "
+            "scope='agent' for the peer's current work, or scope='turn' with "
+            "that exact observable turn id."
+        ),
+        category=ToolCategory.COMMUNICATION,
+        command_prefix="!peer stop",
+    )
+    async def stop_peer(
+        self,
+        recipient: str,
+        reason: str = "Peer requested cooperative Stop",
+        scope: str = "agent",
+        target: str = "",
+    ) -> ToolResult:
+        """Request a peer Stop without bypassing dispatcher policy."""
+
+        from uuid import uuid4
+
+        from kestrel_sdk.signals import Status
+        from kestrel_sovereign.signals.sources.peer_stop import (
+            MAX_PEER_STOP_REASON_CHARS,
+            PEER_STOP_A2A_VERB,
+            encode_peer_stop_intent,
+            peer_stop_delivery_id,
+        )
+        from kestrel_sovereign.a2a.envelope_signing import (
+            A2A_AUDIENCE_METADATA_KEY,
+        )
+        from kestrel_sovereign.stop import StopDisposition, StopOutcome, StopScope
+
+        try:
+            stop_scope = StopScope(scope)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                "Peer Stop scope must be agent or turn",
+                data={"stopped": False, "recipient": recipient},
+            )
+        if stop_scope is StopScope.HOST:
+            return ToolResult.failed(
+                "Peer Stop cannot target host scope",
+                data={"stopped": False, "recipient": recipient},
+            )
+        if stop_scope is StopScope.TOOL_CALL:
+            return ToolResult.failed(
+                "Peer Stop cannot target tool_call scope until the peer exposes "
+                "a live tool-call cancellation address",
+                data={"stopped": False, "recipient": recipient},
+            )
+        work_target = target or None
+        if stop_scope is StopScope.AGENT:
+            if work_target is not None:
+                return ToolResult.failed(
+                    "Agent-scope peer Stop is routed by the peer directory and "
+                    "cannot carry a second target",
+                    data={"stopped": False, "recipient": recipient},
+                )
+        elif work_target is None:
+            return ToolResult.failed(
+                f"Peer {stop_scope.value} Stop requires an exact work target",
+                data={"stopped": False, "recipient": recipient},
+            )
+        if (
+            not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason) > MAX_PEER_STOP_REASON_CHARS
+        ):
+            return ToolResult.failed(
+                "Peer Stop reason must be non-empty and at most "
+                f"{MAX_PEER_STOP_REASON_CHARS} characters",
+                data={"stopped": False, "recipient": recipient},
+            )
+
+        try:
+            router, requester, peer = await self._resolve_automatic_peer(recipient)
+        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError):
+            return ToolResult.failed(
+                "Peer is not available in the automatic directory",
+                data={"stopped": False, "recipient": recipient},
+            )
+        except (PeerTransportError, PeerUnavailableError):
+            return ToolResult.failed(
+                f"Could not reach agent '{recipient}'",
+                data={"stopped": False, "recipient": recipient},
+            )
+        except PeerDirectoryError:
+            logger.exception("Peer Stop route resolution failed for %r", recipient)
+            return ToolResult.failed(
+                "Peer routing is unavailable",
+                data={"stopped": False, "recipient": recipient},
+            )
+
+        correlation_id = uuid4().hex
+        session_id = f"peer-stop-{correlation_id}"
+        try:
+            message = encode_peer_stop_intent(
+                scope=stop_scope,
+                target=work_target,
+                reason=reason,
+                # Cascade is sovereign-only (#3143); a peer never asks for it.
+                cascade=False,
+                correlation_id=correlation_id,
+            )
+        except (TypeError, ValueError) as error:
+            return ToolResult.failed(
+                f"Invalid peer Stop request: {error}",
+                data={"stopped": False, "recipient": recipient},
+            )
+
+        metadata: Dict[str, Any] = {
+            "sender": self._current_legacy_outbound_sender(),
+            "a2a_verb": PEER_STOP_A2A_VERB,
+            # Signed on remote routes and manager-bound on same-host routes.
+            # Receivers compare it to their trusted route identity; it never
+            # supplies Signal.target_agent.
+            A2A_AUDIENCE_METADATA_KEY: peer.agent_id,
+        }
+        chain_provider = getattr(self.agent, "_provide_causation_chain", None)
+        if callable(chain_provider):
+            try:
+                chain = chain_provider()
+            except Exception as error:  # noqa: BLE001 - agent context provider
+                logger.warning(
+                    "Could not read peer Stop causation chain: %s",
+                    type(error).__name__,
+                )
+                return ToolResult.failed(
+                    "Peer Stop could not preserve its causation chain",
+                    data={"stopped": False, "recipient": recipient},
+                )
+            if chain:
+                metadata["causation_chain"] = chain
+        route_stop = getattr(router, "stop_peer", None)
+        if not callable(route_stop):
+            return ToolResult.failed(
+                "Peer router does not support cooperative Stop",
+                data={"stopped": False, "recipient": recipient},
+            )
+
+        try:
+            raw_response = await self._deliver_peer_stop(
+                route_stop,
+                requester,
+                peer,
+                correlation_id=correlation_id,
+                session_id=session_id,
+                message=message,
+                metadata=metadata,
+                recipient=recipient,
+            )
+        except OutboundSigningError as error:
+            return ToolResult.failed(
+                "Peer Stop was not sent because sender authentication failed",
+                data={
+                    "stopped": False,
+                    "recipient": recipient,
+                    "error_type": "a2a_signing_failed",
+                    "error_code": error.code,
+                },
+            )
+        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError):
+            return ToolResult.failed(
+                "Peer is not available in the automatic directory",
+                data={"stopped": False, "recipient": recipient},
+            )
+        except (PeerTransportError, PeerUnavailableError):
+            return ToolResult.failed(
+                f"Could not reach agent '{recipient}'",
+                data={"stopped": False, "recipient": recipient},
+            )
+        except PeerDirectoryError:
+            logger.exception("Peer Stop dispatch failed for %r", recipient)
+            return ToolResult.failed(
+                "Peer Stop dispatch failed",
+                data={"stopped": False, "recipient": recipient},
+            )
+        except Exception:  # noqa: BLE001 - peer-router provider boundary
+            logger.exception("Peer Stop dispatch failed for %r", recipient)
+            return ToolResult.failed(
+                "Peer Stop dispatch failed",
+                data={"stopped": False, "recipient": recipient},
+            )
+        if not isinstance(raw_response, Mapping):
+            return ToolResult.failed(
+                "Peer returned a malformed Stop receipt",
+                data={"stopped": False, "recipient": recipient},
+            )
+        response = dict(raw_response)
+        raw_outcomes = response.get("stop_outcomes")
+        signal_receipt = response.get("signal_receipt")
+        if not isinstance(raw_outcomes, list) or not isinstance(
+            signal_receipt, Mapping
+        ):
+            return ToolResult.failed(
+                "Peer returned a malformed Stop receipt",
+                data={"stopped": False, "recipient": recipient},
+            )
+        receipt_signal_id = signal_receipt.get("signal_id")
+        receipt_status_value = signal_receipt.get("status")
+        receipt_detail = signal_receipt.get("detail")
+        receipt_kind = response.get("receipt_kind")
+        if (
+            not isinstance(receipt_signal_id, str)
+            or not receipt_signal_id.strip()
+            or receipt_kind not in {"operation", "delivery"}
+            # Only a delivery can be refused before any dispatcher decision.
+            or not (
+                isinstance(receipt_status_value, str)
+                or (receipt_status_value is None and receipt_kind == "delivery")
+            )
+            or "status" not in signal_receipt
+            or "detail" not in signal_receipt
+            or (receipt_detail is not None and not isinstance(receipt_detail, str))
+        ):
+            return ToolResult.failed(
+                "Peer returned a malformed Stop receipt",
+                data={"stopped": False, "recipient": recipient},
+            )
+        if receipt_status_value is not None:
+            try:
+                Status(receipt_status_value)
+            except ValueError:
+                return ToolResult.failed(
+                    "Peer returned a malformed Stop receipt",
+                    data={"stopped": False, "recipient": recipient},
+                )
+        try:
+            outcomes = [StopOutcome.from_dict(item) for item in raw_outcomes]
+        except (KeyError, TypeError, ValueError):
+            return ToolResult.failed(
+                "Peer returned a malformed Stop outcome",
+                data={"stopped": False, "recipient": recipient},
+            )
+        stop_correlation_id = response.get("stop_correlation_id")
+        # The response names the one record its outcomes are (#3169): the
+        # Stop *operation*'s receipt (the handler's effect, or its replay), or
+        # a decision about this *delivery* alone (cycle/depth, rate limit,
+        # validation, identity reuse).  A delivery record is keyed by the
+        # signal it answers and can never report an effect.
+        delivery_correlation_id = peer_stop_delivery_id(receipt_signal_id)
+        if receipt_kind == "delivery":
+            record_matches = stop_correlation_id == delivery_correlation_id and all(
+                outcome.disposition
+                in {StopDisposition.REFUSED, StopDisposition.UNREACHABLE}
+                for outcome in outcomes
+            )
+        else:
+            record_matches = (
+                isinstance(stop_correlation_id, str)
+                and bool(stop_correlation_id.strip())
+                and stop_correlation_id != delivery_correlation_id
+            )
+        if (
+            response.get("correlation_id") != correlation_id
+            or not record_matches
+            or len(outcomes) != 1
+            or any(
+                outcome.agent_id != peer.agent_id
+                or outcome.correlation_id != stop_correlation_id
+                or outcome.scope is not stop_scope
+                or outcome.requested_target
+                != (
+                    peer.agent_id
+                    if stop_scope is StopScope.AGENT
+                    else work_target
+                )
+                for outcome in outcomes
+            )
+        ):
+            return ToolResult.failed(
+                "Peer Stop receipt did not match the routed peer",
+                data={"stopped": False, "recipient": recipient},
+            )
+
+        response["recipient"] = recipient
+        response["recipient_agent_id"] = peer.agent_id
+        # A retry is answered from the original receipt (or completes an
+        # interrupted Stop), so the outcomes, not the dispatcher status, say
+        # what happened.
+        response["stopped"] = any(
+            outcome.disposition is StopDisposition.STOPPED
+            for outcome in outcomes
+        )
+        failed = any(
+            outcome.disposition
+            in {StopDisposition.REFUSED, StopDisposition.UNREACHABLE}
+            for outcome in outcomes
+        )
+        if failed:
+            return ToolResult.failed(
+                "Peer Stop was refused or could not be confirmed",
+                data=response,
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"Peer '{recipient}' stopped cooperative work"
+                if response["stopped"]
+                else f"Peer '{recipient}' had no matching active work"
+            ),
+            data=response,
+        )
+
+    async def _deliver_peer_stop(
+        self,
+        route_stop,
+        requester: PeerRequester,
+        peer: PeerIdentity,
+        *,
+        correlation_id: str,
+        session_id: str,
+        message: str,
+        metadata: Mapping[str, Any],
+        recipient: str,
+    ) -> object:
+        """Deliver one peer Stop, re-signing each attempt of the same request.
+
+        A lost request or response is ambiguous: the peer may already have
+        dispatched this Stop.  The recipient refuses a verbatim resend by its
+        replay nonce, so every attempt signs the SAME intent, ``id`` and
+        ``sessionId`` with a fresh nonce.  The recipient keys durable
+        idempotency on (verified sender, correlation id), so a retry of an
+        already-dispatched Stop is answered ``COALESCED`` from the original
+        receipt and never stops the peer a second time (#3169).  Only
+        undelivered/unconfirmed transport outcomes are retried; any
+        authorization or protocol decision is final.
+        """
+
+        from kestrel_sovereign.signals.sources.peer_stop import (
+            PEER_STOP_DELIVERY_ATTEMPTS,
+        )
+
+        for attempt in range(1, PEER_STOP_DELIVERY_ATTEMPTS + 1):
+            payload: Dict[str, Any] = {
+                "id": correlation_id,
+                "sessionId": session_id,
+                "message": {
+                    "role": "user",
+                    "parts": [{"type": "text", "text": message}],
+                },
+                "metadata": dict(metadata),
+            }
+            self._maybe_sign_outbound(
+                payload,
+                task_id=correlation_id,
+                sess_id=session_id,
+                message=message,
+            )
+            try:
+                return await route_stop(requester, peer, payload)
+            except (PeerTransportError, PeerUnavailableError):
+                if attempt >= PEER_STOP_DELIVERY_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "Peer Stop delivery to %r was not confirmed (attempt %d/%d); "
+                    "re-signing the same request",
+                    recipient,
+                    attempt,
+                    PEER_STOP_DELIVERY_ATTEMPTS,
+                )
+        raise AssertionError("unreachable: delivery loop always returns or raises")
 
     @tool(
         name="list_peers",

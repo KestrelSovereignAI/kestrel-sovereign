@@ -379,6 +379,43 @@ class TestDeployFeature:
             assert "available_profiles" in result.data
 
     @pytest.mark.asyncio
+    async def test_unready_deploy_is_a_failed_tool_result(self, sample_config):
+        """#2473: ``!deploy deploy`` of a revision that failed readiness is
+        an error carrying the revision and readiness detail, never ok."""
+        unready = {
+            "success": False,
+            "action": "deploy",
+            "control_plane_status": "succeeded",
+            "readiness_status": "unready",
+            "service": "kestrel-dev",
+            "revision": "kestrel-dev-00003-abc",
+            "service_url": "https://kestrel-dev-abc.run.app",
+            "readiness": {"status": "unready", "failure": "http_status"},
+            "error": (
+                "Revision kestrel-dev-00003-abc of kestrel-dev was created "
+                "but is not ready: HTTP 503 from the health endpoint"
+            ),
+        }
+        with patch("kestrel_sovereign.features.deploy.feature.DeployManager") as mock_mgr:
+            mock_instance = MagicMock()
+            mock_instance.profiles = {"dev": MagicMock(is_multi_agent=False)}
+            mock_instance.deploy_profile = AsyncMock(return_value=unready)
+            mock_mgr.return_value = mock_instance
+
+            feature = DeployFeature(agent=MagicMock())
+            await feature.initialize()
+
+            result = await feature.deploy_agent(
+                action="deploy", profile="dev", tag="v1.2.3"
+            )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "kestrel-dev-00003-abc" in result.error
+        assert "not ready" in result.error
+        assert result.data["control_plane_status"] == "succeeded"
+        assert result.data["readiness_status"] == "unready"
+
+    @pytest.mark.asyncio
     async def test_unknown_action(self, sample_config):
         """Test unknown action returns error."""
         with patch("kestrel_sovereign.features.deploy.feature.DeployManager") as mock_mgr:

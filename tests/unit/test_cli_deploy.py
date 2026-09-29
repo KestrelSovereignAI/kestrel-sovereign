@@ -188,6 +188,125 @@ def test_cmd_deploy_success_failed_result_returns_1():
     assert rc == 1
 
 
+def _real_manager_with_probe(probe_result: dict):
+    """A real DeployManager whose provider and HTTP probe are faked.
+
+    Exercises the actual manager → CLI path for #2473 rather than a
+    hand-written result dict.
+    """
+    from kestrel_sovereign.features.deploy.manager import DeployManager
+
+    manager = DeployManager(
+        config={
+            "manager": {
+                "gcp_project_id": "real-project",
+                "health_check_timeout_seconds": 5,
+            },
+            "profiles": {
+                "dev": {
+                    "provider": "cloudrun",
+                    "service_name": "kestrel-dev",
+                    "region": "us-central1",
+                    "max_instances": 1,
+                    "persistence_mode": "ephemeral_demo",
+                    "env_vars": {
+                        "KESTREL_ENV": "development",
+                        "KESTREL_DB_BACKEND": "sqlite",
+                        "KESTREL_DEPLOYMENT_PERSISTENCE": "ephemeral_demo",
+                    },
+                },
+            },
+        }
+    )
+    provider = MagicMock()
+    provider.deploy = AsyncMock(
+        return_value={
+            "service_url": "https://kestrel-dev-xyz.run.app",
+            "revision": "kestrel-dev-00042-rev",
+            "status": "active",
+            "operation": "update",
+            "warnings": [],
+        }
+    )
+    manager._get_provider = lambda *a, **kw: provider
+    manager.health_check_timeout = 0.1
+    probe = patch(
+        "kestrel_sovereign.features.deploy.core.probe_http_health",
+        AsyncMock(return_value=probe_result),
+    )
+    return manager, probe
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_cmd_deploy_unready_revision_exits_nonzero(capsys, json_output):
+    """#2473: the control plane created a revision but it failed readiness.
+    The command exits 1, names the revision/URL and failed gate, and says
+    nothing that reads as a successful deploy."""
+    manager, probe = _real_manager_with_probe(
+        {"healthy": False, "status_code": 503, "response_time": 0.01}
+    )
+    with patch("kestrel_sovereign.cli_deploy.DeployManager", return_value=manager), probe:
+        rc = cmd_deploy(_make_args(target="dev", tag="v1.2.3", json=json_output))
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert rc == 1
+    assert "kestrel-dev-00042-rev" in output
+    assert "https://kestrel-dev-xyz.run.app" in output
+    assert "https://kestrel-dev-xyz.run.app/health" in output
+    assert "HTTP 503" in output
+    assert "Deployment ready" not in output
+    assert "successful" not in output.lower()
+    if json_output:
+        import json
+
+        result = json.loads(captured.out)
+        assert result["control_plane_status"] == "succeeded"
+        assert result["readiness_status"] == "unready"
+    else:
+        assert "NOT ready" in captured.err
+
+
+def test_cmd_deploy_ready_revision_exits_zero(capsys):
+    """The healthy counterpart of the #2473 regression stays green."""
+    manager, probe = _real_manager_with_probe(
+        {"healthy": True, "status_code": 200, "response_time": 0.01}
+    )
+    with patch("kestrel_sovereign.cli_deploy.DeployManager", return_value=manager), probe:
+        rc = cmd_deploy(_make_args(target="dev", tag="v1.2.3"))
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert (
+        "Deployment ready: kestrel-dev revision kestrel-dev-00042-rev at "
+        "https://kestrel-dev-xyz.run.app"
+    ) in captured.out
+    assert "readiness_status: ready" in captured.out
+
+
+def test_cmd_deploy_control_plane_failure_prints_error(capsys):
+    with patch("kestrel_sovereign.cli_deploy.DeployManager") as mock_mgr_cls:
+        mock_instance = MagicMock()
+        mock_instance.gcp_project_id = "real-project"
+        mock_instance.deploy_profile = AsyncMock(
+            return_value={
+                "success": False,
+                "control_plane_status": "failed",
+                "readiness_status": "unknown",
+                "error": "Deployment failed: quota exceeded",
+            }
+        )
+        mock_mgr_cls.return_value = mock_instance
+
+        rc = cmd_deploy(_make_args(target="dev", tag="v1.2.3"))
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "error: Deployment failed: quota exceeded" in captured.err
+    assert "NOT ready" not in captured.err
+    assert "Deployment ready" not in captured.out
+
+
 def test_cmd_deploy_rejects_placeholder_project_id_for_cloudrun(capsys):
     """Codex review on the final epic→main PR: the deploy CLI must
     reject ``manager.gcp_project_id == "your-gcp-project-id"`` (the

@@ -11,6 +11,7 @@ Consumed by CLI, API, and Feature Store UI.
 
 import importlib.metadata
 import logging
+from functools import lru_cache
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -89,6 +90,15 @@ class FeaturePackageInfo:
     tags: List[str] = field(default_factory=list)
     icon: str = ""
     core: bool = False
+    # A host-scope feature participates in a host-wide protocol on behalf of
+    # every co-hosted agent (the restart coordinator's whole-host restart
+    # handshake, for instance). Disabling it on ONE agent is not that agent's
+    # own business: it degrades the host. Such a class is refused by every
+    # disable door — the HTTP route, the agent's own runtime disable, and the
+    # persistent enablement delta — through ``feature_disable_refusal``
+    # (kestrel-sovereign#3234). Ordinary ``core = true`` rows are the shipped
+    # baseline and remain per-agent toggles (``[agents.<name>].features``).
+    host_scope: bool = False
     boundary: Optional[PackageBoundary] = None
     bundled_components: List[str] = field(default_factory=list)
     provider_classes: List[str] = field(default_factory=list)
@@ -443,6 +453,7 @@ def load_registry(path: Optional[Path] = None) -> Dict[str, FeaturePackageInfo]:
             tags=entry.get("tags", []),
             icon=entry.get("icon", ""),
             core=entry.get("core", False),
+            host_scope=bool(entry.get("host_scope", False)),
             boundary=boundary,
             bundled_components=entry.get("bundled_components", []),
             provider_classes=entry.get("provider_classes", []),
@@ -462,6 +473,62 @@ def load_registry(path: Optional[Path] = None) -> Dict[str, FeaturePackageInfo]:
 
     validate_registry(registry)
     return registry
+
+
+class HostScopeFeatureError(RuntimeError):
+    """A host-scope feature was asked to disable itself on one agent.
+
+    Raised by the agent's own disable and persistent-enablement doors so the
+    tool-driven path (``feature_remove`` and friends) declines exactly where
+    the HTTP route answers 409. Carries only the class name.
+    """
+
+    def __init__(self, feature_name: str) -> None:
+        self.feature_name = feature_name
+        super().__init__(
+            f"Host-scope feature '{feature_name}' cannot be disabled per agent: "
+            "it participates in a host-wide protocol for every co-hosted agent."
+        )
+
+
+@lru_cache(maxsize=None)
+def host_scope_feature_classes(path: Optional[Path] = None) -> frozenset:
+    """Feature class names declared ``host_scope = true`` in the registry.
+
+    Memoized per path: the bundled registry is read-only at runtime and
+    ``feature_disable_refusal`` asks for this set once per class on every
+    catalog read (round 3 of kestrel-sovereign#3234 measured ~50 full
+    registry parses per ``GET /api/features``, ~92 ms of event-loop CPU).
+    Tests that swap the registry file clear it with ``cache_clear()``.
+    """
+    return frozenset(
+        class_name
+        for info in load_registry(path).values()
+        if info.host_scope
+        for class_name in info.features
+    )
+
+
+def feature_disable_refusal(class_name: str) -> Optional[str]:
+    """Why ``class_name`` may not be disabled on one agent, or ``None``.
+
+    The single rule every disable door reads (kestrel-sovereign#3234):
+    ``POST /api/features/{name}/disable``, ``KestrelAgent._disable_feature``
+    (the tool-driven runtime disable) and ``persist_feature_enablement``
+    (the delta replayed at every boot). A rule taught to one door and not
+    the others was the shape of the defect: the gated door was in-memory
+    while the ungated one was durable.
+    """
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+    if class_name in MANDATORY_FEATURES:
+        return "Mandatory sovereignty features cannot be disabled"
+    if class_name in host_scope_feature_classes():
+        return (
+            "Host-scope features cannot be disabled per agent; they "
+            "participate in a host-wide protocol for every co-hosted agent"
+        )
+    return None
 
 
 @dataclass(frozen=True)
