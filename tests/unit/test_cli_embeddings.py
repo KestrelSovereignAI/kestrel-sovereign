@@ -17,7 +17,6 @@ import sqlite3
 import struct
 import sys
 from dataclasses import fields
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 import pytest
@@ -28,6 +27,11 @@ from kestrel_sovereign.storage.embedding_vec_backfill import (
     DEFAULT_BATCH_SIZE,
     LEGACY_EMBEDDING_TABLES,
     EmbeddingVecReport,
+)
+from tests.utils.postgres_schema import (
+    pgvector_schema,
+    quoted_search_path,
+    with_search_path,
 )
 
 _REPORT_FIELDS = [field.name for field in fields(EmbeddingVecReport)]
@@ -555,14 +559,12 @@ def test_postgres_verify_changes_neither_the_column_nor_a_row(
 
 
 @pytest.fixture
-def private_pg_schema(postgres_url, monkeypatch):
-    """A private schema the CLI resolves ``document_chunks`` in first.
+def private_pg_schema(postgres_url):
+    """A schema of this test's own, dropped at teardown.
 
-    The CLI's ``KESTREL_DATABASE_URL`` carries ``search_path=<schema>,public``
-    (asyncpg sends unknown DSN parameters as server settings), so the gate is
-    checked against a table this test owns. ``public`` stays on the path for
-    the pgvector type. The shared ``document_chunks`` column is never altered,
-    so no parallel test can observe it change.
+    :func:`_create_pg_chunks` builds ``document_chunks`` in it and points the
+    CLI there. The shared ``document_chunks`` column is never altered, so no
+    parallel test can observe it change.
     """
     schema = f"cli_embeddings_{uuid4().hex}"
 
@@ -570,12 +572,6 @@ def private_pg_schema(postgres_url, monkeypatch):
         await db.execute(f"CREATE SCHEMA {schema}", ())
 
     _on_postgres(postgres_url, create_schema, initialize_schema=False)
-    parts = urlsplit(postgres_url)
-    query = [(k, v) for k, v in parse_qsl(parts.query) if k != "search_path"]
-    query.append(("search_path", f"{schema},public"))
-    monkeypatch.setenv(
-        "KESTREL_DATABASE_URL", urlunsplit(parts._replace(query=urlencode(query)))
-    )
     try:
         yield schema
     finally:
@@ -585,20 +581,41 @@ def private_pg_schema(postgres_url, monkeypatch):
         _on_postgres(postgres_url, remove_schema, initialize_schema=False)
 
 
-def _create_pg_chunks(url, schema, *, embedding_vec):
-    vec_column = ", embedding_vec vector(2)" if embedding_vec else ""
+def _create_pg_chunks(url, schema, monkeypatch, *, embedding_vec):
+    """Create ``<schema>.document_chunks`` and point the CLI at it.
+
+    The CLI's ``KESTREL_DATABASE_URL`` carries ``search_path=<schema>``
+    (asyncpg sends unknown DSN parameters as server settings), so the gate is
+    checked against a table this test owns. With an ``embedding_vec`` column
+    the path also names pgvector's schema, for the helper's ``::vector``
+    cast, and the DDL qualifies the type: this connection's path is the xdist
+    worker's own schema, which need not hold the extension (#3401).
+    """
 
     async def create(db):
-        if embedding_vec:
-            await db.execute("CREATE EXTENSION IF NOT EXISTS vector", ())
+        vector_schema = await pgvector_schema(db) if embedding_vec else None
+        vec_column = (
+            f', embedding_vec "{vector_schema}".vector(2)' if embedding_vec else ""
+        )
         await db.execute(
             f"CREATE TABLE {schema}.document_chunks ("
             "chunk_id SERIAL PRIMARY KEY, file_hash TEXT, content TEXT, "
             f"embedding BYTEA{vec_column})",
             (),
         )
+        return vector_schema
 
-    _on_postgres(url, create, initialize_schema=False)
+    vector_schema = _on_postgres(url, create, initialize_schema=False)
+    search_path = quoted_search_path(
+        schema, *([vector_schema] if vector_schema else [])
+    )
+    monkeypatch.setenv("KESTREL_DATABASE_URL", with_search_path(url, search_path))
+
+
+def test_cli_search_path_names_each_schema_once_and_quoted():
+    # pgvector may already live in the schema named first, e.g. a worker's own.
+    assert quoted_search_path("cli_x", "public", "cli_x") == '"cli_x","public"'
+    assert quoted_search_path('odd"name') == '"odd""name"'
 
 
 async def _pg_private_chunks_have_embedding_vec(db, schema):
@@ -618,7 +635,9 @@ def test_postgres_absent_embedding_vec_on_an_empty_table_fails_the_gate(
     # The startup migration defers the column until a legacy embedding
     # exists, so an empty PostgreSQL table has none. A reader switched to it
     # would fail, so the gate must not pass (#3405).
-    _create_pg_chunks(postgres_url, private_pg_schema, embedding_vec=False)
+    _create_pg_chunks(
+        postgres_url, private_pg_schema, monkeypatch, embedding_vec=False
+    )
 
     rc = _kestrel(
         monkeypatch, "embeddings", command, "--table", "document_chunks", "--json"
@@ -642,7 +661,9 @@ def test_postgres_absent_embedding_vec_on_an_empty_table_fails_the_gate(
 def test_postgres_clean_backfill_with_the_column_meets_the_gate(
     postgres_url, private_pg_schema, monkeypatch, capsys
 ):
-    _create_pg_chunks(postgres_url, private_pg_schema, embedding_vec=True)
+    _create_pg_chunks(
+        postgres_url, private_pg_schema, monkeypatch, embedding_vec=True
+    )
     legacy = _pack([0.5, -0.25])
 
     async def insert(db):
