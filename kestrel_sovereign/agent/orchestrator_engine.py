@@ -42,7 +42,9 @@ from kestrel_sovereign.agent.parts import (
     sanitize_part,
 )
 from kestrel_sovereign.agent.turn_lifecycle import (
+    bind_current_chain,
     bind_turn_session,
+    capture_current_chain,
     capture_turn_session_binding,
 )
 from kestrel_sovereign.storage.privacy_wrapper import (
@@ -715,6 +717,17 @@ class OrchestratorEngineMixin:
         )
 
         turn_scheduler_scope = capture_scheduler_execution_scope()
+        # Capture the OWNING turn's causation chain -- the SIXTH instance of
+        # this defect here (#3112 gate-2 P1). The dispatcher publishes it on
+        # the dispatching task only, so an inline tool that sends an A2A task
+        # from the codex reader reads ``[]`` and ``TaskManager.create_task``
+        # attaches no lineage. The peer's completion then wakes a turn at
+        # depth 1 with no trace of the ``self_followup`` turn that caused it,
+        # and that turn may schedule another follow-up: the single-hop bound
+        # evaded by one A2A round trip. Rebinding the current signal alone
+        # does not cover this -- outbound lineage reads the chain, not the
+        # signal.
+        turn_chain = capture_current_chain()
 
         async def _exec(name: str, args: dict):
             # Capture the post-hook args so the inline adapter's
@@ -726,7 +739,8 @@ class OrchestratorEngineMixin:
                     bind_transition_lock_reentry(transition_reentry_token), \
                     bind_turn_session(turn_session_binding), \
                     bind_current_signal(turn_signal), \
-                    bind_scheduler_execution_scope(turn_scheduler_scope):
+                    bind_scheduler_execution_scope(turn_scheduler_scope), \
+                    bind_current_chain(turn_chain):
                 result = await self.execute_named_tool(
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,

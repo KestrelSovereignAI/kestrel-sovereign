@@ -46,8 +46,10 @@ from the executor into this setup where it is harder to see.
 Real completeness has to derive the turn-scoped set from the DECLARATION site
 rather than from whatever a test happens to publish; the four live in four
 different modules with no registry or marker. That is tracked in #3114, which
-also records instances five and six (``_CURRENT_TURN_ID``, ``_CURRENT_CHAIN``)
-as already present in the tree and NOT covered here.
+also records ``_CURRENT_TURN_ID`` and ``_CURRENT_CHAIN`` as already present in
+the tree. ``_CURRENT_CHAIN`` is now re-bound at both executor boundaries and
+has its own wiring tests below (#3112 gate-2 P1: an A2A task sent from an
+inline tool left without lineage); ``_CURRENT_TURN_ID`` is still NOT covered.
 """
 from __future__ import annotations
 
@@ -282,7 +284,6 @@ async def test_inline_executor_wiring_carries_scheduler_execution_scope():
     from kestrel_sovereign.features.scheduler.runner import (
         _SchedulerExecutionScope,
         _current_execution,
-        get_current_scheduler_execution,
     )
 
     execution = SimpleNamespace(id="exec-wiring-1", idempotency_key="occ:key:wiring")
@@ -391,3 +392,147 @@ async def test_subagent_executor_wiring_carries_scheduler_execution_scope():
         "the effect -- a merge running twice, via delegation (#3112)."
     )
     assert getattr(seen["scope"], "idempotency_key", None) == "occ:key:subagent"
+
+
+def _chain_frame(source: str):
+    from datetime import datetime, timezone
+
+    from kestrel_sdk.signals import CausationFrame
+
+    return CausationFrame(
+        agent_id="did:test:chain",
+        source=source,
+        signal_id=f"sig-{source}",
+        turn_id="turn-chain",
+        depth=1,
+        emitted_at=datetime(2026, 9, 29, tzinfo=timezone.utc),
+    )
+
+
+class _ChainReadingAgent(OrchestratorEngineMixin):
+    """Records the causation chain an inline tool actually observes."""
+
+    def __init__(self):
+        from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+
+        self._chain_reader = TurnLifecycleMixin._get_current_chain
+        self.seen_chain = "not-called"
+
+    async def execute_named_tool(self, name, args, *, session_id, source, _capture):
+        _capture["effective_args"] = args
+        self.seen_chain = self._chain_reader(self)
+        return {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_inline_executor_wiring_carries_causation_chain():
+    """The parent-turn boundary re-presents ``_CURRENT_CHAIN`` (#3112 gate-2 P1).
+
+    Outbound A2A lineage is read from the chain, not the signal, so carrying
+    ``_current_signal`` alone left a tool-sent A2A task without ancestry and
+    its completion turn free to schedule a second ``self_followup``.
+    """
+    from kestrel_sovereign.agent.turn_lifecycle import _CURRENT_CHAIN
+
+    agent = _ChainReadingAgent()
+    harness = _CodexReaderHarness()
+    await harness.ensure_started()
+
+    frame = _chain_frame("cron.self_followup")
+    token = _CURRENT_CHAIN.set([frame])
+    try:
+        with part_collector():
+            executor = agent._make_inline_tool_executor("session-chain")
+            await harness.dispatch(executor, "send_a2a_task", {})
+    finally:
+        _CURRENT_CHAIN.reset(token)
+    await harness.stop()
+
+    assert agent.seen_chain == [frame], (
+        "the inline tool read no causation chain: an A2A task it sends leaves "
+        "without lineage (#3112 gate-2 P1)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inline_executor_does_not_leak_a_stale_chain_into_a_later_turn():
+    """A reader born inside an EARLIER signal-driven turn keeps that chain.
+
+    The executor must bind the owning turn's value even when it is empty, or a
+    later direct turn's outbound work is stamped with a lineage it does not
+    have -- and the single-hop guard refuses a legitimate first-hop follow-up.
+    """
+    from kestrel_sovereign.agent.turn_lifecycle import _CURRENT_CHAIN
+
+    agent = _ChainReadingAgent()
+    harness = _CodexReaderHarness()
+
+    token = _CURRENT_CHAIN.set([_chain_frame("cron.self_followup")])
+    try:
+        # Reader spawned during the earlier turn: frozen WITH its chain.
+        await harness.ensure_started()
+    finally:
+        _CURRENT_CHAIN.reset(token)
+
+    with part_collector():
+        executor = agent._make_inline_tool_executor("session-later")
+        await harness.dispatch(executor, "send_a2a_task", {})
+    await harness.stop()
+
+    assert agent.seen_chain is None, (
+        "a later turn with no chain inherited the reader's stale lineage"
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagent_executor_wiring_carries_causation_chain():
+    """The SUBAGENT boundary, twin of the parent-turn chain test above."""
+    from kestrel_sovereign.agent.turn_lifecycle import (
+        TurnLifecycleMixin,
+        _CURRENT_CHAIN,
+    )
+    from kestrel_sovereign.features.base import Feature
+
+    seen: dict = {}
+
+    class _ChainReadingTool:
+        name = "send_a2a_task"
+
+        async def execute(self, **kwargs):
+            seen["chain"] = TurnLifecycleMixin._get_current_chain(None)
+            return {"ok": True}
+
+    class _ChainSubagentFeature(Feature):
+        def __init__(self):
+            self.agent = SimpleNamespace(hooks_manager=None)
+            self.name = "chain_feature"
+            self._tools = [_ChainReadingTool()]
+
+        async def initialize(self):  # abstract
+            pass
+
+        @property
+        def tool_description(self) -> str:  # abstract
+            return "Reads the causation chain."
+
+        def get_tools(self):
+            return self._tools
+
+    feature = _ChainSubagentFeature()
+    harness = _CodexReaderHarness()
+    await harness.ensure_started()
+
+    frame = _chain_frame("cron.self_followup")
+    token = _CURRENT_CHAIN.set([frame])
+    try:
+        with part_collector():
+            executor = feature._make_feature_inline_tool_executor()
+            await harness.dispatch(executor, "send_a2a_task", {})
+    finally:
+        _CURRENT_CHAIN.reset(token)
+    await harness.stop()
+
+    assert seen.get("chain") == [frame], (
+        "a SUBAGENT inline tool read no causation chain: a delegated A2A send "
+        "leaves without lineage (#3112 gate-2 P1)"
+    )

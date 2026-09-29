@@ -136,6 +136,39 @@ def bind_turn_session(
         _BOUND_TURN_SESSION.reset(token)
 
 
+def capture_current_chain() -> tuple[CausationFrame, ...]:
+    """Snapshot the calling task's in-flight causation chain.
+
+    Companion to :func:`capture_turn_session_binding` for the same task
+    boundary. The dispatcher publishes a COGNITION turn's chain on the
+    dispatching task only; a transport reader spawned before that turn (the
+    codex app-server's) carries a frozen pre-turn copy, so an inline tool that
+    sends an A2A task reads ``[]`` and the outbound task leaves without its
+    lineage. The completion wake then starts at depth 1, and every guard that
+    walks causation ancestry — dispatcher cycle detection, the scheduler's
+    single-hop ``self_followup`` refusal — sees nothing to refuse (#3112).
+
+    Returns an immutable copy, empty when no signal-driven turn is in flight.
+    """
+    return tuple(_CURRENT_CHAIN.get())
+
+
+@contextmanager
+def bind_current_chain(chain: tuple[CausationFrame, ...]) -> Iterator[None]:
+    """Re-present a chain captured by :func:`capture_current_chain`.
+
+    Binds the captured value even when it is empty: a reader task spawned
+    inside an EARLIER signal-driven turn still holds that turn's chain, and
+    letting it show through would stamp a stale lineage onto an unrelated
+    turn's outbound work.
+    """
+    token = _CURRENT_CHAIN.set(list(chain))
+    try:
+        yield
+    finally:
+        _CURRENT_CHAIN.reset(token)
+
+
 class TurnLifecycleMixin:
     """Provides `_turn_lifecycle` and the per-agent state it needs.
 

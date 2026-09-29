@@ -1522,7 +1522,9 @@ class Feature(_SdkFeature):
         background work.
         """
         from kestrel_sovereign.agent.turn_lifecycle import (
+            bind_current_chain,
             bind_turn_session,
+            capture_current_chain,
             capture_turn_session_binding,
         )
         from kestrel_sovereign.storage.privacy_wrapper import (
@@ -1564,6 +1566,13 @@ class Feature(_SdkFeature):
         )
 
         turn_scheduler_scope = capture_scheduler_execution_scope()
+        # And the causation chain, twin of the parent boundary's capture: a
+        # delegated inline tool that sends an A2A task must carry the owning
+        # turn's lineage, or the peer's completion wakes a depth-1 turn that
+        # may schedule a second ``self_followup`` (#3112 gate-2 P1). Built on
+        # the parent executor's reader task, which re-presents the chain, so
+        # the capture sees the owning turn's value.
+        turn_chain = capture_current_chain()
 
         async def _exec(name: str, args: Dict[str, Any]):
             with (
@@ -1571,6 +1580,7 @@ class Feature(_SdkFeature):
                 bind_turn_session(turn_session_binding),
                 bind_current_signal(turn_signal),
                 bind_scheduler_execution_scope(turn_scheduler_scope),
+                bind_current_chain(turn_chain),
             ):
                 return await self._execute_subagent_tool(
                     tool_name=name,

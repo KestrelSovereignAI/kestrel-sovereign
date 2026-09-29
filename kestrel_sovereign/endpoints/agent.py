@@ -2347,10 +2347,18 @@ async def reflection_status(request: Request):
                 """,
                 (agent_id,),
             )
+            # Same column the scheduler's readers redact: a reflection result
+            # can summarize conversation, follow-up turns included, so it is
+            # withheld under a volatile privacy mode like any stored result.
+            from kestrel_sovereign.features.scheduler.outcome import (
+                redact_stored_result_text,
+            )
+
             result["recent_executions"] = [
                 {
                     "task_id": r[0], "task_name": r[1], "status": r[2],
-                    "duration_ms": r[3], "executed_at": r[4], "result_preview": r[5],
+                    "duration_ms": r[3], "executed_at": r[4],
+                    "result_preview": redact_stored_result_text(agent, r[5]),
                 }
                 for r in rows
             ]

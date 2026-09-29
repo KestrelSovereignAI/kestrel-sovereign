@@ -299,9 +299,11 @@ Two bounds are deliberate and are enforced as **refusals at schedule time**,
 never as a silent downgrade — an accept that produces no turn is worse than an
 explicit refusal:
 
-- **Single hop.** A follow-up turn may not schedule another follow-up. A
-  persisted row starts a fresh causation chain, so `allow_self_loops=False`
-  cannot see this case; `SchedulerFeature` refuses it directly.
+- **Single hop.** A follow-up turn — or any turn it causes, such as the
+  completion wake of an A2A task it sent — may not schedule another
+  follow-up. A persisted row starts a fresh causation chain, so
+  `allow_self_loops=False` cannot see this case; `SchedulerFeature` refuses it
+  by walking the waking signal's causation chain.
 - **One-shot only.** A recurring self-followup is a standing order to spend on
   turns forever.
 
@@ -311,6 +313,11 @@ A follow-up scheduled from a chat turn is bound to that session and comes back
 refused rather than fired into a blank pane (#2877/#2922). Use
 `!schedule self-followups` to see every follow-up with its outcome — a dropped
 turn is recorded `missed`, never filed alongside genuine successes.
+
+In a volatile privacy mode (EPHEMERAL / ISOLATED / DEIDENTIFIED) a follow-up is
+refused at schedule time and at fire time, and no reader returns a stored
+execution result for any task: `schedule_history` and the follow-up projection
+show status and timing, with the text withheld.
 
 #### Coding workflows and provider ownership
 
