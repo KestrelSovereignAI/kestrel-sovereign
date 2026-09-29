@@ -5,13 +5,13 @@
 announcement to the user as the answer. The repair gives the model one more
 step to make the call.
 
-Two rules keep the repair from damaging a message that was already finished:
+The announcement is matched by a pattern, and a pattern cannot tell "I will
+check the issue now" from a finished answer's plan ("when CI passes, I will
+run the review"). The repair is therefore built so that firing on a finished
+answer costs one model call and nothing else (#3397):
 
-* Only the message's final paragraph is read for the announcement. The #1237
-  failure is a message that *ends* by promising a call. A plan inside a
-  finished answer ("when CI passes, I will run the review") is not that
-  failure, and reading the whole body fired the repair on nearly every
-  orchestrator status report.
+* It asks rather than orders. The check says it is the runtime, not the user,
+  and gives the model a truthful way to say the message was complete.
 * A repair that makes no tool call does not replace the message it repaired.
   The model has confirmed the message was its answer, so the answer is the
   original plus anything the model adds, never the model's reply to the
@@ -20,27 +20,10 @@ Two rules keep the repair from damaging a message that was already finished:
 
 from __future__ import annotations
 
-import re
-from typing import Optional, Pattern
+from typing import Optional
 
 #: What the model replies when its message was already its complete answer.
 REPAIR_COMPLETE_MARKER = "[answer complete]"
-
-_PARAGRAPH_BREAK_RE = re.compile(r"\n\s*\n")
-
-
-def final_paragraph(content: Optional[str]) -> str:
-    """The last non-empty paragraph of ``content`` ("" when there is none)."""
-    if not content:
-        return ""
-    paragraphs = [p for p in _PARAGRAPH_BREAK_RE.split(content.strip()) if p.strip()]
-    return paragraphs[-1] if paragraphs else ""
-
-
-def ends_with_unfinished_intent(content: Optional[str], pattern: Pattern[str]) -> bool:
-    """True when the final paragraph of ``content`` announces a tool call."""
-    return bool(pattern.search(final_paragraph(content)))
-
 
 def turn_completion_repair_prompt(unit: str) -> str:
     """The runtime's check, worded for a ``unit`` of work ("turn" or "task").

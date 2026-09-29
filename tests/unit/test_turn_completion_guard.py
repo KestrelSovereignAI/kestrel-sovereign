@@ -390,9 +390,11 @@ async def test_feature_subagent_no_tool_continuation_gets_repair_step():
 #
 # Live case, 2026-09-29: an orchestrating agent answered a status request with
 # a full report whose body named its next steps ("when CI finishes I will run
-# the codex review"). The whole-body match fired the repair five times in one
-# turn, and each no-tool repair reply ("This turn is done...") replaced the
-# report, so the caller received only that reply and the report was lost.
+# the codex review"). The match fired the repair five times in one turn, and
+# each no-tool repair reply ("This turn is done...") replaced the report, so
+# the caller received only that reply and the report was lost. The pattern
+# cannot tell that plan from an unfinished announcement, so the repair must be
+# harmless when it fires on a finished answer.
 
 _STATUS_REPORT = (
     "Nothing is running. #3380 is held until CI shows its PostgreSQL cases run.\n\n"
@@ -402,23 +404,27 @@ _STATUS_REPORT = (
 )
 
 
-def test_plan_inside_a_finished_answer_is_not_unfinished_work():
-    assert OrchestratorEngineMixin._signals_unfinished_tool_work(_STATUS_REPORT) is False
-    assert Feature._signals_unfinished_tool_work(_STATUS_REPORT) is False
-
-
-def test_a_message_that_ends_by_announcing_a_call_is_unfinished_work():
-    content = "The issue is open.\n\nLet me check the GitHub issue comments."
+@pytest.mark.parametrize(
+    "content",
+    [
+        "The issue is open.\n\nLet me check the GitHub issue comments.",
+        # An announcement followed by a closing line (codex review r3).
+        "I'll check the GitHub issue now.\n\nPlease wait.",
+    ],
+)
+def test_an_unmade_announced_call_is_unfinished_work(content):
     assert OrchestratorEngineMixin._signals_unfinished_tool_work(content) is True
     assert Feature._signals_unfinished_tool_work(content) is True
 
 
 @pytest.mark.asyncio
-async def test_finished_report_is_answered_without_a_repair():
+async def test_finished_report_survives_a_repair_it_did_not_need():
     agent = MagicMock()
     _bind_turn_completion_helpers(agent)
     agent.llm_service = MagicMock()
-    agent.llm_service.generate_with_messages = AsyncMock()
+    agent.llm_service.generate_with_messages = AsyncMock(
+        return_value=LLMResponse(content="[answer complete]", tool_calls=None)
+    )
 
     handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
     result = await handler(
@@ -432,7 +438,7 @@ async def test_finished_report_is_answered_without_a_repair():
     )
 
     assert result == _STATUS_REPORT
-    agent.llm_service.generate_with_messages.assert_not_awaited()
+    assert agent.llm_service.generate_with_messages.await_count == 1
 
 
 _ENDS_WITH_PLAN = (

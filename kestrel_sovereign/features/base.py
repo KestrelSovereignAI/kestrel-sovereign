@@ -40,7 +40,6 @@ from kestrel_sdk.features.ui import UIContributions
 # these across every feature docstring in the tree before removal.
 from kestrel_sdk.features.base import tool, parse_docstring_params
 from kestrel_sovereign.turn_completion import (
-    ends_with_unfinished_intent,
     settle_repaired_content,
     turn_completion_repair_prompt,
 )
@@ -321,8 +320,10 @@ class Feature(_SdkFeature):
 
     @staticmethod
     def _signals_unfinished_tool_work(content: Optional[str]) -> bool:
-        """Return True when assistant text ends by promising more tool-backed work."""
-        return ends_with_unfinished_intent(content, CONTINUATION_INTENT_RE)
+        """Return True when assistant text promises more tool-backed work."""
+        if not content:
+            return False
+        return bool(CONTINUATION_INTENT_RE.search(content))
 
     @staticmethod
     def _append_missing_tool_call_repair(messages: list, content: str) -> list:

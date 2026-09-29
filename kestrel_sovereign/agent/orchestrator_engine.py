@@ -34,7 +34,6 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.turn_completion import (
-    ends_with_unfinished_intent,
     repair_addition,
     settle_repaired_content,
     turn_completion_repair_prompt,
@@ -466,9 +465,8 @@ class OrchestratorEngineMixin:
         Covers two no-structured-tool-call failure modes that both warrant a
         single repair turn:
 
-        * the model *ends* by narrating a tool call ("let me check the repo…")
-          but emits no ``tool_use`` block — read from the final paragraph only
-          (see :mod:`kestrel_sovereign.turn_completion`), and
+        * the model *narrates* a future tool call ("let me check the repo…")
+          but emits no ``tool_use`` block, and
         * the model writes tool-call *syntax* as literal text (e.g.
           ``<function_calls><invoke name="…">…``) instead of a structured
           call — which executes nothing and tends to be followed by
@@ -477,7 +475,7 @@ class OrchestratorEngineMixin:
         if not content:
             return False
         return bool(
-            ends_with_unfinished_intent(content, CONTINUATION_INTENT_RE)
+            CONTINUATION_INTENT_RE.search(content)
             or OrchestratorEngineMixin._tool_call_emitted_as_text(content)
         )
 
