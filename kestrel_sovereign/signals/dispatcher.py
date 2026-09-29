@@ -1943,7 +1943,27 @@ class SignalDispatcher:
         """
         async with self._admit_durable_operation():
             await self.initialize_durable_delivery()
-            if await self._durable_claim_deferred_by_hold(consumer_id):
+            try:
+                deferred = await self._durable_claim_deferred_by_hold(consumer_id)
+            except BaseException:
+                # Unknown Hold state must not hand work off, and must not
+                # leave this event's reservation leased to a claimant that is
+                # about to fail. Return it exactly as a Hold deferral would,
+                # as the post-claim fence does, then report the read failure.
+                try:
+                    await self._release_initial_reservations_deferred_by_hold(
+                        consumer_id=consumer_id,
+                        event_id=event_id,
+                    )
+                except BaseException:
+                    logger.exception(
+                        "Could not return initial durable reservation after "
+                        "Hold-state read failure: consumer=%s event=%s",
+                        consumer_id,
+                        event_id,
+                    )
+                raise
+            if deferred:
                 await self._release_initial_reservations_deferred_by_hold(
                     consumer_id=consumer_id,
                     event_id=event_id,
@@ -1951,21 +1971,11 @@ class SignalDispatcher:
                 return None
             self._discard_expired_transient_durable_handoffs()
             await self._release_expired_initial_handoffs()
-            async with self._pending_cognition_claim_fence(executor_id):
-                delivery = await self._durable_store.claim_delivery_for_event(
-                    agent_id=self._agent.did,
-                    consumer_id=consumer_id,
-                    event_id=event_id,
-                    executor_id=executor_id,
-                    runtime_owner_stale_before=(
-                        datetime.now(timezone.utc) - self._runtime_owner_stale_after
-                    ),
-                    cognition_admission_pending=True,
-                )
-                if delivery is not None:
-                    self._track_pending_cognition_admission(
-                        delivery, executor_id=executor_id
-                    )
+            delivery = await self._claim_durable_delivery_row_for_event(
+                consumer_id=consumer_id,
+                event_id=event_id,
+                executor_id=executor_id,
+            )
             if delivery is not None:
                 return await self._publish_claimed_durable_delivery_after_hold_race(
                     consumer_id=consumer_id,
@@ -1982,34 +1992,75 @@ class SignalDispatcher:
                 if reserved is None:
                     return None
                 handoff = self._transient_durable_handoffs.get(reserved.delivery_id)
-                if handoff is None or handoff.initial_lease_token is None:
-                    return None
-                async with self._pending_cognition_claim_fence(executor_id):
-                    delivery = await self._durable_store.claim_initial_delivery(
-                        agent_id=self._agent.did,
-                        consumer_id=consumer_id,
-                        delivery_id=reserved.delivery_id,
-                        initial_lease_owner=self._durable_delivery_owner,
-                        initial_lease_token=handoff.initial_lease_token,
-                        executor_id=executor_id,
-                        cognition_admission_pending=True,
-                    )
-                    if delivery is not None:
-                        self._track_pending_cognition_admission(
-                            delivery, executor_id=executor_id
+                if handoff is not None and handoff.initial_lease_token is not None:
+                    async with self._pending_cognition_claim_fence(executor_id):
+                        delivery = await self._durable_store.claim_initial_delivery(
+                            agent_id=self._agent.did,
+                            consumer_id=consumer_id,
+                            delivery_id=reserved.delivery_id,
+                            initial_lease_owner=self._durable_delivery_owner,
+                            initial_lease_token=handoff.initial_lease_token,
+                            executor_id=executor_id,
+                            cognition_admission_pending=True,
                         )
-                if delivery is None:
+                        if delivery is not None:
+                            self._track_pending_cognition_admission(
+                                delivery, executor_id=executor_id
+                            )
+                    if delivery is not None:
+                        handoff.initial_lease_token = None
+                        return await self._publish_claimed_durable_delivery_after_hold_race(
+                            consumer_id=consumer_id,
+                            delivery=delivery,
+                            executor_id=executor_id,
+                        )
                     # If the transfer can no longer happen, raw data must not
                     # outlive the reservation capability that protected it.
                     # An expired first lease is still released (#3370).
                     self._retire_initial_handoff(reserved.delivery_id)
-                    return None
-                handoff.initial_lease_token = None
-                return await self._publish_claimed_durable_delivery_after_hold_race(
-                    consumer_id=consumer_id,
-                    delivery=delivery,
-                    executor_id=executor_id,
+
+            # No reservation of this event was left to transfer. It was
+            # returned (a Hold deferral, an expired first lease), transferred
+            # to another claimant, or settled after the row claim above
+            # missed. The reservation token is not what decides this event's
+            # fate; its durable row is (#3283). Claim the row once more: a
+            # returned row is RETRY and due now, while one another claimant
+            # owns or one that is settled still misses.
+            await self._release_expired_initial_handoffs()
+            delivery = await self._claim_durable_delivery_row_for_event(
+                consumer_id=consumer_id,
+                event_id=event_id,
+                executor_id=executor_id,
+            )
+            if delivery is None:
+                return None
+            return await self._publish_claimed_durable_delivery_after_hold_race(
+                consumer_id=consumer_id,
+                delivery=delivery,
+                executor_id=executor_id,
+            )
+
+    async def _claim_durable_delivery_row_for_event(
+        self, *, consumer_id: str, event_id: str, executor_id: str
+    ) -> Optional[DurableDelivery]:
+        """Claim one event's claimable ledger row, never a live reservation."""
+
+        async with self._pending_cognition_claim_fence(executor_id):
+            delivery = await self._durable_store.claim_delivery_for_event(
+                agent_id=self._agent.did,
+                consumer_id=consumer_id,
+                event_id=event_id,
+                executor_id=executor_id,
+                runtime_owner_stale_before=(
+                    datetime.now(timezone.utc) - self._runtime_owner_stale_after
+                ),
+                cognition_admission_pending=True,
+            )
+            if delivery is not None:
+                self._track_pending_cognition_admission(
+                    delivery, executor_id=executor_id
                 )
+        return delivery
 
     @asynccontextmanager
     async def _pending_cognition_claim_fence(self, executor_id: str):
@@ -3975,6 +4026,15 @@ class SignalDispatcher:
                 durable=True,
             )
             if held_result is not None:
+                # The cognition route's disposition: the row is deferred,
+                # not unavailable (#3283).
+                if durable_admission is not None and not durable_admission.done():
+                    durable_admission.set_result(
+                        DurableAdmissionResult(
+                            DurableAdmissionDisposition.HELD,
+                            signal.id,
+                        )
+                    )
                 return held_result
             existing = await self.get_durable_delivery_for_event(
                 consumer_id=consumer_id,
