@@ -518,8 +518,9 @@ CREATE INDEX IF NOT EXISTS idx_user_byok_keys_agent ON user_byok_service_keys(ag
 CREATE INDEX IF NOT EXISTS idx_user_byok_keys_provider ON user_byok_service_keys(provider_id);
 
 -- Host (operator) master credentials for the HOST_MASTER_PROVISIONED
--- payer-policy path. Single host per deployment. Sponsor and
--- user-master variants are modeled separately if/when needed. See
+-- payer-policy path. Single host per deployment. The user-master and
+-- sponsor variants follow. All three are written through
+-- kestrel_sovereign.security.principal_master_key_store. See
 -- kestrel_sovereign.security.host_key_storage.HostKeyStorage.
 CREATE TABLE IF NOT EXISTS host_service_keys (
     id TEXT PRIMARY KEY,
