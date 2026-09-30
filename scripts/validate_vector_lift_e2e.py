@@ -3,7 +3,7 @@
 
 What this script proves: the chain from a fresh ``AsyncDatabase`` →
 the Phase-2 migrations adding ``embedding_vec`` columns → ``Async*Store``
-dual-write → ``get_vector_backend`` factory picking ``PgVectorBackend``
+``embedding_vec`` writes → ``get_vector_backend`` factory picking ``PgVectorBackend``
 on PG → pgvector kNN actually serving the search — all works end-to-end
 against a real Postgres with the pgvector extension installed.
 
@@ -232,6 +232,22 @@ async def _embed_via_ollama(text: str) -> list[float]:
         return embeddings[0]
 
 
+async def _assert_legacy_column_retired(conn, table: str) -> None:
+    """The boot's #3411 migration dropped *table*'s legacy ``embedding``.
+
+    Every row has ``embedding_vec`` by now, so the retirement gate is met.
+    """
+    legacy = await conn.fetchval(
+        """SELECT COUNT(*) FROM information_schema.columns
+           WHERE table_name = $1 AND column_name = 'embedding'""",
+        table,
+    )
+    assert legacy == 0, (
+        f"  ✗ {table}.embedding still present; the retirement gate was met"
+    )
+    print(f"  ✓ Legacy {table}.embedding column retired")
+
+
 async def main() -> int:
     print("Vector-lift end-to-end validation against pgvector PG")
     print(f"  DSN: {_build_dsn_redacted()}")
@@ -281,6 +297,8 @@ async def main() -> int:
         # Ollama from inside this script. Instead, insert rows via raw
         # SQL with the legacy ``embedding`` BYTEA column populated —
         # that's the exact state the migration is designed to convert.
+        # No store writes that column any more (#3411); these rows stand
+        # in for data an older release wrote.
         import struct
         texts = [
             "Postgres pgvector enables fast HNSW-indexed cosine search.",
@@ -333,6 +351,7 @@ async def main() -> int:
                 f"  ✗ {filled} rows backfilled; expected {len(texts)}"
             )
             print(f"  ✓ Backfill: {filled}/{len(texts)} rows have embedding_vec")
+            await _assert_legacy_column_retired(conn, "document_chunks")
     finally:
         await db.close()
     print()
@@ -359,9 +378,9 @@ async def main() -> int:
         # Drive PgVectorBackend DIRECTLY, not via
         # ``rag._search_by_embedding`` — that wrapper has a designed-in
         # fallback to the legacy in-Python loop on any backend error,
-        # which would silently mask a pgvector failure (the BYTEA
-        # embeddings are still populated, so the legacy path would
-        # return the same ranked results). Calling
+        # which would silently mask a pgvector failure (that loop
+        # scores the same stored vectors, so it would return the same
+        # ranked results). Calling
         # ``PgVectorBackend.knn`` directly exercises the actual code
         # path this validation is meant to prove. (Caught by codex
         # review.)
@@ -413,11 +432,12 @@ async def main() -> int:
     print()
 
     print()
-    print("→ Phase D: store-API dual-writes. ``AsyncRAGStore.chunk_document`` "
+    print("→ Phase D: store-API writes. ``AsyncRAGStore.chunk_document`` "
           "and ``SavedItemsStore.save_item`` should populate ``embedding_vec`` "
-          "immediately on insert (no second-boot backfill needed). Earlier "
-          "phases tested the backfill via raw SQL; this phase tests the dual-"
-          "write path the stores are actually advertised to support.")
+          "immediately on insert (no second-boot backfill needed), creating "
+          "the column if it is absent. Earlier phases tested the backfill via "
+          "raw SQL; this phase tests the write path the stores are actually "
+          "advertised to support.")
     db = await AsyncDatabase.postgres(_build_dsn())
     try:
         # Wire the global embedding service in BOTH stores so their
@@ -454,7 +474,7 @@ async def main() -> int:
               "the store API")
 
         # Verify ``embedding_vec`` is populated for those new rows —
-        # the dual-write path must have fired.
+        # the store's write path must have fired.
         async with db.backend._pool.acquire() as conn:
             filled = await conn.fetchval(
                 """SELECT COUNT(*) FROM document_chunks
@@ -462,18 +482,16 @@ async def main() -> int:
                 "store-api-doc",
             )
             assert filled == new_chunks_count, (
-                f"  ✗ dual-write regression: {filled}/{new_chunks_count} "
+                f"  ✗ write regression: {filled}/{new_chunks_count} "
                 f"new chunks have embedding_vec populated"
             )
             print(f"  ✓ All {filled} new chunks have embedding_vec "
-                  "populated by the dual-write (no second-boot needed)")
+                  "populated by the store (no second-boot needed)")
 
         # 2. SavedItemsStore.save_item path. The migration deferred
         # this table's embedding_vec column on the fresh DB (Phase A);
-        # Phase D's first write should sniff-and-create on the
-        # NEXT-boot logic. So we save an item, restart the DB so the
-        # migration runs against the now-populated rows, and verify
-        # everything backfilled correctly.
+        # Phase D's first write creates it at the vector's width
+        # (#3411). A restart then finds the column already present.
         item = await si_store.save_item(
             item_type="stash",
             name="store-api validation item",
@@ -488,8 +506,7 @@ async def main() -> int:
     finally:
         await db.close()
 
-    # Restart to fire the saved_items migration now that there's a
-    # sniff-able row.
+    # Restart: the startup migrations find embedding_vec in place.
     db = await AsyncDatabase.postgres(_build_dsn())
     try:
         async with db.backend._pool.acquire() as conn:
@@ -502,21 +519,20 @@ async def main() -> int:
                 f"  ✗ saved_items.embedding_vec is {udt!r}; expected "
                 "'vector' after Phase-D restart"
             )
-            print(f"  ✓ Restart created saved_items.embedding_vec as {udt!r}")
+            print(f"  ✓ save_item created saved_items.embedding_vec as {udt!r}")
 
-            # The save_item path computed an embedding before
-            # embedding_vec existed → ``_write_embedding_vec`` logged
-            # and degraded gracefully. After the migration, the row
-            # has been backfilled from the legacy ``embedding`` BYTEA.
+            # save_item wrote the vector straight into the column it
+            # created.
             filled = await conn.fetchval(
                 "SELECT COUNT(*) FROM saved_items "
                 "WHERE embedding_vec IS NOT NULL"
             )
             assert filled >= 1, (
-                f"  ✗ saved_items backfill: {filled} rows have embedding_vec; "
+                f"  ✗ saved_items: {filled} rows have embedding_vec; "
                 "expected at least 1 (the one written via save_item)"
             )
-            print(f"  ✓ {filled} saved_items row(s) backfilled with embedding_vec")
+            print(f"  ✓ {filled} saved_items row(s) have embedding_vec")
+            await _assert_legacy_column_retired(conn, "saved_items")
     finally:
         await db.close()
 

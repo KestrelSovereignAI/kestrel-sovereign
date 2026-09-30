@@ -2,6 +2,9 @@
 
 The SQLite cases run everywhere. The PostgreSQL case runs when
 ``TEST_POSTGRES_URL`` is set, which the CI unit tier provides.
+
+A freshly booted database has already lost the legacy column (#3411), so the
+fixtures restore it and the rows stand in for data an older release wrote.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from kestrel_sovereign.storage.embedding_vec_backfill import (
     backfill_embedding_vec,
     verify_embedding_vec,
 )
+from tests.utils.legacy_embedding_column import restore_legacy_embedding_column
 from tests.utils.postgres_schema import (
     pgvector_schema,
     quoted_search_path,
@@ -34,12 +38,19 @@ def _pack(values):
 
 
 @pytest.fixture
-async def sqlite_db(tmp_path):
+async def retired_sqlite_db(tmp_path):
+    """A freshly booted database: the legacy column is already retired."""
     db = await AsyncDatabase.sqlite(str(tmp_path / "backfill.db"))
     try:
         yield db
     finally:
         await db.close()
+
+
+@pytest.fixture
+async def sqlite_db(retired_sqlite_db):
+    await restore_legacy_embedding_column(retired_sqlite_db)
+    return retired_sqlite_db
 
 
 async def _insert_saved_item(db, item_id, embedding=None, embedding_vec=None):
@@ -206,6 +217,51 @@ async def test_missing_embedding_vec_column_is_reported_not_created(sqlite_db):
     assert columns == []
 
 
+@pytest.mark.parametrize("write", [False, True])
+async def test_retired_table_reports_every_vector_as_embedding_vec_only(
+    retired_sqlite_db, write
+):
+    db = retired_sqlite_db
+    assert not await db.column_exists("saved_items", "embedding")
+    await db.execute(
+        "INSERT INTO saved_items (id, agent_id, item_type, name, content, "
+        "embedding_vec) VALUES "
+        "('vec', 'did:test:agent', 'stash', 'vec', 'c', ?), "
+        "('none', 'did:test:agent', 'stash', 'none', 'c', NULL)",
+        (_pack([1.0, 2.0]),),
+    )
+
+    run = backfill_embedding_vec if write else verify_embedding_vec
+    report = await run(db, "saved_items")
+
+    assert report.embedding_vec_present is True
+    assert (
+        report.total_rows,
+        report.rows_with_both,
+        report.rows_missing_embedding_vec,
+        report.rows_embedding_vec_only,
+        report.rows_disagreeing,
+        report.rows_backfilled,
+        report.rows_unbackfillable,
+    ) == (2, 0, 0, 1, 0, 0, 0)
+    assert not await db.column_exists("saved_items", "embedding")
+
+
+async def test_retired_table_without_embedding_vec_reports_the_column_absent(
+    retired_sqlite_db,
+):
+    db = retired_sqlite_db
+    await db.execute("ALTER TABLE document_chunks DROP COLUMN embedding_vec", ())
+    await db.execute(
+        "INSERT INTO document_chunks (file_hash, content) VALUES ('doc', 'chunk')", ()
+    )
+
+    report = await verify_embedding_vec(db, "document_chunks")
+
+    assert report.embedding_vec_present is False
+    assert (report.total_rows, report.rows_missing_embedding_vec) == (1, 0)
+
+
 async def test_rejects_unknown_table_and_non_positive_batch(sqlite_db):
     with pytest.raises(ValueError, match="table must be one of"):
         await verify_embedding_vec(sqlite_db, "conversation_history")
@@ -277,6 +333,8 @@ async def postgres_db():
     )
     file_hash = f"embedding-vec-backfill-{uuid4()}"
     try:
+        # The boot retires the legacy column once no row needs it (#3411).
+        await restore_legacy_embedding_column(db, "document_chunks")
         yield db, file_hash
     finally:
         try:

@@ -31,7 +31,11 @@ from typing import List, Dict, Any, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .bm25_index import AsyncBM25Index, BM25_AVAILABLE
-from .embedding_column import decode_stored_embedding, stored_embedding_column
+from .embedding_column import (
+    decode_stored_embedding,
+    ensure_embedding_vec_column,
+    stored_embedding_column,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -188,38 +192,16 @@ class AsyncRAGStore:
                 except Exception as e:
                     logger.warning(f"Failed to compute embeddings: {e}")
 
-        # Store chunks with embeddings. The legacy ``embedding`` BYTEA
-        # / BLOB column is written here as before; the parallel
-        # ``embedding_vec`` column added by the Phase-2 migration is
-        # populated by ``_write_embedding_vec`` so the vector search
+        # Store chunks. Their embeddings go to ``embedding_vec`` only,
+        # through ``_write_embedding_vec`` below, where the vector search
         # backend (PgVectorBackend on PG, PurePythonBackend on SQLite)
-        # can pick it up. (kestrel-sovereign #1454 followup: same
-        # parallel-column design used for saved_items.)
+        # picks them up. The legacy ``embedding`` column is no longer
+        # written (#3411).
         new_chunk_ids: List[Tuple[int, List[float]]] = []
         for chunk, embedding in zip(chunks, embeddings):
-            embedding_blob = None
-            if embedding:
-                embedding_blob = _serialize_embedding(embedding)
-
             chunk_id: int
             async with self.db.transaction():
-                if self.db.backend_type == "postgres":
-                    row = await self.db.fetchone(
-                        "INSERT INTO document_chunks "
-                        "(file_hash, content, embedding) VALUES (?, ?, ?) "
-                        "RETURNING chunk_id",
-                        (file_hash, chunk, embedding_blob),
-                    )
-                else:
-                    await self.db.execute(
-                        "INSERT INTO document_chunks "
-                        "(file_hash, content, embedding) VALUES (?, ?, ?)",
-                        (file_hash, chunk, embedding_blob),
-                    )
-                    row = await self.db.fetchone("SELECT last_insert_rowid()")
-                if not row:
-                    raise RuntimeError("Could not resolve inserted RAG chunk id")
-                chunk_id = int(row[0])
+                chunk_id = await self._insert_chunk(file_hash, chunk)
                 if self.agent_id:
                     # Chunk plaintext is caller-supplied, so ownership must be
                     # recorded atomically with the row. File co-owners do not
@@ -260,10 +242,14 @@ class AsyncRAGStore:
                         exc,
                     )
 
-        # Dual-write embedding_vec + embedding_profile_id for every
-        # chunk we just inserted. Outside the INSERT loop because the
-        # column might not exist yet on a DB whose Phase-2 migration
-        # hasn't run — the helper catches that and logs info.
+        # Write embedding_vec + embedding_profile_id for every chunk we
+        # just inserted, creating the column first if this database has
+        # none yet. Outside the INSERT loop so one failed write stays
+        # non-fatal for the rest.
+        if new_chunk_ids:
+            await ensure_embedding_vec_column(
+                self.db, "document_chunks", len(new_chunk_ids[0][1]),
+            )
         for chunk_id, embedding in new_chunk_ids:
             await self._write_embedding_vec(chunk_id, embedding, profile_id)
 
@@ -354,27 +340,8 @@ class AsyncRAGStore:
 
         written: List[Tuple[int, IndexedChunk]] = []
         for chunk in chunks:
-            embedding_blob = (
-                _serialize_embedding(chunk.embedding) if chunk.embedding else None
-            )
             async with self.db.transaction():
-                if self.db.backend_type == "postgres":
-                    row = await self.db.fetchone(
-                        "INSERT INTO document_chunks "
-                        "(file_hash, content, embedding) VALUES (?, ?, ?) "
-                        "RETURNING chunk_id",
-                        (file_hash, chunk.content, embedding_blob),
-                    )
-                else:
-                    await self.db.execute(
-                        "INSERT INTO document_chunks "
-                        "(file_hash, content, embedding) VALUES (?, ?, ?)",
-                        (file_hash, chunk.content, embedding_blob),
-                    )
-                    row = await self.db.fetchone("SELECT last_insert_rowid()")
-                if not row:
-                    raise RuntimeError("Could not resolve inserted RAG chunk id")
-                chunk_id = int(row[0])
+                chunk_id = await self._insert_chunk(file_hash, chunk.content)
                 if self.agent_id:
                     await self.db.execute(
                         "INSERT INTO document_chunk_owners "
@@ -383,8 +350,13 @@ class AsyncRAGStore:
                     )
             written.append((chunk_id, chunk))
 
-        # Same dual-write as chunk_document, and outside the insert loop for
-        # the same reason: the parallel column may not exist yet.
+        # Same embedding_vec write as chunk_document, outside the insert
+        # loop for the same reason.
+        embedded = [chunk.embedding for _, chunk in written if chunk.embedding]
+        if embedded:
+            await ensure_embedding_vec_column(
+                self.db, "document_chunks", len(embedded[0]),
+            )
         for chunk_id, chunk in written:
             if chunk.embedding:
                 await self._write_embedding_vec(
@@ -395,28 +367,50 @@ class AsyncRAGStore:
         self._bm25_built = False  # Invalidate BM25 index
         return len(written)
 
+    async def _insert_chunk(self, file_hash: str, content: str) -> int:
+        """Insert one chunk row and return its ``chunk_id``.
+
+        The caller holds the transaction that also records ownership.
+        """
+        if self.db.backend_type == "postgres":
+            row = await self.db.fetchone(
+                "INSERT INTO document_chunks (file_hash, content) "
+                "VALUES (?, ?) RETURNING chunk_id",
+                (file_hash, content),
+            )
+        else:
+            await self.db.execute(
+                "INSERT INTO document_chunks (file_hash, content) VALUES (?, ?)",
+                (file_hash, content),
+            )
+            row = await self.db.fetchone("SELECT last_insert_rowid()")
+        if not row:
+            raise RuntimeError("Could not resolve inserted RAG chunk id")
+        return int(row[0])
+
     async def _write_embedding_vec(
         self,
         chunk_id: int,
         embedding: List[float],
         profile_id: Optional[str] = None,
     ) -> None:
-        """Dual-write the embedding (+ #1477 profile id) to the parallel
-        ``embedding_vec`` column.
+        """Write the embedding (+ #1477 profile id) to ``embedding_vec``,
+        the only column that stores it (#3411).
 
         - On Postgres, formats the list as pgvector's text shape
           (``[v1,v2,…]``) and binds with a ``::vector`` cast.
-        - On SQLite, packs to float32 little-endian bytes — same shape
-          stored in the legacy ``embedding`` BLOB column.
+        - On SQLite, packs to float32 little-endian bytes.
+
+        The caller creates the column first with
+        ``ensure_embedding_vec_column``.
 
         ``profile_id`` may be NULL on pre-#1477 deployments; kNN
         filters by the active profile so NULL rows correctly stay
         out of mixed-coordinate-space recall.
 
-        Errors are non-fatal: the most likely cause is that a
-        migration hasn't created the column yet on this DB, in which
-        case the legacy ``embedding`` column is already written and
-        readers use it until the column exists (#3409).
+        Errors are non-fatal, but a failed ``embedding_vec`` write leaves
+        the chunk without a stored vector until ``kestrel embeddings
+        reindex`` embeds it.
 
         Each attempt runs in its own ``transaction()`` so "non-fatal"
         stays true when a CALLER holds a transaction open. PostgreSQL
@@ -480,10 +474,10 @@ class AsyncRAGStore:
                         (_serialize_embedding(embedding), chunk_id),
                     )
         except Exception as e2:
-            logger.debug(
+            logger.warning(
                 "document_chunks.embedding_vec write failed for chunk "
-                "%s: %s (column likely missing — Phase-2 migration "
-                "pending).", chunk_id, e2,
+                "%s: %s. The chunk has no stored vector until it is "
+                "re-embedded.", chunk_id, e2,
             )
         # Best-effort profile-id-only write so the legacy in-Python
         # fallback (which filters by profile id) still sees this

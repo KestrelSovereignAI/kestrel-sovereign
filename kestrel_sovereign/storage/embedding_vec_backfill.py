@@ -17,6 +17,10 @@ value, or overwrites a non-NULL ``embedding_vec``. After
 ``kestrel embeddings reindex`` the two columns legitimately disagree
 (reindex rewrites ``embedding_vec`` only), so a disagreement is
 counted, never repaired.
+
+Phase 3 (#3411) drops the legacy column once no row depends on it. A
+table without it reports as if every legacy value were NULL: nothing is
+missing, disagreeing, or left to backfill.
 """
 
 from __future__ import annotations
@@ -119,6 +123,10 @@ async def _run(
     id_col = LEGACY_EMBEDDING_TABLES[table]
     is_postgres = _is_postgres(db)
     column = await _vec_column(db, table, is_postgres)
+    legacy_present = await db.column_exists(table, "embedding")
+
+    if not legacy_present:
+        return await _retired_report(db, table, column)
 
     if not column.present:
         total, legacy = await _fetch_counts(
@@ -167,6 +175,34 @@ async def _run(
         rows_unbackfillable=unbackfillable,
     )
     logger.info("embedding_vec %s: %s", "backfill" if write else "verify", report)
+    return report
+
+
+async def _retired_report(
+    db: "AsyncDatabase", table: str, column: _VecColumn
+) -> EmbeddingVecReport:
+    """Report on a table whose legacy column is gone (#3411)."""
+    if column.present:
+        total, vec_only = await _fetch_counts(
+            db,
+            f"SELECT COUNT(*), {_count_when('embedding_vec IS NOT NULL')} "
+            f"FROM {table}",
+        )
+    else:
+        (total,) = await _fetch_counts(db, f"SELECT COUNT(*) FROM {table}")
+        vec_only = 0
+    report = EmbeddingVecReport(
+        table=table,
+        embedding_vec_present=column.present,
+        total_rows=total,
+        rows_with_both=0,
+        rows_missing_embedding_vec=0,
+        rows_embedding_vec_only=vec_only,
+        rows_disagreeing=0,
+        rows_backfilled=0,
+        rows_unbackfillable=0,
+    )
+    logger.info("embedding_vec on %s (legacy column retired): %s", table, report)
     return report
 
 

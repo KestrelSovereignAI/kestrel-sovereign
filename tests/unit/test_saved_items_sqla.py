@@ -282,7 +282,7 @@ async def test_search_preserves_query_when_falling_back_to_text():
 
 @pytest.mark.asyncio
 async def test_search_end_to_end_against_real_sqlite():
-    """Insert items with embeddings via the legacy path, then search
+    """Insert items with embeddings via raw SQL, then search
     via the new sovereign vector backend through a real
     ``make_session_factory`` against on-disk SQLite. Returns the most
     similar item first.
@@ -300,12 +300,11 @@ async def test_search_end_to_end_against_real_sqlite():
             target = [1.0] + [0.0] * 1535
             distractor = [0.0, 1.0] + [0.0] * 1534
 
-            # Phase 2: rows are written to BOTH the legacy ``embedding``
-            # column (BYTEA / BLOB used by raw IO) AND ``embedding_vec``
-            # (the ORM-mapped column the vector backend reads). In
-            # production ``save_item()``'s dual-write keeps these in
-            # sync; the test does it manually here to keep the search
-            # path isolated from the embedding-service path.
+            # Rows carry their vector in ``embedding_vec`` (the
+            # ORM-mapped column the vector backend reads), the only
+            # column ``save_item()`` writes since #3411. The test writes
+            # it directly to keep the search path isolated from the
+            # embedding-service path.
             for row_id, name, vec in [
                 ("id-target", "Target", target),
                 ("id-distractor", "Distractor", distractor),
@@ -314,7 +313,7 @@ async def test_search_end_to_end_against_real_sqlite():
                 await db.execute(
                     """INSERT INTO saved_items
                        (id, agent_id, item_type, name, summary, content,
-                        content_hash, ipfs_cid, embedding, source_type,
+                        content_hash, ipfs_cid, embedding_vec, source_type,
                         source_ref, schema_id, tags, metadata,
                         created_at, updated_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -324,10 +323,6 @@ async def test_search_end_to_end_against_real_sqlite():
                         None, None, None, "[]", "{}",
                         "2026-01-01T00:00:00", "2026-01-01T00:00:00",
                     ),
-                )
-                await db.execute(
-                    "UPDATE saved_items SET embedding_vec = ? WHERE id = ?",
-                    (packed, row_id),
                 )
             await db.commit()
 

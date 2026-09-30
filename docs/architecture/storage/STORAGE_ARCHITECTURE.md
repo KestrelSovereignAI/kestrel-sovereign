@@ -88,14 +88,15 @@ The current SQLAlchemy-mapped vector tables are:
 
 | Table | Mapping | Vector column | Status |
 |---|---|---|---|
-| `saved_items` | `storage/sqla/saved_item.py` | `embedding_vec` | Active vector backend path with legacy `embedding` dual-write. |
-| `document_chunks` | `storage/sqla/document_chunk.py` | `embedding_vec` | Active RAG vector backend path with legacy `embedding` dual-write. |
+| `saved_items` | `storage/sqla/saved_item.py` | `embedding_vec` | Active vector backend path; the only embedding column writers use (#3411). |
+| `document_chunks` | `storage/sqla/document_chunk.py` | `embedding_vec` | Active RAG vector backend path; the only embedding column writers use (#3411). |
 | `conversation_history` | `storage/sqla/conversation_message.py` | `embedding_vec` | Storage/schema groundwork landed; `MemoryRetriever` still uses keyword/concept overlap in the current tree. |
 
-`embedding_vec` is the canonical vector column. The legacy `embedding` column
-on `saved_items` and `document_chunks` is being retired (#2684). Every
-remaining legacy reader and writer, and the `embedding_vec` verify/backfill
-helper, are listed in
+`embedding_vec` is the canonical vector column. Nothing writes the legacy
+`embedding` column on `saved_items` and `document_chunks` any more, and a
+startup migration drops it once no row depends on it (#2684, #3411). The
+former legacy readers and writers, the `embedding_vec` verify/backfill helper,
+and the retirement gate are described in
 [Legacy Embedding Column Inventory](EMBEDDING_COLUMN_RETIREMENT.md).
 
 ## Vector Search

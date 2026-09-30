@@ -21,7 +21,11 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from .async_database import AsyncDatabase
-from .embedding_column import decode_stored_embedding, stored_embedding_column
+from .embedding_column import (
+    decode_stored_embedding,
+    ensure_embedding_vec_column,
+    stored_embedding_column,
+)
 
 if TYPE_CHECKING:
     from kestrel_sovereign.filecoin_adapter import FilecoinAdapter
@@ -478,16 +482,13 @@ class SavedItemsStore:
 
         # Compute embedding if requested
         embedding = None
-        embedding_blob = None
         if compute_embedding:
             embedding_service = self._get_embedding_service()
             if embedding_service:
                 try:
                     # Embed summary if available, otherwise first 1000 chars of content
                     text_to_embed = summary or content[:1000]
-                    embedding = await embedding_service.aembed(text_to_embed)
-                    if embedding:
-                        embedding_blob = _serialize_embedding(embedding)
+                    embedding = await embedding_service.aembed(text_to_embed) or None
                 except Exception as e:
                     logger.warning(f"Failed to compute embedding: {e}")
 
@@ -496,17 +497,15 @@ class SavedItemsStore:
         if pin_to_ipfs:
             ipfs_cid = await self._pin_to_ipfs(content, content_hash)
 
-        # Insert into database. Legacy ``embedding`` BYTEA / BLOB
-        # column is written here unchanged; the parallel
-        # ``embedding_vec`` column added by the Phase-2 migration is
-        # populated by ``_write_embedding_vec`` below so the vector
-        # search backend can pick it up.
+        # Insert into database. The vector goes to ``embedding_vec``
+        # only, through ``_write_embedding_vec`` below; the legacy
+        # ``embedding`` column is no longer written (#3411).
         await self.db.execute(
             """INSERT INTO saved_items
                (id, agent_id, item_type, name, summary, content, content_hash,
-                ipfs_cid, embedding, source_type, source_ref, schema_id, tags, metadata,
+                ipfs_cid, source_type, source_ref, schema_id, tags, metadata,
                 created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 item_id,
                 self.agent_id,
@@ -516,7 +515,6 @@ class SavedItemsStore:
                 content,
                 content_hash,
                 ipfs_cid,
-                embedding_blob,
                 source_type,
                 source_ref,
                 schema_id,
@@ -555,6 +553,9 @@ class SavedItemsStore:
                         "current_profile_id() failed for saved_item %s: %s",
                         item_id, exc,
                     )
+            await ensure_embedding_vec_column(
+                self.db, "saved_items", len(embedding),
+            )
             await self._write_embedding_vec(item_id, embedding, profile_id)
             if profile_id is not None and embedding_service is not None:
                 from .sqla.embedding_profile import upsert_embedding_profile
@@ -812,17 +813,17 @@ class SavedItemsStore:
         embedding: List[float],
         profile_id: Optional[str] = None,
     ) -> None:
-        """Write the embedding (and #1477 profile id) to the parallel
-        ``embedding_vec`` column so it's discoverable by the vector
-        backend.
+        """Write the embedding (and #1477 profile id) to
+        ``embedding_vec``, the only column that stores it (#3411).
 
         - On Postgres, formats the list as pgvector's text shape
           (``[v1,v2,…]``) and binds with a ``::vector`` cast.
-        - On SQLite, packs to float32 little-endian bytes — same shape
-          stored in the legacy ``embedding`` BLOB column, so the
-          PurePythonBackend reads either column identically.
+        - On SQLite, packs to float32 little-endian bytes.
         - On any other dialect, treats the column as binary like
           SQLite.
+
+        The caller creates the column first with
+        ``ensure_embedding_vec_column``.
 
         ``profile_id`` is co-written into the parallel
         ``embedding_profile_id`` column. NULL is allowed (pre-#1477
@@ -830,11 +831,9 @@ class SavedItemsStore:
         active profile so NULL rows correctly stay out of mixed-
         coordinate-space recall.
 
-        Errors here are non-fatal. While the table has no
-        ``embedding_vec`` column, readers use the legacy column, which
-        is already written. Once the column exists it is the only one
-        readers use (#3409), so a failed write leaves the item without
-        a stored vector until ``kestrel embeddings backfill`` copies it.
+        Errors here are non-fatal, but a failed ``embedding_vec`` write
+        leaves the item without a stored vector (``save_item`` then
+        reports none) until ``kestrel embeddings reindex`` embeds it.
         Failure paths attempt to stamp the profile id even when
         the vector column is missing — without this, partial-
         migration deployments (only #1477 ran, not Phase-2) would
@@ -886,9 +885,9 @@ class SavedItemsStore:
                     (_serialize_embedding(embedding), item_id),
                 )
         except Exception as e2:
-            logger.debug(
-                "saved_items.embedding_vec write failed for %s: %s "
-                "(column likely missing — Phase-2 migration pending).",
+            logger.warning(
+                "saved_items.embedding_vec write failed for %s: %s. The "
+                "item has no stored vector until it is re-embedded.",
                 item_id, e2,
             )
         # Best-effort profile-id-only write so the legacy in-Python
