@@ -21,6 +21,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from .async_database import AsyncDatabase
+from .embedding_column import decode_stored_embedding, stored_embedding_column
 
 if TYPE_CHECKING:
     from kestrel_sovereign.filecoin_adapter import FilecoinAdapter
@@ -246,7 +247,12 @@ class SavedItem:
 
     @classmethod
     def from_row(cls, row: tuple) -> "SavedItem":
-        """Create from database row."""
+        """Create from a row selected with ``_SAVED_ITEM_COLUMNS``.
+
+        ``row[8]`` is the stored embedding, read from ``embedding_vec``
+        (see ``embedding_column``), never the legacy column once
+        ``embedding_vec`` exists (#3409).
+        """
         return cls(
             id=row[0],
             agent_id=row[1],
@@ -256,7 +262,7 @@ class SavedItem:
             content=row[5],
             content_hash=row[6],
             ipfs_cid=row[7],
-            embedding=_deserialize_embedding(row[8]) if row[8] else None,
+            embedding=decode_stored_embedding(row[8]),
             source_type=row[9],
             source_ref=row[10],
             schema_id=row[11],
@@ -310,19 +316,14 @@ def _serialize_embedding(embedding: List[float]) -> bytes:
     return struct.pack(f'<{len(embedding)}f', *embedding)
 
 
-def _deserialize_embedding(data: bytes) -> List[float]:
-    """Deserialize embedding from little-endian float32 bytes.
-
-    A length that isn't a multiple of 4 can't be a valid float32 vector —
-    skip it rather than ``// 4``-truncate to noise (#1653).
-    """
-    if len(data) % 4 != 0:
-        logger.warning(
-            "Skipping embedding: %d bytes not a multiple of 4.", len(data),
-        )
-        return []
-    count = len(data) // 4  # 4 bytes per float
-    return list(struct.unpack(f'<{count}f', data))
+# Column list of every SELECT that feeds ``SavedItem.from_row``.
+# ``{embedding}`` is the stored-embedding expression resolved by
+# ``SavedItemsStore._item_columns`` (#3409).
+_SAVED_ITEM_COLUMNS = (
+    "id, agent_id, item_type, name, summary, content, content_hash, "
+    "ipfs_cid, {embedding}, source_type, source_ref, schema_id, "
+    "tags, metadata, created_at, updated_at"
+)
 
 
 def _compute_content_hash(content: str) -> str:
@@ -567,6 +568,11 @@ class SavedItemsStore:
                         "saved_item %s: %s", item_id, exc,
                     )
         await self.db.commit()
+        if embedding is not None:
+            # Report the vector readers will see, not the one computed
+            # here: after a failed ``embedding_vec`` write the item is not
+            # searchable, and ``has_embedding`` must say so (#3409).
+            embedding = await self._stored_embedding(item_id)
 
         return SavedItem(
             id=item_id,
@@ -710,12 +716,26 @@ class SavedItemsStore:
 
         return await self.get_by_id(item_id)
 
+    async def _item_columns(self) -> str:
+        """SELECT list for ``SavedItem.from_row`` on this database."""
+        column = await stored_embedding_column(self.db, "saved_items")
+        return _SAVED_ITEM_COLUMNS.format(embedding=column.select)
+
+    async def _stored_embedding(self, item_id: str) -> Optional[List[float]]:
+        """The stored embedding readers see for *item_id*."""
+        column = await stored_embedding_column(self.db, "saved_items")
+        row = await self.db.fetchone(
+            f"SELECT {column.select} FROM saved_items "
+            "WHERE id = ? AND agent_id = ?",
+            (item_id, self.agent_id),
+        )
+        return decode_stored_embedding(row[0]) if row else None
+
     async def get_by_id(self, item_id: str) -> Optional[SavedItem]:
         """Get a saved item by ID."""
+        columns = await self._item_columns()
         row = await self.db.fetchone(
-            """SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                      ipfs_cid, embedding, source_type, source_ref, schema_id,
-                      tags, metadata, created_at, updated_at
+            f"""SELECT {columns}
                FROM saved_items WHERE id = ? AND agent_id = ?""",
             (item_id, self.agent_id)
         )
@@ -723,10 +743,9 @@ class SavedItemsStore:
 
     async def get_by_content_hash(self, content_hash: str) -> Optional[SavedItem]:
         """Get a saved item by content hash (for deduplication)."""
+        columns = await self._item_columns()
         row = await self.db.fetchone(
-            """SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                      ipfs_cid, embedding, source_type, source_ref, schema_id,
-                      tags, metadata, created_at, updated_at
+            f"""SELECT {columns}
                FROM saved_items WHERE content_hash = ? AND agent_id = ?""",
             (content_hash, self.agent_id)
         )
@@ -734,10 +753,9 @@ class SavedItemsStore:
 
     async def list_by_content_hash(self, content_hash: str) -> List[SavedItem]:
         """List saved items with the same content hash for this agent."""
+        columns = await self._item_columns()
         rows = await self.db.fetchall(
-            """SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                      ipfs_cid, embedding, source_type, source_ref, schema_id,
-                      tags, metadata, created_at, updated_at
+            f"""SELECT {columns}
                FROM saved_items WHERE content_hash = ? AND agent_id = ?""",
             (content_hash, self.agent_id)
         )
@@ -769,11 +787,10 @@ class SavedItemsStore:
         limit: int = 50
     ) -> List[SavedItem]:
         """List saved items, optionally filtered by type."""
+        columns = await self._item_columns()
         if item_type:
             rows = await self.db.fetchall(
-                """SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                          ipfs_cid, embedding, source_type, source_ref, schema_id,
-                          tags, metadata, created_at, updated_at
+                f"""SELECT {columns}
                    FROM saved_items
                    WHERE agent_id = ? AND item_type = ?
                    ORDER BY created_at DESC LIMIT ?""",
@@ -781,9 +798,7 @@ class SavedItemsStore:
             )
         else:
             rows = await self.db.fetchall(
-                """SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                          ipfs_cid, embedding, source_type, source_ref, schema_id,
-                          tags, metadata, created_at, updated_at
+                f"""SELECT {columns}
                    FROM saved_items
                    WHERE agent_id = ?
                    ORDER BY created_at DESC LIMIT ?""",
@@ -815,9 +830,11 @@ class SavedItemsStore:
         active profile so NULL rows correctly stay out of mixed-
         coordinate-space recall.
 
-        Errors here are non-fatal: the legacy ``embedding`` BYTEA / BLOB
-        column is already written, so search degrades gracefully to
-        the in-Python fallback path on the next ``search()`` call.
+        Errors here are non-fatal. While the table has no
+        ``embedding_vec`` column, readers use the legacy column, which
+        is already written. Once the column exists it is the only one
+        readers use (#3409), so a failed write leaves the item without
+        a stored vector until ``kestrel embeddings backfill`` copies it.
         Failure paths attempt to stamp the profile id even when
         the vector column is missing — without this, partial-
         migration deployments (only #1477 ran, not Phase-2) would
@@ -1074,13 +1091,11 @@ class SavedItemsStore:
 
         # Materialize: fetch full SavedItem rows by id, preserve the
         # backend's similarity ordering.
+        columns = await self._item_columns()
         scored: List[Dict[str, Any]] = []
         for item_id, score in top_k:
             row = await self.db.fetchone(
-                """SELECT id, agent_id, item_type, name, summary, content,
-                          content_hash, ipfs_cid, embedding, source_type,
-                          source_ref, schema_id, tags, metadata,
-                          created_at, updated_at
+                f"""SELECT {columns}
                    FROM saved_items WHERE id = ? AND agent_id = ?""",
                 (item_id, self.agent_id),
             )
@@ -1110,6 +1125,12 @@ class SavedItemsStore:
         try with the filter first; if the column doesn't exist (pre-
         migration DB), retry the legacy query unchanged. Catches the
         codex P2 about the fallback path bypassing the new filter.
+
+        #3409: scores the stored embedding ``embedding_column``
+        resolves, which is ``embedding_vec`` whenever the column
+        exists. Reindex rewrites that column and the profile id
+        together, so a row matching the active profile is scored with
+        that profile's vector, not the legacy bytes reindex leaves.
         """
         # Derive current profile id once.
         current_profile_id: Optional[str] = None
@@ -1133,24 +1154,23 @@ class SavedItemsStore:
             profile_params = (current_profile_id,)
 
         # Get all items with embeddings (optionally filtered by profile).
+        stored = await stored_embedding_column(self.db, "saved_items")
+        columns = _SAVED_ITEM_COLUMNS.format(embedding=stored.select)
+
         async def _fetch(with_profile: bool):
             clause = profile_clause if with_profile else ""
             params_tail = profile_params if with_profile else ()
             if item_type:
                 return await self.db.fetchall(
-                    f"""SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                              ipfs_cid, embedding, source_type, source_ref, schema_id,
-                              tags, metadata, created_at, updated_at
+                    f"""SELECT {columns}
                        FROM saved_items
-                       WHERE agent_id = ? AND item_type = ? AND embedding IS NOT NULL{clause}""",
+                       WHERE agent_id = ? AND item_type = ? AND {stored.name} IS NOT NULL{clause}""",
                     (self.agent_id, item_type, *params_tail),
                 )
             return await self.db.fetchall(
-                f"""SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                          ipfs_cid, embedding, source_type, source_ref, schema_id,
-                          tags, metadata, created_at, updated_at
+                f"""SELECT {columns}
                    FROM saved_items
-                   WHERE agent_id = ? AND embedding IS NOT NULL{clause}""",
+                   WHERE agent_id = ? AND {stored.name} IS NOT NULL{clause}""",
                 (self.agent_id, *params_tail),
             )
 
@@ -1203,6 +1223,7 @@ class SavedItemsStore:
         not just the embedding one.
         """
         query_lower = f"%{query.lower()}%"
+        columns = await self._item_columns()
 
         current_profile_id: Optional[str] = None
         embedding_service_for_profile = self._get_embedding_service()
@@ -1239,9 +1260,7 @@ class SavedItemsStore:
             params_tail = profile_params if with_profile else ()
             if item_type:
                 return await self.db.fetchall(
-                    f"""SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                              ipfs_cid, embedding, source_type, source_ref, schema_id,
-                              tags, metadata, created_at, updated_at
+                    f"""SELECT {columns}
                        FROM saved_items
                        WHERE agent_id = ? AND item_type = ?
                          AND (LOWER(name) LIKE ? OR LOWER(summary) LIKE ? OR LOWER(content) LIKE ?)
@@ -1251,9 +1270,7 @@ class SavedItemsStore:
                      query_lower, *params_tail, limit),
                 )
             return await self.db.fetchall(
-                f"""SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                          ipfs_cid, embedding, source_type, source_ref, schema_id,
-                          tags, metadata, created_at, updated_at
+                f"""SELECT {columns}
                    FROM saved_items
                    WHERE agent_id = ?
                      AND (LOWER(name) LIKE ? OR LOWER(summary) LIKE ? OR LOWER(content) LIKE ?)
@@ -1308,10 +1325,9 @@ class SavedItemsStore:
         limit: int = 50
     ) -> List[SavedItem]:
         """List structured items by schema type."""
+        columns = await self._item_columns()
         rows = await self.db.fetchall(
-            """SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                      ipfs_cid, embedding, source_type, source_ref, schema_id,
-                      tags, metadata, created_at, updated_at
+            f"""SELECT {columns}
                FROM saved_items
                WHERE agent_id = ? AND schema_id = ?
                ORDER BY created_at DESC LIMIT ?""",
@@ -1328,12 +1344,11 @@ class SavedItemsStore:
         """List items that have a specific tag."""
         # SQLite JSON search - look for tag in JSON array
         tag_pattern = f'%"{tag}"%'
+        columns = await self._item_columns()
 
         if item_type:
             rows = await self.db.fetchall(
-                """SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                          ipfs_cid, embedding, source_type, source_ref, schema_id,
-                          tags, metadata, created_at, updated_at
+                f"""SELECT {columns}
                    FROM saved_items
                    WHERE agent_id = ? AND item_type = ? AND tags LIKE ?
                    ORDER BY created_at DESC LIMIT ?""",
@@ -1341,9 +1356,7 @@ class SavedItemsStore:
             )
         else:
             rows = await self.db.fetchall(
-                """SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                          ipfs_cid, embedding, source_type, source_ref, schema_id,
-                          tags, metadata, created_at, updated_at
+                f"""SELECT {columns}
                    FROM saved_items
                    WHERE agent_id = ? AND tags LIKE ?
                    ORDER BY created_at DESC LIMIT ?""",
@@ -1396,9 +1409,11 @@ class SavedItemsStore:
         )
         ipfs_count = ipfs_row[0] if ipfs_row else 0
 
-        # Count items with embeddings
+        # Count items with a stored embedding (#3409: ``embedding_vec``).
+        stored = await stored_embedding_column(self.db, "saved_items")
         embedding_row = await self.db.fetchone(
-            "SELECT COUNT(*) FROM saved_items WHERE agent_id = ? AND embedding IS NOT NULL",
+            "SELECT COUNT(*) FROM saved_items "
+            f"WHERE agent_id = ? AND {stored.name} IS NOT NULL",
             (self.agent_id,)
         )
         embedding_count = embedding_row[0] if embedding_row else 0

@@ -2,8 +2,9 @@
 type: Architecture Spec
 title: Legacy Embedding Column Inventory
 description: Canonical inventory of every reader and writer of the legacy raw-SQL
-  `embedding` column on `saved_items` and `document_chunks`, and the verify/backfill
-  helper for `embedding_vec`. Phase 1 of the retirement tracked in #2684.
+  `embedding` column on `saved_items` and `document_chunks`, the verify/backfill
+  helper for `embedding_vec`, and the readers moved to `embedding_vec`. Phases 1
+  and 2 of the retirement tracked in #2684.
 resource: /docs/architecture/storage/EMBEDDING_COLUMN_RETIREMENT.md
 tags:
 - docs
@@ -24,8 +25,8 @@ privacy: public
 
 | Column | SQLite | PostgreSQL | Who uses it |
 |---|---|---|---|
-| `embedding` (legacy) | `BLOB`, float32 little-endian | `BYTEA`, float32 little-endian | Raw `AsyncDatabase` IO: inserts, row hydration, the in-Python fallback search, stats |
-| `embedding_vec` | `BLOB`, float32 little-endian | `vector(N)` (pgvector) with an HNSW index | The SQLAlchemy ORM and the vector backends (`storage/vector`) |
+| `embedding` (legacy) | `BLOB`, float32 little-endian | `BYTEA`, float32 little-endian | The dual-write inserts, the startup migrations, the verify/backfill helper, and readers only while a table has no `embedding_vec` column |
+| `embedding_vec` (canonical) | `BLOB`, float32 little-endian | `vector(N)` (pgvector) with an HNSW index | The SQLAlchemy ORM, the vector backends (`storage/vector`), and every raw-SQL reader ([#3409](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3409)) |
 
 The split was the #1447 bridge: it let the pgvector path land without rewriting
 the raw SQL that binds float32 bytes. Retirement is tracked in
@@ -38,12 +39,14 @@ three phases:
 2. Pass the gate with `kestrel embeddings verify|backfill`
    ([#3405](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3405),
    see [How to run](#how-to-run)), then move every legacy reader to
-   `embedding_vec`.
+   `embedding_vec`. The readers moved in
+   [#3409](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3409);
+   see [Readers](#readers-moved-to-embedding_vec).
 3. Stop the dual writes, then retire the legacy column.
 
-This page is the starting point for phases 2 and 3. Line numbers are against
-the tree that introduced this page. Re-run the grep below before acting on
-them.
+This page is the starting point for phase 3. Line numbers in the schema and
+writer tables are against the tree that introduced this page; reader
+locations are against #3409. Re-run the grep below before acting on them.
 
 ```bash
 grep -rn "embedding" kestrel_sovereign/storage kestrel_sovereign/identity \
@@ -110,33 +113,53 @@ recomputes an embedding, so neither column changes on edit.
 |---|---|
 | `storage/embedding_reindex.py:459-484` (`_write_row`, via `kestrel embeddings reindex` in `cli_embeddings.py`) | Rewrites `embedding_vec` and `embedding_profile_id` to the target profile. The legacy `embedding` column is **not** touched, so after a reindex the two representations disagree by design. Reindex also embeds rows that had no vector at all, which leaves them with `embedding_vec` only. |
 
-## Readers of the legacy `embedding` column
+## Readers (moved to `embedding_vec`)
+
+Since [#3409](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3409)
+every raw-SQL reader resolves its column through
+`storage/embedding_column.py`:
+
+- `stored_embedding_column(db, table)` asks the catalog (`column_exists`)
+  whether the table has `embedding_vec`. If it does, readers select
+  `embedding_vec` on SQLite and `embedding_vec::text` on PostgreSQL, and
+  filter on `embedding_vec IS NOT NULL`. A row whose `embedding_vec` is NULL
+  has no stored vector, whatever its legacy column holds. Nothing falls back
+  to the legacy value per row.
+- Only when the table has **no `embedding_vec` column at all** do readers use
+  the legacy `embedding`. That is a fresh PostgreSQL database, where the
+  startup migration defers `vector(N)` until a legacy row shows the width
+  (see [Schema and migrations](#schema-and-migrations)). Reindex reads and
+  writes `embedding_vec`, so it cannot have run against such a table, and its
+  legacy bytes are current. The next boot creates the column and copies them.
+- `decode_stored_embedding(value)` decodes float32 little-endian bytes and
+  pgvector text. It is the one decoder; the per-store `_deserialize_embedding`
+  helpers are gone.
 
 | Location | Table | Reader |
 |---|---|---|
-| `storage/saved_items_store.py:248-262` (line 259) | `saved_items` | `SavedItem.from_row` decodes `row[8]` (legacy `embedding`) into the dataclass `embedding` field. Every `SELECT` below feeds it. |
-| `storage/saved_items_store.py:717` | `saved_items` | `get_by_id`. |
-| `storage/saved_items_store.py:728` | `saved_items` | `get_by_content_hash`. |
-| `storage/saved_items_store.py:739` | `saved_items` | `list_by_content_hash`. |
-| `storage/saved_items_store.py:775, 785` | `saved_items` | `list_items`. |
-| `storage/saved_items_store.py:1081` | `saved_items` | `_search_via_vector_backend` hydrates kNN hits (the ranking itself uses `embedding_vec`). |
-| `storage/saved_items_store.py:1136-1179` | `saved_items` | `_legacy_in_python_search`: `WHERE embedding IS NOT NULL` (1145, 1153) and cosine over the legacy bytes (1179). |
-| `storage/saved_items_store.py:1243, 1255` | `saved_items` | `_text_search`. |
-| `storage/saved_items_store.py:1313` | `saved_items` | `list_by_schema`. |
-| `storage/saved_items_store.py:1335, 1345` | `saved_items` | `list_by_tag`. |
-| `storage/saved_items_store.py:1400-1411` | `saved_items` | `get_stats`: `with_embedding` counts `embedding IS NOT NULL`. |
-| `storage/async_rag_store.py:311-326` | `document_chunks` | `read_indexed_chunks` decodes the legacy bytes. `identity/birth_record.py:640` uses it to copy chunks, and `store_precomputed_chunks` (called at `identity/birth_record.py:868`) writes them back into both columns. |
-| `storage/async_rag_store.py:773-806` | `document_chunks` | `_legacy_in_python_search`: `WHERE embedding IS NOT NULL` and cosine over the legacy bytes. It serves when the vector backend is unavailable or fails. |
-| `storage/sqla/migrations.py:1401, 1446, 1582, 1617` | both | Phase-2 migrations (see above). |
+| `storage/saved_items_store.py:249-265` | `saved_items` | `SavedItem.from_row` decodes `row[8]`, the stored embedding every `SELECT` below names through `_SAVED_ITEM_COLUMNS` (line 322) and `_item_columns` (line 719). |
+| `storage/saved_items_store.py:734, 744, 754` | `saved_items` | `get_by_id`, `get_by_content_hash`, `list_by_content_hash`. |
+| `storage/saved_items_store.py:784` | `saved_items` | `list_items`. |
+| `storage/saved_items_store.py:1012` | `saved_items` | `_search_via_vector_backend` hydrates kNN hits (the ranking itself already used `embedding_vec`). |
+| `storage/saved_items_store.py:1112-1157` | `saved_items` | `_legacy_in_python_search`: filters and scores the resolved column. |
+| `storage/saved_items_store.py:1209, 1322, 1338` | `saved_items` | `_text_search`, `list_by_schema`, `list_by_tag`. |
+| `storage/saved_items_store.py:1385-1413` | `saved_items` | `get_stats`: `with_embedding` counts the resolved column. |
+| `storage/saved_items_store.py:724` | `saved_items` | `_stored_embedding`: `save_item` returns the vector that landed in the resolved column, not the one it computed. After a failed `embedding_vec` write the item reports no embedding. |
+| `storage/async_rag_store.py:275-317` | `document_chunks` | `read_indexed_chunks`: the copy pairs `embedding_profile_id` with `embedding_vec`, the vector reindex stamped it with. |
+| `storage/async_rag_store.py:722-793` | `document_chunks` | `_legacy_in_python_search`: filters and scores the resolved column. Despite its name it is the **only** embedding path for a bound (per-agent) store; the generic vector spec has no ownership join. |
 
-### Indirect consumers of the legacy value
+The `sqla/migrations.py` reads of the legacy column (lines 1401, 1446, 1582,
+1617) and `embedding_vec_backfill.py` are not readers in this sense. They copy
+the legacy value into `embedding_vec` and stay until phase 3.
 
-These read `SavedItem.embedding` (the dataclass field), which `from_row`
-populates **from the legacy column**:
+### Indirect consumers
+
+These read `SavedItem.embedding` (the dataclass field), which `from_row` and
+`save_item` now populate from the resolved column:
 
 | Location | Use |
 |---|---|
-| `features/save/feature.py:280, 402, 497` | `has_embedding` in tool results. |
+| `features/save/feature.py:280, 402, 497` | `has_embedding` in tool results. A row embedded only by reindex reports `true`. |
 | `agent/memory_manager.py:757` | `has_embedding` in saved-item context blocks. |
 | `scripts/validate_vector_lift_e2e.py:483` | Asserts a saved item has an embedding. |
 
@@ -152,23 +175,29 @@ populates **from the legacy column**:
 
 ## Findings for phases 2 and 3
 
-- **The legacy fallback reads a stale vector after a reindex.**
-  `SavedItemsStore._legacy_in_python_search` filters on the current
-  `embedding_profile_id`, which reindex rewrites. It then scores the legacy
-  bytes, which reindex does not rewrite. A reindexed row can therefore match
-  the new profile while its legacy vector comes from the old model.
-  `AsyncRAGStore._legacy_in_python_search` scores legacy bytes without a
-  profile filter at all. Moving these readers to `embedding_vec` in phase 2
-  removes both problems.
-- **`has_embedding` reports the legacy column.** A row embedded only through
-  reindex reports `has_embedding: false`.
+- **Fixed in #3409: the in-Python search scored a stale vector after a
+  reindex.** Both `_legacy_in_python_search` methods filter on the current
+  `embedding_profile_id` (the RAG one only when the embedding service reports
+  a profile), which reindex rewrites, and then scored the legacy bytes, which
+  reindex does not. A reindexed row matched the new profile and was scored
+  with the old model's vector. For `document_chunks` this was every bound
+  store's embedding search, not a fallback.
+- **Fixed in #3409: `has_embedding` reported the legacy column.** A row
+  embedded only through reindex reported `has_embedding: false`.
 - **Disagreement is expected, not corruption.** After a reindex,
   `embedding_vec` is the authoritative representation. The verify helper
   counts disagreeing rows. It never rewrites them.
 - **PostgreSQL can have legacy-only rows with no `embedding_vec` column.**
   Until the column exists the backfill helper reports it as absent and changes
   nothing. Creating it stays with the startup migration, which chooses the
-  vector width.
+  vector width. Readers use the legacy column in that state (see
+  [Readers](#readers-moved-to-embedding_vec)).
+- **Phase 3 must create `embedding_vec` before it stops the legacy write.**
+  A fresh PostgreSQL database holds its first vectors only in the legacy
+  column until the next boot. Once the legacy write stops, the first write
+  must create the column at the vector's width (or the width must come from
+  configuration). Only then can the legacy branch of
+  `stored_embedding_column` be deleted with the column.
 
 ## Verify and backfill helper
 
@@ -232,11 +261,13 @@ kestrel embeddings backfill [--table saved_items|document_chunks|all] [--batch-s
   commits while `verify` reads a checkpointed database, `verify` refuses to
   report (exit `2`). `backfill` writes, and opens the database normally.
 
-**The phase-2 gate.** Before any reader switches to `embedding_vec`, run
+**The phase-2 gate.** Before deploying the reader switch (#3409), run
 `kestrel embeddings backfill`, then `kestrel embeddings verify`, on every
 deployment. Proceed only when `verify` exits 0 and `rows_disagreeing` has been
 reviewed. A disagreement is expected after a reindex, so it is reported but
-does not affect the exit code.
+does not affect the exit code. After the switch a row that `verify` counts in
+`rows_missing_embedding_vec` is invisible to search and reports
+`has_embedding: false` until `backfill` copies it.
 
 | Exit code | Meaning |
 |---|---|

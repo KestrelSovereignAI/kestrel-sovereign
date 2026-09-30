@@ -31,6 +31,7 @@ from typing import List, Dict, Any, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .bm25_index import AsyncBM25Index, BM25_AVAILABLE
+from .embedding_column import decode_stored_embedding, stored_embedding_column
 
 logger = logging.getLogger(__name__)
 
@@ -68,21 +69,6 @@ def _serialize_embedding(embedding: List[float]) -> bytes:
     async_conversation_store; #1653).
     """
     return struct.pack(f'<{len(embedding)}f', *embedding)
-
-
-def _deserialize_embedding(data: bytes) -> List[float]:
-    """Deserialize embedding from little-endian float32 bytes.
-
-    A length that isn't a multiple of 4 can't be a valid float32 vector —
-    skip it rather than ``// 4``-truncate to noise (#1653).
-    """
-    if len(data) % 4 != 0:
-        logger.warning(
-            "Skipping embedding: %d bytes not a multiple of 4.", len(data),
-        )
-        return []
-    count = len(data) // 4  # 4 bytes per float
-    return list(struct.unpack(f'<{count}f', data))
 
 
 class AsyncRAGStore:
@@ -297,6 +283,11 @@ class AsyncRAGStore:
 
         ``embedding_profile_id`` predates #1477 on some databases; a database
         without the column still yields chunks, with ``profile_id`` None.
+
+        The vector is the stored embedding ``embedding_column`` resolves
+        (#3409): ``embedding_vec``, which reindex rewrites together with the
+        profile id, so the copy never pairs the new profile with the legacy
+        bytes of the previous model.
         """
         owner_scope, owner_params = self._owner_scope()
         # Ask whether the column exists rather than letting a SELECT fail to
@@ -309,10 +300,11 @@ class AsyncRAGStore:
         has_profile_id = await self.db._column_exists(
             "document_chunks", "embedding_profile_id",
         )
+        stored = await stored_embedding_column(self.db, "document_chunks")
         columns = (
-            "content, embedding, embedding_profile_id"
+            f"content, {stored.select}, embedding_profile_id"
             if has_profile_id
-            else "content, embedding"
+            else f"content, {stored.select}"
         )
         rows = await self.db.fetchall(
             f"SELECT {columns} FROM document_chunks "
@@ -322,8 +314,7 @@ class AsyncRAGStore:
 
         chunks: List[IndexedChunk] = []
         for row in rows:
-            blob = row[1]
-            embedding = _deserialize_embedding(bytes(blob)) if blob else []
+            embedding = decode_stored_embedding(row[1]) or []
             profile_id = row[2] if len(row) > 2 else None
             chunks.append(
                 IndexedChunk(
@@ -425,7 +416,7 @@ class AsyncRAGStore:
         Errors are non-fatal: the most likely cause is that a
         migration hasn't created the column yet on this DB, in which
         case the legacy ``embedding`` column is already written and
-        search degrades to the in-Python fallback.
+        readers use it until the column exists (#3409).
 
         Each attempt runs in its own ``transaction()`` so "non-fatal"
         stays true when a CALLER holds a transaction open. PostgreSQL
@@ -609,11 +600,10 @@ class AsyncRAGStore:
             if scored is not None:
                 return scored
 
-        # Fallback: legacy in-Python loop. Same logic as pre-#1447 —
-        # used when the SQLA session factory can't be built or the
-        # vector backend errors. The legacy path reads the BYTEA
-        # ``embedding`` column, which is still populated by
-        # ``chunk_document`` for every embedded chunk.
+        # Fallback: in-Python loop. Same logic as pre-#1447 — used for
+        # bound stores, when the SQLA session factory can't be built, or
+        # when the vector backend errors. It reads the stored embedding
+        # ``embedding_column`` resolves (``embedding_vec``, #3409).
         return await self._legacy_in_python_search(
             query_embedding, limit, min_score,
         )
@@ -735,11 +725,16 @@ class AsyncRAGStore:
         limit: int,
         min_score: float,
     ) -> List[Dict[str, Any]]:
-        """Fallback used when the SQLA session factory isn't available.
+        """In-Python cosine search. Serves every bound store, and unbound
+        ones when the SQLA session factory isn't available.
 
-        Reads the legacy ``embedding`` BYTEA / BLOB column and runs
-        cosine in Python. Matches the pre-#1447 RAG search behavior
-        exactly, including the #1404 ``min_score`` floor.
+        Scores the stored embedding ``embedding_column`` resolves
+        (#3409): ``embedding_vec`` whenever the column exists. Reindex
+        rewrites it together with ``embedding_profile_id``, so a chunk
+        matching the active profile is scored with that profile's vector,
+        never the legacy bytes reindex leaves behind. Matches the
+        pre-#1447 RAG search behavior otherwise, including the #1404
+        ``min_score`` floor.
 
         #1477: also applies the profile-id filter so cross-model chunks
         can't sneak into cosine on the legacy path. Tries with the
@@ -767,13 +762,16 @@ class AsyncRAGStore:
                     )
 
             owner_scope, owner_params = self._owner_scope()
+            stored = await stored_embedding_column(self.db, "document_chunks")
+            select = (
+                f"SELECT chunk_id, file_hash, content, {stored.select} "
+                "FROM document_chunks "
+                f"WHERE {owner_scope} AND {stored.name} IS NOT NULL"
+            )
             if current_profile_id is not None:
                 try:
                     rows = await self.db.fetchall(
-                        "SELECT chunk_id, file_hash, content, embedding "
-                        "FROM document_chunks "
-                        f"WHERE {owner_scope} AND embedding IS NOT NULL "
-                        "AND embedding_profile_id = ?",
+                        f"{select} AND embedding_profile_id = ?",
                         owner_params + (current_profile_id,),
                     )
                 except Exception as exc:
@@ -783,27 +781,17 @@ class AsyncRAGStore:
                         "Legacy RAG search failed with profile filter "
                         "(%s); retrying unfiltered.", exc,
                     )
-                    rows = await self.db.fetchall(
-                        "SELECT chunk_id, file_hash, content, embedding "
-                        "FROM document_chunks "
-                        f"WHERE {owner_scope} AND embedding IS NOT NULL",
-                        owner_params,
-                    )
+                    rows = await self.db.fetchall(select, owner_params)
             else:
-                rows = await self.db.fetchall(
-                    "SELECT chunk_id, file_hash, content, embedding "
-                    "FROM document_chunks "
-                    f"WHERE {owner_scope} AND embedding IS NOT NULL",
-                    owner_params,
-                )
+                rows = await self.db.fetchall(select, owner_params)
             if not rows:
                 return []
 
             scored: List[Dict[str, Any]] = []
             for row in rows:
-                chunk_id, file_hash, content, embedding_blob = row
-                if embedding_blob:
-                    chunk_embedding = _deserialize_embedding(embedding_blob)
+                chunk_id, file_hash, content, stored_value = row
+                chunk_embedding = decode_stored_embedding(stored_value)
+                if chunk_embedding:
                     score = cosine_similarity(query_embedding, chunk_embedding)
                     if score < min_score:
                         continue

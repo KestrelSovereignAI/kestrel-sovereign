@@ -177,6 +177,7 @@ async def test_search_with_no_embedding_service_falls_back_to_text():
     is never invoked."""
     mock_db = MagicMock()
     mock_db.fetchall = AsyncMock(return_value=[])
+    mock_db.column_exists = AsyncMock(return_value=True)
     store = SavedItemsStore(mock_db, agent_id="agent-1")
     store._get_embedding_service = lambda: None
 
@@ -252,6 +253,7 @@ async def test_search_preserves_query_when_falling_back_to_text():
     mock_db = MagicMock()
     mock_db.backend_type = "unknown-backend"  # force legacy fallback path
     mock_db.fetchall = AsyncMock(return_value=[])
+    mock_db.column_exists = AsyncMock(return_value=True)
 
     store = SavedItemsStore(mock_db, agent_id="agent-1")
     service = SimpleNamespace(
