@@ -38,6 +38,8 @@ def process_local_service(
     service._disabled_routes = {}
     service._mandate_preference = {}
     service._mandate_fallbacks = []
+    service._mandate_load_error = None
+    service._preference_persistence_callback = None
     service._route_embedding_model_overrides = {}
     service._route_embedding_caps_backup = {}
     service._route_embedding_model_persistence_callback = None

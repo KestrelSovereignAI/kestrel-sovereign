@@ -12,6 +12,9 @@ Covered here:
 
 - the CLI re-applies the verified shared spaces the database records, so it
   resolves the agent's profile (the root cause);
+- with an auto ``embedding_route``, the CLI applies the chat-model preference
+  the agent persisted, through the agent's own loader, so it follows the same
+  chat route the agent does;
 - the agent records the profile it resolves, and ``reindex`` refuses any other
   target, in a dry-run and with ``--yes``, without writing anything; onto the
   recorded profile it re-embeds only the stale rows;
@@ -503,6 +506,175 @@ async def test_the_fleet_reindex_finds_the_corpus_already_on_its_profile(
     assert "Nothing to do" in out
     assert adapter.embedded == []
     assert await _snapshot(db) == before
+
+
+# -------------------------- an auto embedding_route follows the pinned chat route
+
+
+class _RouteAdapter:
+    """Embeds natively on its own route and records what it embedded."""
+
+    def __init__(self) -> None:
+        self.embedded: list[str] = []
+
+    async def aembed_batch(self, client, texts, model=None, **kwargs):
+        self.embedded.extend(texts)
+        return [[float(len(t) % 5) + i for i in range(DIM)] for t in texts]
+
+
+# ``openai:api`` leads the route order; the agent's chat is pinned to
+# ``openrouter:api``. Both embed natively with different models, so with an
+# auto embedding_route the pin alone decides which profile the agent stamps.
+_DEFAULT_ROUTE_MODEL = ("openai", "text-embedding-3-small")
+_PINNED_ROUTE_MODEL = ("openrouter", "qwen/qwen3-embedding-8b")
+_CHAT_PIN = {"vendor": "openrouter", "model": "qwen/qwen3-235b", "route": "api"}
+
+
+def _two_route_service(adapters):
+    """What ``LLMService()`` builds from a config listing both routes."""
+
+    def route(vendor, embedding_model):
+        return {
+            "name": f"{vendor}:api",
+            "vendor": vendor,
+            "route": "api",
+            "adapter": adapters[vendor],
+            "client": object(),
+            "model": "auto",
+            "is_local": False,
+            "is_cloud": True,
+            "capabilities": {
+                "supports_embeddings": True,
+                "embedding_model": embedding_model,
+                "embedding_dim": DIM,
+            },
+        }
+
+    return process_local_service(
+        [route(*_DEFAULT_ROUTE_MODEL), route(*_PINNED_ROUTE_MODEL)]
+    )
+
+
+def _route_profile(vendor_model):
+    vendor, model = vendor_model
+    return derive_embedding_profile(provider=vendor, model=model, dim=DIM).profile_id
+
+
+class _BootingAgent(ModelPreferenceMixin):
+    """The agent's own boot-time loaders, run against a real ``LLMService``."""
+
+    def __init__(self, db, service) -> None:
+        self._raw_storage = SimpleNamespace(db=db)
+        self.agent_id = AGENT
+        self.llm_service = service
+        self.privacy_agent = None
+
+    async def boot(self) -> str:
+        """Load the persisted config in boot order; return the recorded profile."""
+        await self._load_model_preference()
+        await self._load_embedding_route()
+        await self.record_active_embedding_profile()
+        return (await load_active_embedding_profiles(self._raw_storage.db, AGENT)).profile_id
+
+
+async def _persist_chat_pin(db, preference):
+    await db.execute_commit(
+        "INSERT INTO agent_metadata (agent_id, key, value) VALUES (?, ?, ?)",
+        (AGENT, "model_preference", preference),
+    )
+    # Explicitly auto: embeddings follow the chat route.
+    await db.execute_commit(
+        "INSERT INTO agent_metadata (agent_id, key, value) VALUES (?, ?, ?)",
+        (AGENT, "embedding_route", json.dumps(None)),
+    )
+
+
+def _cli_builds(monkeypatch, adapters):
+    """Make the CLI's ``LLMService()`` build the same config the agent runs."""
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.service.LLMService",
+        lambda *args, **kwargs: _two_route_service(adapters),
+    )
+
+
+@pytest.mark.parametrize(
+    "scope", [AGENT, None], ids=["agent-id", "single-agent-database"]
+)
+async def test_the_cli_resolves_the_profile_of_the_pinned_chat_route(
+    db, monkeypatch, capsys, scope
+):
+    adapters = {"openai": _RouteAdapter(), "openrouter": _RouteAdapter()}
+    await _persist_chat_pin(db, json.dumps(_CHAT_PIN))
+    recorded = await _BootingAgent(db, _two_route_service(adapters)).boot()
+    assert recorded == _route_profile(_PINNED_ROUTE_MODEL)
+    # Without the pin the default route's profile resolves: what the CLI
+    # targeted before it applied the persisted preference.
+    err, _, unpinned = cli_embeddings._resolve_target(_two_route_service(adapters))
+    assert err is None and unpinned == _route_profile(_DEFAULT_ROUTE_MODEL)
+    _cli_builds(monkeypatch, adapters)
+
+    resolution = await cli_embeddings.resolve_agent_embedding(db, scope)
+
+    assert resolution.error is None
+    assert resolution.profile_id == recorded
+    out, err = capsys.readouterr()
+    assert "# using persisted model preference: openrouter:api/qwen/qwen3-235b" in out
+    assert "WARNING" not in err
+
+
+async def test_reindex_proceeds_for_an_agent_pinned_to_its_chat_route(
+    db, monkeypatch, capsys
+):
+    adapters = {"openai": _RouteAdapter(), "openrouter": _RouteAdapter()}
+    await _persist_chat_pin(db, json.dumps(_CHAT_PIN))
+    recorded = await _BootingAgent(db, _two_route_service(adapters)).boot()
+    await _seed_corpus(db, recorded)
+    stale = _route_profile(_DEFAULT_ROUTE_MODEL)
+    await _add_message(db, "default-route memory", stale, _vector(9.0))
+    before = await _snapshot(db)
+    _cli_builds(monkeypatch, adapters)
+
+    # The operator's invocation: no --agent-id, --yes.
+    rc = await _reindex(db, None, apply=True)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert f"target_profile: {recorded}" in out
+    assert f"active_profile: {recorded}" in out
+    assert sorted(adapters["openrouter"].embedded) == [
+        "default-route memory", "never embedded",
+    ]
+    assert adapters["openai"].embedded == []
+    after = await _snapshot(db)
+    for table in ("conversation_history", "saved_items", "document_chunks"):
+        assert {row[-1] for row in after[table]} == {recorded}
+    kept = [row for row in before["conversation_history"] if row[-1] == recorded]
+    assert kept and all(row in after["conversation_history"] for row in kept)
+    assert after["saved_items"] == before["saved_items"]
+    assert after["document_chunks"] == before["document_chunks"]
+
+
+async def test_a_preference_that_cannot_be_applied_leaves_both_unpinned(
+    db, monkeypatch, capsys
+):
+    # The agent's loader drops it and runs unpinned; the CLI runs that same
+    # loader, so it resolves what the agent resolves, and says why.
+    adapters = {"openai": _RouteAdapter(), "openrouter": _RouteAdapter()}
+    await _persist_chat_pin(db, "not json")
+    agent_service = _two_route_service(adapters)
+    recorded = await _BootingAgent(db, agent_service).boot()
+    assert recorded == _route_profile(_DEFAULT_ROUTE_MODEL)
+    assert agent_service._mandate_load_error
+    _cli_builds(monkeypatch, adapters)
+
+    resolution = await cli_embeddings.resolve_agent_embedding(db, AGENT)
+
+    assert resolution.error is None
+    assert resolution.profile_id == recorded
+    assert resolution.llm_service._mandate_load_error
+    err = capsys.readouterr().err
+    assert "WARNING: the persisted model preference could not be applied" in err
+    assert "resolving unpinned" in err
 
 
 # ---------------------------------------------------- the agent's own record

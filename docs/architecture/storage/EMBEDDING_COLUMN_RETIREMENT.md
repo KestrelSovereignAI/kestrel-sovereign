@@ -529,11 +529,16 @@ because it did not look at profile ids.
 Three changes close this:
 
 - **The CLI resolves what the agent resolves.**
-  `_apply_persisted_embedding_config` now replays the two boot steps it
+  `_apply_persisted_embedding_config` now replays the three boot steps it
   skipped, before it applies the persisted pins and route: it rehydrates the
-  verified shared spaces, and it registers the corpus's dominant profile so
-  an unpinned route's auto model keeps the corpus's space (#2366). The
-  constitution reanchor resolves through the same helper.
+  verified shared spaces; it applies the agent's persisted chat-model
+  preference, which an auto `embedding_route` follows; and it registers the
+  corpus's dominant profile so an unpinned route's auto model keeps the
+  corpus's space (#2366). The preference goes through the agent's own loader,
+  `apply_persisted_model_preference`, so the two cannot drift. A preference
+  that loader cannot apply leaves the CLI unpinned, as it leaves the agent,
+  and the CLI prints a warning saying so. The constitution reanchor resolves
+  through the same helper.
 - **The agent records its active profile.** It writes the profile it resolves
   to `agent_metadata` under `active_embedding_profile`: at boot once its
   embedding config is loaded, whenever the embedding route, a route's model

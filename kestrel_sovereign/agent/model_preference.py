@@ -72,90 +72,14 @@ class ModelPreferenceMixin:
     async def _load_model_preference(self) -> None:
         """Load persisted model preference from agent_metadata table.
 
-        Persistence schema: ``{"vendor": str, "model": str, "route": str|None}``.
-        Rows using the legacy ``{"model", "provider"}`` shape are dropped
-        silently — the agent starts with no mandate and the user re-selects
-        via the UI.
+        See :func:`apply_persisted_model_preference`, which offline tools run
+        too so they resolve what this agent resolves.
         """
-        try:
-            result = await self._raw_storage.db.fetchall(
-                "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
-                (self.agent_id, self.MODEL_PREFERENCE_KEY),
-            )
-            if not result:
-                return
-            pref = json.loads(result[0][0])
-            # New shape.
-            model = pref.get("model")
-            vendor = pref.get("vendor")
-            route = pref.get("route")
-            if vendor is None and "provider" in pref:
-                # Legacy row — drop it. User re-selects via UI.
-                logging.warning(
-                    "Ignoring legacy model_preference row for %s (old shape {model, provider}); "
-                    "re-select via the UI to persist in the new {vendor, model, route} shape.",
-                    self.agent_id,
-                )
-                return
-            if model and model != "auto":
-                # Re-applying our OWN persisted decision, so do not re-validate
-                # it against the live catalog (#3190).
-                #
-                # Validation belongs at the boundary where NEW information
-                # enters — `set_model_preference` from an operator or a tool,
-                # where #1927/#1946 guard against a hallucinated triple being
-                # written. Replaying a triple this agent already accepted is a
-                # different boundary, and gating it on a catalog fetched
-                # seconds earlier means a transient discovery problem silently
-                # revokes a deliberate choice.
-                #
-                # That is exactly the 2026-08-31 outage: the Anthropic key was
-                # disabled, `GET /v1/models` 401ed, the collapsed catalog
-                # "proved" claude-opus-5 unservable, this call raised, the
-                # except below swallowed it, and all four agents booted
-                # unpinned onto a 1B local model. The route itself was fine
-                # throughout — only discovery was broken.
-                #
-                # If the pin really is unservable, `resolve_provider_routing`
-                # raises `LLMProviderUnavailableError` at use time. Loud at the
-                # point of use beats silent at boot.
-                # Local model-ignoring routes keep their validation (#3190
-                # r8 P2). `llama_cpp` and `ollama` serve whatever model is
-                # currently loaded and ignore the requested id, and the
-                # streaming paths never call `_model_available_for_route`. So a
-                # stale persisted id restored without validation is not merely
-                # a wrong pin — responses from the newly loaded model get
-                # reported and METERED as the model that is no longer there.
-                #
-                # The bypass exists because a remote vendor's catalog can be
-                # transiently unfetchable while the route still serves the
-                # pinned model perfectly. That argument does not hold for a
-                # local server: its catalog is what it has actually loaded, so
-                # a populated local catalog that disagrees is evidence, not a
-                # discovery artefact.
-                from kestrel_sovereign.llm.service import _MODEL_IGNORING_VENDORS
-
-                revalidate = vendor in _MODEL_IGNORING_VENDORS
-                self.llm_service.set_model_preference(
-                    model, vendor, route, validate=revalidate
-                )
-                if vendor and route:
-                    logging.info("Loaded persisted model preference: %s:%s/%s", vendor, route, model)
-                elif vendor:
-                    logging.info("Loaded persisted model preference: %s/%s", vendor, model)
-                else:
-                    logging.info("Loaded persisted model preference: %s", model)
-        except Exception as e:
-            logging.warning(f"Failed to load model preference: {e}")
-            # Record the drop for the health surface (#3190). A persisted pin
-            # that fails to apply is an operator-visible degradation: the agent
-            # then runs unpinned and routing falls through to route_priority,
-            # which with allow_paid_fallback=false can land on a 1B local model.
-            # A WARNING line in a multi-million-line host log is not a surface.
-            try:
-                self.llm_service._mandate_load_error = str(e)[:300]
-            except Exception:  # pragma: no cover - never fail boot on reporting
-                pass
+        await apply_persisted_model_preference(
+            self.llm_service,
+            getattr(self._raw_storage, "db", None),
+            self.agent_id,
+        )
 
     async def _persist_model_preference(
         self,
@@ -439,3 +363,117 @@ class ModelPreferenceMixin:
         except Exception as e:
             logging.error(f"Solvency check failed: {e}", exc_info=True)
             return None
+
+
+async def apply_persisted_model_preference(
+    llm_service: Any, db: Any, agent_id: Optional[str]
+) -> Optional[str]:
+    """Re-apply the chat-model preference an agent persisted in agent_metadata.
+
+    The one loader for that preference. The agent runs it at boot, and
+    ``kestrel embeddings reindex`` / ``kestrel constitution reanchor`` run it
+    before they resolve the agent's embedding profile: with an auto
+    ``embedding_route``, embeddings follow the chat route this preference
+    selects, so a tool that skipped it resolved another profile than the
+    agent (#3420).
+
+    Persistence schema: ``{"vendor": str, "model": str, "route": str|None}``.
+    Rows using the legacy ``{"model", "provider"}`` shape are dropped
+    silently — the agent starts with no mandate and the user re-selects
+    via the UI.
+
+    ``agent_id`` ``None`` reads the single stored preference (a single-agent
+    database) and applies nothing when several agents stored one.
+
+    Returns ``None`` when the preference was applied or none is stored, and
+    the reason when a stored preference could not be applied. That failure is
+    also logged and recorded on the service for the health surface; the
+    service is left unpinned, as the agent then runs.
+    """
+    try:
+        if agent_id:
+            result = await db.fetchall(
+                "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+                (agent_id, ModelPreferenceMixin.MODEL_PREFERENCE_KEY),
+            )
+        else:
+            result = await db.fetchall(
+                "SELECT value FROM agent_metadata WHERE key = ?",
+                (ModelPreferenceMixin.MODEL_PREFERENCE_KEY,),
+            )
+        if not result or len(result) != 1:
+            return None
+        pref = json.loads(result[0][0])
+        # New shape.
+        model = pref.get("model")
+        vendor = pref.get("vendor")
+        route = pref.get("route")
+        if vendor is None and "provider" in pref:
+            # Legacy row — drop it. User re-selects via UI.
+            logging.warning(
+                "Ignoring legacy model_preference row for %s (old shape {model, provider}); "
+                "re-select via the UI to persist in the new {vendor, model, route} shape.",
+                agent_id,
+            )
+            return None
+        if model and model != "auto":
+            # Re-applying our OWN persisted decision, so do not re-validate
+            # it against the live catalog (#3190).
+            #
+            # Validation belongs at the boundary where NEW information
+            # enters — `set_model_preference` from an operator or a tool,
+            # where #1927/#1946 guard against a hallucinated triple being
+            # written. Replaying a triple this agent already accepted is a
+            # different boundary, and gating it on a catalog fetched
+            # seconds earlier means a transient discovery problem silently
+            # revokes a deliberate choice.
+            #
+            # That is exactly the 2026-08-31 outage: the Anthropic key was
+            # disabled, `GET /v1/models` 401ed, the collapsed catalog
+            # "proved" claude-opus-5 unservable, this call raised, the
+            # except below swallowed it, and all four agents booted
+            # unpinned onto a 1B local model. The route itself was fine
+            # throughout — only discovery was broken.
+            #
+            # If the pin really is unservable, `resolve_provider_routing`
+            # raises `LLMProviderUnavailableError` at use time. Loud at the
+            # point of use beats silent at boot.
+            # Local model-ignoring routes keep their validation (#3190
+            # r8 P2). `llama_cpp` and `ollama` serve whatever model is
+            # currently loaded and ignore the requested id, and the
+            # streaming paths never call `_model_available_for_route`. So a
+            # stale persisted id restored without validation is not merely
+            # a wrong pin — responses from the newly loaded model get
+            # reported and METERED as the model that is no longer there.
+            #
+            # The bypass exists because a remote vendor's catalog can be
+            # transiently unfetchable while the route still serves the
+            # pinned model perfectly. That argument does not hold for a
+            # local server: its catalog is what it has actually loaded, so
+            # a populated local catalog that disagrees is evidence, not a
+            # discovery artefact.
+            from kestrel_sovereign.llm.service import _MODEL_IGNORING_VENDORS
+
+            revalidate = vendor in _MODEL_IGNORING_VENDORS
+            llm_service.set_model_preference(
+                model, vendor, route, validate=revalidate
+            )
+            if vendor and route:
+                logging.info("Loaded persisted model preference: %s:%s/%s", vendor, route, model)
+            elif vendor:
+                logging.info("Loaded persisted model preference: %s/%s", vendor, model)
+            else:
+                logging.info("Loaded persisted model preference: %s", model)
+    except Exception as e:
+        logging.warning(f"Failed to load model preference: {e}")
+        # Record the drop for the health surface (#3190). A persisted pin
+        # that fails to apply is an operator-visible degradation: the agent
+        # then runs unpinned and routing falls through to route_priority,
+        # which with allow_paid_fallback=false can land on a 1B local model.
+        # A WARNING line in a multi-million-line host log is not a surface.
+        try:
+            llm_service._mandate_load_error = str(e)[:300]
+        except Exception:  # pragma: no cover - never fail boot on reporting
+            pass
+        return str(e)
+    return None

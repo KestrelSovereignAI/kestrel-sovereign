@@ -58,9 +58,10 @@ verbs operate on an existing corpus and never create an empty one. The audit
 subcommand never
 touches the LLM stack, so it works without credentials. The reindex
 subcommand needs the LLM stack to resolve the target embedding profile,
-applying the agent's persisted runtime ``embedding_route`` (#2263) and the
-shared embedding spaces the database records as verified (#2290, #3420)
-first so it re-embeds to the profile the live agent actually resolves.
+applying the agent's persisted runtime ``embedding_route`` (#2263), its
+persisted chat-model preference, and the shared embedding spaces the
+database records as verified (#2290, #3420) first so it re-embeds to the
+profile the live agent actually resolves.
 ``kestrel constitution reanchor`` embeds its re-indexed chunks through the
 same resolution, :func:`resolve_agent_embedding` (#3418).
 """
@@ -377,17 +378,23 @@ async def _apply_persisted_embedding_config(
     the server resolves fine (e.g. ``openrouter:api`` pinned via the UI) is
     rejected here as "does not advertise embedding support". This reproduces the
     boot path (``hydrate_verified_space_pins`` →
+    ``_load_model_preference`` →
     ``set_corpus_embedding_profile_provider`` →
     ``ModelPreferenceMixin._load_route_embedding_models`` →
     ``_load_embedding_route``) so the CLI and server agree about the same
     persisted state:
 
     0. Re-apply the shared embedding spaces whose parity this database records
-       as verified (#2290), and let auto model resolution see the corpus's
-       dominant profile (#2366). Without the first, a member route of a
-       verified shared space resolves its route-scoped profile instead of the
-       space's: ``reindex`` then moved every row off the profile the agent
-       searches (#3420).
+       as verified (#2290), the persisted chat-model preference, and let auto
+       model resolution see the corpus's dominant profile (#2366). Without the
+       first, a member route of a verified shared space resolves its
+       route-scoped profile instead of the space's: ``reindex`` then moved
+       every row off the profile the agent searches (#3420). Without the
+       second, an auto ``embedding_route`` follows the default chat route
+       rather than the one the agent is pinned to. It runs the agent's own
+       loader, :func:`~kestrel_sovereign.agent.model_preference.apply_persisted_model_preference`;
+       a preference that fails to apply leaves the service unpinned, as it
+       leaves the agent, and is reported as a warning.
     1. Re-apply persisted per-route ``embedding_model`` pins — each pin
        re-advertises embedding support for that exact route (#2337).
     2. Fold live embedding discovery into route capabilities (#2338).
@@ -397,9 +404,36 @@ async def _apply_persisted_embedding_config(
     persisted route still can't be applied (caller refuses rather than reindex
     into the wrong profile).
     """
-    # (0) The boot runs both of these before it loads any embedding config.
+    # (0) The boot runs these before it loads any embedding config.
     if hasattr(llm_service, "hydrate_verified_space_pins"):
         await llm_service.hydrate_verified_space_pins(db)
+    # With an auto embedding_route, embeddings follow the chat route this
+    # preference selects; the agent's own loader, so the two cannot drift.
+    from kestrel_sovereign.agent.model_preference import (
+        apply_persisted_model_preference,
+    )
+
+    preference_error = await apply_persisted_model_preference(
+        llm_service, db, agent_id
+    )
+    if preference_error is not None:
+        print(
+            "WARNING: the persisted model preference could not be applied "
+            f"({preference_error}); resolving unpinned, as the agent does "
+            "when its own load fails.",
+            file=sys.stderr,
+        )
+    else:
+        preference = llm_service.get_model_preference()
+        if preference.get("model"):
+            selector = ":".join(
+                part for part in (preference.get("vendor"), preference.get("route"))
+                if part
+            )
+            print(
+                "# using persisted model preference: "
+                f"{selector + '/' if selector else ''}{preference['model']}"
+            )
     if hasattr(llm_service, "set_corpus_embedding_profile_provider"):
         from kestrel_sovereign.storage.embedding_reindex import (
             dominant_embedding_profile,
