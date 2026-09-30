@@ -22,7 +22,10 @@ Four subcommands:
     ``--yes`` to actually rewrite rows. Refuses when no embedding
     provider resolves, when ``embedding_route = "none"``, or when the
     resolved embedding dimension doesn't match the vector column width
-    (with instructions for the required re-migration).
+    (with instructions for the required re-migration). Also refuses, in a
+    dry-run too, when the target is not the profile the agent records as
+    active, because the rewrite would move every row off the profile the
+    agent searches (#3420). The report prints both profile ids.
 
 ``verify`` / ``backfill``
     The phase-2 gate for retiring the legacy ``embedding`` column on
@@ -37,7 +40,10 @@ Four subcommands:
     vectors into it. An absent column is reported, never created. On SQLite
     ``verify`` also opens read-only through the cold-read connection
     (#3407): the normal open sets ``journal_mode=WAL``, which would rewrite a
-    rollback-journal database and fail on a read-only file.
+    rollback-journal database and fail on a read-only file. ``verify`` also
+    counts, per embedded table, the stored vectors that are not on the
+    profile the agent records as active (#3420); they do not affect the exit
+    code.
 
 Every subcommand opens the same production :class:`AsyncDatabase` the
 agent/server open — ``KESTREL_DATABASE_URL`` for Postgres, otherwise
@@ -52,7 +58,8 @@ verbs operate on an existing corpus and never create an empty one. The audit
 subcommand never
 touches the LLM stack, so it works without credentials. The reindex
 subcommand needs the LLM stack to resolve the target embedding profile,
-applying the agent's persisted runtime ``embedding_route`` (#2263)
+applying the agent's persisted runtime ``embedding_route`` (#2263) and the
+shared embedding spaces the database records as verified (#2290, #3420)
 first so it re-embeds to the profile the live agent actually resolves.
 ``kestrel constitution reanchor`` embeds its re-indexed chunks through the
 same resolution, :func:`resolve_agent_embedding` (#3418).
@@ -369,10 +376,18 @@ async def _apply_persisted_embedding_config(
     (#2338) that the serving process applies at boot. Net effect (#2361): a route
     the server resolves fine (e.g. ``openrouter:api`` pinned via the UI) is
     rejected here as "does not advertise embedding support". This reproduces the
-    boot path (``ModelPreferenceMixin._load_route_embedding_models`` →
+    boot path (``hydrate_verified_space_pins`` →
+    ``set_corpus_embedding_profile_provider`` →
+    ``ModelPreferenceMixin._load_route_embedding_models`` →
     ``_load_embedding_route``) so the CLI and server agree about the same
     persisted state:
 
+    0. Re-apply the shared embedding spaces whose parity this database records
+       as verified (#2290), and let auto model resolution see the corpus's
+       dominant profile (#2366). Without the first, a member route of a
+       verified shared space resolves its route-scoped profile instead of the
+       space's: ``reindex`` then moved every row off the profile the agent
+       searches (#3420).
     1. Re-apply persisted per-route ``embedding_model`` pins — each pin
        re-advertises embedding support for that exact route (#2337).
     2. Fold live embedding discovery into route capabilities (#2338).
@@ -382,6 +397,18 @@ async def _apply_persisted_embedding_config(
     persisted route still can't be applied (caller refuses rather than reindex
     into the wrong profile).
     """
+    # (0) The boot runs both of these before it loads any embedding config.
+    if hasattr(llm_service, "hydrate_verified_space_pins"):
+        await llm_service.hydrate_verified_space_pins(db)
+    if hasattr(llm_service, "set_corpus_embedding_profile_provider"):
+        from kestrel_sovereign.storage.embedding_reindex import (
+            dominant_embedding_profile,
+        )
+
+        llm_service.set_corpus_embedding_profile_provider(
+            lambda: dominant_embedding_profile(db, agent_id=agent_id)
+        )
+
     # (1) Re-apply persisted per-route embedding_model pins (#2337). Each pin
     # writes embedding capability onto its exact route, so a route whose support
     # is only advertised via a UI-set model pin is recognised before validation.
@@ -809,6 +836,100 @@ def _resolve_column_dim() -> Optional[int]:
         return None
 
 
+def _service_descriptor(embedding_service: Any) -> str:
+    """`` (provider/model dim=N)`` for a service that can describe itself."""
+    describe = getattr(embedding_service, "describe", None)
+    profile = describe() if callable(describe) else None
+    if profile is None:
+        return ""
+    return f" ({profile.provider}/{profile.model} dim={profile.dim})"
+
+
+def _active_profile_line(active: Any) -> str:
+    """The recorded active profile(s), as ``reindex`` and ``verify`` print it."""
+    if active.ambiguous:
+        return "AMBIGUOUS: " + ", ".join(
+            f"{record.profile_id} ({record.agent_id})"
+            for record in active.records
+        )
+    if active.profile_id is None:
+        return "(none recorded; the agent records it each time it starts)"
+    record = active.record_for(active.profile_id)
+    return (
+        f"{record.profile_id} ({record.describe()}, recorded by "
+        f"{record.agent_id} at {record.recorded_at})"
+    )
+
+
+def _active_profile_refusal(
+    target: str,
+    active: Any,
+    vectors: Dict[str, Optional[Dict[Optional[str], int]]],
+) -> Optional[str]:
+    """Why reindexing onto *target* would strand vectors, else ``None`` (#3420).
+
+    Reindex rewrites every row that is not on *target*, which is the intended
+    migration only when *target* is the profile the agent searches. Otherwise
+    it moves every row off that profile and vector search finds none of them:
+    #3420 moved a whole corpus onto a route-scoped profile while the agent
+    searched its verified shared space. The agent records the profile it
+    resolves (:mod:`kestrel_sovereign.storage.active_embedding_profile`):
+
+    - Agents sharing the database record different profiles: no one target
+      serves them.
+    - A recorded profile other than *target*: refuse.
+    - Nothing recorded (no agent has started since the record existed): refuse
+      while any stored vector is on another profile, or a table's vectors
+      cannot be read. Nothing then shows which profile the agent searches.
+
+    *vectors* is :func:`stored_vectors_by_profile` for the tables in scope.
+    """
+    if active.ambiguous:
+        return (
+            "the agents in this database record different active embedding "
+            f"profiles ({_active_profile_line(active)}), so no one target "
+            "serves them. Pass --agent-id <did> to reindex one agent's rows."
+        )
+    if active.profile_id is not None:
+        if active.profile_id == target:
+            return None
+        return (
+            f"the resolved target profile {target} is not the profile the "
+            f"agent records as active, {active.profile_id}. Reindexing would "
+            f"move every row off {active.profile_id}, and the agent's vector "
+            "search would find none of them. Run this command with the "
+            "configuration the agent runs with (the same KESTREL_HOME and "
+            "kestrel.toml). If the agent's embedding configuration changed "
+            "outside the settings API/UI, restart the agent so it records the "
+            "profile it now resolves."
+        )
+    others: Dict[str, int] = {}
+    for counts in vectors.values():
+        for profile_id, count in (counts or {}).items():
+            if profile_id is not None and profile_id != target:
+                others[profile_id] = others.get(profile_id, 0) + count
+    unreadable = sorted(t for t, counts in vectors.items() if counts is None)
+    if not others and not unreadable:
+        return None
+    evidence = []
+    if others:
+        evidence.append(
+            f"{sum(others.values())} stored vector(s) are on other "
+            "profile(s): "
+            + ", ".join(f"{pid} ({n})" for pid, n in sorted(others.items()))
+        )
+    if unreadable:
+        evidence.append(
+            f"the stored vectors in {', '.join(unreadable)} could not be read"
+        )
+    return (
+        "no active embedding profile is recorded for this database, and "
+        f"{'; '.join(evidence)}. Nothing shows which profile the agent "
+        f"searches, so reindexing onto {target} could move every row off it. "
+        "Start the agent once so it records its active profile, then re-run."
+    )
+
+
 async def _reindex(
     db: "Any",
     *,
@@ -830,9 +951,13 @@ async def _reindex(
     LLM provider. Without ``apply`` (i.e. no ``--yes``) this only
     prints the dry-run scope.
     """
+    from kestrel_sovereign.storage.active_embedding_profile import (
+        load_active_embedding_profiles,
+    )
     from kestrel_sovereign.storage.embedding_reindex import (
         REINDEX_TABLES,
         EmbeddingReindexer,
+        stored_vectors_by_profile,
     )
 
     # Resolve the target profile unless the caller injected one, through the
@@ -882,12 +1007,32 @@ async def _reindex(
         rate_limit_s=rate_limit,
     )
 
+    # What the running agent searches with (#3420). Unreadable is a refusal,
+    # never "nothing recorded".
+    try:
+        active = await load_active_embedding_profiles(db, agent_id)
+    except Exception as exc:  # noqa: BLE001 - any read failure refuses
+        print(
+            "ERROR: could not read the active embedding profile the agent "
+            f"recorded ({type(exc).__name__}: {exc}); refusing to reindex "
+            "without it.",
+            file=sys.stderr,
+        )
+        return 2
+    vectors = await stored_vectors_by_profile(
+        db, agent_id=agent_id, tables=tables
+    )
+
     # --- Dry-run report (always shown first) --------------------------------
     counts = await reindexer.count_all_stale(agent_id=agent_id, tables=tables)
     total_stale = sum(counts.values())
 
     print("# embeddings reindex")
-    print(f"target_profile: {target_profile_id}")
+    print(
+        f"target_profile: {target_profile_id}"
+        f"{_service_descriptor(embedding_service)}"
+    )
+    print(f"active_profile: {_active_profile_line(active)}")
     print(f"embedding_dim:  {target_dim if target_dim is not None else '(unknown)'}")
     print(f"agent_id:       {agent_id or '(all)'}")
     print(f"batch:          {batch}")
@@ -897,6 +1042,12 @@ async def _reindex(
     for tname in tables:
         print(f"  {tname:<22} {counts.get(tname, 0):>8}")
     print(f"  {'TOTAL':<22} {total_stale:>8}")
+
+    refusal = _active_profile_refusal(target_profile_id, active, vectors)
+    if refusal is not None:
+        # A dry-run refuses too: exiting 0 would say ``--yes`` can proceed.
+        print(f"\nERROR: {refusal}", file=sys.stderr)
+        return 2
 
     if not apply:
         if total_stale:
@@ -976,6 +1127,11 @@ async def _embedding_vec(
     does not affect the exit code: after a reindex the two columns
     legitimately differ. Nor does ``rows_without_any_embedding`` (#3415): a
     row with no vector in either column has nothing to copy or to lose.
+
+    ``verify`` also reports the stored vectors that are not on the profile
+    the agent records as active (#3420; see :func:`_active_profile_report`).
+    That is a search-visibility problem, not a phase-2 one, so it does not
+    affect the exit code either.
     """
     from kestrel_sovereign.storage.db.sqlite import ColdReadUnavailable
     from kestrel_sovereign.storage.embedding_vec_backfill import (
@@ -1002,6 +1158,12 @@ async def _embedding_vec(
             return 2
         reports.append(report)
 
+    profile_report = None
+    if command == "verify":
+        profile_report = await _active_profile_report(
+            db, _EMBEDDED_TABLES if table == "all" else (table,)
+        )
+
     # ``verify`` opens a quiescent SQLite database ``immutable=1``, which is
     # blind to a writer that commits while it reads. Refuse to report on a
     # database that changed underneath it (#3407); a no-op otherwise.
@@ -1017,21 +1179,27 @@ async def _embedding_vec(
 
     gate_met = all(_gate_met(report) for report in reports)
     if as_json:
-        print(json.dumps({
+        payload: Dict[str, Any] = {
             "command": command,
             "gate_met": gate_met,
             "tables": [
                 {**asdict(report), "gate_met": _gate_met(report)}
                 for report in reports
             ],
-        }, indent=2))
+        }
+        if profile_report is not None:
+            payload["active_embedding_profile"] = profile_report
+        print(json.dumps(payload, indent=2))
     else:
-        _print_embedding_vec_reports(command, reports, gate_met)
+        _print_embedding_vec_reports(command, reports, gate_met, profile_report)
     return 0 if gate_met else EXIT_GATE_NOT_MET
 
 
 def _print_embedding_vec_reports(
-    command: str, reports: List[Any], gate_met: bool
+    command: str,
+    reports: List[Any],
+    gate_met: bool,
+    profile_report: Optional[Dict[str, Any]] = None,
 ) -> None:
     title = "read-only" if command == "verify" else "writes embedding_vec"
     print(f"# embeddings {command} ({title})")
@@ -1086,11 +1254,113 @@ def _print_embedding_vec_reports(
                 "them. There is nothing to copy, so they are not part of the "
                 "exit code; `kestrel embeddings reindex --yes` embeds them."
             )
+    if profile_report is not None:
+        _print_active_profile_report(profile_report)
     verdict = "met" if gate_met else "NOT met"
     print(
         f"\nphase-2 gate: {verdict} (embedding_vec present and "
         "rows_missing_embedding_vec == rows_unbackfillable on every table)"
     )
+
+
+async def _active_profile_report(
+    db: Any, tables: Tuple[str, ...]
+) -> Dict[str, Any]:
+    """Stored vectors on and off the profile the agent records as active (#3420).
+
+    ``status`` is ``recorded``, ``not_recorded``, ``ambiguous`` (agents
+    sharing the database record different profiles) or ``unreadable``. The
+    per-table counts need one recorded profile, so they are ``null`` in every
+    other state, and for a table whose vectors cannot be read (such as a
+    PostgreSQL table with no ``embedding_vec`` column yet).
+    ``vectors_off_active_profile`` includes vectors with a NULL profile:
+    vector search filters by profile, so it cannot find those either. It is
+    the sum over the tables that could be read.
+    """
+    from kestrel_sovereign.storage.active_embedding_profile import (
+        load_active_embedding_profiles,
+    )
+    from kestrel_sovereign.storage.embedding_reindex import (
+        stored_vectors_by_profile,
+    )
+
+    report: Dict[str, Any] = {
+        "status": "unreadable",
+        "profile_id": None,
+        "records": [],
+        "error": None,
+        "tables": {name: None for name in tables},
+        "vectors_off_active_profile": None,
+    }
+    try:
+        active = await load_active_embedding_profiles(db)
+    except Exception as exc:  # noqa: BLE001 - reported, never "not recorded"
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        return report
+    report["records"] = [asdict(record) for record in active.records]
+    if active.ambiguous:
+        report["status"] = "ambiguous"
+        return report
+    if active.profile_id is None:
+        report["status"] = "not_recorded"
+        return report
+    report["status"] = "recorded"
+    report["profile_id"] = active.profile_id
+    vectors = await stored_vectors_by_profile(db, tables=tables)
+    off_total = 0
+    for name in tables:
+        counts = vectors[name]
+        if counts is None:
+            continue
+        off = sum(n for pid, n in counts.items() if pid != active.profile_id)
+        report["tables"][name] = {
+            "vectors_on_active_profile": counts.get(active.profile_id, 0),
+            "vectors_off_active_profile": off,
+        }
+        off_total += off
+    report["vectors_off_active_profile"] = off_total
+    return report
+
+
+def _print_active_profile_report(report: Dict[str, Any]) -> None:
+    from kestrel_sovereign.storage.active_embedding_profile import (
+        ActiveProfileLookup,
+        RecordedEmbeddingProfile,
+    )
+
+    status = report["status"]
+    if status == "unreadable":
+        print(
+            "\nactive embedding profile: could not be read "
+            f"({report['error']}); stored vectors off it are not counted."
+        )
+        return
+    active = ActiveProfileLookup(tuple(
+        RecordedEmbeddingProfile(**record) for record in report["records"]
+    ))
+    print(f"\nactive embedding profile: {_active_profile_line(active)}")
+    if status != "recorded":
+        print(
+            "  stored vectors off the active profile are not counted without "
+            "one recorded profile."
+        )
+        return
+    for name, counts in report["tables"].items():
+        if counts is None:
+            print(f"  {name:<28} stored vectors could not be read")
+            continue
+        print(
+            f"  {name:<28} on {counts['vectors_on_active_profile']:>8}"
+            f"  off {counts['vectors_off_active_profile']:>8}"
+        )
+    off_total = report["vectors_off_active_profile"]
+    if off_total:
+        print(
+            f"  WARNING: {off_total} stored vector(s) are not on the active "
+            "profile, so the agent's vector search cannot find them. "
+            "`kestrel embeddings reindex --yes` re-embeds them onto it. Not "
+            "part of the exit code."
+        )
 
 
 def run(args: argparse.Namespace) -> int:

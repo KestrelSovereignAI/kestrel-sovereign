@@ -159,6 +159,54 @@ class ReindexStats:
         }
 
 
+async def _rows_by_profile(
+    db: Any, table: str, agent_id: Optional[str], *, vectors_only: bool
+) -> Dict[Optional[str], int]:
+    """``{embedding_profile_id: row_count}`` for one table (``None`` = NULL).
+
+    ``vectors_only`` counts only rows that hold a stored vector. Raises when
+    the table or column cannot be read.
+    """
+    spec = _TABLE_SPECS[table]
+    clauses = ["embedding_vec IS NOT NULL"] if vectors_only else []
+    scope, params = _agent_scope(spec, agent_id)
+    if scope:
+        clauses.append(scope)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = await db.fetchall(
+        f"SELECT embedding_profile_id, COUNT(*) FROM {spec.name}{where} "
+        "GROUP BY embedding_profile_id",
+        tuple(params),
+    )
+    return {row[0]: int(row[1] or 0) for row in rows or []}
+
+
+async def stored_vectors_by_profile(
+    db: Any,
+    *,
+    agent_id: Optional[str] = None,
+    tables: Sequence[str] = REINDEX_TABLES,
+) -> Dict[str, Optional[Dict[Optional[str], int]]]:
+    """Per table, ``{embedding_profile_id: rows with a stored vector}`` (#3420).
+
+    Vector search considers only the rows stamped with the profile the agent
+    resolves; every other stored vector, including one with a NULL profile,
+    is invisible to it. A table that cannot be read (absent, or without an
+    ``embedding_vec`` column) maps to ``None``, so a caller never mistakes it
+    for an empty one.
+    """
+    out: Dict[str, Optional[Dict[Optional[str], int]]] = {}
+    for table in tables:
+        try:
+            out[table] = await _rows_by_profile(
+                db, table, agent_id, vectors_only=True
+            )
+        except Exception as exc:  # noqa: BLE001 - reported as unreadable
+            logger.debug("stored-vector profile count of %s failed: %s", table, exc)
+            out[table] = None
+    return out
+
+
 async def dominant_embedding_profile(
     db: Any, agent_id: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
@@ -179,25 +227,18 @@ async def dominant_embedding_profile(
     ``None`` and the caller falls back to hint/catalog order.
     """
     counts: Dict[str, int] = {}
-    for table, spec in _TABLE_SPECS.items():
-        where = "embedding_profile_id IS NOT NULL"
-        scope, params = _agent_scope(spec, agent_id)
-        if scope:
-            where += f" AND {scope}"
+    for table in _TABLE_SPECS:
         try:
-            rows = await db.fetchall(
-                f"SELECT embedding_profile_id, COUNT(*) FROM {spec.name} "
-                f"WHERE {where} GROUP BY embedding_profile_id",
-                tuple(params),
+            table_counts = await _rows_by_profile(
+                db, table, agent_id, vectors_only=False
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("dominant profile scan of %s failed: %s", table, exc)
             continue
-        for row in rows or []:
-            pid, n = row[0], row[1]
+        for pid, n in table_counts.items():
             if not pid:
                 continue
-            counts[pid] = counts.get(pid, 0) + int(n or 0)
+            counts[pid] = counts.get(pid, 0) + n
 
     if not counts:
         return None

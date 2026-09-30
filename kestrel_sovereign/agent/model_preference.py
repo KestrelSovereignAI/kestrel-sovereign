@@ -173,6 +173,8 @@ class ModelPreferenceMixin:
             )
         except Exception as e:
             logging.warning(f"Failed to persist model preference: {e}")
+        # With an auto embedding_route, embeddings follow the chat route.
+        await self.record_active_embedding_profile()
 
     async def _load_embedding_route(self) -> None:
         """Load the persisted top-level embedding_route knob (#2263).
@@ -244,6 +246,47 @@ class ModelPreferenceMixin:
             )
         except Exception as e:
             logging.warning(f"Failed to persist embedding_route: {e}")
+        await self.record_active_embedding_profile()
+
+    async def record_active_embedding_profile(self) -> None:
+        """Record the embedding profile this agent resolves (#3420).
+
+        Offline tools compare against it: ``kestrel embeddings reindex``
+        refuses to move rows to any other profile, and ``embeddings verify``
+        counts the vectors that are off it (see
+        :mod:`kestrel_sovereign.storage.active_embedding_profile`). Called at
+        boot once the embedding config is loaded, and after every persisted
+        change to that config.
+
+        Skipped while a local-only privacy mode forces the resolution: it
+        writes no durable rows, and its forced route does not describe the
+        corpus. Best-effort, like the persistence it follows.
+        """
+        try:
+            privacy_agent = getattr(self, "privacy_agent", None)
+            if privacy_agent is not None and not (
+                privacy_agent.privacy_config.allows_cloud_llm()
+            ):
+                return
+            db = getattr(self._raw_storage, "db", None)
+            if db is None or not self.llm_service:
+                return
+            from kestrel_sovereign.llm.embedding_service import (
+                get_provider_embedding_service,
+            )
+            from kestrel_sovereign.storage.active_embedding_profile import (
+                record_active_embedding_profile,
+            )
+
+            profile_id = await record_active_embedding_profile(
+                db,
+                self.agent_id,
+                get_provider_embedding_service(self.llm_service),
+            )
+            if profile_id:
+                logging.info("Recorded active embedding profile: %s", profile_id)
+        except Exception as e:
+            logging.warning(f"Failed to record active embedding profile: {e}")
 
     async def _dominant_embedding_profile(self) -> Optional[Dict[str, Any]]:
         """Return the DB's dominant existing embedding profile, or ``None`` (#2366).
@@ -329,6 +372,7 @@ class ModelPreferenceMixin:
             )
         except Exception as e:
             logging.warning(f"Failed to persist embedding_model overrides: {e}")
+        await self.record_active_embedding_profile()
 
     def _get_local_model_fallback(self) -> str:
         """Get the configured local (ollama) model for economy/solvency fallback."""

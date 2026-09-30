@@ -24,6 +24,9 @@ from uuid import uuid4
 import pytest
 
 from kestrel_sovereign import cli, cli_embeddings
+from kestrel_sovereign.storage.active_embedding_profile import (
+    ACTIVE_EMBEDDING_PROFILE_KEY,
+)
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.embedding_vec_backfill import (
     DEFAULT_BATCH_SIZE,
@@ -345,6 +348,162 @@ def test_unbackfillable_nan_row_is_counted_and_reflected_in_the_exit_code(
     )
     assert rc == 0
     assert verify_after["tables"][0]["rows_unbackfillable"] == 1
+
+
+_ACTIVE = "activeprofil"
+_ROUTE_SCOPED = "routescoped1"
+
+
+def _record_active_profile(data_dir, profile_id, agent_id="did:test:agent"):
+    with closing(_connect(data_dir)) as conn, conn:
+        conn.execute(
+            "INSERT INTO agent_metadata (agent_id, key, value) VALUES (?, ?, ?)",
+            (agent_id, ACTIVE_EMBEDDING_PROFILE_KEY, json.dumps({
+                "profile_id": profile_id,
+                "provider": "shared:qwen3-embedding-8b@768",
+                "model": "qwen3-embedding-8b",
+                "dim": 768,
+                "recorded_at": "2026-09-30T05:00:00+00:00",
+            })),
+        )
+
+
+def _insert_profiled_rows(data_dir):
+    """Stored vectors on and off ``_ACTIVE``, and one row with no vector."""
+    with closing(_connect(data_dir)) as conn, conn:
+        for content, vec, profile in (
+            ("on", _pack([1.0]), _ACTIVE),
+            ("reindexed away", _pack([2.0]), _ROUTE_SCOPED),
+            ("unstamped", _pack([3.0]), None),
+            ("never embedded", None, None),
+        ):
+            conn.execute(
+                "INSERT INTO conversation_history (agent_id, role, content, "
+                "embedding_vec, embedding_profile_id) "
+                "VALUES ('did:test:agent', 'user', ?, ?, ?)",
+                (content, vec, profile),
+            )
+        conn.execute(
+            "INSERT INTO saved_items (id, agent_id, item_type, name, content, "
+            "embedding_vec, embedding_profile_id) VALUES "
+            "('s', 'did:test:agent', 'stash', 's', 'c', ?, ?)",
+            (_pack([4.0]), _ROUTE_SCOPED),
+        )
+        conn.execute(
+            "INSERT INTO document_chunks (file_hash, content, embedding_vec, "
+            "embedding_profile_id) VALUES ('doc', 'chunk', ?, ?)",
+            (_pack([5.0]), _ACTIVE),
+        )
+
+
+def test_verify_counts_stored_vectors_off_the_recorded_active_profile(
+    retired_agent_dir, monkeypatch, capsys
+):
+    # #3420: a reindex moved every row off the profile the agent searches,
+    # and verify still reported the gate met without a word about it.
+    _record_active_profile(retired_agent_dir, _ACTIVE)
+    _insert_profiled_rows(retired_agent_dir)
+    before = _snapshot(retired_agent_dir)
+
+    rc, payload = _embeddings_json(monkeypatch, capsys, "verify", retired_agent_dir)
+
+    # Search visibility is reported, not part of the phase-2 exit code.
+    assert rc == 0
+    assert payload["gate_met"] is True
+    active = payload["active_embedding_profile"]
+    assert (active["status"], active["profile_id"]) == ("recorded", _ACTIVE)
+    assert [r["agent_id"] for r in active["records"]] == ["did:test:agent"]
+    assert active["tables"] == {
+        "conversation_history": {
+            "vectors_on_active_profile": 1, "vectors_off_active_profile": 2,
+        },
+        "saved_items": {
+            "vectors_on_active_profile": 0, "vectors_off_active_profile": 1,
+        },
+        "document_chunks": {
+            "vectors_on_active_profile": 1, "vectors_off_active_profile": 0,
+        },
+    }
+    assert active["vectors_off_active_profile"] == 3
+    assert _snapshot(retired_agent_dir) == before
+
+    rc = _kestrel(
+        monkeypatch, "embeddings", "verify", "--data-dir", str(retired_agent_dir)
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert (
+        f"active embedding profile: {_ACTIVE} (shared:qwen3-embedding-8b@768/"
+        "qwen3-embedding-8b dim=768, recorded by did:test:agent at "
+        "2026-09-30T05:00:00+00:00)"
+    ) in out
+    assert f"  {'conversation_history':<28} on {1:>8}  off {2:>8}" in out
+    assert "WARNING: 3 stored vector(s) are not on the active profile" in out
+    assert out.rstrip().splitlines()[-1].startswith("phase-2 gate: met")
+
+
+def test_verify_scopes_the_profile_count_to_the_selected_table(
+    retired_agent_dir, monkeypatch, capsys
+):
+    _record_active_profile(retired_agent_dir, _ACTIVE)
+    _insert_profiled_rows(retired_agent_dir)
+
+    _, payload = _embeddings_json(
+        monkeypatch, capsys, "verify", retired_agent_dir, "--table", "saved_items"
+    )
+
+    active = payload["active_embedding_profile"]
+    assert list(active["tables"]) == ["saved_items"]
+    assert active["vectors_off_active_profile"] == 1
+
+
+@pytest.mark.parametrize(
+    ("records", "status"),
+    [((), "not_recorded"), ((_ACTIVE, _ROUTE_SCOPED), "ambiguous")],
+)
+def test_verify_counts_nothing_without_one_recorded_profile(
+    retired_agent_dir, monkeypatch, capsys, records, status
+):
+    for index, profile_id in enumerate(records):
+        _record_active_profile(retired_agent_dir, profile_id, f"did:test:{index}")
+    _insert_profiled_rows(retired_agent_dir)
+
+    rc, payload = _embeddings_json(monkeypatch, capsys, "verify", retired_agent_dir)
+
+    assert rc == 0
+    active = payload["active_embedding_profile"]
+    assert (active["status"], active["profile_id"]) == (status, None)
+    assert active["vectors_off_active_profile"] is None
+    assert set(active["tables"].values()) == {None}
+
+    _kestrel(monkeypatch, "embeddings", "verify", "--data-dir", str(retired_agent_dir))
+    out = capsys.readouterr().out
+    assert "not counted without one recorded profile" in out
+    assert "WARNING" not in out
+
+
+def test_verify_reports_an_unreadable_record(retired_agent_dir, monkeypatch, capsys):
+    with closing(_connect(retired_agent_dir)) as conn, conn:
+        conn.execute(
+            "INSERT INTO agent_metadata (agent_id, key, value) VALUES (?, ?, ?)",
+            ("did:test:agent", ACTIVE_EMBEDDING_PROFILE_KEY, "not json"),
+        )
+
+    rc, payload = _embeddings_json(monkeypatch, capsys, "verify", retired_agent_dir)
+
+    assert rc == 0
+    active = payload["active_embedding_profile"]
+    assert active["status"] == "unreadable"
+    assert "ActiveEmbeddingProfileError" in active["error"]
+
+
+def test_backfill_reports_no_active_profile_section(
+    retired_agent_dir, monkeypatch, capsys
+):
+    _, payload = _embeddings_json(monkeypatch, capsys, "backfill", retired_agent_dir)
+
+    assert "active_embedding_profile" not in payload
 
 
 def test_verify_writes_nothing(agent_dir, monkeypatch, capsys):
@@ -944,6 +1103,128 @@ def test_postgres_clean_backfill_with_the_column_meets_the_gate(
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert payload["tables"][0]["rows_with_both"] == 1
+
+
+def _create_pg_profiled_chunks(url, schema, monkeypatch):
+    """``<schema>.document_chunks`` holding stored vectors on and off
+    ``_ACTIVE``, and an ``agent_metadata`` recording ``_ACTIVE`` (#3420).
+
+    Points the CLI at the schema like :func:`_create_pg_chunks`, and returns
+    the ``search_path`` URL for opening it directly.
+    """
+
+    async def create(db):
+        vector_schema = await pgvector_schema(db)
+        await db.execute(
+            f"CREATE TABLE {schema}.document_chunks ("
+            "chunk_id SERIAL PRIMARY KEY, file_hash TEXT, content TEXT, "
+            f'embedding BYTEA, embedding_vec "{vector_schema}".vector(2), '
+            "embedding_profile_id TEXT)",
+            (),
+        )
+        await db.execute(
+            f"CREATE TABLE {schema}.agent_metadata ("
+            "agent_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+            "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            "PRIMARY KEY (agent_id, key))",
+            (),
+        )
+        # Untyped literals take the column's type, so no ``vector`` cast is
+        # needed on a path that may not name pgvector's schema.
+        await db.execute(
+            f"INSERT INTO {schema}.document_chunks "
+            "(file_hash, content, embedding_vec, embedding_profile_id) VALUES "
+            f"('doc', 'on', '[1,2]', '{_ACTIVE}'), "
+            f"('doc', 'reindexed away', '[3,4]', '{_ROUTE_SCOPED}'), "
+            "('doc', 'never embedded', NULL, NULL)",
+            (),
+        )
+        await db.execute(
+            f"INSERT INTO {schema}.agent_metadata (agent_id, key, value) "
+            "VALUES (?, ?, ?)",
+            (
+                "did:test:agent",
+                ACTIVE_EMBEDDING_PROFILE_KEY,
+                json.dumps({"profile_id": _ACTIVE, "dim": 2}),
+            ),
+        )
+        return vector_schema
+
+    vector_schema = _on_postgres(url, create, initialize_schema=False)
+    scoped_url = with_search_path(url, quoted_search_path(schema, vector_schema))
+    monkeypatch.setenv("KESTREL_DATABASE_URL", scoped_url)
+    return scoped_url
+
+
+async def _pg_profiled_chunks(db):
+    return await db.fetchall(
+        "SELECT chunk_id, embedding_vec::text, embedding_profile_id "
+        "FROM document_chunks ORDER BY chunk_id",
+        (),
+    )
+
+
+def test_postgres_verify_counts_vectors_off_the_recorded_profile(
+    postgres_url, private_pg_schema, monkeypatch, capsys
+):
+    _create_pg_profiled_chunks(postgres_url, private_pg_schema, monkeypatch)
+
+    rc = _kestrel(
+        monkeypatch, "embeddings", "verify", "--table", "document_chunks", "--json"
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    active = payload["active_embedding_profile"]
+    assert (active["status"], active["profile_id"]) == ("recorded", _ACTIVE)
+    assert active["tables"] == {
+        "document_chunks": {
+            "vectors_on_active_profile": 1, "vectors_off_active_profile": 1,
+        },
+    }
+    assert active["vectors_off_active_profile"] == 1
+
+
+def test_postgres_reindex_refuses_a_target_other_than_the_recorded_profile(
+    postgres_url, private_pg_schema, monkeypatch, capsys
+):
+    scoped_url = _create_pg_profiled_chunks(
+        postgres_url, private_pg_schema, monkeypatch
+    )
+    monkeypatch.setattr(cli_embeddings, "_resolve_column_dim", lambda: 2)
+
+    class _RouteScoped:
+        embedding_dim = 2
+        embedded = []
+
+        def current_profile_id(self):
+            return _ROUTE_SCOPED
+
+        def describe(self):
+            return None
+
+        async def aembed_batch(self, texts):
+            self.embedded.extend(texts)
+            return [[1.0, 1.0] for _ in texts]
+
+    service = _RouteScoped()
+
+    async def reindex(db):
+        before = await _pg_profiled_chunks(db)
+        rc = await cli_embeddings._reindex(
+            db, table="document_chunks", agent_id=None, batch=10,
+            rate_limit=0.0, dry_run=False, apply=True,
+            embedding_service=service, target_profile_id=_ROUTE_SCOPED,
+            target_dim=2,
+        )
+        return rc, before, await _pg_profiled_chunks(db)
+
+    rc, before, after = _on_postgres(scoped_url, reindex, initialize_schema=False)
+
+    assert rc == 2
+    assert f"records as active, {_ACTIVE}" in capsys.readouterr().err
+    assert service.embedded == []
+    assert after == before
 
 
 def _parse(*argv):

@@ -36,10 +36,13 @@ from kestrel_sovereign.llm.embedding_service import (
     ProviderEmbeddingService,
     derive_embedding_profile,
 )
-from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
 from kestrel_sovereign.setup.constitution_reanchor import reanchor_constitution
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from tests.utils.process_local_llm_service import (
+    ProcessLocalService as _ProcessLocalService,
+    process_local_service as _process_local_service,
+)
 
 CONSTITUTION_V1 = b"""# Kestrel Constitution (Test V1)
 
@@ -84,18 +87,6 @@ class _EmbeddingAdapter:
         return [[float(len(t) % 5) + i for i in range(DIM)] for t in texts]
 
 
-class _ProcessLocalService(LLMService):
-    """A real ``LLMService`` whose ``close`` records the call.
-
-    The real ``close`` drains route state this double never builds.
-    """
-
-    closed = False
-
-    async def close(self) -> None:
-        self.closed = True
-
-
 def _route(name: str, adapter: object, *, capabilities: dict) -> dict:
     vendor, route = name.split(":")
     return {
@@ -109,29 +100,6 @@ def _route(name: str, adapter: object, *, capabilities: dict) -> dict:
         "is_cloud": vendor != "ollama",
         "capabilities": capabilities,
     }
-
-
-def _process_local_service(providers: list[dict]) -> _ProcessLocalService:
-    """What ``LLMService()`` builds from static config, before any agent state."""
-    service = _ProcessLocalService.__new__(_ProcessLocalService)
-    service.providers = providers
-    service.disabled = False
-    service._disabled_routes = {}
-    service._mandate_preference = {}
-    service._mandate_fallbacks = []
-    service._route_embedding_model_overrides = {}
-    service._route_embedding_caps_backup = {}
-    service._route_embedding_model_persistence_callback = None
-    service._embedding_route_persistence_callback = None
-    service._embedding_discovery_cache = []  # discovery finds nothing new
-    service._embedding_space_change_warnings = {}
-    service._corpus_embedding_profile_provider = None
-    service._force_local_only_provider = None
-    service._embedding_space_pins = None
-    service._verified_space_pins = {}
-    service._embedding_route = None
-    service._preference_persistence_tasks = set()
-    return service
 
 
 class _Host:

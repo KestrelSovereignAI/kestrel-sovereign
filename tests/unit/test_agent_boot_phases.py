@@ -569,6 +569,41 @@ async def test_clean_boot_reaches_ready(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_boot_records_its_embedding_profile_after_loading_the_config(tmp_path):
+    """Offline tools compare their resolution with the recorded profile (#3420).
+
+    Recorded before the persisted embedding config is applied, it would name a
+    profile the agent does not search.
+    """
+    agent = _make_agent(tmp_path)
+    calls = []
+
+    def spy(name):
+        original = getattr(agent, name)
+
+        async def recorded(*args, **kwargs):
+            calls.append(name)
+            return await original(*args, **kwargs)
+
+        return recorded
+
+    order = [
+        "_load_embedding_route",
+        "_load_route_embedding_models",
+        "record_active_embedding_profile",
+    ]
+    for name in order:
+        setattr(agent, name, spy(name))
+    try:
+        with _boot_mocks():
+            await agent.initialize()
+        assert agent._boot_state is BootPhaseState.READY
+        assert calls == order
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
 async def test_second_initialize_when_ready_is_a_noop(tmp_path):
     agent = _make_agent(tmp_path)
     try:
