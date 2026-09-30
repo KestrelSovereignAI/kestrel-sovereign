@@ -6,6 +6,9 @@ writers is ``docs/architecture/storage/EMBEDDING_COLUMN_RETIREMENT.md``.
 Every raw ``AsyncDatabase`` reader of a stored vector on those tables
 resolves its column through :func:`stored_embedding_column`.
 
+Since phase 3 (#3411) writers store vectors in ``embedding_vec`` only, and
+create that column with :func:`ensure_embedding_vec_column` when it is absent.
+
 ``embedding_vec`` is the canonical representation. ``kestrel embeddings
 reindex`` rewrites it and ``embedding_profile_id`` but never the legacy
 column, so a reader of the legacy bytes scores a reindexed row with the
@@ -76,6 +79,82 @@ async def stored_embedding_column(
         else CANONICAL_COLUMN
     )
     return StoredEmbeddingColumn(name=CANONICAL_COLUMN, select=select)
+
+
+async def ensure_embedding_vec_column(
+    db: "AsyncDatabase", table: str, dimension: int,
+) -> bool:
+    """Create *table*'s ``embedding_vec`` column if it is absent.
+
+    The startup migration sizes PostgreSQL's ``vector(N)`` from a legacy
+    row. Writers no longer fill the legacy column (#3411), so on a fresh
+    PostgreSQL database no such row ever appears, and the first embedded
+    write sizes the column from its own vector instead. SQLite stores bytes
+    and gets a ``BLOB``; its startup migration normally created it already.
+
+    Returns whether the column exists afterwards. A failure is logged, not
+    raised: the caller's write then fails the same way and is non-fatal.
+    The DDL runs inside ``transaction()``, a savepoint when the caller holds
+    one on PostgreSQL, so a failure cannot poison the caller's transaction.
+    """
+    if table not in _TABLES:
+        raise ValueError(f"no stored embedding column on table {table!r}")
+    # Interpolated into the DDL below.
+    if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0:
+        raise ValueError(f"embedding dimension must be a positive int, got {dimension!r}")
+    if await db.column_exists(table, CANONICAL_COLUMN):
+        return True
+
+    is_postgres = getattr(db, "backend_type", None) == "postgres"
+    try:
+        async with db.transaction():
+            if is_postgres:
+                # The extension must exist before the ALTER names ``vector``.
+                await db.execute("CREATE EXTENSION IF NOT EXISTS vector", ())
+                # IF NOT EXISTS: a concurrent first write may have added it.
+                await db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "
+                    f"{CANONICAL_COLUMN} vector({dimension})",
+                    (),
+                )
+            else:
+                await db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {CANONICAL_COLUMN} BLOB", ()
+                )
+    except Exception as exc:
+        # Another connection may have added it first (SQLite has no
+        # ``ADD COLUMN IF NOT EXISTS``).
+        if await db.column_exists(table, CANONICAL_COLUMN):
+            return True
+        logger.warning(
+            "Could not create %s.%s for a %d-dimension embedding: %s. The "
+            "vector is not stored.",
+            table, CANONICAL_COLUMN, dimension, exc,
+        )
+        return False
+    logger.info(
+        "Created %s.%s (%s) for the first embedded write.",
+        table, CANONICAL_COLUMN,
+        f"vector({dimension})" if is_postgres else "BLOB",
+    )
+
+    if is_postgres:
+        # Same index the startup migration builds. Separate, so a width
+        # pgvector cannot index (HNSW stops at 2000) still keeps the column.
+        try:
+            async with db.transaction():
+                await db.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_{CANONICAL_COLUMN}_hnsw "
+                    f"ON {table} USING hnsw ({CANONICAL_COLUMN} vector_cosine_ops)",
+                    (),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not create the HNSW index on %s.%s: %s. kNN search "
+                "still works, without the index.",
+                table, CANONICAL_COLUMN, exc,
+            )
+    return True
 
 
 def decode_stored_embedding(value: Any) -> Optional[List[float]]:

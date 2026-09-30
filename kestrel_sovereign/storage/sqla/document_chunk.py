@@ -5,10 +5,10 @@ The table is created by the raw-SQL ``CORE_SCHEMA`` path in
 :class:`AsyncRAGStore._search_by_embedding` can hand the table to the
 generic vector backends.
 
-Parallel-column design: the legacy ``embedding`` BYTEA / BLOB column
-stays as-is for raw ``AsyncDatabase`` IO (the ``chunk_document``
-INSERT path). The ORM points at a separate ``embedding_vec`` column
-that the Phase-2 migration adds + dual-write keeps in sync. Same
+The ORM points at ``embedding_vec``, the column the Phase-2
+migration added beside the legacy ``embedding`` BYTEA / BLOB column.
+Since #3411 it is the only one writers fill, and the startup
+migration drops the legacy column once no row depends on it. Same
 shape we landed for ``saved_items`` in #1454.
 
 RAG-specific details:
@@ -58,8 +58,7 @@ class DocumentChunk(SovereignBase):
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
     # ORM-side embedding column. The legacy ``embedding`` BYTEA / BLOB
-    # column used by raw IO is NOT in this mapping — see the module
-    # docstring for the parallel-column rationale.
+    # column is NOT in this mapping — see the module docstring.
     embedding: Mapped[Optional[Any]] = mapped_column(
         "embedding_vec",
         PortableVector(DOCUMENT_CHUNK_EMBEDDING_DIM),

@@ -11,6 +11,9 @@ Every case runs on SQLite and on PostgreSQL. Both legs start with the column
 absent and add it the way a deployment gets it: the startup migration creates
 the column, then ``kestrel embeddings backfill`` copies the legacy vectors.
 The reindexed rows are produced by the real ``EmbeddingReindexer``.
+
+Since #3411 no store writes the legacy column, so legacy vectors are seeded
+the way an older release's dual-write left them (:meth:`write_legacy`).
 """
 
 from __future__ import annotations
@@ -34,7 +37,8 @@ from kestrel_sovereign.storage.embedding_vec_backfill import (
     backfill_embedding_vec,
     verify_embedding_vec,
 )
-from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
+from kestrel_sovereign.storage.saved_items_store import SavedItem, SavedItemsStore
+from tests.utils.legacy_embedding_column import restore_legacy_embedding_column
 from tests.utils.postgres_schema import (
     disposable_postgres_schema,
     pgvector_schema,
@@ -105,6 +109,21 @@ class _Deployment:
         assert report.embedding_vec_present
         assert report.rows_missing_embedding_vec == report.rows_unbackfillable == 0
 
+    async def write_legacy(self, table: str, row_id, model: _Model, text: str) -> None:
+        """Give a row the vector an older release's dual-write left behind.
+
+        Before #3411 the insert wrote the legacy column, and while
+        ``embedding_vec`` was absent the write fell back to stamping only the
+        profile id beside it.
+        """
+        id_col = "id" if table == "saved_items" else "chunk_id"
+        vector = model.vectors[text]
+        await self.db.execute(
+            f"UPDATE {table} SET embedding = ?, embedding_profile_id = ? "
+            f"WHERE {id_col} = ?",
+            (struct.pack(f"<{len(vector)}f", *vector), model.profile_id, row_id),
+        )
+
     async def reindex(self, table: str, model: _Model) -> None:
         reindexer = EmbeddingReindexer(
             self.db, model, model.profile_id, column_dim=DIM
@@ -122,8 +141,10 @@ async def deployment(request, tmp_path):
     if request.param == "sqlite":
         db = await AsyncDatabase.sqlite(str(tmp_path / "readers.db"))
         try:
-            # SQLite's startup migration always adds the column. Remove it so
-            # this leg starts where a fresh PostgreSQL database does.
+            # SQLite's startup migration always adds the column, and then
+            # retires the legacy one (#3411). Reverse both so this leg starts
+            # where a PostgreSQL database an older release wrote does.
+            await restore_legacy_embedding_column(db)
             for table in TABLES:
                 await db.execute(
                     f"ALTER TABLE {table} DROP COLUMN embedding_vec", ()
@@ -200,20 +221,13 @@ async def _rag_store(db, model: Optional[_Model]) -> tuple:
     return store, file_hash
 
 
-def _embedding_vec_write_failed(db, table: str, id_col: str):
-    """A dual-write whose ``embedding_vec`` UPDATE failed.
-
-    The helper's per-column fallback still stamps the profile id, so the row
-    matches the active profile and only its missing vector keeps it out.
-    """
-
-    async def write(row_id, _embedding, profile_id=None):
-        await db.execute(
-            f"UPDATE {table} SET embedding_profile_id = ? WHERE {id_col} = ?",
-            (profile_id, row_id),
-        )
-
-    return write
+async def _save_legacy(deployment: _Deployment, text: str, model: _Model) -> SavedItem:
+    """Save *text* as an older release did, its vector in the legacy column."""
+    item = await _saved_items_store(deployment.db, None).save_item(
+        item_type="excerpt", name=text, content=text
+    )
+    await deployment.write_legacy("saved_items", item.id, model, text)
+    return item
 
 
 # --------------------------------------------------------------- saved_items
@@ -221,12 +235,11 @@ def _embedding_vec_write_failed(db, table: str, id_col: str):
 
 async def test_saved_item_search_scores_embedding_vec_after_reindex(deployment):
     db = deployment.db
-    store = _saved_items_store(db, OLD)
-    alpha = await store.save_item(item_type="excerpt", name="alpha", content="alpha")
-    beta = await store.save_item(item_type="excerpt", name="beta", content="beta")
+    alpha = await _save_legacy(deployment, "alpha", OLD)
+    beta = await _save_legacy(deployment, "beta", OLD)
     await deployment.create_embedding_vec("saved_items")
     await deployment.reindex("saved_items", NEW)
-    store._get_embedding_service = lambda: NEW
+    store = _saved_items_store(db, NEW)
 
     # Reindex rewrote embedding_vec and left the old model's legacy bytes.
     assert (await verify_embedding_vec(db, "saved_items")).rows_disagreeing == 2
@@ -240,7 +253,7 @@ async def test_saved_item_search_scores_embedding_vec_after_reindex(deployment):
 async def test_saved_item_hydration_and_stats_read_embedding_vec(deployment):
     db = deployment.db
     store = _saved_items_store(db, OLD)
-    alpha = await store.save_item(item_type="excerpt", name="alpha", content="alpha")
+    alpha = await _save_legacy(deployment, "alpha", OLD)
     await deployment.create_embedding_vec("saved_items")
     await deployment.reindex("saved_items", NEW)
 
@@ -305,13 +318,10 @@ async def test_legacy_only_saved_item_has_no_vector_once_embedding_vec_exists(
     db = deployment.db
     await deployment.create_embedding_vec("saved_items")
     store = _saved_items_store(db, OLD)
-    store._write_embedding_vec = _embedding_vec_write_failed(db, "saved_items", "id")
-
-    alpha = await store.save_item(item_type="excerpt", name="alpha", content="alpha")
+    # An older release's dual-write whose embedding_vec UPDATE failed.
+    alpha = await _save_legacy(deployment, "alpha", OLD)
 
     assert (await verify_embedding_vec(db, "saved_items")).rows_missing_embedding_vec == 1
-    # save_item reports the stored vector, so has_embedding is False.
-    assert alpha.embedding is None
     assert (await store.get_by_id(alpha.id)).embedding is None
     assert (await store.get_stats())["with_embedding"] == 0
     # "beta" does not match the row's text, so the LIKE fallback finds
@@ -322,15 +332,18 @@ async def test_legacy_only_saved_item_has_no_vector_once_embedding_vec_exists(
 async def test_saved_item_readers_use_legacy_column_while_embedding_vec_is_absent(
     deployment,
 ):
-    # A fresh PostgreSQL database holds its first vectors only in the legacy
-    # column until the next boot creates embedding_vec.
+    # A PostgreSQL database an older release wrote before its first
+    # embedding_vec existed holds its vectors only in the legacy column until
+    # the next boot creates embedding_vec.
     db = deployment.db
     store = _saved_items_store(db, OLD)
 
-    alpha = await store.save_item(item_type="excerpt", name="alpha", content="alpha")
-    beta = await store.save_item(item_type="excerpt", name="beta", content="beta")
+    alpha = await _save_legacy(deployment, "alpha", OLD)
+    beta = await _save_legacy(deployment, "beta", OLD)
 
-    assert alpha.embedding == pytest.approx(OLD.vectors["alpha"])
+    assert (await store.get_by_id(alpha.id)).embedding == pytest.approx(
+        OLD.vectors["alpha"]
+    )
     assert (await store.get_by_id(beta.id)).embedding == pytest.approx(
         OLD.vectors["beta"]
     )
@@ -343,21 +356,26 @@ async def test_saved_item_readers_use_legacy_column_while_embedding_vec_is_absen
 # ------------------------------------------------------------ document_chunks
 
 
-async def _seed_chunks(store: AsyncRAGStore, file_hash: str, model: _Model) -> None:
+async def _seed_chunks(
+    deployment: _Deployment, store: AsyncRAGStore, file_hash: str, model: _Model
+) -> None:
+    """Store "alpha" and "beta" as an older release did (legacy vectors)."""
     written = await store.store_precomputed_chunks(
-        file_hash,
-        [
-            IndexedChunk(text, model.vectors[text], model.profile_id)
-            for text in ("alpha", "beta")
-        ],
+        file_hash, [IndexedChunk(text) for text in ("alpha", "beta")]
     )
     assert written == 2
+    rows = await deployment.db.fetchall(
+        "SELECT chunk_id, content FROM document_chunks WHERE file_hash = ?",
+        (file_hash,),
+    )
+    for chunk_id, text in rows:
+        await deployment.write_legacy("document_chunks", chunk_id, model, text)
 
 
 async def test_rag_search_scores_embedding_vec_after_reindex(deployment):
     db = deployment.db
     store, file_hash = await _rag_store(db, OLD)
-    await _seed_chunks(store, file_hash, OLD)
+    await _seed_chunks(deployment, store, file_hash, OLD)
     await deployment.create_embedding_vec("document_chunks")
     await deployment.reindex("document_chunks", NEW)
     store._get_embedding_service = lambda: NEW
@@ -373,7 +391,7 @@ async def test_rag_search_scores_embedding_vec_after_reindex(deployment):
 async def test_read_indexed_chunks_pairs_the_profile_with_embedding_vec(deployment):
     db = deployment.db
     store, file_hash = await _rag_store(db, OLD)
-    await _seed_chunks(store, file_hash, OLD)
+    await _seed_chunks(deployment, store, file_hash, OLD)
     await deployment.create_embedding_vec("document_chunks")
     await deployment.reindex("document_chunks", NEW)
 
@@ -406,10 +424,8 @@ async def test_legacy_only_chunk_has_no_vector_once_embedding_vec_exists(deploym
     db = deployment.db
     store, file_hash = await _rag_store(db, OLD)
     await deployment.create_embedding_vec("document_chunks")
-    store._write_embedding_vec = _embedding_vec_write_failed(
-        db, "document_chunks", "chunk_id"
-    )
-    await _seed_chunks(store, file_hash, OLD)
+    # An older release's dual-write whose embedding_vec UPDATE failed.
+    await _seed_chunks(deployment, store, file_hash, OLD)
 
     assert (
         await verify_embedding_vec(db, "document_chunks")
@@ -423,7 +439,7 @@ async def test_rag_readers_use_legacy_column_while_embedding_vec_is_absent(
 ):
     db = deployment.db
     store, file_hash = await _rag_store(db, OLD)
-    await _seed_chunks(store, file_hash, OLD)
+    await _seed_chunks(deployment, store, file_hash, OLD)
 
     chunks = await store.read_indexed_chunks(file_hash)
     assert chunks[0].embedding == pytest.approx(OLD.vectors["alpha"])

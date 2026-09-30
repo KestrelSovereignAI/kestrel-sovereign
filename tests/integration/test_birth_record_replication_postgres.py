@@ -6,7 +6,8 @@ Two defects here cannot be reproduced on SQLite, so the SQLite suite in
 * ``document_chunks.embedding_vec`` is created unconditionally on SQLite
   (``sqla/migrations.py`` ``_migrate_sqlite_table``) but **deferred** on
   PostgreSQL until the table has an embedded row — which is exactly the state
-  of a fresh runtime database at first boot.
+  of a fresh runtime database at first boot. Since #3411 the first embedded
+  write creates it, sized from its own vector.
 * PostgreSQL aborts an entire transaction on any failed statement. SQLite does
   not. So a "best-effort, errors are non-fatal" write that fails inside a
   caller's transaction is genuinely non-fatal on SQLite and silently
@@ -21,22 +22,29 @@ Run against any throwaway PostgreSQL:
     TEST_POSTGRES_URL=postgresql://u:p@127.0.0.1:5432/db pytest \
         tests/integration/test_birth_record_replication_postgres.py
 
-Skipped when that is not set, so CI (which has no PostgreSQL) stays green.
+Skipped when that is not set.
+
+Each case boots the core schema into a schema of its own, dropped at
+teardown, so the ``embedding_vec`` column a first write creates (#3411) is
+sized for that case alone and never pins the shared table's width.
 """
 
-import contextlib
 import os
 import uuid
 
 import pytest
 
+from tests.utils.postgres_schema import (
+    disposable_postgres_schema,
+    pgvector_schema,
+    postgres_test_url,
+    quoted_search_path,
+    with_search_path,
+)
+
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
-POSTGRES_URL = (
-    os.environ.get("TEST_POSTGRES_URL")
-    or os.environ.get("KESTREL_DATABASE_URL")
-    or os.environ.get("DATABASE_URL")
-)
+POSTGRES_URL = postgres_test_url()
 
 if not POSTGRES_URL:  # pragma: no cover - environment gate
     pytest.skip(
@@ -45,15 +53,50 @@ if not POSTGRES_URL:  # pragma: no cover - environment gate
     )
 
 
+async def _leave_schema_unchanged(db):
+    """Schema initializer for the connection that only manages schemas."""
+
+
 @pytest.fixture
-async def pg():
+async def pg_vector_schema():
+    """``(db, schema holding pgvector)`` in a fresh schema of this case's own.
+
+    pgvector's schema follows on the ``search_path`` for the stores'
+    ``::vector`` casts (#3401).
+    """
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
-    db = await AsyncDatabase.postgres(POSTGRES_URL)
+    admin = await AsyncDatabase.postgres(
+        POSTGRES_URL, schema_initializer=_leave_schema_unchanged
+    )
     try:
-        yield db
+        vector_schema = await pgvector_schema(admin)
+        async with disposable_postgres_schema(admin, "birth_record") as schema:
+            db = await AsyncDatabase.postgres(
+                with_search_path(
+                    POSTGRES_URL, quoted_search_path(schema, vector_schema)
+                )
+            )
+            try:
+                # migrate_add_embedding_profile_id probes an unscoped
+                # information_schema, so a same-named table in another schema
+                # can make it skip this one.
+                await db.execute(
+                    "ALTER TABLE document_chunks "
+                    "ADD COLUMN IF NOT EXISTS embedding_profile_id TEXT",
+                    (),
+                )
+                yield db, vector_schema
+            finally:
+                await db.close()
     finally:
-        await db.close()
+        await admin.close()
+
+
+@pytest.fixture
+async def pg(pg_vector_schema):
+    db, _vector_schema = pg_vector_schema
+    return db
 
 
 async def _purge_agent(db, agent_did: str) -> None:
@@ -117,81 +160,91 @@ async def _purge_agent(db, agent_did: str) -> None:
             )
 
 
-@contextlib.asynccontextmanager
-async def _without_embedding_vec(db):
-    """Put document_chunks in the state a fresh PostgreSQL runtime is in.
-
-    The Phase-2 migration skips the column while the table has no embedded
-    rows, so a first boot always finds it missing.
-
-    Restored on the way out. Left dropped, the next `_migrate_pg_table` run
-    recreates it by sniffing the dimension from the first non-NULL `embedding`
-    row — so an interrupted run leaving this test's 3-float vectors behind
-    would pin the whole database's column to `vector(3)`.
-    """
-    had_column = await db._column_exists("document_chunks", "embedding_vec")
-    await db.execute(
-        "ALTER TABLE document_chunks DROP COLUMN IF EXISTS embedding_vec", ()
-    )
-    try:
-        yield
-    finally:
-        if had_column:
-            await db.execute(
-                "ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS "
-                "embedding_vec vector",
-                (),
-            )
-
-
-async def test_precomputed_chunks_commit_when_the_vector_column_is_missing(pg):
-    """The caller's transaction must survive a failed parallel-column write.
-
-    Before the fix the first failed UPDATE aborted the enclosing transaction,
-    every later statement raised, both fallbacks were swallowed at debug level,
-    and store_precomputed_chunks returned len(chunks) having committed nothing.
-    """
+async def _store_probe_chunks_in_a_caller_transaction(pg, agent):
+    """Store two 3-dimension chunks the way replicate_birth_record does."""
     from kestrel_sovereign.storage.async_file_store import AsyncFileStore
     from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore, IndexedChunk
 
+    files = AsyncFileStore(pg, agent_id=agent)
+    file_hash = await files.store_file(
+        f"vector column probe {agent}".encode(), "probe.md",
+    )
+    rag = AsyncRAGStore(pg, agent_id=agent)
+    payload = [
+        IndexedChunk("one", [0.5, 0.25, 0.125], "profile-x"),
+        IndexedChunk("two", [1.0, 0.0, -1.0], "profile-x"),
+    ]
+
+    # The shape replicate_birth_record uses: one transaction on the target.
+    async with pg.transaction():
+        written = await rag.store_precomputed_chunks(file_hash, payload)
+    assert written == 2
+
+    row = await pg.fetchone(
+        "SELECT COUNT(*) FROM document_chunks WHERE file_hash = $1",
+        (file_hash,),
+    )
+    assert int(row[0]) == 2, "the copy reported success but committed nothing"
+    return rag, file_hash
+
+
+async def _embedding_vec_typmod(pg):
+    row = await pg.fetchone(
+        "SELECT atttypmod FROM pg_attribute "
+        "WHERE attrelid = to_regclass('document_chunks') "
+        "AND attname = 'embedding_vec' AND NOT attisdropped",
+        (),
+    )
+    return None if row is None else int(row[0])
+
+
+async def test_precomputed_chunks_create_the_vector_column_in_a_caller_transaction(pg):
+    """A fresh runtime database gets ``embedding_vec`` from its first write.
+
+    The startup migration defers the column (no legacy row shows its width),
+    and no store writes the legacy column any more (#3411), so without this
+    the copied vectors would be lost.
+    """
+    assert await _embedding_vec_typmod(pg) is None
     agent = f"did:web:test.invalid:vec-{uuid.uuid4().hex[:8]}"
-    try:
-        async with _without_embedding_vec(pg):
-            files = AsyncFileStore(pg, agent_id=agent)
-            file_hash = await files.store_file(
-                f"vector column probe {agent}".encode(), "probe.md",
-            )
-            rag = AsyncRAGStore(pg, agent_id=agent)
-            payload = [
-                IndexedChunk("one", [0.5, 0.25, 0.125], "profile-x"),
-                IndexedChunk("two", [1.0, 0.0, -1.0], "profile-x"),
-            ]
 
-            # The shape replicate_birth_record uses: one transaction on the
-            # target.
-            async with pg.transaction():
-                written = await rag.store_precomputed_chunks(file_hash, payload)
-            assert written == 2
+    rag, file_hash = await _store_probe_chunks_in_a_caller_transaction(pg, agent)
 
-            row = await pg.fetchone(
-                "SELECT COUNT(*) FROM document_chunks WHERE file_hash = $1",
-                (file_hash,),
-            )
-            assert int(row[0]) == 2, (
-                "the copy reported success but committed nothing"
-            )
+    assert await _embedding_vec_typmod(pg) == 3
+    read_back = await rag.read_indexed_chunks(file_hash)
+    assert [c.content for c in read_back] == ["one", "two"]
+    assert read_back[0].embedding == pytest.approx([0.5, 0.25, 0.125])
+    assert read_back[1].embedding == pytest.approx([1.0, 0.0, -1.0])
+    assert [c.profile_id for c in read_back] == ["profile-x", "profile-x"]
 
-            # The legacy embedding column carries the vectors even with the
-            # parallel column absent, so retrieval still has something to work
-            # with.
-            read_back = await rag.read_indexed_chunks(file_hash)
-            assert [c.content for c in read_back] == ["one", "two"]
-            assert read_back[0].embedding == pytest.approx([0.5, 0.25, 0.125])
-            # The profile-id-only fallback ran rather than being swallowed by
-            # an aborted transaction.
-            assert [c.profile_id for c in read_back] == ["profile-x", "profile-x"]
-    finally:
-        await _purge_agent(pg, agent)
+
+async def test_precomputed_chunks_commit_when_the_vector_write_fails(
+    pg_vector_schema,
+):
+    """The caller's transaction must survive a failed ``embedding_vec`` write.
+
+    Before the #2871 fix the first failed UPDATE aborted the enclosing
+    transaction, every later statement raised, both fallbacks were swallowed
+    at debug level, and store_precomputed_chunks returned len(chunks) having
+    committed nothing. A column sized for another model fails every write.
+    """
+    pg, vector_schema = pg_vector_schema
+    await pg.execute(
+        "ALTER TABLE document_chunks ADD COLUMN embedding_vec "
+        f'"{vector_schema}".vector(4)',
+        (),
+    )
+    agent = f"did:web:test.invalid:vec-{uuid.uuid4().hex[:8]}"
+
+    rag, file_hash = await _store_probe_chunks_in_a_caller_transaction(pg, agent)
+
+    read_back = await rag.read_indexed_chunks(file_hash)
+    assert [c.content for c in read_back] == ["one", "two"]
+    # No column holds a 3-dimension vector: they are not stored.
+    assert [c.embedding for c in read_back] == [[], []]
+    # The profile-id-only fallback ran rather than being swallowed by an
+    # aborted transaction.
+    assert [c.profile_id for c in read_back] == ["profile-x", "profile-x"]
 
 
 async def test_embedding_profile_rows_cross_from_a_sqlite_anchor(pg, tmp_path):

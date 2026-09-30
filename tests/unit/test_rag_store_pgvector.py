@@ -308,28 +308,17 @@ async def test_search_end_to_end_against_real_sqlite():
             target = [1.0] + [0.0] * 767
             distractor = [0.0, 1.0] + [0.0] * 766
 
-            # Manual dual-write — production goes through
-            # ``chunk_document``'s dual-write path, but that helper
-            # also computes embeddings (Ollama-dependent); the test
-            # writes both columns directly to stay focused on the
+            # Manual write — production goes through
+            # ``chunk_document``'s ``embedding_vec`` write, but that
+            # helper also computes embeddings (Ollama-dependent); the
+            # test writes the column directly to stay focused on the
             # search path.
             for fh, vec in [("file-target", target), ("file-distractor", distractor)]:
                 packed = struct.pack(f"<768f", *vec)
-                cur = await db.execute(
-                    "INSERT INTO document_chunks (file_hash, content, embedding) "
+                await db.execute(
+                    "INSERT INTO document_chunks (file_hash, content, embedding_vec) "
                     "VALUES (?, ?, ?)",
                     (fh, f"content for {fh}", packed),
-                )
-                chunk_id = getattr(cur, "lastrowid", None)
-                if chunk_id is None:
-                    row = await db.fetchone(
-                        "SELECT chunk_id FROM document_chunks WHERE file_hash = ?",
-                        (fh,),
-                    )
-                    chunk_id = row[0]
-                await db.execute(
-                    "UPDATE document_chunks SET embedding_vec = ? WHERE chunk_id = ?",
-                    (packed, chunk_id),
                 )
             await db.commit()
 

@@ -1509,10 +1509,10 @@ class AsyncDatabase:
 
         # Phase 2 of #1447: add a parallel ``saved_items.embedding_vec``
         # column for the SQLA + pgvector code path. On PG it's
-        # ``vector(N)`` indexed with HNSW; on SQLite it's BLOB. The
-        # legacy ``embedding`` BYTEA / BLOB column stays — raw IO in
-        # SavedItemsStore continues to use it, and ``save_item``'s
-        # dual-write keeps both in sync.
+        # ``vector(N)`` indexed with HNSW; on SQLite it's BLOB. It
+        # copies the legacy ``embedding`` BYTEA / BLOB values, which
+        # nothing writes any more (#3411) and which the retirement
+        # migration below drops once every vector is copied.
         # Idempotent: skips cleanly if the column already exists.
         # Wrapped in ``db.transaction()`` internally so any partial
         # failure rolls back. See sqla/migrations.py for details.
@@ -1544,6 +1544,25 @@ class AsyncDatabase:
                 "AsyncRAGStore search falls back to in-Python cosine until "
                 "next boot.", e, exc_info=True,
             )
+
+        # Phase 3 of #2684 (#3411): drop the legacy ``embedding`` column
+        # from each table once the verify gate is met there — every
+        # stored vector is in ``embedding_vec``. It refuses, keeping the
+        # column and its data, otherwise; see sqla/migrations.py.
+        # Independent per table, and non-fatal: nothing writes the legacy
+        # column any more, so keeping it costs only disk.
+        for table in ("saved_items", "document_chunks"):
+            try:
+                from .sqla.migrations import (
+                    migrate_retire_legacy_embedding_column,
+                )
+                await migrate_retire_legacy_embedding_column(self, table)
+            except Exception as e:
+                logger.error(
+                    "Retiring the legacy %s.embedding column failed: %s. "
+                    "The column is kept; the next boot retries.",
+                    table, e, exc_info=True,
+                )
 
         # Greenfield ``embedding_vec`` column on ``conversation_history``
         # for the SQLAlchemy/vector path that will back

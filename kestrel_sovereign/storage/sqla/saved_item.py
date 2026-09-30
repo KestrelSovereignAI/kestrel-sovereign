@@ -66,13 +66,11 @@ class SavedItem(SovereignBase):
 
     # Embedding column — the ORM uses the parallel ``embedding_vec``
     # SQL column added by the Phase-2 migration (NOT the legacy
-    # ``embedding`` BYTEA / BLOB column used by raw ``AsyncDatabase``
-    # IO). The two are kept in sync by ``SavedItemsStore.save_item``'s
-    # dual-write. This split lets the SQLA + pgvector path land
-    # without disturbing the raw ``INSERT`` / ``from_row`` callers
-    # that bind/unpack float32 bytes. (Caught by codex review on the
-    # Phase 2 PR — an in-place column-type swap would have broken
-    # them.)
+    # ``embedding`` BYTEA / BLOB column). A parallel column, rather than
+    # an in-place type swap, let the SQLA + pgvector path land without
+    # breaking raw callers that bound float32 bytes. Since #3411 every
+    # writer fills ``embedding_vec`` only, and the startup migration
+    # drops the legacy column once no row depends on it.
     embedding: Mapped[Optional[Any]] = mapped_column(
         "embedding_vec", PortableVector(SAVED_ITEM_EMBEDDING_DIM), nullable=True
     )

@@ -9,12 +9,13 @@ Phase 2 of #1447: add a parallel ``embedding_vec`` column to
 ``saved_items``:
 
 - On Postgres: ``vector(N)``, indexed with HNSW for fast cosine kNN.
-  The existing ``embedding`` BYTEA column stays — legacy raw IO paths
-  in :class:`SavedItemsStore` continue to write/read it unchanged, and
-  the new ``save_item`` dual-write keeps the two in sync.
-- On SQLite: also ``BLOB``. Same dual-write keeps both columns in
-  sync there too. PurePythonBackend can read either; the ORM uses
-  ``embedding_vec`` so the code path is the same as PG.
+- On SQLite: also ``BLOB``. The ORM uses ``embedding_vec`` so the
+  code path is the same as PG.
+
+Both copy the legacy ``embedding`` BYTEA / BLOB values. Since #3411
+nothing writes that column, and
+:func:`migrate_retire_legacy_embedding_column` drops it once no row
+depends on it.
 
 The parallel column lets us flip the vector-backend factory to
 ``PgVectorBackend`` on PG without rewriting the raw INSERT / SELECT
@@ -1685,6 +1686,170 @@ async def _migrate_sqlite_table(db: "AsyncDatabase", table: str) -> None:
     logger.info(
         "%s Phase-2 SQLite migration complete: added embedding_vec BLOB, "
         "copied existing embeddings.", table,
+    )
+
+
+# =============================================================================
+# Retire the legacy ``embedding`` column on saved_items / document_chunks
+# (#3411, phase 3 of #2684). Writers store vectors in ``embedding_vec`` only;
+# this drops the legacy column once no row still depends on it.
+# =============================================================================
+
+# ``ALTER TABLE ... DROP COLUMN`` arrived in SQLite 3.35.0.
+_SQLITE_DROP_COLUMN_MIN_VERSION = (3, 35, 0)
+
+# How long the PostgreSQL retirement waits for its table lock before giving
+# up until the next boot, instead of stalling startup behind a long-running
+# transaction.
+_RETIREMENT_LOCK_TIMEOUT = "10s"
+
+
+def legacy_embedding_retirement_gate_met(report) -> bool:
+    """Whether *report*'s table may lose its legacy ``embedding`` column.
+
+    *report* is an ``EmbeddingVecReport`` from ``verify_embedding_vec``.
+    Stricter than the phase-2 gate ``kestrel embeddings verify`` exits on
+    (``rows_missing_embedding_vec == rows_unbackfillable``): dropping the
+    column destroys every legacy value, so no row may hold a vector only
+    there, whether or not it could be copied.
+    """
+    return (
+        report.embedding_vec_present
+        and report.rows_missing_embedding_vec == 0
+        and report.rows_unbackfillable == 0
+    )
+
+
+async def migrate_retire_legacy_embedding_column(
+    db: "AsyncDatabase", table: str,
+) -> bool:
+    """Drop *table*'s legacy ``embedding`` column if the verify gate is met.
+
+    Fails closed. The column stays, untouched, unless
+    ``verify_embedding_vec`` reports that ``embedding_vec`` exists and no row
+    is missing it (see :func:`legacy_embedding_retirement_gate_met`). That
+    full gate runs without a lock, so a database that fails it never blocks
+    other connections. The transaction that drops the column then rechecks,
+    under ``BEGIN IMMEDIATE`` on SQLite and an ``ACCESS EXCLUSIVE`` table
+    lock on PostgreSQL, that no row holds a legacy value with a NULL
+    ``embedding_vec``. So no concurrent writer (an older release still
+    dual-writing, say) can add a legacy-only row in between. The recheck is
+    one SQL statement that reads no vector values, not a second scan of
+    every vector pair, because the lock is held while it runs.
+
+    Idempotent: a table without the legacy column, or without the table,
+    is left alone. The drop is not reversible. An older release cannot
+    write to a table that has lost the column, so roll back only by
+    restoring a backup.
+
+    Returns whether this call dropped the column.
+    """
+    # Local import: ``embedding_vec_backfill`` imports ``embedding_reindex``,
+    # which imports the ``sqla`` package that loads this module.
+    from ..embedding_vec_backfill import (
+        LEGACY_EMBEDDING_TABLES,
+        EmbeddingVecBackfillError,
+        verify_embedding_vec,
+    )
+
+    if table not in LEGACY_EMBEDDING_TABLES:
+        raise ValueError(
+            f"table must be one of {sorted(LEGACY_EMBEDDING_TABLES)}, got {table!r}"
+        )
+    backend_type = getattr(db, "backend_type", None)
+    if backend_type not in ("postgres", "sqlite"):
+        return False
+    if not await db.column_exists(table, "embedding"):
+        return False
+    if backend_type == "sqlite":
+        version = await _sqlite_version(db)
+        if version < _SQLITE_DROP_COLUMN_MIN_VERSION:
+            logger.warning(
+                "Keeping the legacy %s.embedding column: SQLite %s cannot drop "
+                "a column (3.35.0 or newer can). Nothing reads or writes it.",
+                table, ".".join(str(part) for part in version),
+            )
+            return False
+
+    try:
+        report = await verify_embedding_vec(db, table)
+    except EmbeddingVecBackfillError as exc:
+        logger.warning("Keeping the legacy %s.embedding column: %s", table, exc)
+        return False
+    if not legacy_embedding_retirement_gate_met(report):
+        _log_retirement_refused(report)
+        return False
+
+    async with db.transaction(immediate=True):
+        if backend_type == "postgres":
+            await db.execute(
+                f"SET LOCAL lock_timeout = '{_RETIREMENT_LOCK_TIMEOUT}'", ()
+            )
+            await db.execute(f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE", ())
+        # A concurrent boot may have retired it while this one waited.
+        if not await db.column_exists(table, "embedding"):
+            return False
+        if await _legacy_only_vector_written(db, table):
+            logger.warning(
+                "Keeping the legacy %s.embedding column: rechecked under the "
+                "drop's lock, a row now holds its vector only there. Run "
+                "`kestrel embeddings backfill`; the next boot retries.",
+                table,
+            )
+            return False
+        await db.execute(f"ALTER TABLE {table} DROP COLUMN embedding", ())
+
+    logger.info(
+        "Retired the legacy %s.embedding column: all %d stored vectors are "
+        "in embedding_vec (%d rows).",
+        table, report.rows_with_both + report.rows_embedding_vec_only,
+        report.total_rows,
+    )
+    return True
+
+
+async def _legacy_only_vector_written(db: "AsyncDatabase", table: str) -> bool:
+    """Whether *table* now fails the retirement gate, asked in one statement.
+
+    The gate's blocking rows are those with a legacy value and a NULL
+    ``embedding_vec``: ``verify_embedding_vec`` counts an unbackfillable
+    row only among them, so this catches both kinds without telling them
+    apart. Called under the drop's table lock, so it reads no vector
+    values, only whether each column is NULL. A missing ``embedding_vec``
+    fails the gate too.
+    """
+    if not await db.column_exists(table, "embedding_vec"):
+        return True
+    row = await db.fetchone(
+        f"SELECT EXISTS (SELECT 1 FROM {table} "
+        "WHERE embedding IS NOT NULL AND embedding_vec IS NULL)",
+        (),
+    )
+    return bool(row[0])
+
+
+async def _sqlite_version(db: "AsyncDatabase") -> tuple:
+    row = await db.fetchone("SELECT sqlite_version()", ())
+    return tuple(int(part) for part in str(row[0]).split(".")[:3])
+
+
+def _log_retirement_refused(report) -> None:
+    if not report.embedding_vec_present and report.rows_missing_embedding_vec == 0:
+        # A fresh PostgreSQL table: the first embedded write creates
+        # ``embedding_vec`` at its vector's width.
+        logger.info(
+            "Keeping the legacy %s.embedding column until embedding_vec "
+            "exists.", report.table,
+        )
+        return
+    logger.warning(
+        "Keeping the legacy %s.embedding column: the retirement gate is not "
+        "met (embedding_vec present: %s, rows missing embedding_vec: %d, "
+        "unbackfillable: %d). Run `kestrel embeddings backfill`; re-embed "
+        "unbackfillable rows with `kestrel embeddings reindex`. The next "
+        "boot retries.",
+        report.table, report.embedding_vec_present,
+        report.rows_missing_embedding_vec, report.rows_unbackfillable,
     )
 
 

@@ -30,6 +30,7 @@ from kestrel_sovereign.storage.embedding_vec_backfill import (
     LEGACY_EMBEDDING_TABLES,
     EmbeddingVecReport,
 )
+from tests.utils.legacy_embedding_column import restore_legacy_embedding_column
 from tests.utils.postgres_schema import (
     pgvector_schema,
     quoted_search_path,
@@ -43,9 +44,7 @@ def _pack(values):
     return struct.pack(f"<{len(values)}f", *values)
 
 
-@pytest.fixture
-def agent_dir(tmp_path, monkeypatch):
-    """An agent data dir whose ``kestrel_prime.db`` has the full schema."""
+def _agent_data_dir(tmp_path, monkeypatch, *, legacy_column):
     for name in (
         "KESTREL_DATABASE_URL",
         "DATABASE_URL",
@@ -58,10 +57,30 @@ def agent_dir(tmp_path, monkeypatch):
 
     async def create():
         db = await AsyncDatabase.sqlite(str(data_dir / "kestrel_prime.db"))
-        await db.close()
+        try:
+            if legacy_column:
+                await restore_legacy_embedding_column(db)
+        finally:
+            await db.close()
 
     asyncio.run(create())
     return data_dir
+
+
+@pytest.fixture
+def agent_dir(tmp_path, monkeypatch):
+    """An agent data dir whose ``kestrel_prime.db`` has the pre-#3411 schema.
+
+    The boot retires the legacy ``embedding`` column (#3411); it is restored
+    so rows can be seeded the way an older release wrote them.
+    """
+    return _agent_data_dir(tmp_path, monkeypatch, legacy_column=True)
+
+
+@pytest.fixture
+def retired_agent_dir(tmp_path, monkeypatch):
+    """An agent data dir as a fresh boot leaves it: no legacy column."""
+    return _agent_data_dir(tmp_path, monkeypatch, legacy_column=False)
 
 
 def _connect(data_dir):
@@ -157,6 +176,33 @@ def test_empty_tables_meet_the_gate(agent_dir, monkeypatch, capsys, command):
         assert entry["rows_missing_embedding_vec"] == 0
         assert entry["rows_backfilled"] == 0
         assert entry["gate_met"] is True
+
+
+@pytest.mark.parametrize("command", ["verify", "backfill"])
+def test_retired_legacy_column_meets_the_gate(
+    retired_agent_dir, monkeypatch, capsys, command
+):
+    # After #3411 drops the legacy column there is nothing left to copy.
+    with closing(_connect(retired_agent_dir)) as conn, conn:
+        conn.execute(
+            "INSERT INTO saved_items (id, agent_id, item_type, name, content, "
+            "embedding_vec) VALUES ('vec', 'did:test:agent', 'stash', 'vec', "
+            "'c', ?)",
+            (_pack([1.0, 2.0]),),
+        )
+    before = _snapshot(retired_agent_dir)
+
+    rc, payload = _embeddings_json(monkeypatch, capsys, command, retired_agent_dir)
+
+    assert rc == 0
+    assert payload["gate_met"] is True
+    saved_items = _table(payload, "saved_items")
+    assert (
+        saved_items["rows_embedding_vec_only"],
+        saved_items["rows_missing_embedding_vec"],
+        saved_items["rows_backfilled"],
+    ) == (1, 0, 0)
+    assert _snapshot(retired_agent_dir) == before
 
 
 def test_json_report_carries_every_report_field(agent_dir, monkeypatch, capsys):
@@ -656,6 +702,8 @@ def test_postgres_verify_changes_neither_the_column_nor_a_row(
     file_hash = f"cli-embeddings-verify-{uuid4()}"
 
     async def insert_legacy_row(db):
+        # The boot retires the legacy column once no row needs it (#3411).
+        await restore_legacy_embedding_column(db, "document_chunks")
         typmod, _ = await _pg_chunk_state(db, file_hash)
         width = typmod if typmod is not None and typmod > 0 else 4
         await db.execute(

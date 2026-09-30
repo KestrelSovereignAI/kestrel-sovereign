@@ -1424,7 +1424,8 @@
     {
       "existing_code_refs": [
         "kestrel_sovereign/storage/embedding_vec_backfill.py",
-        "scripts/validate_vector_lift_e2e.py"
+        "scripts/validate_vector_lift_e2e.py",
+        "tests/utils/legacy_embedding_column.py"
       ],
       "findings": [],
       "missing_code_refs": [],

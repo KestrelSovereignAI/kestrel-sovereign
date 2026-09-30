@@ -1655,7 +1655,7 @@ async def test_precomputed_chunks_store_text_when_there_is_no_vector(tmp_path):
         assert [c.embedding for c in read_back] == [[], []]
         row = await db.fetchone(
             "SELECT COUNT(*) FROM document_chunks "
-            "WHERE file_hash = ? AND embedding IS NULL",
+            "WHERE file_hash = ? AND embedding_vec IS NULL",
             (file_hash,),
         )
         assert int(row[0]) == 2

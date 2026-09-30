@@ -3,8 +3,9 @@ type: Architecture Spec
 title: Legacy Embedding Column Inventory
 description: Canonical inventory of every reader and writer of the legacy raw-SQL
   `embedding` column on `saved_items` and `document_chunks`, the verify/backfill
-  helper for `embedding_vec`, and the readers moved to `embedding_vec`. Phases 1
-  and 2 of the retirement tracked in #2684.
+  helper for `embedding_vec`, the readers moved to `embedding_vec`, and the
+  gated migration that drops the legacy column. Phases 1-3 of the retirement
+  tracked in #2684.
 resource: /docs/architecture/storage/EMBEDDING_COLUMN_RETIREMENT.md
 tags:
 - docs
@@ -25,13 +26,13 @@ privacy: public
 
 | Column | SQLite | PostgreSQL | Who uses it |
 |---|---|---|---|
-| `embedding` (legacy) | `BLOB`, float32 little-endian | `BYTEA`, float32 little-endian | The dual-write inserts, the startup migrations, the verify/backfill helper, and readers only while a table has no `embedding_vec` column |
-| `embedding_vec` (canonical) | `BLOB`, float32 little-endian | `vector(N)` (pgvector) with an HNSW index | The SQLAlchemy ORM, the vector backends (`storage/vector`), and every raw-SQL reader ([#3409](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3409)) |
+| `embedding` (legacy) | `BLOB`, float32 little-endian | `BYTEA`, float32 little-endian | Written by nothing since [#3411](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3411). The startup migrations copy it into `embedding_vec`, the verify/backfill helper reads it, readers use it only while a table has no `embedding_vec` column, and the retirement migration drops it once the gate is met |
+| `embedding_vec` (canonical) | `BLOB`, float32 little-endian | `vector(N)` (pgvector) with an HNSW index | Every writer ([#3411](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3411)), the SQLAlchemy ORM, the vector backends (`storage/vector`), and every raw-SQL reader ([#3409](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3409)) |
 
 The split was the #1447 bridge: it let the pgvector path land without rewriting
 the raw SQL that binds float32 bytes. Retirement is tracked in
 [#2684](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2684) in
-three phases:
+three phases, all complete:
 
 1. **This inventory plus an idempotent verify/backfill of `embedding_vec`**
    ([#3402](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3402)).
@@ -42,11 +43,16 @@ three phases:
    `embedding_vec`. The readers moved in
    [#3409](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3409);
    see [Readers](#readers-moved-to-embedding_vec).
-3. Stop the dual writes, then retire the legacy column.
+3. Stop the dual writes, then retire the legacy column
+   ([#3411](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3411)).
+   Writers store vectors in `embedding_vec` only, and a startup migration
+   drops the legacy column wherever the gate is met; see
+   [Phase 3](#phase-3-retiring-the-legacy-column).
 
-This page is the starting point for phase 3. Line numbers in the schema and
-writer tables are against the tree that introduced this page; reader
-locations are against #3409. Re-run the grep below before acting on them.
+Line numbers in the schema table are against the tree that introduced this
+page, except the phase-3 rows; reader locations are against #3409, and the
+writer and phase-3 locations against #3411. Re-run the grep below before
+acting on them.
 
 ```bash
 grep -rn "embedding" kestrel_sovereign/storage kestrel_sovereign/identity \
@@ -73,12 +79,21 @@ with `scripts/`.
 | `storage/sqla/migrations.py:1534` | `migrate_document_chunks_add_embedding_vec`, which delegates to the generic helpers below. |
 | `storage/sqla/migrations.py:1582, 1617, 1635` | `_migrate_pg_table`: dimension sniff, legacy read, `embedding_vec` write. |
 | `storage/sqla/migrations.py:1680` | `_migrate_sqlite_table`: copy `embedding` into `embedding_vec`. |
+| `storage/async_database.py:1548-1565` | Phase 3: startup call to `migrate_retire_legacy_embedding_column` for each table, after the two migrations above. |
+| `storage/sqla/migrations.py:1707, 1723` | Phase 3: `legacy_embedding_retirement_gate_met` and `migrate_retire_legacy_embedding_column`. |
+| `storage/sqla/migrations.py:1811` | Phase 3: `_legacy_only_vector_written`, the recheck under the drop's lock. It tests only whether each column is NULL and reads no legacy value. |
 
-Both migrations run only when `embedding_vec` is **absent**, so neither repairs
-a row that is later left with only the legacy column. On PostgreSQL the column
-is not created at all until some row has a legacy embedding (the width is
-sniffed from it). Until then every PG `embedding_vec` write fails and is logged,
-and only the legacy column holds the vector.
+Both copy migrations run only when `embedding_vec` is **absent**, so neither
+repairs a row that is later left with only the legacy column. On PostgreSQL the
+column is not created by them at all until some row has a legacy embedding (the
+width is sniffed from it). Since #3411 no row gets one, so the first embedded
+write creates the column instead (see [Writers](#writers)).
+
+`CREATE TABLE` still declares the legacy column, so a fresh table starts with
+it. Readers need a column to resolve until `embedding_vec` exists (see
+[Readers](#readers-moved-to-embedding_vec)), and the retirement migration drops
+it once that is true: on SQLite at the first boot, on PostgreSQL at the boot
+after the first embedded write.
 
 ## ORM mappings (`embedding_vec` only)
 
@@ -88,26 +103,44 @@ and only the legacy column holds the vector.
 | `storage/sqla/document_chunk.py:60-67` | `DocumentChunk.embedding` maps `embedding_vec`. The legacy column is deliberately unmapped. |
 | `storage/sqla/types.py` | `PortableVector`: `vector(N)` on PG, float32 bytes on SQLite. It also accepts legacy bytes on bind. |
 
-## Writers of the legacy `embedding` column
+## Writers
 
-Every production writer dual-writes. The legacy value is written by the
-`INSERT`, and `embedding_vec` by a separate follow-up `UPDATE` that is
-non-fatal on failure.
+### Stopped: writers of the legacy `embedding` column
+
+Until #3411 every production writer dual-wrote: the `INSERT` wrote the legacy
+value, and a separate, non-fatal `UPDATE` wrote `embedding_vec`. Each of these
+has stopped writing the legacy column. Locations are from the tree that
+introduced this page.
+
+| Former location | Table | What it wrote | Since #3411 |
+|---|---|---|---|
+| `storage/saved_items_store.py:489, 504-518` | `saved_items` | `save_item` serialized the vector and inserted it into `embedding`. | The `INSERT` names no embedding column. |
+| `storage/async_rag_store.py:216, 223, 230` | `document_chunks` | `chunk_document` inserted the serialized vector into `embedding`. | `_insert_chunk` inserts `file_hash` and `content` only. |
+| `storage/async_rag_store.py:367, 373, 380` | `document_chunks` | `store_precomputed_chunks` inserted into `embedding`. | Same `_insert_chunk`. |
+| `scripts/validate_vector_lift_e2e.py:294` | `document_chunks` | The validation script seeds a legacy-only row. | Kept on purpose: it stands in for data an older release wrote, which the startup migration still lifts. The script now also checks that the boot retires the legacy column. |
+
+`grep` for `embedding` in an `INSERT` or `SET` on either table finds no
+production writer. Tests that need legacy data put the column back with
+`tests/utils/legacy_embedding_column.py` and seed it directly.
+
+### Writers of `embedding_vec`
 
 | Location | Table | What it writes |
 |---|---|---|
-| `storage/saved_items_store.py:489, 504-518` | `saved_items` | `save_item` serializes the vector (`_serialize_embedding`, line 303) and inserts it into `embedding`. |
-| `storage/saved_items_store.py:557` → `794-892` | `saved_items` | Dual-write: `_write_embedding_vec` sets `embedding_vec` (PG `?::vector` at 832, SQLite bytes at 838; single-column fallbacks at 862 and 868). |
-| `storage/async_rag_store.py:216, 223, 230` | `document_chunks` | `chunk_document` inserts the serialized vector into `embedding`. |
-| `storage/async_rag_store.py:282` → `407-513` | `document_chunks` | Dual-write: `_write_embedding_vec` (PG at 451, SQLite at 457; fallbacks at 481 and 487). |
-| `storage/async_rag_store.py:367, 373, 380` | `document_chunks` | `store_precomputed_chunks` inserts into `embedding`. |
-| `storage/async_rag_store.py:399` | `document_chunks` | Dual-write for precomputed chunks. |
-| `scripts/validate_vector_lift_e2e.py:294` | `document_chunks` | Validation script seeds a legacy-only row. |
+| `storage/saved_items_store.py:556` → `810` | `saved_items` | `save_item` creates the column if absent, then `_write_embedding_vec` sets `embedding_vec` and `embedding_profile_id` (PG `?::vector`, SQLite float32 bytes; single-column fallbacks). |
+| `storage/async_rag_store.py:250` → `391` | `document_chunks` | `chunk_document`: the same, once per batch. |
+| `storage/async_rag_store.py:357` → `391` | `document_chunks` | `store_precomputed_chunks`: the same. |
+| `storage/embedding_column.py:84` | both | `ensure_embedding_vec_column(db, table, dimension)` creates an absent `embedding_vec`: `vector(N)` sized from the vector being written plus the HNSW index on PostgreSQL, `BLOB` on SQLite. A fresh PostgreSQL database needs it, because the startup migration sizes the column only from a legacy row and none is written any more. It runs inside `transaction()`, a savepoint under a caller's transaction, and a failure is logged, not raised. |
 
-`SavedItemsStore.update_item` (`storage/saved_items_store.py:666-711`) never
-recomputes an embedding, so neither column changes on edit.
+A failed `embedding_vec` write is logged at `WARNING` and leaves the row with no
+stored vector: there is no legacy copy left to backfill from. `save_item`
+reports `has_embedding: false` for it, and `kestrel embeddings reindex` embeds
+it (reindex selects rows whose `embedding_vec` is NULL).
 
-## Writers of `embedding_vec` only
+`SavedItemsStore.update_item` never recomputes an embedding, so no embedding
+column changes on edit.
+
+### Reindex
 
 | Location | Effect |
 |---|---|
@@ -126,11 +159,14 @@ every raw-SQL reader resolves its column through
   has no stored vector, whatever its legacy column holds. Nothing falls back
   to the legacy value per row.
 - Only when the table has **no `embedding_vec` column at all** do readers use
-  the legacy `embedding`. That is a fresh PostgreSQL database, where the
-  startup migration defers `vector(N)` until a legacy row shows the width
-  (see [Schema and migrations](#schema-and-migrations)). Reindex reads and
-  writes `embedding_vec`, so it cannot have run against such a table, and its
-  legacy bytes are current. The next boot creates the column and copies them.
+  the legacy `embedding`. That is a PostgreSQL table no embedded write has
+  reached yet: since #3411 the first one creates `embedding_vec` (see
+  [Writers](#writers)), so such a table's legacy column holds only what an
+  older release wrote. Reindex reads and writes `embedding_vec`, so it cannot
+  have run against such a table, and those legacy bytes are current. The next
+  boot creates the column and copies them. The retirement migration never
+  drops the legacy column while `embedding_vec` is absent, so a reader always
+  has a column to resolve.
 - `decode_stored_embedding(value)` decodes float32 little-endian bytes and
   pgvector text. It is the one decoder; the per-store `_deserialize_embedding`
   helpers are gone.
@@ -150,7 +186,8 @@ every raw-SQL reader resolves its column through
 
 The `sqla/migrations.py` reads of the legacy column (lines 1401, 1446, 1582,
 1617) and `embedding_vec_backfill.py` are not readers in this sense. They copy
-the legacy value into `embedding_vec` and stay until phase 3.
+the legacy value into `embedding_vec`. They stay after phase 3 for every
+database whose legacy column the retirement migration has not yet dropped.
 
 ### Indirect consumers
 
@@ -175,6 +212,8 @@ These read `SavedItem.embedding` (the dataclass field), which `from_row` and
 
 ## Findings for phases 2 and 3
 
+These were recorded before phase 3 and are kept for the history.
+
 - **Fixed in #3409: the in-Python search scored a stale vector after a
   reindex.** Both `_legacy_in_python_search` methods filter on the current
   `embedding_profile_id` (the RAG one only when the embedding service reports
@@ -191,13 +230,14 @@ These read `SavedItem.embedding` (the dataclass field), which `from_row` and
   Until the column exists the backfill helper reports it as absent and changes
   nothing. Creating it stays with the startup migration, which chooses the
   vector width. Readers use the legacy column in that state (see
-  [Readers](#readers-moved-to-embedding_vec)).
-- **Phase 3 must create `embedding_vec` before it stops the legacy write.**
-  A fresh PostgreSQL database holds its first vectors only in the legacy
-  column until the next boot. Once the legacy write stops, the first write
-  must create the column at the vector's width (or the width must come from
-  configuration). Only then can the legacy branch of
-  `stored_embedding_column` be deleted with the column.
+  [Readers](#readers-moved-to-embedding_vec)). Since #3411 only an older
+  release can have written such rows.
+- **Done in #3411: create `embedding_vec` before stopping the legacy write.**
+  A fresh PostgreSQL database held its first vectors only in the legacy column
+  until the next boot. Now the first embedded write creates the column at the
+  vector's width (`ensure_embedding_vec_column`). The legacy branch of
+  `stored_embedding_column` stays until no supported database can still have
+  a table without `embedding_vec` (see [What remains](#what-remains)).
 
 ## Verify and backfill helper
 
@@ -251,8 +291,9 @@ kestrel embeddings backfill [--table saved_items|document_chunks|all] [--batch-s
   `--data-dir`, `KESTREL_DB_PATH`, or `KESTREL_DATABASE_URL` for PostgreSQL.
 - They open it **without** the startup schema initializer. The default open
   runs the `embedding_vec` startup migration, which would itself create an
-  absent column and copy the legacy vectors into it. An absent column is
-  reported as `ABSENT` and left for the agent's startup migration to create.
+  absent column and copy the legacy vectors into it, and, since #3411, the
+  retirement migration. An absent column is reported as `ABSENT` and left for
+  the agent's startup migration to create.
 - On SQLite, `verify` opens the file read-only through the cold-read
   connection ([#3407](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3407)).
   It never sets the journal mode. A checkpointed database (no `-wal`/`-shm`)
@@ -282,5 +323,97 @@ does not exist. The row equality alone would not catch it: with the column
 absent, the helper counts every legacy row as unbackfillable, so the counts
 match while no vector has moved. On PostgreSQL the startup migration sizes
 `vector(N)` from an existing legacy embedding, so a table that has never held
-one has no column and cannot pass the gate until one exists and the agent
-restarts.
+one has no column and cannot pass the gate until one exists. Since #3411 the
+first embedded write creates it.
+
+A table whose legacy column is already retired reports as if every legacy
+value were NULL: `rows_embedding_vec_only` counts its stored vectors, and every
+other count is 0, so it meets the gate whenever `embedding_vec` exists.
+
+## Phase 3: retiring the legacy column
+
+[#3411](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3411)
+stopped every legacy write (see [Writers](#writers)) and added
+`migrate_retire_legacy_embedding_column(db, table)` to the startup sequence,
+once per table, after the copy migrations. It drops the legacy column with
+`ALTER TABLE <table> DROP COLUMN embedding`, and only when the **retirement
+gate** is met for that table on that database:
+
+- `embedding_vec` exists, and
+- `rows_missing_embedding_vec == 0` and `rows_unbackfillable == 0`, as
+  `verify_embedding_vec` reports them.
+
+This is stricter than the phase-2 gate that `kestrel embeddings verify` exits
+on. That gate accepts unbackfillable rows (for example a legacy vector with a
+NaN component), but those rows hold their only vector in the legacy column,
+and the drop would destroy it. `rows_disagreeing` does not block the drop: a
+disagreement means reindex already wrote the authoritative vector to
+`embedding_vec`.
+
+**Fail closed.** When the gate is not met the migration keeps the column and
+every byte in it, logs `Keeping the legacy <table>.embedding column` with the
+counts at `WARNING` (at `INFO` for a PostgreSQL table that has no
+`embedding_vec` yet and no legacy vector, the normal state of a fresh
+database), and the next boot tries again. To let it proceed, run
+`kestrel embeddings backfill`; for rows it reports unbackfillable, run
+`kestrel embeddings reindex`, which embeds every row whose `embedding_vec` is
+NULL. Each table is judged on its own. A failure in the migration is logged
+and non-fatal: nothing writes the legacy column any more, so keeping it costs
+only disk.
+
+**No write can slip in between.** The full gate (`verify_embedding_vec`) runs
+without a lock, so a database that fails it never blocks another connection.
+The drop then runs in one transaction under `BEGIN IMMEDIATE` on SQLite and
+`LOCK TABLE ... IN ACCESS EXCLUSIVE MODE` on PostgreSQL. Before dropping, that
+transaction rechecks with one statement:
+
+```sql
+SELECT EXISTS (SELECT 1 FROM <table>
+               WHERE embedding IS NOT NULL AND embedding_vec IS NULL)
+```
+
+A release still dual-writing on the same database (a mixed-version fleet on
+shared PostgreSQL) therefore cannot land a legacy-only row after the check.
+For as long as the lock is held it blocks every access to the table on
+PostgreSQL and every other writer on SQLite, and the boot waits with it. So the
+recheck is not a second `verify_embedding_vec`. That call reads and compares
+every vector pair in Python, while the recheck tests only whether each column
+is NULL. It still scans the table at most once, but it transfers no vector
+values.
+
+The two checks split the gate between them:
+
+| Refusal case | Unlocked full gate | Recheck under the lock |
+|---|---|---|
+| `embedding_vec` absent | yes | yes (catalog lookup) |
+| A legacy value with a NULL `embedding_vec` (`rows_missing_embedding_vec`) | yes | yes |
+| That value is unbackfillable (not whole float32, wrong `vector(N)` width, NaN or infinite) | yes, counted separately | yes, but not told apart: `verify_embedding_vec` counts an unbackfillable row only among the rows missing `embedding_vec`, so the recheck blocks on it without classifying it |
+| PostgreSQL `embedding_vec` is not a pgvector `vector` | yes (`verify_embedding_vec` raises) | no; nothing between the checks changes a column type |
+
+On PostgreSQL the lock wait is bounded by a 10-second `lock_timeout`; on
+timeout the drop waits for the next boot. `lock_timeout` bounds only the wait,
+not the hold, which is why the work under the lock is kept to one statement.
+A concurrent boot that dropped the column first is detected under the lock.
+
+**SQLite older than 3.35.0** has no `DROP COLUMN`. The migration keeps the
+column there and says so at `WARNING`.
+
+**The drop is not reversible, and it is forward-only.** An older release
+inserts into the legacy column, so it fails against a table that has lost it.
+Before deploying #3411, run `kestrel embeddings verify` on every data directory
+and back up each database; roll back only by restoring that backup. Until a
+table's column is dropped, older releases keep working against it.
+
+## What remains
+
+Phase 3 leaves two pieces of compatibility code, both still reachable:
+
+- `CREATE TABLE` still declares the legacy column, and
+  `stored_embedding_column` still falls back to it when a table has no
+  `embedding_vec`. A PostgreSQL table reaches `embedding_vec` only through
+  its first embedded write, and until then readers need a column to resolve.
+  Removing both needs `embedding_vec` in the fresh schema at a known width
+  (for example from configuration, as `conversation_history` does).
+- The copy migrations in `sqla/migrations.py` and `embedding_vec_backfill.py`
+  read the legacy column of databases that have not yet met the gate. They can
+  go once no supported deployment can still hold one.
