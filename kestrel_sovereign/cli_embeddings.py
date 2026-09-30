@@ -893,7 +893,8 @@ async def _embedding_vec(
     :data:`EXIT_GATE_NOT_MET` when any does not, and 2 when the helper
     refuses the database. ``rows_disagreeing`` is reported for review and
     does not affect the exit code: after a reindex the two columns
-    legitimately differ.
+    legitimately differ. Nor does ``rows_without_any_embedding`` (#3415): a
+    row with no vector in either column has nothing to copy or to lose.
     """
     from kestrel_sovereign.storage.db.sqlite import ColdReadUnavailable
     from kestrel_sovereign.storage.embedding_vec_backfill import (
@@ -967,6 +968,7 @@ def _print_embedding_vec_reports(
             "rows_with_both",
             "rows_missing_embedding_vec",
             "rows_embedding_vec_only",
+            "rows_without_any_embedding",
             "rows_disagreeing",
             "rows_backfilled",
             "rows_unbackfillable",
@@ -995,6 +997,13 @@ def _print_embedding_vec_reports(
                 f"  note: {report.rows_disagreeing} row(s) disagree. Expected "
                 "after a reindex (embedding_vec is authoritative); review "
                 "before switching readers. Not part of the exit code."
+            )
+        if report.rows_without_any_embedding:
+            print(
+                f"  note: {report.rows_without_any_embedding} row(s) have no "
+                "embedding in either column, so vector search cannot find "
+                "them. There is nothing to copy, so they are not part of the "
+                "exit code; `kestrel embeddings reindex --yes` embeds them."
             )
     verdict = "met" if gate_met else "NOT met"
     print(

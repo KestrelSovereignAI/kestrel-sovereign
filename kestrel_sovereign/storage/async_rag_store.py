@@ -183,14 +183,29 @@ class AsyncRAGStore:
 
         # Get embeddings if requested and service available
         embeddings = [None] * len(chunks)
+        unembedded_reason = "the embedding model returned no vector"
         if compute_embeddings:
             embedding_service = self._get_embedding_service()
-            if embedding_service:
+            if not embedding_service:
+                unembedded_reason = "no embedding service resolved"
+            else:
                 try:
-                    embeddings = await embedding_service.aembed_batch(chunks)
-                    logger.debug(f"Computed embeddings for {len(chunks)} chunks")
+                    batch = await embedding_service.aembed_batch(chunks)
                 except Exception as e:
-                    logger.warning(f"Failed to compute embeddings: {e}")
+                    # Logged with the stored-without-embedding count below.
+                    unembedded_reason = f"the embedding call failed: {e}"
+                else:
+                    if len(batch) == len(chunks):
+                        embeddings = batch
+                        logger.debug(f"Computed embeddings for {len(chunks)} chunks")
+                    else:
+                        # ``zip`` below would silently drop every chunk past
+                        # the shorter list, and a misaligned batch cannot be
+                        # matched back to its chunks.
+                        unembedded_reason = (
+                            f"the embedding model returned {len(batch)} "
+                            f"vectors for {len(chunks)} chunks"
+                        )
 
         # Store chunks. Their embeddings go to ``embedding_vec`` only,
         # through ``_write_embedding_vec`` below, where the vector search
@@ -213,6 +228,17 @@ class AsyncRAGStore:
                     )
             if embedding:
                 new_chunk_ids.append((chunk_id, embedding))
+
+        unembedded = len(chunks) - len(new_chunk_ids)
+        if compute_embeddings and unembedded:
+            # A constitution reanchor stored 47 chunks per agent this way, and
+            # nothing above INFO said so (#3415).
+            logger.warning(
+                "Stored %d of %d chunks of %s without an embedding (%s). "
+                "Keyword search finds them; vector search cannot until "
+                "`kestrel embeddings reindex --yes` embeds them.",
+                unembedded, len(chunks), file_hash, unembedded_reason,
+            )
 
         # #1477 — derive the active embedding profile id once (same
         # for every chunk we just batched) so kNN can filter

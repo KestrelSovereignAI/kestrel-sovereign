@@ -142,14 +142,22 @@ production writer. Tests that need legacy data put the column back with
 | Location | Table | What it writes |
 |---|---|---|
 | `storage/saved_items_store.py:556` → `810` | `saved_items` | `save_item` creates the column if absent, then `_write_embedding_vec` sets `embedding_vec` and `embedding_profile_id` (PG `?::vector`, SQLite float32 bytes; single-column fallbacks). |
-| `storage/async_rag_store.py:250` → `391` | `document_chunks` | `chunk_document`: the same, once per batch. |
-| `storage/async_rag_store.py:357` → `391` | `document_chunks` | `store_precomputed_chunks`: the same. |
+| `storage/async_rag_store.py:276` → `417` | `document_chunks` | `chunk_document`: the same, once per batch. |
+| `storage/async_rag_store.py:383` → `417` | `document_chunks` | `store_precomputed_chunks`: the same. |
 | `storage/embedding_column.py:84` | both | `ensure_embedding_vec_column(db, table, dimension)` creates an absent `embedding_vec`: `vector(N)` sized from the vector being written plus the HNSW index on PostgreSQL, `BLOB` on SQLite. A fresh PostgreSQL database needs it, because the startup migration sizes the column only from a legacy row and none is written any more. It runs inside `transaction()`, a savepoint under a caller's transaction, and a failure is logged, not raised. It copies no legacy vector; the next boot does (#3414). |
 
 A failed `embedding_vec` write is logged at `WARNING` and leaves the row with no
 stored vector: there is no legacy copy left to backfill from. `save_item`
 reports `has_embedding: false` for it, and `kestrel embeddings reindex` embeds
 it (reindex selects rows whose `embedding_vec` is NULL).
+
+`chunk_document` stores a chunk even when it gets no vector for it: no
+embedding service resolves, the embedding call fails, or the model returns no
+vector or a batch of the wrong length. Since
+[#3415](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3415) it
+logs that at `WARNING` with the count, the file hash, the reason, and the
+reindex command. Until then the no-service case logged nothing above `INFO`,
+and a short batch silently dropped every chunk past its end.
 
 `SavedItemsStore.update_item` never recomputes an embedding, so no embedding
 column changes on edit.
@@ -195,8 +203,8 @@ every raw-SQL reader resolves its column through
 | `storage/saved_items_store.py:1209, 1322, 1338` | `saved_items` | `_text_search`, `list_by_schema`, `list_by_tag`. |
 | `storage/saved_items_store.py:1385-1413` | `saved_items` | `get_stats`: `with_embedding` counts the resolved column. |
 | `storage/saved_items_store.py:724` | `saved_items` | `_stored_embedding`: `save_item` returns the vector that landed in the resolved column, not the one it computed. After a failed `embedding_vec` write the item reports no embedding. |
-| `storage/async_rag_store.py:275-317` | `document_chunks` | `read_indexed_chunks`: the copy pairs `embedding_profile_id` with `embedding_vec`, the vector reindex stamped it with. |
-| `storage/async_rag_store.py:722-793` | `document_chunks` | `_legacy_in_python_search`: filters and scores the resolved column. Despite its name it is the **only** embedding path for a bound (per-agent) store; the generic vector spec has no ownership join. |
+| `storage/async_rag_store.py:287-338` | `document_chunks` | `read_indexed_chunks`: the copy pairs `embedding_profile_id` with `embedding_vec`, the vector reindex stamped it with. |
+| `storage/async_rag_store.py:742-830` | `document_chunks` | `_legacy_in_python_search`: filters and scores the resolved column. Despite its name it is the **only** embedding path for a bound (per-agent) store; the generic vector spec has no ownership join. |
 
 The `sqla/migrations.py` reads of the legacy column (lines 1401, 1446, 1582,
 1617) and `embedding_vec_backfill.py` are not readers in this sense. They copy
@@ -219,7 +227,7 @@ These read `SavedItem.embedding` (the dataclass field), which `from_row` and
 - `identity/exporter.py:362-380` and `identity/importer.py:830-867` select and
   insert explicit column lists that omit both embedding columns. Imported
   saved items carry no vector until they are re-embedded.
-- `storage/async_rag_store.py:1116-1124` (`get_chunks_for_file`) reads
+- `storage/async_rag_store.py:1124-1132` (`get_chunks_for_file`) reads
   `content` only.
 - Sovereignty exports and sync snapshots copy the database file and carry both
   columns without interpreting them.
@@ -275,7 +283,14 @@ These were recorded before phase 3 and are kept for the history.
   runs it on every boot the legacy column survives (#3414). It writes nothing
   when either column is absent.
 
-`table` is `"saved_items"` or `"document_chunks"`. The report counts:
+`table` is `"saved_items"` or `"document_chunks"`. The report counts are below.
+Every row is in exactly one of `rows_with_both`, `rows_missing_embedding_vec`,
+`rows_embedding_vec_only` and `rows_without_any_embedding`, so those four sum
+to `total_rows`. Building a report whose buckets do not sum to `total_rows`
+raises `EmbeddingVecBackfillError`. Before
+[#3415](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3415)
+added `rows_without_any_embedding`, rows with no vector in either column were
+in no bucket.
 
 | Field | Meaning |
 |---|---|
@@ -283,6 +298,7 @@ These were recorded before phase 3 and are kept for the history.
 | `rows_with_both` | Both columns are non-NULL. |
 | `rows_missing_embedding_vec` | Legacy `embedding` is set and `embedding_vec` is NULL. |
 | `rows_embedding_vec_only` | `embedding_vec` is set and legacy `embedding` is NULL (reindexed rows that had no vector). |
+| `rows_without_any_embedding` | Both columns are NULL: the row was never embedded. Vector search cannot find it until `kestrel embeddings reindex --yes` embeds it. |
 | `rows_disagreeing` | Both are set and decode to different float32 vectors. |
 | `rows_backfilled` | Rows this call wrote (always 0 for `verify_embedding_vec`). |
 | `rows_unbackfillable` | Missing rows that cannot be copied: a byte length that is not a positive multiple of 4, a width that differs from the PG `vector(N)` column, a NaN or infinite component (pgvector rejects it, and SQLite applies the same rule), or no `embedding_vec` column. |
@@ -353,8 +369,16 @@ one has no column and cannot pass the gate until one exists. Since #3411 the
 first embedded write creates it.
 
 A table whose legacy column is already retired reports as if every legacy
-value were NULL: `rows_embedding_vec_only` counts its stored vectors, and every
-other count is 0, so it meets the gate whenever `embedding_vec` exists.
+value were NULL: `rows_embedding_vec_only` counts its stored vectors,
+`rows_without_any_embedding` counts the rest, and every other count is 0, so it
+meets the gate whenever `embedding_vec` exists.
+
+`rows_without_any_embedding` is part of neither the phase-2 gate nor the
+retirement gate, because a row with no vector has nothing to copy or to lose.
+It is reported so that rows invisible to vector search are not also invisible
+to the report. `verify` prints a note naming `kestrel embeddings reindex --yes`
+whenever it is non-zero. The reindex selects every row whose `embedding_vec` is
+NULL, so it embeds them.
 
 ## Phase 3: retiring the legacy column
 
@@ -433,6 +457,36 @@ inserts into the legacy column, so it fails against a table that has lost it.
 Before deploying #3411, run `kestrel embeddings verify` on every data directory
 and back up each database; roll back only by restoring that backup. Until a
 table's column is dropped, older releases keep working against it.
+
+## Rows that were never embedded
+
+After #3411 deployed, `verify` on four co-hosted agent databases reported
+buckets that did not sum to `total_rows`: 47 `document_chunks` rows per
+database had neither column set, and the pre-drop backup showed the same 47,
+so no vector was lost
+([#3415](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3415)).
+Grouped by `file_hash`, all 47 are one file: the chunks of
+`KESTREL_CONSTITUTION.md` that `kestrel constitution reanchor` wrote when it
+reanchored each agent, with a NULL `embedding_profile_id` as well.
+
+The reanchor re-indexes RAG through `chunk_document(compute_embeddings=True)`
+on a store built without the agent's `LLMService`. The embedding service is
+therefore resolved by a bare process-local `LLMService()`, which never applies
+the agent's persisted `embedding_route` from `agent_metadata`
+(`kestrel embeddings reindex` does, through
+`_apply_persisted_embedding_config`). When the first available chat route
+cannot embed and names no `embedding_sibling`, that service resolves nothing,
+and the affected host lists such a route first. `chunk_document` then stores
+every chunk without a vector, and the only log line is the `LLMService` `INFO`
+that the route "does not support embeddings", which a CLI does not print. This
+is the probable cause, not a proven one: the rows record only the missing
+vector, and no log of that run survives, so a failed or empty embedding call
+cannot be ruled out. Every one of those branches stored the chunks the same
+way.
+
+Such rows are not intentionally excluded. `kestrel embeddings reindex --yes`
+embeds them, and the gaps are now reported both when the chunks are written
+and by `verify`.
 
 ## What remains
 
