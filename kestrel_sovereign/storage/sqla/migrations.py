@@ -12,9 +12,10 @@ Phase 2 of #1447: add a parallel ``embedding_vec`` column to
 - On SQLite: also ``BLOB``. The ORM uses ``embedding_vec`` so the
   code path is the same as PG.
 
-Both copy the legacy ``embedding`` BYTEA / BLOB values. Since #3411
-nothing writes that column, and
-:func:`migrate_retire_legacy_embedding_column` drops it once no row
+Both copy the legacy ``embedding`` BYTEA / BLOB values, and
+:func:`migrate_backfill_legacy_embedding_vec` copies any a later boot
+still finds only there (#3414). Since #3411 nothing writes that column,
+and :func:`migrate_retire_legacy_embedding_column` drops it once no row
 depends on it.
 
 The parallel column lets us flip the vector-backend factory to
@@ -1687,6 +1688,44 @@ async def _migrate_sqlite_table(db: "AsyncDatabase", table: str) -> None:
         "%s Phase-2 SQLite migration complete: added embedding_vec BLOB, "
         "copied existing embeddings.", table,
     )
+
+
+async def migrate_backfill_legacy_embedding_vec(
+    db: "AsyncDatabase", table: str,
+) -> int:
+    """Copy vectors held only in *table*'s legacy column into ``embedding_vec``.
+
+    The Phase-2 migrations above copy legacy vectors only on the boot that
+    creates ``embedding_vec``. A column created any other way starts empty.
+    On PostgreSQL that happens when a Phase-2 migration rolls back (its
+    HNSW index refuses a vector wider than 2000, say) and the first
+    embedded write then creates the column (``ensure_embedding_vec_column``)
+    without copying. Every later boot found the column present and skipped
+    the copy, so the older rows stayed out of vector search, and kept the
+    retirement below from dropping the legacy column, until an operator ran
+    ``kestrel embeddings backfill`` (#3414). So the copy runs on every boot
+    the legacy column survives.
+
+    Idempotent: only NULL ``embedding_vec`` values are written. A table
+    without either column is left alone; creating ``embedding_vec`` stays
+    with the Phase-2 migration and the first embedded write, which choose
+    its width.
+
+    Returns the number of rows written.
+    """
+    # Local import, for the reason ``migrate_retire_legacy_embedding_column``
+    # gives.
+    from ..embedding_vec_backfill import backfill_missing_embedding_vec
+
+    if getattr(db, "backend_type", None) not in ("postgres", "sqlite"):
+        return 0
+    backfilled, _unbackfillable = await backfill_missing_embedding_vec(db, table)
+    if backfilled:
+        logger.info(
+            "Copied %d vectors held only in the legacy %s.embedding column "
+            "into embedding_vec.", backfilled, table,
+        )
+    return backfilled
 
 
 # =============================================================================

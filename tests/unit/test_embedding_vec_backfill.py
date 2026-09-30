@@ -23,6 +23,7 @@ from kestrel_sovereign.storage.embedding_vec_backfill import (
     _pgvector_text_to_bytes,
     _VecColumn,
     backfill_embedding_vec,
+    backfill_missing_embedding_vec,
     verify_embedding_vec,
 )
 from tests.utils.legacy_embedding_column import restore_legacy_embedding_column
@@ -262,11 +263,72 @@ async def test_retired_table_without_embedding_vec_reports_the_column_absent(
     assert (report.total_rows, report.rows_missing_embedding_vec) == (1, 0)
 
 
+async def test_backfill_missing_copies_what_backfill_copies_without_reading_pairs(
+    sqlite_db, monkeypatch
+):
+    # The startup sequence runs this on every boot the legacy column
+    # survives (#3414), so it must not read the vector pairs the report
+    # compares.
+    db = sqlite_db
+    legacy = _pack([0.1, 0.2, 0.3])
+    reindexed = _pack([0.9, 0.8, 0.7])
+    await _insert_saved_item(db, "a-legacy-only", embedding=legacy)
+    await _insert_saved_item(db, "b-both-disagree", embedding=legacy, embedding_vec=reindexed)
+    await _insert_saved_item(db, "c-malformed", embedding=b"\x01\x02\x03\x04\x05")
+    await _insert_saved_item(db, "d-vec-only", embedding_vec=reindexed)
+    await _insert_saved_item(db, "e-legacy-only", embedding=reindexed)
+    reads = []
+
+    def recording(method):
+        async def record(sql, params=()):
+            reads.append(" ".join(sql.split()))
+            return await method(sql, params)
+
+        return record
+
+    for name in ("fetchone", "fetchall"):
+        monkeypatch.setattr(db, name, recording(getattr(db, name)))
+
+    assert await backfill_missing_embedding_vec(db, "saved_items", batch_size=1) == (2, 1)
+
+    table_reads = [sql for sql in reads if "FROM saved_items" in sql]
+    assert table_reads
+    assert all("embedding_vec IS NULL" in sql for sql in table_reads), table_reads
+    assert await _saved_item_columns(db, "a-legacy-only") == (legacy, legacy)
+    assert await _saved_item_columns(db, "e-legacy-only") == (reindexed, reindexed)
+    assert await _saved_item_columns(db, "b-both-disagree") == (legacy, reindexed)
+    assert await _saved_item_columns(db, "c-malformed") == (b"\x01\x02\x03\x04\x05", None)
+    # Idempotent: the unbackfillable row is counted again, nothing written.
+    assert await backfill_missing_embedding_vec(db, "saved_items") == (0, 1)
+
+
+async def test_backfill_missing_writes_nothing_without_both_columns(sqlite_db):
+    db = sqlite_db
+    await db.execute("ALTER TABLE document_chunks DROP COLUMN embedding_vec", ())
+    await db.execute(
+        "INSERT INTO document_chunks (file_hash, content, embedding) VALUES (?, ?, ?)",
+        ("doc", "chunk", _pack([1.0])),
+    )
+
+    # Creating embedding_vec stays with the startup migration and the first
+    # embedded write, which choose its width.
+    assert await backfill_missing_embedding_vec(db, "document_chunks") == (0, 0)
+    assert not await db.column_exists("document_chunks", "embedding_vec")
+
+    # A retired table has no legacy vector to copy.
+    await db.execute("ALTER TABLE saved_items DROP COLUMN embedding", ())
+    assert await backfill_missing_embedding_vec(db, "saved_items") == (0, 0)
+
+
 async def test_rejects_unknown_table_and_non_positive_batch(sqlite_db):
     with pytest.raises(ValueError, match="table must be one of"):
         await verify_embedding_vec(sqlite_db, "conversation_history")
     with pytest.raises(ValueError, match="batch_size"):
         await backfill_embedding_vec(sqlite_db, "saved_items", batch_size=0)
+    with pytest.raises(ValueError, match="table must be one of"):
+        await backfill_missing_embedding_vec(sqlite_db, "conversation_history")
+    with pytest.raises(ValueError, match="batch_size"):
+        await backfill_missing_embedding_vec(sqlite_db, "saved_items", batch_size=0)
 
 
 async def test_rejects_unsupported_backend():
