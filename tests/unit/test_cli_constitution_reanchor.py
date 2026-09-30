@@ -17,7 +17,10 @@ import pytest
 import toml
 
 from kestrel_sovereign.cli import build_parser, cmd_constitution
-from kestrel_sovereign.setup.constitution_reanchor import ReanchorResult
+from kestrel_sovereign.setup.constitution_reanchor import (
+    ConstitutionRagIndex,
+    ReanchorResult,
+)
 
 
 @pytest.fixture
@@ -402,6 +405,77 @@ def test_reanchor_success_prints_old_new_and_backup(reanchor_env, capsys):
     assert "aaaaaaaaaaaa" in out  # truncated old hash
     assert "bbbbbbbbbbbb" in out  # truncated new hash
     assert str(backup_path) in out  # full backup path visible
+
+
+def _reanchored_with_rag(reanchor_env, rag_index) -> ReanchorResult:
+    return ReanchorResult(
+        agent_name="Test",
+        db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+        canonical_path=Path("/fake/canonical.md"),
+        old_hash="a" * 64,
+        new_hash="b" * 64,
+        backup_path=None,
+        reanchored=True,
+        rag_index=rag_index,
+    )
+
+
+def _run_forced(reanchor_env, result):
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_stubbed_helper(result),
+         ):
+        return cmd_constitution(args)
+
+
+def test_reanchor_warns_visibly_about_chunks_stored_without_a_vector(
+    reanchor_env, capsys,
+):
+    """#3418: a reanchor that could not embed says so, with the count and remedy.
+
+    The governance write landed, so the exit is still 0. The only signal
+    before #3418 was an INFO line the CLI does not print.
+    """
+    reason = (
+        "no embedding-capable provider resolves for the active configuration"
+    )
+    rc = _run_forced(
+        reanchor_env,
+        _reanchored_with_rag(
+            reanchor_env,
+            ConstitutionRagIndex(
+                agent_did=AGENT_DID,
+                chunks=47,
+                unembedded=47,
+                unembedded_reason=reason,
+            ),
+        ),
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "reanchored" in captured.out.lower()
+    err = captured.err
+    assert "warning: 47 of 47 constitution chunks were stored without an embedding" in err
+    assert reason in err
+    assert (
+        f"kestrel embeddings reindex --agent-name Test --agent-id {AGENT_DID} --yes"
+        in err
+    )
+
+
+def test_reanchor_says_nothing_about_fully_embedded_chunks(reanchor_env, capsys):
+    rc = _run_forced(
+        reanchor_env,
+        _reanchored_with_rag(
+            reanchor_env,
+            ConstitutionRagIndex(agent_did=AGENT_DID, chunks=47, unembedded=0),
+        ),
+    )
+    assert rc == 0
+    assert "without an embedding" not in capsys.readouterr().err
 
 
 def test_reanchor_helper_error_propagates(reanchor_env, capsys):

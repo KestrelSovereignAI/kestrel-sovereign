@@ -54,6 +54,8 @@ touches the LLM stack, so it works without credentials. The reindex
 subcommand needs the LLM stack to resolve the target embedding profile,
 applying the agent's persisted runtime ``embedding_route`` (#2263)
 first so it re-embeds to the profile the live agent actually resolves.
+``kestrel constitution reanchor`` embeds its re-indexed chunks through the
+same resolution, :func:`resolve_agent_embedding` (#3418).
 """
 
 from __future__ import annotations
@@ -64,7 +66,7 @@ import json
 import logging
 import os
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
@@ -696,6 +698,75 @@ def _resolve_target(
     return (None, embedding_service, target)
 
 
+@dataclass(frozen=True)
+class AgentEmbeddingResolution:
+    """What a live agent embeds with, resolved outside its process.
+
+    ``error`` is set, and ``embedding_service`` / ``profile_id`` are None,
+    when nothing may embed on the agent's behalf: the LLM service cannot be
+    built, the persisted ``embedding_route`` can no longer be applied, no
+    provider resolves, or ``embedding_route = "none"``. ``llm_service`` is the
+    service the resolution ran against (None only when it could not be built).
+    """
+
+    llm_service: Optional[Any]
+    embedding_service: Optional[Any]
+    profile_id: Optional[str]
+    error: Optional[str] = None
+
+
+async def resolve_agent_embedding(
+    db: Any,
+    agent_id: Optional[str],
+    *,
+    llm_service: Optional[Any] = None,
+) -> AgentEmbeddingResolution:
+    """Resolve the embedding service and profile the live agent resolves.
+
+    The one resolution path for every offline writer that embeds on an
+    agent's behalf: ``kestrel embeddings reindex`` and
+    ``kestrel constitution reanchor`` (#3418). A bare ``LLMService()``
+    resolves from static config alone. When the first available chat route
+    cannot embed and names no ``embedding_sibling``, it resolves nothing,
+    although the agent itself embeds through the ``embedding_route`` it
+    persisted in ``agent_metadata``. The reanchor stored every constitution
+    chunk without a vector that way.
+
+    When no ``llm_service`` is passed, one is built and the agent's persisted
+    embedding config is applied first (:func:`_apply_persisted_embedding_config`),
+    so the target is the profile the live agent resolves, not the
+    config/default route (#2263/#2337/#2338/#2361). An injected service is
+    presumed already configured and is resolved as-is.
+    """
+    if llm_service is None:
+        try:
+            from kestrel_sovereign.llm.service import LLMService
+
+            llm_service = LLMService()
+        except Exception as exc:
+            return AgentEmbeddingResolution(
+                llm_service=None,
+                embedding_service=None,
+                profile_id=None,
+                error=f"could not initialize LLM service: {exc}",
+            )
+        err = await _apply_persisted_embedding_config(llm_service, db, agent_id)
+        if err is not None:
+            return AgentEmbeddingResolution(
+                llm_service=llm_service,
+                embedding_service=None,
+                profile_id=None,
+                error=err,
+            )
+    err, embedding_service, profile_id = _resolve_target(llm_service)
+    return AgentEmbeddingResolution(
+        llm_service=llm_service,
+        embedding_service=embedding_service,
+        profile_id=profile_id,
+        error=err,
+    )
+
+
 def _resolve_column_dim() -> Optional[int]:
     """The deployment's vector-column width (``resolve_embedding_dim``)."""
     try:
@@ -734,37 +805,17 @@ async def _reindex(
         EmbeddingReindexer,
     )
 
-    # Resolve the target profile unless the caller injected one.
+    # Resolve the target profile unless the caller injected one, through the
+    # same helper the constitution reanchor embeds with (#3418).
     if target_profile_id is None or embedding_service is None:
-        # Apply the agent's persisted runtime embedding config (#2263/#2337/#2338)
-        # BEFORE resolving the target, so the CLI re-embeds to the profile the
-        # live agent actually resolves — not the config/default route. Mirrors
-        # ModelPreferenceMixin._load_route_embedding_models → _load_embedding_route
-        # on the agent boot path: re-apply per-route model pins, run embedding
-        # discovery, then set the persisted route. Without this a UI-created route
-        # the server resolves fine (e.g. openrouter:api pinned at runtime) is
-        # rejected here as "does not advertise embedding support" (#2361).
-        # Only done when we construct the LLMService (production path); an
-        # injected service is presumed already configured (tests).
-        if llm_service is None:
-            try:
-                from kestrel_sovereign.llm.service import LLMService
-
-                llm_service = LLMService()
-            except Exception as exc:
-                print(
-                    f"ERROR: could not initialize LLM service: {exc}",
-                    file=sys.stderr,
-                )
-                return 2
-            err = await _apply_persisted_embedding_config(llm_service, db, agent_id)
-            if err is not None:
-                print(f"ERROR: {err}", file=sys.stderr)
-                return 2
-        err, embedding_service, target_profile_id = _resolve_target(llm_service)
-        if err is not None:
-            print(f"ERROR: {err}", file=sys.stderr)
+        resolution = await resolve_agent_embedding(
+            db, agent_id, llm_service=llm_service
+        )
+        if resolution.error is not None:
+            print(f"ERROR: {resolution.error}", file=sys.stderr)
             return 2
+        embedding_service = resolution.embedding_service
+        target_profile_id = resolution.profile_id
 
     if target_dim is None:
         target_dim = getattr(embedding_service, "embedding_dim", None)

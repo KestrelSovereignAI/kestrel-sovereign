@@ -488,6 +488,23 @@ Such rows are not intentionally excluded. `kestrel embeddings reindex --yes`
 embeds them, and the gaps are now reported both when the chunks are written
 and by `verify`.
 
+Since [#3418](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3418)
+the reanchor resolves its embedding service through `resolve_agent_embedding`
+in `cli_embeddings.py`, the helper `reindex` uses. It applies the agent's
+persisted model pins and `embedding_route` before resolving, so the chunks are
+embedded and stamped with the profile the live agent searches. When nothing
+resolves, or the persisted route can no longer be applied, the reanchor still
+completes but stores the chunks without vectors rather than embed them with a
+route the operator did not choose (`reindex` refuses in that state). It then
+logs a `WARNING`, and the CLI prints a warning with the unembedded count and
+the `reindex` command to run. The governance write has landed, so the exit
+code stays 0.
+
+Inception still indexes its constitution through a bare `LLMService()`. A
+newborn agent has no persisted embedding config to apply, so on a host whose
+first chat route cannot embed its constitution chunks are stored without
+vectors the same way; `reindex` embeds them once a route is set.
+
 ## What remains
 
 Phase 3 leaves two pieces of compatibility code, both still reachable:
