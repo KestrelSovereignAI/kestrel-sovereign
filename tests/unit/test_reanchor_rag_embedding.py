@@ -32,7 +32,10 @@ from kestrel_sovereign.constitution.amendment_artifact import (
     did_document_from_legacy_public_key,
 )
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
-from kestrel_sovereign.llm.embedding_service import derive_embedding_profile
+from kestrel_sovereign.llm.embedding_service import (
+    ProviderEmbeddingService,
+    derive_embedding_profile,
+)
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
 from kestrel_sovereign.setup.constitution_reanchor import reanchor_constitution
@@ -282,7 +285,9 @@ async def test_reanchor_embeds_through_the_persisted_embedding_route(
     assert result.rag_index.agent_did == agent_did
     assert result.rag_index.chunks == len(stored)
     assert result.rag_index.unembedded == 0
-    assert result.rag_index.unembedded_reason is None
+    assert result.rag_index.misprofiled == 0
+    assert result.rag_index.needs_reindex == 0
+    assert result.rag_index.reason is None
     # The reanchor closed the service it built for the re-index.
     assert host.built[-1].closed is True
 
@@ -304,8 +309,9 @@ async def test_reanchor_with_no_embedding_service_reports_the_unembedded_count(
     assert all(vec is None and pid is None for vec, pid in stored)
     rag = result.rag_index
     assert rag is not None
-    assert rag.chunks == rag.unembedded == len(stored)
-    assert "no embedding-capable provider resolves" in rag.unembedded_reason
+    assert rag.chunks == rag.unembedded == rag.needs_reindex == len(stored)
+    assert rag.misprofiled == 0
+    assert "no embedding-capable provider resolves" in rag.reason
     assert any(
         f"stored {len(stored)} of {len(stored)} constitution chunks" in r.message
         and agent_did in r.message
@@ -350,7 +356,7 @@ async def test_reanchor_does_not_embed_when_the_persisted_route_cannot_apply(
     assert all(vec is None for vec, _ in stored)
     assert host.adapter.embedded == []
     assert result.rag_index.unembedded == len(stored)
-    assert "'openrouter:api' is no longer valid" in result.rag_index.unembedded_reason
+    assert "'openrouter:api' is no longer valid" in result.rag_index.reason
 
 
 @pytest.mark.asyncio
@@ -403,3 +409,131 @@ async def test_a_service_that_fails_to_close_does_not_fail_a_committed_reanchor(
 
     assert result.error is None
     assert {pid for _, pid in _chunks(db_path, result.new_hash)} == {PINNED_PROFILE}
+
+
+def _raise_outage(self, *args, **kwargs):
+    raise RuntimeError("provider outage")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "method"),
+    [
+        (_ProcessLocalService, "get_embedding_service"),
+        (ProviderEmbeddingService, "current_profile_id"),
+    ],
+    ids=["get_embedding_service", "current_profile_id"],
+)
+async def test_a_provider_that_raises_while_resolving_does_not_abort_the_reanchor(
+    tmp_path, constitution_path, monkeypatch, caplog, owner, method
+):
+    """An embedding outage costs the vectors, never the governance write.
+
+    Before resolution was shared, ``chunk_document`` caught a failing
+    provider and still stored keyword-searchable chunks. A raise escaping the
+    resolution aborted a forced reanchor before its transaction instead.
+    """
+    host = _Host(monkeypatch, _fleet_routes)
+    agent_dir, agent_did = await _incept(tmp_path, constitution_path)
+    db_path = agent_dir / "kestrel_prime.db"
+    _persist_fleet_embedding_config(db_path, agent_did)
+    monkeypatch.setattr(owner, method, _raise_outage)
+
+    with caplog.at_level(logging.WARNING):
+        result = await _force_reanchor(tmp_path, agent_dir, constitution_path)
+
+    assert result.error is None
+    stored = _chunks(db_path, result.new_hash)
+    assert stored
+    assert all(vec is None and pid is None for vec, pid in stored)
+    rag = result.rag_index
+    assert rag.unembedded == rag.needs_reindex == len(stored)
+    assert "RuntimeError: provider outage" in rag.reason
+    assert any(
+        f"stored {len(stored)} of {len(stored)} constitution chunks" in r.message
+        and agent_did in r.message
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    ), [r.message for r in caplog.records]
+    assert host.built[-1].closed is True
+
+
+def _raise_on_restamp(self):
+    raise RuntimeError("profile lookup failed")
+
+
+def _foreign_restamp(self):
+    return "ollama:nomic-embed-text@16"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("restamp", "stamped"),
+    [(_raise_on_restamp, None), (_foreign_restamp, "ollama:nomic-embed-text@16")],
+    ids=["null-profile", "foreign-profile"],
+)
+async def test_a_vector_without_the_agents_profile_counts_as_needing_reindex(
+    tmp_path, constitution_path, monkeypatch, caplog, restamp, stamped
+):
+    """Vector search filters by profile, so a vector is not proof of findability.
+
+    ``chunk_document`` resolves the profile again after embedding and stamps
+    NULL when that fails; a service that describes itself differently the
+    second time stamps a profile the agent does not search.
+    """
+    _Host(monkeypatch, _fleet_routes)
+    agent_dir, agent_did = await _incept(tmp_path, constitution_path)
+    db_path = agent_dir / "kestrel_prime.db"
+    _persist_fleet_embedding_config(db_path, agent_did)
+
+    resolve = cli_embeddings.resolve_agent_embedding
+
+    async def _resolve_then_restamp(*args, **kwargs):
+        resolution = await resolve(*args, **kwargs)
+        assert resolution.profile_id == PINNED_PROFILE
+        monkeypatch.setattr(ProviderEmbeddingService, "current_profile_id", restamp)
+        return resolution
+
+    monkeypatch.setattr(
+        cli_embeddings, "resolve_agent_embedding", _resolve_then_restamp,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await _force_reanchor(tmp_path, agent_dir, constitution_path)
+
+    stored = _chunks(db_path, result.new_hash)
+    assert stored
+    assert all(vec is not None for vec, _ in stored)
+    assert {pid for _, pid in stored} == {stamped}
+    rag = result.rag_index
+    assert rag.unembedded == 0
+    assert rag.misprofiled == rag.needs_reindex == len(stored)
+    assert f"not stamped with the agent's profile {PINNED_PROFILE}" in rag.reason
+    assert any(
+        f"stored {len(stored)} of {len(stored)} constitution chunks" in r.message
+        and agent_did in r.message
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    ), [r.message for r in caplog.records]
+
+
+@pytest.mark.asyncio
+async def test_reindex_refuses_rather_than_crashes_when_the_provider_raises(
+    tmp_path, monkeypatch, capsys
+):
+    """The shared resolution turns a raise into the refusal ``reindex`` prints."""
+    _Host(monkeypatch, _fleet_routes)
+    monkeypatch.setattr(_ProcessLocalService, "get_embedding_service", _raise_outage)
+    db = await AsyncDatabase.sqlite(str(tmp_path / "kestrel_prime.db"))
+    try:
+        rc = await cli_embeddings._reindex(
+            db, table=None, agent_id="did:x", batch=10, rate_limit=0.0,
+            dry_run=True, apply=False,
+        )
+    finally:
+        await db.close()
+    assert rc == 2
+    assert (
+        "ERROR: resolving the embedding service failed "
+        "(RuntimeError: provider outage)"
+    ) in capsys.readouterr().err

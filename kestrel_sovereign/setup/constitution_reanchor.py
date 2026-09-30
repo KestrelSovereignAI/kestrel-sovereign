@@ -333,16 +333,24 @@ async def resolve_reanchor_target(
 class ConstitutionRagIndex:
     """How a forced reanchor re-indexed the new constitution for RAG (#3418).
 
-    ``chunks`` and ``unembedded`` are read back from what was stored for the
-    new hash. An unembedded chunk is found by keyword search but is invisible
-    to vector search until ``kestrel embeddings reindex`` embeds it;
-    ``unembedded_reason`` says why it has no vector.
+    The counts are read back from what was stored for the new hash.
+    ``unembedded`` chunks have no vector. ``misprofiled`` chunks have one,
+    but its ``embedding_profile_id`` is missing or is not the profile the
+    agent resolves. Vector search filters by profile, so both kinds are found
+    by keyword search only until ``kestrel embeddings reindex`` re-embeds
+    them, which selects exactly those rows. ``reason`` says why.
     """
 
     agent_did: str
     chunks: int
     unembedded: int
-    unembedded_reason: str | None = None
+    misprofiled: int = 0
+    reason: str | None = None
+
+    @property
+    def needs_reindex(self) -> int:
+        """Chunks vector search cannot find."""
+        return self.unembedded + self.misprofiled
 
 
 @dataclass(frozen=True)
@@ -1424,8 +1432,8 @@ async def _reindex_constitution_rag(
     that could not apply the persisted route may still resolve some other
     route, and embedding with it would stamp a profile the operator did not
     choose, which is why ``embeddings reindex`` refuses in the same state.
-    Either way the stored chunks are counted, and any without a vector are
-    logged at WARNING and returned for the caller to report.
+    Either way the stored chunks are counted, and any vector search cannot
+    find are logged at WARNING and returned for the caller to report.
     """
     from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
 
@@ -1439,29 +1447,45 @@ async def _reindex_constitution_rag(
     stored = await rag.read_indexed_chunks(new_hash)
     await rag.delete_chunks_for_file(old_hash)
 
+    target = embedding.profile_id
     unembedded = sum(1 for chunk in stored if not chunk.embedding)
-    if not unembedded:
+    # ``chunk_document`` resolves the profile a second time and stamps NULL
+    # when that fails, so a vector is not proof the chunk is searchable. With
+    # no target resolved, no stamp can be confirmed as the agent's.
+    misprofiled = sum(
+        1 for chunk in stored
+        if chunk.embedding
+        and (chunk.profile_id is None or chunk.profile_id != target)
+    )
+    if not unembedded and not misprofiled:
         return ConstitutionRagIndex(
             agent_did=agent_did, chunks=len(stored), unembedded=0,
         )
-    if embedding.error is not None:
-        reason = embedding.error
-        # ``chunk_document`` warns only when it tried to embed.
-        logger.warning(
-            "Reanchor stored %d of %d constitution chunks for %s without an "
-            "embedding: %s",
-            unembedded, len(stored), agent_did, reason,
+
+    causes: list[str] = []
+    if unembedded:
+        cause = embedding.error or (
+            f"embedding through profile {target} produced no vector for them"
         )
-    else:
-        reason = (
-            f"embedding through profile {embedding.profile_id} produced no "
-            f"vector for them"
+        causes.append(f"{unembedded} stored without a vector ({cause})")
+    if misprofiled:
+        wanted = f"the agent's profile {target}" if target else "a resolved profile"
+        causes.append(
+            f"{misprofiled} stored with a vector not stamped with {wanted}, "
+            f"which profile-filtered vector search skips"
         )
+    reason = "; ".join(causes)
+    logger.warning(
+        "Reanchor stored %d of %d constitution chunks for %s that vector "
+        "search cannot find: %s",
+        unembedded + misprofiled, len(stored), agent_did, reason,
+    )
     return ConstitutionRagIndex(
         agent_did=agent_did,
         chunks=len(stored),
         unembedded=unembedded,
-        unembedded_reason=reason,
+        misprofiled=misprofiled,
+        reason=reason,
     )
 
 

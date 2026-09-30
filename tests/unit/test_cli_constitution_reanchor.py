@@ -440,7 +440,8 @@ def test_reanchor_warns_visibly_about_chunks_stored_without_a_vector(
     before #3418 was an INFO line the CLI does not print.
     """
     reason = (
-        "no embedding-capable provider resolves for the active configuration"
+        "47 stored without a vector (no embedding-capable provider resolves "
+        "for the active configuration)"
     )
     rc = _run_forced(
         reanchor_env,
@@ -450,7 +451,7 @@ def test_reanchor_warns_visibly_about_chunks_stored_without_a_vector(
                 agent_did=AGENT_DID,
                 chunks=47,
                 unembedded=47,
-                unembedded_reason=reason,
+                reason=reason,
             ),
         ),
     )
@@ -458,7 +459,10 @@ def test_reanchor_warns_visibly_about_chunks_stored_without_a_vector(
     captured = capsys.readouterr()
     assert "reanchored" in captured.out.lower()
     err = captured.err
-    assert "warning: 47 of 47 constitution chunks were stored without an embedding" in err
+    assert (
+        "warning: 47 of 47 constitution chunks cannot be found by vector search"
+        in err
+    )
     assert reason in err
     assert (
         f"kestrel embeddings reindex --agent-name Test --agent-id {AGENT_DID} --yes"
@@ -475,7 +479,41 @@ def test_reanchor_says_nothing_about_fully_embedded_chunks(reanchor_env, capsys)
         ),
     )
     assert rc == 0
-    assert "without an embedding" not in capsys.readouterr().err
+    assert "vector search" not in capsys.readouterr().err
+
+
+def test_reanchor_warns_about_vectors_stamped_with_the_wrong_profile(
+    reanchor_env, capsys,
+):
+    """A vector whose profile the agent does not search counts too (#3418)."""
+    reason = (
+        "5 stored with a vector not stamped with the agent's profile P, which "
+        "profile-filtered vector search skips"
+    )
+    rc = _run_forced(
+        reanchor_env,
+        _reanchored_with_rag(
+            reanchor_env,
+            ConstitutionRagIndex(
+                agent_did=AGENT_DID,
+                chunks=47,
+                unembedded=0,
+                misprofiled=5,
+                reason=reason,
+            ),
+        ),
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert (
+        "warning: 5 of 47 constitution chunks cannot be found by vector search"
+        in err
+    )
+    assert reason in err
+    assert (
+        f"kestrel embeddings reindex --agent-name Test --agent-id {AGENT_DID} --yes"
+        in err
+    )
 
 
 def test_reanchor_helper_error_propagates(reanchor_env, capsys):

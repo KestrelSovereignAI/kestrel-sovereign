@@ -651,8 +651,15 @@ def _resolve_target(
     Returns ``(error_message, embedding_service, target_profile_id)``.
     ``error_message`` is non-None (and the other two None) when
     reindexing must refuse: no provider resolves, ``embedding_route =
-    "none"``, or the service can't describe itself. Factored out so
-    unit tests can drive the refusal paths without an LLM.
+    "none"``, the service can't describe itself, or the provider raises
+    while doing either. Factored out so unit tests can drive the refusal
+    paths without an LLM.
+
+    A provider that raises is an outcome, not a crash: the caller refuses or
+    falls back exactly as when nothing resolves. Letting it escape aborted a
+    forced ``constitution reanchor`` before its governance write, over an
+    embedding outage the re-index used to survive with keyword-only
+    chunks (#3418).
     """
     try:
         from kestrel_sovereign.llm.service import LLMService
@@ -678,7 +685,17 @@ def _resolve_target(
             None,
         )
 
-    embedding_service = service_owner.get_embedding_service()
+    try:
+        embedding_service = service_owner.get_embedding_service()
+    except Exception as exc:  # noqa: BLE001 — any provider failure is a refusal
+        logger.warning("Resolving the embedding service raised.", exc_info=True)
+        return (
+            f"resolving the embedding service failed "
+            f"({type(exc).__name__}: {exc}); semantic search is on keyword "
+            "fallback. Fix the embedding route/provider before reindexing.",
+            None,
+            None,
+        )
     if embedding_service is None:
         return (
             "no embedding-capable provider resolves for the active "
@@ -687,7 +704,19 @@ def _resolve_target(
             None,
             None,
         )
-    target = embedding_service.current_profile_id()
+    try:
+        target = embedding_service.current_profile_id()
+    except Exception as exc:  # noqa: BLE001 — any provider failure is a refusal
+        logger.warning(
+            "The resolved embedding service raised describing itself.",
+            exc_info=True,
+        )
+        return (
+            f"the resolved embedding service failed to describe itself "
+            f"({type(exc).__name__}: {exc}); cannot derive a target profile.",
+            None,
+            None,
+        )
     if target is None:
         return (
             "the resolved embedding service can't describe itself "
@@ -705,7 +734,8 @@ class AgentEmbeddingResolution:
     ``error`` is set, and ``embedding_service`` / ``profile_id`` are None,
     when nothing may embed on the agent's behalf: the LLM service cannot be
     built, the persisted ``embedding_route`` can no longer be applied, no
-    provider resolves, or ``embedding_route = "none"``. ``llm_service`` is the
+    provider resolves, the provider raises while resolving, or
+    ``embedding_route = "none"``. ``llm_service`` is the
     service the resolution ran against (None only when it could not be built).
     """
 
