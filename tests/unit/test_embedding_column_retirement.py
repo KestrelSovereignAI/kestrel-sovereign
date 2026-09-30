@@ -342,7 +342,7 @@ async def test_boot_with_the_gate_met_drops_the_legacy_column_and_search_works(
 
 @pytest.mark.parametrize("blocker", ["missing", "unbackfillable"])
 async def test_boot_with_the_gate_not_met_keeps_the_column_and_every_byte(
-    deployment, blocker, caplog
+    deployment, blocker, caplog, monkeypatch
 ):
     dep = deployment
     await dep.use_pre_retirement_schema()
@@ -361,6 +361,16 @@ async def test_boot_with_the_gate_not_met_keeps_the_column_and_every_byte(
     assert report.rows_missing_embedding_vec == 1
     assert report.rows_unbackfillable == (1 if blocker == "unbackfillable" else 0)
     before = {table: await dep.snapshot(table) for table in TABLES}
+    if blocker == "missing":
+        # The boot copies a copyable legacy vector before the retirement
+        # runs (#3414). The retirement must still refuse when that copy
+        # fails, and the failure must not stop the boot.
+        async def copy_fails(_db, _table, **_kwargs):
+            raise RuntimeError("the copy failed")
+
+        monkeypatch.setattr(
+            embedding_vec_backfill, "backfill_missing_embedding_vec", copy_fails
+        )
 
     with caplog.at_level(logging.WARNING, logger=migrations.__name__):
         db = await dep.reboot()
@@ -375,10 +385,15 @@ async def test_boot_with_the_gate_not_met_keeps_the_column_and_every_byte(
     ]
 
     if blocker == "missing":
-        # The operator's remedy, then the next boot retires it.
-        await backfill_embedding_vec(db, "saved_items")
+        # The next boot whose copy succeeds retires it, the row's only
+        # vector now in embedding_vec.
+        monkeypatch.undo()
         db = await dep.reboot()
         assert not await db.column_exists("saved_items", "embedding")
+        alpha = next(
+            row for row in await dep.snapshot("saved_items") if row[0] == ids["alpha"]
+        )
+        assert alpha[3] == pytest.approx(vector)
 
 
 async def test_absent_embedding_vec_keeps_the_legacy_column(deployment):
@@ -594,6 +609,123 @@ async def test_first_embedded_write_creates_embedding_vec_at_its_width(
     # legacy column.
     db = await dep.reboot()
     assert not await db.column_exists(table, "embedding")
+
+
+# pgvector's HNSW index takes vectors of at most this many dimensions.
+_HNSW_MAX_DIMENSIONS = 2000
+
+
+def _axis(width: int, index: int) -> List[float]:
+    vector = [0.0] * width
+    vector[index] = 1.0
+    return vector
+
+
+async def _write_legacy_only(db, table: str, row_id, vector, profile_id) -> None:
+    """Store *vector* as an older release did while ``embedding_vec`` was absent."""
+    await db.execute(
+        f"UPDATE {table} SET embedding = ?, embedding_profile_id = ? "
+        f"WHERE {ID_COLUMNS[table]} = ?",
+        (_pack(vector), profile_id, row_id),
+    )
+
+
+@pytest.mark.parametrize(
+    "width",
+    [DIM, _HNSW_MAX_DIMENSIONS + 1],
+    ids=["indexable", "too-wide-for-hnsw"],
+)
+async def test_legacy_vectors_a_first_write_did_not_copy_are_copied_at_the_next_boot(
+    deployment, width
+):
+    # #3414. Legacy rows and no embedding_vec: a startup migration that
+    # rolled back leaves this, as on PostgreSQL when its HNSW index refuses
+    # a vector wider than 2000. The first embedded write then creates the
+    # column without copying those rows, and every later boot found the
+    # column present and skipped its copy. The rows stayed out of vector
+    # search until an operator ran `kestrel embeddings backfill`.
+    dep = deployment
+    if width > _HNSW_MAX_DIMENSIONS and dep.backend != "postgres":
+        pytest.skip("only PostgreSQL builds an HNSW index on embedding_vec")
+    db = dep.db
+    model = _Model(
+        "legacy-model-03",
+        {
+            "alpha": _axis(width, width - 1),
+            "beta": _axis(width, width - 2),
+            "gamma": _axis(width, 0),
+            # Means "alpha" without containing the word, so LIKE cannot find it.
+            "the last axis": _axis(width, width - 1),
+        },
+    )
+    for table in TABLES:
+        if await db.column_exists(table, "embedding_vec"):
+            await db.execute(f"ALTER TABLE {table} DROP COLUMN embedding_vec", ())
+    await restore_legacy_embedding_column(db)
+
+    ids = {}
+    for text in ("alpha", "beta"):
+        item = await _saved_items_store(db, None).save_item(
+            item_type="excerpt", name=text, content=text
+        )
+        await _write_legacy_only(
+            db, "saved_items", item.id, model.vectors[text], model.profile_id
+        )
+        ids[text] = item.id
+    rag = await _rag_store(db, None, "legacy-doc")
+    await rag.store_precomputed_chunks(
+        "legacy-doc", [IndexedChunk("alpha"), IndexedChunk("beta")]
+    )
+    for text, chunk_id in (await _chunk_ids(db, "legacy-doc")).items():
+        await _write_legacy_only(
+            db, "document_chunks", chunk_id, model.vectors[text], model.profile_id
+        )
+
+    if width > _HNSW_MAX_DIMENSIONS:
+        # A boot cannot keep the column it sizes from these rows.
+        db = await dep.reboot()
+        for table in TABLES:
+            assert not await db.column_exists(table, "embedding_vec")
+            assert await _legacy_values(db, table) == 2
+
+    # The first embedded write creates embedding_vec and copies nothing.
+    items = _saved_items_store(db, model)
+    gamma = await items.save_item(item_type="excerpt", name="gamma", content="gamma")
+    assert gamma.embedding == pytest.approx(model.vectors["gamma"])
+    rag = await _rag_store(db, model, "first-write-doc")
+    await rag.store_precomputed_chunks(
+        "first-write-doc",
+        [IndexedChunk("gamma", model.vectors["gamma"], model.profile_id)],
+    )
+    for table in TABLES:
+        report = await verify_embedding_vec(db, table)
+        assert report.embedding_vec_present
+        assert report.rows_missing_embedding_vec == 2
+        assert report.rows_unbackfillable == 0
+    found = await items.search("the last axis", limit=3)
+    assert ids["alpha"] not in [r["item"]["id"] for r in found]
+    found = await rag._search_by_embedding("the last axis", limit=3)
+    assert "alpha" not in [r["content"] for r in found]
+
+    db = await dep.reboot()
+
+    for table in TABLES:
+        report = await verify_embedding_vec(db, table)
+        assert report.rows_missing_embedding_vec == 0
+        assert report.rows_embedding_vec_only == 3
+        # Every vector copied, so the retirement dropped the legacy column.
+        assert not await db.column_exists(table, "embedding")
+    items = _saved_items_store(db, model)
+    for text in ("alpha", "beta"):
+        stored = await items.get_by_id(ids[text])
+        assert stored.embedding == pytest.approx(model.vectors[text])
+    found = await items.search("the last axis", limit=1)
+    assert [r["item"]["id"] for r in found] == [ids["alpha"]]
+    assert found[0]["score"] == pytest.approx(1.0)
+    chunks = await _rag_store(db, model, "search-doc")
+    found = await chunks._search_by_embedding("the last axis", limit=1)
+    assert [r["content"] for r in found] == ["alpha"]
+    assert found[0]["score"] == pytest.approx(1.0)
 
 
 async def test_a_failed_embedding_vec_write_stores_no_vector(deployment):

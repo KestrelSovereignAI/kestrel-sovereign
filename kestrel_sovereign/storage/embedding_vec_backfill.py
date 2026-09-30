@@ -10,7 +10,9 @@ vectors only when they first *create* ``embedding_vec``. A row that is
 later left with only the legacy value (a failed dual-write, a PG
 database whose column was created after the row was written) is never
 repaired by them. :func:`backfill_embedding_vec` repairs those rows and
-:func:`verify_embedding_vec` reports on them.
+:func:`verify_embedding_vec` reports on them. Since #3414 the startup
+sequence also repairs them, through :func:`backfill_missing_embedding_vec`,
+on every boot the legacy column survives.
 
 Neither function changes the schema, touches the legacy ``embedding``
 value, or overwrites a non-NULL ``embedding_vec``. After
@@ -111,15 +113,48 @@ async def backfill_embedding_vec(
     return await _run(db, table, batch_size=batch_size, write=True)
 
 
-async def _run(
-    db: "AsyncDatabase", table: str, *, batch_size: int, write: bool
-) -> EmbeddingVecReport:
+async def backfill_missing_embedding_vec(
+    db: "AsyncDatabase",
+    table: str,
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> Tuple[int, int]:
+    """The copy :func:`backfill_embedding_vec` makes, without its report.
+
+    The report reads and compares every row's pair of vectors, a scan the
+    startup sequence cannot afford on every boot the legacy column
+    survives (#3414). This walks only the rows holding a legacy value and
+    a NULL ``embedding_vec``, with the same guarantees.
+
+    Returns ``(rows written, rows that cannot be written)``. Writes nothing,
+    and returns ``(0, 0)``, when either column is absent.
+    """
+    _check_arguments(table, batch_size)
+    is_postgres = _is_postgres(db)
+    if not await db.column_exists(table, "embedding"):
+        return 0, 0
+    column = await _vec_column(db, table, is_postgres)
+    if not column.present:
+        return 0, 0
+    return await _backfill_missing(
+        db, table, LEGACY_EMBEDDING_TABLES[table], column, is_postgres,
+        batch_size=batch_size, write=True,
+    )
+
+
+def _check_arguments(table: str, batch_size: int) -> None:
     if table not in LEGACY_EMBEDDING_TABLES:
         raise ValueError(
             f"table must be one of {sorted(LEGACY_EMBEDDING_TABLES)}, got {table!r}"
         )
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+
+async def _run(
+    db: "AsyncDatabase", table: str, *, batch_size: int, write: bool
+) -> EmbeddingVecReport:
+    _check_arguments(table, batch_size)
     id_col = LEGACY_EMBEDDING_TABLES[table]
     is_postgres = _is_postgres(db)
     column = await _vec_column(db, table, is_postgres)

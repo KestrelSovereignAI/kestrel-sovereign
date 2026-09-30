@@ -1551,7 +1551,24 @@ class AsyncDatabase:
         # column and its data, otherwise; see sqla/migrations.py.
         # Independent per table, and non-fatal: nothing writes the legacy
         # column any more, so keeping it costs only disk.
+        #
+        # First, copy any vector still held only in the legacy column
+        # into an ``embedding_vec`` the migrations above did not create
+        # (#3414): a first embedded write creates it without copying.
+        # A failed copy leaves those rows blocking the retirement.
         for table in ("saved_items", "document_chunks"):
+            try:
+                from .sqla.migrations import (
+                    migrate_backfill_legacy_embedding_vec,
+                )
+                await migrate_backfill_legacy_embedding_vec(self, table)
+            except Exception as e:
+                logger.error(
+                    "Copying legacy %s.embedding vectors into embedding_vec "
+                    "failed: %s. Rows holding a vector only there stay out "
+                    "of vector search; the next boot retries.",
+                    table, e, exc_info=True,
+                )
             try:
                 from .sqla.migrations import (
                     migrate_retire_legacy_embedding_column,

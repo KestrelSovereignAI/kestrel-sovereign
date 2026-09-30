@@ -21,7 +21,8 @@ its first vectors only in the legacy column until the next boot. Reindex
 cannot have run against such a table (it reads and writes ``embedding_vec``),
 so those legacy bytes are current. Once the column exists it is the only
 source: a row whose ``embedding_vec`` is NULL has no stored vector, whatever
-its legacy column holds. ``kestrel embeddings backfill`` repairs such rows.
+its legacy column holds. The next boot copies such rows' legacy vectors
+(#3414), and ``kestrel embeddings backfill`` does so on demand.
 """
 
 from __future__ import annotations
@@ -91,6 +92,10 @@ async def ensure_embedding_vec_column(
     PostgreSQL database no such row ever appears, and the first embedded
     write sizes the column from its own vector instead. SQLite stores bytes
     and gets a ``BLOB``; its startup migration normally created it already.
+
+    It copies no legacy vector. Rows an older release left with one (the
+    column is absent because a startup migration rolled back) are copied
+    by the next boot (#3414), not by this write.
 
     Returns whether the column exists afterwards. A failure is logged, not
     raised: the caller's write then fails the same way and is non-fatal.
