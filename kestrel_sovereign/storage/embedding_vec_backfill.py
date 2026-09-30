@@ -61,6 +61,12 @@ class EmbeddingVecReport:
 
     Counts describe the table after the call. ``rows_backfilled`` and
     ``rows_unbackfillable`` describe the rows the call scanned.
+
+    Every row falls in exactly one of ``rows_with_both``,
+    ``rows_missing_embedding_vec``, ``rows_embedding_vec_only`` and
+    ``rows_without_any_embedding``, so the four sum to ``total_rows``. A
+    report that does not partition its table is refused (#3415): before that
+    bucket existed, rows with no vector in either column were in none.
     """
 
     table: str
@@ -69,9 +75,28 @@ class EmbeddingVecReport:
     rows_with_both: int
     rows_missing_embedding_vec: int
     rows_embedding_vec_only: int
+    # No vector in either column: nothing to copy, so neither gate counts
+    # them, and vector search cannot find them until reindex embeds them.
+    rows_without_any_embedding: int
     rows_disagreeing: int
     rows_backfilled: int
     rows_unbackfillable: int
+
+    def __post_init__(self) -> None:
+        buckets = (
+            self.rows_with_both
+            + self.rows_missing_embedding_vec
+            + self.rows_embedding_vec_only
+            + self.rows_without_any_embedding
+        )
+        if buckets != self.total_rows:
+            raise EmbeddingVecBackfillError(
+                f"{self.table}: the row buckets sum to {buckets}, not "
+                f"total_rows {self.total_rows} (with_both={self.rows_with_both}, "
+                f"missing_embedding_vec={self.rows_missing_embedding_vec}, "
+                f"embedding_vec_only={self.rows_embedding_vec_only}, "
+                f"without_any_embedding={self.rows_without_any_embedding})"
+            )
 
 
 @dataclass(frozen=True)
@@ -164,8 +189,10 @@ async def _run(
         return await _retired_report(db, table, column)
 
     if not column.present:
-        total, legacy = await _fetch_counts(
-            db, f"SELECT COUNT(*), {_count_when('embedding IS NOT NULL')} FROM {table}"
+        total, legacy, neither = await _fetch_counts(
+            db,
+            f"SELECT COUNT(*), {_count_when('embedding IS NOT NULL')}, "
+            f"{_count_when('embedding IS NULL')} FROM {table}",
         )
         logger.warning(
             "%s.embedding_vec does not exist; %d legacy embeddings cannot be "
@@ -179,6 +206,7 @@ async def _run(
             rows_with_both=0,
             rows_missing_embedding_vec=legacy,
             rows_embedding_vec_only=0,
+            rows_without_any_embedding=neither,
             rows_disagreeing=0,
             rows_backfilled=0,
             rows_unbackfillable=legacy,
@@ -187,12 +215,13 @@ async def _run(
     backfilled, unbackfillable = await _backfill_missing(
         db, table, id_col, column, is_postgres, batch_size=batch_size, write=write
     )
-    total, both, missing, vec_only = await _fetch_counts(
+    total, both, missing, vec_only, neither = await _fetch_counts(
         db,
         f"SELECT COUNT(*), "
         f"{_count_when('embedding IS NOT NULL AND embedding_vec IS NOT NULL')}, "
         f"{_count_when('embedding IS NOT NULL AND embedding_vec IS NULL')}, "
-        f"{_count_when('embedding IS NULL AND embedding_vec IS NOT NULL')} "
+        f"{_count_when('embedding IS NULL AND embedding_vec IS NOT NULL')}, "
+        f"{_count_when('embedding IS NULL AND embedding_vec IS NULL')} "
         f"FROM {table}",
     )
     disagreeing = await _count_disagreeing(
@@ -205,6 +234,7 @@ async def _run(
         rows_with_both=both,
         rows_missing_embedding_vec=missing,
         rows_embedding_vec_only=vec_only,
+        rows_without_any_embedding=neither,
         rows_disagreeing=disagreeing,
         rows_backfilled=backfilled,
         rows_unbackfillable=unbackfillable,
@@ -218,14 +248,14 @@ async def _retired_report(
 ) -> EmbeddingVecReport:
     """Report on a table whose legacy column is gone (#3411)."""
     if column.present:
-        total, vec_only = await _fetch_counts(
+        total, vec_only, neither = await _fetch_counts(
             db,
-            f"SELECT COUNT(*), {_count_when('embedding_vec IS NOT NULL')} "
-            f"FROM {table}",
+            f"SELECT COUNT(*), {_count_when('embedding_vec IS NOT NULL')}, "
+            f"{_count_when('embedding_vec IS NULL')} FROM {table}",
         )
     else:
         (total,) = await _fetch_counts(db, f"SELECT COUNT(*) FROM {table}")
-        vec_only = 0
+        vec_only, neither = 0, total
     report = EmbeddingVecReport(
         table=table,
         embedding_vec_present=column.present,
@@ -233,6 +263,7 @@ async def _retired_report(
         rows_with_both=0,
         rows_missing_embedding_vec=0,
         rows_embedding_vec_only=vec_only,
+        rows_without_any_embedding=neither,
         rows_disagreeing=0,
         rows_backfilled=0,
         rows_unbackfillable=0,

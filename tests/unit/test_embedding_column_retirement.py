@@ -752,6 +752,78 @@ async def test_a_failed_embedding_vec_write_stores_no_vector(deployment):
     assert await _legacy_values(db, "saved_items") == 0
 
 
+def _assert_buckets_partition(report: EmbeddingVecReport) -> None:
+    assert (
+        report.rows_with_both
+        + report.rows_missing_embedding_vec
+        + report.rows_embedding_vec_only
+        + report.rows_without_any_embedding
+    ) == report.total_rows
+
+
+async def test_a_chunk_stored_without_a_vector_is_reported_and_reindex_embeds_it(
+    deployment, caplog
+):
+    # #3415. A constitution reanchor re-indexed RAG with no embedding
+    # service, leaving 47 chunks per agent with no vector in either column:
+    # invisible to vector search, and in no bucket of `verify`.
+    dep = deployment
+    db = dep.db
+    await dep.use_pre_retirement_schema()
+    rag = await _rag_store(db, NEW, "embedded-doc")
+    await rag.chunk_document("embedded-doc", "gamma", chunk_size=100)
+    rag = await _rag_store(db, None, "unembedded-doc")
+    with caplog.at_level(logging.WARNING, logger=AsyncRAGStore.__module__):
+        stored = await rag.chunk_document(
+            "unembedded-doc", "third letter", chunk_size=100
+        )
+
+    assert stored == 1
+    assert (
+        "Stored 1 of 1 chunks of unembedded-doc without an embedding "
+        "(no embedding service resolved)"
+    ) in caplog.text
+    assert "`kestrel embeddings reindex --yes`" in caplog.text
+    report = await verify_embedding_vec(db, "document_chunks")
+    assert (
+        report.total_rows,
+        report.rows_embedding_vec_only,
+        report.rows_without_any_embedding,
+    ) == (2, 1, 1)
+    _assert_buckets_partition(report)
+    # A row with no vector has nothing to copy or to lose.
+    assert legacy_embedding_retirement_gate_met(report)
+
+    db = await dep.reboot()
+
+    assert not await db.column_exists("document_chunks", "embedding")
+    report = await verify_embedding_vec(db, "document_chunks")
+    assert (
+        report.total_rows,
+        report.rows_embedding_vec_only,
+        report.rows_without_any_embedding,
+    ) == (2, 1, 1)
+    _assert_buckets_partition(report)
+    # "third letter" means "gamma", but has no vector to be found by.
+    search = await _rag_store(db, NEW, "search-doc")
+    found = await search._search_by_embedding("gamma", limit=2)
+    assert [r["content"] for r in found] == ["gamma"]
+
+    stats = await EmbeddingReindexer(
+        db, NEW, NEW.profile_id, column_dim=DIM
+    ).reindex_table("document_chunks")
+
+    assert (stats.scanned, stats.reembedded, stats.failed) == (1, 1, 0)
+    report = await verify_embedding_vec(db, "document_chunks")
+    assert (
+        report.total_rows,
+        report.rows_embedding_vec_only,
+        report.rows_without_any_embedding,
+    ) == (2, 2, 0)
+    found = await search._search_by_embedding("gamma", limit=2)
+    assert sorted(r["content"] for r in found) == ["gamma", "third letter"]
+
+
 # ------------------------------------------------------ gate and guards
 
 
@@ -759,15 +831,22 @@ def _report(**overrides) -> EmbeddingVecReport:
     fields = dict(
         table="saved_items",
         embedding_vec_present=True,
-        total_rows=3,
         rows_with_both=1,
         rows_missing_embedding_vec=0,
         rows_embedding_vec_only=2,
+        rows_without_any_embedding=0,
         rows_disagreeing=1,
         rows_backfilled=0,
         rows_unbackfillable=0,
     )
     fields.update(overrides)
+    # The buckets partition the table (#3415).
+    fields["total_rows"] = (
+        fields["rows_with_both"]
+        + fields["rows_missing_embedding_vec"]
+        + fields["rows_embedding_vec_only"]
+        + fields["rows_without_any_embedding"]
+    )
     return EmbeddingVecReport(**fields)
 
 
@@ -784,6 +863,8 @@ def test_retirement_gate_is_stricter_than_the_phase_2_gate():
     assert not legacy_embedding_retirement_gate_met(
         _report(rows_missing_embedding_vec=1, rows_unbackfillable=1)
     )
+    # A row never embedded has no vector to destroy (#3415).
+    assert legacy_embedding_retirement_gate_met(_report(rows_without_any_embedding=5))
 
 
 async def test_old_sqlite_keeps_the_legacy_column(tmp_path, monkeypatch, caplog):

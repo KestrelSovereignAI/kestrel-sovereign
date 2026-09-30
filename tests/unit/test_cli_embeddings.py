@@ -205,6 +205,59 @@ def test_retired_legacy_column_meets_the_gate(
     assert _snapshot(retired_agent_dir) == before
 
 
+_BUCKETS = (
+    "rows_with_both",
+    "rows_missing_embedding_vec",
+    "rows_embedding_vec_only",
+    "rows_without_any_embedding",
+)
+
+
+@pytest.mark.parametrize("schema", ["agent_dir", "retired_agent_dir"])
+def test_a_never_embedded_row_is_counted_and_does_not_fail_the_gate(
+    request, monkeypatch, capsys, schema
+):
+    # #3415: 47 chunks per agent had no vector in either column, and verify
+    # put them in no bucket.
+    data_dir = request.getfixturevalue(schema)
+    with closing(_connect(data_dir)) as conn, conn:
+        conn.execute(
+            "INSERT INTO document_chunks (file_hash, content, embedding_vec) "
+            "VALUES ('doc', 'embedded', ?)",
+            (_pack([1.0, 2.0]),),
+        )
+        conn.execute(
+            "INSERT INTO document_chunks (file_hash, content) "
+            "VALUES ('doc', 'never embedded')"
+        )
+
+    rc, payload = _embeddings_json(
+        monkeypatch, capsys, "verify", data_dir, "--table", "document_chunks"
+    )
+
+    assert rc == 0
+    assert payload["gate_met"] is True
+    (entry,) = payload["tables"]
+    assert (
+        entry["total_rows"],
+        entry["rows_embedding_vec_only"],
+        entry["rows_without_any_embedding"],
+    ) == (2, 1, 1)
+    assert sum(entry[bucket] for bucket in _BUCKETS) == entry["total_rows"]
+
+    rc = _kestrel(
+        monkeypatch, "embeddings", "verify", "--data-dir", str(data_dir),
+        "--table", "document_chunks",
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert f"  {'rows_without_any_embedding':<28} {1:>8}" in out
+    assert "note: 1 row(s) have no embedding in either column" in out
+    assert "`kestrel embeddings reindex --yes` embeds them" in out
+    assert "phase-2 gate: met" in out
+
+
 def test_json_report_carries_every_report_field(agent_dir, monkeypatch, capsys):
     _insert_saved_item(agent_dir, "legacy-only", embedding=_pack([1.0, 2.0]))
 
@@ -565,6 +618,7 @@ def test_gate_requires_the_column_and_every_missing_row_unbackfillable(
         rows_with_both=0,
         rows_missing_embedding_vec=missing,
         rows_embedding_vec_only=0,
+        rows_without_any_embedding=0,
         rows_disagreeing=0,
         rows_backfilled=0,
         rows_unbackfillable=unbackfillable,
@@ -638,7 +692,7 @@ async def test_batch_size_reaches_the_helper_only_when_given(monkeypatch, capsys
 
     async def spy(db, table, **kwargs):
         calls.append((table, kwargs))
-        return EmbeddingVecReport(table, True, 0, 0, 0, 0, 0, 0, 0)
+        return EmbeddingVecReport(table, True, 0, 0, 0, 0, 0, 0, 0, 0)
 
     monkeypatch.setattr(embedding_vec_backfill, "backfill_embedding_vec", spy)
 

@@ -19,6 +19,7 @@ from kestrel_sdk.storage.database.interface import TransactionError
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.embedding_vec_backfill import (
     EmbeddingVecBackfillError,
+    EmbeddingVecReport,
     _backfill_value,
     _pgvector_text_to_bytes,
     _VecColumn,
@@ -90,6 +91,8 @@ async def test_backfill_copies_only_missing_rows_and_second_run_changes_nothing(
     assert first.rows_with_both == 4
     assert first.rows_missing_embedding_vec == 1
     assert first.rows_embedding_vec_only == 1
+    # "f-neither" was in no bucket before #3415.
+    assert first.rows_without_any_embedding == 1
     assert first.rows_disagreeing == 1
 
     assert await _saved_item_columns(db, "a-legacy-only") == (legacy, legacy)
@@ -107,8 +110,9 @@ async def test_backfill_copies_only_missing_rows_and_second_run_changes_nothing(
         second.rows_with_both,
         second.rows_missing_embedding_vec,
         second.rows_embedding_vec_only,
+        second.rows_without_any_embedding,
         second.rows_disagreeing,
-    ) == (7, 4, 1, 1, 1)
+    ) == (7, 4, 1, 1, 1, 1)
 
 
 async def test_non_finite_legacy_embedding_is_unbackfillable_not_fatal(sqlite_db):
@@ -202,12 +206,16 @@ async def test_missing_embedding_vec_column_is_reported_not_created(sqlite_db):
         "INSERT INTO document_chunks (file_hash, content, embedding) VALUES (?, ?, ?)",
         ("doc", "chunk", _pack([1.0])),
     )
+    await db.execute(
+        "INSERT INTO document_chunks (file_hash, content) VALUES ('doc', 'never')", ()
+    )
 
     report = await backfill_embedding_vec(db, "document_chunks")
 
     assert report.embedding_vec_present is False
-    assert report.total_rows == 1
+    assert report.total_rows == 2
     assert report.rows_missing_embedding_vec == 1
+    assert report.rows_without_any_embedding == 1
     assert report.rows_unbackfillable == 1
     assert report.rows_backfilled == 0
     columns = await db.fetchall(
@@ -241,10 +249,11 @@ async def test_retired_table_reports_every_vector_as_embedding_vec_only(
         report.rows_with_both,
         report.rows_missing_embedding_vec,
         report.rows_embedding_vec_only,
+        report.rows_without_any_embedding,
         report.rows_disagreeing,
         report.rows_backfilled,
         report.rows_unbackfillable,
-    ) == (2, 0, 0, 1, 0, 0, 0)
+    ) == (2, 0, 0, 1, 1, 0, 0, 0)
     assert not await db.column_exists("saved_items", "embedding")
 
 
@@ -260,7 +269,42 @@ async def test_retired_table_without_embedding_vec_reports_the_column_absent(
     report = await verify_embedding_vec(db, "document_chunks")
 
     assert report.embedding_vec_present is False
-    assert (report.total_rows, report.rows_missing_embedding_vec) == (1, 0)
+    assert (
+        report.total_rows,
+        report.rows_missing_embedding_vec,
+        report.rows_without_any_embedding,
+    ) == (1, 0, 1)
+
+
+@pytest.mark.parametrize(
+    "bucket",
+    [
+        "rows_with_both",
+        "rows_missing_embedding_vec",
+        "rows_embedding_vec_only",
+        "rows_without_any_embedding",
+    ],
+)
+def test_a_report_whose_buckets_do_not_sum_to_total_rows_is_refused(bucket):
+    counts = dict(
+        rows_with_both=1,
+        rows_missing_embedding_vec=1,
+        rows_embedding_vec_only=1,
+        rows_without_any_embedding=1,
+    )
+    fields = dict(
+        table="document_chunks",
+        embedding_vec_present=True,
+        total_rows=4,
+        rows_disagreeing=0,
+        rows_backfilled=0,
+        rows_unbackfillable=0,
+    )
+    assert EmbeddingVecReport(**fields, **counts).total_rows == 4
+
+    # The count #3415 found missing: rows in no bucket.
+    with pytest.raises(EmbeddingVecBackfillError, match="sum to 3, not total_rows 4"):
+        EmbeddingVecReport(**fields, **{**counts, bucket: 0})
 
 
 async def test_backfill_missing_copies_what_backfill_copies_without_reading_pairs(
@@ -436,15 +480,29 @@ async def test_postgres_backfill_is_idempotent(postgres_db):
                 "VALUES (?, ?, ?)",
                 (file_hash, f"chunk {index}", blob),
             )
+        # A chunk never embedded: no vector in either column (#3415).
+        await db.execute(
+            "INSERT INTO document_chunks (file_hash, content) VALUES (?, ?)",
+            (file_hash, "never embedded"),
+        )
 
         first = await backfill_embedding_vec(db, "document_chunks", batch_size=2)
 
         assert first.embedding_vec_present is True
         assert first.rows_backfilled >= 3
         assert first.rows_missing_embedding_vec == first.rows_unbackfillable
+        # Other rows may share this table, so the partition is asserted, not
+        # the exact counts; the report refuses to exist without it.
+        assert first.rows_without_any_embedding >= 1
+        assert (
+            first.rows_with_both
+            + first.rows_missing_embedding_vec
+            + first.rows_embedding_vec_only
+            + first.rows_without_any_embedding
+        ) == first.total_rows
         rows = await db.fetchall(
             "SELECT embedding, embedding_vec::text FROM document_chunks "
-            "WHERE file_hash = ? ORDER BY chunk_id",
+            "WHERE file_hash = ? AND embedding IS NOT NULL ORDER BY chunk_id",
             (file_hash,),
         )
         assert [bytes(blob) for blob, _ in rows] == legacy
@@ -455,6 +513,7 @@ async def test_postgres_backfill_is_idempotent(postgres_db):
         assert second.rows_backfilled == 0
         assert second.rows_missing_embedding_vec == first.rows_missing_embedding_vec
         assert second.rows_with_both == first.rows_with_both
+        assert second.rows_without_any_embedding == first.rows_without_any_embedding
     finally:
         if created_column:
             await db.execute(
