@@ -1727,12 +1727,15 @@ async def migrate_retire_legacy_embedding_column(
 
     Fails closed. The column stays, untouched, unless
     ``verify_embedding_vec`` reports that ``embedding_vec`` exists and no row
-    is missing it (see :func:`legacy_embedding_retirement_gate_met`). The
-    gate is checked once without a lock, so a database that fails it never
-    blocks other connections, then again inside the transaction that drops
-    the column: under ``BEGIN IMMEDIATE`` on SQLite and an ``ACCESS
-    EXCLUSIVE`` table lock on PostgreSQL, so no concurrent writer (an older
-    release still dual-writing, say) can add a legacy-only row in between.
+    is missing it (see :func:`legacy_embedding_retirement_gate_met`). That
+    full gate runs without a lock, so a database that fails it never blocks
+    other connections. The transaction that drops the column then rechecks,
+    under ``BEGIN IMMEDIATE`` on SQLite and an ``ACCESS EXCLUSIVE`` table
+    lock on PostgreSQL, that no row holds a legacy value with a NULL
+    ``embedding_vec``. So no concurrent writer (an older release still
+    dual-writing, say) can add a legacy-only row in between. The recheck is
+    one SQL statement that reads no vector values, not a second scan of
+    every vector pair, because the lock is held while it runs.
 
     Idempotent: a table without the legacy column, or without the table,
     is left alone. The drop is not reversible. An older release cannot
@@ -1786,9 +1789,13 @@ async def migrate_retire_legacy_embedding_column(
         # A concurrent boot may have retired it while this one waited.
         if not await db.column_exists(table, "embedding"):
             return False
-        report = await verify_embedding_vec(db, table)
-        if not legacy_embedding_retirement_gate_met(report):
-            _log_retirement_refused(report)
+        if await _legacy_only_vector_written(db, table):
+            logger.warning(
+                "Keeping the legacy %s.embedding column: rechecked under the "
+                "drop's lock, a row now holds its vector only there. Run "
+                "`kestrel embeddings backfill`; the next boot retries.",
+                table,
+            )
             return False
         await db.execute(f"ALTER TABLE {table} DROP COLUMN embedding", ())
 
@@ -1799,6 +1806,26 @@ async def migrate_retire_legacy_embedding_column(
         report.total_rows,
     )
     return True
+
+
+async def _legacy_only_vector_written(db: "AsyncDatabase", table: str) -> bool:
+    """Whether *table* now fails the retirement gate, asked in one statement.
+
+    The gate's blocking rows are those with a legacy value and a NULL
+    ``embedding_vec``: ``verify_embedding_vec`` counts an unbackfillable
+    row only among them, so this catches both kinds without telling them
+    apart. Called under the drop's table lock, so it reads no vector
+    values, only whether each column is NULL. A missing ``embedding_vec``
+    fails the gate too.
+    """
+    if not await db.column_exists(table, "embedding_vec"):
+        return True
+    row = await db.fetchone(
+        f"SELECT EXISTS (SELECT 1 FROM {table} "
+        "WHERE embedding IS NOT NULL AND embedding_vec IS NULL)",
+        (),
+    )
+    return bool(row[0])
 
 
 async def _sqlite_version(db: "AsyncDatabase") -> tuple:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import struct
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, List, Optional
 
@@ -403,12 +404,18 @@ async def test_absent_embedding_vec_keeps_the_legacy_column(deployment):
     ) == before
 
 
+@pytest.mark.parametrize(
+    "late_vector",
+    [[1.0, 0.0, 0.0, 0.0], [0.5, float("nan"), 0.0, 0.0]],
+    ids=["copyable", "unbackfillable"],
+)
 async def test_a_legacy_row_written_between_the_checks_blocks_the_drop(
-    deployment, monkeypatch
+    deployment, monkeypatch, late_vector, caplog
 ):
-    # The gate is checked once unlocked, then again under the lock that the
-    # drop runs in. A release still dual-writing can land a legacy-only row
-    # in between; the second check must see it.
+    # The full gate runs unlocked; the drop's transaction then rechecks, under
+    # its lock, that no row holds a vector only in the legacy column. A
+    # release still dual-writing can land such a row in between, copyable or
+    # not; the recheck must see it.
     dep = deployment
     db = dep.db
     await dep.use_pre_retirement_schema()
@@ -419,11 +426,10 @@ async def test_a_legacy_row_written_between_the_checks_blocks_the_drop(
         nonlocal calls
         calls += 1
         report = await real_verify(target, table)
-        if calls == 1:
-            item = await _saved_items_store(db, None).save_item(
-                item_type="excerpt", name="late", content="late"
-            )
-            await dep.write_legacy("saved_items", item.id, OLD.vectors["alpha"])
+        item = await _saved_items_store(db, None).save_item(
+            item_type="excerpt", name="late", content="late"
+        )
+        await dep.write_legacy("saved_items", item.id, late_vector)
         return report
 
     monkeypatch.setattr(
@@ -431,11 +437,78 @@ async def test_a_legacy_row_written_between_the_checks_blocks_the_drop(
         verify_then_a_concurrent_legacy_write,
     )
 
-    assert await migrate_retire_legacy_embedding_column(db, "saved_items") is False
+    with caplog.at_level(logging.WARNING, logger=migrations.__name__):
+        dropped = await migrate_retire_legacy_embedding_column(db, "saved_items")
 
-    assert calls == 2
+    assert dropped is False
+    # The recheck under the lock is not a second full verify.
+    assert calls == 1
+    assert "rechecked under the drop's lock" in caplog.text
     assert await db.column_exists("saved_items", "embedding")
     assert await _legacy_values(db, "saved_items") == 1
+
+
+async def test_the_locked_recheck_reads_no_vector_values(deployment, monkeypatch):
+    # The lock blocks every access to the table (and startup with it) for as
+    # long as it is held, so the recheck under it is one statement over the
+    # columns' NULL state, never verify_embedding_vec's scan of every pair.
+    dep = deployment
+    db = dep.db
+    await dep.use_pre_retirement_schema()
+    await _seed_legacy_rows(dep)
+    await backfill_embedding_vec(db, "saved_items")
+    # Rows the gate does not block on: one with no vector at all, and one
+    # with a vector only in embedding_vec.
+    await _saved_items_store(db, None).save_item(
+        item_type="excerpt", name="none", content="none"
+    )
+    await _saved_items_store(db, NEW).save_item(
+        item_type="excerpt", name="gamma", content="gamma"
+    )
+
+    locked = False
+    verify_calls_under_lock = []
+    statements_under_lock = []
+    real_transaction = db.transaction
+    real_verify = embedding_vec_backfill.verify_embedding_vec
+
+    @asynccontextmanager
+    async def tracked_transaction(**kwargs):
+        nonlocal locked
+        async with real_transaction(**kwargs):
+            locked = True
+            try:
+                yield
+            finally:
+                locked = False
+
+    async def tracked_verify(target, table):
+        verify_calls_under_lock.append(locked)
+        return await real_verify(target, table)
+
+    def recording(method):
+        async def record(sql, params=()):
+            if locked:
+                statements_under_lock.append(" ".join(sql.split()))
+            return await method(sql, params)
+
+        return record
+
+    monkeypatch.setattr(db, "transaction", tracked_transaction)
+    for name in ("execute", "fetchone", "fetchall", "fetchval"):
+        monkeypatch.setattr(db, name, recording(getattr(db, name)))
+    monkeypatch.setattr(embedding_vec_backfill, "verify_embedding_vec", tracked_verify)
+
+    assert await migrate_retire_legacy_embedding_column(db, "saved_items") is True
+
+    assert verify_calls_under_lock == [False]
+    table_reads = [sql for sql in statements_under_lock if "FROM saved_items" in sql]
+    assert table_reads == [
+        "SELECT EXISTS (SELECT 1 FROM saved_items "
+        "WHERE embedding IS NOT NULL AND embedding_vec IS NULL)"
+    ]
+    assert statements_under_lock[-1] == "ALTER TABLE saved_items DROP COLUMN embedding"
+    assert not await db.column_exists("saved_items", "embedding")
 
 
 # ---------------------------------------------------------------- writers

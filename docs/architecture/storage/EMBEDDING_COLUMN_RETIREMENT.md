@@ -80,7 +80,8 @@ with `scripts/`.
 | `storage/sqla/migrations.py:1582, 1617, 1635` | `_migrate_pg_table`: dimension sniff, legacy read, `embedding_vec` write. |
 | `storage/sqla/migrations.py:1680` | `_migrate_sqlite_table`: copy `embedding` into `embedding_vec`. |
 | `storage/async_database.py:1548-1565` | Phase 3: startup call to `migrate_retire_legacy_embedding_column` for each table, after the two migrations above. |
-| `storage/sqla/migrations.py:1706, 1722` | Phase 3: `legacy_embedding_retirement_gate_met` and `migrate_retire_legacy_embedding_column`. |
+| `storage/sqla/migrations.py:1707, 1723` | Phase 3: `legacy_embedding_retirement_gate_met` and `migrate_retire_legacy_embedding_column`. |
+| `storage/sqla/migrations.py:1811` | Phase 3: `_legacy_only_vector_written`, the recheck under the drop's lock. It tests only whether each column is NULL and reads no legacy value. |
 
 Both copy migrations run only when `embedding_vec` is **absent**, so neither
 repairs a row that is later left with only the legacy column. On PostgreSQL the
@@ -360,15 +361,39 @@ NULL. Each table is judged on its own. A failure in the migration is logged
 and non-fatal: nothing writes the legacy column any more, so keeping it costs
 only disk.
 
-**No write can slip in between.** The gate is checked once without a lock, so
-a database that fails it never blocks another connection. The drop then runs
-in one transaction that checks the gate again first, under `BEGIN IMMEDIATE`
-on SQLite and `LOCK TABLE ... IN ACCESS EXCLUSIVE MODE` on PostgreSQL. A
-release still dual-writing on the same database (a mixed-version fleet on
-shared PostgreSQL) therefore cannot land a legacy-only row after the check. On
-PostgreSQL the lock wait is bounded by a 10-second `lock_timeout`; on timeout
-the drop waits for the next boot. A concurrent boot that dropped the column
-first is detected under the lock.
+**No write can slip in between.** The full gate (`verify_embedding_vec`) runs
+without a lock, so a database that fails it never blocks another connection.
+The drop then runs in one transaction under `BEGIN IMMEDIATE` on SQLite and
+`LOCK TABLE ... IN ACCESS EXCLUSIVE MODE` on PostgreSQL. Before dropping, that
+transaction rechecks with one statement:
+
+```sql
+SELECT EXISTS (SELECT 1 FROM <table>
+               WHERE embedding IS NOT NULL AND embedding_vec IS NULL)
+```
+
+A release still dual-writing on the same database (a mixed-version fleet on
+shared PostgreSQL) therefore cannot land a legacy-only row after the check.
+For as long as the lock is held it blocks every access to the table on
+PostgreSQL and every other writer on SQLite, and the boot waits with it. So the
+recheck is not a second `verify_embedding_vec`. That call reads and compares
+every vector pair in Python, while the recheck tests only whether each column
+is NULL. It still scans the table at most once, but it transfers no vector
+values.
+
+The two checks split the gate between them:
+
+| Refusal case | Unlocked full gate | Recheck under the lock |
+|---|---|---|
+| `embedding_vec` absent | yes | yes (catalog lookup) |
+| A legacy value with a NULL `embedding_vec` (`rows_missing_embedding_vec`) | yes | yes |
+| That value is unbackfillable (not whole float32, wrong `vector(N)` width, NaN or infinite) | yes, counted separately | yes, but not told apart: `verify_embedding_vec` counts an unbackfillable row only among the rows missing `embedding_vec`, so the recheck blocks on it without classifying it |
+| PostgreSQL `embedding_vec` is not a pgvector `vector` | yes (`verify_embedding_vec` raises) | no; nothing between the checks changes a column type |
+
+On PostgreSQL the lock wait is bounded by a 10-second `lock_timeout`; on
+timeout the drop waits for the next boot. `lock_timeout` bounds only the wait,
+not the hold, which is why the work under the lock is kept to one statement.
+A concurrent boot that dropped the column first is detected under the lock.
 
 **SQLite older than 3.35.0** has no `DROP COLUMN`. The migration keeps the
 column there and says so at `WARNING`.
