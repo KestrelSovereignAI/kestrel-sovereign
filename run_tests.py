@@ -47,7 +47,8 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # This is a regression budget for the duration pytest reports in its collection
-# summary. It deliberately excludes uv resolution and subprocess startup.
+# summary. It deliberately excludes uv resolution and subprocess startup, and
+# assertion rewriting (validate_imports collects with --assert=plain).
 IMPORT_VALIDATION_COLLECTION_BUDGET_SECONDS = 60.0
 # Provisional early-warning threshold on the same pytest-reported metric. The
 # import-validation output now exposes that metric so ubuntu-latest can provide
@@ -309,6 +310,12 @@ class SmartTestRunner:
             "--collect-only",
             "-q",
             "--color=no",
+            # Nothing is run here, so rewritten asserts are never used. On a
+            # cold bytecode cache (every CI run) rewriting every test module
+            # was ~60% of collection time and grows with the suite's size, not
+            # its imports; it pushed this budget over on main (#3418). Plain
+            # mode still imports every module; the test tiers still rewrite.
+            "--assert=plain",
         ]
         for test_dir in test_dirs:
             cmd.append(str(test_dir))

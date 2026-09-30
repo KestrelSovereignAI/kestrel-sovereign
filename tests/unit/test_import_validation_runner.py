@@ -68,13 +68,14 @@ def test_validate_imports_times_direct_pytest_and_pins_summary_environment(
     assert runner.validate_imports([runner.kestrel_tests]) is True
 
     command = captured["command"]
-    assert command[:6] == [
+    assert command[:7] == [
         sys.executable,
         "-m",
         "pytest",
         "--collect-only",
         "-q",
         "--color=no",
+        "--assert=plain",
     ]
     assert command[0] != "uv"
     assert captured["kwargs"]["timeout"] == (
@@ -87,6 +88,27 @@ def test_validate_imports_times_direct_pytest_and_pins_summary_environment(
     output = capsys.readouterr().out
     assert "5.00s collection" in output
     assert "7.0s process wall time" in output
+
+
+def test_plain_assert_collection_still_fails_on_a_broken_import(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    """Skipping assertion rewriting must not skip the import it validates."""
+    (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    (tmp_path / "test_broken.py").write_text(
+        "import kestrel_module_that_does_not_exist_3418\n\n"
+        "def test_never_collected():\n    assert True\n"
+    )
+    runner = run_tests.SmartTestRunner()
+    monkeypatch.setattr(runner, "root_dir", tmp_path)
+
+    assert runner.validate_imports([tmp_path]) is False
+
+    output = capsys.readouterr().out
+    assert "kestrel_module_that_does_not_exist_3418" in output
+    assert "Missing module detected" in output
 
 
 def test_validate_imports_enforces_pytest_duration_not_process_wall_time(

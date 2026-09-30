@@ -63,9 +63,11 @@ import logging
 import os
 import shutil
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from kestrel_sovereign.constitution.anchored_bytes import (
     read_anchored_constitution,
@@ -95,6 +97,9 @@ from kestrel_sovereign.constitution.trust_root import (
     load_sovereign_trust_root,
 )
 from kestrel_sovereign.storage import AsyncStorage, GraphNode
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.cli_embeddings import AgentEmbeddingResolution
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +330,30 @@ async def resolve_reanchor_target(
 
 
 @dataclass(frozen=True)
+class ConstitutionRagIndex:
+    """How a forced reanchor re-indexed the new constitution for RAG (#3418).
+
+    The counts are read back from what was stored for the new hash.
+    ``unembedded`` chunks have no vector. ``misprofiled`` chunks have one,
+    but its ``embedding_profile_id`` is missing or is not the profile the
+    agent resolves. Vector search filters by profile, so both kinds are found
+    by keyword search only until ``kestrel embeddings reindex`` re-embeds
+    them, which selects exactly those rows. ``reason`` says why.
+    """
+
+    agent_did: str
+    chunks: int
+    unembedded: int
+    misprofiled: int = 0
+    reason: str | None = None
+
+    @property
+    def needs_reindex(self) -> int:
+        """Chunks vector search cannot find."""
+        return self.unembedded + self.misprofiled
+
+
+@dataclass(frozen=True)
 class ReanchorResult:
     """Outcome of :func:`reanchor_constitution`.
 
@@ -371,6 +400,9 @@ class ReanchorResult:
     #: a local file. The inner transaction still makes the write atomic; what
     #: is absent is the *outer* net, and an operator relying on it must know.
     backup_unavailable_reason: str | None = None
+    #: Set when a forced reanchor re-indexed RAG, i.e. the hash moved. None
+    #: for a same-hash governance repair, which leaves the index alone.
+    rag_index: ConstitutionRagIndex | None = None
 
 
 async def reanchor_constitution(
@@ -873,7 +905,7 @@ async def reanchor_constitution(
     )
 
     try:
-        await _write_reanchor(
+        rag_index = await _write_reanchor(
             target=target,
             agent_did=agent_did,
             old_hash=old_hash,
@@ -914,6 +946,7 @@ async def reanchor_constitution(
         reanchored=True,
         governance_edge_drift=governance_edge_drift,
         stale_edge_targets=stale_edge_targets,
+        rag_index=rag_index,
     )
 
 
@@ -1102,8 +1135,10 @@ async def _write_reanchor(
     amendment_artifact_bytes: bytes,
     amendment_artifact: dict,
     amendment_verification: AmendmentArtifactVerification,
-) -> None:
+) -> ConstitutionRagIndex | None:
     """Apply the five governance locations plus authorization atomically.
+
+    Returns how RAG was re-indexed, or None for a same-hash repair.
 
     Wrapped in ``storage.db.transaction()``: every mutation below is
     a single SQLite transaction with automatic rollback on exception.
@@ -1133,7 +1168,10 @@ async def _write_reanchor(
          (same "always have something" reasoning). Skipped entirely in
          a same-hash repair — the chunks for ``new_hash`` ARE the live
          index; re-chunking would duplicate them and "dropping the old"
-         would drop the fresh ones.
+         would drop the fresh ones. The chunks are embedded with the
+         service the agent itself resolves, from its persisted
+         ``embedding_route``; that is resolved before the transaction
+         opens (#3418).
       5. Update the agent node's properties last — that's the pointer
          everyone reads, so flipping it is the conceptual commit. The
          genesis-audit receipt is superseded only when the hash actually
@@ -1145,11 +1183,13 @@ async def _write_reanchor(
     left in its pre-transaction state. The caller's file-level backup, when
     the target is a local file, remains untouched and available either way.
     """
+    rag_index: ConstitutionRagIndex | None = None
     async with target.open_storage() as storage:
         storage.graph.bind_agent(agent_did)
         storage.files.bind_agent(agent_did)
-        storage.rag.bind_agent(agent_did)
-        async with storage.db.transaction():
+        async with _agent_embedding(
+            storage.db, agent_did, needed=old_hash != new_hash,
+        ) as embedding, storage.db.transaction():
             # 1. File blob (encrypted at rest if KESTREL_DATA_KEY is set).
             stored_hash = await storage.files.store_file(
                 new_content, "KESTREL_CONSTITUTION.md"
@@ -1284,14 +1324,15 @@ async def _write_reanchor(
 
             # 4. Re-index RAG — only when the governing content actually
             # moved (see docstring for the same-hash hazard).
-            if old_hash != new_hash:
-                await storage.rag.chunk_document(
-                    file_hash=new_hash,
+            if embedding is not None:
+                rag_index = await _reindex_constitution_rag(
+                    storage.db,
+                    agent_did=agent_did,
+                    embedding=embedding,
+                    old_hash=old_hash,
+                    new_hash=new_hash,
                     content=new_content.decode("utf-8"),
-                    chunk_size=500,
-                    compute_embeddings=True,
                 )
-                await storage.rag.delete_chunks_for_file(old_hash)
 
             # 5. Update the agent's pointer + audit record. By DID, not by
             # "the first agent-typed node": the bind above already scopes this
@@ -1334,6 +1375,118 @@ async def _write_reanchor(
             if emancipation_contract_json is not None:
                 agent.properties["emancipation_contract"] = emancipation_contract_json
             await storage.graph.add_node(agent)
+    return rag_index
+
+
+@asynccontextmanager
+async def _agent_embedding(
+    db: Any, agent_did: str, *, needed: bool,
+) -> AsyncIterator[AgentEmbeddingResolution | None]:
+    """Resolve what this agent embeds with, and close the service afterwards.
+
+    Resolved the way ``kestrel embeddings reindex`` resolves it, through the
+    same helper, so the two cannot drift. A bare ``LLMService()`` ignores the
+    agent's persisted ``embedding_route``; on a host whose first chat route
+    cannot embed it resolves nothing, and every constitution chunk was stored
+    without a vector (#3418). Resolution reads ``agent_metadata`` and may run
+    embedding discovery, so the caller enters this before its transaction.
+
+    Yields None when ``needed`` is false (a same-hash repair re-indexes
+    nothing).
+    """
+    if not needed:
+        yield None
+        return
+    from kestrel_sovereign.cli_embeddings import resolve_agent_embedding
+
+    resolution = await resolve_agent_embedding(db, agent_did)
+    try:
+        yield resolution
+    finally:
+        if resolution.llm_service is not None:
+            try:
+                await resolution.llm_service.close()
+            except Exception:  # noqa: BLE001 — cleanup after the outcome is decided
+                # This runs after the caller's transaction has committed or
+                # rolled back. Raising here would report a committed reanchor
+                # as failed, or replace the error that rolled one back.
+                logger.warning(
+                    "Could not close the embedding LLM service after the "
+                    "reanchor of %s.", agent_did, exc_info=True,
+                )
+
+
+async def _reindex_constitution_rag(
+    db: Any,
+    *,
+    agent_did: str,
+    embedding: AgentEmbeddingResolution,
+    old_hash: str,
+    new_hash: str,
+    content: str,
+) -> ConstitutionRagIndex:
+    """Chunk the new constitution into RAG, then drop the old hash's chunks.
+
+    Embeds through ``embedding``, the agent's own resolved service. When that
+    resolution failed the chunks are stored without vectors instead: a service
+    that could not apply the persisted route may still resolve some other
+    route, and embedding with it would stamp a profile the operator did not
+    choose, which is why ``embeddings reindex`` refuses in the same state.
+    Either way the stored chunks are counted, and any vector search cannot
+    find are logged at WARNING and returned for the caller to report.
+    """
+    from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
+
+    rag = AsyncRAGStore(db, llm_service=embedding.llm_service, agent_id=agent_did)
+    await rag.chunk_document(
+        file_hash=new_hash,
+        content=content,
+        chunk_size=500,
+        compute_embeddings=embedding.error is None,
+    )
+    stored = await rag.read_indexed_chunks(new_hash)
+    await rag.delete_chunks_for_file(old_hash)
+
+    target = embedding.profile_id
+    unembedded = sum(1 for chunk in stored if not chunk.embedding)
+    # ``chunk_document`` resolves the profile a second time and stamps NULL
+    # when that fails, so a vector is not proof the chunk is searchable. With
+    # no target resolved, no stamp can be confirmed as the agent's.
+    misprofiled = sum(
+        1 for chunk in stored
+        if chunk.embedding
+        and (chunk.profile_id is None or chunk.profile_id != target)
+    )
+    if not unembedded and not misprofiled:
+        return ConstitutionRagIndex(
+            agent_did=agent_did, chunks=len(stored), unembedded=0,
+        )
+
+    causes: list[str] = []
+    if unembedded:
+        cause = embedding.error or (
+            f"embedding through profile {target} produced no vector for them"
+        )
+        causes.append(f"{unembedded} stored without a vector ({cause})")
+    if misprofiled:
+        wanted = f"the agent's profile {target}" if target else "a resolved profile"
+        causes.append(
+            f"{misprofiled} stored with a vector not stamped with {wanted}, "
+            f"which profile-filtered vector search skips"
+        )
+    reason = "; ".join(causes)
+    logger.warning(
+        "Reanchor stored %d of %d constitution chunks for %s that vector "
+        "search cannot find: %s",
+        unembedded + misprofiled, len(stored), agent_did, reason,
+    )
+    return ConstitutionRagIndex(
+        agent_did=agent_did,
+        chunks=len(stored),
+        unembedded=unembedded,
+        misprofiled=misprofiled,
+        reason=reason,
+    )
 
 
 def _backup_db(db_path: Path) -> Path:

@@ -1356,6 +1356,22 @@ def cmd_constitution_reanchor(args) -> int:
         f"{target}\n"
         f"{backup_line}"
     )
+    rag = result.rag_index
+    if rag is not None and rag.needs_reindex:
+        # The governance write landed, so this is not a failure exit. But a
+        # chunk with no vector, or one stamped with the wrong profile, is
+        # invisible to vector search, and until #3418 47 of them per agent
+        # were stored with nothing said above INFO.
+        print(
+            f"warning: {rag.needs_reindex} of {rag.chunks} constitution chunks "
+            f"cannot be found by vector search: {rag.reason}\n"
+            f"  Keyword search finds them; vector search cannot until they "
+            f"are re-embedded. Once an embedding route resolves for this "
+            f"agent, run:\n"
+            f"  kestrel embeddings reindex --agent-name {result.agent_name} "
+            f"--agent-id {rag.agent_did} --yes",
+            file=sys.stderr,
+        )
     return 0
 
 
