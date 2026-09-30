@@ -444,13 +444,16 @@ class TestEmbeddingSerialization:
 
     def test_serialize_deserialize_embedding(self):
         """Test embedding roundtrip."""
+        from kestrel_sovereign.storage.embedding_column import (
+            decode_stored_embedding,
+        )
         from kestrel_sovereign.storage.saved_items_store import (
-            _serialize_embedding, _deserialize_embedding
+            _serialize_embedding,
         )
 
         original = [0.1, 0.2, 0.3, 0.4, 0.5]
         serialized = _serialize_embedding(original)
-        deserialized = _deserialize_embedding(serialized)
+        deserialized = decode_stored_embedding(serialized)
 
         assert len(deserialized) == len(original)
         for i in range(len(original)):
@@ -458,14 +461,17 @@ class TestEmbeddingSerialization:
 
     def test_serialize_large_embedding(self):
         """Test serializing larger embedding vector."""
+        from kestrel_sovereign.storage.embedding_column import (
+            decode_stored_embedding,
+        )
         from kestrel_sovereign.storage.saved_items_store import (
-            _serialize_embedding, _deserialize_embedding
+            _serialize_embedding,
         )
 
         # Typical embedding size (768 dimensions)
         original = [float(i) / 768 for i in range(768)]
         serialized = _serialize_embedding(original)
-        deserialized = _deserialize_embedding(serialized)
+        deserialized = decode_stored_embedding(serialized)
 
         assert len(deserialized) == 768
         assert abs(deserialized[100] - original[100]) < 0.0001

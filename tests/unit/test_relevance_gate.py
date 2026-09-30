@@ -247,23 +247,31 @@ class TestRAGMinScoreFilter:
         import kestrel_sovereign.llm.embedding_service as emb_mod
         monkeypatch.setattr(emb_mod, "cosine_similarity", fake_cosine)
 
-        # Stub the deserializer so embeddings stay distinct per chunk
-        monkeypatch.setattr(
-            rag_mod, "_deserialize_embedding",
-            lambda blob: [float(blob[0]), 0.0, 0.0],
-        )
+        # Stub DB rows: (chunk_id, file_hash, content, stored embedding).
+        # Each chunk's first component keys its score in ``scores``.
+        import struct
 
-        # Stub DB rows: (chunk_id, file_hash, content, embedding_blob)
         store = AsyncRAGStore.__new__(AsyncRAGStore)
 
         async def fake_fetchall(sql, *args):
             return [
-                (1, "fileA", "high relevance chunk", bytes([1])),
-                (2, "fileB", "borderline chunk", bytes([2])),
-                (3, "fileC", "noise chunk", bytes([3])),
+                (1, "fileA", "high relevance chunk", struct.pack("<3f", 1, 0, 0)),
+                (2, "fileB", "borderline chunk", struct.pack("<3f", 2, 0, 0)),
+                (3, "fileC", "noise chunk", struct.pack("<3f", 3, 0, 0)),
             ]
 
-        store.db = type("FakeDB", (), {"fetchall": staticmethod(fake_fetchall)})()
+        async def fake_column_exists(table, column):
+            return True
+
+        store.db = type(
+            "FakeDB",
+            (),
+            {
+                "backend_type": "sqlite",
+                "fetchall": staticmethod(fake_fetchall),
+                "column_exists": staticmethod(fake_column_exists),
+            },
+        )()
 
         # With floor 0.5: chunks 2 (0.4) and 3 (0.1) drop; only chunk 1 survives.
         results = await store._search_by_embedding("q", limit=10, min_score=0.5)
