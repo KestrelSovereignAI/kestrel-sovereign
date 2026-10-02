@@ -57,6 +57,9 @@ from .invocation_context import (
 )
 from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import BackendType, RemoteBackendMixin
+from .decision_service import DecisionServiceMixin
+from .decisions.resolve import RouteDecisionState
+from .decisions.config import DecisionRouteConfig
 from kestrel_sovereign.kestrel_config.constants import (
     CLIENT_CLOSE_TIMEOUT,
 )
@@ -347,7 +350,7 @@ def _warn_no_llm_config_found() -> None:
     logger.warning("\n  ".join(hint_lines))
 
 
-class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, StreamingMixin, ConstitutionalAwarenessMixin, RemoteBackendMixin):
+class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, StreamingMixin, ConstitutionalAwarenessMixin, RemoteBackendMixin):
     """Unified LLM service with provider fallback and remote GPU support."""
 
     # Class-level default so tests that construct via ``__new__`` (bypassing
@@ -417,6 +420,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         except ProviderInitializationError as e:
             logger.error(f"Failed to initialize providers: {e}")
             self.providers = []
+        # Decisions modality (#3424): ``[llm] decision_*`` and
+        # ``[decisions.thresholds]``. Invalid config raises here.
+        self._init_decisions()
 
         # Model discovery uses process-wide SharedModelCache (see model_cache.py).
         # Pre-populate from disk if this is the first LLMService instance.
@@ -3092,6 +3098,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 "embedding_sibling": getattr(
                     provider, "_kestrel_embedding_sibling", None
                 ),
+                # #3424 per-route decision config (``decision_model``,
+                # ``decision_hints``, ``decision_context_limit``) plus the
+                # discovery/pin state the decide path reads.
+                "decision_state": RouteDecisionState(
+                    config=getattr(provider, "_kestrel_decision_config", None)
+                    or DecisionRouteConfig()
+                ),
             })
         return out
 
@@ -3363,6 +3376,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             "cost",
             "cache_creation_input_tokens",
             "cache_read_input_tokens",
+            # #3424: which modality the usage came from ("chat" | "decision").
+            # Passed only to callbacks that name it explicitly.
+            "modality",
         }
         accepted_optional: set[str] = set()
         try:
@@ -3858,8 +3874,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         cost: Optional[float] = None,
         usage_available: bool = True,
         invocation_context: Optional[LLMInvocationContext] = None,
+        modality: str = "chat",
+        caller: Optional[str] = None,
     ) -> None:
         """Log an LLM call to the observability store (if configured).
+
+        ``modality`` selects the Prometheus series: chat calls keep
+        ``kestrel_llm_*`` exactly as before; decision calls (#3424) count only
+        in ``kestrel_llm_decision_*`` (labelled by ``caller``) so they never
+        change what the chat series mean.
 
         This is called automatically by get_response() and generate().
         Also triggers metering callback for billing (Vending Machine).
@@ -3969,7 +3992,24 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 LLM_TOKENS,
             )
 
-            if _prom:
+            if _prom and modality == "decision":
+                from kestrel_sdk.metrics import (
+                    DECISION_CALLS,
+                    DECISION_DURATION,
+                    DECISION_TOKENS,
+                )
+
+                label_caller = caller or "unknown"
+                DECISION_CALLS.labels(
+                    provider=provider, model=model, caller=label_caller,
+                    success=str(success),
+                ).inc()
+                DECISION_DURATION.labels(
+                    provider=provider, model=model, caller=label_caller
+                ).observe(duration_ms / 1000)
+                if input_tokens is not None:
+                    DECISION_TOKENS.labels(model=model).inc(input_tokens)
+            elif _prom:
                 LLM_CALLS.labels(
                     provider=provider, model=model, success=str(success)
                 ).inc()
@@ -4025,6 +4065,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     "cost": cost,
                     "cache_creation_input_tokens": cache_creation_input_tokens,
                     "cache_read_input_tokens": cache_read_input_tokens,
+                    "modality": modality,
                 }
                 # Only pass optional fields to callbacks that opted in; this
                 # keeps callbacks written against the original signature live.
@@ -4061,6 +4102,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 "session_id": context.session_id,
                 "correlation_id": context.correlation_id,
             }
+            if modality != "chat":
+                usage_log["modality"] = modality
+                usage_log["caller"] = caller
             logger.info("llm.usage: %s", json.dumps(usage_log, default=str))
         except Exception as log_err:
             logger.warning("llm.usage log failed: %s", log_err)
@@ -4837,6 +4881,7 @@ No other text or formatting.
     async def close(self):
         """Close all async HTTP clients properly."""
         await self.drain_preference_persistence()
+        await self.drain_decision_records()
 
         for provider in self.providers:
             # Adapter-owned resources (e.g. CodexAdapter's app-server
