@@ -801,7 +801,6 @@ def test_resolve_db_target_refuses_db_path_from_kestrel_home(monkeypatch, tmp_pa
     # elsewhere, set KESTREL_DB_PATH, and confirm the refusal still fires
     # rather than KESTREL_DB_PATH silently winning (#2327).
     import argparse
-    import os
 
     from kestrel_sovereign import cli_embeddings
 
@@ -864,26 +863,13 @@ async def test_load_persisted_embedding_route(db):
 def _cli_context_service(provider):
     """A freshly-constructed process-local ``LLMService`` (CLI context).
 
-    Mirrors the ``__new__`` build used by ``test_embedding_route_model`` — no
-    boot-time pin-load or embedding discovery has run, so a route with empty
-    static capabilities advertises no embedding support (the #2361 starting
-    state).
+    No boot-time pin-load or embedding discovery has run, so a route with
+    empty static capabilities advertises no embedding support (the #2361
+    starting state).
     """
-    from kestrel_sovereign.llm.service import LLMService
+    from tests.utils.process_local_llm_service import process_local_service
 
-    service = LLMService.__new__(LLMService)
-    service.providers = [provider]
-    service._route_embedding_model_overrides = {}
-    service._route_embedding_caps_backup = {}
-    service._route_embedding_model_persistence_callback = None
-    service._embedding_route_persistence_callback = None
-    service._embedding_discovery_cache = []  # empty → discovery is a no-op
-    service._force_local_only_provider = None
-    service._embedding_space_pins = None
-    service._verified_space_pins = {}
-    service._embedding_route = None
-    service.disabled = False
-    return service
+    return process_local_service([provider])
 
 
 @pytest.mark.asyncio

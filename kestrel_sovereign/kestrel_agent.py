@@ -3735,6 +3735,11 @@ class KestrelAgent(
                 self._persist_route_embedding_models
             )
 
+        # Record the embedding profile the loaded config resolves, so offline
+        # tools (`kestrel embeddings reindex` / `verify`) can compare their own
+        # resolution against it (#3420).
+        await self.record_active_embedding_profile()
+
         # Cache the features prompt (built once at session start)
         self._cached_features_prompt = self._build_features_prompt_section()
 
