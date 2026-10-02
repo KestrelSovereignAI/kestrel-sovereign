@@ -215,7 +215,7 @@ async def test_evaluate_model_runs_under_the_eval_caller_and_counts_errors() -> 
 def test_report_and_snippet_rendering() -> None:
     full = ev.ModelReport("ollama:local/tev1", "ollama:local", "tev1",
                           metrics=[ev.KeyMetrics("answers", "noul", 4, 1.0, 0.02, 0.05, 0.42)],
-                          latencies_ms=[100, 120, 140, 400])
+                          latencies_ms=[100, 120, 140, 400], expected_keys=["answers"])
     partial = ev.ModelReport("openrouter:api/x", "openrouter:api", "x",
                              metrics=[ev.KeyMetrics("answers", "noul", 2, 0.5, 0.3, 0.2, None,
                                                     note="needs both")])
@@ -225,8 +225,8 @@ def test_report_and_snippet_rendering() -> None:
     snippet = ev.render_threshold_snippet([full, partial], caller="memory_answerability",
                                           samples=4, sample_hash="ab" * 32,
                                           today=date(2026, 10, 2))
-    assert '[decisions.thresholds.memory_answerability.models."ollama:local/tev1"]' in snippet
-    assert "answers = 0.42" in snippet and "2026-10-02" in snippet and "abababababab" in snippet
+    assert '[decisions.thresholds."memory_answerability".models."ollama:local/tev1"]' in snippet
+    assert '"answers" = 0.42' in snippet and "2026-10-02" in snippet and "abababababab" in snippet
     assert "openrouter:api/x" not in snippet  # partial calibration is never offered
 
 
@@ -296,3 +296,36 @@ async def test_private_samples_default_to_local_routes(tmp_path: Path, monkeypat
     assert await cli_decisions._eval(_CliService(), args(allow_cloud=True)) == 0
     assert "openrouter:api/typesafe/jev-1.13" in [s["selector"] for s in seen]
     assert not any(s["local_only"] for s in seen)
+
+
+def test_snippet_requires_a_complete_run_and_parses_as_toml() -> None:
+    import tomllib
+
+    good = ev.ModelReport("ollama:local/tev1", "ollama:local", "tev1",
+                          metrics=[ev.KeyMetrics("answer.score", "noul", 4, 1.0, 0.0, 0.0, 0.4)],
+                          expected_keys=["answer.score"])
+    errored = ev.ModelReport("a:b/m", "a:b", "m", errors={"DecisionTimeout": 1},
+                             metrics=[ev.KeyMetrics("answers", "noul", 4, 1.0, 0.0, 0.0, 0.4)],
+                             expected_keys=["answers"])
+    uncovered = ev.ModelReport("c:d/m", "c:d", "m",
+                               metrics=[ev.KeyMetrics("a", "noul", 4, 1.0, 0.0, 0.0, 0.4)],
+                               expected_keys=["a", "b"])
+    assert errored.proposal_blocker() == "some samples failed"
+    assert "b" in uncovered.proposal_blocker()
+
+    snippet = ev.render_threshold_snippet([good, errored, uncovered], caller="x.y",
+                                          samples=4, sample_hash="cd" * 32)
+    parsed = tomllib.loads(snippet)
+    assert parsed["decisions"]["thresholds"]["x.y"]["models"]["ollama:local/tev1"] == {"answer.score": 0.4}
+    assert "a:b/m" not in snippet and "c:d/m" not in snippet
+    text = ev.render_report([errored], samples=4, sample_hash="cd" * 32)
+    assert "no calibration proposal: some samples failed" in text
+
+
+@pytest.mark.asyncio
+async def test_default_samples_must_exist(tmp_path: Path, capsys) -> None:
+    args = argparse.Namespace(caller="no_such_caller", samples=None, route=None, model=None,
+                              local_only=False, allow_cloud=False, timeout=5.0, concurrency=1,
+                              target_accuracy=0.9, json=None)
+    assert await cli_decisions._eval(_CliService(), args) == 2
+    assert "no shipped sample set" in capsys.readouterr().err

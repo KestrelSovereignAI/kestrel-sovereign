@@ -143,6 +143,12 @@ async def _models(service: Any, args: argparse.Namespace) -> int:
 
 
 async def _eval(service: Any, args: argparse.Namespace) -> int:
+    if args.samples is None and not (PACKAGED_SAMPLES_DIR / args.caller).is_dir():
+        print(
+            f"ERROR: no shipped sample set for caller {args.caller!r}; pass --samples",
+            file=sys.stderr,
+        )
+        return 2
     paths = args.samples or [PACKAGED_SAMPLES_DIR / args.caller]
     try:
         files = sample_files(paths)

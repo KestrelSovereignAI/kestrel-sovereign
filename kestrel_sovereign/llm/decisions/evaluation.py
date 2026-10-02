@@ -320,6 +320,25 @@ class ModelReport:
     metrics: List[KeyMetrics] = field(default_factory=list)
     latencies_ms: List[int] = field(default_factory=list)
     errors: Dict[str, int] = field(default_factory=dict)
+    expected_keys: List[str] = field(default_factory=list)
+
+    def proposal_blocker(self) -> Optional[str]:
+        """Why this run cannot back a calibration, or ``None`` if it can.
+
+        A proposal must come from a complete run: every sample answered and
+        every threshold key in the sample set covered with a threshold.
+        Anything less is biased by the missing labels (§2.5, §9).
+        """
+
+        if self.errors:
+            return "some samples failed"
+        if not self.metrics:
+            return "no answers"
+        covered = {m.key for m in self.metrics if m.proposed_threshold is not None}
+        missing = sorted((set(self.expected_keys) | {m.key for m in self.metrics}) - covered)
+        if missing:
+            return f"no threshold for key(s) {', '.join(missing)}"
+        return None
 
     def latency(self, quantile: float) -> Optional[float]:
         if not self.latencies_ms:
@@ -353,7 +372,12 @@ async def evaluate_model(
     """Run every sample against one model (``<vendor>:<route>/<model>``)."""
 
     route, _, model = selector.partition("/")
-    report = ModelReport(selector=selector, route=route, model=model)
+    expected_keys = sorted({
+        sample.threshold_keys.get(qid, qid)
+        for sample in samples
+        for qid in sample.request.questions
+    })
+    report = ModelReport(selector=selector, route=route, model=model, expected_keys=expected_keys)
     gate = asyncio.Semaphore(max(1, concurrency))
     observations: List[Observation] = []
 
@@ -392,6 +416,12 @@ async def evaluate_model(
 # ---------------------------------------------------------------------------
 
 
+def _toml_key(key: str) -> str:
+    """A TOML quoted key. JSON string escaping is valid TOML basic-string syntax."""
+
+    return json.dumps(key, ensure_ascii=False)
+
+
 def _fmt(value: Optional[float], digits: int = 3) -> str:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return "-"
@@ -407,6 +437,9 @@ def render_report(reports: Sequence[ModelReport], *, samples: int, sample_hash: 
             f"p50={_fmt(report.latency(0.5), 0)}ms  p95={_fmt(report.latency(0.95), 0)}ms  "
             f"errors: {errors}"
         )
+        blocker = report.proposal_blocker()
+        if blocker:
+            lines.append(f"  no calibration proposal: {blocker}")
         for m in report.metrics:
             extra = "  ".join(f"{k}={_fmt(v)}" for k, v in sorted(m.extra.items()))
             lines.append(
@@ -425,18 +458,22 @@ def render_threshold_snippet(
 ) -> str:
     """TOML the operator may paste into ``kestrel.toml`` to accept proposals.
 
-    Only models with a proposal for every key they answered are included, so
-    the snippet never declares a partial calibration (§2.5).
+    Only complete runs are included (see :meth:`ModelReport.proposal_blocker`),
+    so the snippet never declares a partial or biased calibration (§2.5).
+    Every key is quoted: threshold keys and caller ids may contain dots, which
+    TOML would otherwise read as nested tables.
     """
 
     stamp = (today or date.today()).isoformat()
     blocks: List[str] = []
     for report in reports:
-        if not report.metrics or any(m.proposed_threshold is None for m in report.metrics):
+        if report.proposal_blocker() is not None:
             continue
-        body = "\n".join(f"{m.key} = {m.proposed_threshold}" for m in report.metrics)
+        body = "\n".join(
+            f"{_toml_key(m.key)} = {m.proposed_threshold}" for m in report.metrics
+        )
         blocks.append(
             f"# kestrel decisions eval {stamp}: {samples} samples, set sha256:{sample_hash[:12]}\n"
-            f'[decisions.thresholds.{caller}.models."{report.selector}"]\n{body}'
+            f"[decisions.thresholds.{_toml_key(caller)}.models.{_toml_key(report.selector)}]\n{body}"
         )
     return "\n\n".join(blocks) + ("\n" if blocks else "")
