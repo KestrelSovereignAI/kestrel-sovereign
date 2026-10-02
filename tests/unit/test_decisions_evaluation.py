@@ -317,6 +317,16 @@ def test_snippet_requires_a_complete_run_and_parses_as_toml() -> None:
                                           samples=4, sample_hash="cd" * 32)
     parsed = tomllib.loads(snippet)
     assert parsed["decisions"]["thresholds"]["x.y"]["models"]["ollama:local/tev1"] == {"answer.score": 0.4}
+    assert parsed["decisions"]["thresholds"]["x.y"]["uncalibrated"] == "refuse"
+
+    # Pasted on its own, the proposal is usable: the calibrated model admits
+    # requests and nothing is refused for a missing default table.
+    from kestrel_sovereign.llm.decisions.thresholds import ThresholdBook
+
+    book = ThresholdBook.from_config(parsed["decisions"])
+    book.check_request("x.y", ["answer.score"])
+    assert book.admits("x.y", "ollama:local/tev1", ["answer.score"])
+    assert not book.admits("x.y", "other:route/m", ["answer.score"])
     assert "a:b/m" not in snippet and "c:d/m" not in snippet
     text = ev.render_report([errored], samples=4, sample_hash="cd" * 32)
     assert "no calibration proposal: some samples failed" in text

@@ -586,4 +586,16 @@ def render_threshold_snippet(
             f"# kestrel decisions eval {stamp}: {samples} samples, set sha256:{sample_hash[:12]}\n"
             f"[decisions.thresholds.{_toml_key(caller)}.models.{_toml_key(report.selector)}]\n{body}"
         )
-    return "\n\n".join(blocks) + ("\n" if blocks else "")
+    if not blocks:
+        return ""
+    # The caller table's policy makes the proposal complete on its own: a
+    # caller with no built-in defaults, under the implicit "default" policy
+    # and no default table, would have every request refused (§2.5).
+    header = (
+        f"[decisions.thresholds.{_toml_key(caller)}]\n"
+        "# \"refuse\": only the calibrated models below may answer this caller.\n"
+        "# \"default\" lets uncalibrated models answer too, using the caller's\n"
+        "# built-in defaults or a `default = { <key> = <threshold> }` table.\n"
+        'uncalibrated = "refuse"'
+    )
+    return header + "\n\n" + "\n\n".join(blocks) + "\n"
