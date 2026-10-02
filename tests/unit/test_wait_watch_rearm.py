@@ -15,11 +15,13 @@ Two changes, both pinned here against the real reconciler and store:
   reconciler dedups on that identity, and the CI provider names one built
   from the head SHA plus the completed check runs' ids and attempts.
 
-The check runs are named differently by the Checks API and its Actions
-fallback, so they travel as a view-scoped detail
-(``TERMINAL_EVENT_DETAIL_KEY``/``TERMINAL_EVENT_VIEW_KEY``) that the
-reconciler compares only within one view: a credential that gains or loses
-the Checks API is not a new event.
+A watch fires on a new execution, never on a change of view. The Checks API
+and its Actions fallback name one execution's records differently, so the
+execution set travels as a view-scoped detail
+(``TERMINAL_EVENT_DETAIL_KEY``/``TERMINAL_EVENT_VIEW_KEY``). Within one view
+the sets are compared; across views the outcome is not consulted at all — the
+reconciler re-baselines onto the new view without a wake, so a credential that
+gains or loses the Checks API is not a new event.
 
 The dispatcher and providers are test doubles; the CI scenarios run the real
 ``CIWaitable.poll`` and ``classify_ci_state`` over fabricated GitHub records,
@@ -46,6 +48,7 @@ from kestrel_sovereign.signals.sources.github_pr_watch import (
 )
 from kestrel_sovereign.waits.engine import (
     TERMINAL_EVENT_DETAIL_KEY,
+    TERMINAL_EVENT_FINAL_KEY,
     TERMINAL_EVENT_KEY,
     TERMINAL_EVENT_VIEW_KEY,
     WaitRegistry,
@@ -260,6 +263,124 @@ async def test_an_upgrade_adoption_keeps_a_rearmed_watch_armed(make_agent):
     assert len(_wakes(agent)) == 2
 
 
+@pytest.mark.asyncio
+async def test_after_an_upgrade_every_later_event_wakes_as_its_own_transition(
+    make_agent,
+):
+    """Review finding on #3399: an upgraded row keeps its delivered outcome
+    token as its attempt target. Re-keying only the delivered token let every
+    later failure match that stale target by outcome, so it was emitted as a
+    retry under the old string and the event after it was read as old news.
+    Each new head commit's failure must wake, as attempt 1, under its own
+    token — including when the watch is re-registered inside the previous
+    wake's turn, before its delivery is harvested."""
+    ci = doubles._PollOnlyProvider(kind="ci")
+    ci.set("o/r#1", Outcome.FAILED)  # a pre-#3399 provider: outcome token
+    agent = await make_agent(ci)
+    store = agent._wait_reconciler._store
+    await register_wait_watch(agent, "ci:o/r#1")
+    await _settle(agent)
+    await register_wait_watch(agent, "ci:o/r#1")
+    ci.set("o/r#1", Outcome.FAILED, data=_event("head@s1", "set-1", "check_runs"))
+    await _settle(agent)  # the upgrade re-keys the delivered failure
+    assert len(_wakes(agent)) == 1
+    row = await store.get("ci", "o/r#1")
+    assert row.attempts_signaled_target == row.last_signaled_outcome
+
+    for n, head in enumerate(["s2", "s3", "s4"], start=2):
+        ci.set("o/r#1", Outcome.FAILED, data=_event(f"head@{head}", "set-1", "check_runs"))
+        await agent._wait_reconciler.reconcile()  # this failure's wake is enqueued
+        await register_wait_watch(agent, "ci:o/r#1")  # inside its turn
+        ci.set("o/r#1", Outcome.PENDING)  # the next push's CI is running
+        await _settle(agent)
+
+        assert len(_wakes(agent)) == n
+        wake = _wakes(agent)[-1]
+        assert wake.payload[TERMINAL_EVENT_KEY] == f"head@{head}"
+        assert wake.payload["delivery_attempt"] == 1, "news, not a retry"
+        assert (await _delivered(agent, "ci", "o/r#1")).event == f"head@{head}"
+        assert len(await store.list_watched()) == 1
+
+
+@pytest.mark.asyncio
+async def test_after_a_view_switch_every_rerun_wakes_once(make_agent):
+    """Review finding on #3399: after a re-baseline onto a new view, the
+    delivered transition's attempt target still named the old view, so each
+    later re-run matched it across views and was emitted as a retry of it —
+    only every other re-run woke, and the attempt count climbed to the lock."""
+    jobs = doubles._PollOnlyProvider(kind="job")
+    jobs.set("h1", Outcome.FAILED, data=_event("head@a", "run-1", "check_runs"))
+    agent = await make_agent(jobs)
+    await register_wait_watch(agent, "job:h1")
+    await _settle(agent)
+    await register_wait_watch(agent, "job:h1")
+    jobs.set("h1", Outcome.FAILED, data=_event("head@a", "wf-1#1", "workflow_runs"))
+    await _settle(agent)  # re-baselined, no wake
+    assert len(_wakes(agent)) == 1
+
+    for attempt in range(2, 14):
+        await register_wait_watch(agent, "job:h1")
+        jobs.set(
+            "h1", Outcome.FAILED,
+            data=_event("head@a", f"wf-1#{attempt}", "workflow_runs"),
+        )
+        await _settle(agent)
+        await _settle(agent)
+        assert len(_wakes(agent)) == attempt, f"re-run {attempt} woke once"
+        assert _wakes(agent)[-1].payload["delivery_attempt"] == 1
+
+
+# ---------------------------------------------------------------------------
+# A final event: nothing can follow it, so a re-armed watch is retired
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_watch_rearmed_over_a_final_event_is_retired_not_polled(
+    make_agent, caplog,
+):
+    """Review finding on #3399: a re-armed watch waits for an event other
+    than the delivered one. Over a merged PR there is none, so polling it
+    every tick forever would spend GitHub requests on a wake that cannot
+    come."""
+    ci = doubles._PollOnlyProvider(kind="ci")
+    merged = {**_event("merged@a"), TERMINAL_EVENT_FINAL_KEY: True}
+    ci.set("o/r#1", Outcome.DONE, data=merged)
+    agent = await make_agent(ci)
+    store = agent._wait_reconciler._store
+    await register_wait_watch(agent, "ci:o/r#1")
+    await _settle(agent)
+    assert len(_wakes(agent)) == 1
+    assert await store.list_watched() == []
+
+    await register_wait_watch(agent, "ci:o/r#1")
+    assert len(await store.list_watched()) == 1, "registration re-arms"
+    with caplog.at_level("INFO", logger="kestrel_sovereign.waits.reconciler"):
+        await _settle(agent)
+
+    assert len(_wakes(agent)) == 1
+    assert await store.list_watched() == []
+    assert any("retired" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_watch_rearmed_while_its_final_wake_is_in_flight_is_retired(
+    make_agent,
+):
+    ci = doubles._PollOnlyProvider(kind="ci")
+    ci.set("o/r#1", Outcome.DONE, data={**_event("merged@a"), TERMINAL_EVENT_FINAL_KEY: True})
+    agent = await make_agent(ci)
+    store = agent._wait_reconciler._store
+    await register_wait_watch(agent, "ci:o/r#1")
+    await agent._wait_reconciler.reconcile()  # the merge's wake is enqueued
+    await register_wait_watch(agent, "ci:o/r#1")  # inside that wake's turn
+    await _settle(agent)
+    await _settle(agent)
+
+    assert len(_wakes(agent)) == 1
+    assert await store.list_watched() == []
+
+
 # ---------------------------------------------------------------------------
 # The ledger token
 # ---------------------------------------------------------------------------
@@ -284,6 +405,37 @@ def test_an_unreadable_identity_token_matches_no_event(stored):
     parsed = TerminalToken.parse(stored)
     assert parsed == TerminalToken(stored)
     assert not parsed.names_same_event(TerminalToken("failed", "x"))
+
+
+@pytest.mark.parametrize(("delivered", "current", "same", "switch"), [
+    # Same head SHA, same view: new iff the execution set differs.
+    (TerminalToken("failed", "head@a", "set-1", "checks"),
+     TerminalToken("failed", "head@a", "set-1", "checks"), True, False),
+    (TerminalToken("failed", "head@a", "set-1", "checks"),
+     TerminalToken("failed", "head@a", "set-2", "checks"), False, False),
+    # Same head SHA, different view: never new, whatever either outcome says.
+    (TerminalToken("done", "head@a", "set-1", "checks"),
+     TerminalToken("partial", "head@a", "set-9", "actions"), True, True),
+    (TerminalToken("failed", "head@a", "set-1", "checks"),
+     TerminalToken("done", "head@a", "set-9", "actions"), True, True),
+    # New head SHA: always new, through any view, with any outcome.
+    (TerminalToken("failed", "head@a", "set-1", "checks"),
+     TerminalToken("failed", "head@b", "set-1", "checks"), False, False),
+    (TerminalToken("failed", "head@a", "set-1", "checks"),
+     TerminalToken("failed", "head@b", "set-9", "actions"), False, False),
+    # The outcome is no part of an identity: a reclassified event is old news.
+    (TerminalToken("failed:blocked", "job@t0"),
+     TerminalToken("partial:clarifying", "job@t0"), True, False),
+    # No identity on one side: the outcome is all the two share.
+    (TerminalToken("failed"),
+     TerminalToken("failed", "head@a", "set-1", "checks"), True, False),
+    (TerminalToken("failed"),
+     TerminalToken("done", "head@a", "set-1", "checks"), False, False),
+])
+def test_one_execution_is_one_event_through_every_view(delivered, current, same, switch):
+    assert delivered.names_same_event(current) is same
+    assert current.names_same_event(delivered) is same
+    assert current.switches_view_from(delivered) is switch
 
 
 # ---------------------------------------------------------------------------
@@ -317,20 +469,37 @@ async def test_a_view_change_alone_is_not_a_new_event(make_agent):
 
 
 @pytest.mark.asyncio
-async def test_across_a_view_change_a_different_outcome_is_news(make_agent):
-    """Across views the outcome is the only shared evidence. A re-run that
-    passes, first seen through the other path, still wakes."""
+async def test_across_a_view_change_the_outcome_is_not_consulted(make_agent, caplog):
+    """The ruling on #3399's review: the outcome is never part of the identity,
+    and the same head SHA through a different view is not a new event, even
+    when the two views classify it differently. The watch is re-baselined onto
+    the new view, so a genuine re-run seen through that view still fires."""
     jobs = doubles._PollOnlyProvider(kind="job")
-    jobs.set("h1", Outcome.FAILED, data=_event("sha-1", "check-run-101", "checks"))
+    jobs.set("h1", Outcome.DONE, data=_event("sha-1", "check-run-101", "checks"))
     agent = await make_agent(jobs)
     await register_wait_watch(agent, "job:h1")
     await _settle(agent)
     await register_wait_watch(agent, "job:h1")
 
-    jobs.set("h1", Outcome.DONE, data=_event("sha-1", "workflow-9001#2", "actions"))
+    jobs.set("h1", Outcome.PARTIAL, data=_event("sha-1", "workflow-9001#1", "actions"))
+    with caplog.at_level("INFO", logger="kestrel_sovereign.waits.reconciler"):
+        await _settle(agent)
+
+    assert len(_wakes(agent)) == 1
+    switches = [r for r in caplog.records if "re-baselined" in r.getMessage()]
+    assert len(switches) == 1 and switches[0].levelname == "INFO"
+    assert "'actions'" in switches[0].getMessage()
+    delivered = await _delivered(agent, "job", "h1")
+    assert (delivered.view, delivered.detail) == ("actions", "workflow-9001#1")
+    store = agent._wait_reconciler._store
+    [watch] = await store.list_watched()
+    assert watch.watch_baseline == delivered.render(), "the baseline moved with it"
+
+    jobs.set("h1", Outcome.PARTIAL, data=_event("sha-1", "workflow-9001#2", "actions"))
     await _settle(agent)
 
-    assert [w.payload["outcome"] for w in _wakes(agent)] == ["failed", "done"]
+    assert [w.payload["outcome"] for w in _wakes(agent)] == ["done", "partial"]
+    assert await store.list_watched() == []
 
 
 @pytest.mark.asyncio
@@ -348,6 +517,48 @@ async def test_across_a_view_change_a_new_event_identity_is_news(make_agent):
     await _settle(agent)
 
     assert len(_wakes(agent)) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_view_switch_does_not_swallow_an_owed_rerun_wake(make_agent):
+    """Review finding on #3399: a re-run judged new and emitted, whose wake
+    soft-failed, is OWED. When the next poll reads that same execution
+    through another view, the cross-view rule says it is the same event as
+    the one delivered before the re-run — but the owed wake must still be
+    retried, not re-keyed away. (A host restart to rotate the token is the
+    realistic trigger: the in-flight wake is lost and the credential's view
+    changes in the same tick.)"""
+    jobs = doubles._PollOnlyProvider(kind="job")
+    jobs.set("h1", Outcome.FAILED, data=_event("head@a", "set-1", "check_runs"))
+    agent = await make_agent(jobs)
+    store = agent._wait_reconciler._store
+    await register_wait_watch(agent, "job:h1")
+    await _settle(agent)
+    await register_wait_watch(agent, "job:h1")
+
+    jobs.set("h1", Outcome.FAILED, data=_event("head@a", "set-2", "check_runs"))
+    agent.dispatcher._status = Status.FAILED  # the re-run's wake soft-fails
+    await _settle(agent)
+    owed = await store.get("job", "h1")
+    assert owed.last_signaled_outcome != owed.attempts_signaled_target
+
+    agent.dispatcher._status = Status.OK
+    jobs.set("h1", Outcome.FAILED, data=_event("head@a", "wf-1#2", "workflow_runs"))
+    await _settle(agent)
+
+    row = await store.get("job", "h1")
+    assert row.last_signaled_outcome == owed.attempts_signaled_target, (
+        "the owed re-run wake was delivered under its own token"
+    )
+    assert _wakes(agent)[-1].payload["delivery_attempt"] > 1, "a retry of it"
+    assert await store.list_watched() == [], "the re-armed watch fired"
+    delivered_count = len(_wakes(agent))
+
+    await register_wait_watch(agent, "job:h1")
+    await _settle(agent)  # the same execution again: re-baselined, no wake
+    assert len(_wakes(agent)) == delivered_count
+    assert (await _delivered(agent, "job", "h1")).view == "workflow_runs"
+    assert len(await store.list_watched()) == 1
 
 
 @pytest.mark.asyncio
@@ -439,8 +650,8 @@ async def test_a_ci_rerun_that_fails_again_wakes_a_rearmed_watch(ci_rig):
         (w.payload[TERMINAL_EVENT_KEY], w.payload[TERMINAL_EVENT_DETAIL_KEY])
         for w in _wakes(agent)
     )
-    assert first[0] == second[0], "same head commit, no legacy statuses"
-    assert first[1] != second[1], "the re-run's check run is the new event"
+    assert first[0] == second[0], "same head commit"
+    assert first[1] != second[1], "the re-run's check run is a new execution set"
 
 
 @pytest.mark.asyncio
@@ -525,6 +736,41 @@ async def test_rearming_from_inside_the_failure_wake_still_wakes_on_the_rerun(
     assert [w.payload["outcome"] for w in _wakes(agent)] == ["failed", "done"]
 
 
+@pytest.mark.asyncio
+async def test_a_ci_watch_rearmed_over_a_merge_is_retired(ci_rig):
+    agent, github = ci_rig.agent, ci_rig.github
+    store = agent._wait_reconciler._store
+    github.pr = {**PR_OPEN, "state": "closed", "merged": True}
+    github.runs(_run(101, conclusion="success"))
+    await register_wait_watch(agent, ci_rig.ref)
+    await _settle(agent)
+    await register_wait_watch(agent, ci_rig.ref)
+    await _settle(agent)
+
+    assert [w.payload["outcome"] for w in _wakes(agent)] == ["done"]
+    assert await store.list_watched() == []
+
+
+@pytest.mark.asyncio
+async def test_a_ci_watch_rearmed_over_a_close_waits_for_a_reopen(ci_rig):
+    """A closed PR can be reopened, so a close is not final: the re-armed
+    watch stays armed and wakes when the reopened PR's CI settles."""
+    agent, github = ci_rig.agent, ci_rig.github
+    store = agent._wait_reconciler._store
+    github.pr = {**PR_OPEN, "state": "closed", "closed_at": "2026-09-29T10:00:00Z"}
+    await register_wait_watch(agent, ci_rig.ref)
+    await _settle(agent)
+    await register_wait_watch(agent, ci_rig.ref)
+    await _settle(agent)
+    assert len(await store.list_watched()) == 1
+
+    github.pr = dict(PR_OPEN)
+    github.runs(_run(101, conclusion="success"))
+    await _settle(agent)
+
+    assert [w.payload["outcome"] for w in _wakes(agent)] == ["failed", "done"]
+
+
 # ---------------------------------------------------------------------------
 # The CI read path changing under a watch (review finding on #3399)
 # ---------------------------------------------------------------------------
@@ -580,30 +826,49 @@ async def http_rig(make_agent, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_checks_to_actions_to_checks_is_one_event_then_a_rerun_wakes(http_rig):
+@pytest.mark.parametrize(
+    ("conclusion", "outcome", "through_actions"),
+    [
+        ("failure", "failed", "failed"),
+        # The review's P1: one successful execution is DONE through Checks and
+        # PARTIAL through the narrower Actions fallback. Neither reading is a
+        # new execution.
+        ("success", "done", "partial"),
+    ],
+)
+async def test_checks_to_actions_to_checks_is_one_event_then_a_rerun_wakes(
+    http_rig, conclusion, outcome, through_actions,
+):
     agent, github = http_rig.agent, http_rig.github
-    github.execution(job_id=_ACTIONS_JOB, attempt=1)
+    store = agent._wait_reconciler._store
+    github.execution(job_id=_ACTIONS_JOB, attempt=1, conclusion=conclusion)
     await register_wait_watch(agent, http_rig.ref)
     await _settle(agent)
-    assert [w.payload["outcome"] for w in _wakes(agent)] == ["failed"]
+    assert [w.payload["outcome"] for w in _wakes(agent)] == [outcome]
     assert _wakes(agent)[0].payload[TERMINAL_EVENT_VIEW_KEY] == CHECKS_SOURCE_CHECK_RUNS
     await register_wait_watch(agent, http_rig.ref)  # re-run requested
 
     github.checks_readable = False  # the credential loses the Checks API
     await _settle(agent)
-    assert (await _delivered(agent, "ci", "o/r#3380")).view == (
-        CHECKS_SOURCE_WORKFLOW_RUNS
+    delivered = await _delivered(agent, "ci", "o/r#3380")
+    assert (delivered.view, delivered.outcome) == (
+        CHECKS_SOURCE_WORKFLOW_RUNS, through_actions,
     ), "the Actions read was actually taken"
+    assert len(await store.list_watched()) == 1, "still armed after the switch"
     github.checks_readable = True
     await _settle(agent)
 
     assert len(_wakes(agent)) == 1, "an unchanged execution is not news"
-    assert len(await agent._wait_reconciler._store.list_watched()) == 1
+    assert (await _delivered(agent, "ci", "o/r#3380")).view == CHECKS_SOURCE_CHECK_RUNS
+    assert len(await store.list_watched()) == 1
 
-    github.execution(job_id=_ACTIONS_JOB + 1, attempt=2)  # the re-run fails again
+    # The genuine re-run, with the same conclusion as the run it re-ran.
+    github.execution(job_id=_ACTIONS_JOB + 1, attempt=2, conclusion=conclusion)
+    await _settle(agent)
     await _settle(agent)
 
-    assert [w.payload["outcome"] for w in _wakes(agent)] == ["failed", "failed"]
+    assert [w.payload["outcome"] for w in _wakes(agent)] == [outcome, outcome]
+    assert await store.list_watched() == [], "fired once, then spent"
 
 
 @pytest.mark.asyncio

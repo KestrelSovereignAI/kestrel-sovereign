@@ -77,6 +77,7 @@ from kestrel_sovereign.storage.async_wait_signal_store import (
 )
 from kestrel_sovereign.waits.engine import (
     TERMINAL_EVENT_DETAIL_KEY,
+    TERMINAL_EVENT_FINAL_KEY,
     TERMINAL_EVENT_KEY,
     TERMINAL_EVENT_VIEW_KEY,
 )
@@ -152,7 +153,8 @@ class TerminalToken:
     what it always wrote, and to ``event:`` plus canonical JSON otherwise.
 
     The ledger's columns compare tokens as strings, but two strings can name
-    one event: the outcome is recorded with the identity, so a reclassified
+    one event: the outcome is recorded with the identity (it is the only
+    evidence a legacy outcome-only row can be compared on), so a reclassified
     event renders differently, and so does one re-read through another view.
     :meth:`names_same_event` is the one rule for that question.
     """
@@ -216,35 +218,43 @@ class TerminalToken:
     def names_same_event(self, other: "TerminalToken") -> bool:
         """Whether two tokens describe one terminal event.
 
-        Identities decide wherever they are comparable, and the outcome is
-        left out of that comparison: a classifier change that re-labels an
-        old event must not make it news (#3390). Where they are not
-        comparable, the outcome is the only evidence both sides share:
+        When both sides name an event, the outcome is never part of the
+        answer: a classifier change that re-labels an old event must not make
+        it news (#3390), and one execution can read DONE through one view and
+        PARTIAL through a narrower one. A watch fires on a new execution,
+        never on a change of view:
 
-        * one side names no event — a row delivered before its provider named
-          events, or a provider that names none;
-        * one event read through two views, whose details name records the
-          other view cannot see (GitHub's Checks and Actions APIs).
+        * a different event (for CI, a new head SHA) is always new;
+        * the same event through the same view is new if and only if the
+          details (for CI, the execution sets) differ;
+        * the same event through a different view is NOT new. Details from two
+          views name records the other cannot see (GitHub's Checks and Actions
+          APIs), so they cannot be compared; the caller re-baselines onto the
+          new view instead (see :meth:`switches_view_from`). Accepted limit: a
+          new execution whose first terminal read is also the view switch is
+          absorbed, and the next distinct one still fires.
 
-        Treating the outcome as the event there costs one wake at most: a
-        different event with the same outcome, settling across an upgrade or a
-        view change, is absorbed once. The alternative replays a delivered
-        event, and a watch that replays its own baseline has fired and no
-        longer waits for the event it was armed for.
+        When one side names no event — a row delivered before its provider
+        named events, or a provider that names none — the outcome is the only
+        evidence both share, and it decides. That costs one wake at most: a
+        different event with the same outcome, settling across the upgrade,
+        is absorbed once, where the alternative replays every delivered wake.
         """
         if self.event is None or other.event is None:
             return self.outcome == other.outcome
         if self.event != other.event:
             return False
-        if self.detail is None and other.detail is None:
+        if self.view != other.view:
             return True
-        if (
-            self.detail is not None
-            and other.detail is not None
-            and self.view == other.view
-        ):
-            return self.detail == other.detail
-        return self.outcome == other.outcome
+        return self.detail == other.detail
+
+    def switches_view_from(self, previous: "TerminalToken") -> bool:
+        """Whether this token re-reads ``previous``'s event through another view."""
+        return (
+            self.event is not None
+            and self.event == previous.event
+            and self.view != previous.view
+        )
 
 # ---------------------------------------------------------------------------
 # Visibility verdicts (#2922)
@@ -822,25 +832,12 @@ class WaitReconciler:
 
         # Application-level dedup: already signaled this transition.
         if delivered == signaled_token:
+            await self._retire_final_watch(store, kind, handle, state, status)
             return
         # A prior emit for this handle is still in flight — wait for the
         # next tick's Phase 0 to confirm it before re-emitting.
         if (kind, handle) in self._pending_signal_tasks:
             return
-        # A different string for the event already delivered: the provider
-        # started naming events after this row was written, re-labelled the
-        # event (#3390), or read it through another view (GitHub's Actions
-        # fallback names a run differently from the Checks API). None of those
-        # is news. Re-key the row, and any watch armed over it, to the current
-        # token without emitting, so later polls compare against it.
-        if delivered is not None and TerminalToken.parse(delivered).names_same_event(
-            current
-        ):
-            await store.adopt_signaled_token(
-                kind, handle, previous=delivered, token=signaled_token,
-            )
-            return
-
         # Attempts belong to a TRANSITION, not to a handle (#3105). A provider
         # that corrects a terminal state — talon's supported
         # ``finished_unknown -> failed`` — starts a NEW transition, and its
@@ -848,11 +845,45 @@ class WaitReconciler:
         # brings the retry cap forward against work that was never retried and
         # makes the payload label new information as a repeat, which is the
         # exact confusion the provenance below exists to remove.
+        # A delivered transition's attempt target is its delivered token, and
+        # ``adopt_signaled_token`` re-keys the two together. Were it left on
+        # an older string, the cross-view and outcome-only rules of
+        # ``names_same_event`` would fold a later execution into the
+        # delivered one (#3399 review).
         attempts_target = state.attempts_signaled_target if state else None
         same_transition = bool(
             attempts_target
             and TerminalToken.parse(attempts_target).names_same_event(current)
         )
+        # A wake already emitted for this event and not yet delivered is
+        # OWED. It is retried below, never re-keyed away: the event was judged
+        # new when it was emitted, and reading it now through another view
+        # does not make it old news (#3399 review).
+        owed = same_transition and attempts_target != delivered
+
+        # A different string for the event already delivered: the provider
+        # started naming events after this row was written, re-labelled the
+        # event (#3390), or read it through another view (GitHub's Actions
+        # fallback names a run differently from the Checks API). None of those
+        # is news. Re-key the row, and any watch armed over it, to the current
+        # token without emitting, so later polls compare against it — after a
+        # view switch, a genuine re-run seen through the new view still fires.
+        previous = TerminalToken.parse(delivered) if delivered is not None else None
+        if not owed and previous is not None and previous.names_same_event(current):
+            adopted = await store.adopt_signaled_token(
+                kind, handle, previous=delivered, token=signaled_token,
+            )
+            if adopted and current.switches_view_from(previous):
+                logger.info(
+                    "wait_reconcile: %s:%s terminal event %s now read through "
+                    "view %r (was %r); not a new event — re-baselined without "
+                    "a wake",
+                    kind, handle, current.event, current.view, previous.view,
+                )
+            if adopted:
+                await self._retire_final_watch(store, kind, handle, state, status)
+            return
+
         if same_transition:
             # ...and so does its token. A retry of a wake whose event is now
             # read under a different string keeps the string it was first
@@ -952,6 +983,34 @@ class WaitReconciler:
             signal.visibility != Visibility.INTERNAL
         )
         counters["signals_enqueued"] += 1
+
+    @staticmethod
+    async def _retire_final_watch(
+        store: WaitSignalStore,
+        kind: str,
+        handle: str,
+        state: Optional[WaitSignalState],
+        status: Any,
+    ) -> None:
+        """Disarm an armed watch that is polling an already-delivered event
+        its provider declares final (``TERMINAL_EVENT_FINAL_KEY``).
+
+        A re-registered watch waits for a terminal event other than the one
+        already delivered (#3399). Over a final event — a merged PR — there
+        is no other one, so the watch could never fire and would otherwise be
+        polled every tick for good, at a provider cost (three GitHub requests
+        per CI poll) that buys nothing.
+        """
+        if not (state and state.watching):
+            return
+        if (status.data or {}).get(TERMINAL_EVENT_FINAL_KEY) is not True:
+            return
+        await store.stop_watch(kind, handle)
+        logger.info(
+            "wait_reconcile: watch on %s:%s retired — its delivered terminal "
+            "event is final, so no later event can wake it",
+            kind, handle,
+        )
 
     @staticmethod
     def _signaled_token(status: Any) -> str:

@@ -57,28 +57,49 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5
 #   re-run, a new head commit, a corrected terminal record.
 # * the same through every read path the provider has. A provider that can
 #   read one event through several paths that name its records differently
-#   puts only what every path names alike here, and the rest in
-#   ``TERMINAL_EVENT_DETAIL_KEY``.
+#   puts only what every path names alike here (for CI, the head SHA), and
+#   the rest in ``TERMINAL_EVENT_DETAIL_KEY``.
 # * written by the provider itself. A provider that spreads third-party data
-#   into ``WaitStatus.data`` must drop this key, and the two below, from that
-#   data, or the third party decides when the agent is woken.
+#   into ``WaitStatus.data`` must drop this key, and the three below, from
+#   that data, or the third party decides when the agent is woken.
 #
 # A provider that does not set it keeps the legacy ``"<outcome>"`` /
 # ``"<outcome>:<native status>"`` token unchanged.
 TERMINAL_EVENT_KEY = "terminal_event"
 
 # Optional, and always set as a pair: the part of the event's identity that
-# only one read path can see, and that path's name. GitHub CI is the case
-# (#3399): the Checks API names a re-run by its new check-run ids, the Actions
-# API fallback by its workflow run's ``run_attempt``, and nothing maps one onto
-# the other. Two details are compared only when their views match. Across a
-# view change the reconciler cannot tell a re-read of the delivered event from
-# a new one by identity, so it compares the outcome there instead, the same
-# rule it applies to a row delivered before its provider named any events. A
-# provider whose read path never changes does not need these keys: put the
+# only one read path can see (the DETAIL — for CI, the execution set), and
+# that path's name (the VIEW). GitHub CI is the case (#3399): the Checks API
+# names a re-run by its new check-run ids, the Actions API fallback by its
+# workflow run's ``run_attempt``, and nothing maps one onto the other. A watch
+# fires on a new execution, never on a change of view, so with the event
+# unchanged:
+#
+# * same view: a new event if and only if the details differ.
+# * different view: NOT a new event, whatever the outcome — one execution can
+#   be DONE through one view and PARTIAL through a narrower one. The
+#   reconciler does not wake; it re-baselines the delivered token, and any
+#   watch armed over it, to the new view's identity and logs the switch, so a
+#   genuine re-run seen later through that view still fires.
+#
+# Accepted limit: a new execution whose first terminal read is also the read
+# where the view switches is absorbed into that re-baseline. A view switch is
+# rare (for CI, a credential gaining or losing the Checks API), and the next
+# distinct execution still fires.
+#
+# A provider whose read path never changes does not need these keys: put the
 # whole identity in ``TERMINAL_EVENT_KEY``.
 TERMINAL_EVENT_DETAIL_KEY = "terminal_event_detail"
 TERMINAL_EVENT_VIEW_KEY = "terminal_event_view"
+
+# Optional: ``True`` when the handle can produce no later terminal event — a
+# merged PR, a finished local task, an A2A task whose terminal state this
+# agent has stamped. A re-registered watch waits for an event other than the one
+# already delivered, so over a final event it can never fire; the reconciler
+# disarms it when it polls that event again rather than polling it every tick
+# forever. Leave it unset for anything that can still change (a closed PR can
+# be reopened). Like the keys above, only the provider may write it.
+TERMINAL_EVENT_FINAL_KEY = "terminal_event_final"
 
 
 def parse_ref(ref: str) -> Tuple[str, str]:

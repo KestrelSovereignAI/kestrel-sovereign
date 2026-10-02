@@ -552,6 +552,17 @@ to `0` because the wake is the only thing that resumes the parked work. A
 delivery is a wake, not a verdict: poll the provider for the handle's state on
 every delivery, then deactivate the consumer when the parked work finishes.
 
+Registering again after the handle's wake was delivered re-arms the watch
+(#3399). It records that delivered (or still in-flight) wake as its baseline
+and wakes once more, on the first terminal event other than it. A provider
+that names its terminal events (`TERMINAL_EVENT_KEY` in
+`kestrel_sovereign/waits/engine.py`) makes "other" mean a new execution — a CI
+re-run that fails again, or a new head commit — rather than a new outcome; the
+same execution read through a different view (GitHub's Checks API or its
+Actions fallback) re-baselines the watch without a wake. A watch re-armed over
+an event its provider marks final (a merged PR) can never fire, so the
+reconciler retires it instead of polling it.
+
 The dispatcher permits durable registrations only for its own `agent.did`.
 Every claim, acknowledgement, retry, and observation query is selected by
 that scope in storage; scope is therefore an authorization boundary for a

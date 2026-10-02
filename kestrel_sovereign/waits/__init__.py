@@ -24,6 +24,7 @@ Core must never import features; features import from here.
 from .engine import (
     MAX_HANDLE_WAIT_SECONDS,
     TERMINAL_EVENT_DETAIL_KEY,
+    TERMINAL_EVENT_FINAL_KEY,
     TERMINAL_EVENT_KEY,
     TERMINAL_EVENT_VIEW_KEY,
     WaitRegistry,
@@ -33,6 +34,7 @@ from .engine import (
 __all__ = [
     "MAX_HANDLE_WAIT_SECONDS",
     "TERMINAL_EVENT_DETAIL_KEY",
+    "TERMINAL_EVENT_FINAL_KEY",
     "TERMINAL_EVENT_KEY",
     "TERMINAL_EVENT_VIEW_KEY",
     "WaitRegistry",

@@ -596,7 +596,8 @@
         "kestrel_sovereign/features/scheduler/runner.py",
         "kestrel_sovereign/features/security/approval_queue.py",
         "kestrel_sovereign/heartbeat.py",
-        "kestrel_sovereign/kestrel_agent.py"
+        "kestrel_sovereign/kestrel_agent.py",
+        "kestrel_sovereign/waits/engine.py"
       ],
       "findings": [],
       "missing_code_refs": [],

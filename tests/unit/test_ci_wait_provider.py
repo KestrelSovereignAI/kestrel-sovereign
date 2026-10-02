@@ -33,6 +33,7 @@ from kestrel_sovereign.features.scheduler.ci_wait_provider import (
 )
 from kestrel_sovereign.waits.engine import (
     TERMINAL_EVENT_DETAIL_KEY,
+    TERMINAL_EVENT_FINAL_KEY,
     TERMINAL_EVENT_KEY,
     TERMINAL_EVENT_VIEW_KEY,
 )
@@ -573,6 +574,7 @@ def _event_of(pr, check_runs=None, combined_status=None, **kwargs):
         status.data[TERMINAL_EVENT_KEY],
         status.data.get(TERMINAL_EVENT_DETAIL_KEY),
         status.data.get(TERMINAL_EVENT_VIEW_KEY),
+        status.data.get(TERMINAL_EVENT_FINAL_KEY) is True,
     )
 
 
@@ -582,7 +584,7 @@ def test_the_same_records_always_name_the_same_event():
     assert _event_of(_OPEN, _runs(a, b)) == _event_of(_OPEN, _runs(b, a))
     outcome, identity = _event_of(_OPEN, _runs(a, b))
     assert outcome is Outcome.FAILED
-    assert identity.event.startswith(f"checks@{_SHA}:")
+    assert identity.event == f"head@{_SHA}"
     assert identity.view == CHECKS_SOURCE_CHECK_RUNS
 
 
@@ -614,18 +616,21 @@ def test_a_new_head_commit_is_a_new_event():
     )
 
 
-def test_a_settled_legacy_status_is_part_of_the_event():
-    """Every read path sees the same statuses, so a status re-report changes
-    the view-independent event, not just the detail."""
+def test_a_settled_legacy_status_is_part_of_the_execution_set():
+    """A status re-reported under a new id is a new execution of that gate,
+    the same as a check run re-run: the head SHA (the event) is unchanged,
+    and the execution set it was read in differs."""
     def status(status_id):
         return {
             "state": "failure", "total_count": 1,
             "statuses": [{"id": status_id, "context": "cov", "state": "failure"}],
         }
 
-    assert _event_of(_OPEN, {}, status(1))[1].event != (
-        _event_of(_OPEN, {}, status(2))[1].event
-    )
+    first = _event_of(_OPEN, {}, status(1))[1]
+    rerun = _event_of(_OPEN, {}, status(2))[1]
+    assert first.event == rerun.event == f"head@{_SHA}"
+    assert first.view == rerun.view
+    assert first.detail != rerun.detail
 
 
 def test_a_pending_rerun_names_no_event():
@@ -638,8 +643,8 @@ def test_a_pending_rerun_names_no_event():
 
 def test_the_event_ignores_the_classification():
     """#3390: the same records read completely (DONE) or through the Actions
-    fallback (PARTIAL) name one event and one detail. Only the verdict about
-    them differs, and the view that says which path read them."""
+    fallback (PARTIAL) name one event and one execution set. Only the verdict
+    about them differs, and the view that says which path read them."""
     green = _runs({"id": 5, "name": "ci", "status": "completed", "conclusion": "success"})
     done = _event_of(_OPEN, green)
     partial = _event_of(
@@ -656,8 +661,9 @@ def test_the_event_ignores_the_classification():
 def test_one_execution_read_through_checks_and_actions_is_one_event():
     """The review finding on #3399: the Checks API names a GitHub Actions
     execution by its job-level check-run ids, the Actions fallback by its
-    workflow run's id and attempt. The ids cannot agree, so they are the
-    view-scoped detail; the event both paths name alike is the same."""
+    workflow run's id and attempt. The ids cannot agree, so the execution set
+    is scoped to its view; the event both paths name alike — the head SHA —
+    is the same."""
     status = {
         "state": "failure", "total_count": 1,
         "statuses": [{"id": 77, "context": "cov", "state": "failure"}],
@@ -690,15 +696,28 @@ def test_one_execution_read_through_checks_and_actions_is_one_event():
 def test_merge_and_close_name_their_own_events():
     merged = {**_OPEN, "state": "closed", "merged": True}
     assert _event_of(merged, _runs(_failed_run(1)))[1] == CITerminalEvent(
-        f"merged@{_SHA}"
+        f"merged@{_SHA}", final=True
     )
-    assert _event_of(merged)[1] == CITerminalEvent(f"merged@{_SHA}"), (
+    assert _event_of(merged)[1] == CITerminalEvent(f"merged@{_SHA}", final=True), (
         "checks do not move a merge, and a merge has no view-scoped detail"
     )
 
     closed_once = {**_OPEN, "state": "closed", "closed_at": "2026-09-29T10:00:00Z"}
     closed_again = {**closed_once, "closed_at": "2026-09-30T10:00:00Z"}
     assert _event_of(closed_once)[1] != _event_of(closed_again)[1]
+
+
+def test_only_a_merge_is_final():
+    """Nothing follows a merge. A close can be reopened, and an open PR can
+    be pushed to or re-run, so neither is final."""
+    def final(pr, check_runs=None):
+        status = classify_ci_state(pr, check_runs=check_runs, repo="o/r", number=1)
+        assert status.outcome.is_terminal()
+        return status.data.get(TERMINAL_EVENT_FINAL_KEY)
+
+    assert final({**_OPEN, "state": "closed", "merged": True}) is True
+    assert final({**_OPEN, "state": "closed"}) is None
+    assert final(_OPEN, _runs(_failed_run(1))) is None
 
 
 def test_an_empty_rollup_is_an_event_and_its_first_run_is_another():

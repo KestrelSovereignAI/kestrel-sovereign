@@ -654,7 +654,10 @@ class WaitSignalStore:
         the one that token delivered. Re-keying in place records that without
         emitting, so the upgrade replays nothing (#3390), and later polls
         compare identities, so the next event with the same outcome still
-        wakes. A watch armed over ``previous`` moves with it and stays live.
+        wakes. A watch armed over ``previous`` moves with it and stays live,
+        and so does the attempt accounting of the delivered transition
+        (``attempts_signaled_target``): left on the old string, it would read
+        a later, different event as a retry of the delivered one.
 
         Compare-and-set on ``previous``: a delivery recorded since the
         reconciler read the row is left alone. Returns whether it re-keyed.
@@ -667,11 +670,17 @@ class WaitSignalStore:
                     WHEN watch_baseline = ? THEN ?
                     ELSE watch_baseline
                 END,
+                attempts_signaled_target = CASE
+                    WHEN attempts_signaled_target = ? THEN ?
+                    ELSE attempts_signaled_target
+                END,
                 updated_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND kind = ? AND handle = ?
                   AND last_signaled_outcome = ?
             """,
             (
+                token,
+                previous,
                 token,
                 previous,
                 token,

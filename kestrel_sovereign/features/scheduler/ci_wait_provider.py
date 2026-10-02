@@ -69,26 +69,34 @@ payload, because a repository with no required checks is reported ``clean``
 while its CI is still queued — resolving that to DONE would fabricate a merge
 signal out of a race.
 
-Every terminal status also names the terminal EVENT it describes, under
-:data:`~kestrel_sovereign.waits.engine.TERMINAL_EVENT_KEY` (#3399). The
+Every terminal status also names the terminal EVENT it describes (#3399). The
 outcome alone is a class, not an event: a re-run that fails again is
 ``failed`` twice, and a watch dedup'd on the outcome never woke for the second
-one. The identity is read from GitHub's raw records — the head SHA, the PR's
-merge/close, the settled legacy statuses' ids, and the completed check runs'
-ids and run attempts — never from the verdict this module derives from them,
-so a change to the classification rules cannot re-label an old event as new
-(#3390). A re-run or a new head commit is a new event even when its outcome
-repeats; a re-run still in progress keeps the rollup pending and so reports no
-event at all.
+one. A watch fires on a new *execution*, never on a change of *view*, so the
+identity is read from GitHub's raw records and never from the verdict this
+module derives from them — the outcome is no part of it, and a change to the
+classification rules cannot re-label an old event as new (#3390). It has
+three parts:
 
-The check runs are the one part of that identity the read path changes. The
-Checks API names a re-run by its new check-run ids; the Actions fallback above
-names the same re-run by its workflow run's id and ``run_attempt``, and
-neither can be mapped onto the other. So they travel separately, as the
-event's view-scoped detail (``TERMINAL_EVENT_DETAIL_KEY``) under the name of
-the path that read them (``TERMINAL_EVENT_VIEW_KEY``), and the reconciler
-compares them only within one view. A credential that gains or loses the
-Checks API is not, by itself, a new terminal event.
+  * the event (:data:`~kestrel_sovereign.waits.engine.TERMINAL_EVENT_KEY`):
+    the head SHA, or the PR's merge/close. A new head commit is always a new
+    event. A merge is also marked final (``TERMINAL_EVENT_FINAL_KEY``): nothing
+    follows it, so a watch re-registered over it is retired, not polled.
+  * the view (``TERMINAL_EVENT_VIEW_KEY``): which read path saw the
+    executions — the Checks API, its Actions fallback above, or legacy
+    statuses alone (the ``checks_source`` of :class:`CheckRollup`).
+  * the view's execution set (``TERMINAL_EVENT_DETAIL_KEY``): the completed
+    check runs' ids and run attempts plus the settled legacy statuses' ids. A
+    re-run is a new execution set even when its outcome repeats; a re-run
+    still in progress keeps the rollup pending and so reports no event at all.
+
+The Checks API names a re-run by its new check-run ids, the Actions fallback by
+its workflow run's id and ``run_attempt``, and neither can be mapped onto the
+other. So the reconciler compares execution sets only within one view: one
+unchanged execution read through the other path — DONE through Checks, PARTIAL
+through Actions — is the same event, and re-baselines the watch rather than
+waking it. A credential that gains or loses the Checks API is not a new
+terminal event.
 """
 
 from __future__ import annotations
@@ -108,6 +116,7 @@ from kestrel_sovereign.signals.sources.github_pr_watch import (
 )
 from kestrel_sovereign.waits.engine import (
     TERMINAL_EVENT_DETAIL_KEY,
+    TERMINAL_EVENT_FINAL_KEY,
     TERMINAL_EVENT_KEY,
     TERMINAL_EVENT_VIEW_KEY,
 )
@@ -173,15 +182,17 @@ def _gate_digest(gates: List[List[str]]) -> str:
 class CITerminalEvent:
     """The terminal event one settled PR read describes (#3399).
 
-    ``event`` is what every read path names alike. ``detail`` is what only the
-    path named by ``view`` can see: the check runs, whose records the Checks
-    API and the Actions fallback identify differently. A merge or close has no
-    detail.
+    ``event`` is the head SHA (or the merge/close) every read path names
+    alike. ``detail`` is the execution set as the read path named by ``view``
+    sees it: the Checks API and the Actions fallback identify one execution by
+    different records. A merge or close has neither. ``final`` marks the one
+    event nothing can follow — a merge.
     """
 
     event: str
     detail: Optional[str] = None
     view: Optional[str] = None
+    final: bool = False
 
 
 def ci_terminal_event(
@@ -197,27 +208,29 @@ def ci_terminal_event(
     :func:`classify_ci_state` derives, so the same records always yield the
     same identity whatever the classification rules say about them (#3390):
 
-      * merged          -> ``merged@<head sha>``: a PR merges once.
+      * merged          -> ``merged@<head sha>``, final: a PR merges once,
+        and a merged PR has no later terminal event.
       * closed unmerged -> ``closed@<head sha>@<closed_at>``: a PR closed,
-        reopened and closed again has closed twice.
-      * open            -> ``checks@<head sha>:<digest>`` over every settled
-        legacy status's id and state, which every read path sees alike, with a
-        detail digest over every completed check run's id, run attempt and
-        conclusion under the view ``checks_source``. A GitHub Actions re-run
-        is a new check-run id through the Checks API, or the same workflow-run
-        id with a higher ``run_attempt`` through the Actions fallback. Either
-        way the detail changes, so a re-run that fails again is a new event. A
-        new head commit changes the SHA.
+        reopened and closed again has closed twice, so a close is not final.
+      * open            -> ``head@<head sha>``, with the view
+        ``checks_source`` and a digest of that view's execution set: every
+        completed check run's id, run attempt and conclusion, and every
+        settled legacy status's id and state. A GitHub Actions re-run is a new
+        check-run id through the Checks API, or the same workflow-run id with
+        a higher ``run_attempt`` through the Actions fallback, so a re-run
+        that fails again is a new execution set. The conclusion is the run's
+        own record, not this module's verdict: an app that re-concludes a
+        check run in place has produced a new execution record.
 
     The run ids differ between the two paths for one unchanged execution,
-    which is why they are a detail and not the event: the reconciler compares
-    details only within one view (see
-    :data:`~kestrel_sovereign.waits.engine.TERMINAL_EVENT_DETAIL_KEY`).
+    which is why the execution set is scoped to its view: the reconciler
+    compares two sets only when their views match (see
+    :data:`~kestrel_sovereign.waits.engine.TERMINAL_EVENT_VIEW_KEY`).
     """
     head = pr_raw.get("head")
     head_sha = str(head.get("sha", "") or "") if isinstance(head, dict) else ""
     if bool(pr_raw.get("merged", False)):
-        return CITerminalEvent(f"merged@{head_sha}")
+        return CITerminalEvent(f"merged@{head_sha}", final=True)
     if str(pr_raw.get("state", "") or "").strip().lower() == "closed":
         return CITerminalEvent(
             f"closed@{head_sha}@{pr_raw.get('closed_at', '') or ''}"
@@ -234,28 +247,28 @@ def ci_terminal_event(
         if isinstance(combined_status, dict)
         else []
     )
-    run_gates: List[List[str]] = []
+    executions: List[List[str]] = []
     for run in runs:
         if not isinstance(run, dict):
             continue
         if str(run.get("status", "") or "").lower() != "completed":
             continue
-        run_gates.append([
+        executions.append([
+            "run",
             _gate_key(run, "name"),
             str(run.get("run_attempt", "") or ""),
             str(run.get("conclusion", "") or "").lower(),
         ])
-    status_gates: List[List[str]] = []
     for status in statuses:
         if not isinstance(status, dict):
             continue
         state = str(status.get("state", "") or "").lower()
         if state == "pending":
             continue
-        status_gates.append([_gate_key(status, "context"), state])
+        executions.append(["status", _gate_key(status, "context"), "", state])
     return CITerminalEvent(
-        f"checks@{head_sha}:{_gate_digest(status_gates)}",
-        detail=_gate_digest(run_gates),
+        f"head@{head_sha}",
+        detail=_gate_digest(executions),
         view=checks_source,
     )
 
@@ -285,9 +298,9 @@ def classify_ci_state(
     verdict here is allowed to claim more than was visible.
 
     Every terminal status names its event under ``TERMINAL_EVENT_KEY``, and an
-    open PR's view-scoped detail under ``TERMINAL_EVENT_DETAIL_KEY`` and
-    ``TERMINAL_EVENT_VIEW_KEY`` (see :func:`ci_terminal_event`); a PENDING one
-    names none.
+    open PR's execution set and its view under ``TERMINAL_EVENT_DETAIL_KEY``
+    and ``TERMINAL_EVENT_VIEW_KEY`` (see :func:`ci_terminal_event`); a PENDING
+    one names none.
     """
     state = str(pr_raw.get("state", "") or "").strip().lower()
     merged = bool(pr_raw.get("merged", False))
@@ -325,6 +338,8 @@ def classify_ci_state(
         if event.detail is not None:
             data[TERMINAL_EVENT_DETAIL_KEY] = event.detail
             data[TERMINAL_EVENT_VIEW_KEY] = event.view
+        if event.final:
+            data[TERMINAL_EVENT_FINAL_KEY] = True
         return WaitStatus(outcome, summary, data=data)
 
     if merged:

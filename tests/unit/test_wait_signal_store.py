@@ -280,8 +280,12 @@ async def test_a_soft_failed_wake_keeps_a_rearmed_watch_polled(make_store):
 @pytest.mark.asyncio
 async def test_adopt_signaled_token_rekeys_and_carries_the_watch(make_store):
     """Re-keying a pre-identity delivery to its identity must keep a watch
-    armed over the old token live, and is a compare-and-set on it."""
+    armed over the old token live, carry the delivered transition's attempt
+    target with it, and is a compare-and-set on it."""
     store = await make_store()
+    await store.record_pending(
+        "ci", "o/r#1", signal_id="sig-1", target="failed", attempts=1,
+    )
     await store.record_delivery(
         "ci", "o/r#1", delivery_status="ok_queued", signaled_outcome="failed",
     )
@@ -294,6 +298,9 @@ async def test_adopt_signaled_token_rekeys_and_carries_the_watch(make_store):
     [row] = await store.list_watched()
     assert row.last_signaled_outcome == "event:checks@abc:1"
     assert row.watch_baseline == "event:checks@abc:1"
+    assert row.attempts_signaled_target == "event:checks@abc:1", (
+        "left on the old string, a later event would match it as a retry"
+    )
 
     # Stale ``previous``: a delivery recorded since the read wins.
     assert await store.adopt_signaled_token(
