@@ -386,10 +386,17 @@ async def answerability_chat_baseline(
 
     raw = sample.raw or {}
     contents = list(raw.get("candidates", []))
+    live = getattr(llm_service, "_current_force_local_only", None)
+
+    def force_local_only() -> bool:
+        # Privacy only tightens: the eval flag adds to the service's live
+        # restriction and never replaces it; an unknown live state is local.
+        return local_only or (bool(live()) if callable(live) else True)
+
     gate = LLMAnswerabilityGate(
         llm_service,
         timeout_seconds=timeout_seconds,
-        force_local_only_provider=lambda: local_only,
+        force_local_only_provider=force_local_only,
     )
     labels = [f"c{index}" for index in range(len(contents))]
     decision = await gate.filter(

@@ -393,3 +393,26 @@ def test_backend_selects_the_gate(monkeypatch):
     chat = memory_system_module._build_answerability_gate(
         MagicMock(), memory_system_module.AnswerabilitySettings(True, 12.0, "gemma4:31b"))
     assert type(chat) is LLMAnswerabilityGate and chat.model_override == "gemma4:31b"
+
+
+@pytest.mark.asyncio
+async def test_chat_baseline_never_loosens_live_privacy():
+    from kestrel_sovereign.llm.decisions.evaluation import parse_sample
+    from kestrel_sovereign.storage.memory_answerability import answerability_chat_baseline
+
+    sample = parse_sample(json.dumps({
+        "adapter": "memory_answerability", "id": "p", "question": "pet?",
+        "candidates": ["Quasar the axolotl"], "answerable": [0]}), "f:1")
+
+    for live, flag, expected in [(True, False, True), (False, False, False),
+                                 (False, True, True), (None, False, True)]:
+        service = MagicMock(spec=["generate", "_current_force_local_only"])
+        service.generate = AsyncMock(return_value='{"answerable_ids":["c0"]}')
+        if live is None:
+            del service._current_force_local_only
+        else:
+            service._current_force_local_only = (lambda value=live: value)
+        verdict = await answerability_chat_baseline(
+            service, sample, timeout_seconds=5, local_only=flag)
+        assert verdict == {"c0": True}
+        assert service.generate.await_args.kwargs["force_local_only"] is expected, (live, flag)
