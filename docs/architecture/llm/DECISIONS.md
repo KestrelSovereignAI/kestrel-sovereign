@@ -263,7 +263,7 @@ Chat listings must still not offer a model that cannot chat. Today an installed 
 Discovery is capability-driven and per route, with no pinned lists. It follows the embedding discovery pair (`discover_embedding_models` → `reconcile_embedding_capabilities`), with one deliberate difference: decision state can turn **off**.
 
 - `discover_decision_models(vendor=, route=, use_cache=)` runs single-flight and is cached per instance. It is invalidated together with the chat catalog.
-- `reconcile_decision_capabilities()` runs inside `discover_all_models`, on both the cache-hit and cache-miss paths. On a **successful** discovery it **replaces** the route's decision model list with what the route reports now, which may be empty. A model that has been uninstalled or withdrawn stops being a candidate at the next refresh. On a **failed** discovery the last successful list is kept, the route is marked `decision_discovery_stale_since=<time>`, and an ERROR is logged. A stale list still produces candidates, because availability is not a safety property. A dispatch to a model that has since disappeared fails as `DecisionTransportError` (§8) and is never retried elsewhere.
+- `reconcile_decision_capabilities()` runs inside `discover_all_models`, on both the cache-hit and cache-miss paths. On a **successful** discovery it **replaces** the route's decision model list with what the route reports now, which may be empty. A model that has been uninstalled or withdrawn stops being a candidate at the next refresh. On a **failed** discovery the last successful list is kept, the route is marked `decision_discovery_stale_since=<time>`, and a WARNING is logged. It is a WARNING rather than an ERROR because a local daemon that is down, or too old to serve decisions, is a normal host state, and every catalog refresh re-tries. A stale list still produces candidates, because availability is not a safety property. A dispatch to a model that has since disappeared fails as `DecisionTransportError` (§8) and is never retried elsewhere.
 
 How each route discovers its models:
 
@@ -313,7 +313,7 @@ The steps run in order. No decision request is sent until step 4, and **no netwo
 
 1. **Disabled.** If `decision_route == "none"`, raise `DecisionUnavailable(DISABLED)`.
 2. **Candidate routes**, filtered **before** any discovery:
-   1. Start from configured routes. An explicit `decision_route` is terminal, so only that route remains. Under `"auto"`, every configured route remains, in `route_priority` order.
+   1. Start from configured routes whose adapter declares `supports_decisions` (§3.2), in `route_priority` order. A route whose adapter has no decision surface at all is not a candidate. An explicit `decision_route` is terminal, so only that route remains.
    2. Apply `model_override` (§5.3).
    3. Apply privacy (§6): under effective local-only, drop every route that is not `is_local`.
    4. **Then** read decision state for the remaining routes only. A remaining route whose decision discovery has never run (a cold cache) is discovered now, together with its pin canary (§4.1). This is the only discovery `decide` ever triggers, and it is scoped to these routes. It is the same rule the chat path follows, where local-only turns skip discovery that would contact the cloud.
@@ -354,7 +354,7 @@ Privacy modes **route** decisions to local models. They never disable decisions.
 
 ## 7. Context fit, caps and batching
 
-- **Fit before dispatch.** The request's size, measured once during validation (§2.2), is converted to a token estimate with the heuristics core uses for context budgeting. The estimate leaves headroom for the model's own prompt framing. `max_request_bytes` is checked against the candidate dialect's serialised size, which validation has already bounded. A candidate is skipped (§5.2) if any of these holds:
+- **Fit before dispatch.** The request's size, measured once during validation (§2.2), is converted to a token estimate with the heuristics core uses for context budgeting. The estimate leaves headroom for the model's own prompt framing. `max_request_bytes` is checked against the measured canonical size plus a fixed envelope allowance (`ENVELOPE_BYTES`, 1 KiB) for the fields a route adds around it (`model`, `keep_alive`, OpenRouter's `provider`/`user`). Dialects rename keys and add envelope fields; they do not expand content. A candidate is skipped (§5.2) if any of these holds:
   - its `context_limit` is unknown;
   - the estimate exceeds `context_limit`;
   - the serialised request exceeds `max_request_bytes`;
