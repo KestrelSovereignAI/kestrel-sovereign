@@ -21,6 +21,20 @@ engine owns everything else:
 Core must never import features; features import from here.
 """
 
-from .engine import MAX_HANDLE_WAIT_SECONDS, WaitRegistry, run_wait_loop
+from .engine import (
+    MAX_HANDLE_WAIT_SECONDS,
+    TERMINAL_EVENT_DETAIL_KEY,
+    TERMINAL_EVENT_KEY,
+    TERMINAL_EVENT_VIEW_KEY,
+    WaitRegistry,
+    run_wait_loop,
+)
 
-__all__ = ["MAX_HANDLE_WAIT_SECONDS", "WaitRegistry", "run_wait_loop"]
+__all__ = [
+    "MAX_HANDLE_WAIT_SECONDS",
+    "TERMINAL_EVENT_DETAIL_KEY",
+    "TERMINAL_EVENT_KEY",
+    "TERMINAL_EVENT_VIEW_KEY",
+    "WaitRegistry",
+    "run_wait_loop",
+]

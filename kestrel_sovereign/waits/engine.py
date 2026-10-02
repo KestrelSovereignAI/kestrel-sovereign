@@ -39,6 +39,47 @@ logger = logging.getLogger(__name__)
 MAX_HANDLE_WAIT_SECONDS = 3600
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 
+# The ``WaitStatus.data`` key through which a provider names the terminal
+# EVENT a terminal poll describes (#3399). The reconciler dedups wakes on it
+# when present, so a provider that sets it gets one wake per distinct terminal
+# event rather than one per outcome class: a CI re-run that fails again is a
+# new event even though its outcome is the same ``failed``.
+#
+# The value is a non-empty string, and it must be:
+#
+# * stable — the same event polled again, at any later time, yields the same
+#   string. Anything that varies between polls of one event (a fetch time, an
+#   ``updated_at`` touched by an unrelated edit) re-fires the wake.
+# * read from the provider's raw record, never from its classification. The
+#   reconciler compares identities without the outcome, so a classifier change
+#   that re-labels an old event does not make it news and replay it (#3390).
+# * distinct for distinct events, including ones with the same outcome — a
+#   re-run, a new head commit, a corrected terminal record.
+# * the same through every read path the provider has. A provider that can
+#   read one event through several paths that name its records differently
+#   puts only what every path names alike here, and the rest in
+#   ``TERMINAL_EVENT_DETAIL_KEY``.
+# * written by the provider itself. A provider that spreads third-party data
+#   into ``WaitStatus.data`` must drop this key, and the two below, from that
+#   data, or the third party decides when the agent is woken.
+#
+# A provider that does not set it keeps the legacy ``"<outcome>"`` /
+# ``"<outcome>:<native status>"`` token unchanged.
+TERMINAL_EVENT_KEY = "terminal_event"
+
+# Optional, and always set as a pair: the part of the event's identity that
+# only one read path can see, and that path's name. GitHub CI is the case
+# (#3399): the Checks API names a re-run by its new check-run ids, the Actions
+# API fallback by its workflow run's ``run_attempt``, and nothing maps one onto
+# the other. Two details are compared only when their views match. Across a
+# view change the reconciler cannot tell a re-read of the delivered event from
+# a new one by identity, so it compares the outcome there instead, the same
+# rule it applies to a row delivered before its provider named any events. A
+# provider whose read path never changes does not need these keys: put the
+# whole identity in ``TERMINAL_EVENT_KEY``.
+TERMINAL_EVENT_DETAIL_KEY = "terminal_event_detail"
+TERMINAL_EVENT_VIEW_KEY = "terminal_event_view"
+
 
 def parse_ref(ref: str) -> Tuple[str, str]:
     """Split a ``"<kind>:<handle>"`` wait reference into its parts.

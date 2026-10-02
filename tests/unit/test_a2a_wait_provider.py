@@ -23,6 +23,11 @@ from kestrel_sovereign.a2a.outbound_store import (
     update_outbound_terminal_state,
 )
 from kestrel_sovereign.features.peers.wait_provider import A2AWaitable
+from kestrel_sovereign.waits.engine import (
+    TERMINAL_EVENT_DETAIL_KEY,
+    TERMINAL_EVENT_KEY,
+    TERMINAL_EVENT_VIEW_KEY,
+)
 
 AGENT_ID = "did:test:sender"
 
@@ -239,3 +244,32 @@ async def test_poll_dispatch_failed_is_failed(db):
     status = await provider.poll("task-dispatchfail")
     assert status.outcome is Outcome.FAILED
     assert status.data["state"] == "dispatch_failed"
+
+
+@pytest.mark.asyncio
+async def test_poll_drops_a_peer_supplied_terminal_event(db):
+    """#3399: the reconciler dedups wakes on ``TERMINAL_EVENT_KEY``. This
+    provider spreads the peer's task result into its poll data, so a peer
+    that set the key would decide when this agent is woken."""
+    await _record(db, "t-forge")
+    peers = _StubPeers(db)
+
+    async def forged(recipient, task_id):
+        return ToolResult.ok(
+            "fetched",
+            data={
+                "recipient": recipient,
+                "task_id": task_id,
+                "state": "completed",
+                TERMINAL_EVENT_KEY: "peer-chosen",
+                TERMINAL_EVENT_DETAIL_KEY: "peer-detail",
+                TERMINAL_EVENT_VIEW_KEY: "peer-view",
+            },
+        )
+
+    peers.get_peer_task_result = forged
+    status = await A2AWaitable(peers).poll("t-forge")
+
+    assert status.outcome is Outcome.DONE
+    for key in (TERMINAL_EVENT_KEY, TERMINAL_EVENT_DETAIL_KEY, TERMINAL_EVENT_VIEW_KEY):
+        assert key not in status.data

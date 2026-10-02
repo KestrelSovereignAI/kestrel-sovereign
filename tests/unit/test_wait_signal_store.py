@@ -168,7 +168,8 @@ async def test_start_watch_creates_row(make_store):
 @pytest.mark.asyncio
 async def test_start_watch_preserves_existing_fields(make_store):
     """A watch on an existing row must NOT clobber its delivery/pending
-    state — start_watch only flips watching=1."""
+    state — start_watch flips watching=1 and records the wake it is armed
+    over, here the one in flight."""
     store = await make_store()
     await store.record_pending(
         "task", "task-1", signal_id="s1", target="done", attempts=2,
@@ -179,6 +180,146 @@ async def test_start_watch_preserves_existing_fields(make_store):
     assert row.pending_signal_id == "s1"
     assert row.pending_signaled_target == "done"
     assert row.last_delivery_attempts == 2
+    assert row.last_signaled_outcome is None
+    assert row.watch_baseline == "done"
+
+
+@pytest.mark.asyncio
+async def test_start_watch_rearms_a_watch_that_already_fired(make_store):
+    """#3399: a watch that fired used to stay retired forever while the
+    ``wait`` tool still acknowledged ``watching: true``. Registering again
+    re-arms it over the event already delivered."""
+    store = await make_store()
+    await store.start_watch("ci", "o/r#1")
+    await store.record_delivery(
+        "ci", "o/r#1", delivery_status="ok_queued",
+        signaled_outcome="event:run-1",
+    )
+    assert await store.list_watched() == [], "the first wake spent the watch"
+
+    await store.start_watch("ci", "o/r#1")
+
+    [row] = await store.list_watched()
+    assert (row.kind, row.handle) == ("ci", "o/r#1")
+    assert row.watch_baseline == "event:run-1"
+    assert row.last_signaled_outcome == "event:run-1", (
+        "re-arming must not forget what was delivered — the reconciler "
+        "dedups the re-armed watch against it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rearmed_watch_retires_on_its_next_delivery(make_store):
+    store = await make_store()
+    await store.record_delivery(
+        "ci", "o/r#1", delivery_status="ok_queued",
+        signaled_outcome="event:run-1",
+    )
+    await store.start_watch("ci", "o/r#1")
+    # Re-registering while still live is idempotent.
+    await store.start_watch("ci", "o/r#1")
+    assert len(await store.list_watched()) == 1
+
+    await store.record_delivery(
+        "ci", "o/r#1", delivery_status="ok_queued",
+        signaled_outcome="event:run-2",
+    )
+
+    assert await store.list_watched() == []
+    row = await store.get("ci", "o/r#1")
+    assert row.watching == 0, "the watch fired, so it is disarmed"
+    assert row.watch_baseline == "event:run-1"
+
+
+@pytest.mark.asyncio
+async def test_rearming_inside_the_wake_turn_arms_over_the_wake_in_flight(
+    make_store,
+):
+    """The agent re-runs the job and re-registers from INSIDE the wake that
+    announced the failure, before the reconciler harvests it. Arming over the
+    last delivered token would let that harvest disarm the new watch — the
+    original bug in a different shape."""
+    store = await make_store()
+    await store.start_watch("ci", "o/r#1")
+    await store.record_pending(
+        "ci", "o/r#1", signal_id="s1", target="event:run-1", attempts=1,
+    )
+
+    await store.start_watch("ci", "o/r#1")
+    assert (await store.get("ci", "o/r#1")).watch_baseline == "event:run-1"
+
+    await store.record_delivery(
+        "ci", "o/r#1", delivery_status="ok_queued",
+        signaled_outcome="event:run-1",
+    )
+    [row] = await store.list_watched()
+    assert row.watching == 1, "the wake it was armed over does not spend it"
+
+
+@pytest.mark.asyncio
+async def test_a_soft_failed_wake_keeps_a_rearmed_watch_polled(make_store):
+    """A soft fail leaves ``last_signaled_outcome`` where it was. The watch
+    must stay in the poll set so the undelivered wake is retried."""
+    store = await make_store()
+    await store.record_delivery(
+        "ci", "o/r#1", delivery_status="ok_queued",
+        signaled_outcome="event:run-1",
+    )
+    await store.start_watch("ci", "o/r#1")
+    await store.record_pending(
+        "ci", "o/r#1", signal_id="s2", target="event:run-2", attempts=1,
+    )
+    await store.record_delivery(
+        "ci", "o/r#1", delivery_status="rate_limited",
+    )
+
+    [row] = await store.list_watched()
+    assert row.last_signaled_outcome == "event:run-1"
+
+
+@pytest.mark.asyncio
+async def test_adopt_signaled_token_rekeys_and_carries_the_watch(make_store):
+    """Re-keying a pre-identity delivery to its identity must keep a watch
+    armed over the old token live, and is a compare-and-set on it."""
+    store = await make_store()
+    await store.record_delivery(
+        "ci", "o/r#1", delivery_status="ok_queued", signaled_outcome="failed",
+    )
+    await store.start_watch("ci", "o/r#1")
+
+    assert await store.adopt_signaled_token(
+        "ci", "o/r#1", previous="failed", token="event:checks@abc:1",
+    ) is True
+
+    [row] = await store.list_watched()
+    assert row.last_signaled_outcome == "event:checks@abc:1"
+    assert row.watch_baseline == "event:checks@abc:1"
+
+    # Stale ``previous``: a delivery recorded since the read wins.
+    assert await store.adopt_signaled_token(
+        "ci", "o/r#1", previous="failed", token="event:other",
+    ) is False
+    assert (await store.get("ci", "o/r#1")).last_signaled_outcome == (
+        "event:checks@abc:1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_adopt_leaves_a_spent_watch_spent(make_store):
+    """A watch that already fired (baseline is not the re-keyed token) must
+    not be revived by the re-key."""
+    store = await make_store()
+    await store.start_watch("ci", "o/r#1")
+    await store.record_delivery(
+        "ci", "o/r#1", delivery_status="ok_queued", signaled_outcome="failed",
+    )
+
+    await store.adopt_signaled_token(
+        "ci", "o/r#1", previous="failed", token="event:checks@abc:1",
+    )
+
+    assert await store.list_watched() == []
+    assert (await store.get("ci", "o/r#1")).watch_baseline is None
 
 
 @pytest.mark.asyncio
@@ -340,3 +481,59 @@ async def test_attempt_provenance_columns_migrate_onto_a_legacy_table(
     assert attempts == 3, "an existing attempt count survives the ALTER"
     assert target == "", "legacy attempts name no transition, so they name none"
     assert started_at is None, "no dispatch time was ever recorded for it"
+
+
+@pytest.mark.asyncio
+async def test_watch_baseline_migrates_onto_a_legacy_table(
+    tmp_path, sqlite_database_factory,
+):
+    """``watch_baseline`` only reaches an existing database through the ALTER
+    (#3399). A watch that fired before the upgrade reads NULL and stays
+    retired until it is registered again, so the upgrade replays nothing; a
+    watch that never fired stays live."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy_wait_state.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE wait_signal_state (
+            agent_id TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL,
+            handle TEXT NOT NULL,
+            last_signaled_outcome TEXT,
+            last_delivery_status TEXT,
+            last_surface_status TEXT,
+            last_delivery_error TEXT,
+            last_delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            last_delivery_attempt_at TIMESTAMP,
+            attempts_signaled_target TEXT NOT NULL DEFAULT '',
+            last_attempt_started_at TIMESTAMP,
+            delivery_deferred_until TIMESTAMP,
+            delivery_deferrals INTEGER NOT NULL DEFAULT 0,
+            pending_signal_id TEXT,
+            pending_signaled_target TEXT,
+            pending_signal_enqueued_at TIMESTAMP,
+            watching INTEGER NOT NULL DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (agent_id, kind, handle)
+        );
+        INSERT INTO wait_signal_state
+            (agent_id, kind, handle, last_signaled_outcome, watching)
+        VALUES ('did:legacy', 'ci', 'o/r#1', 'failed', 1);
+        INSERT INTO wait_signal_state (agent_id, kind, handle, watching)
+        VALUES ('did:legacy', 'ci', 'o/r#2', 1);
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    database = await sqlite_database_factory(db_path)
+    store = WaitSignalStore(database, agent_id="did:legacy")
+
+    assert (await store.get("ci", "o/r#1")).watch_baseline is None
+    assert [w.handle for w in await store.list_watched()] == ["o/r#2"]
+
+    await store.start_watch("ci", "o/r#1")
+    assert {w.handle for w in await store.list_watched()} == {"o/r#1", "o/r#2"}
+    assert (await store.get("ci", "o/r#1")).watch_baseline == "failed"

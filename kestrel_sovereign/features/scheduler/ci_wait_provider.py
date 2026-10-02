@@ -68,19 +68,48 @@ reads pending is surfaced as a ``contradiction`` marker on the PENDING
 payload, because a repository with no required checks is reported ``clean``
 while its CI is still queued — resolving that to DONE would fabricate a merge
 signal out of a race.
+
+Every terminal status also names the terminal EVENT it describes, under
+:data:`~kestrel_sovereign.waits.engine.TERMINAL_EVENT_KEY` (#3399). The
+outcome alone is a class, not an event: a re-run that fails again is
+``failed`` twice, and a watch dedup'd on the outcome never woke for the second
+one. The identity is read from GitHub's raw records — the head SHA, the PR's
+merge/close, the settled legacy statuses' ids, and the completed check runs'
+ids and run attempts — never from the verdict this module derives from them,
+so a change to the classification rules cannot re-label an old event as new
+(#3390). A re-run or a new head commit is a new event even when its outcome
+repeats; a re-run still in progress keeps the rollup pending and so reports no
+event at all.
+
+The check runs are the one part of that identity the read path changes. The
+Checks API names a re-run by its new check-run ids; the Actions fallback above
+names the same re-run by its workflow run's id and ``run_attempt``, and
+neither can be mapped onto the other. So they travel separately, as the
+event's view-scoped detail (``TERMINAL_EVENT_DETAIL_KEY``) under the name of
+the path that read them (``TERMINAL_EVENT_VIEW_KEY``), and the reconciler
+compares them only within one view. A credential that gains or loses the
+Checks API is not, by itself, a new terminal event.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
-from typing import Any, ClassVar, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 from kestrel_sdk.tools import Outcome, WaitStatus
 from kestrel_sovereign.signals.sources.github_pr_watch import (
     CHECKS_SOURCE_CHECK_RUNS,
     CheckRollup,
     _check_verdict,
+)
+from kestrel_sovereign.waits.engine import (
+    TERMINAL_EVENT_DETAIL_KEY,
+    TERMINAL_EVENT_KEY,
+    TERMINAL_EVENT_VIEW_KEY,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,6 +149,117 @@ def _mergeability(pr_raw: Dict[str, Any]) -> Tuple[Optional[bool], str]:
     return mergeable, str(pr_raw.get("mergeable_state", "") or "").strip().lower()
 
 
+def _gate_key(record: Dict[str, Any], label_field: str) -> str:
+    """Name one check run or status by GitHub's ``id`` for it.
+
+    The ``id`` is what separates a re-run from the run it re-ran (Actions
+    mints a new check-run id per attempt). A record without one — never seen
+    from GitHub, but tolerated — falls back to its label.
+    """
+    gate_id = record.get("id")
+    if gate_id is not None and str(gate_id).strip():
+        return f"id={gate_id}"
+    return f"{label_field}={record.get(label_field, '') or ''}"
+
+
+def _gate_digest(gates: List[List[str]]) -> str:
+    """Order-independent digest of gate records, so pagination cannot move it."""
+    return hashlib.sha256(
+        json.dumps(sorted(gates), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class CITerminalEvent:
+    """The terminal event one settled PR read describes (#3399).
+
+    ``event`` is what every read path names alike. ``detail`` is what only the
+    path named by ``view`` can see: the check runs, whose records the Checks
+    API and the Actions fallback identify differently. A merge or close has no
+    detail.
+    """
+
+    event: str
+    detail: Optional[str] = None
+    view: Optional[str] = None
+
+
+def ci_terminal_event(
+    pr_raw: Dict[str, Any],
+    *,
+    check_runs: Any = None,
+    combined_status: Any = None,
+    checks_source: str = CHECKS_SOURCE_CHECK_RUNS,
+) -> CITerminalEvent:
+    """The identity of the terminal event a settled PR read describes (#3399).
+
+    Read only from GitHub's raw records, never from the verdict
+    :func:`classify_ci_state` derives, so the same records always yield the
+    same identity whatever the classification rules say about them (#3390):
+
+      * merged          -> ``merged@<head sha>``: a PR merges once.
+      * closed unmerged -> ``closed@<head sha>@<closed_at>``: a PR closed,
+        reopened and closed again has closed twice.
+      * open            -> ``checks@<head sha>:<digest>`` over every settled
+        legacy status's id and state, which every read path sees alike, with a
+        detail digest over every completed check run's id, run attempt and
+        conclusion under the view ``checks_source``. A GitHub Actions re-run
+        is a new check-run id through the Checks API, or the same workflow-run
+        id with a higher ``run_attempt`` through the Actions fallback. Either
+        way the detail changes, so a re-run that fails again is a new event. A
+        new head commit changes the SHA.
+
+    The run ids differ between the two paths for one unchanged execution,
+    which is why they are a detail and not the event: the reconciler compares
+    details only within one view (see
+    :data:`~kestrel_sovereign.waits.engine.TERMINAL_EVENT_DETAIL_KEY`).
+    """
+    head = pr_raw.get("head")
+    head_sha = str(head.get("sha", "") or "") if isinstance(head, dict) else ""
+    if bool(pr_raw.get("merged", False)):
+        return CITerminalEvent(f"merged@{head_sha}")
+    if str(pr_raw.get("state", "") or "").strip().lower() == "closed":
+        return CITerminalEvent(
+            f"closed@{head_sha}@{pr_raw.get('closed_at', '') or ''}"
+        )
+
+    if isinstance(check_runs, dict):
+        runs = check_runs.get("check_runs", []) or []
+    elif isinstance(check_runs, list):
+        runs = check_runs
+    else:
+        runs = []
+    statuses = (
+        combined_status.get("statuses", []) or []
+        if isinstance(combined_status, dict)
+        else []
+    )
+    run_gates: List[List[str]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        if str(run.get("status", "") or "").lower() != "completed":
+            continue
+        run_gates.append([
+            _gate_key(run, "name"),
+            str(run.get("run_attempt", "") or ""),
+            str(run.get("conclusion", "") or "").lower(),
+        ])
+    status_gates: List[List[str]] = []
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        state = str(status.get("state", "") or "").lower()
+        if state == "pending":
+            continue
+        status_gates.append([_gate_key(status, "context"), state])
+    return CITerminalEvent(
+        f"checks@{head_sha}:{_gate_digest(status_gates)}",
+        detail=_gate_digest(run_gates),
+        view=checks_source,
+    )
+
+
 def classify_ci_state(
     pr_raw: Dict[str, Any],
     *,
@@ -143,6 +283,11 @@ def classify_ci_state(
     (see :class:`CheckRollup`). They default to a complete read, so a caller
     holding a full rollup passes nothing extra; when they say otherwise, no
     verdict here is allowed to claim more than was visible.
+
+    Every terminal status names its event under ``TERMINAL_EVENT_KEY``, and an
+    open PR's view-scoped detail under ``TERMINAL_EVENT_DETAIL_KEY`` and
+    ``TERMINAL_EVENT_VIEW_KEY`` (see :func:`ci_terminal_event`); a PENDING one
+    names none.
     """
     state = str(pr_raw.get("state", "") or "").strip().lower()
     merged = bool(pr_raw.get("merged", False))
@@ -169,17 +314,28 @@ def classify_ci_state(
         data["blind_spot"] = rollup.caveat()
     label = f"{repo}#{number}" if repo else "PR"
 
-    if merged:
-        return WaitStatus(Outcome.DONE, f"{label} merged", data=data)
-    if state == "closed":
-        return WaitStatus(
-            Outcome.FAILED, f"{label} closed without merge", data=data
+    def settled(outcome: Outcome, summary: str) -> WaitStatus:
+        event = ci_terminal_event(
+            pr_raw,
+            check_runs=check_runs,
+            combined_status=combined_status,
+            checks_source=rollup.source,
         )
+        data[TERMINAL_EVENT_KEY] = event.event
+        if event.detail is not None:
+            data[TERMINAL_EVENT_DETAIL_KEY] = event.detail
+            data[TERMINAL_EVENT_VIEW_KEY] = event.view
+        return WaitStatus(outcome, summary, data=data)
+
+    if merged:
+        return settled(Outcome.DONE, f"{label} merged")
+    if state == "closed":
+        return settled(Outcome.FAILED, f"{label} closed without merge")
     if verdict == "failure":
         # Terminal whatever else was invisible. An unread gate can only hide
         # MORE failures, never turn an observed one into a pass, so a partial
         # rollup does not soften a failure the way it softens a pass.
-        return WaitStatus(Outcome.FAILED, f"{label} CI checks failed", data=data)
+        return settled(Outcome.FAILED, f"{label} CI checks failed")
     if verdict == "success":
         if not rollup.complete:
             # Everything VISIBLE passed. Reported PARTIAL rather than DONE so
@@ -189,12 +345,11 @@ def classify_ci_state(
                 f"{label}: every check this poll could read passed, but "
                 f"{rollup.caveat()}"
             )
-            return WaitStatus(
+            return settled(
                 Outcome.PARTIAL,
                 f"{label} visible CI checks passed, rollup incomplete",
-                data=data,
             )
-        return WaitStatus(Outcome.DONE, f"{label} CI checks passed", data=data)
+        return settled(Outcome.DONE, f"{label} CI checks passed")
     if verdict == "none" and not rollup.complete:
         # Empty, but only the part that was readable. Terminal for the same
         # #2939 reason as a complete empty rollup — a mode="signal" watch on
@@ -206,10 +361,9 @@ def classify_ci_state(
             f"read, and {rollup.caveat()} — this is NOT evidence that no "
             f"checks ran"
         )
-        return WaitStatus(
+        return settled(
             Outcome.PARTIAL,
             f"{label} open, no checks visible (rollup incomplete)",
-            data=data,
         )
     if verdict == "none":
         # Read the rollup and it is empty: no CI is configured for this head
@@ -222,9 +376,7 @@ def classify_ci_state(
         # any unrelated PR edit) to bound a settle window against, so a grace
         # period here would re-arm indefinitely on a checkless head SHA.
         data["caveat"] = f"no checks ran on {label} head commit"
-        return WaitStatus(
-            Outcome.PARTIAL, f"{label} open, no checks ran", data=data
-        )
+        return settled(Outcome.PARTIAL, f"{label} open, no checks ran")
 
     # open + checks pending, or the rollup was never read — keep the wait
     # armed. A pending read is NEVER promoted to a terminal verdict here.

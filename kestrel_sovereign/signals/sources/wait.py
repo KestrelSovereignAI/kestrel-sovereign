@@ -10,7 +10,8 @@ own feature-owned signal name.
 
 Idempotency: the reconciler records ``last_signaled_outcome`` per
 ``(kind, handle)`` in the ``wait_signal_state`` table and only emits when the
-current terminal outcome differs from the persisted value. The signal source
+current terminal event differs from the persisted one — the provider's named
+terminal event when it exposes one (#3399), else the outcome. The signal source
 also coalesces by ``dedupe_key`` within a short window as defense-in-depth.
 """
 

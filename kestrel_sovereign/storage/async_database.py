@@ -26,7 +26,6 @@ from .conversation_created_at import (
     UNDATED_DDL,
     UNDATED_TABLE,
     canonical_created_at,
-    canonical_sql,
     conversation_history_ddl,
     created_at_bind,
     created_at_check,
@@ -764,6 +763,13 @@ CREATE INDEX IF NOT EXISTS idx_pending_a2a_questions_sweep
 --                            is poll-only (not MonitorableWaitable), so EVERY
 --                            async waitable is wakeable without auto-waking all
 --                            tasks (which would self-wake on inbound work)
+--                            (cleared again when the watch fires, #3399)
+--   - watch_baseline         the terminal-event token a watch was (re)armed
+--                            over (#3399): the wake in flight, else the one
+--                            last delivered, when the agent registered it.
+--                            Delivering any other token disarms the watch, so
+--                            re-registering a watch that has fired re-arms it
+--                            instead of leaving it inert
 --
 -- ``agent_id`` scopes rows to the OWNING agent for shared-backend isolation,
 -- exactly like pending_a2a_questions above.
@@ -796,6 +802,7 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     pending_signaled_target TEXT,
     pending_signal_enqueued_at TIMESTAMP,
     watching INTEGER NOT NULL DEFAULT 0,
+    watch_baseline TEXT,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (agent_id, kind, handle)
 );
@@ -1475,6 +1482,13 @@ class AsyncDatabase:
         await self._migrate_add_column(
             "wait_signal_state", "delivery_deferrals",
             "INTEGER NOT NULL DEFAULT 0",
+        )
+        # Watch re-arm baseline (#3399), same reasoning again. A legacy row
+        # reads NULL: a watch that already fired stays retired exactly as it
+        # was until the agent registers it again, so the upgrade replays
+        # nothing.
+        await self._migrate_add_column(
+            "wait_signal_state", "watch_baseline", "TEXT"
         )
         # Both indexes go through ``ensure_index`` rather than a bare
         # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
