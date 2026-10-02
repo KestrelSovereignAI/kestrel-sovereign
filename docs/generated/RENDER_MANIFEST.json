@@ -1008,6 +1008,18 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/llm/DECISIONS.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "draft",
+      "title": "Decisions \u2014 Typed Choice / Score / Noul as an LLM Modality",
+      "type": "Architecture Spec"
+    },
+    {
       "existing_code_refs": [
         "kestrel_sovereign/agent/orchestrator_engine.py",
         "kestrel_sovereign/agent/streaming.py",
