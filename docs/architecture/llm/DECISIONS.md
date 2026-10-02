@@ -95,7 +95,7 @@ class DecisionResult:
     route: str
     model: str                                       # the model that actually answered
     thresholds: Mapping[str, float]                  # per question id, resolved for this model (§2.4)
-    calibrated: bool                                 # False only under the "default" uncalibrated policy
+    calibrated: bool | None                          # False: "default" policy applied; None: caller declares no thresholds
     input_tokens: int | None
     duration_ms: int
 ```
@@ -159,8 +159,11 @@ answers = 0.62                   # example as of 2026-10; written from the eval 
 
 The service resolves calibration, not the caller. This is the only way telemetry can report the truth.
 
-- Under **`refuse`**, models with no entry for this caller are removed from the candidate list during resolution (§5.2, step 3), before anything is sent. If none remain, `decide` raises `DecisionUnavailable(NO_CALIBRATED_MODEL)`, and no call is wasted on an answer that would be thrown away.
-- Under **`default`**, an uncalibrated model can still answer. The result then carries the declared `default` thresholds, `calibrated=False` is set on the result, and the same value is recorded in telemetry.
+**A model is calibrated for a request only if its entry has a threshold for every question id in that request.** Coverage is all-or-nothing: an entry that covers `answers` but not `relevant` counts as uncalibrated for a request that asks both. Thresholds from two calibrations are never mixed.
+
+- Under **`refuse`**, a model that is uncalibrated for the request is rejected for this call during resolution (§5.2), before anything is sent.
+- Under **`default`**, an uncalibrated model can still answer. Every threshold on the result then comes from `default`, and `calibrated=False` is set on the result and in telemetry. The `default` table itself must cover every question id the request asks; a gap there is a configuration error, raised as `DecisionRequestInvalid` before routing.
+- **Callers with no thresholds table.** A caller that uses distributions directly (for example, ranking by `p_true`) declares no `[decisions.thresholds.<caller>]` table. Its results carry `thresholds={}` and `calibrated=None`, meaning not applicable.
 
 `DecisionResult.thresholds` is the only threshold source a caller reads, so every caller applies calibration the same way. Model ids appear here only as config keys, which the no-hardcoded-IDs rule permits.
 
@@ -240,9 +243,18 @@ How each route discovers its models:
 
 A route may pin `decision_model` (§5.1). This covers Ollama builds that serve `/v1/systemone` but don't report `"decision"` in `/api/show`, and any route whose discovery is unavailable. The spec never infers a decision model from its name.
 
-- A pin is verified with a **canary decision**: one `noul` question over a fixed synthetic state, sent through the route's `adecide`. The canary runs during every `reconcile_decision_capabilities`, so at boot and on each catalog refresh.
-- A pin that passes the canary becomes a candidate.
-- A pin that fails is marked `unverified` with the failure reason, is excluded from candidates, and is logged at ERROR. No unverified pin is ever dispatched to.
+- A pin is verified with a **canary decision**: one `noul` question over a fixed synthetic state, sent through the route's `adecide`.
+- The canary runs whenever the discovery cache is refreshed: at boot, on a cache miss, and on an explicit refresh. On the cache-hit path, reconciliation reuses the cached canary outcome and makes no network call.
+- Each canary has its own deadline, `decision_canary_timeout_seconds` (default 10). Canaries for different routes run concurrently, so one hung route cannot stall discovery past that deadline.
+- How each outcome changes the pin:
+
+| Outcome | Pin state afterwards |
+|---|---|
+| Passes | `verified`; the pin becomes a candidate. |
+| Protocol failure (the model answered with a malformed result), or a definitive not-found (HTTP 404 for the endpoint or the model) | `unverified`, recorded with the reason. Logged at ERROR. |
+| Timeout, cancellation or another transport failure | **unchanged**: a verified pin stays verified, and a never-verified pin stays unverified. The pin is marked `canary_stale_since=<time>`. A transient outage never flips a verified pin off; a later real dispatch failure surfaces through §8 instead. |
+
+- No unverified pin is ever dispatched to.
 - Canary calls are recorded like any other decision call (§8), under `caller="kestrel.canary"`.
 - A model with no discoverable `num_ctx` has `context_limit=None` and cannot pass the fit check unless the pin also sets `decision_context_limit`.
 
@@ -253,6 +265,7 @@ A route may pin `decision_model` (§5.1). This covers Ollama builds that serve `
 ```toml
 [llm]
 decision_route = "auto"        # "auto" | "<vendor>[:<route>]" | "none"
+decision_canary_timeout_seconds = 10   # per-pin canary deadline (§4.1)
 
 [llm.vendors.ollama.routes.local]
 decision_model = "auto"        # "auto" | "<model-id>" (pin; verified per §4.1)
@@ -262,7 +275,7 @@ decision_hints = []            # substring patterns, never full ids
 
 ### 5.2 Resolution, per call
 
-The steps run in order, and nothing is sent until step 5.
+The steps run in order, and nothing is sent until step 4.
 
 1. **Disabled.** If `decision_route == "none"`, raise `DecisionUnavailable(DISABLED)`.
 2. **Candidate routes.**
@@ -270,16 +283,13 @@ The steps run in order, and nothing is sent until step 5.
    - With `"auto"`, every route whose decision model list is non-empty or which has a verified pin is considered, in `route_priority` order.
    - Apply `model_override` (§5.3).
    - Apply privacy (§6): under effective local-only, drop every route that is not `is_local`.
-3. **Candidate model per route.**
-   - A verified pin is that route's model.
-   - Otherwise, the discovered models are filtered by `decision_hints`.
-   - Then the calibration policy is applied. Under `refuse` (§2.5), uncalibrated models are dropped.
-   - Exactly one survivor → that model.
-   - Several survivors → raise `DecisionUnavailable(AMBIGUOUS_MODEL)` naming them. Kestrel never picks one arbitrarily, because thresholds are per model and an arbitrary pick would silently change calibration.
-4. **Fit check.** Check the request against each candidate's limits (§7).
-5. **Dispatch** to the first candidate that fits. If none fits, raise `DecisionUnavailable(NO_FITTING_MODEL)`, carrying every rejected candidate and its reason.
+3. **Walk the routes in order.** For each route, resolve its model and stop at the first one that passes every check. A route that fails a check is skipped, and its rejection reason is recorded.
+   - **Pick the model.** A verified pin is the route's model. An unverified pin rejects the route with `UNVERIFIED_PIN`, and the route's discovered models are not consulted instead, because the operator's pin is authoritative for that route. With no pin, the discovered models are filtered by `decision_hints`. If exactly one survives, that is the model. If several survive, reject the route with `AMBIGUOUS_MODEL` and name the survivors. Kestrel never picks among them arbitrarily, because thresholds are per model and an arbitrary pick would silently change calibration.
+   - **Calibration** (§2.5). Under `refuse`, reject the route with `NOT_CALIBRATED` if its model is uncalibrated for this request.
+   - **Fit check** (§7). Reject the route with `NO_FIT` if the request exceeds the model's limits.
+4. **Dispatch** to the first route that passed. If none passed, raise `DecisionUnavailable(NO_CANDIDATE)` with each route's rejection reason. One ambiguous or ill-fitting route never blocks a usable route earlier or later in the order.
 
-Within one `decide` call, Kestrel **never re-sends the request to another candidate** after a dispatch failure. A transport or protocol failure from the selected candidate is raised to the caller, because silently re-asking a different model would change which calibration applies. Fallthrough happens only during resolution, before anything is sent.
+Within one `decide` call, Kestrel **never re-sends the request to another candidate** after a dispatch failure. A transport or protocol failure from the selected candidate is raised to the caller, because silently re-asking a different model would change which calibration applies. Moving on to another route happens only during resolution (step 3), before anything is sent.
 
 ### 5.3 `model_override` grammar
 
@@ -325,7 +335,7 @@ Anything other than a complete, normalised `DecisionResult` is raised as an exce
 | Exception | Meaning |
 |---|---|
 | `DecisionRequestInvalid(rule)` | The request failed validation (§2.2). Nothing was sent. |
-| `DecisionUnavailable(reason, candidates)` | Nothing was sent. `reason` is one of `DISABLED`, `NO_ROUTE`, `NO_LOCAL_ROUTE`, `NO_CALIBRATED_MODEL`, `AMBIGUOUS_MODEL`, `NO_FITTING_MODEL`, `SELECTOR_CONFLICT`. |
+| `DecisionUnavailable(reason, rejections)` | Nothing was sent. `reason` is one of `DISABLED`, `SELECTOR_CONFLICT`, `NO_ROUTE` (no decision-capable route remains after the override), `NO_LOCAL_ROUTE` (privacy removed every route) or `NO_CANDIDATE` (routes remained, but each was rejected). `rejections` lists each route with its reason: `AMBIGUOUS_MODEL`, `NOT_CALIBRATED`, `NO_FIT` or `UNVERIFIED_PIN`. |
 | `DecisionTimeout` | `timeout_seconds` elapsed. The deadline covers the whole call: resolution, the fit check, dispatch and normalisation. It is enforced with `asyncio.timeout` in `decide` and is also passed to the adapter's HTTP client. The Ollama route must set an explicit HTTP timeout, because the chat `AsyncClient` has none. |
 | `DecisionTransportError` | A network or HTTP failure. This includes a 404 for `/v1/systemone` on a runtime too old to serve it, and a model that has disappeared since discovery. |
 | `DecisionProtocolError` | The response violated §2.3. |
@@ -336,7 +346,8 @@ Fail-closed behaviour is **the caller's policy, not the service's**. For example
 
 - **Cancellation propagates.** `decide` does not swallow `CancelledError`. A Stop or caller cancellation aborts the in-flight HTTP request and re-raises.
 - **No retry, ever.** Not after a timeout, a cancellation or a transport error. The request may already have been processed, and possibly billed, by the vendor. Re-sending would charge twice and could answer from a different model.
-- **Accounting still happens.** A dispatched call that ends in a timeout, cancellation or transport error is still recorded (§8.3). Its usage is recorded as unknown (`usage_available=False`) when the route did not report it. Recording runs in a `finally` path that is itself bounded and cannot raise into the caller.
+- **Accounting still happens.** A dispatched call that ends in a timeout, cancellation or transport error is still recorded (§8.3). Its usage is recorded as unknown (`usage_available=False`) when the route did not report it.
+- **Recording survives cancellation.** The record is written by a separate task protected with `asyncio.shield`. `decide` awaits that task, for at most `DECISION_RECORD_TIMEOUT` (2 s), in its `finally` path, and then re-raises the original exception (`CancelledError` included). Cancelling `decide` does not cancel the shielded write. If the write overruns its bound, it is handed to the service's supervised background tasks to finish, and a WARNING notes the late record. The caller's exception is never replaced by a recording error, and recording never re-raises into the caller.
 
 ### 8.3 Accounting and redaction
 
@@ -353,15 +364,16 @@ Fail-closed behaviour is **the caller's policy, not the service's**. For example
 
 This is stricter than chat telemetry, and that is deliberate: decision `state` is often private memory or turn content passed by a background caller, with no user-visible turn to attribute it to.
 
-**Sinks.** Every dispatched call, successful or not, is recorded through the chat path's recorders, with the content-free fields above. Each sink:
+**One modality-aware recorder.** Today `_log_llm_call` does two jobs: it writes the content-free sinks, and it increments the chat-only Prometheus series (`LLM_CALLS`, `LLM_DURATION`, `LLM_TOKENS`). Routing decisions through it unchanged would count every decision as a chat call. Slice 2 therefore extracts the recording into a single recorder that takes `modality: Literal["chat", "embedding", "decision"]`. Chat calls go through it with `modality="chat"` and produce exactly the rows, series and metering they produce today. Every dispatched decision, successful or not, is recorded through it with `modality="decision"`:
 
-| Sink | What is written |
+| Sink | What is written for a decision |
 |---|---|
-| `model_usage` | `_track_model_usage(model, provider, tokens=input_tokens)` |
-| `llm_calls` | `_log_llm_call(...)` with the frozen context and `metadata={"modality": "decision", "caller": caller, "question_count": n, "calibrated": bool, "usage_available": bool}`. The route's reported cost goes in `provider_reported_cost_usd` when present. |
-| Prometheus | **dedicated** series, not the chat ones: `kestrel_llm_decision_calls_total{provider, model, caller, success}` and `kestrel_llm_decision_duration_seconds{provider, model, caller}`. They are defined in `kestrel_sdk.metrics` next to `LLM_CALLS`. The chat series keep their existing labels and meaning, so dashboards that count chat calls are unaffected. |
+| `model_usage` | input tokens against (model, provider), as for chat |
+| `llm_calls` | the frozen context and only the content-free fields above. `metadata` carries `{"modality": "decision", "caller", "question_count", "calibrated", "usage_available"}`, plus `provider_reported_cost_usd` when the route reports a cost. |
+| Prometheus | **dedicated** series, selected by modality: `kestrel_llm_decision_calls_total{provider, model, caller, success}`, `kestrel_llm_decision_duration_seconds{provider, model, caller}` and `kestrel_llm_decision_tokens_total{model}`. They are defined in `kestrel_sdk.metrics` next to `LLM_CALLS`. Decisions never touch the chat series, so their labels and meaning do not change. |
+| Metering callback | invoked under the same conditions as chat (`success`, usage available, a token breakdown present), with `modality` in the payload. Decisions are billable tokens. |
 
-Embeddings currently bypass these sinks entirely, tracked as [#3426](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3426). The recording helper written for decisions must be shared with embeddings, not copied for them.
+Embeddings currently bypass all of these sinks, which is tracked as [#3426](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3426). They join the same recorder with `modality="embedding"` rather than getting a copy of it.
 
 ## 9. Eval harness
 
@@ -394,7 +406,9 @@ Slices are tracked on #3424. Each one lands with tests that fail without it.
    - Core: `LLMService.decide`, the normaliser, resolver, fit check, thresholds, accounting, and the chat-listing exclusion (§3.3).
    - Routes: OpenRouter and Ollama `adecide` / `list_decision_models`. Two routes ship together so the dialect seam is exercised by real divergence.
 3. **Eval harness.**
-4. **First caller:** the memory answerability gate, measured against the current gate on recorded retrievals.
+4. **First caller:** the memory answerability gate, measured against the current gate on recorded retrievals. The migration translates the gate's two routing inputs explicitly:
+   - **Privacy.** The gate's injected `force_local_only_provider` becomes `local_only=self._force_local_only()`. Under §6, `decide` ORs that value with the live provider. Today the injected provider *replaces* the live one, so the only possible behaviour change is that the gate becomes stricter.
+   - **Model selection.** `[retrieval] memory_answerability_model` uses `generate`'s selector grammar, which allows a bare model id. It is replaced by `memory_answerability_decision_model` in §5.3's grammar. A config that still sets the old key fails validation at load, with an error naming the new key. The old value is never silently reinterpreted under the new grammar.
 5. Response audit, as a `score` question.
 6. Reflection capture pre-gate, and batched sleep attestation.
 7. Per-heuristic migrations, each with labelled samples: tagger, schema router, continuation intent, turn classifier, injection scoring, and GitHub-app should-respond.
