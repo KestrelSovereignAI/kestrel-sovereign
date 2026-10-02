@@ -145,6 +145,9 @@ class ModelDiscoveryMixin:
                 # embedding route's ``supports_embeddings`` unset on this
                 # instance even though its embedding catalog is discoverable.
                 await self.reconcile_embedding_capabilities(use_cache=True)
+                # Decision models (#3424): reuse cached decision state; only
+                # never-discovered routes are contacted on a cache hit.
+                await self.reconcile_decision_capabilities(use_cache=True)
                 return self._filter_models(
                     cached_models,
                     featured_only=featured_only,
@@ -311,6 +314,9 @@ class ModelDiscoveryMixin:
         # (they use ``_resolve_local_auto_routes``), so cloud embedding
         # endpoints are not contacted under a privacy-gated turn.
         await self.reconcile_embedding_capabilities(use_cache=True)
+        # Decision models (#3424) on the same non-local warm-up path; a cache
+        # miss refreshes every decision route and re-runs pin canaries.
+        await self.reconcile_decision_capabilities(use_cache=False)
 
         # Cache results in shared memory cache and on disk
         shared_cache.set(all_models)
@@ -904,6 +910,15 @@ class ModelDiscoveryMixin:
                     if parity is not None and getattr(parity, "passed", False):
                         return m
         return None
+
+    async def reconcile_decision_capabilities(self, use_cache: bool = True) -> None:
+        """Hook for the decisions modality (#3424), called beside embedding reconciliation.
+
+        :class:`~kestrel_sovereign.llm.decision_service.DecisionServiceMixin`
+        implements it and precedes this mixin in ``LLMService``'s MRO; a bare
+        discovery mixin (catalog-only tooling and tests) has no decision state
+        to reconcile.
+        """
 
     async def reconcile_embedding_capabilities(self, *, use_cache: bool = True) -> None:
         """Fold live embedding discovery into each route's static capabilities (#2338).

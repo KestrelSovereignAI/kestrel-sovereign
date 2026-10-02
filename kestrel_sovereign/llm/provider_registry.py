@@ -49,6 +49,7 @@ try:
 except ImportError:
     ollama = None
 
+from .decisions.config import parse_route_decision_config
 from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter, ProviderInfo
 from kestrel_sdk.llm import ProviderCapabilities
 
@@ -412,6 +413,11 @@ class ProviderRegistry:
                 "be boolean"
             )
         info._kestrel_embedding_answerability_gate = answerability_gate  # type: ignore[attr-defined]
+        # #3424 decision config, stashed like the knobs above and surfaced as
+        # ``decision_state`` by ``LLMService._convert_providers_format``.
+        info._kestrel_decision_config = parse_route_decision_config(  # type: ignore[attr-defined]
+            vendor, route, route_cfg
+        )
         return info
 
     def _build_client_and_adapter(

@@ -31,6 +31,12 @@ from pydantic import BaseModel
 
 from .adapter import LLMResponse
 from kestrel_sdk.llm import ProviderCapabilities
+from kestrel_sdk.llm.decisions import (
+    DecisionModelInfo,
+    DecisionTransportError,
+    ValidatedDecisionRequest,
+)
+from .decisions.http import post_systemone, systemone_body
 from .openai_adapter import OpenAIAdapter
 from .model_metadata import ModelInfo, ModelCategory
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
@@ -91,6 +97,9 @@ class OpenRouterAdapter(OpenAIAdapter):
             # Truthful, ROUTE-scoped embedding advertisement (#2288): only when
             # an embedding model is actually configured for this route.
             supports_embeddings=self._supports_embeddings,
+            # Decision models are served on their own systemone surface; which
+            # ones exist is discovery state, not this static flag (#3424).
+            supports_decisions=True,
             embedding_model=self._embedding_model,
             embedding_dim=self._embedding_dim,
             model_dependent=("tools", "vision", "structured_output"),
@@ -443,6 +452,69 @@ class OpenRouterAdapter(OpenAIAdapter):
             ))
 
         logger.info(f"OpenRouter: discovered {len(results)} embedding models")
+        return results
+
+    async def adecide(
+        self,
+        client: Any,
+        model: str,
+        request: ValidatedDecisionRequest,
+        *,
+        timeout: float,
+    ) -> Dict[str, Any]:
+        """Answer a decision request via OpenRouter's ``/systemone`` passthrough (#3424).
+
+        OpenRouter serves decision models only on this typed surface; they are
+        not chat-completions models. The canonical systemone request is sent
+        as-is with the model id; the raw response (including OpenRouter's
+        ``usage.cost``) is returned for the framework to normalise.
+        """
+        if not self.api_key:
+            raise DecisionTransportError("openrouter: OPENROUTER_API_KEY is not set")
+        return await post_systemone(
+            f"{self.base_url}/systemone",
+            systemone_body(model, request),
+            timeout=timeout,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            route="openrouter",
+        )
+
+    async def list_decision_models(self, client: Any = None) -> List[DecisionModelInfo]:
+        """Discover decision models from the catalog's ``decisions`` output modality.
+
+        ``GET /models?output_modalities=decisions`` returns exactly the
+        ``text->decisions`` models (verified live 2026-10-02). The plain
+        ``/models`` listing omits them, so they never appear as chat models.
+        Failures propagate so discovery can mark the route stale.
+        """
+        if not self.api_key:
+            return []
+        async with httpx.AsyncClient() as http_client:
+            response = await http_client.get(
+                f"{self.base_url}/models",
+                params={"output_modalities": "decisions"},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=HTTP_TIMEOUT_DEFAULT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+
+        results: List[DecisionModelInfo] = []
+        for entry in payload.get("data", []):
+            model_id = entry.get("id")
+            modality = (entry.get("architecture") or {}).get("modality") or ""
+            if not model_id or not str(modality).endswith("decisions"):
+                continue
+            context = entry.get("context_length")
+            created = entry.get("created")
+            results.append(DecisionModelInfo(
+                id=str(model_id),
+                vendor="openrouter",
+                route="",
+                context_limit=int(context) if isinstance(context, int) and context > 0 else None,
+                created_at=str(created) if created is not None else None,
+            ))
+        logger.info(f"OpenRouter: discovered {len(results)} decision models")
         return results
 
     @staticmethod
