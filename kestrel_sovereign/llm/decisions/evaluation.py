@@ -388,6 +388,17 @@ class ModelReport:
         return float(ordered[index])
 
 
+def _error_label(error: DecisionError) -> str:
+    """Error class, plus the per-route reason for an unavailable model."""
+
+    name = type(error).__name__
+    reasons = sorted({r.reason.value for r in getattr(error, "rejections", ())})
+    detail = sorted({r.detail for r in getattr(error, "rejections", ()) if r.detail})
+    if reasons:
+        name += f"({', '.join(reasons)}" + (f": {'; '.join(detail)}" if detail else "") + ")"
+    return name
+
+
 def eval_caller_id(caller: str) -> str:
     """Eval traffic is recorded under its own caller, never the real one.
 
@@ -433,7 +444,7 @@ async def evaluate_model(
                     threshold_keys=sample.threshold_keys or None,
                 )
             except DecisionError as error:
-                name = type(error).__name__
+                name = _error_label(error)
                 report.errors[name] = report.errors.get(name, 0) + 1
                 return
         report.latencies_ms.append(result.duration_ms)

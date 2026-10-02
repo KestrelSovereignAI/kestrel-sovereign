@@ -407,3 +407,19 @@ def test_exact_thresholds_are_not_rounded_into_the_snippet() -> None:
                             metrics=[ev.KeyMetrics("answers", "noul", 2, 1.0, 0.0, 0.0, 0.90004)])
     assert '"answers" = 0.90004' in ev.render_threshold_snippet(
         [report], caller="c", samples=2, sample_hash="ab" * 32)
+
+
+def test_unavailable_errors_carry_their_rejection_reason() -> None:
+    from kestrel_sdk.llm.decisions import (
+        DecisionUnavailable,
+        RejectionReason,
+        RouteRejection,
+        UnavailableReason,
+    )
+
+    error = DecisionUnavailable(
+        UnavailableReason.NO_CANDIDATE, "x",
+        rejections=[RouteRejection("openrouter:api", RejectionReason.NO_FIT, "m",
+                                   "context limit unknown")])
+    assert ev._error_label(error) == "DecisionUnavailable(no_fit: context limit unknown)"
+    assert ev._error_label(DecisionTransportError("x")) == "DecisionTransportError"
