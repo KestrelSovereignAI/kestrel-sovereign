@@ -340,7 +340,7 @@ The `generate` path's `resolve_provider_routing` treats a selector without `/` a
 A bare model id is **not** accepted, because one id can exist on several vendors with different calibration. The `cheap` alias is not accepted either, because it names a chat model.
 
 An override is terminal: it narrows the candidates and never widens them. When the override names a model, it replaces model selection on every route it leaves:
-- **Discovered models.** On a route with no pin, the named model is used if that route's discovery reports it; otherwise the route is rejected with `NOT_SERVED`. `decision_hints` do not apply, because an exact model needs no narrowing.
+- **Discovered models.** On a route with no pin, the named model is used if that route's discovery reports it. If discovery found other decision models but not this one, the route is rejected with `NOT_SERVED`. If discovery found no decision models at all, `NO_MODELS` takes precedence, as in §5.2. `decision_hints` do not apply, because an exact model needs no narrowing.
 - **Pins.** On a route with a verified pin, the named model must equal the pin; otherwise the route is rejected with `PIN_CONFLICT`. An unverified pin still rejects the route with `UNVERIFIED_PIN`. The operator's pin is never bypassed and never silently ignored. If the override named a single route (`<vendor>:<route>/<model>`), that rejection is the whole outcome: `NO_CANDIDATE`, with the one route's reason. If an explicit `decision_route` is set and the override names a different route or vendor, `decide` raises `DecisionUnavailable(SELECTOR_CONFLICT)`. The operator's routing decision and the caller's request disagree, and neither silently wins.
 
 ## 6. Privacy modes
@@ -348,7 +348,7 @@ An override is terminal: it narrows the candidates and never widens them. When t
 Privacy modes **route** decisions to local models. They never disable decisions.
 
 - The effective restriction is **`local_only OR self._current_force_local_only()`**. The live privacy provider is the same one the embedding resolver reads, and it fails closed (`True`) when the bound callable raises. A caller can tighten privacy with `local_only=True`, but it cannot loosen it: there is no parameter that turns the live restriction off.
-- Under effective local-only, only `is_local` routes are candidates. If none can answer, the caller gets `DecisionUnavailable(NO_LOCAL_ROUTE)`. **There is never a silent cloud fallback.**
+- Under effective local-only, only `is_local` routes are candidates. If no route survives the privacy filter, the caller gets `DecisionUnavailable(NO_LOCAL_ROUTE)`. If local routes survive but every one is rejected (for example `NO_MODELS` or `NO_FIT`), the caller gets `NO_CANDIDATE` with those per-route reasons. **There is never a silent cloud fallback.**
 - The effective restriction is evaluated once, at the start of `decide`, together with the invocation context (§8). It applies to the whole call.
 - **Background discovery is not a decision call.** Catalog discovery at boot and on refresh (§4) is not triggered by `decide`. It carries no request content, and pin canaries send only a fixed synthetic state. Inside a `decide` call, discovery is scoped to the routes that survive the privacy filter (§5.2, step 2).
 
@@ -373,7 +373,7 @@ Anything other than a complete, normalised `DecisionResult` is raised as an exce
 | Exception | Meaning |
 |---|---|
 | `DecisionRequestInvalid(rule)` | The request failed validation (§2.2). Nothing was sent. |
-| `DecisionUnavailable(reason, rejections)` | Nothing was sent. `reason` is one of `DISABLED`, `SELECTOR_CONFLICT`, `NO_ROUTE` (no configured route remains after the override), `NO_LOCAL_ROUTE` (privacy removed every route) or `NO_CANDIDATE` (routes remained, but each was rejected). `rejections` lists each route with its reason: `NO_MODELS`, `AMBIGUOUS_MODEL`, `NOT_CALIBRATED`, `NO_FIT`, `UNVERIFIED_PIN`, `NOT_SERVED` or `PIN_CONFLICT`. `NO_ROUTE` means no configured route survived the override. If routes survived but every one was rejected, including the case where every route discovered zero models, the reason is `NO_CANDIDATE`. |
+| `DecisionUnavailable(reason, rejections)` | Nothing was sent. `reason` is one of `DISABLED`, `SELECTOR_CONFLICT`, `NO_ROUTE` (no configured route remains after the override), `NO_LOCAL_ROUTE` (no route survived the privacy filter) or `NO_CANDIDATE` (routes remained, but each was rejected). `rejections` lists each route with its reason: `NO_MODELS`, `AMBIGUOUS_MODEL`, `NOT_CALIBRATED`, `NO_FIT`, `UNVERIFIED_PIN`, `NOT_SERVED` or `PIN_CONFLICT`. `NO_ROUTE` means no configured route survived the override. If routes survived but every one was rejected, including the case where every route discovered zero models, the reason is `NO_CANDIDATE`. |
 | `DecisionTimeout` | `timeout_seconds` elapsed. The deadline covers the whole call: resolution, the fit check, dispatch and normalisation. It is enforced with `asyncio.timeout` in `decide` and is also passed to the adapter's HTTP client. The Ollama route must set an explicit HTTP timeout, because the chat `AsyncClient` has none. |
 | `DecisionTransportError` | A network or HTTP failure. This includes a 404 for `/v1/systemone` on a runtime too old to serve it, and a model that has disappeared since discovery. |
 | `DecisionProtocolError` | The response violated §2.3. |
