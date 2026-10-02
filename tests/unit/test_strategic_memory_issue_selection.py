@@ -140,20 +140,36 @@ def _closed(number, title="t"):
     return {"number": number, "title": title, "state": "closed", "labels": []}
 
 
-def _stub_github(monkeypatch, responses, calls=None, linked_prs=None):
+def _stub_github(
+    monkeypatch, responses, calls=None, linked_prs=None, retry_evidence=None
+):
     """Answer github_api_get from ``responses``; anything else is a 404.
 
     The PR-linkage GraphQL read answers from ``linked_prs`` keyed by
     ``(repo, number)``: a list of PR nodes, ``None`` for an unreadable read,
     or an exception to raise. Absent means no PR links the issue.
+
+    The post-run activity read (#3398) answers from ``retry_evidence`` keyed
+    the same way: an ``issue`` node (see ``_activity``), ``None`` for an
+    unreadable read, or an exception to raise. Absent means no activity.
     """
     monkeypatch.setattr(issue_selection, "get_github_token", lambda: "token")
     linked_prs = linked_prs or {}
+    retry_evidence = retry_evidence or {}
 
     async def fake_post(path, token, body):
         assert path == "/graphql", path
         variables = body["variables"]
         key = (f"{variables['owner']}/{variables['name']}", variables["number"])
+        if "timelineItems" in body["query"]:
+            if calls is not None:
+                calls.append(("activity",) + key)
+            value = retry_evidence.get(key, _activity())
+            if isinstance(value, Exception):
+                raise value
+            if value is None:
+                return None
+            return {"data": {"repository": {"issue": value}}}
         if calls is not None:
             calls.append(("graphql",) + key)
         value = linked_prs.get(key, [])
@@ -388,6 +404,7 @@ async def test_diagnostics_say_when_nothing_could_be_confirmed(monkeypatch):
         "candidates_checked": 0,
         "candidates_unreadable": 0,
         "open_pr_exclusions": [],
+        "run_exclusions": [],
     }
 
 
@@ -411,6 +428,7 @@ async def test_a_closed_blocker_is_checked_but_not_unreadable(monkeypatch):
         "candidates_checked": 0,
         "candidates_unreadable": 0,
         "open_pr_exclusions": [],
+        "run_exclusions": [],
     }
 
 
@@ -933,3 +951,507 @@ async def test_one_unreadable_candidate_among_in_flight_ones_is_counted(monkeypa
     ) is None
     assert diagnostics["candidates_checked"] == 3
     assert diagnostics["candidates_unreadable"] == 1
+
+
+# ---------------------------------------------------------------------------
+# #3398: an issue whose last Talon run asked a question is not dispatched
+# again until something newer than that run authorizes a retry
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from kestrel_sovereign.features.strategic_memory import run_history  # noqa: E402
+
+#: When #3093's last run (clarifying) finished on the live host.
+_RUN_ENDED = datetime(2026, 9, 24, 8, 41, tzinfo=timezone.utc)
+
+
+def _at(minutes):
+    """An ISO instant ``minutes`` after (negative: before) the run ended."""
+    return (_RUN_ENDED + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+
+
+def _run(issue, disposition="clarifying", *, repo="o/r", ended=_RUN_ENDED, job_id=None):
+    return run_history.TalonRun(
+        job_id=job_id or f"job-{issue}-{disposition}",
+        repo=repo,
+        issue_number=issue,
+        disposition=disposition,
+        completed_at=ended,
+    )
+
+
+def _history(*runs):
+    return run_history.RunHistory.from_runs(runs)
+
+
+def _activity(*nodes, last_edited_at=None):
+    """An ``issue`` node as the post-run activity query returns it."""
+    return {"lastEditedAt": last_edited_at, "timelineItems": {"nodes": list(nodes)}}
+
+
+def _comment(minutes, body="Please split this", association="OWNER"):
+    return {
+        "__typename": "IssueComment",
+        "createdAt": _at(minutes),
+        "authorAssociation": association,
+        "body": body,
+    }
+
+
+def _labeled(minutes, name):
+    return {"__typename": "LabeledEvent", "createdAt": _at(minutes), "label": {"name": name}}
+
+
+def _renamed(minutes):
+    return {"__typename": "RenamedTitleEvent", "createdAt": _at(minutes)}
+
+
+def _blockers(*issues):
+    return {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [
+            {"severity": "high", "issue": f"o/r#{n}", "title": f"row {n}"} for n in issues
+        ],
+    }
+
+
+#: What Talon itself leaves on an issue around the end of a run: its question,
+#: and the claim release posted on exit. Both under the operator's account.
+_TALON_OWN_COMMENTS = (
+    _comment(-1, "**Kestrel Talon Analyzing** | Session: `s`\n\n## Clarification Needed"),
+    _comment(1, "<!-- kestrel-talon:claim-released -->\n**Kestrel Talon claim released**"),
+)
+
+
+@pytest.mark.asyncio
+async def test_the_live_shape_an_answered_by_nobody_run_is_not_dispatched_again(monkeypatch):
+    """#3093 on 09-16, 09-23 and 09-24: open, a high blocker, no open PR, and
+    the Talon label cleared to mean "acknowledged". Every run ended with the
+    same question and no diff. Nothing since the last one changed its input,
+    so dispatching it again is the same run again."""
+    _stub_github(
+        monkeypatch,
+        {
+            "/repos/o/r/issues/3093": _open(3093, "Talon live progress"),
+            "/repos/o/r/issues/3094": _open(3094, "next"),
+        },
+        retry_evidence={("o/r", 3093): _activity(*_TALON_OWN_COMMENTS)},
+    )
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        _blockers(3093, 3094), diagnostics, run_history=_history(_run(3093, job_id="9a63c66b2b71"))
+    )
+
+    assert picked is not None and picked["issue_number"] == 3094
+    [exclusion] = diagnostics["run_exclusions"]
+    assert exclusion == {
+        "repo": "o/r",
+        "issue_number": 3093,
+        "reason": issue_selection.EXCLUDED_UNCHANGED_SINCE_RUN,
+        "job_id": "9a63c66b2b71",
+        "disposition": "clarifying",
+        "completed_at": _RUN_ENDED.isoformat(),
+    }
+    assert issue_selection.describe_exclusion(exclusion) == (
+        "skipped o/r#3093 -- Talon job 9a63c66b ended clarifying at "
+        "2026-09-24 08:41 UTC without a PR, and nothing since authorizes a "
+        "retry (a maintainer or orchestrator comment, an issue edit, or agent-ready)"
+    )
+    # A real answer from GitHub, not an outage.
+    assert diagnostics["blockers_unreadable"] == 0
+    assert diagnostics["open_pr_exclusions"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["blocked", "clarifying"])
+async def test_a_board_whose_only_candidate_awaits_an_answer_selects_nothing(
+    monkeypatch, disposition
+):
+    _stub_github(monkeypatch, {"/repos/o/r/issues/3093": _open(3093)})
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(3093), diagnostics, run_history=_history(_run(3093, disposition))
+    ) is None
+    [exclusion] = diagnostics["run_exclusions"]
+    assert exclusion["disposition"] == disposition
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "activity",
+    [
+        pytest.param(_activity(_comment(5)), id="owner-comment"),
+        pytest.param(_activity(_comment(5, association="MEMBER")), id="member-comment"),
+        pytest.param(_activity(_comment(5, association="COLLABORATOR")), id="orchestrator-comment"),
+        pytest.param(_activity(last_edited_at=_at(5)), id="body-edit"),
+        pytest.param(_activity(_renamed(5)), id="title-change"),
+        pytest.param(_activity(_labeled(5, "agent-ready")), id="readiness-label"),
+        pytest.param(_activity(_labeled(5, "Agent-Ready")), id="readiness-label-case"),
+        pytest.param(
+            _activity(_comment(5), *_TALON_OWN_COMMENTS), id="answer-among-talon-comments"
+        ),
+    ],
+)
+async def test_something_newer_than_the_run_authorizes_a_retry(monkeypatch, activity):
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/3093": _open(3093)},
+        retry_evidence={("o/r", 3093): activity},
+    )
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        _blockers(3093), diagnostics, run_history=_history(_run(3093))
+    )
+
+    assert picked is not None and picked["issue_number"] == 3093
+    assert diagnostics["run_exclusions"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "activity",
+    [
+        pytest.param(_activity(), id="nothing"),
+        pytest.param(_activity(_comment(-5)), id="comment-before-the-run-ended"),
+        pytest.param(_activity(_comment(0)), id="comment-at-the-same-instant"),
+        pytest.param(_activity(_comment(5, association="NONE")), id="stranger-comment"),
+        pytest.param(
+            _activity(_comment(5, association="CONTRIBUTOR")), id="contributor-comment"
+        ),
+        pytest.param(
+            _activity(_comment(5, association="FIRST_TIME_CONTRIBUTOR")),
+            id="first-time-contributor-comment",
+        ),
+        pytest.param(_activity(*_TALON_OWN_COMMENTS), id="talon-own-comments"),
+        pytest.param(
+            _activity(_comment(5, "  **Kestrel Talon Blocked** | Session: `s`")),
+            id="talon-blocked-comment-after",
+        ),
+        pytest.param(_activity(_labeled(5, "agent-blocked")), id="talon-label"),
+        pytest.param(_activity(_labeled(5, "bug")), id="unrelated-label"),
+        pytest.param(_activity(_labeled(-5, "agent-ready")), id="readiness-label-before"),
+        pytest.param(_activity(last_edited_at=_at(-5)), id="edit-before-the-run-ended"),
+        pytest.param(_activity(_renamed(-5)), id="title-change-before"),
+        pytest.param(
+            _activity({"__typename": "IssueComment", "authorAssociation": "OWNER", "body": "x"}),
+            id="comment-without-a-timestamp",
+        ),
+    ],
+)
+async def test_nothing_newer_from_the_repository_withholds(monkeypatch, activity):
+    """Removing ``agent-blocked`` is deliberately absent from the authorizers:
+    it has meant both "retry" and "stop" (#3398). The query does not even ask
+    for unlabel events."""
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/3093": _open(3093)},
+        retry_evidence={("o/r", 3093): activity},
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(3093), diagnostics, run_history=_history(_run(3093))
+    ) is None
+    [exclusion] = diagnostics["run_exclusions"]
+    assert exclusion["reason"] == issue_selection.EXCLUDED_UNCHANGED_SINCE_RUN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["completed", "failed", "unknown"])
+async def test_a_run_that_did_not_stop_on_a_question_does_not_withhold(
+    monkeypatch, disposition
+):
+    """``failed`` keeps its own gate -- Talon's ``agent-failed`` label (#3294) --
+    and ``unknown`` is not evidence that the run asked anything."""
+    calls = []
+    _stub_github(monkeypatch, {"/repos/o/r/issues/3093": _open(3093)}, calls)
+
+    picked = await issue_selection.pick_top_issue(
+        _blockers(3093), run_history=_history(_run(3093, disposition))
+    )
+
+    assert picked is not None and picked["issue_number"] == 3093
+    assert ("activity", "o/r", 3093) not in calls
+
+
+@pytest.mark.asyncio
+async def test_an_issue_with_no_talon_run_is_never_asked_about(monkeypatch):
+    calls = []
+    _stub_github(monkeypatch, {"/repos/o/r/issues/7": _open(7)}, calls)
+
+    picked = await issue_selection.pick_top_issue(
+        _blockers(7), run_history=_history(_run(3093, "blocked"))
+    )
+
+    assert picked is not None and picked["issue_number"] == 7
+    assert not any(call[0] == "activity" for call in calls if isinstance(call, tuple))
+
+
+@pytest.mark.asyncio
+async def test_without_a_run_history_there_is_no_last_run(monkeypatch):
+    _stub_github(monkeypatch, {"/repos/o/r/issues/3093": _open(3093)})
+
+    picked = await issue_selection.pick_top_issue(_blockers(3093))
+
+    assert picked is not None and picked["issue_number"] == 3093
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runs, withheld",
+    [
+        pytest.param(
+            [_run(1, "blocked", ended=_RUN_ENDED - timedelta(days=2)), _run(1, "completed")],
+            False,
+            id="a-later-completed-run-supersedes-a-blocked-one",
+        ),
+        pytest.param(
+            [_run(1, "completed", ended=_RUN_ENDED - timedelta(days=2)), _run(1, "blocked")],
+            True,
+            id="a-later-blocked-run-supersedes-a-completed-one",
+        ),
+    ],
+)
+async def test_the_most_recent_run_decides(monkeypatch, runs, withheld):
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": _open(1)})
+
+    picked = await issue_selection.pick_top_issue(_blockers(1), run_history=_history(*runs))
+
+    assert (picked is None) is withheld
+
+
+@pytest.mark.asyncio
+async def test_the_retry_window_starts_at_the_most_recent_run(monkeypatch):
+    """A comment that authorized the 09-23 run does not authorize another
+    after the 09-24 run asked again: the earlier answer was already read."""
+    first = _run(1, "blocked", ended=_RUN_ENDED - timedelta(days=1))
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/1": _open(1)},
+        retry_evidence={("o/r", 1): _activity(_comment(-60 * 12))},
+    )
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(1), run_history=_history(first)
+    ) is not None
+    assert await issue_selection.pick_top_issue(
+        _blockers(1), run_history=_history(first, _run(1, "clarifying"))
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_the_registry_and_the_ledger_need_not_agree_on_case(monkeypatch):
+    _stub_github(monkeypatch, {"/repos/O/R/issues/5": _open(5)})
+    data = {
+        "morning_signal_config": {"scan_repos": ["O/R"]},
+        "blockers": [{"severity": "high", "issue": "O/R#5", "title": "x"}],
+    }
+
+    assert await issue_selection.pick_top_issue(
+        data, run_history=_history(_run(5, "blocked", repo="o/r"))
+    ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        RuntimeError("502"),
+    ],
+)
+async def test_unreadable_post_run_activity_withholds_and_counts_as_unreadable(
+    monkeypatch, failure
+):
+    """"Could not tell whether anyone answered" is not "someone answered", and
+    an outage must still render as one rather than as nothing to do."""
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/3093": _open(3093)},
+        retry_evidence={("o/r", 3093): failure},
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(3093), diagnostics, run_history=_history(_run(3093, "blocked"))
+    ) is None
+    assert diagnostics["blockers_checked"] == 1
+    assert diagnostics["blockers_unreadable"] == 1
+    [exclusion] = diagnostics["run_exclusions"]
+    assert exclusion["reason"] == issue_selection.EXCLUDED_RETRY_EVIDENCE_UNREADABLE
+    assert issue_selection.describe_exclusion(exclusion).endswith(
+        "and GitHub could not say whether anything since authorizes a retry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_open_pr_is_reported_instead_of_the_run(monkeypatch):
+    """One reason per skip: a PR already working the issue is the stronger
+    fact, and the post-run read is not spent on it."""
+    calls = []
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/1": _open(1)},
+        calls,
+        linked_prs={("o/r", 1): [_pr(2, updated_at=_fresh_now())]},
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(1), diagnostics, run_history=_history(_run(1, "blocked"))
+    ) is None
+    assert len(diagnostics["open_pr_exclusions"]) == 1
+    assert diagnostics["run_exclusions"] == []
+    assert ("activity", "o/r", 1) not in calls
+
+
+@pytest.mark.asyncio
+async def test_a_talon_state_label_still_withholds_first(monkeypatch):
+    calls = []
+    _stub_github(
+        monkeypatch, {"/repos/o/r/issues/1": _labelled(1, "agent-clarifying")}, calls
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(1), diagnostics, run_history=_history(_run(1))
+    ) is None
+    assert diagnostics["blockers_talon_owned"] == 1
+    assert diagnostics["run_exclusions"] == []
+    assert ("activity", "o/r", 1) not in calls
+
+
+@pytest.mark.asyncio
+async def test_the_backlog_scan_skips_an_issue_awaiting_an_answer(monkeypatch):
+    _stub_github(monkeypatch, {_BACKLOG: [_open(1), {**_open(2), "comments": 3}]})
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}},
+        diagnostics,
+        run_history=_history(_run(1, "blocked")),
+    )
+
+    assert picked is not None and picked["issue_number"] == 2
+    assert [e["issue_number"] for e in diagnostics["run_exclusions"]] == [1]
+    assert diagnostics["candidates_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_milestone_scan_skips_an_issue_awaiting_an_answer(monkeypatch):
+    _stub_github(
+        monkeypatch,
+        {
+            _MILESTONES: [{"number": 4, "title": "Extraction"}],
+            _MILESTONE_ISSUES: [_open(11), _open(12)],
+        },
+    )
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "milestones": [{"name": "Extraction", "status": "at_risk", "repos": ["o/r"]}],
+    }
+
+    picked = await issue_selection.pick_top_issue(
+        data, run_history=_history(_run(11, "clarifying"))
+    )
+
+    assert picked is not None and picked["issue_number"] == 12
+
+
+@pytest.mark.asyncio
+async def test_unreadable_post_run_activity_in_the_backlog_is_counted(monkeypatch):
+    _stub_github(
+        monkeypatch, {_BACKLOG: [_open(1)]}, retry_evidence={("o/r", 1): None}
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}},
+        diagnostics,
+        run_history=_history(_run(1, "blocked")),
+    ) is None
+    assert diagnostics["candidates_checked"] == 1
+    assert diagnostics["candidates_unreadable"] == 1
+
+
+@pytest.mark.asyncio
+async def test_post_run_activity_is_read_once_per_issue_across_passes(monkeypatch):
+    calls = []
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/5": _open(5), _BACKLOG: [_open(5)]},
+        calls,
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(5), diagnostics, run_history=_history(_run(5, "blocked"))
+    ) is None
+    assert calls.count(("activity", "o/r", 5)) == 1, calls
+    assert len(diagnostics["run_exclusions"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"errors": [{"message": "Could not resolve to a Repository"}]},
+        {
+            "data": {"repository": {"issue": _activity()}},
+            "errors": [{"message": "Resource not accessible by integration"}],
+        },
+        {"data": {"repository": None}},
+        {"data": {"repository": {"issue": None}}},
+        {"data": {"repository": {"issue": {"lastEditedAt": None}}}},
+        {"data": {"repository": {"issue": {"timelineItems": {"nodes": None}}}}},
+        [],
+        None,
+    ],
+)
+async def test_a_graphql_answer_without_activity_is_unreadable_not_empty(
+    monkeypatch, response
+):
+    """An empty timeline is "nobody answered"; a missing one is no answer."""
+    monkeypatch.setattr(
+        issue_selection, "github_api_post", AsyncMock(return_value=response)
+    )
+
+    assert await issue_selection._fetch_retry_evidence("o/r", 1, "t") is None
+
+
+@pytest.mark.asyncio
+async def test_the_activity_query_names_the_issue_it_is_asked_about(monkeypatch):
+    post = AsyncMock(return_value={"data": {"repository": {"issue": _activity(
+        _comment(1), last_edited_at=_at(2),
+    )}}})
+    monkeypatch.setattr(issue_selection, "github_api_post", post)
+
+    evidence = await issue_selection._fetch_retry_evidence("Kestrel.AI/kestrel-x", 3093, "t")
+
+    assert evidence == {"last_edited_at": _at(2), "timeline": [_comment(1)]}
+    path, token, body = post.await_args.args
+    assert (path, token) == ("/graphql", "t")
+    assert body["variables"] == {"owner": "Kestrel.AI", "name": "kestrel-x", "number": 3093}
+    for field in ("lastEditedAt", "ISSUE_COMMENT", "LABELED_EVENT", "RENAMED_TITLE_EVENT",
+                  "authorAssociation"):
+        assert field in body["query"], field
+
+
+def test_the_retry_vocabulary_matches_talons():
+    """Copies of kestrel-feature-talon / kestrel-talon vocabulary, pinned here
+    because core cannot import either package. Change both or neither."""
+    # kestrel_feature_talon/run_disposition.py BLOCKED, CLARIFYING
+    assert run_history.QUESTION_DISPOSITIONS == frozenset({"blocked", "clarifying"})
+    # kestrel_feature_talon/wait_provider.py TalonWaitable.kind
+    assert run_history.TALON_WAIT_KIND == "talon"
+    # kestreltalon/models.py TALON_COMMENT_MARKER; claim_record.py markers
+    assert issue_selection.TALON_COMMENT_PREFIXES == (
+        "**Kestrel Talon",
+        "<!-- kestrel-talon:",
+    )
+    # kestreltalon/processor.py: "agent-ready" in context.labels skips clarification
+    assert issue_selection.RETRY_READINESS_LABELS == frozenset({"agent-ready"})
