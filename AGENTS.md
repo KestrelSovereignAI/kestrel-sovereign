@@ -459,10 +459,11 @@ explicit refusal:
 - **One-shot only.** A recurring self-followup is a standing order to spend on
   turns forever.
 
-A follow-up scheduled from a chat turn is bound to that session and comes back
-`USER_VISIBLE` in the same pane; one scheduled from unattended work stays
-`INTERNAL` and log-only. A bound follow-up whose source could not surface is
-refused rather than fired into a blank pane (#2877/#2922). Use
+A follow-up scheduled from a turn is bound to that turn's session and comes back
+`USER_VISIBLE` there: the chat pane, or, from an autonomous wake turn, the
+session the dispatcher minted for that wake's chain (#3429). One scheduled
+outside any turn stays `INTERNAL` and log-only. A bound follow-up whose source
+could not surface is refused rather than fired into a blank pane (#2877/#2922). Use
 `!schedule self-followups` to see every follow-up with its outcome — a dropped
 turn is recorded `missed`, never filed alongside genuine successes.
 

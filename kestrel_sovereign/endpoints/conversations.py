@@ -15,6 +15,7 @@ from kestrel_sovereign.storage.conversation_sessions import (
     SessionCursorError,
 )
 from kestrel_sovereign.storage.async_conversation_store import ProjectionNotReady
+from kestrel_sovereign.storage.session_id_column import new_session_id as mint_session_id
 from kestrel_sovereign.security.encryption import get_fernet, get_agent_fernet, decrypt_string_fernet as decrypt_string
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.agent.context_builder import extract_raw_user_content
@@ -412,8 +413,7 @@ async def start_new_conversation(request: Request):
         # client round-trips the SAME id the list endpoint advertises and any
         # rename lands under it (#2012). Without this the response returned the
         # marker row-id, diverging from the list/rename key.
-        import uuid as _uuid
-        new_session_id = str(_uuid.uuid4())
+        new_session_id = mint_session_id()
         await storage.add_conversation(
             role="system",
             content="[New conversation started]",

@@ -168,6 +168,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     _resolve_transition_lock,
     optional_transition_lock,
 )
+from kestrel_sovereign.storage.session_id_column import new_session_id
 from kestrel_sovereign.telemetry import (
     capture_turn_ids,
     KESTREL_AGENT_NAME,
@@ -5867,15 +5868,25 @@ class SignalDispatcher:
             process_input_kwargs["system_prompt_budget_bytes"] = budget
         if anchored_doctrine is not None:
             process_input_kwargs["anchored_doctrine"] = anchored_doctrine
-        # Route the cognition turn into the signal's originating session when one
-        # is set (e.g. the restart.completed wake carries the session the
-        # restart was requested from, #1809), so the turn lands in that chat
-        # window instead of a fresh implicit session. Guarded by signature
-        # inspection like the other optional kwargs.
-        if signal.session_id and _agent_accepts_kwarg(
-            self._agent.process_input, "session_id"
-        ):
-            process_input_kwargs["session_id"] = signal.session_id
+        # A wake turn's session is ONE value, fixed here before the turn starts
+        # (#3429). A bound signal resumes its originating session (e.g. the
+        # restart.completed wake carries the session the restart was requested
+        # from, #1809), so the turn lands in that chat window. An unbound
+        # signal gets a fresh session of its own. Passing None instead left the
+        # turn running with no session while the store filed each row through
+        # the 30-minute time-gap heuristic at write time — gluing unattended
+        # work into whatever chat was newest, or minting a new session per
+        # wake — and work dispatched from that turn stamped an empty origin,
+        # so its own wake was unbound again. With an explicit session, the
+        # turn's rows, its live binding, and the origin its dispatches record
+        # are the same value: one session per autonomous chain. Visibility is
+        # still the signal's: nobody is watching a minted session, so the wake
+        # stays INTERNAL. Guarded by signature inspection like the other
+        # optional kwargs.
+        if _agent_accepts_kwarg(self._agent.process_input, "session_id"):
+            process_input_kwargs["session_id"] = (
+                signal.session_id or new_session_id()
+            )
 
         # Tag the persisted wake turn so the transcript renderer collapses this
         # internal COGNITION prompt to an "Autonomous wake" chip on reload
