@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import logging
 import math
+from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 
 from .memory_models import MemoryMetadata, TemporalPattern, MemoryEpisode
@@ -33,7 +34,13 @@ from .emotional_tagger import EmotionalTagger
 from .temporal_analyzer import TemporalAnalyzer
 from .associative_linker import AssociativeLinker
 from .memory_retriever import MemoryRetriever
-from .memory_answerability import LLMAnswerabilityGate
+from kestrel_sovereign.llm.decisions.config import parse_decision_selector
+
+from .memory_answerability import (
+    AnswerabilityGate,
+    DecisionAnswerabilityGate,
+    LLMAnswerabilityGate,
+)
 from .memory_consolidator import MemoryConsolidator
 from .schema_router import SchemaRouter
 from .async_storage import AsyncStorage
@@ -90,12 +97,34 @@ def _consolidation_timeout_seconds() -> float:
     )
 
 
-def _answerability_settings() -> tuple[bool, float, Optional[str]]:
+@dataclass(frozen=True)
+class AnswerabilitySettings:
+    """``[retrieval] memory_answerability_*``.
+
+    ``backend`` picks the judge: ``"chat"`` (``LLMService.generate``, model
+    ``model`` in the chat selector grammar) or ``"decision"``
+    (``LLMService.decide``, model ``decision_model`` in the decisions grammar,
+    #3424). Each model key belongs to one backend only.
+    """
+
+    enabled: bool
+    timeout_seconds: float
+    model: Optional[str]
+    backend: str = "chat"
+    decision_model: Optional[str] = None
+
+
+ANSWERABILITY_BACKENDS = ("chat", "decision")
+
+
+def _answerability_settings() -> AnswerabilitySettings:
     """Load and validate the global retrieval answerability controls."""
     config = load_section("retrieval") or {}
     enabled = config.get("memory_answerability_gate", True)
     timeout = config.get("memory_answerability_timeout_seconds", 12.0)
     model = config.get("memory_answerability_model")
+    backend = config.get("memory_answerability_backend", "chat")
+    decision_model = config.get("memory_answerability_decision_model")
     if not isinstance(enabled, bool):
         raise ValueError("retrieval.memory_answerability_gate must be boolean")
     if (
@@ -108,7 +137,57 @@ def _answerability_settings() -> tuple[bool, float, Optional[str]]:
         )
     if model is not None and (not isinstance(model, str) or not model.strip()):
         raise ValueError("retrieval.memory_answerability_model must be a model string")
-    return enabled, float(timeout), model.strip() if model else None
+    if backend not in ANSWERABILITY_BACKENDS:
+        raise ValueError(
+            'retrieval.memory_answerability_backend must be "chat" or "decision"'
+        )
+    if decision_model is not None:
+        if not isinstance(decision_model, str) or not decision_model.strip():
+            raise ValueError(
+                "retrieval.memory_answerability_decision_model must be a selector string"
+            )
+        try:
+            parse_decision_selector(decision_model)
+        except ValueError as error:
+            raise ValueError(
+                f"retrieval.memory_answerability_decision_model: {error}"
+            ) from error
+    # One model key per backend: a value written for one judge is never read
+    # by the other under a different selector grammar.
+    if backend == "chat" and decision_model is not None:
+        raise ValueError(
+            "retrieval.memory_answerability_decision_model applies only when "
+            'memory_answerability_backend = "decision"'
+        )
+    if backend == "decision" and model is not None:
+        raise ValueError(
+            "retrieval.memory_answerability_model is the chat backend's model; "
+            "with the decision backend use memory_answerability_decision_model "
+            "(<vendor>[:<route>][/<model>])"
+        )
+    return AnswerabilitySettings(
+        enabled=enabled,
+        timeout_seconds=float(timeout),
+        model=model.strip() if model else None,
+        backend=backend,
+        decision_model=decision_model.strip() if decision_model else None,
+    )
+
+
+def _build_answerability_gate(
+    llm_service: Any, settings: AnswerabilitySettings
+) -> AnswerabilityGate:
+    if settings.backend == "decision":
+        return DecisionAnswerabilityGate(
+            llm_service,
+            timeout_seconds=settings.timeout_seconds,
+            model_override=settings.decision_model,
+        )
+    return LLMAnswerabilityGate(
+        llm_service,
+        timeout_seconds=settings.timeout_seconds,
+        model_override=settings.model,
+    )
 
 
 def _routing_suppressed(metadata: Optional[Dict[str, Any]]) -> bool:
@@ -199,22 +278,16 @@ class MemorySystem:
         self.analyzer = TemporalAnalyzer(self.storage.db)
         self.linker = AssociativeLinker(governed_graph)
         llm_service = getattr(self.storage, "llm_service", None)
-        answerability_enabled, answerability_timeout, answerability_model = (
-            _answerability_settings()
-        )
+        answerability = _answerability_settings()
         self.retriever = MemoryRetriever(
             self.storage.conversation,
             self.linker,
             answerability_gate=(
-                LLMAnswerabilityGate(
-                    llm_service,
-                    timeout_seconds=answerability_timeout,
-                    model_override=answerability_model,
-                )
-                if llm_service is not None and answerability_enabled
+                _build_answerability_gate(llm_service, answerability)
+                if llm_service is not None and answerability.enabled
                 else None
             ),
-            answerability_enabled=answerability_enabled,
+            answerability_enabled=answerability.enabled,
         )
         self.consolidator = MemoryConsolidator(
             self.storage.db,

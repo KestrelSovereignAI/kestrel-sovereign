@@ -283,7 +283,7 @@ async def test_private_samples_default_to_local_routes(tmp_path: Path, monkeypat
     def args(**kw):
         base = dict(caller="memory_answerability", samples=[private], route=None, model=None,
                     local_only=False, allow_cloud=False, timeout=5.0, concurrency=1,
-                    target_accuracy=0.9, json=None)
+                    target_accuracy=0.9, json=None, baseline=None)
         base.update(kw)
         return argparse.Namespace(**base)
 
@@ -326,6 +326,84 @@ def test_snippet_requires_a_complete_run_and_parses_as_toml() -> None:
 async def test_default_samples_must_exist(tmp_path: Path, capsys) -> None:
     args = argparse.Namespace(caller="no_such_caller", samples=None, route=None, model=None,
                               local_only=False, allow_cloud=False, timeout=5.0, concurrency=1,
-                              target_accuracy=0.9, json=None)
+                              target_accuracy=0.9, json=None, baseline=None)
     assert await cli_decisions._eval(_CliService(), args) == 2
     assert "no shipped sample set" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Caller adapters and baselines (#3435)
+# ---------------------------------------------------------------------------
+
+
+def test_shipped_answerability_samples_use_the_gates_own_builder() -> None:
+    from kestrel_sovereign.storage.memory_answerability import answerability_decision_request
+
+    files = ev.sample_files([ev.PACKAGED_SAMPLES_DIR / "memory_answerability"])
+    samples, _ = ev.load_samples(files)
+    assert len(samples) >= 30
+    labels = [v for s in samples for v in s.expected.values()]
+    assert any(labels) and not all(labels)
+    for sample in samples:
+        request, keys = answerability_decision_request(
+            sample.raw["question"], sample.raw["candidates"])
+        assert sample.request == request and sample.threshold_keys == keys
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ({"adapter": "nope", "id": "x"}, "unknown sample adapter"),
+        ({"adapter": "memory_answerability", "id": "x", "question": "q",
+          "candidates": [], "answerable": []}, "candidates must be"),
+        ({"adapter": "memory_answerability", "id": "x", "question": "q",
+          "candidates": ["a"], "answerable": [1]}, "distinct candidate indices"),
+        ({"adapter": "memory_answerability", "id": "x", "question": " ",
+          "candidates": ["a"], "answerable": []}, "question must be"),
+    ],
+)
+def test_adapter_samples_are_validated(raw, message) -> None:
+    with pytest.raises(ev.SampleError, match=message):
+        ev.parse_sample(json.dumps(raw), "f:1")
+
+
+@pytest.mark.asyncio
+async def test_chat_baseline_is_scored_but_never_proposes(monkeypatch) -> None:
+    from kestrel_sovereign.storage import memory_answerability as ma
+
+    raw = {"adapter": "memory_answerability", "id": "p", "question": "pet?",
+           "candidates": ["Quasar the axolotl", "gravel"], "answerable": [0]}
+    bad = dict(raw, id="q")
+    samples = [ev.parse_sample(json.dumps(raw), "f:1"), ev.parse_sample(json.dumps(bad), "f:2")]
+
+    class _Gate:
+        def __init__(self, service, **kwargs):
+            self.kwargs = kwargs
+
+        async def filter(self, query, candidates):
+            if query and candidates[1].content == "gravel" and self.kwargs["force_local_only_provider"]():
+                return ma.AnswerabilityDecision(frozenset({"c0"}), True, 1.0)
+            return ma.AnswerabilityDecision(frozenset(), False, 1.0, reason="x")
+
+    monkeypatch.setattr(ma, "LLMAnswerabilityGate", _Gate)
+    report = await ev.evaluate_baseline(
+        object(), "memory_answerability", "chat", samples, local_only=True,
+        timeout_seconds=5, concurrency=1, target_accuracy=0.9)
+    assert report.baseline and report.selector == "baseline:chat"
+    [m] = report.metrics
+    assert m.key == "answers" and m.accuracy == 1.0 and m.n == 4
+    assert report.proposal_blocker() == "baseline (comparison only)"
+    assert ev.render_threshold_snippet([report], caller="memory_answerability",
+                                       samples=2, sample_hash="ef" * 32) == ""
+
+    with pytest.raises(ev.SampleError, match="no baseline"):
+        await ev.evaluate_baseline(object(), "memory_answerability", "nope", samples,
+                                   local_only=True, timeout_seconds=5, concurrency=1,
+                                   target_accuracy=0.9)
+
+
+def test_exact_thresholds_are_not_rounded_into_the_snippet() -> None:
+    report = ev.ModelReport("a:b/m", "a:b", "m", expected_keys=["answers"],
+                            metrics=[ev.KeyMetrics("answers", "noul", 2, 1.0, 0.0, 0.0, 0.90004)])
+    assert '"answers" = 0.90004' in ev.render_threshold_snippet(
+        [report], caller="c", samples=2, sample_hash="ab" * 32)

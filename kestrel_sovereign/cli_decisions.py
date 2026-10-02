@@ -21,8 +21,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from kestrel_sovereign.llm.decisions.evaluation import (
+    BASELINES,
     PACKAGED_SAMPLES_DIR,
     SampleError,
+    evaluate_baseline,
     evaluate_model,
     load_samples,
     render_report,
@@ -66,6 +68,11 @@ def add_decisions_subparser(subparsers: argparse._SubParsersAction) -> None:
     eval_p.add_argument(
         "--target-accuracy", type=float, default=0.9,
         help="Accuracy a choice/score threshold must reach on the answers it keeps",
+    )
+    eval_p.add_argument(
+        "--baseline", action="append", default=None,
+        help="Also score a caller-registered baseline on the same samples "
+        "(e.g. memory_answerability: chat)",
     )
     eval_p.add_argument("--json", type=Path, default=None, help="Also write the report as JSON")
 
@@ -177,7 +184,21 @@ async def _eval(service: Any, args: argparse.Namespace) -> int:
         print("ERROR: no decision model matches; see `kestrel decisions models`", file=sys.stderr)
         return 2
 
+    for name in args.baseline or ():
+        if name not in (BASELINES.get(args.caller) or {}):
+            print(f"ERROR: caller {args.caller!r} has no baseline {name!r}", file=sys.stderr)
+            return 2
+
     reports = []
+    for name in args.baseline or ():
+        print(f"evaluating baseline {name} on {len(samples)} samples...", file=sys.stderr)
+        reports.append(await evaluate_baseline(
+            service, args.caller, name, samples,
+            local_only=local_only,
+            timeout_seconds=args.timeout,
+            concurrency=args.concurrency,
+            target_accuracy=args.target_accuracy,
+        ))
     for selector in selectors:
         print(f"evaluating {selector} on {len(samples)} samples...", file=sys.stderr)
         reports.append(await evaluate_model(

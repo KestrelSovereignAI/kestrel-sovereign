@@ -19,12 +19,19 @@ Sample format (JSON Lines, one sample per line)::
 ``questions`` use the systemone wire shape. ``expected`` is a bool for
 ``noul``, an option id for ``choice`` and a level index for ``score``.
 ``threshold_keys`` is optional, as in ``decide``.
+
+A caller may instead register a sample *adapter*: a line carrying
+``"adapter": "<caller>"`` is built by that caller's own request builder, so
+the eval measures exactly the request the caller sends. A caller may also
+register *baselines* (``--baseline``): another way of making the same
+judgement, scored on the same samples for comparison.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import math
 import statistics
@@ -37,6 +44,7 @@ from kestrel_sdk.llm.decisions import (
     ChoiceQuestion,
     DecisionError,
     DecisionRequest,
+    NoulAnswer,
     NoulQuestion,
     Question,
     ScoreQuestion,
@@ -47,6 +55,28 @@ PACKAGED_SAMPLES_DIR = Path(__file__).with_name("eval_samples")
 
 #: Bins for expected calibration error.
 ECE_BINS = 10
+
+#: Caller-owned sample adapters: ``adapter`` name -> ``"module:function"``
+#: taking ``(raw, source)`` and returning a :class:`Sample`.
+SAMPLE_ADAPTERS: Mapping[str, str] = {
+    "memory_answerability": (
+        "kestrel_sovereign.storage.memory_answerability:answerability_eval_sample"
+    ),
+}
+
+#: Caller-owned baselines: caller -> {name: "module:function"}. A baseline is
+#: ``async (llm_service, sample, *, timeout_seconds, local_only)`` returning
+#: ``{question_id: bool}`` for noul samples, or ``None`` when it failed.
+BASELINES: Mapping[str, Mapping[str, str]] = {
+    "memory_answerability": {
+        "chat": "kestrel_sovereign.storage.memory_answerability:answerability_chat_baseline",
+    },
+}
+
+
+def _resolve(target: str) -> Any:
+    module, _, name = target.partition(":")
+    return getattr(importlib.import_module(module), name)
 
 
 class SampleError(ValueError):
@@ -60,6 +90,8 @@ class Sample:
     expected: Mapping[str, Any]
     threshold_keys: Mapping[str, str]
     source: str
+    #: The adapter's original fields, for caller-owned baselines.
+    raw: Optional[Mapping[str, Any]] = None
 
 
 def _question(raw: Any, where: str) -> Question:
@@ -108,6 +140,12 @@ def parse_sample(line: str, source: str) -> Sample:
         raise SampleError(f"{source}: invalid JSON ({error.msg})") from None
     if not isinstance(raw, Mapping):
         raise SampleError(f"{source}: sample must be an object")
+    adapter = raw.get("adapter")
+    if adapter is not None:
+        target = SAMPLE_ADAPTERS.get(adapter) if isinstance(adapter, str) else None
+        if target is None:
+            raise SampleError(f"{source}: unknown sample adapter {adapter!r}")
+        return _resolve(target)(raw, source)
     sample_id = raw.get("id")
     if not isinstance(sample_id, str) or not sample_id:
         raise SampleError(f"{source}: sample needs a non-empty string id")
@@ -235,7 +273,7 @@ def _noul_metrics(key: str, observations: Sequence[Observation]) -> KeyMetrics:
     fn = sum(not p and y for p, y in zip(predicted, labels))
     accuracy = statistics.fmean(p == y for p, y in zip(predicted, labels))
     return KeyMetrics(
-        key, "noul", len(labels), accuracy, brier, ece, round(threshold, 4),
+        key, "noul", len(labels), accuracy, brier, ece, threshold,
         extra={
             "precision": tp / (tp + fp) if tp + fp else math.nan,
             "recall": tp / (tp + fn) if tp + fn else math.nan,
@@ -281,8 +319,7 @@ def _categorical_metrics(
             abs(o.answer.score - int(o.expected)) for o in observations
         )
     return KeyMetrics(
-        key, kind, len(rows), accuracy, brier, ece,
-        round(threshold, 4) if threshold is not None else None,
+        key, kind, len(rows), accuracy, brier, ece, threshold,
         note="" if threshold is not None else f"no cut reaches accuracy {target_accuracy}",
         extra=extra,
     )
@@ -321,6 +358,7 @@ class ModelReport:
     latencies_ms: List[int] = field(default_factory=list)
     errors: Dict[str, int] = field(default_factory=dict)
     expected_keys: List[str] = field(default_factory=list)
+    baseline: bool = False
 
     def proposal_blocker(self) -> Optional[str]:
         """Why this run cannot back a calibration, or ``None`` if it can.
@@ -330,6 +368,8 @@ class ModelReport:
         Anything less is biased by the missing labels (§2.5, §9).
         """
 
+        if self.baseline:
+            return "baseline (comparison only)"
         if self.errors:
             return "some samples failed"
         if not self.metrics:
@@ -411,6 +451,63 @@ async def evaluate_model(
     return report
 
 
+async def evaluate_baseline(
+    llm_service: Any,
+    caller: str,
+    name: str,
+    samples: Sequence[Sample],
+    *,
+    local_only: bool,
+    timeout_seconds: float,
+    concurrency: int,
+    target_accuracy: float,
+) -> ModelReport:
+    """Score a caller-registered baseline on the same samples.
+
+    Its verdicts are scored as probabilities 1.0 / 0.0, so accuracy,
+    precision and recall line up with the decision models'; it never proposes
+    a calibration.
+    """
+
+    target = (BASELINES.get(caller) or {}).get(name)
+    if target is None:
+        raise SampleError(f"caller {caller!r} has no baseline named {name!r}")
+    baseline = _resolve(target)
+    report = ModelReport(
+        selector=f"baseline:{name}", route="baseline", model=name, baseline=True,
+        expected_keys=sorted({s.threshold_keys.get(q, q) for s in samples for q in s.request.questions}),
+    )
+    gate = asyncio.Semaphore(max(1, concurrency))
+    observations: List[Observation] = []
+    loop = asyncio.get_running_loop()
+
+    async def one(sample: Sample) -> None:
+        async with gate:
+            started = loop.time()
+            verdicts = await baseline(
+                llm_service, sample, timeout_seconds=timeout_seconds, local_only=local_only
+            )
+            elapsed = int((loop.time() - started) * 1000)
+        if verdicts is None:
+            report.errors["BaselineIncomplete"] = report.errors.get("BaselineIncomplete", 0) + 1
+            return
+        report.latencies_ms.append(elapsed)
+        for qid, question in sample.request.questions.items():
+            if not isinstance(question, NoulQuestion):
+                raise SampleError(f"baseline {name!r} only scores noul questions")
+            observations.append(Observation(
+                key=sample.threshold_keys.get(qid, qid),
+                question=question,
+                expected=sample.expected[qid],
+                answer=NoulAnswer(p_true=1.0 if verdicts[qid] else 0.0),
+            ))
+
+    await asyncio.gather(*(one(sample) for sample in samples))
+    if observations:
+        report.metrics = score_observations(observations, target_accuracy=target_accuracy)
+    return report
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -469,8 +566,10 @@ def render_threshold_snippet(
     for report in reports:
         if report.proposal_blocker() is not None:
             continue
+        # repr() keeps the exact cut: rounding down could admit an answer
+        # the proposal was chosen to exclude.
         body = "\n".join(
-            f"{_toml_key(m.key)} = {m.proposed_threshold}" for m in report.metrics
+            f"{_toml_key(m.key)} = {m.proposed_threshold!r}" for m in report.metrics
         )
         blocks.append(
             f"# kestrel decisions eval {stamp}: {samples} samples, set sha256:{sample_hash[:12]}\n"
