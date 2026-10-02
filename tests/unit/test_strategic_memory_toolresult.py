@@ -722,27 +722,64 @@ async def test_signal_dispatch_without_skips_reports_an_empty_list():
 
 
 # ---------------------------------------------------------------------------
-# #3398: the pick reads Talon's job registry, and says so when it cannot
+# #3398: the pick reads Talon's run history, and says so when it cannot
 # ---------------------------------------------------------------------------
 
 
 class _TalonJobs:
-    """A ``talon`` wait provider over a fixed set of polls."""
+    """A ``talon`` wait provider reporting its finished runs read-only.
+
+    On the real provider ``poll()`` reaps jobs, pushes preserved work to the
+    remote and rewrites the registry, and ``active_handles()`` cannot say
+    whether it read the whole registry. A dispatch, and above all a
+    ``mode='suggest'`` preview, must use neither. Each records the call in
+    ``effects`` before failing, so a test can assert none happened even where
+    the failure itself is caught.
+    """
 
     kind = "talon"
     signal = None
 
-    def __init__(self, jobs, list_error=None):
-        self._jobs = jobs
-        self._list_error = list_error
+    def __init__(self, runs, complete=True, reason="", error=None):
+        self._report = {"complete": complete, "runs": list(runs), "reason": reason}
+        self._error = error
+        self.reads = 0
+        self.effects = []
+
+    async def finished_runs(self):
+        self.reads += 1
+        if self._error is not None:
+            raise self._error
+        return self._report
 
     async def active_handles(self):
-        if self._list_error is not None:
-            raise self._list_error
-        return list(self._jobs)
+        self.effects.append("active_handles")
+        raise AssertionError("signal_dispatch must not enumerate through active_handles()")
 
     async def poll(self, handle):
-        return self._jobs[handle]
+        self.effects.extend([f"reap:{handle}", f"push:{handle}", "persist"])
+        raise AssertionError("signal_dispatch must not poll: poll() reaps, pushes and writes")
+
+
+class _SilentlyUnreadableTalon:
+    """The Talon provider as it stands without ``finished_runs()``, over a
+    corrupt ``jobs.json``: the reload logs the failure and returns, so
+    ``active_handles()`` answers ``[]``; ``poll()`` would reap, push and
+    persist."""
+
+    kind = "talon"
+    signal = None
+
+    def __init__(self):
+        self.effects = []
+
+    async def active_handles(self):
+        self.effects.append("active_handles")
+        return []
+
+    async def poll(self, handle):
+        self.effects.extend([f"reap:{handle}", f"push:{handle}", "persist"])
+        raise AssertionError("signal_dispatch must not poll: poll() reaps, pushes and writes")
 
 
 def _with_talon(agent, provider):
@@ -753,71 +790,20 @@ def _with_talon(agent, provider):
     return agent
 
 
-def _clarifying_3093():
-    from kestrel_sdk.tools import Outcome, WaitStatus
-
-    return WaitStatus(
-        Outcome.PARTIAL,
-        "Talon job 9a63c66b clarifying (rc=0)",
-        data={
-            "job_id": "9a63c66b2b71",
-            "status": "complete",
-            "repo": "o/r",
-            "issue": 3093,
-            "completed_at": "2026-09-24T08:41:00+00:00",
-            "disposition": "clarifying",
-        },
-    )
+def _talon_run(disposition="clarifying", job_id="9a63c66b2b71"):
+    """One ``finished_runs()`` entry: #3093's last run, as Talon records it."""
+    return {
+        "job_id": job_id,
+        "repo": "o/r",
+        "issue": 3093,
+        "completed_at": "2026-09-24T08:41:00+00:00",
+        "disposition": disposition,
+    }
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["execute", "suggest"])
-async def test_signal_dispatch_does_not_select_without_talons_job_registry(mode):
-    """Selecting without the registry could dispatch the very run that is
-    waiting on an answer. That is not "nothing to do" either."""
-    agent = _with_talon(
-        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")),
-        _TalonJobs({}, list_error=RuntimeError("jobs.json unreadable")),
-    )
-    feat = _make_feature({}, agent=agent)
-    pick = AsyncMock(return_value=_TOP_ISSUE)
-
-    with patch(
-        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue", new=pick
-    ):
-        result = await feat.signal_dispatch(mode=mode)
-
-    assert result.status is ToolResultStatus.PARTIAL
-    assert result.data["reason_code"] == "RUN_HISTORY_UNCONFIRMED"
-    assert result.data["dispatched"] is False
-    assert "jobs.json unreadable" in result.confirmation
-    assert "No actionable issue found" not in result.confirmation
-    pick.assert_not_awaited()
-    agent.execute_named_tool.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_signal_dispatch_hands_the_registry_it_read_to_selection():
-    agent = _with_talon(_dispatch_agent(registration=None), _TalonJobs({"j": _clarifying_3093()}))
-    feat = _make_feature({}, agent=agent)
-    pick = AsyncMock(return_value=None)
-
-    with patch(
-        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue", new=pick
-    ):
-        await feat.signal_dispatch(mode="suggest")
-
-    history = pick.await_args.kwargs["run_history"]
-    assert history.latest("o/r", 3093).disposition == "clarifying"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["execute", "suggest"])
-async def test_signal_dispatch_does_not_redispatch_an_unanswered_run(mode, monkeypatch):
-    """#3398 acceptance, through the real selector and the real registry
-    read: #3093's last run ended clarifying, its label has since been
-    cleared, and nothing on the issue is newer than the run. It is not
-    dispatched, and the output says why and what would re-arm it."""
+def _github_with_open_3093(monkeypatch):
+    """GitHub as the selector sees it: #3093 open and unlabelled, no PR on
+    it, and nothing on the issue newer than its last Talon run."""
     from kestrel_sovereign.features.strategic_memory import issue_selection
 
     monkeypatch.setattr(issue_selection, "get_github_token", lambda: "token")
@@ -841,15 +827,122 @@ async def test_signal_dispatch_does_not_redispatch_an_unanswered_run(mode, monke
 
     monkeypatch.setattr(issue_selection, "github_api_get", fake_get)
     monkeypatch.setattr(issue_selection, "github_api_post", fake_post)
-    agent = _with_talon(
-        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")),
-        _TalonJobs({"9a63c66b2b71": _clarifying_3093()}),
-    )
-    feat = _make_feature(
+
+
+def _feature_with_3093_blocker(agent):
+    return _make_feature(
         {"morning_signal_config": {"scan_repos": ["o/r"]}},
         agent=agent,
         blockers=[{"severity": "high", "issue": "o/r#3093", "title": "epic"}],
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["execute", "suggest"])
+async def test_signal_dispatch_does_not_select_without_talons_run_history(mode):
+    """Selecting without the history could dispatch the very run that is
+    waiting on an answer. That is not "nothing to do" either."""
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")),
+        _TalonJobs([], error=RuntimeError("jobs.json unreadable")),
+    )
+    feat = _make_feature({}, agent=agent)
+    pick = AsyncMock(return_value=_TOP_ISSUE)
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue", new=pick
+    ):
+        result = await feat.signal_dispatch(mode=mode)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["reason_code"] == "RUN_HISTORY_UNCONFIRMED"
+    assert result.data["dispatched"] is False
+    assert "jobs.json unreadable" in result.confirmation
+    assert "No actionable issue found" not in result.confirmation
+    pick.assert_not_awaited()
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["execute", "suggest"])
+async def test_signal_dispatch_does_not_dispatch_over_a_silently_unreadable_registry(
+    mode, monkeypatch
+):
+    """Review P1 on #3432: a corrupt ``jobs.json`` makes the provider's
+    enumeration answer ``[]`` without raising. Read as a history, that is "no
+    previous runs" and #3093 is dispatched again. Through the real selector:
+    the history is unconfirmed, nothing is selected or dispatched, and
+    nothing on the provider is touched."""
+    _github_with_open_3093(monkeypatch)
+    provider = _SilentlyUnreadableTalon()
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")), provider
+    )
+    feat = _feature_with_3093_blocker(agent)
+
+    result = await feat.signal_dispatch(mode=mode)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["reason_code"] == "RUN_HISTORY_UNCONFIRMED"
+    assert result.data["dispatched"] is False
+    assert result.data["issue"] is None
+    assert "finished_runs()" in result.confirmation
+    assert "No actionable issue found" not in result.confirmation
+    assert provider.effects == []
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_does_not_dispatch_over_an_incomplete_read(monkeypatch):
+    """The runs Talon could read say #3093's last run completed; the one it
+    could not read may be a later run that asked a question."""
+    _github_with_open_3093(monkeypatch)
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")),
+        _TalonJobs(
+            [_talon_run("completed")],
+            complete=False,
+            reason="jobs.json: JSONDecodeError",
+        ),
+    )
+    feat = _feature_with_3093_blocker(agent)
+
+    result = await feat.signal_dispatch(mode="execute")
+
+    assert result.data["reason_code"] == "RUN_HISTORY_UNCONFIRMED"
+    assert result.data["dispatched"] is False
+    assert "jobs.json: JSONDecodeError" in result.confirmation
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_hands_the_history_it_read_to_selection():
+    agent = _with_talon(_dispatch_agent(registration=None), _TalonJobs([_talon_run()]))
+    feat = _make_feature({}, agent=agent)
+    pick = AsyncMock(return_value=None)
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue", new=pick
+    ):
+        await feat.signal_dispatch(mode="suggest")
+
+    history = pick.await_args.kwargs["run_history"]
+    assert history.latest("o/r", 3093).disposition == "clarifying"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["execute", "suggest"])
+async def test_signal_dispatch_does_not_redispatch_an_unanswered_run(mode, monkeypatch):
+    """#3398 acceptance, through the real selector and the real history
+    read: #3093's last run ended clarifying, its label has since been
+    cleared, and nothing on the issue is newer than the run. It is not
+    dispatched, and the output says why and what would re-arm it."""
+    _github_with_open_3093(monkeypatch)
+    provider = _TalonJobs([_talon_run("clarifying")])
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")), provider
+    )
+    feat = _feature_with_3093_blocker(agent)
 
     result = await feat.signal_dispatch(mode=mode)
 
@@ -863,4 +956,29 @@ async def test_signal_dispatch_does_not_redispatch_an_unanswered_run(mode, monke
         "skipped o/r#3093 -- Talon job 9a63c66b ended clarifying at "
         "2026-09-24 08:41 UTC without a PR, and nothing since authorizes a retry"
     ) in result.confirmation
+    assert provider.reads == 1
+    assert provider.effects == []
     agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["suggest", "execute"])
+async def test_signal_dispatch_reads_talons_history_without_polling(mode, monkeypatch):
+    """Review P2 on #3432: the real ``poll()`` reaps jobs, pushes preserved
+    work (``git push origin``) and persists the registry. A preview must not
+    publish work, and the history read is the same in both modes, so neither
+    polls. #3093's last run completed, so it is picked."""
+    _github_with_open_3093(monkeypatch)
+    provider = _TalonJobs([_talon_run("completed")])
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")), provider
+    )
+    feat = _feature_with_3093_blocker(agent)
+
+    result = await feat.signal_dispatch(mode=mode)
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["issue"]["issue_number"] == 3093
+    assert result.data["dispatched"] is (mode == "execute")
+    assert provider.reads == 1
+    assert provider.effects == []

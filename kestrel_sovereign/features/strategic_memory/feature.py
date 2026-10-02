@@ -109,8 +109,9 @@ SIGNAL_DISPATCH_REASON_CODES = frozenset(
         # candidate was withheld only because GitHub could not say whether an
         # open PR already works it; not "the backlog is empty" (#3367).
         "CANDIDATES_UNCONFIRMED",
-        # Talon's job registry could not be read, so whether the pick's last
-        # run already ended with an unanswered question is unknown (#3398).
+        # Talon's job registry was not read completely (or its provider has
+        # no read that says whether it was), so whether the pick's last run
+        # already ended with an unanswered question is unknown (#3398).
         "RUN_HISTORY_UNCONFIRMED",
     }
 )
@@ -1741,18 +1742,18 @@ class StrategicMemoryFeature(Feature):
             run_history = await read_run_history(self.agent)
         except RunHistoryUnreadable as exc:
             # The registry is how selection knows an issue's last run asked a
-            # question nobody has answered (#3398). Selecting without it could
-            # dispatch that same run again.
+            # question nobody has answered (#3398). Selecting without all of
+            # it could dispatch that same run again.
             return ToolResult.partial(
                 confirmation=(
                     "## Signal Dispatch"
                     + (" (suggest)" if mode == "suggest" else "")
-                    + f"\nCould not read Talon's job registry: {exc}. Nothing "
+                    + f"\nCould not confirm Talon's run history: {exc}. Nothing "
                     "was dispatched -- without it, re-dispatching an issue "
                     "whose last run is still waiting on an answer cannot be "
                     "ruled out. This is not the same as having nothing to do."
                 ),
-                error=f"Talon's job registry could not be read: {exc}",
+                error=f"Talon's run history is unconfirmed: {exc}",
                 data={
                     "mode": mode,
                     "issue": None,
