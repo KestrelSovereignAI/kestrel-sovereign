@@ -101,7 +101,10 @@ class ThresholdBook:
 
         Under the ``default`` policy every question the request asks must have
         a default threshold; a gap is a configuration error raised before
-        routing.
+        routing. This is checked even when a calibrated model would answer:
+        which model answers depends on routing (privacy mode, a route going
+        down), so a gap must fail the same way on every route rather than only
+        on the day an uncalibrated route is chosen (spec §2.5).
         """
 
         table = self.callers.get(caller)
@@ -112,7 +115,8 @@ class ThresholdBook:
             raise DecisionRequestInvalid(
                 "thresholds",
                 f"[decisions.thresholds.{caller}].default has no threshold for "
-                f"question(s) {missing!r}",
+                f"question(s) {missing!r}; add them, or set "
+                'uncalibrated = "refuse" to allow only calibrated models',
             )
 
     def admits(self, caller: str, model_key: str, question_ids: Collection[str]) -> bool:
