@@ -47,7 +47,7 @@ class ModelInfo:
     provider: str     # the vendor name (field name retained for file-format compatibility;
                       # the *semantic* is vendor, not "execution provider")
     display_name: str
-    category: ModelCategory   # chat | embedding | image | audio (| decision, per llm/DECISIONS.md)
+    category: ModelCategory   # chat | embedding | image | audio
     is_featured: bool
     is_hidden: bool
     created_at: Optional[str]

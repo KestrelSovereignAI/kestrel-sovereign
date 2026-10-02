@@ -19,41 +19,36 @@ privacy: public
 
 # Decisions — Typed Choice / Score / Noul as an LLM Modality
 
-> **Status:** draft spec for epic [#3424](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3424), slice [#3425](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3425). No code implements this yet. Once code lands, the code wins and this doc is a bug — update it in the same change.
+> **Status:** draft spec for epic [#3424](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3424), slice [#3425](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3425). Nothing implements this yet. Once code lands, the code is authoritative and any disagreement in this doc is a bug — update the doc in the same change.
 >
-> Read [LLM_SERVICE_ARCHITECTURE.md](../LLM_SERVICE_ARCHITECTURE.md) first. This spec adds a modality to that architecture; it does not change vendor / route / model.
+> Read [LLM_SERVICE_ARCHITECTURE.md](../LLM_SERVICE_ARCHITECTURE.md) first. This spec adds a modality to that architecture. It does not change vendor / route / model.
 
 ## 1. What a decision is
 
-A **decision request** is a `state` plus a set of named, independent **questions**. A **decision model** answers every question with a probability distribution. No prose is generated and nothing is parsed.
+A **decision request** is a `state` plus a set of named, independent **questions**. A **decision model** answers every question with a probability distribution. It generates no prose, so there is nothing to parse.
 
 | Type | The question asks | The answer carries |
 |---|---|---|
-| `choice` | Which of these named options fits? | `choice` (argmax) and `probabilities` over the options |
+| `choice` | Which of these named options fits? | `choice` (the argmax) and `probabilities` over the options |
 | `score` | Where does the state sit on this ordered rubric (levels 0..N-1)? | `score` (Σ i·pᵢ) and `probabilities` over the levels |
 | `noul` | Is this statement true of the state? | `p_true` in [0, 1] |
 
-Questions are evaluated in isolation against the same state. No question can see another question's answer. Any composition happens in the caller's code.
+Each question is evaluated in isolation against the same state. No question sees another question's answer. Any composition happens in the caller's code.
 
-The wire shape was introduced by TypeSafe's Jev (`POST /v1/systemone`). Today the same shape is served by:
-- hosted vendors (TypeSafe, OpenRouter, Vercel, Cloudflare Workers AI);
-- local runtimes (Ollama ≥ 0.35; llama.cpp and SGLang on master);
-- open-weight models (Nimble, Tev1, Clef).
-
-Kestrel treats `/v1/systemone` as the de facto contract and TypeSafe's OpenAPI document as its reference. No vendor is special in code.
+TypeSafe's Jev introduced the wire shape (`POST /v1/systemone`). The same shape is now served by hosted vendors (TypeSafe, OpenRouter, Vercel, Cloudflare Workers AI), local runtimes (Ollama ≥ 0.35; llama.cpp and SGLang on master) and open-weight models (Nimble, Tev1, Clef). Kestrel treats `/v1/systemone` as the de facto contract and uses TypeSafe's OpenAPI document as its reference. No vendor is special in code.
 
 ### Why a modality, not a prompt pattern
 
-Kestrel already makes many decisions of this shape. Each one either asks a chat model for JSON or a marker string and then parses it, or uses a regex. The epic's call-site census lists them. A decision model:
-- answers in tens to hundreds of milliseconds;
-- batches many questions over one state in a single call;
-- returns distributions, so thresholds become tunable policy instead of prompt wording.
+Kestrel already makes many decisions of this shape. Today each one either asks a chat model for JSON or a marker string and parses the reply, or applies a regex; the epic's call-site census lists them. A decision model does better on three counts:
+- it answers in tens to hundreds of milliseconds;
+- it batches many questions over one state;
+- it returns distributions, so thresholds become tunable policy instead of prompt wording.
 
 ## 2. Contract
 
 ### 2.1 Types live in the SDK
 
-The request and response types live in `kestrel_sdk.llm.decisions`. This lets features and external adapters build and read them without importing core. The types are frozen dataclasses, matching `ProviderCapabilities`. The contract version bump is `SDK_LLM_CONTRACT_VERSION` 6 → 7.
+The request and response types live in `kestrel_sdk.llm.decisions`. Features and external adapters can build and read them without importing core. They are frozen dataclasses, like `ProviderCapabilities`. Adding them bumps `SDK_LLM_CONTRACT_VERSION` from 6 to 7.
 
 ```python
 @dataclass(frozen=True)
@@ -77,7 +72,7 @@ Question = ChoiceQuestion | ScoreQuestion | NoulQuestion
 @dataclass(frozen=True)
 class DecisionRequest:
     state: str | Mapping[str, Any] | Sequence[Any]   # JSON-serialisable
-    questions: Mapping[str, Question]                # 1..N, ids unique
+    questions: Mapping[str, Question]
 
 @dataclass(frozen=True)
 class ChoiceAnswer:
@@ -99,61 +94,75 @@ class DecisionResult:
     vendor: str
     route: str
     model: str                                       # the model that actually answered
+    thresholds: Mapping[str, float]                  # per question id, resolved for this model (§2.4)
+    calibrated: bool                                 # False only under the "default" uncalibrated policy
     input_tokens: int | None
     duration_ms: int
 ```
 
-**Naming.** The question types keep their wire names (`choice`, `score`, `noul`). Keeping them avoids a translation table between our types and every route's dialect.
+**Naming.** The question types keep their wire names (`choice`, `score`, `noul`), so there is no translation table between our types and every route's dialect.
 
-**Typed options and levels.** Kestrel's types are deliberately narrower than TypeSafe's. TypeSafe allows `criteria` values that are strings, objects or arrays, and `instructions` may be null. Kestrel keeps option descriptions as `str | None` and `instructions` as a required non-empty `str`. That is the intersection every known route accepts, so a request built from these types is valid everywhere. When a richer description is needed, the caller puts that structure in `state` and refers to it by path, e.g. ``"Does `memory.content` answer `question`?"``.
+**A deliberately narrow contract.** TypeSafe allows `criteria` values to be strings, objects or arrays, and allows `instructions` to be null. Kestrel narrows both:
+- option descriptions are `str | None`;
+- `instructions` is a required, non-empty `str`.
 
-### 2.2 Kestrel owns the answer's meaning
+That is the intersection every known route accepts, so a valid request is valid everywhere. When a richer description is needed, put the structure in `state` and refer to it by path, e.g. ``"Does `memory.content` answer `question`?"``.
 
-Adapters return raw vendor responses. A single normaliser in `kestrel_sovereign/llm/decisions/` turns them into `DecisionResult`. It enforces:
+### 2.2 Request validation
 
-- **Exact coverage.** Every requested question has exactly one answer of the matching type. A choice answer's `probabilities` cover exactly the requested option ids, and a score answer covers exactly `len(levels)` levels.
-  - A missing question, an extra key, or a type mismatch is a `DecisionProtocolError`.
-  - The result is refused whole, never partially accepted. A partial answer set silently drops the questions that matter most, so the protocol error is the honest outcome.
-- **Numeric sanity.** Every probability is finite and in [0, 1]. Distributions sum to 1 within `1e-3` and are then renormalised. A larger deviation is a `DecisionProtocolError`.
-- **Argmax consistency.** `ChoiceAnswer.choice` is recomputed as the argmax of `probabilities`. The vendor's `choice` field is checked against it and logged on mismatch, but never trusted over the distribution.
-- **Score recomputation.** `ScoreAnswer.score = Σ i·pᵢ` over Kestrel's level indices. The vendor's `score` and `legend` are ignored.
+`decide` validates the request **before** routing or serialising for any route. A violation raises `DecisionRequestInvalid` naming the rule, and nothing is sent.
 
-### 2.3 Kestrel owns confidence; vendor `confidence` is dropped
+| Rule | Bound | Why |
+|---|---|---|
+| Question count | 1 – `MAX_QUESTIONS` (64) | 64 is the smallest published route cap (Ollama). A request valid here is valid on every known route, and §7 never splits a request. |
+| Question / option ids | `^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$`, unique within their map | Ids appear as JSON keys in every dialect and in telemetry. |
+| `choice` options | 2 – `MAX_OPTIONS` (26) | One option is not a decision. 26 is the smallest published cap (Ollama's letter scoring). |
+| `score` levels | 2 – `MAX_OPTIONS` (26) | Same reasons. |
+| `instructions`, descriptions | non-empty after strip; descriptions may be `None` | A blank prompt is not a question. |
+| `state` | JSON-serialisable; serialised size ≤ `MAX_STATE_BYTES` (512 KiB) | Bounds the serialisation work done before the per-route fit check (§7). |
 
-Vendors disagree about what `confidence` means:
-- Jev uses `(K·p_max − 1)/(K − 1)`.
-- Ollama uses `1 − H(p)/ln K`.
-- The others don't document theirs.
+These bounds are module constants in `kestrel_sovereign/llm/decisions/`. They are policy, not configuration, in the same way loop-policy constants are. A future route with stricter caps tightens §7's per-candidate fit check; it does not change these constants.
 
-A field that means different things depending on which route answered is a proxy. A caller thresholding on it would silently change behaviour on a route switch. So `DecisionResult` **does not carry the vendor's `confidence`**.
+### 2.3 Kestrel owns the answer's meaning
 
-Callers threshold on `probabilities` / `p_true`. When a caller wants a concentration measure, it calls the one SDK function:
+Adapters return the raw vendor response. One normaliser in `kestrel_sovereign/llm/decisions/` converts it into `DecisionResult`, and it enforces four rules:
+
+- **Exact coverage.** Every requested question gets exactly one answer of the matching type. A `choice` answer's `probabilities` cover exactly the requested option ids, and a `score` answer covers exactly `len(levels)` levels. A missing question, an extra key, or a type mismatch raises `DecisionProtocolError`. The whole result is refused, never partially accepted, because a partial answer set would silently drop exactly the questions that matter.
+- **Numeric sanity.** Every probability must be finite and in [0, 1]. A distribution that sums to 1 within `1e-3` is renormalised. Anything further off raises `DecisionProtocolError`.
+- **Argmax consistency.** `ChoiceAnswer.choice` is recomputed as the argmax of `probabilities`. If the vendor's `choice` disagrees, the mismatch is logged and the vendor value is discarded.
+- **Score recomputation.** `ScoreAnswer.score = Σ i·pᵢ` over Kestrel's own level indices. The vendor's `score` and `legend` are ignored.
+
+### 2.4 Kestrel owns confidence; vendor `confidence` is dropped
+
+Vendors disagree on what `confidence` means. Jev computes `(K·p_max − 1)/(K − 1)`, Ollama computes `1 − H(p)/ln K`, and other vendors don't document theirs. A field whose meaning depends on which route answered is a proxy: a caller that thresholds on it silently changes behaviour when the route changes. **`DecisionResult` therefore does not carry the vendor's `confidence` at all.**
+
+Callers threshold on `probabilities` or `p_true`. A caller that wants a concentration measure uses the single SDK function:
 
 ```python
 def concentration(probabilities: Sequence[float]) -> float:
     """1 − H(p)/ln K. 0 = uniform, 1 = one-hot. Not a probability of being right."""
 ```
 
-This is the entropy form because it uses the whole distribution, not just its peak. `noul` has no concentration: `p_true` is the whole answer.
+This is the entropy form because it uses the whole distribution, not just its peak. Validation (§2.2) guarantees K ≥ 2. A `noul` answer has no concentration; `p_true` is the whole answer.
 
-### 2.4 Calibration is per (caller, model)
+### 2.5 Calibration is per (caller, model), and the service resolves it
 
-A threshold tuned on one model's distributions does not transfer to another model. Thresholds are therefore keyed by the model that answered:
+A threshold tuned on one model's distributions does not transfer to another model. Thresholds are therefore keyed by caller, by the model that answers, and by question id:
 
 ```toml
 [decisions.thresholds.memory_answerability]
 uncalibrated = "default"         # "default" | "refuse"
-default = 0.5
-[decisions.thresholds.memory_answerability.models]
-"ollama:local/<model-id>"       = 0.62    # example as of 2026-10; set from the eval harness
-"openrouter:api/<model-id>"     = 0.55
+default = { answers = 0.5 }      # per question id
+[decisions.thresholds.memory_answerability.models."ollama:local/<model-id>"]
+answers = 0.62                   # example as of 2026-10; written from the eval harness (§9)
 ```
 
-- `DecisionResult.model` and `.route` let the caller look up the right threshold through `decision_threshold(caller, result)`. That lookup lives in core, so every caller reads thresholds the same way.
-- When there is no entry for the answering model, the caller's declared `uncalibrated` policy applies:
-  - `default`: use the declared default, and mark telemetry `calibrated=false`;
-  - `refuse`: treat the call as not completed.
-- Model ids appear here only as config keys, which is an allowed location under the no-hardcoded-IDs rule. Entries are written from eval-harness output (§9), not by hand-tuning.
+The service resolves calibration, not the caller. This is the only way telemetry can report the truth.
+
+- Under **`refuse`**, models with no entry for this caller are removed from the candidate list during resolution (§5.2, step 3), before anything is sent. If none remain, `decide` raises `DecisionUnavailable(NO_CALIBRATED_MODEL)`, and no call is wasted on an answer that would be thrown away.
+- Under **`default`**, an uncalibrated model can still answer. The result then carries the declared `default` thresholds, `calibrated=False` is set on the result, and the same value is recorded in telemetry.
+
+`DecisionResult.thresholds` is the only threshold source a caller reads, so every caller applies calibration the same way. Model ids appear here only as config keys, which the no-hardcoded-IDs rule permits.
 
 ## 3. Placement
 
@@ -166,23 +175,23 @@ async def decide(
     *,
     caller: str,                          # stable id, e.g. "memory_answerability"; keys thresholds + telemetry
     timeout_seconds: float,               # required: every caller owns its deadline
-    model_override: str | None = None,    # same selector grammar as generate()
-    force_local_only: bool | None = None, # None -> self._current_force_local_only()
+    model_override: str | None = None,    # §5.3 grammar
+    local_only: bool = False,             # may only TIGHTEN privacy (§6)
     session_id: str | None = None,
 ) -> DecisionResult: ...
 ```
 
-`decide` sits beside `generate` and `get_embedding_service`, and it is the only path to a decision model. Callers already hold an `LLMService` (the answerability gate receives one; features reach `self.agent.llm_service`), so no new object needs to be threaded through.
+`decide` sits beside `generate` and `get_embedding_service`, and it is the only path to a decision model. Callers already hold an `LLMService`: the answerability gate is handed one, and features reach `self.agent.llm_service`. No new object has to be threaded through.
 
-There is no separate long-lived `DecisionService` instance. Embeddings bind to one route because vectors must stay in one space. Decisions are stateless per call, so they can be **routed per call** (§5). The implementation lives in `kestrel_sovereign/llm/decisions/`: normaliser, fit check, resolver and thresholds. `LLMService.decide` is its only public entry point.
+There is no long-lived `DecisionService` instance. Embeddings bind to one route because vectors must stay in one space. Decisions are stateless per call and are **resolved per call** (§5). The implementation (validation, normaliser, resolver, fit check, thresholds and accounting) lives in `kestrel_sovereign/llm/decisions/`, and `LLMService.decide` is its only public entry point.
 
 ### 3.2 Adapter surface (SDK)
 
-`LLMAdapter` gains two optional methods, with defaults that mean "not supported". This is the same shape as `aembed`.
+`LLMAdapter` gains two optional methods, following the same pattern as `aembed`: the default means "not supported".
 
 | Method | Default | Returns |
 |---|---|---|
-| `adecide(client, model, request, *, timeout)` | raises `DecisionsNotSupported` | the vendor's raw JSON response as a dict |
+| `adecide(client, model, request, *, timeout)` | raises `DecisionsNotSupported` | the vendor's raw JSON response, as a dict |
 | `list_decision_models(client)` | `[]` | `List[DecisionModelInfo]` |
 
 ```python
@@ -199,35 +208,43 @@ class DecisionModelInfo:
     created_at: str | None
 ```
 
-**The adapter is the dialect seam.** It translates a `DecisionRequest` into its route's wire format and returns the raw response. All divergence lives in the adapter that owns the route:
-- Ollama: string-or-null criteria; required `instructions`; 2–26 options and 1–64 questions.
-- OpenRouter: extra `provider`, `session_id`, `trace` and `user` request fields; `usage.cost` in the response.
-- Vercel: `boolean` in place of `noul`.
+**The adapter is the dialect seam.** It translates a `DecisionRequest` into its route's wire format and returns the raw response. Every divergence lives in the adapter that owns the route, and framework code never branches on vendor. The divergences known today:
+- **Ollama:** criteria descriptions must be a string or null; `instructions` is required; 2–26 options; 1–64 questions; a 64 KiB request body.
+- **OpenRouter:** extra `provider`, `session_id`, `trace` and `user` request fields; `usage.cost` in the response.
+- **Vercel:** `boolean` in place of `noul`.
 
-Framework code never branches on vendor.
+`ProviderCapabilities` gains `supports_decisions: bool = False`, which an adapter sets when its route *can* serve decisions. Which models a route currently serves is discovery state (§4); the static flag does not carry it.
 
-`ProviderCapabilities` gains `supports_decisions: bool = False`. Discovery folds the resolved state into the route's `capabilities` dict (§4), exactly as it does for `supports_embeddings`.
+### 3.3 Decision capability is per route; chat listings exclude decision-only models
 
-### 3.3 Model category
+Decision models are a separate discovery facet, as embedding models are. `discover_decision_models` runs per route, with no per-vendor collapse, and its result lives on the route (§4). It does **not** add a category to the vendor's shared chat catalog. A model that serves chat on one route and decisions on another keeps its chat category.
 
-`ModelCategory` gains `DECISION`. Without it, an installed Ollama decision model (`/api/tags` lists it like any other model) would appear in the chat dropdown as a chat model. `list_models` implementations classify decision-capable models as `DECISION`, and the existing `category != "chat"` filter keeps them out of chat.
+Chat listings must still not offer a model that cannot chat. Today an installed Ollama decision model appears in `/api/tags` exactly like any other model. An adapter's `list_models` therefore drops a model when the runtime reports `decision` capability **and does not report chat (`completion`) capability** for it. This uses the runtime's own capability report; the model name is never used to decide.
 
 ## 4. Discovery
 
-Discovery is capability-driven per route, with no pinned lists. It mirrors embedding discovery (`discover_embedding_models` → `reconcile_embedding_capabilities`):
+Discovery is capability-driven and per route, with no pinned lists. It follows the embedding discovery pair (`discover_embedding_models` → `reconcile_embedding_capabilities`), with one deliberate difference: decision state can turn **off**.
 
-- `discover_decision_models(vendor=, route=, use_cache=)` runs per route, single-flight, cached per instance and invalidated alongside the chat catalog.
-- `reconcile_decision_capabilities()` runs inside `discover_all_models` on both the cache-hit and cache-miss paths, like its embedding twin. It sets `capabilities["supports_decisions"] = True` and records the discovered `DecisionModelInfo` list on the route. It only ever turns capability **on**; a failed discovery leaves the previous state alone and logs.
+- `discover_decision_models(vendor=, route=, use_cache=)` runs single-flight and is cached per instance. It is invalidated together with the chat catalog.
+- `reconcile_decision_capabilities()` runs inside `discover_all_models`, on both the cache-hit and cache-miss paths. On a **successful** discovery it **replaces** the route's decision model list with what the route reports now, which may be empty. A model that has been uninstalled or withdrawn stops being a candidate at the next refresh. On a **failed** discovery the last successful list is kept, the route is marked `decision_discovery_stale_since=<time>`, and an ERROR is logged. A stale list still produces candidates, because availability is not a safety property. A dispatch to a model that has since disappeared fails as `DecisionTransportError` (§8) and is never retried elsewhere.
 
 How each route discovers its models:
 
-| Route | Discovery | Limits come from |
+| Route | Discovery | Where limits come from |
 |---|---|---|
-| OpenRouter | `GET {base_url}/models?output_modalities=decisions` (modality `text->decisions`) | `context_length` per model. Question and option caps are not published; use `None`. |
-| Ollama | `/api/tags`, then `/api/show` per model, keeping models whose `capabilities` include `"decision"` | `context_limit` comes from the **`num_ctx` parameter**, never from `model_info.*.context_length`, which is the base model's limit. For example, Nimble's library page shows 256K, but the registry params set `num_ctx` to 8194. Caps (1–64 questions, 2–26 options, 64 KiB request body without images) are adapter-declared from the Ollama API docs. `parallel_questions=False` as of 0.35. |
+| OpenRouter | `GET {base_url}/models?output_modalities=decisions` (modality `text->decisions`) | `context_length` per model. Question and option caps are unpublished, so they are `None`; §2.2's bounds still apply. |
+| Ollama | `/api/tags`, then `/api/show` for each model; keep models whose `capabilities` include `"decision"` | `context_limit` comes from the **`num_ctx` parameter**, never from `model_info.*.context_length`, which is the base model's limit. For example, the library page lists Nimble at 256K, but the registry params set `num_ctx` to 8194. The caps (1–64 questions, 2–26 options, 64 KiB body without images) come from the Ollama API docs and are declared by the adapter. `parallel_questions=False` as of 0.35. |
 | Any other route | the adapter's `list_decision_models` | the adapter |
 
-**Older Ollama without the `"decision"` capability.** If an Ollama build serves `/v1/systemone` but does not report `"decision"` in `/api/show`, its models are not discovered, and the spec does not guess from names. The operator either upgrades or pins the model (§5.2). A pin is verified with a canary decision at set time, the same way `aset_embedding_route` canaries a cloud route. A model with no discoverable `num_ctx` has `context_limit=None` and cannot pass the fit check unless the pin also sets `decision_context_limit`.
+### 4.1 Pins are verified at reconcile time
+
+A route may pin `decision_model` (§5.1). This covers Ollama builds that serve `/v1/systemone` but don't report `"decision"` in `/api/show`, and any route whose discovery is unavailable. The spec never infers a decision model from its name.
+
+- A pin is verified with a **canary decision**: one `noul` question over a fixed synthetic state, sent through the route's `adecide`. The canary runs during every `reconcile_decision_capabilities`, so at boot and on each catalog refresh.
+- A pin that passes the canary becomes a candidate.
+- A pin that fails is marked `unverified` with the failure reason, is excluded from candidates, and is logged at ERROR. No unverified pin is ever dispatched to.
+- Canary calls are recorded like any other decision call (§8), under `caller="kestrel.canary"`.
+- A model with no discoverable `num_ctx` has `context_limit=None` and cannot pass the fit check unless the pin also sets `decision_context_limit`.
 
 ## 5. Routing and model selection
 
@@ -238,90 +255,134 @@ How each route discovers its models:
 decision_route = "auto"        # "auto" | "<vendor>[:<route>]" | "none"
 
 [llm.vendors.ollama.routes.local]
-decision_model = "auto"        # "auto" | "<model-id>" (pin)
+decision_model = "auto"        # "auto" | "<model-id>" (pin; verified per §4.1)
 decision_hints = []            # substring patterns, never full ids
 # decision_context_limit = 8192   # only with a pinned model whose limit is not discoverable
 ```
 
 ### 5.2 Resolution, per call
 
-1. If `decision_route == "none"` → `DecisionUnavailable(DISABLED)`.
+The steps run in order, and nothing is sent until step 5.
+
+1. **Disabled.** If `decision_route == "none"`, raise `DecisionUnavailable(DISABLED)`.
 2. **Candidate routes.**
-   - An explicit `decision_route` is terminal: only that route.
-   - `"auto"`: every route with `supports_decisions`, in `route_priority` order.
-   - Then apply privacy (§6): when local-only, drop every route that is not `is_local`.
+   - An explicit `decision_route` is terminal: only that route is considered.
+   - With `"auto"`, every route whose decision model list is non-empty or which has a verified pin is considered, in `route_priority` order.
+   - Apply `model_override` (§5.3).
+   - Apply privacy (§6): under effective local-only, drop every route that is not `is_local`.
 3. **Candidate model per route.**
-   - A pinned `decision_model` is that model.
-   - Otherwise the discovered models are filtered by `decision_hints`.
+   - A verified pin is that route's model.
+   - Otherwise, the discovered models are filtered by `decision_hints`.
+   - Then the calibration policy is applied. Under `refuse` (§2.5), uncalibrated models are dropped.
    - Exactly one survivor → that model.
-   - Several survivors → `DecisionUnavailable(AMBIGUOUS_MODEL)` naming them. Kestrel does not pick one arbitrarily, because thresholds are per model (§2.4) and an arbitrary pick would silently change calibration.
-4. **Fit check** (§7) of the request against the model's limits. The first candidate that fits answers.
-5. No candidate fits → `DecisionUnavailable(NO_FITTING_MODEL)`, carrying each rejected candidate and its reason.
+   - Several survivors → raise `DecisionUnavailable(AMBIGUOUS_MODEL)` naming them. Kestrel never picks one arbitrarily, because thresholds are per model and an arbitrary pick would silently change calibration.
+4. **Fit check.** Check the request against each candidate's limits (§7).
+5. **Dispatch** to the first candidate that fits. If none fits, raise `DecisionUnavailable(NO_FITTING_MODEL)`, carrying every rejected candidate and its reason.
 
-A caller's `model_override` uses the existing selector grammar (`vendor`, `vendor:route`, `vendor/model`, `vendor:route/model`). It narrows step 2 or 3 and is terminal. It never widens past the privacy filter.
+Within one `decide` call, Kestrel **never re-sends the request to another candidate** after a dispatch failure. A transport or protocol failure from the selected candidate is raised to the caller, because silently re-asking a different model would change which calibration applies. Fallthrough happens only during resolution, before anything is sent.
 
-Within a single `decide` call, Kestrel **never retries the request on a different route** after a dispatch failure. A transport or protocol failure on the selected candidate is raised to the caller. Silently re-asking on another model would change which calibration applies mid-call. Fallthrough happens only during resolution (steps 2–5), before anything is sent.
+### 5.3 `model_override` grammar
+
+The `generate` path's `resolve_provider_routing` treats a selector without `/` as a model id. Decisions route by a different rule, so they define their own grammar. It is the explicit form of the selectors `mandate._resolve_model_selector` already accepts:
+
+| Form | Meaning |
+|---|---|
+| `<vendor>` | routes of that vendor only |
+| `<vendor>:<route>` | that route only |
+| `<vendor>/<model>` | that model, on any route of that vendor |
+| `<vendor>:<route>/<model>` | that model on that route |
+
+A bare model id is **not** accepted, because one id can exist on several vendors with different calibration. The `cheap` alias is not accepted either, because it names a chat model.
+
+An override is terminal: it narrows the candidates and never widens them. If an explicit `decision_route` is set and the override names a different route or vendor, `decide` raises `DecisionUnavailable(SELECTOR_CONFLICT)`. The operator's routing decision and the caller's request disagree, and neither silently wins.
 
 ## 6. Privacy modes
 
-Privacy modes **route** decisions; they do not disable them.
+Privacy modes **route** decisions to local models. They never disable decisions.
 
-- `force_local_only` defaults to `self._current_force_local_only()`, the same provider the embedding resolver uses. It returns `True` (fail closed) when the bound callable raises.
-- When local-only, only `is_local` routes are candidates. If none can answer, the caller gets `DecisionUnavailable(NO_LOCAL_ROUTE)`. There is **never** a silent cloud fallback.
-- What is sent follows the same rule as chat: under local-only, state never leaves the host.
+- The effective restriction is **`local_only OR self._current_force_local_only()`**. The live privacy provider is the same one the embedding resolver reads, and it fails closed (`True`) when the bound callable raises. A caller can tighten privacy with `local_only=True`, but it cannot loosen it: there is no parameter that turns the live restriction off.
+- Under effective local-only, only `is_local` routes are candidates. If none can answer, the caller gets `DecisionUnavailable(NO_LOCAL_ROUTE)`. **There is never a silent cloud fallback.**
+- The effective restriction is evaluated once, at the start of `decide`, together with the invocation context (§8). It applies to the whole call.
 
 ## 7. Context fit, caps and batching
 
-- **Fit before dispatch.** The request is serialised in its route's dialect, and its size is estimated with the token heuristics core uses for context budgeting. The estimate must leave headroom for the model's own prompt framing. If `context_limit` is unknown, or the estimate exceeds it, or the serialised request exceeds `max_request_bytes`, that candidate is skipped (§5.2). Kestrel **never truncates `state`**: a decision about half a document is a different decision.
-- **Per-question cost on serial routes.** Some backends re-send the full state for each question (`parallel_questions=False`). The fit check is per question there, but wall time scales with the number of questions. `DecisionModelInfo.parallel_questions` is surfaced so latency-sensitive callers can choose a route or narrow their question set.
-- **Splitting by question cap.** When a request exceeds a route's `max_questions`, Kestrel splits it into consecutive chunks on that same route and model, then merges the answers. This is safe by contract, because questions are independent and cannot see each other. It is not a fallback: the same model answers every question. A choice or score question with more options than `max_options` is a fit failure for that candidate and is never split.
+- **Fit before dispatch.** The request is serialised in the candidate route's dialect, and its size is estimated with the token heuristics core uses for context budgeting, leaving headroom for the model's own prompt framing. A candidate is skipped (§5.2) if any of these holds:
+  - its `context_limit` is unknown;
+  - the estimate exceeds `context_limit`;
+  - the serialised request exceeds `max_request_bytes`;
+  - the request exceeds the candidate's `max_questions`;
+  - any question exceeds the candidate's `max_options`.
+- **Never truncate `state`.** A decision about half a document is a different decision.
+- **One `decide` is one dispatch.** Kestrel never splits a request across several dispatches. §2.2 caps every request at 64 questions, so a valid request fits every known route's question cap. A caller with more independent questions makes more `decide` calls and owns their deadlines; no single call hides a fan-out.
+- **Serial routes.** Some backends re-send the full state for every question (`parallel_questions=False`). The fit check is per question on those routes, but wall time grows with question count. `DecisionModelInfo.parallel_questions` is exposed so latency-sensitive callers can pick a route or narrow their question set.
 
-## 8. Failure semantics, timeouts and accounting
+## 8. Failure semantics, timeouts, cancellation and accounting
 
-**Exceptions.** Every outcome other than a complete, normalised `DecisionResult` is an exception:
+### 8.1 Exceptions
+
+Anything other than a complete, normalised `DecisionResult` is raised as an exception.
 
 | Exception | Meaning |
 |---|---|
-| `DecisionUnavailable(reason, candidates)` | Nothing was sent. Reasons: `DISABLED`, `NO_ROUTE`, `NO_LOCAL_ROUTE`, `AMBIGUOUS_MODEL`, `NO_FITTING_MODEL`. |
-| `DecisionTimeout` | `timeout_seconds` elapsed. Enforced by `asyncio.timeout` in `decide`, and also passed to the adapter's HTTP client. The Ollama route must set an explicit HTTP timeout, because the chat `AsyncClient` has none. |
-| `DecisionTransportError` | Network or HTTP failure, including a 404 for `/v1/systemone` on a runtime too old to serve it. |
-| `DecisionProtocolError` | The response violated §2.2. |
+| `DecisionRequestInvalid(rule)` | The request failed validation (§2.2). Nothing was sent. |
+| `DecisionUnavailable(reason, candidates)` | Nothing was sent. `reason` is one of `DISABLED`, `NO_ROUTE`, `NO_LOCAL_ROUTE`, `NO_CALIBRATED_MODEL`, `AMBIGUOUS_MODEL`, `NO_FITTING_MODEL`, `SELECTOR_CONFLICT`. |
+| `DecisionTimeout` | `timeout_seconds` elapsed. The deadline covers the whole call: resolution, the fit check, dispatch and normalisation. It is enforced with `asyncio.timeout` in `decide` and is also passed to the adapter's HTTP client. The Ollama route must set an explicit HTTP timeout, because the chat `AsyncClient` has none. |
+| `DecisionTransportError` | A network or HTTP failure. This includes a 404 for `/v1/systemone` on a runtime too old to serve it, and a model that has disappeared since discovery. |
+| `DecisionProtocolError` | The response violated §2.3. |
 
-**Fail-closed is the caller's policy, not the service's.** For example, the answerability gate maps any exception to `completed=False` and its existing lexical-evidence path. Each caller documents its policy at its call site.
+Fail-closed behaviour is **the caller's policy, not the service's**. For example, the answerability gate maps every exception to `completed=False` and its existing lexical-evidence path. Each caller documents its policy at its call site.
 
-**Usage accounting.** Every dispatched call, successful or not, records through the same sinks chat uses:
-- `_track_model_usage(model, provider, tokens=input_tokens)`;
-- `_log_llm_call(...)` with `metadata={"modality": "decision", "caller": caller, "question_count": n, "calibrated": bool}`, and with the route's reported cost when present (OpenRouter `usage.cost`);
-- the Prometheus `LLM_CALLS` / `LLM_DURATION` series, labelled with modality.
+### 8.2 Cancellation and ambiguous delivery
 
-The same content-redaction rules apply to the `llm_calls` row. State and question text are prompt content.
+- **Cancellation propagates.** `decide` does not swallow `CancelledError`. A Stop or caller cancellation aborts the in-flight HTTP request and re-raises.
+- **No retry, ever.** Not after a timeout, a cancellation or a transport error. The request may already have been processed, and possibly billed, by the vendor. Re-sending would charge twice and could answer from a different model.
+- **Accounting still happens.** A dispatched call that ends in a timeout, cancellation or transport error is still recorded (§8.3). Its usage is recorded as unknown (`usage_available=False`) when the route did not report it. Recording runs in a `finally` path that is itself bounded and cannot raise into the caller.
+
+### 8.3 Accounting and redaction
+
+**Freeze the context first.** At entry, `decide` freezes the invocation context, using the same `LLMInvocationContext` snapshot `generate` uses. It passes that snapshot explicitly to every telemetry write, including the writes on timeout, cancellation and protocol-error paths. Telemetry never re-resolves ambient context after an await.
+
+**Content is never logged.** Decision telemetry never records `state`, question text, option descriptions, or vendor error bodies that echo the request. The `llm_calls` row's prompt and response columns are written as null. Only content-free fields are kept:
+- caller, vendor, route and model;
+- question count and question types;
+- serialised request size in bytes;
+- duration and success;
+- error class (not message);
+- tokens and cost when reported;
+- `calibrated`.
+
+This is stricter than chat telemetry, and that is deliberate: decision `state` is often private memory or turn content passed by a background caller, with no user-visible turn to attribute it to.
+
+**Sinks.** Every dispatched call, successful or not, is recorded through the chat path's recorders, with the content-free fields above. Each sink:
+
+| Sink | What is written |
+|---|---|
+| `model_usage` | `_track_model_usage(model, provider, tokens=input_tokens)` |
+| `llm_calls` | `_log_llm_call(...)` with the frozen context and `metadata={"modality": "decision", "caller": caller, "question_count": n, "calibrated": bool, "usage_available": bool}`. The route's reported cost goes in `provider_reported_cost_usd` when present. |
+| Prometheus | **dedicated** series, not the chat ones: `kestrel_llm_decision_calls_total{provider, model, caller, success}` and `kestrel_llm_decision_duration_seconds{provider, model, caller}`. They are defined in `kestrel_sdk.metrics` next to `LLM_CALLS`. The chat series keep their existing labels and meaning, so dashboards that count chat calls are unaffected. |
+
+Embeddings currently bypass these sinks entirely, tracked as [#3426](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3426). The recording helper written for decisions must be shared with embeddings, not copied for them.
 
 ## 9. Eval harness
 
-Thresholds and model choices are set from measurement.
+Thresholds and model choices come from measurement.
 
-- **Samples.** Each caller has a labelled sample set: `state`, `questions`, and the expected answers.
-  - Samples committed to the repo are synthetic or public (`tests/evals/decisions/<caller>/*.jsonl`).
-  - Operator-local samples drawn from real memory or turns live under the agent data directory and are never committed.
-- **Runner.** `kestrel decisions eval --caller <id> [--route <selector>]` runs every sample against each candidate model. It reports:
-  - accuracy;
-  - Brier score and expected calibration error;
-  - latency p50 / p95;
-  - a proposed threshold per model.
-- **Recording.** An accepted proposal is written into `[decisions.thresholds.<caller>.models]` (§2.4). The run's sample-set hash and date go into a comment beside the entry, so a threshold can always be traced to the evidence that set it.
+- **Samples.** Each caller has a labelled sample set: a `state`, its `questions`, and the expected answers. Committed samples are synthetic or public and live under `tests/evals/decisions/<caller>/*.jsonl`. Operator-local samples drawn from real memory or turns live under the agent data directory and are never committed.
+- **Runner.** `kestrel decisions eval --caller <id> [--route <selector>]` runs the samples against each candidate model. For each model it reports accuracy, Brier score, expected calibration error, latency p50/p95, and a proposed threshold for every question id.
+- **Recording.** An accepted proposal is written into `[decisions.thresholds.<caller>.models."<route>/<model>"]` (§2.5), with the run's sample-set hash and date in an adjacent comment, so every threshold can be traced back to the evidence behind it.
 
 ## 10. Feature (SDK) surface
 
-Features call `self.agent.llm_service.decide(...)` with SDK types, the same duck-typed access they already use for `generate`. Feature code needs no import from core: the request, answer and exception types and `concentration()` all live in `kestrel_sdk.llm.decisions`.
+Features call `self.agent.llm_service.decide(...)` with SDK types, through the same duck-typed access they already use for `generate`. The request, answer and exception types, `concentration()`, and the validation constants all live in `kestrel_sdk.llm.decisions`. Feature code needs no import from core.
 
-Isolated (out-of-process) features have no LLM RPC today. Decisions do not add one; that is a separate gap that also covers `generate`.
+Isolated (out-of-process) features have no LLM RPC today. Decisions do not add one; that gap also covers `generate` and is a separate piece of work.
 
 ## 11. Explicitly out of scope
 
-- **Serving `/v1/systemone` inbound.** Kestrel already serves `/v1/models` and `/v1/chat/completions`. Exposing decisions to other agents would be a later decision.
-- **Images in `state`.** The contract extension is reserved. When a route we use accepts images (Clef, OpenAI's Decisions API, Ollama main), `DecisionRequest` gains an `images` field and `DecisionModelInfo` gains `accepts_images`. Requests carrying images route only to models that accept them. Until then there is no field, and there is no silent image drop.
+- **Serving `/v1/systemone` inbound.** Kestrel already serves `/v1/models` and `/v1/chat/completions`. Exposing decisions to other agents is a later decision.
+- **Images in `state`.** The contract extension is reserved. When a route we use accepts images (Clef, OpenAI's Decisions API, Ollama main), `DecisionRequest` gains an `images` field and `DecisionModelInfo` gains `accepts_images`; a request carrying images then routes only to models that accept them. Until then there is no `images` field, so an image cannot be silently dropped.
 - **A role table** mapping callers to models. Callers pass `model_override` from their own config, as the answerability gate does today.
-- **Runtime setters and endpoints** (`/api/decision/models`, `/api/decision/settings`). Configuration is file-based until a caller needs a runtime switch. Their shape will mirror `/api/embedding/*`.
+- **Runtime setters and endpoints** (`/api/decision/models`, `/api/decision/settings`). Configuration is file-based, and pins are verified at reconcile time (§4.1). When a caller needs a runtime switch, the endpoints will mirror `/api/embedding/*` and run the same canary at set time.
 
 ## 12. Rollout
 
@@ -329,22 +390,22 @@ Slices are tracked on #3424. Each one lands with tests that fail without it.
 
 1. This spec.
 2. **SDK contract plus core.**
-   - SDK types, adapter methods, `supports_decisions`, `ModelCategory.DECISION` and the contract version bump. The SDK ships first and core bumps its pin.
-   - Core: `LLMService.decide`, the normaliser, resolution, fit check, accounting and thresholds.
+   - SDK: types, validation constants, adapter methods, `supports_decisions`, the decision metrics series, and the contract version bump. The SDK ships first and core bumps its pin.
+   - Core: `LLMService.decide`, the normaliser, resolver, fit check, thresholds, accounting, and the chat-listing exclusion (§3.3).
    - Routes: OpenRouter and Ollama `adecide` / `list_decision_models`. Two routes ship together so the dialect seam is exercised by real divergence.
 3. **Eval harness.**
 4. **First caller:** the memory answerability gate, measured against the current gate on recorded retrievals.
 5. Response audit, as a `score` question.
 6. Reflection capture pre-gate, and batched sleep attestation.
-7. Per-heuristic migrations (tagger, schema router, continuation intent, turn classifier, injection scoring, GitHub-app should-respond), each with labelled samples.
+7. Per-heuristic migrations, each with labelled samples: tagger, schema router, continuation intent, turn classifier, injection scoring, and GitHub-app should-respond.
 8. Images in state.
 9. Decision-driven model routing, after the per-turn routing freeze.
 
 ## Related
 
-- [LLM_SERVICE_ARCHITECTURE.md](../LLM_SERVICE_ARCHITECTURE.md): vendor / route / model, discovery, routing, no hardcoded model IDs.
-- [PROVIDER_PLUGINS.md](PROVIDER_PLUGINS.md): the adapter contract that `adecide` / `list_decision_models` extend.
-- [MEMORY_SYSTEM.md](../MEMORY_SYSTEM.md): second-stage answerability, the first caller.
+- [LLM_SERVICE_ARCHITECTURE.md](../LLM_SERVICE_ARCHITECTURE.md) — vendor / route / model, discovery, routing, no hardcoded model IDs.
+- [PROVIDER_PLUGINS.md](PROVIDER_PLUGINS.md) — the adapter contract that `adecide` / `list_decision_models` extend.
+- [MEMORY_SYSTEM.md](../MEMORY_SYSTEM.md) — second-stage answerability, the first caller.
 - TypeSafe System One API reference: <https://docs.typesafe.ai/api.md> (OpenAPI: <https://api.typesafe.ai/openapi.json>).
 - Ollama decision models: <https://docs.ollama.com/api/systemone>.
 - OpenRouter Decisions API: <https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request.md>.
