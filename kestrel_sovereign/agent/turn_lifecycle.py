@@ -83,6 +83,18 @@ def bind_current_chain(chain: Optional[list[CausationFrame]]) -> Iterator[None]:
         _CURRENT_CHAIN.reset(token)
 
 
+def current_turn_is_signal_driven() -> bool:
+    """Whether the calling task runs inside a signal-driven cognition turn.
+
+    The dispatcher binds the signal's causation chain, already extended with
+    this hop's frame, before entering the turn, so the chain is non-empty
+    exactly when a signal (an A2A task, a wake, a scheduled COGNITION source)
+    started the turn, and empty for direct user input. Such a turn has no
+    person in its conversation to answer an approval prompt (#3439).
+    """
+    return bool(_CURRENT_CHAIN.get())
+
+
 turn_scoped(
     "causation_chain",
     variables=(_CURRENT_CHAIN,),
