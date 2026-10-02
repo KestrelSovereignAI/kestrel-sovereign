@@ -155,7 +155,7 @@ The early stop means an oversized `state` costs at most about the cap in encodin
 - The per-route fit check (§7) uses it for its token estimate and does not re-tokenise.
 - Each adapter's dialect serialisation is at most a constant factor of it, because dialects rename keys and do not expand content.
 
-These bounds are module constants in `kestrel_sovereign/llm/decisions/`. They are policy, not configuration, in the same way loop-policy constants are. A future route with stricter caps tightens §7's per-candidate fit check; it does not change these constants.
+These bounds, the validation function and the snapshot type are module constants and code in `kestrel_sdk.llm.decisions`. They belong in the SDK because adapters receive the snapshot type and features build requests against the same limits. Core calls the SDK validator; it does not keep its own copy. They are policy, not configuration, in the same way loop-policy constants are. A future route with stricter caps tightens §7's per-candidate fit check; it does not change these constants.
 
 ### 2.3 Kestrel owns the answer's meaning
 
