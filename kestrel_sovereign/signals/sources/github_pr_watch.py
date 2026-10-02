@@ -599,6 +599,11 @@ def _workflow_runs_as_check_runs(payload: Any) -> Any:
     :func:`summarize_checks` read Actions runs unchanged rather than growing
     a second, separately-drifting reducer.
 
+    Each run's ``id`` and ``run_attempt`` are carried across too. A re-run
+    keeps its workflow run's ``id`` and increments ``run_attempt``, so the pair
+    is what tells the CI wait provider a re-run that failed again from the
+    failure it re-ran (#3399).
+
     ``total_count`` is carried across verbatim when GitHub sent one, so the
     unread-gate protection in :func:`_check_verdict` — which lowers
     ``success`` to ``pending`` when the rollup was read short — keeps
@@ -615,6 +620,8 @@ def _workflow_runs_as_check_runs(payload: Any) -> Any:
             continue
         runs.append(
             {
+                "id": r.get("id"),
+                "run_attempt": r.get("run_attempt"),
                 "name": str(r.get("name", "") or ""),
                 "status": str(r.get("status", "") or ""),
                 "conclusion": r.get("conclusion"),

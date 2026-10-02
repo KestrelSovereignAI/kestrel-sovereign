@@ -205,3 +205,44 @@ class TestWaitModeSignal:
         assert result.status is ToolResultStatus.OK
         # Blocking path doesn't lazily build a reconciler/watch row.
         assert getattr(db_agent, "_wait_reconciler", None) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "final"), [
+    ("completed", True),
+    ("failed", True),
+    ("canceled", True),
+    ("working", None),
+    ("submitted", None),
+])
+async def test_task_terminal_states_are_final(status, final):
+    """#3399: the task store fences completed/failed/canceled against any
+    later update, so a watch re-armed over one is retired, not polled."""
+    from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
+    from kestrel_sovereign.waits.engine import TERMINAL_EVENT_FINAL_KEY
+
+    async def status_data(handle):
+        return {"ok": True, "task_id": handle, "status": status}
+
+    provider = TaskWaitable(SimpleNamespace(_get_task_status_data=status_data))
+    polled = await provider.poll("t1")
+
+    assert polled.data.get(TERMINAL_EVENT_FINAL_KEY) is final
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_task_is_not_final():
+    from kestrel_sdk.tools import Outcome
+
+    from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
+    from kestrel_sovereign.waits.engine import TERMINAL_EVENT_FINAL_KEY
+
+    async def status_data(handle):
+        return {"ok": False, "error": "backend unavailable"}
+
+    polled = await TaskWaitable(
+        SimpleNamespace(_get_task_status_data=status_data)
+    ).poll("t1")
+
+    assert polled.outcome is Outcome.FAILED
+    assert TERMINAL_EVENT_FINAL_KEY not in polled.data

@@ -16,6 +16,7 @@ from kestrel_sovereign.features.storage_access import (
     AgentIdentityUnavailable,
     resolve_scoped_agent_did,
 )
+from kestrel_sovereign.waits.engine import TERMINAL_EVENT_FINAL_KEY
 
 
 class TaskWaitable:
@@ -86,6 +87,11 @@ class TaskWaitable:
             "message": data.get("message"),
         }
 
+        if status in ("completed", "failed", "canceled"):
+            # The task store fences these against any later update, so no
+            # later terminal event can follow and a watch re-armed over one
+            # is retired rather than polled forever (#3399).
+            payload[TERMINAL_EVENT_FINAL_KEY] = True
         if status == "completed":
             n = len(data.get("artifacts") or [])
             return WaitStatus(

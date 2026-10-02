@@ -17,12 +17,25 @@ import pytest
 
 from kestrel_sdk.tools import Outcome
 
-from kestrel_sovereign.signals.sources.github_pr_watch import CheckRollup
+from kestrel_sovereign.signals.sources.github_pr_watch import (
+    CHECKS_SOURCE_CHECK_RUNS,
+    CHECKS_SOURCE_WORKFLOW_RUNS,
+    CheckRollup,
+    _workflow_runs_as_check_runs,
+)
 from kestrel_sovereign.features.scheduler.ci_wait_provider import (
     CIWaitable,
+    CITerminalEvent,
     _check_verdict,
+    ci_terminal_event,
     classify_ci_state,
     parse_ci_handle,
+)
+from kestrel_sovereign.waits.engine import (
+    TERMINAL_EVENT_DETAIL_KEY,
+    TERMINAL_EVENT_FINAL_KEY,
+    TERMINAL_EVENT_KEY,
+    TERMINAL_EVENT_VIEW_KEY,
 )
 
 
@@ -529,3 +542,208 @@ async def test_poll_without_head_sha_stays_pending_unknown(monkeypatch):
 
     assert status.outcome is Outcome.PENDING
     assert status.data["checks"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# #3399: every terminal status names its terminal event
+# ---------------------------------------------------------------------------
+
+_SHA = "362b6c0d85573b25ee4fba32278d6ad2f1cbf80c"
+_OPEN = {"state": "open", "merged": False, "head": {"sha": _SHA}}
+
+
+def _runs(*runs):
+    return {"total_count": len(runs), "check_runs": list(runs)}
+
+
+def _failed_run(run_id, name="unit-tests"):
+    return {"id": run_id, "name": name, "status": "completed", "conclusion": "failure"}
+
+
+def _event_of(pr, check_runs=None, combined_status=None, **kwargs):
+    """``(outcome, identity)``: the identity is the event, its detail and the
+    detail's view as the poll reports them, or ``None`` when it names none."""
+    status = classify_ci_state(
+        pr, check_runs=check_runs, combined_status=combined_status,
+        repo="o/r", number=1, **kwargs,
+    )
+    if TERMINAL_EVENT_KEY not in status.data:
+        assert TERMINAL_EVENT_DETAIL_KEY not in status.data
+        return status.outcome, None
+    return status.outcome, CITerminalEvent(
+        status.data[TERMINAL_EVENT_KEY],
+        status.data.get(TERMINAL_EVENT_DETAIL_KEY),
+        status.data.get(TERMINAL_EVENT_VIEW_KEY),
+        status.data.get(TERMINAL_EVENT_FINAL_KEY) is True,
+    )
+
+
+def test_the_same_records_always_name_the_same_event():
+    """Stable across polls and independent of the order GitHub pages in."""
+    a, b = _failed_run(1, "lint"), _failed_run(2, "unit-tests")
+    assert _event_of(_OPEN, _runs(a, b)) == _event_of(_OPEN, _runs(b, a))
+    outcome, identity = _event_of(_OPEN, _runs(a, b))
+    assert outcome is Outcome.FAILED
+    assert identity.event == f"head@{_SHA}"
+    assert identity.view == CHECKS_SOURCE_CHECK_RUNS
+
+
+def test_a_rerun_that_fails_again_is_a_new_event_with_the_same_outcome():
+    first = _event_of(_OPEN, _runs(_failed_run(101)))
+    rerun = _event_of(_OPEN, _runs(_failed_run(102)))
+    assert first[0] is rerun[0] is Outcome.FAILED
+    assert first[1] != rerun[1]
+    assert first[1].view == rerun[1].view, "one view, so the details compare"
+
+
+def test_a_workflow_run_attempt_is_part_of_the_event():
+    def attempt(n):
+        return _event_of(
+            _OPEN,
+            _runs({**_failed_run(9001), "run_attempt": n}),
+            checks_source=CHECKS_SOURCE_WORKFLOW_RUNS,
+            unreadable=("check-runs",),
+        )[1]
+
+    assert attempt(1) != attempt(2)
+    assert attempt(1).view == CHECKS_SOURCE_WORKFLOW_RUNS
+
+
+def test_a_new_head_commit_is_a_new_event():
+    moved = {**_OPEN, "head": {"sha": "f" * 40}}
+    assert _event_of(_OPEN, _runs(_failed_run(1)))[1].event != (
+        _event_of(moved, _runs(_failed_run(1)))[1].event
+    )
+
+
+def test_a_settled_legacy_status_is_part_of_the_execution_set():
+    """A status re-reported under a new id is a new execution of that gate,
+    the same as a check run re-run: the head SHA (the event) is unchanged,
+    and the execution set it was read in differs."""
+    def status(status_id):
+        return {
+            "state": "failure", "total_count": 1,
+            "statuses": [{"id": status_id, "context": "cov", "state": "failure"}],
+        }
+
+    first = _event_of(_OPEN, {}, status(1))[1]
+    rerun = _event_of(_OPEN, {}, status(2))[1]
+    assert first.event == rerun.event == f"head@{_SHA}"
+    assert first.view == rerun.view
+    assert first.detail != rerun.detail
+
+
+def test_a_pending_rerun_names_no_event():
+    outcome, identity = _event_of(
+        _OPEN, _runs({"id": 102, "name": "unit-tests", "status": "queued"})
+    )
+    assert outcome is Outcome.PENDING
+    assert identity is None
+
+
+def test_the_event_ignores_the_classification():
+    """#3390: the same records read completely (DONE) or through the Actions
+    fallback (PARTIAL) name one event and one execution set. Only the verdict
+    about them differs, and the view that says which path read them."""
+    green = _runs({"id": 5, "name": "ci", "status": "completed", "conclusion": "success"})
+    done = _event_of(_OPEN, green)
+    partial = _event_of(
+        _OPEN, green,
+        checks_source=CHECKS_SOURCE_WORKFLOW_RUNS, unreadable=("check-runs",),
+    )
+    assert (done[0], partial[0]) == (Outcome.DONE, Outcome.PARTIAL)
+    assert (done[1].event, done[1].detail) == (partial[1].event, partial[1].detail)
+    assert (done[1].view, partial[1].view) == (
+        CHECKS_SOURCE_CHECK_RUNS, CHECKS_SOURCE_WORKFLOW_RUNS,
+    )
+
+
+def test_one_execution_read_through_checks_and_actions_is_one_event():
+    """The review finding on #3399: the Checks API names a GitHub Actions
+    execution by its job-level check-run ids, the Actions fallback by its
+    workflow run's id and attempt. The ids cannot agree, so the execution set
+    is scoped to its view; the event both paths name alike — the head SHA —
+    is the same."""
+    status = {
+        "state": "failure", "total_count": 1,
+        "statuses": [{"id": 77, "context": "cov", "state": "failure"}],
+    }
+    via_checks = _event_of(
+        _OPEN,
+        _runs({**_failed_run(31337, "unit-tests")}, _failed_run(31338, "lint")),
+        status,
+    )
+    via_actions = _event_of(
+        _OPEN,
+        _workflow_runs_as_check_runs({
+            "total_count": 1,
+            "workflow_runs": [{
+                "id": 9001, "run_attempt": 1, "name": "CI",
+                "status": "completed", "conclusion": "failure",
+            }],
+        }),
+        status,
+        checks_source=CHECKS_SOURCE_WORKFLOW_RUNS,
+        unreadable=("check-runs",),
+    )
+
+    assert via_checks[0] is via_actions[0] is Outcome.FAILED
+    assert via_checks[1].event == via_actions[1].event
+    assert via_checks[1].detail != via_actions[1].detail
+    assert via_checks[1].view != via_actions[1].view
+
+
+def test_merge_and_close_name_their_own_events():
+    merged = {**_OPEN, "state": "closed", "merged": True}
+    assert _event_of(merged, _runs(_failed_run(1)))[1] == CITerminalEvent(
+        f"merged@{_SHA}", final=True
+    )
+    assert _event_of(merged)[1] == CITerminalEvent(f"merged@{_SHA}", final=True), (
+        "checks do not move a merge, and a merge has no view-scoped detail"
+    )
+
+    closed_once = {**_OPEN, "state": "closed", "closed_at": "2026-09-29T10:00:00Z"}
+    closed_again = {**closed_once, "closed_at": "2026-09-30T10:00:00Z"}
+    assert _event_of(closed_once)[1] != _event_of(closed_again)[1]
+
+
+def test_only_a_merge_is_final():
+    """Nothing follows a merge. A close can be reopened, and an open PR can
+    be pushed to or re-run, so neither is final."""
+    def final(pr, check_runs=None):
+        status = classify_ci_state(pr, check_runs=check_runs, repo="o/r", number=1)
+        assert status.outcome.is_terminal()
+        return status.data.get(TERMINAL_EVENT_FINAL_KEY)
+
+    assert final({**_OPEN, "state": "closed", "merged": True}) is True
+    assert final({**_OPEN, "state": "closed"}) is None
+    assert final(_OPEN, _runs(_failed_run(1))) is None
+
+
+def test_an_empty_rollup_is_an_event_and_its_first_run_is_another():
+    assert _event_of(_OPEN, _runs())[0] is Outcome.PARTIAL
+    assert _event_of(_OPEN, _runs())[1] != _event_of(_OPEN, _runs(_failed_run(1)))[1]
+
+
+def test_ci_terminal_event_tolerates_runs_without_ids():
+    by_name = ci_terminal_event(_OPEN, check_runs=_runs(
+        {"name": "ci", "status": "completed", "conclusion": "failure"}
+    ))
+    assert by_name == ci_terminal_event(_OPEN, check_runs=_runs(
+        {"name": "ci", "status": "completed", "conclusion": "failure"}
+    ))
+    assert by_name != ci_terminal_event(_OPEN, check_runs=_runs(
+        {"name": "ci", "status": "completed", "conclusion": "success"}
+    ))
+
+
+def test_the_actions_projection_carries_each_runs_id_and_attempt():
+    projected = _workflow_runs_as_check_runs({
+        "total_count": 1,
+        "workflow_runs": [{
+            "id": 9001, "run_attempt": 2, "name": "CI",
+            "status": "completed", "conclusion": "failure",
+        }],
+    })
+    [run] = projected["check_runs"]
+    assert (run["id"], run["run_attempt"]) == (9001, 2)
