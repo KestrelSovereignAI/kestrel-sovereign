@@ -63,6 +63,7 @@ mis-filed legacy keys of #2012 that the grouper already ignores.
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, Dict, Optional, Tuple
 
 # ── The rule, authored once ──────────────────────────────────────────────
@@ -226,6 +227,17 @@ def is_stampable_session_id(value: Any) -> bool:
         and all(character in _ALLOWED_CHARACTERS for character in value)
         and any(character not in _DIGITS for character in value)
     )
+
+
+def new_session_id() -> str:
+    """Mint a fresh conversation session id (UUID4).
+
+    The one spelling every writer that STARTS a session uses: the store's
+    implicit time-gap rollover, a ``new_session`` marker, ``POST
+    /api/conversations/new``, and an unbound COGNITION wake (#3429). A minted
+    id therefore always satisfies :func:`is_stampable_session_id`.
+    """
+    return str(uuid.uuid4())
 
 
 def column_session_id(metadata: Any) -> Optional[str]:

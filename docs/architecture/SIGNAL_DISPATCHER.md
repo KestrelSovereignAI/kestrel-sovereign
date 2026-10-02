@@ -689,7 +689,7 @@ The dispatcher pipeline:
 7. **Route**:
    - ACTION → `await registration.handler(payload)`
    - ARTIFACT → `await registration.artifact_handler(signal)`
-   - COGNITION → select the registration `prompt_template`, or the signal's `prompt_template_override` only when the registration has `allow_prompt_override=True`; render with the signal envelope → `await agent.process_input_or_streaming(prompt, ...)`. The entry point itself acquires `CONVERSATION` at the shared turn lifecycle (Concern #1) — the dispatcher does not pre-acquire it. Streaming vs non-streaming is selected by the calling context; both share the same lifecycle boundary.
+   - COGNITION → select the registration `prompt_template`, or the signal's `prompt_template_override` only when the registration has `allow_prompt_override=True`; render with the signal envelope → `await agent.process_input_or_streaming(prompt, ...)` with `session_id` set to the signal's session, or to a session minted for this turn when the signal has none (#3429), so the turn's session is fixed before it starts rather than chosen per row by the store's time-gap heuristic. The entry point itself acquires `CONVERSATION` at the shared turn lifecycle (Concern #1) — the dispatcher does not pre-acquire it. Streaming vs non-streaming is selected by the calling context; both share the same lifecycle boundary.
 8. **Release locks** in reverse acquisition order.
 9. **Log** the routed outcome per the source's redaction policy.
 

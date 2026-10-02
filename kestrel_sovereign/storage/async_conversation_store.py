@@ -43,6 +43,7 @@ from .session_id_column import (
     SESSION_ID_KEY,
     column_session_id,
     merged_column_assignment,
+    new_session_id,
 )
 from .destructive_audit import DestructiveAuditEvent, DestructiveAuditLog, hash_rows
 from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
@@ -1105,8 +1106,7 @@ class AsyncConversationStore:
     @staticmethod
     def _new_session_id() -> str:
         """Mint a new implicit session_id (UUID4)."""
-        import uuid
-        return str(uuid.uuid4())
+        return new_session_id()
 
     async def _canonicalize_session_id(
         self, session_id: Optional[str]

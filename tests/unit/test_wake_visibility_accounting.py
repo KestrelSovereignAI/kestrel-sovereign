@@ -59,6 +59,7 @@ from kestrel_sovereign.signals.sources.wait import (
     build_wait_complete_registration,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
+from kestrel_sovereign.storage.session_id_column import is_stampable_session_id
 from kestrel_sovereign.waits.engine import WaitRegistry
 from kestrel_sovereign.waits.reconciler import (
     VISIBILITY_QUEUED,
@@ -422,7 +423,11 @@ async def test_unbound_wake_is_recorded_unbound_not_ok(rig):
         "an INTERNAL wake is log-only; emitting it would paint a turn into "
         "whichever pane happens to be open"
     )
-    assert r.agent.process_input_sessions == [None], "still wakes, unattended"
+    # Still wakes, unattended — in a fresh session of its own rather than none
+    # (#3429): the turn's session is fixed at entry, never left for the
+    # store's time-gap heuristic to decide at write time.
+    [turn_session] = r.agent.process_input_sessions
+    assert is_stampable_session_id(turn_session)
 
 
 @pytest.mark.asyncio
