@@ -5021,7 +5021,7 @@ class PrivacyEnforcingStorage:
     async def query_session_rows(
         self, session_id: str, limit: int = 100
     ) -> List[Tuple]:
-        """Resolve every message belonging to ``session_id``, respecting privacy.
+        """Resolve ``session_id``'s most recent ``limit`` messages, respecting privacy.
 
         Unlike :meth:`query_conversation_messages` (which only time-gap walks
         forward from a row-id anchor), this delegates to the store's canonical
@@ -5058,7 +5058,9 @@ class PrivacyEnforcingStorage:
                     conv.get("model"),
                     conv.get("provider"),
                 ))
-            return rows[:limit]
+            # The session's most recent ``limit``, as the persistent resolver
+            # answers (#3431).
+            return rows[-limit:] if limit > 0 else []
 
         # Preserve the live-anchor guard the previous detail-read path had
         # (via query_conversation_start's `deleted_at IS NULL` filter): for a
