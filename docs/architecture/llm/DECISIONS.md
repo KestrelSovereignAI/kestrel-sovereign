@@ -144,6 +144,13 @@ These rules ensure every server parses the same value Kestrel measured.
 3. Abort with `DecisionRequestInvalid(MAX_REQUEST_BYTES)` as soon as the running total, including the questions, passes the cap.
 4. Only a request that passes is encoded, as canonical JSON with `allow_nan=False`.
 
+**Validation produces an immutable snapshot, before the first `await`.** The same walk builds a private, deep-frozen copy of the request:
+- every `dict` becomes a fresh read-only mapping;
+- every `list` becomes a `tuple`;
+- every question's options and levels are copied the same way.
+
+The snapshot's canonical JSON bytes are computed once from that copy. All later steps use **only the snapshot**: sizing, the fit check, privacy routing, and the adapter's dialect serialisation (`adecide` receives the snapshot, never the caller's object). A caller that mutates its own `state` while `decide` awaits discovery, a canary or the network cannot change what is sent. What goes out is exactly what was validated and measured.
+
 The early stop means an oversized `state` costs at most about the cap in encoding work; it is never fully serialised. Later steps use this measured size:
 - The per-route fit check (§7) uses it for its token estimate and does not re-tokenise.
 - Each adapter's dialect serialisation is at most a constant factor of it, because dialects rename keys and do not expand content.
@@ -221,7 +228,7 @@ There is no long-lived `DecisionService` instance. Embeddings bind to one route 
 
 | Method | Default | Returns |
 |---|---|---|
-| `adecide(client, model, request, *, timeout)` | raises `DecisionsNotSupported` | the vendor's raw JSON response, as a dict |
+| `adecide(client, model, request, *, timeout)` | raises `DecisionsNotSupported` | the vendor's raw JSON response, as a dict. `request` is the validated, immutable snapshot (§2.2). |
 | `list_decision_models(client)` | `[]` | `List[DecisionModelInfo]` |
 
 ```python
@@ -310,9 +317,9 @@ The steps run in order. No decision request is sent until step 4, and **no netwo
    2. Apply `model_override` (§5.3).
    3. Apply privacy (§6): under effective local-only, drop every route that is not `is_local`.
    4. **Then** read decision state for the remaining routes only. A remaining route whose decision discovery has never run (a cold cache) is discovered now, together with its pin canary (§4.1). This is the only discovery `decide` ever triggers, and it is scoped to these routes. It is the same rule the chat path follows, where local-only turns skip discovery that would contact the cloud.
-   5. Drop routes with no discovered decision models and no pin.
+   5. A remaining route with no pin whose discovery found no decision models stays in the list. Step 3 rejects it with `NO_MODELS`, so the outcome is always attributable to a route.
 3. **Walk the routes in order.** For each route, resolve its model and stop at the first one that passes every check. A route that fails a check is skipped, and its rejection reason is recorded.
-   - **Pick the model.** A verified pin is the route's model. An unverified pin rejects the route with `UNVERIFIED_PIN`, and the route's discovered models are not consulted instead, because the operator's pin is authoritative for that route. With no pin, the discovered models are filtered by `decision_hints`. If exactly one survives, that is the model. If several survive, reject the route with `AMBIGUOUS_MODEL` and name the survivors. Kestrel never picks among them arbitrarily, because thresholds are per model and an arbitrary pick would silently change calibration.
+   - **Pick the model.** A route with no pin and no discovered decision models is rejected with `NO_MODELS`. A verified pin is the route's model. An unverified pin rejects the route with `UNVERIFIED_PIN`, and the route's discovered models are not consulted instead, because the operator's pin is authoritative for that route. With no pin, the discovered models are filtered by `decision_hints`. If exactly one survives, that is the model. If several survive, reject the route with `AMBIGUOUS_MODEL` and name the survivors. Kestrel never picks among them arbitrarily, because thresholds are per model and an arbitrary pick would silently change calibration.
    - **Calibration** (§2.5). Under `refuse`, reject the route with `NOT_CALIBRATED` if its model is uncalibrated for this request.
    - **Fit check** (§7). Reject the route with `NO_FIT` if the request exceeds the model's limits.
 4. **Dispatch** to the first route that passed. If none passed, raise `DecisionUnavailable(NO_CANDIDATE)` with each route's rejection reason. One ambiguous or ill-fitting route never blocks a usable route earlier or later in the order.
@@ -366,7 +373,7 @@ Anything other than a complete, normalised `DecisionResult` is raised as an exce
 | Exception | Meaning |
 |---|---|
 | `DecisionRequestInvalid(rule)` | The request failed validation (§2.2). Nothing was sent. |
-| `DecisionUnavailable(reason, rejections)` | Nothing was sent. `reason` is one of `DISABLED`, `SELECTOR_CONFLICT`, `NO_ROUTE` (no decision-capable route remains after the override), `NO_LOCAL_ROUTE` (privacy removed every route) or `NO_CANDIDATE` (routes remained, but each was rejected). `rejections` lists each route with its reason: `AMBIGUOUS_MODEL`, `NOT_CALIBRATED`, `NO_FIT`, `UNVERIFIED_PIN`, `NOT_SERVED` or `PIN_CONFLICT`. |
+| `DecisionUnavailable(reason, rejections)` | Nothing was sent. `reason` is one of `DISABLED`, `SELECTOR_CONFLICT`, `NO_ROUTE` (no configured route remains after the override), `NO_LOCAL_ROUTE` (privacy removed every route) or `NO_CANDIDATE` (routes remained, but each was rejected). `rejections` lists each route with its reason: `NO_MODELS`, `AMBIGUOUS_MODEL`, `NOT_CALIBRATED`, `NO_FIT`, `UNVERIFIED_PIN`, `NOT_SERVED` or `PIN_CONFLICT`. `NO_ROUTE` means no configured route survived the override. If routes survived but every one was rejected, including the case where every route discovered zero models, the reason is `NO_CANDIDATE`. |
 | `DecisionTimeout` | `timeout_seconds` elapsed. The deadline covers the whole call: resolution, the fit check, dispatch and normalisation. It is enforced with `asyncio.timeout` in `decide` and is also passed to the adapter's HTTP client. The Ollama route must set an explicit HTTP timeout, because the chat `AsyncClient` has none. |
 | `DecisionTransportError` | A network or HTTP failure. This includes a 404 for `/v1/systemone` on a runtime too old to serve it, and a model that has disappeared since discovery. |
 | `DecisionProtocolError` | The response violated §2.3. |
