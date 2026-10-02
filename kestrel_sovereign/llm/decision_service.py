@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import re
 import time
 from dataclasses import replace
-from typing import Any, Dict, List, Mapping, Optional, Set
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 
 from kestrel_sdk.llm.decisions import (
     DecisionModelInfo,
     DecisionProtocolError,
     DecisionRequest,
+    DecisionRequestInvalid,
     DecisionResult,
     DecisionTimeout,
     DecisionTransportError,
@@ -59,6 +63,7 @@ CANARY_REQUEST: ValidatedDecisionRequest = validate_decision_request(
     )
 )
 CANARY_CALLER = "kestrel.canary"
+_THRESHOLD_KEY = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 
 
 def _route_state(provider: Mapping[str, Any]) -> RouteDecisionState:
@@ -71,6 +76,45 @@ def _route_state(provider: Mapping[str, Any]) -> RouteDecisionState:
 
 def _supports_decisions(provider: Mapping[str, Any]) -> bool:
     return bool((provider.get("capabilities") or {}).get("supports_decisions"))
+
+
+def _threshold_keys(
+    question_ids: Sequence[str], mapping: Optional[Mapping[str, str]]
+) -> Dict[str, str]:
+    """Each question id's calibration key (the id itself unless mapped)."""
+
+    mapping = dict(mapping or {})
+    unknown = sorted(set(mapping) - set(question_ids))
+    if unknown:
+        raise DecisionRequestInvalid(
+            "thresholds", f"threshold_keys names unknown question id(s) {unknown!r}"
+        )
+    for question_id, key in mapping.items():
+        if not isinstance(key, str) or not _THRESHOLD_KEY.fullmatch(key):
+            raise DecisionRequestInvalid(
+                "thresholds", f"threshold key for {question_id!r} is not a valid id: {key!r}"
+            )
+    return {q: mapping.get(q, q) for q in question_ids}
+
+
+def _default_thresholds(
+    raw: Optional[Mapping[str, float]],
+) -> Optional[Mapping[str, float]]:
+    if raw is None:
+        return None
+    values: Dict[str, float] = {}
+    for key, value in raw.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0.0 <= value <= 1.0
+        ):
+            raise DecisionRequestInvalid(
+                "thresholds", f"default threshold for {key!r} must be in [0, 1]"
+            )
+        values[str(key)] = float(value)
+    return MappingProxyType(values)
 
 
 class DecisionServiceMixin:
@@ -104,6 +148,36 @@ class DecisionServiceMixin:
             p for p in providers
             if _supports_decisions(p) and p.get("name") not in disabled
         ]
+
+    def describe_decision_routes(self) -> List[Dict[str, Any]]:
+        """Operator view of every decision-capable route's state (no I/O).
+
+        One entry per route: name, locality, the pin and its verification
+        state, staleness, and the discovered models with their limits. Used by
+        ``kestrel decisions models`` and the eval harness.
+        """
+
+        out: List[Dict[str, Any]] = []
+        for provider in self._decision_routes():
+            state = _route_state(provider)
+            out.append({
+                "route": str(provider.get("name")),
+                "vendor": str(provider.get("vendor")),
+                "is_local": bool(provider.get("is_local")),
+                "pin": state.config.pin,
+                "pin_status": state.pin_status.value,
+                "pin_reason": state.pin_reason,
+                "hints": list(state.config.hints),
+                "discovered": state.models is not None,
+                "discovery_stale_since": state.discovery_stale_since,
+                "canary_stale_since": state.canary_stale_since,
+                "models": [
+                    {"id": m.id, "context_limit": m.context_limit,
+                     "parallel_questions": m.parallel_questions}
+                    for m in (state.models or ())
+                ],
+            })
+        return out
 
     def _decision_lock(self, name: str) -> asyncio.Lock:
         locks = self.__dict__.setdefault("_decision_discovery_locks", {})
@@ -238,12 +312,21 @@ class DecisionServiceMixin:
         model_override: Optional[str] = None,
         local_only: bool = False,
         session_id: Optional[str] = None,
+        threshold_keys: Optional[Mapping[str, str]] = None,
+        default_thresholds: Optional[Mapping[str, float]] = None,
     ) -> DecisionResult:
         """Answer ``request`` on the first decision route that can take it.
 
         Raises a :class:`~kestrel_sdk.llm.decisions.DecisionError` subclass for
         anything other than a complete, normalised result. Never re-sends to
         another route after a dispatch.
+
+        ``threshold_keys`` maps question ids to shared calibration keys, so N
+        questions of one kind (one per candidate, say) share one threshold;
+        unmapped ids are their own key. ``default_thresholds`` (by key) is the
+        caller's own pre-calibration threshold; ``[decisions.thresholds]``
+        overrides it key by key and calibrated per-model entries replace it.
+        ``DecisionResult.thresholds`` is always keyed by question id.
         """
 
         if not isinstance(caller, str) or not caller:
@@ -254,7 +337,9 @@ class DecisionServiceMixin:
         # Frozen before the first await: the snapshot, privacy and identity.
         snapshot = validate_decision_request(request)
         question_ids = tuple(snapshot.questions)
-        self._decision_thresholds.check_request(caller, question_ids)
+        keys = _threshold_keys(question_ids, threshold_keys)
+        defaults = _default_thresholds(default_thresholds)
+        self._decision_thresholds.check_request(caller, keys.values(), defaults)
         selector: Optional[DecisionSelector] = (
             parse_decision_selector(model_override) if model_override else None
         )
@@ -288,10 +373,10 @@ class DecisionServiceMixin:
                     selector=selector,
                     thresholds=self._decision_thresholds,
                     caller=caller,
-                    question_ids=question_ids,
+                    question_ids=tuple(keys.values()),
                 )
                 resolution = self._decision_thresholds.resolve(
-                    caller, candidate.model_key, question_ids
+                    caller, candidate.model_key, keys.values(), defaults
                 )
                 calibrated = resolution.calibrated
                 provider = candidate.provider
@@ -332,7 +417,11 @@ class DecisionServiceMixin:
             vendor=str(provider.get("vendor")),
             route=str(provider.get("name")),
             model=candidate.info.id,
-            thresholds=resolution.thresholds,
+            thresholds=MappingProxyType(
+                {q: resolution.thresholds[keys[q]] for q in question_ids}
+                if resolution.thresholds
+                else {}
+            ),
             calibrated=resolution.calibrated,
             input_tokens=normalized.input_tokens,
             duration_ms=int((time.monotonic() - started) * 1000),

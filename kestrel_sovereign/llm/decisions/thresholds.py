@@ -96,53 +96,87 @@ class ThresholdBook:
     def caller(self, caller: str) -> Optional[CallerThresholds]:
         return self.callers.get(caller)
 
-    def check_request(self, caller: str, question_ids: Collection[str]) -> None:
-        """Refuse a request the caller's ``default`` table cannot cover.
+    def _policy_and_defaults(
+        self, caller: str, caller_defaults: Optional[Mapping[str, float]]
+    ) -> tuple[Optional[UncalibratedPolicy], Mapping[str, float]]:
+        """The effective policy and default table for one request.
 
-        Under the ``default`` policy every question the request asks must have
-        a default threshold; a gap is a configuration error raised before
-        routing. This is checked even when a calibrated model would answer:
-        which model answers depends on routing (privacy mode, a route going
-        down), so a gap must fail the same way on every route rather than only
-        on the day an uncalibrated route is chosen (spec §2.5).
+        A caller may ship its own defaults (the threshold it uses before any
+        calibration exists); the operator's ``default`` table overrides them
+        key by key. ``None`` policy means the caller has neither: thresholds do
+        not apply to it.
         """
 
         table = self.callers.get(caller)
-        if table is None or table.policy is not UncalibratedPolicy.DEFAULT:
+        if table is None and caller_defaults is None:
+            return None, _EMPTY
+        defaults = dict(caller_defaults or {})
+        if table is not None:
+            defaults.update(table.default)
+        policy = table.policy if table is not None else UncalibratedPolicy.DEFAULT
+        return policy, MappingProxyType(defaults)
+
+    def check_request(
+        self,
+        caller: str,
+        keys: Collection[str],
+        caller_defaults: Optional[Mapping[str, float]] = None,
+    ) -> None:
+        """Refuse a request whose default thresholds cannot cover it.
+
+        ``keys`` are the request's threshold keys (question ids, or the shared
+        keys a caller maps them to). Under the ``default`` policy every key must
+        have a default; a gap is a configuration error raised before routing.
+        This is checked even when a calibrated model would answer: which model
+        answers depends on routing (privacy mode, a route going down), so a gap
+        must fail the same way on every route rather than only on the day an
+        uncalibrated route is chosen (spec §2.5).
+        """
+
+        policy, defaults = self._policy_and_defaults(caller, caller_defaults)
+        if policy is not UncalibratedPolicy.DEFAULT:
             return
-        missing = sorted(q for q in question_ids if q not in table.default)
+        missing = sorted(k for k in set(keys) if k not in defaults)
         if missing:
             raise DecisionRequestInvalid(
                 "thresholds",
                 f"[decisions.thresholds.{caller}].default has no threshold for "
-                f"question(s) {missing!r}; add them, or set "
+                f"key(s) {missing!r}; add them, or set "
                 'uncalibrated = "refuse" to allow only calibrated models',
             )
 
-    def admits(self, caller: str, model_key: str, question_ids: Collection[str]) -> bool:
+    def admits(self, caller: str, model_key: str, keys: Collection[str]) -> bool:
         """Whether resolution may dispatch this request to ``model_key``."""
 
         table = self.callers.get(caller)
         if table is None or table.policy is not UncalibratedPolicy.REFUSE:
             return True
-        return table.calibrated_for(model_key, question_ids)
+        return table.calibrated_for(model_key, set(keys))
 
     def resolve(
-        self, caller: str, model_key: str, question_ids: Collection[str]
+        self,
+        caller: str,
+        model_key: str,
+        keys: Collection[str],
+        caller_defaults: Optional[Mapping[str, float]] = None,
     ) -> ThresholdResolution:
-        table = self.callers.get(caller)
-        if table is None:
+        """Thresholds by key for the model that answers."""
+
+        policy, defaults = self._policy_and_defaults(caller, caller_defaults)
+        if policy is None:
             return ThresholdResolution(thresholds=_EMPTY, calibrated=None)
-        if table.calibrated_for(model_key, question_ids):
+        unique = set(keys)
+        table = self.callers.get(caller)
+        if table is not None and table.calibrated_for(model_key, unique):
             source = table.models[model_key]
             calibrated = True
         else:
             # Only reachable under the "default" policy: "refuse" removed the
-            # model during resolution.
-            source = table.default
+            # model during resolution, and check_request proved coverage.
+            source = defaults
             calibrated = False
         return ThresholdResolution(
-            thresholds=MappingProxyType({q: source[q] for q in question_ids}),
+            thresholds=MappingProxyType({k: source[k] for k in unique}),
             calibrated=calibrated,
         )
 

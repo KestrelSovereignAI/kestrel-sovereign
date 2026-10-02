@@ -181,7 +181,9 @@ This is the entropy form because it uses the whole distribution, not just its pe
 
 ### 2.5 Calibration is per (caller, model), and the service resolves it
 
-A threshold tuned on one model's distributions does not transfer to another model. Thresholds are therefore keyed by caller, by the model that answers, and by question id:
+A threshold tuned on one model's distributions does not transfer to another model. Thresholds are therefore keyed by caller, by the model that answers, and by **threshold key**.
+
+A question's threshold key is its id, unless the caller maps it with `decide(..., threshold_keys={"c0": "answers", ...})`. N questions of one kind, such as the answerability gate's one-per-candidate `c0`..`c7`, then share one calibrated threshold instead of N copies of it:
 
 ```toml
 [decisions.thresholds.memory_answerability]
@@ -197,7 +199,8 @@ The service resolves calibration, not the caller. This is the only way telemetry
 
 - Under **`refuse`**, a model that is uncalibrated for the request is rejected for this call during resolution (§5.2), before anything is sent.
 - Under **`default`**, an uncalibrated model can still answer. Every threshold on the result then comes from `default`, and `calibrated=False` is set on the result and in telemetry. The `default` table itself must cover every question id the request asks; a gap there is a configuration error, raised as `DecisionRequestInvalid` before routing.
-- **Callers with no thresholds table.** A caller that uses distributions directly (for example, ranking by `p_true`) declares no `[decisions.thresholds.<caller>]` table. Its results carry `thresholds={}` and `calibrated=None`, meaning not applicable.
+- **Caller defaults.** A caller may pass its own pre-calibration thresholds with `decide(..., default_thresholds={key: value})`. One example is the 0.5 decision boundary a `noul` gate starts from. These act as the `default` table under the `default` policy, and the operator's `[decisions.thresholds.<caller>].default` overrides them key by key. A caller that ships defaults therefore works before any operator configuration exists, and becomes calibrated when a per-model entry is added.
+- **Callers with no thresholds.** A caller that uses distributions directly (for example, ranking by `p_true`) passes no defaults and has no `[decisions.thresholds.<caller>]` table. Its results carry `thresholds={}` and `calibrated=None`, meaning not applicable.
 
 `DecisionResult.thresholds` is the only threshold source a caller reads, so every caller applies calibration the same way. Model ids appear here only as config keys, which the no-hardcoded-IDs rule permits.
 
@@ -215,6 +218,8 @@ async def decide(
     model_override: str | None = None,    # §5.3 grammar
     local_only: bool = False,             # may only TIGHTEN privacy (§6)
     session_id: str | None = None,
+    threshold_keys: Mapping[str, str] | None = None,     # §2.5: question id -> shared calibration key
+    default_thresholds: Mapping[str, float] | None = None,  # §2.5: the caller's pre-calibration thresholds, by key
 ) -> DecisionResult: ...
 ```
 
@@ -417,9 +422,17 @@ Embeddings currently bypass all of these sinks, which is tracked as [#3426](http
 
 Thresholds and model choices come from measurement.
 
-- **Samples.** Each caller has a labelled sample set: a `state`, its `questions`, and the expected answers. Committed samples are synthetic or public and live under `tests/evals/decisions/<caller>/*.jsonl`. Operator-local samples drawn from real memory or turns live under the agent data directory and are never committed.
-- **Runner.** `kestrel decisions eval --caller <id> [--route <selector>]` runs the samples against each candidate model. For each model it reports accuracy, Brier score, expected calibration error, latency p50/p95, and a proposed threshold for every question id.
-- **Recording.** An accepted proposal is written into `[decisions.thresholds.<caller>.models."<route>/<model>"]` (§2.5), with the run's sample-set hash and date in an adjacent comment, so every threshold can be traced back to the evidence behind it.
+- **Samples.** Each caller has a labelled sample set in JSON Lines: an `id`, a `state`, `questions` in the systemone wire shape, the `expected` answer for each question (bool, option id, or level index), and optional `threshold_keys`.
+  - Committed samples are synthetic or public. They ship as package data under `kestrel_sovereign/llm/decisions/eval_samples/<caller>/*.jsonl`, so an installed host can run them.
+  - Operator samples drawn from real memory or turns stay on the host and are never committed. Any sample file outside the shipped sets is evaluated on **local routes only** unless the operator passes `--allow-cloud`.
+- **Runner.** `kestrel decisions eval --caller <id> [--samples ...] [--route ...] [--model ...]` runs every sample through `decide` against each candidate model.
+  - On an unpinned route, the candidates are the route's discovered models; a pinned route contributes only its verified pin.
+  - Eval traffic is recorded under the caller id `kestrel.eval.<caller>`, never the real one. This also keeps the real caller's `refuse` policy from hiding uncalibrated models from the very eval meant to calibrate them.
+  - For each model and threshold key the runner reports accuracy, Brier score, expected calibration error and latency p50/p95, plus a proposed threshold:
+    - `noul`: the cut that maximises Youden's J, with precision and recall at that cut.
+    - `choice` / `score`: the lowest top-probability cut at which the answers kept reach `--target-accuracy`, with the coverage that leaves.
+- **Recording.** The runner prints a `[decisions.thresholds.<caller>.models."<route>/<model>"]` block for every model with a complete proposal. Each block carries the run's sample-set hash and date in a comment, so every threshold can be traced back to the evidence behind it. The operator accepts a proposal by pasting its block into `kestrel.toml`; the runner never edits configuration.
+- **Visibility.** `kestrel decisions models` runs a fresh discovery and lists each route's decision models, their limits, and the pin and staleness state.
 
 ## 10. Feature (SDK) surface
 
