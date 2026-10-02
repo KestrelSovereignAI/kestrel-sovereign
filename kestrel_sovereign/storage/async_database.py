@@ -770,6 +770,12 @@ CREATE INDEX IF NOT EXISTS idx_pending_a2a_questions_sweep
 --                            Delivering any other token disarms the watch, so
 --                            re-registering a watch that has fired re-arms it
 --                            instead of leaving it inert
+--   - last_delivered_at      when a wake for this handle was last delivered
+--                            (persisted). Unlike last_delivery_attempt_at, a
+--                            later transition's attempts never overwrite it,
+--                            so a re-emitted wake can say when the handle was
+--                            last woken and whether its event is older than
+--                            that (#3390)
 --
 -- ``agent_id`` scopes rows to the OWNING agent for shared-backend isolation,
 -- exactly like pending_a2a_questions above.
@@ -803,11 +809,44 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     pending_signal_enqueued_at TIMESTAMP,
     watching INTEGER NOT NULL DEFAULT 0,
     watch_baseline TEXT,
+    last_delivered_at TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (agent_id, kind, handle)
 );
 CREATE INDEX IF NOT EXISTS idx_wait_signal_state_pending
     ON wait_signal_state(agent_id, pending_signal_id);
+
+-- ============================================================================
+-- wait_signal_rekeys — append-only audit of every change the wait reconciler
+-- makes to a delivered row WITHOUT waking the agent (#3390). One row per
+-- re-key of last_signaled_outcome to the token the same terminal event is now
+-- polled under.
+--
+--   - reason   reclassified      the provider labels the delivered event
+--                                differently (its outcome or native status
+--                                changed, its native status or event did not)
+--              view_switched     the provider reads the event through another
+--                                view (#3399)
+--              identity_adopted  the provider began naming terminal events
+--                                after this row was delivered (#3399)
+--              identity_dropped  the provider stopped naming terminal events
+--                                after this row was delivered
+--
+-- A classifier change used to read every delivered row as a new transition
+-- and replay its whole history as first deliveries. That re-key is now
+-- silent, so this table is the only place it is visible.
+CREATE TABLE IF NOT EXISTS wait_signal_rekeys (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL,
+    handle TEXT NOT NULL,
+    previous_token TEXT NOT NULL,
+    token TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    recorded_at TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wait_signal_rekeys_handle
+    ON wait_signal_rekeys(agent_id, kind, handle);
 
 -- ============================================================================
 -- operator_notice_audit — lifecycle record for turn-time operator notices
@@ -1489,6 +1528,27 @@ class AsyncDatabase:
         # nothing.
         await self._migrate_add_column(
             "wait_signal_state", "watch_baseline", "TEXT"
+        )
+        # Last successful delivery (#3390). Unlike the columns above, this one
+        # has an honest legacy answer to backfill: a row whose locked token was
+        # delivered (a persisted ``ok``/``coalesced`` status) and not since
+        # retried still holds that delivery's harvest time in
+        # ``last_delivery_attempt_at``. Rows mid-retry, hard-failed, or never
+        # delivered stay NULL, which reads as "no recorded delivery" and so
+        # never labels a wake a replay.
+        await self.migrate_columns_once(
+            "wait_signal_state",
+            (("last_delivered_at", "TIMESTAMP"),),
+            backfills={
+                "last_delivered_at": (
+                    "UPDATE wait_signal_state "
+                    "SET last_delivered_at = last_delivery_attempt_at "
+                    "WHERE last_signaled_outcome IS NOT NULL "
+                    "AND (last_delivery_status LIKE 'ok%' "
+                    "OR last_delivery_status LIKE 'coalesced%')",
+                    (),
+                ),
+            },
         )
         # Both indexes go through ``ensure_index`` rather than a bare
         # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in

@@ -24,6 +24,7 @@ from kestrel_sovereign.a2a.outbound_store import (
 )
 from kestrel_sovereign.features.peers.wait_provider import A2AWaitable
 from kestrel_sovereign.waits.engine import (
+    TERMINAL_EVENT_AT_KEY,
     TERMINAL_EVENT_DETAIL_KEY,
     TERMINAL_EVENT_FINAL_KEY,
     TERMINAL_EVENT_KEY,
@@ -251,7 +252,9 @@ async def test_poll_dispatch_failed_is_failed(db):
 async def test_poll_drops_a_peer_supplied_terminal_event(db):
     """#3399: the reconciler dedups wakes on ``TERMINAL_EVENT_KEY``. This
     provider spreads the peer's task result into its poll data, so a peer
-    that set the key would decide when this agent is woken."""
+    that set the key would decide when this agent is woken. A peer-dated
+    ``TERMINAL_EVENT_AT_KEY`` could likewise have a fresh completion announced
+    as a replay, without its instructions (#3390)."""
     await _record(db, "t-forge")
     peers = _StubPeers(db)
 
@@ -266,6 +269,7 @@ async def test_poll_drops_a_peer_supplied_terminal_event(db):
                 TERMINAL_EVENT_DETAIL_KEY: "peer-detail",
                 TERMINAL_EVENT_VIEW_KEY: "peer-view",
                 TERMINAL_EVENT_FINAL_KEY: True,
+                TERMINAL_EVENT_AT_KEY: "2000-01-01T00:00:00+00:00",
             },
         )
 
@@ -275,7 +279,7 @@ async def test_poll_drops_a_peer_supplied_terminal_event(db):
     assert status.outcome is Outcome.DONE
     for key in (
         TERMINAL_EVENT_KEY, TERMINAL_EVENT_DETAIL_KEY, TERMINAL_EVENT_VIEW_KEY,
-        TERMINAL_EVENT_FINAL_KEY,
+        TERMINAL_EVENT_FINAL_KEY, TERMINAL_EVENT_AT_KEY,
     ):
         assert key not in status.data
 

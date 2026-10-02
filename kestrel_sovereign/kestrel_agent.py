@@ -2710,6 +2710,8 @@ class KestrelAgent(
         #   stripe.deposit       — Stripe deposit webhook (UNTRUSTED COGNITION)
         #   a2a.question_answered— send_a2a_question resumption rail (#1444)
         #   wait.complete        — generic wait reconciler rail (#1860)
+        #   wait.replay          — a wait wake whose event predates the
+        #                          handle's last delivered wake (#3390)
         #   workflow rescue      — the six generic sources named by the
         #                          Workflows built-in stalled_work_rescue
         from kestrel_sovereign.signals import RegistrationPolicy
@@ -2731,6 +2733,9 @@ class KestrelAgent(
         from kestrel_sovereign.signals.sources.wait import (
             build_wait_complete_registration,
         )
+        from kestrel_sovereign.signals.sources.wait_replay import (
+            build_wait_replay_registration,
+        )
         from kestrel_sovereign.signals.sources.workflow_rescue import (
             build_workflow_rescue_registrations,
         )
@@ -2742,6 +2747,7 @@ class KestrelAgent(
             build_stripe_deposit_registration(),
             build_a2a_question_answered_registration(),
             build_wait_complete_registration(),
+            build_wait_replay_registration(),
             # Core hosts these provider-neutral registrations because the
             # Workflows built-in names them.  The sweep is deliberately the
             # echo-only implementation: an installed domain feature may feed

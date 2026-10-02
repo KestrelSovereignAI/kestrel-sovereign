@@ -60,7 +60,7 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5
 #   puts only what every path names alike here (for CI, the head SHA), and
 #   the rest in ``TERMINAL_EVENT_DETAIL_KEY``.
 # * written by the provider itself. A provider that spreads third-party data
-#   into ``WaitStatus.data`` must drop this key, and the three below, from
+#   into ``WaitStatus.data`` must drop this key, and the four below, from
 #   that data, or the third party decides when the agent is woken.
 #
 # A provider that does not set it keeps the legacy ``"<outcome>"`` /
@@ -100,6 +100,23 @@ TERMINAL_EVENT_VIEW_KEY = "terminal_event_view"
 # forever. Leave it unset for anything that can still change (a closed PR can
 # be reopened). Like the keys above, only the provider may write it.
 TERMINAL_EVENT_FINAL_KEY = "terminal_event_final"
+
+# Optional: when the terminal event happened, read from the provider's raw
+# record (a job's exit time, not the time it was polled or classified), as an
+# ISO 8601 string (a ``datetime`` is accepted too, and re-written as one). A
+# value without a timezone is read as UTC.
+#
+# The reconciler compares it with the handle's last delivered wake (#3390).
+# A wake whose event is older than that delivery is a REPLAY: the event
+# happened before the agent was last woken for this handle, so whatever the
+# provider's own wake would tell the agent to do in that turn may already be
+# done or superseded. The reconciler announces a replay on the generic
+# ``wait.replay`` source, which states that it is a replay and carries none of
+# the provider's act-now instructions, instead of on the provider's signal.
+# A provider that does not set it never has a wake labelled a replay. Like the
+# keys above, only the provider may write it: a forged earlier time would
+# strip a fresh wake of its instructions.
+TERMINAL_EVENT_AT_KEY = "terminal_event_at"
 
 
 def parse_ref(ref: str) -> Tuple[str, str]:

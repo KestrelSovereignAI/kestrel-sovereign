@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 import pytest
 
 from kestrel_sovereign.storage.async_wait_signal_store import (
+    REKEY_IDENTITY_ADOPTED,
+    REKEY_RECLASSIFIED,
     WaitSignalStore,
 )
 
@@ -293,6 +295,7 @@ async def test_adopt_signaled_token_rekeys_and_carries_the_watch(make_store):
 
     assert await store.adopt_signaled_token(
         "ci", "o/r#1", previous="failed", token="event:checks@abc:1",
+        reason=REKEY_IDENTITY_ADOPTED,
     ) is True
 
     [row] = await store.list_watched()
@@ -305,9 +308,15 @@ async def test_adopt_signaled_token_rekeys_and_carries_the_watch(make_store):
     # Stale ``previous``: a delivery recorded since the read wins.
     assert await store.adopt_signaled_token(
         "ci", "o/r#1", previous="failed", token="event:other",
+        reason=REKEY_IDENTITY_ADOPTED,
     ) is False
     assert (await store.get("ci", "o/r#1")).last_signaled_outcome == (
         "event:checks@abc:1"
+    )
+    # Only the re-key that happened is audited.
+    [rekey] = await store.list_rekeys("ci", "o/r#1")
+    assert (rekey.previous_token, rekey.token, rekey.reason) == (
+        "failed", "event:checks@abc:1", REKEY_IDENTITY_ADOPTED,
     )
 
 
@@ -323,6 +332,7 @@ async def test_adopt_leaves_a_spent_watch_spent(make_store):
 
     await store.adopt_signaled_token(
         "ci", "o/r#1", previous="failed", token="event:checks@abc:1",
+        reason=REKEY_IDENTITY_ADOPTED,
     )
 
     assert await store.list_watched() == []
@@ -544,3 +554,187 @@ async def test_watch_baseline_migrates_onto_a_legacy_table(
     await store.start_watch("ci", "o/r#1")
     assert {w.handle for w in await store.list_watched()} == {"o/r#1", "o/r#2"}
     assert (await store.get("ci", "o/r#1")).watch_baseline == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Last successful delivery and the re-key audit (#3390)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_only_a_successful_delivery_dates_the_handle(make_store):
+    """``last_delivered_at`` is the one column a later transition's attempts
+    never rewrite. Hard-fail and retry-cap locks also lock a token, but they
+    are not deliveries, so they must not date one."""
+    store = await make_store()
+    await store.record_pending(
+        "talon", "job-1", signal_id="s1", target="done:complete", attempts=1,
+    )
+    await store.record_delivery(
+        "talon", "job-1", delivery_status="dropped_quiet_hours",
+    )
+    assert (await store.get("talon", "job-1")).last_delivered_at is None
+
+    await store.record_delivery(
+        "talon", "job-1", delivery_status="dropped_validation",
+        signaled_outcome="done:complete",
+    )
+    assert (await store.get("talon", "job-1")).last_delivered_at is None
+
+    delivered_at = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+    await store.record_delivery(
+        "talon", "job-1", delivery_status="ok_queued",
+        signaled_outcome="done:complete", attempt_at=delivered_at,
+        delivered=True,
+    )
+    row = await store.get("talon", "job-1")
+    assert row.delivered_at_utc() == delivered_at
+
+    # A later transition's dispatch and failures leave it alone...
+    await store.record_pending(
+        "talon", "job-1", signal_id="s2", target="failed:failed", attempts=1,
+    )
+    await store.record_delivery(
+        "talon", "job-1", delivery_status="dropped_rate_limit",
+    )
+    # ...and so does a re-key of the delivered token.
+    await store.adopt_signaled_token(
+        "talon", "job-1", previous="done:complete", token="partial:complete",
+        reason=REKEY_RECLASSIFIED,
+    )
+    assert (await store.get("talon", "job-1")).delivered_at_utc() == delivered_at
+
+
+@pytest.mark.asyncio
+async def test_a_successful_delivery_must_lock_its_token(make_store):
+    store = await make_store()
+    with pytest.raises(ValueError, match="signaled_outcome"):
+        await store.record_delivery(
+            "talon", "job-1", delivery_status="ok_queued", delivered=True,
+        )
+    assert await store.get("talon", "job-1") is None
+
+
+@pytest.mark.asyncio
+async def test_a_rekey_and_its_audit_row_land_together(make_store):
+    """The re-key changes delivered state without waking anyone, so its
+    audit row is the only record of it. Both are one transaction: an audit
+    write that fails leaves the delivered token where it was."""
+    store = await make_store()
+    await store.record_delivery(
+        "talon", "job-1", delivery_status="ok_queued",
+        signaled_outcome="done:complete", delivered=True,
+    )
+    await store._db.execute(
+        "ALTER TABLE wait_signal_rekeys RENAME TO wait_signal_rekeys_moved"
+    )
+
+    with pytest.raises(Exception):
+        await store.adopt_signaled_token(
+            "talon", "job-1", previous="done:complete",
+            token="partial:complete", reason=REKEY_RECLASSIFIED,
+        )
+
+    assert (await store.get("talon", "job-1")).last_signaled_outcome == (
+        "done:complete"
+    ), "an unaudited re-key must not survive"
+
+
+@pytest.mark.asyncio
+async def test_rekey_audit_rows_are_scoped_to_their_agent(
+    tmp_path, sqlite_database_factory,
+):
+    db = await sqlite_database_factory(tmp_path / "shared.db")
+    store_a = WaitSignalStore(db, agent_id="did:test:a")
+    store_b = WaitSignalStore(db, agent_id="did:test:b")
+    for store in (store_a, store_b):
+        await store.record_delivery(
+            "talon", "job-1", delivery_status="ok_queued",
+            signaled_outcome="done:complete", delivered=True,
+        )
+    await store_a.adopt_signaled_token(
+        "talon", "job-1", previous="done:complete", token="partial:complete",
+        reason=REKEY_RECLASSIFIED,
+    )
+
+    assert [r.reason for r in await store_a.list_rekeys()] == [REKEY_RECLASSIFIED]
+    assert await store_b.list_rekeys() == []
+    assert (await store_b.get("talon", "job-1")).last_signaled_outcome == (
+        "done:complete"
+    )
+
+
+@pytest.mark.asyncio
+async def test_last_delivered_at_is_backfilled_only_for_delivered_rows(
+    tmp_path, sqlite_database_factory,
+):
+    """A pre-#3390 database gets ``last_delivered_at`` from the migration,
+    filled from ``last_delivery_attempt_at`` only where that column still
+    dates a successful delivery: the locked token was delivered (a persisted
+    ``ok``/``coalesced`` status, composed or bare) and nothing has retried
+    since. A row mid-retry, hard-failed, or never delivered has no honest
+    delivery time and stays NULL, which never labels a wake a replay."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy_wait_state.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE wait_signal_state (
+            agent_id TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL,
+            handle TEXT NOT NULL,
+            last_signaled_outcome TEXT,
+            last_delivery_status TEXT,
+            last_surface_status TEXT,
+            last_delivery_error TEXT,
+            last_delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            last_delivery_attempt_at TIMESTAMP,
+            attempts_signaled_target TEXT NOT NULL DEFAULT '',
+            last_attempt_started_at TIMESTAMP,
+            delivery_deferred_until TIMESTAMP,
+            delivery_deferrals INTEGER NOT NULL DEFAULT 0,
+            pending_signal_id TEXT,
+            pending_signaled_target TEXT,
+            pending_signal_enqueued_at TIMESTAMP,
+            watching INTEGER NOT NULL DEFAULT 0,
+            watch_baseline TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (agent_id, kind, handle)
+        );
+        INSERT INTO wait_signal_state (agent_id, kind, handle,
+            last_signaled_outcome, last_delivery_status, last_delivery_attempt_at)
+        VALUES
+            ('did:legacy', 'talon', 'queued', 'done:complete', 'ok_queued',
+             '2026-08-24 10:00:00'),
+            ('did:legacy', 'talon', 'bare', 'failed:failed', 'ok',
+             '2026-08-25 10:00:00'),
+            ('did:legacy', 'talon', 'coalesced', 'done:complete',
+             'coalesced_unbound', '2026-08-26 10:00:00'),
+            ('did:legacy', 'talon', 'hard', 'done:complete',
+             'dropped_validation', '2026-08-27 10:00:00'),
+            ('did:legacy', 'talon', 'retrying', 'done:complete',
+             'dropped_rate_limit', '2026-08-28 10:00:00'),
+            ('did:legacy', 'talon', 'never', NULL, 'dropped_quiet_hours',
+             '2026-08-29 10:00:00');
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    database = await sqlite_database_factory(db_path)
+    store = WaitSignalStore(database, agent_id="did:legacy")
+
+    backfilled = {
+        handle: (await store.get("talon", handle)).last_delivered_at
+        for handle in ("queued", "bare", "coalesced", "hard", "retrying", "never")
+    }
+    assert backfilled == {
+        "queued": "2026-08-24 10:00:00",
+        "bare": "2026-08-25 10:00:00",
+        "coalesced": "2026-08-26 10:00:00",
+        "hard": None,
+        "retrying": None,
+        "never": None,
+    }
+    assert await store.list_rekeys() == [], "the audit table exists, empty"

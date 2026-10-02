@@ -30,6 +30,7 @@ from kestrel_sdk.tools import Outcome, WaitStatus
 from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_sovereign.waits.engine import (
+    TERMINAL_EVENT_AT_KEY,
     TERMINAL_EVENT_DETAIL_KEY,
     TERMINAL_EVENT_FINAL_KEY,
     TERMINAL_EVENT_KEY,
@@ -225,10 +226,11 @@ class A2AWaitable:
         # ``extra`` is the peer's own task result. This provider names no
         # terminal event, and a peer must not name one for it: the reconciler
         # dedups wakes on these keys, so a forged value would let the peer
-        # choose when this agent is woken (#3399).
+        # choose when this agent is woken (#3399), or date a fresh completion
+        # early enough to have it announced as a replay (#3390).
         for key in (
             TERMINAL_EVENT_KEY, TERMINAL_EVENT_DETAIL_KEY, TERMINAL_EVENT_VIEW_KEY,
-            TERMINAL_EVENT_FINAL_KEY,
+            TERMINAL_EVENT_FINAL_KEY, TERMINAL_EVENT_AT_KEY,
         ):
             data.pop(key, None)
         data.update({"task_id": handle, "state": norm})
