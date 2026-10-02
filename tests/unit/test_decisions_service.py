@@ -399,3 +399,78 @@ async def test_metering_callback_that_names_modality_receives_it() -> None:
     )
     await service.decide(_request(), caller="c", timeout_seconds=5)
     assert seen == ["decision"]
+
+
+# ---------------------------------------------------------------------------
+# Threshold keys and caller defaults (slice 3)
+# ---------------------------------------------------------------------------
+
+
+def _many_candidates_request(n: int = 3) -> DecisionRequest:
+    return DecisionRequest(
+        state={"question": "pet name?", "candidates": {f"c{i}": f"text {i}" for i in range(n)}},
+        questions={f"c{i}": NoulQuestion(instructions=f"Does `candidates.c{i}` answer `question`?")
+                   for i in range(n)},
+    )
+
+
+class _NoulAdapter(FakeDecisionAdapter):
+    def __init__(self, models, n):
+        super().__init__(models, body={"answers": {f"c{i}": {"type": "noul", "noul": 0.5}
+                                                   for i in range(n)}})
+
+
+@pytest.mark.asyncio
+async def test_shared_threshold_key_covers_many_questions() -> None:
+    adapter = _NoulAdapter(["nimble"], 3)
+    service = _service(
+        [_route("ollama:local", adapter, local=True)],
+        thresholds={"thresholds": {"gate": {
+            "uncalibrated": "refuse",
+            "models": {"ollama:local/nimble": {"answers": 0.7}},
+        }}},
+    )
+    keys = {f"c{i}": "answers" for i in range(3)}
+    result = await service.decide(_many_candidates_request(), caller="gate",
+                                  timeout_seconds=5, threshold_keys=keys)
+    assert result.calibrated is True
+    assert dict(result.thresholds) == {"c0": 0.7, "c1": 0.7, "c2": 0.7}
+
+
+@pytest.mark.asyncio
+async def test_caller_defaults_apply_until_config_overrides_them() -> None:
+    adapter = _NoulAdapter(["nimble"], 2)
+    keys = {"c0": "answers", "c1": "answers"}
+
+    service = _service([_route("ollama:local", adapter, local=True)])
+    result = await service.decide(_many_candidates_request(2), caller="gate", timeout_seconds=5,
+                                  threshold_keys=keys, default_thresholds={"answers": 0.5})
+    assert result.calibrated is False and dict(result.thresholds) == {"c0": 0.5, "c1": 0.5}
+
+    service = _service([_route("ollama:local", adapter, local=True)],
+                       thresholds={"thresholds": {"gate": {"default": {"answers": 0.65}}}})
+    result = await service.decide(_many_candidates_request(2), caller="gate", timeout_seconds=5,
+                                  threshold_keys=keys, default_thresholds={"answers": 0.5})
+    assert dict(result.thresholds) == {"c0": 0.65, "c1": 0.65}
+
+
+@pytest.mark.asyncio
+async def test_threshold_key_and_default_validation() -> None:
+    from kestrel_sdk.llm.decisions import DecisionRequestInvalid
+
+    adapter = _NoulAdapter(["nimble"], 2)
+    service = _service([_route("ollama:local", adapter, local=True)])
+    with pytest.raises(DecisionRequestInvalid, match="unknown question"):
+        await service.decide(_many_candidates_request(2), caller="gate", timeout_seconds=5,
+                             threshold_keys={"c9": "answers"})
+    with pytest.raises(DecisionRequestInvalid, match="not a valid id"):
+        await service.decide(_many_candidates_request(2), caller="gate", timeout_seconds=5,
+                             threshold_keys={"c0": "has space"})
+    with pytest.raises(DecisionRequestInvalid, match="in \\[0, 1\\]"):
+        await service.decide(_many_candidates_request(2), caller="gate", timeout_seconds=5,
+                             default_thresholds={"c0": 1.5})
+    with pytest.raises(DecisionRequestInvalid, match="no threshold"):
+        await service.decide(_many_candidates_request(2), caller="gate", timeout_seconds=5,
+                             threshold_keys={"c0": "answers", "c1": "answers"},
+                             default_thresholds={"other": 0.5})
+    assert adapter.decide_calls == []

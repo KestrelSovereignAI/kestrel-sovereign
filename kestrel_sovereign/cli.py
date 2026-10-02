@@ -2022,6 +2022,10 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_serve import add_serve_subparser
     add_serve_subparser(subparsers)
 
+    # kestrel decisions models|eval  (decision models, #3424)
+    from kestrel_sovereign.cli_decisions import add_decisions_subparser
+    add_decisions_subparser(subparsers)
+
     # kestrel start|terminate|restart|update|status|logs
     from kestrel_sovereign.cli_lifecycle import add_lifecycle_subparsers
     add_lifecycle_subparsers(subparsers)
@@ -2468,6 +2472,7 @@ def main() -> int:
     from kestrel_sovereign.cli_runpod import cmd_runpod
     from kestrel_sovereign.cli_embeddings import run as cmd_embeddings
     from kestrel_sovereign.cli_serve import run as cmd_serve
+    from kestrel_sovereign.cli_decisions import run as cmd_decisions
 
     commands = {
         "start": cmd_start,
@@ -2506,6 +2511,7 @@ def main() -> int:
         "runpod": cmd_runpod,
         "embeddings": cmd_embeddings,
         "serve": cmd_serve,
+        "decisions": cmd_decisions,
     }
 
     # Core dispatch dict first; then the extension registry. Feature-contributed
