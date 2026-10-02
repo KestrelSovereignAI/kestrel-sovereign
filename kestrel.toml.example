@@ -289,7 +289,9 @@ banned = []
 # The decision backend asks one noul question per candidate; all share the
 # threshold key "answers" (default 0.5 until calibrated). Measure first:
 #   kestrel decisions eval --caller memory_answerability --baseline chat
-# then paste the proposed block, e.g.:
+# then paste the proposed blocks, e.g.:
+# [decisions.thresholds."memory_answerability"]
+# uncalibrated = "refuse"    # or "default": uncalibrated models use the 0.5 default
 # [decisions.thresholds."memory_answerability".models."ollama:local/<model>"]
 # "answers" = 0.42
 

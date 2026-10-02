@@ -431,7 +431,7 @@ Thresholds and model choices come from measurement.
   - For each model and threshold key the runner reports accuracy, Brier score, expected calibration error and latency p50/p95, plus a proposed threshold:
     - `noul`: the cut that maximises Youden's J, with precision and recall at that cut.
     - `choice` / `score`: the lowest top-probability cut at which the answers kept reach `--target-accuracy`, with the coverage that leaves.
-- **Recording.** The runner prints a `[decisions.thresholds.<caller>.models."<route>/<model>"]` block for every model with a complete proposal. Each block carries the run's sample-set hash and date in a comment, so every threshold can be traced back to the evidence behind it. The operator accepts a proposal by pasting its block into `kestrel.toml`; the runner never edits configuration.
+- **Recording.** The runner prints a `[decisions.thresholds.<caller>.models."<route>/<model>"]` block for every model with a complete proposal. Each block carries the run's sample-set hash and date in a comment, so every threshold can be traced back to the evidence behind it. The output starts with the caller's own table set to `uncalibrated = "refuse"`, so the proposal is usable on its own even for a caller that ships no defaults; its comment explains when to use `"default"` instead. The operator accepts a proposal by pasting its block into `kestrel.toml`; the runner never edits configuration.
 - **Visibility.** `kestrel decisions models` runs a fresh discovery and lists each route's decision models, their limits, and the pin and staleness state.
 
 ## 10. Feature (SDK) surface
