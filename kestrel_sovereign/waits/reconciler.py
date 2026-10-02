@@ -397,6 +397,27 @@ def wake_source(provider: Any) -> str:
     return getattr(provider, "signal", None) or WAIT_COMPLETE_SOURCE
 
 
+@dataclass(frozen=True)
+class _InFlightWake:
+    """What the reconciler knew about a wake when it enqueued it, kept until
+    the next tick harvests it.
+
+    In memory only, in lockstep with ``_pending_signal_tasks``: a wake whose
+    task is missing after a restart is a ``lost_at_restart`` soft-fail that is
+    re-detected and re-polled, so nothing here needs to outlive the process.
+    """
+
+    # Whether the wake was bound to an origin chat session (#2922). The
+    # reconciler decided to build the signal INTERNAL for want of an origin,
+    # so it is the honest source for "this wake never had a window to surface
+    # into".
+    bound: bool
+    # When the poll that built the wake began (#3390). This, not the harvest
+    # tick, dates the delivery: anything that finished after this instant was
+    # not in the wake, so it can never be judged older than it.
+    observed_at: datetime
+
+
 class WaitReconciler:
     """Generic two-phase wait→signal reconciler over ``agent.wait_registry``.
 
@@ -411,15 +432,11 @@ class WaitReconciler:
         # awaiting harvest. Survives across ticks because the reconciler is a
         # singleton on the agent.
         self._pending_signal_tasks: Dict[Tuple[str, str], Any] = {}
-        # (kind, handle) -> whether the in-flight wake was bound to an origin
-        # chat session (#2922). Kept beside the task map rather than derived at
-        # harvest time: the reconciler is the component that decided to build
-        # the signal INTERNAL for want of an origin, so it is the honest source
-        # for "this wake never had a window to surface into". Populated and
-        # dropped in lockstep with ``_pending_signal_tasks`` — an entry missing
-        # from that map is already a ``lost_at_restart`` soft-fail that never
-        # reaches the visibility accounting.
-        self._pending_signal_bindings: Dict[Tuple[str, str], bool] = {}
+        # (kind, handle) -> what was known about the in-flight wake when it was
+        # enqueued: its origin binding (#2922) and its poll time (#3390). Kept
+        # beside the task map rather than derived at harvest time, and
+        # populated and dropped in lockstep with it.
+        self._pending_signal_wakes: Dict[Tuple[str, str], _InFlightWake] = {}
         # The wait-signal scope is the agent's DID through the shared guard.
         # A missing identity refuses construction: an empty scope would bind
         # this agent's transitions to the solo-agent legacy bucket and read
@@ -515,7 +532,7 @@ class WaitReconciler:
                 # parent; we can't know whether the cognition turn fired.
                 # Soft-fail (DON'T set signaled_outcome) so the next tick
                 # re-detects + re-emits. record_delivery clears pending.
-                self._pending_signal_bindings.pop((kind, handle), None)
+                self._pending_signal_wakes.pop((kind, handle), None)
                 await store.record_delivery(
                     kind, handle,
                     delivery_status="lost_at_restart",
@@ -544,7 +561,8 @@ class WaitReconciler:
                 delivery_error = f"{type(e).__name__}: {e}"
 
             self._pending_signal_tasks.pop((kind, handle), None)
-            bound = self._pending_signal_bindings.pop((kind, handle), None)
+            wake = self._pending_signal_wakes.pop((kind, handle), None)
+            bound = wake.bound if wake is not None else None
 
             if status_value in _PERSISTED_STATES:
                 # The dispatcher accepted the wake and its turn ran, so the
@@ -566,10 +584,16 @@ class WaitReconciler:
                     signaled_outcome=target,
                     attempt_at=now,
                     surface_status=surface_status,
-                    # Dates the delivery for later replay checks (#3390). A
-                    # harvest that lost its pending target has no token to
-                    # date it against.
-                    delivered=target is not None,
+                    # Dates the delivery for later replay checks (#3390) by
+                    # the wake's own poll time, never by ``now``: this harvest
+                    # runs a tick after the wake, and an event that finished
+                    # in between would read as older than it. A harvest that
+                    # lost its pending target has no token to date.
+                    delivered_at=(
+                        wake.observed_at
+                        if (wake is not None and target is not None)
+                        else None
+                    ),
                 )
                 signals_persisted += 1
                 if visibility == VISIBILITY_QUEUED:
@@ -904,6 +928,11 @@ class WaitReconciler:
         the watched path passes poll-only providers here. Mutates ``counters``
         and appends to ``transitions``; a non-terminal handle is a no-op.
         """
+        # Taken BEFORE the poll, so it can only precede whatever the poll
+        # reports. A delivered wake is dated by it (#3390): an event that
+        # finishes after this instant is not in this wake, and is never judged
+        # older than it however long the harvest takes.
+        observed_at = datetime.now(timezone.utc)
         try:
             status = await provider.poll(handle)
         except Exception as e:
@@ -1089,9 +1118,11 @@ class WaitReconciler:
         self._pending_signal_tasks[(kind, handle)] = handle_obj
         # Remember whether this wake had a chat window to surface into, so the
         # next tick's harvest can tell "nobody was listening" from "there was
-        # nowhere to listen" (#2922) instead of collapsing both into ``ok``.
-        self._pending_signal_bindings[(kind, handle)] = (
-            signal.visibility != Visibility.INTERNAL
+        # nowhere to listen" (#2922) instead of collapsing both into ``ok``,
+        # and when its poll began, which dates it if it is delivered (#3390).
+        self._pending_signal_wakes[(kind, handle)] = _InFlightWake(
+            bound=signal.visibility != Visibility.INTERNAL,
+            observed_at=observed_at,
         )
         counters["signals_enqueued"] += 1
 

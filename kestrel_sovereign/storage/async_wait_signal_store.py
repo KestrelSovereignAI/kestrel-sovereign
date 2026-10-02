@@ -30,10 +30,12 @@ one row per ``(agent_id, kind, handle)`` the reconciler has observed, tracking
     or last delivered when the agent registered it (#3399). Delivering any
     other token disarms the watch, so registering it again after it fired
     re-arms it for the next event.
-  - ``last_delivered_at`` — when a wake for this handle was last delivered.
-    A later transition's attempts rewrite every ``last_delivery_*`` column,
-    so without it a re-emitted wake could not say the handle had been woken
-    before, nor whether its event predates that wake (#3390).
+  - ``last_delivered_at`` — the time of the last wake for this handle that
+    was delivered: when the reconciler began the poll that built it, not when
+    a later tick harvested its result. A later transition's attempts rewrite
+    every ``last_delivery_*`` column, so without it a re-emitted wake could
+    not say the handle had been woken before, nor whether its event predates
+    that wake (#3390).
 
 Every change to a delivered row that does NOT wake the agent — a re-key of
 ``last_signaled_outcome`` to the token the same event is now polled under —
@@ -178,8 +180,9 @@ class WaitSignalState:
     # it. ``None`` for a watch armed before any wake, and on rows predating
     # the column.
     watch_baseline: Optional[str] = None
-    # When a wake for this handle was last delivered (#3390). ``None`` when
-    # none was, and on legacy rows whose delivery could not be backfilled.
+    # The time of the last delivered wake for this handle (#3390): when the
+    # poll that built it began. ``None`` when none was delivered, and on
+    # legacy rows whose delivered wake could not be dated.
     last_delivered_at: Optional[str] = None
 
     def deferred_until_utc(self) -> Optional[datetime]:
@@ -392,7 +395,7 @@ class WaitSignalStore:
         signaled_outcome: Optional[str] = None,
         attempt_at: TimeArg = None,
         surface_status: Optional[str] = None,
-        delivered: bool = False,
+        delivered_at: TimeArg = None,
     ) -> None:
         """Record the outcome of a harvested delivery.
 
@@ -412,19 +415,24 @@ class WaitSignalStore:
         when ``None`` so a later, less-observable attempt cannot inherit an
         earlier attempt's verdict and read as better than it was.
 
-        ``delivered`` marks a successful delivery — the wake was accepted and
-        its turn ran — as opposed to a hard-fail or retry-cap lock, which also
-        lock ``signaled_outcome``. Only a successful delivery stamps
+        ``delivered_at`` marks a successful delivery — the wake was accepted
+        and its turn ran — as opposed to a hard-fail or retry-cap lock, which
+        also lock ``signaled_outcome``. Only a successful delivery stamps
         ``last_delivered_at`` (#3390), so it requires ``signaled_outcome``.
+        Its value is the WAKE's time, the instant the poll that built it
+        began, and deliberately not ``attempt_at``: the harvest runs a tick
+        later, and an event that finished in between — after the wake, before
+        its harvest — would otherwise read as older than the wake and be
+        announced as a replay.
         """
-        if delivered and signaled_outcome is None:
+        delivered_dt = _coerce_ts(delivered_at)
+        if delivered_dt is not None and signaled_outcome is None:
             raise ValueError(
                 "a successful delivery locks its token: pass signaled_outcome"
             )
         attempt_dt = _coerce_ts(attempt_at) or datetime.now(timezone.utc).replace(
             tzinfo=None
         )
-        delivered_dt = attempt_dt if delivered else None
         # Build the UPDATE so we only touch last_signaled_outcome when asked.
         # Try UPDATE first; if the row is missing (a soft-fail/lost harvest
         # against a row that was never persisted) INSERT a fresh diagnostic

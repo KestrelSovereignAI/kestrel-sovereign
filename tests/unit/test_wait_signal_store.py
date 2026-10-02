@@ -9,7 +9,7 @@ reconciler's use cases against a real SQLite backend.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -565,7 +565,8 @@ async def test_watch_baseline_migrates_onto_a_legacy_table(
 async def test_only_a_successful_delivery_dates_the_handle(make_store):
     """``last_delivered_at`` is the one column a later transition's attempts
     never rewrite. Hard-fail and retry-cap locks also lock a token, but they
-    are not deliveries, so they must not date one."""
+    are not deliveries, so they must not date one. A delivery is dated by
+    the wake's own time, not by the harvest that recorded it."""
     store = await make_store()
     await store.record_pending(
         "talon", "job-1", signal_id="s1", target="done:complete", attempts=1,
@@ -582,13 +583,17 @@ async def test_only_a_successful_delivery_dates_the_handle(make_store):
     assert (await store.get("talon", "job-1")).last_delivered_at is None
 
     delivered_at = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+    harvested_at = delivered_at + timedelta(minutes=5)
     await store.record_delivery(
         "talon", "job-1", delivery_status="ok_queued",
-        signaled_outcome="done:complete", attempt_at=delivered_at,
-        delivered=True,
+        signaled_outcome="done:complete", attempt_at=harvested_at,
+        delivered_at=delivered_at,
     )
     row = await store.get("talon", "job-1")
-    assert row.delivered_at_utc() == delivered_at
+    assert row.delivered_at_utc() == delivered_at, "the wake's time, not the harvest's"
+    assert datetime.fromisoformat(row.last_delivery_attempt_at) == (
+        harvested_at.replace(tzinfo=None)
+    )
 
     # A later transition's dispatch and failures leave it alone...
     await store.record_pending(
@@ -610,7 +615,8 @@ async def test_a_successful_delivery_must_lock_its_token(make_store):
     store = await make_store()
     with pytest.raises(ValueError, match="signaled_outcome"):
         await store.record_delivery(
-            "talon", "job-1", delivery_status="ok_queued", delivered=True,
+            "talon", "job-1", delivery_status="ok_queued",
+            delivered_at=datetime.now(timezone.utc),
         )
     assert await store.get("talon", "job-1") is None
 
@@ -623,7 +629,8 @@ async def test_a_rekey_and_its_audit_row_land_together(make_store):
     store = await make_store()
     await store.record_delivery(
         "talon", "job-1", delivery_status="ok_queued",
-        signaled_outcome="done:complete", delivered=True,
+        signaled_outcome="done:complete",
+        delivered_at=datetime.now(timezone.utc),
     )
     await store._db.execute(
         "ALTER TABLE wait_signal_rekeys RENAME TO wait_signal_rekeys_moved"
@@ -650,7 +657,8 @@ async def test_rekey_audit_rows_are_scoped_to_their_agent(
     for store in (store_a, store_b):
         await store.record_delivery(
             "talon", "job-1", delivery_status="ok_queued",
-            signaled_outcome="done:complete", delivered=True,
+            signaled_outcome="done:complete",
+            delivered_at=datetime.now(timezone.utc),
         )
     await store_a.adopt_signaled_token(
         "talon", "job-1", previous="done:complete", token="partial:complete",
@@ -669,11 +677,17 @@ async def test_last_delivered_at_is_backfilled_only_for_delivered_rows(
     tmp_path, sqlite_database_factory,
 ):
     """A pre-#3390 database gets ``last_delivered_at`` from the migration,
-    filled from ``last_delivery_attempt_at`` only where that column still
-    dates a successful delivery: the locked token was delivered (a persisted
-    ``ok``/``coalesced`` status, composed or bare) and nothing has retried
-    since. A row mid-retry, hard-failed, or never delivered has no honest
-    delivery time and stays NULL, which never labels a wake a replay."""
+    filled from ``last_attempt_started_at`` — the delivered wake's dispatch —
+    only where that still dates a successful delivery: the locked token was
+    delivered (a persisted ``ok``/``coalesced`` status, composed or bare) and
+    nothing has been dispatched or retried since.
+
+    Never from ``last_delivery_attempt_at``. That is the harvest, a tick
+    after the wake, and an event that finished in between would read as older
+    than the wake and be announced as a replay (#3390 review). So a row with
+    no dispatch time (delivered before #3105), one with a wake pending, and
+    one mid-retry, hard-failed, or never delivered all stay NULL, which never
+    labels a wake a replay."""
     import sqlite3
 
     db_path = tmp_path / "legacy_wait_state.db"
@@ -703,20 +717,29 @@ async def test_last_delivered_at_is_backfilled_only_for_delivered_rows(
             PRIMARY KEY (agent_id, kind, handle)
         );
         INSERT INTO wait_signal_state (agent_id, kind, handle,
-            last_signaled_outcome, last_delivery_status, last_delivery_attempt_at)
+            last_signaled_outcome, last_delivery_status,
+            last_attempt_started_at, last_delivery_attempt_at,
+            pending_signal_id)
         VALUES
             ('did:legacy', 'talon', 'queued', 'done:complete', 'ok_queued',
-             '2026-08-24 10:00:00'),
+             '2026-08-24 10:00:00', '2026-08-24 10:05:00', NULL),
             ('did:legacy', 'talon', 'bare', 'failed:failed', 'ok',
-             '2026-08-25 10:00:00'),
+             '2026-08-25 10:00:00', '2026-08-25 10:05:00', NULL),
             ('did:legacy', 'talon', 'coalesced', 'done:complete',
-             'coalesced_unbound', '2026-08-26 10:00:00'),
+             'coalesced_unbound', '2026-08-26 10:00:00',
+             '2026-08-26 10:05:00', NULL),
+            ('did:legacy', 'talon', 'undated', 'done:complete', 'ok_queued',
+             NULL, '2026-08-23 10:05:00', NULL),
+            ('did:legacy', 'talon', 'pending', 'done:complete', 'ok_queued',
+             '2026-08-30 10:00:00', '2026-08-29 10:05:00', 'sig-next'),
             ('did:legacy', 'talon', 'hard', 'done:complete',
-             'dropped_validation', '2026-08-27 10:00:00'),
+             'dropped_validation', '2026-08-27 10:00:00',
+             '2026-08-27 10:05:00', NULL),
             ('did:legacy', 'talon', 'retrying', 'done:complete',
-             'dropped_rate_limit', '2026-08-28 10:00:00'),
+             'dropped_rate_limit', '2026-08-28 10:00:00',
+             '2026-08-28 10:05:00', NULL),
             ('did:legacy', 'talon', 'never', NULL, 'dropped_quiet_hours',
-             '2026-08-29 10:00:00');
+             '2026-08-29 10:00:00', '2026-08-29 10:05:00', NULL);
         """
     )
     legacy.commit()
@@ -725,16 +748,88 @@ async def test_last_delivered_at_is_backfilled_only_for_delivered_rows(
     database = await sqlite_database_factory(db_path)
     store = WaitSignalStore(database, agent_id="did:legacy")
 
+    handles = (
+        "queued", "bare", "coalesced", "undated", "pending", "hard",
+        "retrying", "never",
+    )
     backfilled = {
         handle: (await store.get("talon", handle)).last_delivered_at
-        for handle in ("queued", "bare", "coalesced", "hard", "retrying", "never")
+        for handle in handles
     }
     assert backfilled == {
         "queued": "2026-08-24 10:00:00",
         "bare": "2026-08-25 10:00:00",
         "coalesced": "2026-08-26 10:00:00",
+        "undated": None,
+        "pending": None,
         "hard": None,
         "retrying": None,
         "never": None,
     }
     assert await store.list_rekeys() == [], "the audit table exists, empty"
+
+
+def test_the_rekey_audit_table_is_not_created_by_the_bare_core_schema():
+    """The bare ``CREATE TABLE IF NOT EXISTS`` loop is safe in sequence, not
+    in parallel: two PostgreSQL initializers on the first post-upgrade boot
+    can both pass the catalogue probe and one dies on ``pg_class``'s unique
+    index (#3390 review). The table and its index are created by
+    ``_ensure_wait_signal_rekeys`` instead."""
+    from kestrel_sovereign.storage.async_database import core_schema_sql
+
+    for backend in ("sqlite", "postgres"):
+        assert "wait_signal_rekeys" not in core_schema_sql(backend)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_initializers_create_the_rekey_audit_table_once(
+    tmp_path, sqlite_database_factory,
+):
+    """A post-upgrade request burst must not race the audit table's creation:
+    probe, migration lock, re-probe, then ``ensure_index``."""
+    import asyncio
+    from unittest.mock import patch
+
+    from kestrel_sovereign.storage.async_database import (
+        _WAIT_SIGNAL_REKEYS_INDEX,
+    )
+
+    db = await sqlite_database_factory(tmp_path / "rekey-schema-race.db")
+    await db.execute("DROP TABLE wait_signal_rekeys")
+    creates: list[str] = []
+    indexes: list[tuple] = []
+    real_execute = db.execute
+    real_ensure_index = db.ensure_index
+
+    async def recording_execute(sql, params=()):
+        if sql.lstrip().startswith("CREATE TABLE") and "wait_signal_rekeys" in sql:
+            creates.append(sql)
+            # Let every contender reach the pre-lock probe; the lock and the
+            # re-probe decide whether a second CREATE is attempted.
+            await asyncio.sleep(0)
+        return await real_execute(sql, params)
+
+    async def recording_ensure_index(*args, **kwargs):
+        indexes.append(args)
+        return await real_ensure_index(*args, **kwargs)
+
+    with (
+        patch.object(db, "execute", recording_execute),
+        patch.object(db, "ensure_index", recording_ensure_index),
+    ):
+        await asyncio.gather(*(db._ensure_wait_signal_rekeys() for _ in range(4)))
+
+    assert len(creates) == 1
+    assert indexes and all(args == _WAIT_SIGNAL_REKEYS_INDEX for args in indexes)
+    assert await db.table_exists("wait_signal_rekeys")
+    store = WaitSignalStore(db, agent_id="did:test:agent")
+    await store.record_delivery(
+        "talon", "job-1", delivery_status="ok_queued",
+        signaled_outcome="done:complete",
+        delivered_at=datetime.now(timezone.utc),
+    )
+    assert await store.adopt_signaled_token(
+        "talon", "job-1", previous="done:complete", token="partial:complete",
+        reason=REKEY_RECLASSIFIED,
+    )
+    assert len(await store.list_rekeys()) == 1

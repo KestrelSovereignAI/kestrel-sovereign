@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -403,6 +404,97 @@ async def test_an_event_after_the_last_delivery_is_not_a_replay(make_agent):
     assert news.payload["delivery_replay"] is False
 
 
+def _run(name: str, at: datetime) -> dict:
+    """A terminal read of one execution on a handle that has several (a CI
+    re-run), dated by the provider."""
+    return {
+        "status": "failed",
+        TERMINAL_EVENT_KEY: name,
+        TERMINAL_EVENT_AT_KEY: at.isoformat(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_new_event_that_finishes_before_the_harvest_tick_is_not_a_replay(
+    make_agent,
+):
+    """The #3390 review repro. run1's wake is delivered; run2 finishes after
+    that wake but before the next tick harvests it. Dating the delivery by
+    the harvest made run2 read as older than the wake it was never in, so a
+    genuinely new completion went to ``wait.replay``: no act-now
+    instructions, and no durable resume consumer woken."""
+    jobs = _Jobs()
+    jobs.set("h", Outcome.FAILED, data=_run("run1", EXITED_AT))
+    agent = await make_agent(jobs)
+    await agent._wait_reconciler.reconcile()       # run1's wake, delivered
+
+    time.sleep(0.005)
+    run2_at = datetime.now(timezone.utc)           # after the wake...
+    time.sleep(0.005)
+    jobs.set("h", Outcome.FAILED, data=_run("run2", run2_at))
+    await agent._wait_reconciler.reconcile()       # ...before its harvest
+
+    assert [
+        (w.source, w.payload[TERMINAL_EVENT_KEY], w.payload["delivery_replay"])
+        for w in _wakes(agent)
+    ] == [
+        (TALON_SOURCE, "run1", False),
+        (TALON_SOURCE, "run2", False),
+    ]
+    run2 = _wakes(agent)[1]
+    assert run2.payload["delivery_last_delivered_at"] < run2_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_an_event_that_finishes_while_its_predecessor_is_polled_is_not_a_replay(
+    make_agent,
+):
+    """The delivery is dated from the instant BEFORE the poll that built the
+    wake, not from its enqueue a moment later: run2, finishing while run1 is
+    being read, was not in run1's wake either."""
+    finished_during_poll: list[datetime] = []
+
+    class _SlowJobs(_Jobs):
+        async def poll(self, handle):
+            status = await super().poll(handle)
+            if not finished_during_poll:
+                time.sleep(0.005)
+                finished_during_poll.append(datetime.now(timezone.utc))
+                time.sleep(0.005)
+            return status
+
+    jobs = _SlowJobs()
+    jobs.set("h", Outcome.FAILED, data=_run("run1", EXITED_AT))
+    agent = await make_agent(jobs)
+    await agent._wait_reconciler.reconcile()
+
+    jobs.set("h", Outcome.FAILED, data=_run("run2", finished_during_poll[0]))
+    await _settle(agent)
+
+    run2 = _wakes(agent)[1]
+    assert (run2.source, run2.payload["delivery_replay"]) == (TALON_SOURCE, False)
+
+
+@pytest.mark.asyncio
+async def test_a_delivery_is_dated_by_its_wake_not_by_its_harvest(make_agent):
+    jobs = _Jobs()
+    jobs.set("j1", Outcome.DONE, data=_job("complete"))
+    agent = await make_agent(jobs)
+    before_poll = datetime.now(timezone.utc)
+    await agent._wait_reconciler.reconcile()
+    time.sleep(0.005)
+    await agent._wait_reconciler.reconcile()
+
+    row = await agent._wait_reconciler._store.get("talon", "j1")
+    enqueued = datetime.fromisoformat(row.last_attempt_started_at).replace(
+        tzinfo=timezone.utc
+    )
+    harvested = datetime.fromisoformat(row.last_delivery_attempt_at).replace(
+        tzinfo=timezone.utc
+    )
+    assert before_poll <= row.delivered_at_utc() <= enqueued < harvested
+
+
 @pytest.mark.asyncio
 async def test_a_datetime_event_time_is_accepted_and_carried_as_iso(make_agent):
     jobs = _Jobs()
@@ -675,6 +767,7 @@ async def test_existing_ledger_rows_do_not_replay_after_the_change(
     for handle, token in _LEGACY_ROWS.items():
         row = await store.get("talon", handle)
         assert row.last_signaled_outcome == f"{relabel.value}:{token.split(':', 1)[1]}"
-        assert row.last_delivered_at == "2026-09-29 14:30:00", (
-            "the migration dated each delivered row from its harvest"
+        assert row.last_delivered_at == "2026-09-29 14:27:00", (
+            "the migration dated each delivered row from its dispatch, never "
+            "from the later harvest"
         )
