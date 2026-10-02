@@ -119,7 +119,19 @@ That is the intersection every known route accepts, so a valid request is valid 
 | `choice` options | 2 – `MAX_OPTIONS` (26) | One option is not a decision. 26 is the smallest published cap (Ollama's letter scoring). |
 | `score` levels | 2 – `MAX_OPTIONS` (26) | Same reasons. |
 | `instructions`, descriptions | non-empty after strip; descriptions may be `None` | A blank prompt is not a question. |
-| `state` | JSON-serialisable; serialised size ≤ `MAX_STATE_BYTES` (512 KiB) | Bounds the serialisation work done before the per-route fit check (§7). |
+| `instructions` | ≤ `MAX_INSTRUCTIONS_CHARS` (4,096) | A question is one narrow judgement, not a document. |
+| Option / level / `true_means` / `false_means` text | ≤ `MAX_DESCRIPTION_CHARS` (1,024) each | Same reason. |
+| `state` | JSON-serialisable | |
+| Whole request | canonical JSON (state and questions) ≤ `MAX_REQUEST_BYTES` (1 MiB) | Bounds every later step. See the measurement procedure below. |
+
+**How the whole-request size is measured.** Validation measures the request **once**, in a canonical form, and stops early:
+1. Check the text-field limits. They are plain length checks.
+2. Encode the canonical JSON with `json.JSONEncoder(...).iterencode()`, summing the UTF-8 length of each chunk as it is produced.
+3. Abort with `DecisionRequestInvalid(MAX_REQUEST_BYTES)` as soon as the running total passes the cap.
+
+The early stop means an oversized `state` costs at most about the cap in encoding work; it is never fully serialised. Later steps use this measured size:
+- The per-route fit check (§7) uses it for its token estimate and does not re-tokenise.
+- Each adapter's dialect serialisation is at most a constant factor of it, because dialects rename keys and do not expand content.
 
 These bounds are module constants in `kestrel_sovereign/llm/decisions/`. They are policy, not configuration, in the same way loop-policy constants are. A future route with stricter caps tightens §7's per-candidate fit check; it does not change these constants.
 
@@ -275,14 +287,15 @@ decision_hints = []            # substring patterns, never full ids
 
 ### 5.2 Resolution, per call
 
-The steps run in order, and nothing is sent until step 4.
+The steps run in order. No decision request is sent until step 4, and **no network contact of any kind**, discovery and canaries included, reaches a route that the privacy filter has removed.
 
 1. **Disabled.** If `decision_route == "none"`, raise `DecisionUnavailable(DISABLED)`.
-2. **Candidate routes.**
-   - An explicit `decision_route` is terminal: only that route is considered.
-   - With `"auto"`, every route whose decision model list is non-empty or which has a verified pin is considered, in `route_priority` order.
-   - Apply `model_override` (§5.3).
-   - Apply privacy (§6): under effective local-only, drop every route that is not `is_local`.
+2. **Candidate routes**, filtered **before** any discovery:
+   1. Start from configured routes. An explicit `decision_route` is terminal, so only that route remains. Under `"auto"`, every configured route remains, in `route_priority` order.
+   2. Apply `model_override` (§5.3).
+   3. Apply privacy (§6): under effective local-only, drop every route that is not `is_local`.
+   4. **Then** read decision state for the remaining routes only. A remaining route whose decision discovery has never run (a cold cache) is discovered now, together with its pin canary (§4.1). This is the only discovery `decide` ever triggers, and it is scoped to these routes. It is the same rule the chat path follows, where local-only turns skip discovery that would contact the cloud.
+   5. Drop routes with no discovered decision models and no pin.
 3. **Walk the routes in order.** For each route, resolve its model and stop at the first one that passes every check. A route that fails a check is skipped, and its rejection reason is recorded.
    - **Pick the model.** A verified pin is the route's model. An unverified pin rejects the route with `UNVERIFIED_PIN`, and the route's discovered models are not consulted instead, because the operator's pin is authoritative for that route. With no pin, the discovered models are filtered by `decision_hints`. If exactly one survives, that is the model. If several survive, reject the route with `AMBIGUOUS_MODEL` and name the survivors. Kestrel never picks among them arbitrarily, because thresholds are per model and an arbitrary pick would silently change calibration.
    - **Calibration** (§2.5). Under `refuse`, reject the route with `NOT_CALIBRATED` if its model is uncalibrated for this request.
@@ -304,7 +317,9 @@ The `generate` path's `resolve_provider_routing` treats a selector without `/` a
 
 A bare model id is **not** accepted, because one id can exist on several vendors with different calibration. The `cheap` alias is not accepted either, because it names a chat model.
 
-An override is terminal: it narrows the candidates and never widens them. If an explicit `decision_route` is set and the override names a different route or vendor, `decide` raises `DecisionUnavailable(SELECTOR_CONFLICT)`. The operator's routing decision and the caller's request disagree, and neither silently wins.
+An override is terminal: it narrows the candidates and never widens them. When the override names a model, it replaces model selection on every route it leaves:
+- **Discovered models.** On a route with no pin, the named model is used if that route's discovery reports it; otherwise the route is rejected with `NOT_SERVED`. `decision_hints` do not apply, because an exact model needs no narrowing.
+- **Pins.** On a route with a verified pin, the named model must equal the pin; otherwise the route is rejected with `PIN_CONFLICT`. An unverified pin still rejects the route with `UNVERIFIED_PIN`. The operator's pin is never bypassed and never silently ignored. If the override named a single route (`<vendor>:<route>/<model>`), that rejection is the whole outcome: `NO_CANDIDATE`, with the one route's reason. If an explicit `decision_route` is set and the override names a different route or vendor, `decide` raises `DecisionUnavailable(SELECTOR_CONFLICT)`. The operator's routing decision and the caller's request disagree, and neither silently wins.
 
 ## 6. Privacy modes
 
@@ -313,10 +328,11 @@ Privacy modes **route** decisions to local models. They never disable decisions.
 - The effective restriction is **`local_only OR self._current_force_local_only()`**. The live privacy provider is the same one the embedding resolver reads, and it fails closed (`True`) when the bound callable raises. A caller can tighten privacy with `local_only=True`, but it cannot loosen it: there is no parameter that turns the live restriction off.
 - Under effective local-only, only `is_local` routes are candidates. If none can answer, the caller gets `DecisionUnavailable(NO_LOCAL_ROUTE)`. **There is never a silent cloud fallback.**
 - The effective restriction is evaluated once, at the start of `decide`, together with the invocation context (§8). It applies to the whole call.
+- **Background discovery is not a decision call.** Catalog discovery at boot and on refresh (§4) is not triggered by `decide`. It carries no request content, and pin canaries send only a fixed synthetic state. Inside a `decide` call, discovery is scoped to the routes that survive the privacy filter (§5.2, step 2).
 
 ## 7. Context fit, caps and batching
 
-- **Fit before dispatch.** The request is serialised in the candidate route's dialect, and its size is estimated with the token heuristics core uses for context budgeting, leaving headroom for the model's own prompt framing. A candidate is skipped (§5.2) if any of these holds:
+- **Fit before dispatch.** The request's size, measured once during validation (§2.2), is converted to a token estimate with the heuristics core uses for context budgeting. The estimate leaves headroom for the model's own prompt framing. `max_request_bytes` is checked against the candidate dialect's serialised size, which validation has already bounded. A candidate is skipped (§5.2) if any of these holds:
   - its `context_limit` is unknown;
   - the estimate exceeds `context_limit`;
   - the serialised request exceeds `max_request_bytes`;
@@ -335,7 +351,7 @@ Anything other than a complete, normalised `DecisionResult` is raised as an exce
 | Exception | Meaning |
 |---|---|
 | `DecisionRequestInvalid(rule)` | The request failed validation (§2.2). Nothing was sent. |
-| `DecisionUnavailable(reason, rejections)` | Nothing was sent. `reason` is one of `DISABLED`, `SELECTOR_CONFLICT`, `NO_ROUTE` (no decision-capable route remains after the override), `NO_LOCAL_ROUTE` (privacy removed every route) or `NO_CANDIDATE` (routes remained, but each was rejected). `rejections` lists each route with its reason: `AMBIGUOUS_MODEL`, `NOT_CALIBRATED`, `NO_FIT` or `UNVERIFIED_PIN`. |
+| `DecisionUnavailable(reason, rejections)` | Nothing was sent. `reason` is one of `DISABLED`, `SELECTOR_CONFLICT`, `NO_ROUTE` (no decision-capable route remains after the override), `NO_LOCAL_ROUTE` (privacy removed every route) or `NO_CANDIDATE` (routes remained, but each was rejected). `rejections` lists each route with its reason: `AMBIGUOUS_MODEL`, `NOT_CALIBRATED`, `NO_FIT`, `UNVERIFIED_PIN`, `NOT_SERVED` or `PIN_CONFLICT`. |
 | `DecisionTimeout` | `timeout_seconds` elapsed. The deadline covers the whole call: resolution, the fit check, dispatch and normalisation. It is enforced with `asyncio.timeout` in `decide` and is also passed to the adapter's HTTP client. The Ollama route must set an explicit HTTP timeout, because the chat `AsyncClient` has none. |
 | `DecisionTransportError` | A network or HTTP failure. This includes a 404 for `/v1/systemone` on a runtime too old to serve it, and a model that has disappeared since discovery. |
 | `DecisionProtocolError` | The response violated §2.3. |
