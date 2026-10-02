@@ -47,7 +47,7 @@ class ModelInfo:
     provider: str     # the vendor name (field name retained for file-format compatibility;
                       # the *semantic* is vendor, not "execution provider")
     display_name: str
-    category: ModelCategory   # chat | embedding | image | audio
+    category: ModelCategory   # chat | embedding | image | audio (| decision, per llm/DECISIONS.md)
     is_featured: bool
     is_hidden: bool
     created_at: Optional[str]
@@ -351,6 +351,17 @@ columns match the new dimensions.
 
 ---
 
+## Decisions
+
+Typed `choice` / `score` / `noul` questions evaluated against a state
+(`/v1/systemone`) are a third modality beside chat and embeddings. Unlike
+embeddings, which bind to one route to keep a single vector space, decisions
+are stateless and are routed per call through `LLMService.decide`. The
+canonical spec, covering contract, discovery, routing, privacy, fit and
+calibration, is [llm/DECISIONS.md](llm/DECISIONS.md) (draft, epic #3424).
+
+---
+
 ## No hardcoded model IDs in code
 
 Model identifiers must never appear as literals inside `kestrel_sovereign/**/*.py`, `endpoints/**/*.py`, or frontend JS.
@@ -398,6 +409,7 @@ New hits in service / adapter / endpoint code fail review.
   current-state context contract from conversation persistence through
   budgeting, retrieval, pruning, provider rendering, and diagnostics.
 - **[llm/PROVIDER_PLUGINS.md](llm/PROVIDER_PLUGINS.md)** — adapter contract surface for third-party plugin authors. The `kestrel-sovereign-sdk` boundary, marker emission rules, conformance helpers.
+- **[llm/DECISIONS.md](llm/DECISIONS.md)** — the decisions modality (typed choice / score / noul over `/v1/systemone`): contract, discovery, per-call routing, privacy, calibration. Draft, epic [#3424](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3424).
 - **[llm/HONESTY_LAYER.md](llm/HONESTY_LAYER.md)** — streaming honesty enforcement: `ToolCallStarted` markers, in-band revise sentinel on `/api/agent/stream`, parallel SSE backup, deterministic narration check in the audit hook. Closes [#1042](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1042).
 
 ## Related decisions
