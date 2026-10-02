@@ -75,11 +75,11 @@ def _choice(question: ChoiceQuestion, raw: Mapping[str, Any], where: str) -> Cho
     choice = max(question.options, key=lambda option: distribution[option])
     reported = raw.get("choice")
     if reported is not None and reported != choice:
+        # The vendor's value is untrusted response content and may echo the
+        # state; log only that a mismatch happened (§8.3).
         logger.warning(
-            "decision %s: vendor choice %r disagrees with argmax %r; using argmax",
+            "decision %s: vendor choice disagrees with the argmax; using the argmax",
             where,
-            reported,
-            choice,
         )
     ordered = {option: distribution[option] for option in question.options}
     return ChoiceAnswer(choice=choice, probabilities=MappingProxyType(ordered))

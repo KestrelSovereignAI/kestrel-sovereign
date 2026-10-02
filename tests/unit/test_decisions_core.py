@@ -431,3 +431,12 @@ def test_invalid_route_decision_config_fails_at_build() -> None:
             "ollama", "local", {"is_cloud": False},
             {"adapter": "OllamaAdapter", "decision_context_limit": 8192},
         )
+
+
+def test_vendor_choice_mismatch_is_logged_without_its_value(caplog) -> None:
+    body = {"answers": {"team": {"choice": "LEAKED STATE TEXT",
+                                 "probabilities": {"billing": 0.6, "tech": 0.4}}}}
+    with caplog.at_level("WARNING", logger="kestrel_sovereign.llm.decisions.normalize"):
+        answer = normalize_response(_snapshot(), body).answers["team"]
+    assert answer.choice == "billing"
+    assert "disagrees" in caplog.text and "LEAKED" not in caplog.text
