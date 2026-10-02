@@ -339,11 +339,18 @@ package may relax. The Core-owned release-cascade contract is:
 | kestrel-feature-eye | `kestrel-sovereign-sdk>=0.37.1,<0.40` | External prerequisite (editable manifest; lift on `main`). |
 | kestrel-feature-flight | `kestrel-sovereign-sdk>=0.37.1,<0.40` | External prerequisite (editable manifest; lift on `main`). |
 | kestrel-claws | `kestrel-sovereign-sdk>=0.37.1,<0.40` | External prerequisite (editable manifest; lift on `main`). |
+| kestrel-feature-features | `kestrel-sovereign-sdk>=0.36.0,<0.40` | External prerequisite (PyPI release). |
+| kestrel-channel-telegram | `kestrel-sovereign-sdk>=0.36,<0.40` | External prerequisite (PyPI release). |
 | Frinz | `kestrel-sovereign-sdk>=0.39.0,<0.40` | External prerequisite; Core does not claim Frinz has changed. |
 | Observability fleet | `kestrel-sovereign-sdk>=0.39.0,<0.40` | External prerequisite; Core does not claim observability has changed. |
 
 A Core release that raises the SDK floor without these lifts makes
-`kestrel update` refuse every feature whose cap excludes the new line. Verify
+`kestrel update` refuse every feature whose cap excludes the new line — or
+worse, lets `kestrel feature sync` downgrade the SDK under Core while
+installing a capped package. Survey **every** package in the host feature
+manifest using its *published* metadata (PyPI `requires_dist`, or the
+checkout's `origin/main` for editable entries), not a local checkout's
+`pyproject.toml`, and pull editable checkouts before `kestrel update`. Verify
 the published downstream constraints and tests before the Core publish. Do not
 weaken Core's requirement to make an older sibling resolver succeed.
 

@@ -72,6 +72,8 @@ SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS = {
     "kestrel-feature-eye": ">=0.37.1,<0.40",
     "kestrel-feature-flight": ">=0.37.1,<0.40",
     "kestrel-claws": ">=0.37.1,<0.40",
+    "kestrel-feature-features": ">=0.36.0,<0.40",
+    "kestrel-channel-telegram": ">=0.36,<0.40",
     "frinz": ">=0.39.0,<0.40",
     "observability fleet": ">=0.39.0,<0.40",
 }
