@@ -121,13 +121,28 @@ That is the intersection every known route accepts, so a valid request is valid 
 | `instructions`, descriptions | non-empty after strip; descriptions may be `None` | A blank prompt is not a question. |
 | `instructions` | ≤ `MAX_INSTRUCTIONS_CHARS` (4,096) | A question is one narrow judgement, not a document. |
 | Option / level / `true_means` / `false_means` text | ≤ `MAX_DESCRIPTION_CHARS` (1,024) each | Same reason. |
-| `state` | JSON-serialisable | |
+| `state` | a strict JSON value tree; see below | Every route must read the same state that Kestrel measured. |
 | Whole request | canonical JSON (state and questions) ≤ `MAX_REQUEST_BYTES` (1 MiB) | Bounds every later step. See the measurement procedure below. |
 
-**How the whole-request size is measured.** Validation measures the request **once**, in a canonical form, and stops early:
+**A strict JSON value tree for `state`.** A value is accepted only if it is built from:
+- `dict` with **`str` keys only**, `list` or `tuple`;
+- `str`, `bool` or `None`;
+- `int`, or a **finite** `float`.
+
+Validation rejects, with `DecisionRequestInvalid`:
+- a non-`str` key. Python's encoder would silently turn `1` into `"1"`, and that can collide with an existing `"1"` key;
+- `NaN` or `±Infinity`;
+- any other type;
+- a container that contains itself (a cycle);
+- nesting deeper than `MAX_STATE_DEPTH` (64).
+
+These rules ensure every server parses the same value Kestrel measured.
+
+**How the whole-request size is measured.** Validation measures the request **once**, in a single bounded pass, and stops early:
 1. Check the text-field limits. They are plain length checks.
-2. Encode the canonical JSON with `json.JSONEncoder(...).iterencode()`, summing the UTF-8 length of each chunk as it is produced.
-3. Abort with `DecisionRequestInvalid(MAX_REQUEST_BYTES)` as soon as the running total passes the cap.
+2. Walk the `state` tree with an explicit stack. The walk enforces the tree rules above, tracking the containers on the current path to detect cycles. As it goes, it adds up each node's UTF-8 encoded length, including keys and punctuation.
+3. Abort with `DecisionRequestInvalid(MAX_REQUEST_BYTES)` as soon as the running total, including the questions, passes the cap.
+4. Only a request that passes is encoded, as canonical JSON with `allow_nan=False`.
 
 The early stop means an oversized `state` costs at most about the cap in encoding work; it is never fully serialised. Later steps use this measured size:
 - The per-route fit check (§7) uses it for its token estimate and does not re-tokenise.
@@ -387,7 +402,7 @@ This is stricter than chat telemetry, and that is deliberate: decision `state` i
 | `model_usage` | input tokens against (model, provider), as for chat |
 | `llm_calls` | the frozen context and only the content-free fields above. `metadata` carries `{"modality": "decision", "caller", "question_count", "calibrated", "usage_available"}`, plus `provider_reported_cost_usd` when the route reports a cost. |
 | Prometheus | **dedicated** series, selected by modality: `kestrel_llm_decision_calls_total{provider, model, caller, success}`, `kestrel_llm_decision_duration_seconds{provider, model, caller}` and `kestrel_llm_decision_tokens_total{model}`. They are defined in `kestrel_sdk.metrics` next to `LLM_CALLS`. Decisions never touch the chat series, so their labels and meaning do not change. |
-| Metering callback | invoked under the same conditions as chat (`success`, usage available, a token breakdown present), with `modality` in the payload. Decisions are billable tokens. |
+| Metering callback | invoked under the same conditions as chat: `success`, usage available, and a token breakdown present. Decisions are billable tokens, so a callback written against the original signature still receives every decision as an ordinary billing event. `modality` is added to the existing opt-in set, `_metering_callback_optional_kwargs` (alongside `cost` and the cache-token fields), and is passed only to callbacks that declare it. Slice 2 includes a test that drives a decision through a callback with the original signature and asserts it is metered without a `TypeError`. |
 
 Embeddings currently bypass all of these sinks, which is tracked as [#3426](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3426). They join the same recorder with `modality="embedding"` rather than getting a copy of it.
 
