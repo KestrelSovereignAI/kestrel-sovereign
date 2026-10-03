@@ -49,6 +49,7 @@ from kestrel_sovereign.signals.registry import (
     SourceRegistry,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend, TransactionError
+from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
 
 # ============================================================================
 # Helpers
@@ -927,12 +928,12 @@ class TestChannelFeature:
             def __init__(self):
                 self.storage = SimpleNamespace(db=backend, agent_id=self.did)
                 self.signal_registry = SourceRegistry()
-                self._privacy_transition_lock = asyncio.Lock()
+                self._durable_persistence_gate = DurablePersistenceGate()
                 self.cognition_started = asyncio.Event()
                 self.dispatcher = None
 
-            def _get_privacy_transition_lock(self):
-                return self._privacy_transition_lock
+            def _get_durable_persistence_gate(self):
+                return self._durable_persistence_gate
 
             def _track_background_task(self, coro, *, name):
                 task = asyncio.create_task(coro, name=name)

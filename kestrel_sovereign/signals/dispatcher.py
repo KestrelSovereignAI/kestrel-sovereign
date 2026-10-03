@@ -165,8 +165,8 @@ from kestrel_sovereign.storage.db.write_audit import (
     suppress_write_audit,
 )
 from kestrel_sovereign.storage.privacy_wrapper import (
-    _resolve_transition_lock,
-    optional_transition_lock,
+    _resolve_durable_persistence_gate,
+    optional_durable_persistence_gate,
 )
 from kestrel_sovereign.storage.session_id_column import new_session_id
 from kestrel_sovereign.telemetry import (
@@ -3609,25 +3609,20 @@ class SignalDispatcher:
         # observe it.  Thus a process loss after this point is replayable.
         try:
             await self.initialize_durable_delivery()
-            # A transition and a durable write must share the same critical
-            # section.  Otherwise a NORMAL projection can be computed, the
-            # mode can change to EPHEMERAL while persistence is blocked, and
-            # the stale plaintext projection can commit after the transition.
-            # KestrelAgent provides a task-reentrant lock; lightweight
-            # embeddings with no transition machinery intentionally run
-            # unguarded through ``optional_transition_lock``.
-            #
-            # An in-flight control ACTION (cooperative Stop) is the exception:
-            # every turn holds this same lock for its whole body, so taking it
-            # here would queue a Stop behind the very turn it must stop. Its
-            # projection is a fixed marker with no privacy-dependent content,
-            # so there is nothing a transition could make stale.
-            transition_lock = (
-                None
-                if isinstance(registration, InFlightControlActionRegistration)
-                else _resolve_transition_lock(self._agent)
-            )
-            async with optional_transition_lock(transition_lock):
+            # A transition and a durable write must not interleave.
+            # Otherwise a NORMAL projection can be computed, the mode can
+            # change to EPHEMERAL while persistence is blocked, and the stale
+            # plaintext projection can commit after the transition.  The
+            # agent's durable persistence gate is held shared here and
+            # exclusive by ``privacy_transition()``; it is not the
+            # privacy-transition lock, which every turn holds for its whole
+            # body and would queue this persist behind any in-flight turn
+            # (#3316).  Lightweight embeddings with no transition machinery
+            # intentionally run unguarded through
+            # ``optional_durable_persistence_gate``.
+            async with optional_durable_persistence_gate(
+                _resolve_durable_persistence_gate(self._agent)
+            ):
                 # Normalize the opaque caller once before either the protected
                 # normal-row representation or an elided row's keyed MAC sees
                 # it. This makes caller identity stable across retries and

@@ -67,6 +67,7 @@ from kestrel_sovereign.hold import (
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
+from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
 
 # How long a test waits for work it set in motion before calling it hung. This
 # bounds a deadlock, not the work: a passing run returns as soon as the awaited
@@ -83,7 +84,7 @@ class _Agent:
         self.tasks: list[asyncio.Task] = []
         self.action_calls = 0
         self.action_payloads: list[dict] = []
-        self._privacy_transition_lock = asyncio.Lock()
+        self._durable_persistence_gate = DurablePersistenceGate()
 
     @property
     def did(self) -> str:
@@ -92,9 +93,9 @@ class _Agent:
     async def process_input(self, prompt: str):
         return prompt
 
-    def _get_privacy_transition_lock(self):
+    def _get_durable_persistence_gate(self):
         """Mirror the production agent seam used by durable persistence."""
-        return self._privacy_transition_lock
+        return self._durable_persistence_gate
 
     def _track_background_task(self, coro, *, name: str):
         task = asyncio.create_task(coro, name=name)
@@ -6684,9 +6685,11 @@ async def test_privacy_transition_waits_for_projection_and_durable_commit(tmp_pa
     backend.execute = stall_event_insert
 
     async def transition_to_ephemeral():
-        async with agent._get_privacy_transition_lock():
+        # ``privacy_transition()`` takes the gate exclusive; this double has
+        # no turn machinery, so it takes only that last acquisition.
+        async with agent._get_durable_persistence_gate().exclusive():
             # This point is reachable only after the dispatch's projection and
-            # durable INSERT completed under the same transition lock.
+            # durable INSERT completed under the shared gate.
             assert persist_committed.is_set()
             agent.privacy_config = get_privacy_preset("ephemeral")
 
@@ -6714,7 +6717,7 @@ async def test_privacy_transition_waits_for_projection_and_durable_commit(tmp_pa
         )
         assert row is not None
         # The event was committed while the old NORMAL policy still held the
-        # transition lock; the mode change was not allowed to overtake it.
+        # persistence gate; the mode change was not allowed to overtake it.
         assert secret in row[0]
     finally:
         backend.execute = original_execute

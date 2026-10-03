@@ -57,7 +57,10 @@ from kestrel_sovereign.stop import (
 from kestrel_sovereign.stop.receipt import StopOperationClaim
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
-from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
+from kestrel_sovereign.storage.privacy_wrapper import (
+    DurablePersistenceGate,
+    ReentrantTransitionLock,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TARGET_DID = "did:test:target"
@@ -71,6 +74,7 @@ class _Agent:
         self.did = did
         self.background_tasks: list[asyncio.Task] = []
         self._privacy_transition_lock = ReentrantTransitionLock()
+        self._durable_persistence_gate = DurablePersistenceGate()
         self._active_request_ids: set[str] = set()
         self.cancelled: list[str | None] = []
 
@@ -90,6 +94,9 @@ class _Agent:
 
     def _get_privacy_transition_lock(self):
         return self._privacy_transition_lock
+
+    def _get_durable_persistence_gate(self):
+        return self._durable_persistence_gate
 
     def _track_background_task(self, coro, *, name: str):
         task = asyncio.create_task(coro, name=name)
