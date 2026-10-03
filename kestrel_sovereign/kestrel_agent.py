@@ -711,6 +711,7 @@ class KestrelAgent(
         isolated_runtime_idle_timeouts: Optional[Mapping[str, Optional[float]]] = None,
         isolated_runtime_telemetry_observer: Optional[Callable[[Any], Any]] = None,
         sovereign_trust_root_path: Optional[str] = None,
+        constitution_source_descriptor_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
         semantic_inference_profile: Optional["InferenceProfile"] = None,
         semantic_inference_limits: Optional["InferenceLimits"] = None,
@@ -805,6 +806,12 @@ class KestrelAgent(
                        When omitted, the shared resolver reads
                        ``KESTREL_SOVEREIGN_TRUST_ROOT_PATH``. The graph database
                        is never a trust-root source.
+            constitution_source_descriptor_path: Optional operator-owned,
+                       Sovereign-signed governing-constitution source
+                       descriptor (#2553). When omitted, the shared resolver
+                       reads ``KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH``;
+                       when neither is set the packaged constitution governs.
+                       The graph database never selects the governing source.
             identity_export_dir: Optional per-agent local identity export
                        directory. Multi-agent hosts resolve this before agent
                        construction so it never depends on process CWD.
@@ -958,6 +965,9 @@ class KestrelAgent(
             else None
         )
         self._sovereign_trust_root_path = sovereign_trust_root_path
+        self._constitution_source_descriptor_path = (
+            constitution_source_descriptor_path
+        )
         self.identity_export_dir = identity_export_dir
 
         # Per-agent constitution overlay (#898). When ``<agent_dir>/CONSTITUTION.md``

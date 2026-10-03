@@ -175,6 +175,15 @@ class LocalAgentConfig(BaseModel):
             "are resolved below this agent's data_dir."
         ),
     )
+    constitution_source_descriptor: Optional[Path] = Field(
+        default=None,
+        description=(
+            "Optional absolute path of a Sovereign-signed governing "
+            "constitution source descriptor (#2553). When omitted, "
+            "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH applies; when "
+            "neither is set, the packaged constitution governs."
+        ),
+    )
     features: Optional[List[str]] = Field(
         default=None,
         description=(
@@ -223,6 +232,30 @@ class LocalAgentConfig(BaseModel):
         """Convert an optional export override while preserving relativity."""
 
         return None if value is None else Path(value)
+
+    @field_validator("constitution_source_descriptor", mode="before")
+    @classmethod
+    def coerce_constitution_source_descriptor(
+        cls,
+        value: Optional[Union[str, Path]],
+    ) -> Optional[Path]:
+        """Require an absolute descriptor path.
+
+        The descriptor is operator configuration that decides which bytes
+        govern the agent. Resolving a relative path against the process CWD
+        (or the agent's own writable data directory) would let the launch
+        location, or the agent itself, choose it.
+        """
+
+        if value is None:
+            return None
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            raise ValueError(
+                "constitution_source_descriptor must be an absolute path to "
+                "an operator-owned, Sovereign-signed descriptor file"
+            )
+        return path
 
     def resolve_data_dir(self, base_dir: Optional[Path] = None) -> Path:
         """Resolve this agent's data root using the runtime project base."""
@@ -700,6 +733,12 @@ class MultiAgentConfig(BaseModel):
                     entry["features"] = list(agent.features)
                 if agent.identity_export_dir is not None:
                     entry["identity_export_dir"] = str(agent.identity_export_dir)
+                # Dropping the descriptor on a rewrite would silently move the
+                # agent back to the packaged source and Safe-Mode it (#2553).
+                if agent.constitution_source_descriptor is not None:
+                    entry["constitution_source_descriptor"] = str(
+                        agent.constitution_source_descriptor
+                    )
                 # Preserve an explicit disabled profile too: its presence is
                 # an operator decision and must not fall back to a legacy
                 # per-agent TOML profile after this config is rewritten.

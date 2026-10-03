@@ -586,6 +586,8 @@ async def create_kestrel_identity_async(
     did_web_slug: Optional[str] = None,
     genesis_auditor: Optional["GenesisAuditor"] = None,
     genesis_audit_provenance: Optional[str] = None,
+    constitution_source_descriptor_path: Optional[str] = None,
+    sovereign_trust_root_path: Optional[str] = None,
 ) -> AgentCredentials:
     """
     Generates a new Kestrel identity, including cryptographic keys, a W3C DID,
@@ -602,7 +604,10 @@ async def create_kestrel_identity_async(
 
     Args:
         output_dir: Directory to save agent files. Defaults to agent_data/
-        constitution_path: Path to constitution file. Defaults to KESTREL_CONSTITUTION.md
+        constitution_path: Optional explicit constitution file. It must be the
+                    governing source resolved below — the packaged
+                    KESTREL_CONSTITUTION.md, or the external file a verified
+                    source descriptor names; any other path is refused (#2463).
         is_test_instance: If True, marks this agent as a test instance
         test_cycle_id: Unique identifier for test cycle (auto-generated if not provided)
         agent_name: Custom name for the agent (e.g., "Emma-Test-001")
@@ -629,6 +634,16 @@ async def create_kestrel_identity_async(
         genesis_audit_provenance: Stable description of the auditor. Test and
                        demo callers should identify deterministic injected
                        auditors rather than bypassing the lifecycle.
+        constitution_source_descriptor_path: Optional Sovereign-signed
+                       governing-source descriptor (#2553). When omitted,
+                       ``KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH`` is read;
+                       when neither is set, the packaged constitution governs.
+                       A configured descriptor must verify against the
+                       operator-pinned Sovereign trust root or inception
+                       fails before anything is anchored.
+        sovereign_trust_root_path: Optional explicit trust-root DID document
+                       for that verification; otherwise
+                       ``KESTREL_SOVEREIGN_TRUST_ROOT_PATH``.
     """
     # A SpawnMandate is persisted as a JSON edge receipt. Normalize and prove
     # that representation before creating a directory, database, or key file;
@@ -803,42 +818,49 @@ async def create_kestrel_identity_async(
     files.bind_agent(agent_did)
 
     # 3. Anchor the Kestrel Constitution as the first document
-    # Resolve constitution path if not provided
-    if constitution_path is None:
-        from kestrel_sovereign.config import CONSTITUTION_PATH as DEFAULT_CONSTITUTION_PATH
-        constitution_path = DEFAULT_CONSTITUTION_PATH
-
+    governing_source = None
     try:
-        # Resolve the governing bytes through the SINGLE production resolver
-        # (#2463) so inception anchors exactly what verification later recomputes.
+        # Which source governs is decided by out-of-DB configuration only: the
+        # packaged default, or a Sovereign-signed source descriptor verified
+        # against the operator-pinned trust root (#2553). The bytes then come
+        # from the SINGLE production resolver (#2463), so inception anchors
+        # exactly what verification later recomputes.
         from kestrel_sovereign.constitution.resolver import (
             is_authoritative_governing_source,
             resolve_governing_constitution_bytes,
+            resolve_governing_source,
         )
+        governing_source = resolve_governing_source(
+            descriptor_path=constitution_source_descriptor_path,
+            trust_root_path=sovereign_trust_root_path,
+            agent_dids={agent_did},
+        )
+        if constitution_path is not None:
+            # A missing explicit path surfaces as FileNotFoundError first.
+            os.stat(constitution_path)
+            # REFUSE unsigned overrides (#2463 review, #2553). The periodic
+            # integrity audit recomputes from the resolved governing source;
+            # anchoring bytes from any OTHER path (e.g. the docs copy with OKF
+            # frontmatter) would incept an agent guaranteed to fail its next
+            # audit and Safe-Mode. A custom governing source is expressed by a
+            # Sovereign-signed source descriptor, never by a bare path.
+            if not is_authoritative_governing_source(
+                constitution_path, governing_source
+            ):
+                raise ValueError(
+                    f"Refusing to incept from non-authoritative constitution "
+                    f"source {constitution_path!r}: the periodic integrity "
+                    f"audit recomputes the governing hash from the "
+                    f"{governing_source.kind} source {governing_source.path!r}, "
+                    f"so an agent anchored elsewhere is guaranteed to fail its "
+                    f"next audit and enter Safe Mode. Omit constitution_path, "
+                    f"or configure a Sovereign-signed constitution source "
+                    f"descriptor naming this file (#2553)."
+                )
         constitution_content = resolve_governing_constitution_bytes(
             emancipation_contract,
-            constitution_path=constitution_path,
+            source=governing_source,
         )
-        # REFUSE non-authoritative production overrides (#2463 review). The
-        # periodic integrity audit ALWAYS recomputes from the packaged governing
-        # source; anchoring bytes from any OTHER path (e.g. the docs copy with
-        # OKF frontmatter) would incept an agent guaranteed to fail its next
-        # audit and Safe-Mode. Rather than hide that compatibility break, we
-        # refuse it. A legitimate custom governing source is expressed by
-        # pointing ``config.CONSTITUTION_PATH`` at it (the single seam every
-        # path reads); a signed custom-source descriptor is tracked for a
-        # future design. The check runs AFTER the resolve so a missing/unreadable
-        # path still surfaces its FileNotFoundError/OSError first.
-        if not is_authoritative_governing_source(constitution_path):
-            raise ValueError(
-                f"Refusing to incept from non-authoritative constitution source "
-                f"{constitution_path!r}: the periodic integrity audit recomputes "
-                f"the governing hash from the packaged source, so an agent "
-                f"anchored elsewhere is guaranteed to fail its next audit and "
-                f"enter Safe Mode. Omit constitution_path to use the packaged "
-                f"governing source, or point config.CONSTITUTION_PATH at your "
-                f"authoritative source (#2463)."
-            )
         if emancipation_contract is not None and emancipation_contract.enabled:
             logging.info(
                 "Amendment VIII activated for this agent — anchoring "
@@ -895,7 +917,11 @@ async def create_kestrel_identity_async(
             )
         logging.info(f"Stored Kestrel Constitution with hash: {constitution_hash}")
     except FileNotFoundError:
-        logging.error(f"FATAL: Constitution file not found at {constitution_path}")
+        logging.error(
+            "FATAL: Constitution file not found at %s",
+            constitution_path
+            or (governing_source.path if governing_source is not None else "?"),
+        )
         if not using_external_db:
             await db.close()
             cleanup_artifacts([*identity_paths, db_path])
@@ -952,6 +978,16 @@ async def create_kestrel_identity_async(
         agent_properties["emancipation_contract"] = contract_to_json(
             emancipation_contract
         )
+
+    # #2553: record which Sovereign-signed source descriptor this agent was
+    # incepted under. Audit evidence only — source selection never reads it,
+    # so rewriting it cannot change what governs the agent.
+    if governing_source.descriptor is not None:
+        agent_properties["constitution_source_receipt"] = {
+            "source_path": governing_source.path,
+            **governing_source.receipt_fields(),
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     # Add test instance metadata if applicable
     if is_test_instance:
@@ -1124,6 +1160,8 @@ def create_kestrel_identity(
     did_web_slug: Optional[str] = None,
     genesis_auditor: Optional["GenesisAuditor"] = None,
     genesis_audit_provenance: Optional[str] = None,
+    constitution_source_descriptor_path: Optional[str] = None,
+    sovereign_trust_root_path: Optional[str] = None,
 ) -> AgentCredentials:
     """
     Sync wrapper for create_kestrel_identity_async.
@@ -1151,6 +1189,8 @@ def create_kestrel_identity(
         did_web_slug=did_web_slug,
         genesis_auditor=genesis_auditor,
         genesis_audit_provenance=genesis_audit_provenance,
+        constitution_source_descriptor_path=constitution_source_descriptor_path,
+        sovereign_trust_root_path=sovereign_trust_root_path,
     ))
 
 

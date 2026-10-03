@@ -926,6 +926,28 @@ class ProcessManager:
                 "isolation; use the default in-process fleet host or an "
                 "isolated deployment"
             )
+        # Which constitution governs this agent (#2553). The in-process host
+        # passes the per-agent descriptor to ``KestrelAgent``; a child process
+        # starts with multi_agent.toml loading disabled, so the environment is
+        # its only channel. Resolve the per-agent setting against the launch
+        # environment under the same conflict rules, before any side effect,
+        # and hand the child exactly one answer. Without this the child audits
+        # the packaged constitution while doctor and reanchor resolve the
+        # descriptor's source.
+        from kestrel_sovereign.constitution.source_descriptor import (
+            ConstitutionSourceError,
+            pin_source_descriptor_launch_env,
+        )
+
+        try:
+            pin_source_descriptor_launch_env(
+                env, explicit_path=config.constitution_source_descriptor
+            )
+        except ConstitutionSourceError as exc:
+            raise RuntimeError(
+                f"Agent '{name}': governing constitution source cannot be "
+                f"resolved: {exc}"
+            ) from exc
         # Automatic peers receive a transport-only credential, never the
         # sovereign operator key. The selected key is shared by this host's
         # child processes and is route-scoped again by server auth.

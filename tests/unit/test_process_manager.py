@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -625,6 +625,7 @@ class TestStartAgent:
             _args,
             *,
             host_database_launch_context,
+            constitution_source_descriptor=None,
         ):
             nonlocal captured_shell_context
             captured_shell_context = host_database_launch_context
@@ -1071,6 +1072,273 @@ class TestStartAgent:
         assert payload["pid"] == 54321
         assert payload["root"] == str(pm.project_dir)
         assert payload["port"] == cfg.port
+
+
+# -----------------------------------------------------------------------
+# Governing-constitution source handoff (#2553)
+# -----------------------------------------------------------------------
+
+class TestConstitutionSourceDescriptorHandoff:
+    """A subprocess child must audit the source the in-process host would.
+
+    The child starts with multi_agent.toml loading disabled and cannot receive
+    ``KestrelAgent`` constructor arguments, so a per-agent descriptor that is
+    not carried in its environment leaves it auditing the packaged
+    constitution while doctor and reanchor resolve the descriptor's source.
+    """
+
+    EXTERNAL_TEXT = b"# Operator constitution\n\nBe kind.\n"
+
+    @pytest.fixture(autouse=True)
+    def _no_ambient_source(self, monkeypatch):
+        from kestrel_sovereign.constitution.source_descriptor import (
+            CONSTITUTION_SOURCE_DESCRIPTOR_ENV,
+        )
+        from kestrel_sovereign.constitution.trust_root import (
+            SOVEREIGN_TRUST_ROOT_ENV,
+        )
+
+        monkeypatch.delenv(CONSTITUTION_SOURCE_DESCRIPTOR_ENV, raising=False)
+        monkeypatch.delenv(SOVEREIGN_TRUST_ROOT_ENV, raising=False)
+
+    @pytest.fixture
+    def signed_source(self, tmp_path):
+        """A real external source, a descriptor for it, and the trust root."""
+        import hashlib
+
+        from kestrel_sovereign.constitution.amendment_artifact import (
+            did_document_from_legacy_public_key,
+        )
+        from kestrel_sovereign.constitution.source_descriptor import (
+            build_legacy_signed_source_descriptor,
+        )
+        from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
+
+        keypair = Secp256k1Suite().generate_keypair()
+        root_did = "did:pkh:eip155:1:0x0000000000000000000000000000000000002553"
+        operator = tmp_path / "operator"
+        operator.mkdir()
+        trust_root = operator / "sovereign-root.did.json"
+        trust_root.write_text(
+            json.dumps(did_document_from_legacy_public_key(root_did, keypair.public_key)),
+            encoding="utf-8",
+        )
+        source = operator / "CUSTOM_CONSTITUTION.md"
+        source.write_bytes(self.EXTERNAL_TEXT)
+
+        def write_descriptor(name: str) -> Path:
+            descriptor = build_legacy_signed_source_descriptor(
+                signer_did=root_did,
+                source_kind="external",
+                source_path=str(source),
+                content_sha256=hashlib.sha256(self.EXTERNAL_TEXT).hexdigest(),
+                private_key=keypair.private_key,
+            )
+            path = operator / name
+            path.write_text(json.dumps(descriptor), encoding="utf-8")
+            return path
+
+        return SimpleNamespace(
+            source=source,
+            trust_root=trust_root,
+            descriptor=write_descriptor("source.signed.json"),
+            other_descriptor=write_descriptor("other.signed.json"),
+        )
+
+    @staticmethod
+    def _launch(pm, cfg):
+        with patch("subprocess.Popen", return_value=MagicMock(pid=12345)) as popen:
+            pm.start_agent("claw", cfg)
+        return popen.call_args.kwargs["env"]
+
+    def test_the_child_audits_the_agents_descriptor_source(
+        self, pm, project_dir, signed_source
+    ):
+        from kestrel_sovereign.constitution.resolver import (
+            resolve_governing_source,
+        )
+        from kestrel_sovereign.constitution.source_descriptor import (
+            CONSTITUTION_SOURCE_DESCRIPTOR_ENV,
+        )
+        from kestrel_sovereign.paths import spawned_agent_env
+
+        (project_dir / ".env").write_text(
+            f"KESTREL_SOVEREIGN_TRUST_ROOT_PATH={signed_source.trust_root}\n",
+            encoding="utf-8",
+        )
+        cfg = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            port=8801,
+            constitution_source_descriptor=signed_source.descriptor,
+        )
+
+        child_env = self._launch(pm, cfg)
+
+        assert child_env[CONSTITUTION_SOURCE_DESCRIPTOR_ENV] == str(
+            signed_source.descriptor.resolve()
+        )
+        # The child's KestrelAgent has no explicit descriptor: it resolves
+        # from its environment alone. That must equal the in-process host's
+        # and doctor's view (explicit per-agent path over the launch env).
+        child_view = resolve_governing_source(environ=child_env)
+        host_view = resolve_governing_source(
+            descriptor_path=cfg.constitution_source_descriptor,
+            environ=spawned_agent_env(project_dir),
+        )
+        assert child_view.kind == host_view.kind == "external"
+        assert child_view.path == host_view.path == str(signed_source.source)
+
+    def test_a_project_env_descriptor_reaches_the_child(
+        self, pm, project_dir, signed_source
+    ):
+        from kestrel_sovereign.constitution.source_descriptor import (
+            CONSTITUTION_SOURCE_DESCRIPTOR_ENV,
+        )
+
+        (project_dir / ".env").write_text(
+            f"{CONSTITUTION_SOURCE_DESCRIPTOR_ENV}={signed_source.descriptor}\n",
+            encoding="utf-8",
+        )
+        cfg = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
+
+        child_env = self._launch(pm, cfg)
+
+        assert child_env[CONSTITUTION_SOURCE_DESCRIPTOR_ENV] == str(
+            signed_source.descriptor.resolve()
+        )
+
+    def test_no_descriptor_leaves_the_child_an_explicit_blank(self, pm):
+        """Blank, not absent: a child-side ``.env`` load without override
+        must not be able to supply a descriptor the launcher did not."""
+        from kestrel_sovereign.constitution.source_descriptor import (
+            CONSTITUTION_SOURCE_DESCRIPTOR_ENV,
+        )
+
+        cfg = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
+
+        assert self._launch(pm, cfg)[CONSTITUTION_SOURCE_DESCRIPTOR_ENV] == ""
+
+    @pytest.mark.parametrize("where", ["project_env", "process_env"])
+    def test_a_conflicting_descriptor_refuses_the_launch(
+        self, pm, project_dir, signed_source, monkeypatch, where
+    ):
+        """The conflict the in-process agent would see must not be erased by
+        pinning one side of it into the child's environment."""
+        from kestrel_sovereign.constitution.source_descriptor import (
+            CONSTITUTION_SOURCE_DESCRIPTOR_ENV,
+        )
+
+        if where == "project_env":
+            (project_dir / ".env").write_text(
+                f"{CONSTITUTION_SOURCE_DESCRIPTOR_ENV}="
+                f"{signed_source.other_descriptor}\n",
+                encoding="utf-8",
+            )
+        else:
+            monkeypatch.setenv(
+                CONSTITUTION_SOURCE_DESCRIPTOR_ENV,
+                str(signed_source.other_descriptor),
+            )
+        cfg = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            port=8801,
+            constitution_source_descriptor=signed_source.descriptor,
+        )
+
+        with (
+            patch("subprocess.Popen") as popen,
+            pytest.raises(RuntimeError, match="Ambiguous"),
+        ):
+            pm.start_agent("claw", cfg)
+
+        popen.assert_not_called()
+
+    def test_the_offline_shell_agent_gets_the_agents_descriptor(
+        self, project_dir, signed_source, monkeypatch
+    ):
+        """``kestrel shell``'s in-process fallback builds a KestrelAgent for a
+        named multi-agent entry; without the descriptor it audits the package."""
+        import asyncio
+
+        import kestrel_sovereign.cli as cli_module
+
+        config = LocalAgentConfig(
+            data_dir="agent_data/claw",
+            port=8801,
+            constitution_source_descriptor=signed_source.descriptor,
+        )
+        roster = MultiAgentConfig(agents={"claw": config})
+        forwarded = {}
+
+        async def capture_shell(_agent_dir, _args, **kwargs):
+            forwarded.update(kwargs)
+            return 0
+
+        with (
+            patch.object(cli_module, "_get_project_dir", return_value=project_dir),
+            patch.object(cli_module, "load_project_env"),
+            patch.object(cli_module.MultiAgentConfig, "load", return_value=roster),
+            patch.object(
+                cli_module, "_detect_running_agent_server", return_value=None
+            ),
+            patch.object(cli_module, "_run_shell", side_effect=capture_shell),
+        ):
+            assert cli_module.cmd_shell(SimpleNamespace(name="claw", app=None)) == 0
+
+        assert forwarded["constitution_source_descriptor"] == signed_source.descriptor
+
+        class _Constructed(Exception):
+            pass
+
+        constructed = {}
+
+        def capture_agent(**kwargs):
+            constructed.update(kwargs)
+            raise _Constructed
+
+        storage = MagicMock()
+        storage.initialize = AsyncMock()
+        storage.close = AsyncMock()
+        storage.get_nodes_by_type = AsyncMock(
+            return_value=[SimpleNamespace(node_id="did:test:claw")]
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.storage.AsyncStorage", lambda _path: storage
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.kestrel_agent.KestrelAgent", capture_agent
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.llm.service.LLMService", lambda: object()
+        )
+
+        with pytest.raises(_Constructed):
+            asyncio.run(
+                cli_module._run_shell(
+                    project_dir,
+                    SimpleNamespace(app=None),
+                    constitution_source_descriptor=signed_source.descriptor,
+                )
+            )
+
+        assert constructed["constitution_source_descriptor_path"] == (
+            signed_source.descriptor
+        )
+
+    def test_a_missing_descriptor_refuses_the_launch(self, pm, tmp_path):
+        cfg = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            port=8801,
+            constitution_source_descriptor=tmp_path / "deleted.signed.json",
+        )
+
+        with (
+            patch("subprocess.Popen") as popen,
+            pytest.raises(RuntimeError, match="never falls back"),
+        ):
+            pm.start_agent("claw", cfg)
+
+        popen.assert_not_called()
 
 
 # -----------------------------------------------------------------------

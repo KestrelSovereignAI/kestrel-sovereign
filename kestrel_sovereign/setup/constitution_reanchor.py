@@ -63,6 +63,7 @@ import logging
 import os
 import shutil
 import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -90,7 +91,15 @@ from kestrel_sovereign.constitution.reanchor_receipt import (
     supersede_constitution_reanchor,
 )
 from kestrel_sovereign.constitution.resolver import (
+    GoverningSource,
+    governing_constitution_path,
+    is_authoritative_governing_source,
     resolve_governing_constitution_bytes,
+    resolve_governing_source,
+)
+from kestrel_sovereign.constitution.source_descriptor import (
+    ConstitutionSourceError,
+    configured_source_descriptor_path,
 )
 from kestrel_sovereign.constitution.trust_root import (
     SovereignTrustRootError,
@@ -409,12 +418,14 @@ async def reanchor_constitution(
     *,
     agent_name: str,
     agent_dir: Path | None,
-    canonical_path: Path,
+    canonical_path: Path | None = None,
     force: bool,
     authorization: str = "kestrel constitution reanchor",
     kestrel_toml_path: Path | None = None,
     amendment_artifact_path: Path | None = None,
     sovereign_trust_root_path: Path | None = None,
+    source_descriptor_path: Path | None = None,
+    environ: Mapping[str, str] | None = None,
     runtime_backend: str | None = None,
     runtime_dsn: str | None = None,
     hosted_agent_did: str | None = None,
@@ -447,7 +458,9 @@ async def reanchor_constitution(
         agent_name: Display name (used for messages and backup naming).
         agent_dir: Managed agent's data directory (contains
             ``kestrel_prime.db``); None for a hosted PostgreSQL agent.
-        canonical_path: On-disk constitution to anchor against.
+        canonical_path: Optional on-disk constitution the operator expects to
+            anchor. It must be the resolved governing source; None means
+            "whatever the governing source is".
         force: Required for any write. Without it, drift is reported
             but the DB is not touched.
         authorization: Free-form string stored in the audit record so
@@ -463,12 +476,28 @@ async def reanchor_constitution(
         sovereign_trust_root_path: Optional explicit operator-owned JSON DID
             document. The shared resolver also reads
             ``KESTREL_SOVEREIGN_TRUST_ROOT_PATH`` and rejects conflicts.
+        source_descriptor_path: Optional Sovereign-signed governing-source
+            descriptor (#2553). The shared resolver also reads
+            ``KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH`` and rejects
+            conflicts. Verified against the same trust root; with none
+            configured, the packaged constitution governs.
+        environ: The environment the agent itself runs with, from which both
+            resolvers read their variables. ``kestrel constitution reanchor``
+            passes the launcher's (``paths.spawned_agent_env``), the one the
+            agent and ``kestrel doctor`` resolve from, so the source anchored
+            here is the source the agent audits. None reads ``os.environ``.
         hosted_agent_did: Exact DID from an embedding host's authoritative
             tenant registry. It must be paired with an explicit PostgreSQL
             DSN and no local agent directory. The host must independently
             verify the DID-to-tenant binding before calling this API.
     """
     db_path = agent_dir / "kestrel_prime.db" if agent_dir is not None else None
+    # The path the operator asked for, kept apart from the one reported: the
+    # governing source decides what is authoritative, and it is not known
+    # until the source descriptor (if any) has been verified below (#2553).
+    requested_path = canonical_path
+    if canonical_path is None:
+        canonical_path = Path(governing_constitution_path())
     if hosted_agent_did is not None:
         if (
             agent_dir is not None
@@ -542,39 +571,41 @@ async def reanchor_constitution(
             **kwargs,
         )
 
-    # Pre-flight the canonical source so an unreadable path returns a clean
-    # ReanchorResult error rather than blowing up inside the resolver below.
+    # Which source governs is out-of-DB configuration (#2553). Whether a
+    # descriptor is configured at all is known now; verifying it needs this
+    # agent's DID (so the trust root can refuse an agent-owned root), which is
+    # only known after the anchor read below.
     try:
-        canonical_path.read_bytes()
-    except OSError as exc:
-        return _result(
-            old_hash=None,
-            new_hash=None,
-            error=f"Cannot read canonical constitution at {canonical_path}: {exc}",
+        descriptor_configured = (
+            configured_source_descriptor_path(
+                explicit_path=source_descriptor_path, environ=environ
+            )
+            is not None
         )
+    except ConstitutionSourceError as exc:
+        return _result(old_hash=None, new_hash=None, error=str(exc))
 
-    # REFUSE non-authoritative sources (#2463 review): the periodic integrity
-    # audit recomputes from the packaged governing source, so reanchoring to any
-    # other file would produce an agent guaranteed to fail its next audit. A
-    # legitimate custom governing source is expressed by pointing
-    # config.CONSTITUTION_PATH at it, not by passing an arbitrary --constitution-path.
-    from kestrel_sovereign.constitution.resolver import (
-        is_authoritative_governing_source,
-    )
+    if not descriptor_configured:
+        # Pre-flight the canonical source so an unreadable path returns a
+        # clean ReanchorResult error rather than blowing up inside the
+        # resolver below — and before any database is opened.
+        try:
+            canonical_path.read_bytes()
+        except OSError as exc:
+            return _result(
+                old_hash=None,
+                new_hash=None,
+                error=f"Cannot read canonical constitution at {canonical_path}: {exc}",
+            )
 
-    if not is_authoritative_governing_source(str(canonical_path)):
-        return _result(
-            old_hash=None,
-            new_hash=None,
-            error=(
-                f"Refusing to reanchor to non-authoritative constitution source "
-                f"{canonical_path}: the periodic integrity audit recomputes from "
-                f"the packaged governing source, so an agent anchored elsewhere "
-                f"would fail its next audit and Safe-Mode. Reanchor against the "
-                f"packaged source (omit --constitution-path) or point "
-                f"config.CONSTITUTION_PATH at your authoritative source (#2463)."
-            ),
-        )
+        # REFUSE non-authoritative sources (#2463 review): the periodic
+        # integrity audit recomputes from the governing source, so reanchoring
+        # to any other file would produce an agent guaranteed to fail its next
+        # audit. A custom governing source is expressed by a Sovereign-signed
+        # source descriptor (#2553), not an arbitrary --constitution-path.
+        refusal = _non_authoritative_refusal(requested_path, None)
+        if refusal is not None:
+            return _result(old_hash=None, new_hash=None, error=refusal)
 
     # Opening the runtime database is the first thing here that can reach the
     # network. A PostgreSQL host that is down, or a DSN with the wrong
@@ -671,6 +702,30 @@ async def reanchor_constitution(
             ),
         )
 
+    # Resolve the governing source exactly as the runtime audit does: the
+    # packaged constitution, or a descriptor verified against the operator's
+    # trust root. Nothing read from the agent's database takes part (#2553).
+    try:
+        governing_source = resolve_governing_source(
+            descriptor_path=source_descriptor_path,
+            trust_root_path=sovereign_trust_root_path,
+            agent_dids={agent_did} if agent_did else frozenset(),
+            environ=environ,
+        )
+    except ValueError as exc:
+        return _result(
+            old_hash=old_hash,
+            new_hash=None,
+            error=(
+                f"Cannot resolve the governing constitution source: {exc}. "
+                "Nothing was written."
+            ),
+        )
+    refusal = _non_authoritative_refusal(requested_path, governing_source)
+    if refusal is not None:
+        return _result(old_hash=old_hash, new_hash=None, error=refusal)
+    canonical_path = Path(governing_source.path)
+
     # --- #1118: Iron Rule + active-form re-application -------------------
     try:
         anchored_contract = contract_from_json(anchored_contract_json)
@@ -718,8 +773,8 @@ async def reanchor_constitution(
     ) else candidate_contract
 
     # Route through the single production resolver (#2463) so reanchor produces
-    # byte-identical governing content to inception + verification, pointed at
-    # the same ``canonical_path``.
+    # byte-identical governing content to inception + verification, from the
+    # same governing source.
     # Every other refusal in here returns a ReanchorResult; ``cli.py`` calls
     # this bare inside ``asyncio.run``, so anything that escapes is a traceback
     # at an operator. The resolver is documented to raise so its callers fail
@@ -730,7 +785,7 @@ async def reanchor_constitution(
             effective_contract if (
                 effective_contract is not None and effective_contract.enabled
             ) else None,
-            constitution_path=str(canonical_path),
+            source=governing_source,
         )
         new_text = new_content.decode("utf-8")
     except (OSError, ValueError, UnicodeDecodeError) as exc:
@@ -843,6 +898,7 @@ async def reanchor_constitution(
     try:
         trusted_did_document = load_sovereign_trust_root(
             explicit_path=sovereign_trust_root_path,
+            environ=environ,
             agent_dids={agent_did},
         )
         (
@@ -912,6 +968,7 @@ async def reanchor_constitution(
             new_hash=new_hash,
             new_content=new_content,
             canonical_path=canonical_path,
+            governing_source=governing_source,
             authorization=authorization,
             emancipation_contract_json=contract_json_to_write,
             amendment_artifact_path=amendment_artifact_path,
@@ -947,6 +1004,31 @@ async def reanchor_constitution(
         governance_edge_drift=governance_edge_drift,
         stale_edge_targets=stale_edge_targets,
         rag_index=rag_index,
+    )
+
+
+def _non_authoritative_refusal(
+    requested_path: Path | None,
+    governing_source: GoverningSource | None,
+) -> str | None:
+    """Refuse an explicit path that is not the governing source (#2463, #2553)."""
+    if is_authoritative_governing_source(
+        None if requested_path is None else str(requested_path),
+        governing_source,
+    ):
+        return None
+    authoritative = (
+        governing_source.path
+        if governing_source is not None
+        else governing_constitution_path()
+    )
+    return (
+        f"Refusing to reanchor to non-authoritative constitution source "
+        f"{requested_path}: the periodic integrity audit recomputes from the "
+        f"governing source {authoritative}, so an agent anchored elsewhere "
+        f"would fail its next audit and Safe-Mode. Omit --constitution-path, "
+        f"or configure a Sovereign-signed constitution source descriptor "
+        f"naming this file (#2553)."
     )
 
 
@@ -1129,6 +1211,7 @@ async def _write_reanchor(
     new_hash: str,
     new_content: bytes,
     canonical_path: Path,
+    governing_source: GoverningSource,
     authorization: str,
     emancipation_contract_json: dict | None,
     amendment_artifact_path: Path,
@@ -1359,6 +1442,7 @@ async def _write_reanchor(
                     "old_hash": old_hash,
                     "new_hash": new_hash,
                     "source_path": str(canonical_path),
+                    **governing_source.receipt_fields(),
                     "authorization": authorization,
                     "signed_artifact_hash": artifact_hash,
                     "signed_artifact_path": str(amendment_artifact_path),
