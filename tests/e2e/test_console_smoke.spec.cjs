@@ -96,6 +96,18 @@ test('console boots, authenticates, and answers !status from the fresh agent', a
     await expect(banner).not.toContainText('MISCONFIG');
   });
 
+  await test.step('the Advanced toggle reveals the panel tabs', async () => {
+    // The console is chat-first (#2229/#2350): the tab strip starts hidden
+    // and only this toggle reveals it. A fresh browser context has no
+    // persisted reveal state, so it must start collapsed.
+    const advanced = page.locator('#advanced-toggle-btn');
+    await expect(advanced).toHaveAttribute('aria-pressed', 'false');
+    await expect(page.locator('nav .nav-tabs')).toBeHidden();
+    await advanced.click();
+    await expect(advanced).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.locator('nav .nav-tabs')).toBeVisible();
+  });
+
   await test.step('the Identity panel shows the fresh agent DID', async () => {
     await page.locator('.nav-tab[data-panel="identity"]').click();
     await expect(page.locator('#identity-card .identity-did-text')).toHaveText(manifest.agent_did);
