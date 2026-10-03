@@ -7,7 +7,12 @@ const { defineConfig, devices } = require('@playwright/test');
  * Tests the Sovereign Console UI at localhost:8888
  *
  * API Key: Set KESTREL_API_KEY env var or tests will fetch from /api/auth/key
+ *
+ * The `console-smoke` project is the CI subset. It runs only through
+ * `uv run kestrel demo smoke`, which creates its isolated instance.
  */
+const SMOKE_SPEC = '**/test_console_smoke.spec.cjs';
+
 module.exports = defineConfig({
   testDir: './',
   testMatch: '**/*.spec.cjs',
@@ -30,6 +35,21 @@ module.exports = defineConfig({
   projects: [
     {
       name: 'chromium',
+      // The smoke needs the instance `kestrel demo smoke` creates; it is not
+      // part of the full suite run against a developer's server.
+      testIgnore: SMOKE_SPEC,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      // The CI smoke subset (#2682): `kestrel demo smoke` runs exactly this
+      // project against a fresh isolated instance. No LLM, so it is bounded:
+      // one minute per test, and no retries, because a retry would let a
+      // flaky boot pass the gate.
+      name: 'console-smoke',
+      testMatch: SMOKE_SPEC,
+      retries: 0,
+      timeout: 60000,
+      expect: { timeout: 15000 },
       use: { ...devices['Desktop Chrome'] },
     },
   ],

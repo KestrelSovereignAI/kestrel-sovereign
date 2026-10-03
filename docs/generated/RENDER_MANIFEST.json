@@ -1610,6 +1610,7 @@
       "existing_code_refs": [
         "run_tests.py",
         "server.py",
+        "tests/e2e/playwright.config.cjs",
         "tests/shared/postgres_worker_isolation.py",
         "tests/unit/test_docs_verify.py",
         "tests/unit/test_embedding_vec_backfill.py",

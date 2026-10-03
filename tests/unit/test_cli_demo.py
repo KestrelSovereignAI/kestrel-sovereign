@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 from io import BytesIO
@@ -585,3 +586,449 @@ def test_verify_only_demo_agents_flags_live_agent(monkeypatch):
 
     monkeypatch.setattr(cli_demo.urllib.request, "urlopen", fake_urlopen)
     assert cli_demo._verify_only_demo_agents("http://127.0.0.1:8900") == "Meridian"
+
+
+# ---------------------------------------------------------------------------
+# `kestrel demo smoke` — the Sovereign Console Playwright smoke (#2682)
+# ---------------------------------------------------------------------------
+
+_SMOKE_DID = "did:web:localhost:kestrel-demo-agent-abc123"
+
+
+def test_argparse_demo_smoke_defaults_and_options():
+    parser = _build_parser()
+    args = parser.parse_args(["demo", "smoke"])
+    assert args.demo_command == "smoke"
+    assert args.home is None
+    assert args.port is None
+    assert args.keep_server is False
+
+    args = parser.parse_args(
+        ["demo", "smoke", "--home", "/tmp/h", "--port", "9010", "--keep-server"]
+    )
+    assert (args.home, args.port, args.keep_server) == ("/tmp/h", 9010, True)
+
+
+def test_kestrel_cli_registers_demo_smoke():
+    from kestrel_sovereign.cli import build_parser
+
+    args = build_parser().parse_args(["demo", "smoke"])
+    assert (args.command, args.demo_command) == ("demo", "smoke")
+
+
+def test_cmd_demo_usage_names_both_subverbs(capsys):
+    assert cli_demo.cmd_demo(_Args(demo_command=None)) == 1
+    err = capsys.readouterr().err
+    assert "demo run" in err
+    assert "demo smoke" in err
+
+
+def test_build_smoke_env_inherits_no_kestrel_setting_or_credential(tmp_path):
+    parent = {
+        "PATH": "/usr/bin",
+        "HOME": "/home/dev",
+        "PYTHONPATH": "/src/checkout",
+        "KESTREL_API_KEY": "production-key",
+        "KESTREL_DATA_KEY": "production-data-key",
+        "KESTREL_HOME": "/srv/live",
+        "KESTREL_DATABASE_URL": "postgresql://primary/live",
+        "KESTREL_SOVEREIGN_TRUST_ROOT_PATH": "/srv/live/trust-root.json",
+        "ANTHROPIC_API_KEY": "sk-ant-prod",
+        "OPENROUTER_API_KEY": "sk-or-prod",
+        "ANTHROPIC_AUTH_TOKEN": "oauth-prod",
+        "CLOUD_ACCESS_KEY": "cloud-prod",
+        "STRIPE_WEBHOOK_SECRET": "whsec",
+        "DB_PASSWORD": "pw",
+        "OLLAMA_HOST": "http://gpu-box:11434",
+    }
+    home = tmp_path / "home"
+    data_dir = home / "agent_data" / "console-smoke"
+    env = cli_demo._build_smoke_env(parent, home, data_dir, "ephemeral-key")
+
+    # Ordinary process environment survives.
+    assert env["PATH"] == "/usr/bin"
+    assert env["HOME"] == "/home/dev"
+    assert env["PYTHONPATH"] == "/src/checkout"
+    # No production key, credential, or local-LLM redirect crosses over.
+    for name in (
+        "KESTREL_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN", "CLOUD_ACCESS_KEY", "STRIPE_WEBHOOK_SECRET",
+        "DB_PASSWORD", "OLLAMA_HOST", "KESTREL_DATABASE_URL",
+        "KESTREL_SOVEREIGN_TRUST_ROOT_PATH",
+    ):
+        assert name not in env, name
+    # Every KESTREL_* setting is the instance's own.
+    assert {k: v for k, v in env.items() if k.startswith("KESTREL_")} == {
+        "KESTREL_HOME": str(home),
+        "KESTREL_DATA_KEY": "ephemeral-key",
+        "KESTREL_DID_WEB_DOMAIN": "localhost",
+        "KESTREL_DB_BACKEND": "sqlite",
+        "KESTREL_DB_PATH": str(data_dir),
+        "KESTREL_HOST_DB_PATH": str(data_dir / "host-data" / "host-features.db"),
+        "KESTREL_MULTI_AGENT_CONFIG": str(home / "multi_agent-disabled.toml"),
+        "KESTREL_DEMO_SERVER": "1",
+        "KESTREL_SKIP_REACHABILITY_PROBE": "1",
+        "KESTREL_PHOENIX_ENABLED": "0",
+    }
+
+
+def test_ephemeral_data_key_is_fresh_each_run():
+    first, second = cli_demo._ephemeral_data_key(), cli_demo._ephemeral_data_key()
+    assert first != second
+    assert len(first) == 44
+
+
+def test_prepare_smoke_home_creates_a_fresh_private_dir(tmp_path):
+    created = cli_demo._prepare_smoke_home(None)
+    try:
+        assert created.is_dir() and not any(created.iterdir())
+    finally:
+        created.rmdir()
+
+    target = tmp_path / "nested" / "home"
+    assert cli_demo._prepare_smoke_home(str(target)) == target.resolve()
+    assert target.is_dir()
+    if os.name == "posix":
+        assert target.stat().st_mode & 0o777 == 0o700
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert cli_demo._prepare_smoke_home(str(empty)) == empty.resolve()
+
+
+def test_prepare_smoke_home_never_reuses_a_populated_dir(tmp_path):
+    populated = tmp_path / "populated"
+    populated.mkdir()
+    (populated / "kestrel_prime.db").write_text("live")
+    with pytest.raises(cli_demo._SmokeSetupError, match="not empty"):
+        cli_demo._prepare_smoke_home(str(populated))
+    assert (populated / "kestrel_prime.db").read_text() == "live"
+
+    a_file = tmp_path / "file"
+    a_file.write_text("x")
+    with pytest.raises(cli_demo._SmokeSetupError):
+        cli_demo._prepare_smoke_home(str(a_file))
+
+
+@pytest.mark.parametrize(
+    ("port", "busy", "message"),
+    [(8888, False, "live server"), (8911, True, "already in use")],
+)
+def test_cmd_demo_smoke_refuses_unsafe_port(monkeypatch, capsys, tmp_path, port, busy, message):
+    monkeypatch.setattr(cli_demo, "_port_is_busy", lambda p: busy)
+    home = tmp_path / "home"
+    rc = cli_demo.cmd_demo(
+        _Args(demo_command="smoke", home=str(home), port=port, keep_server=False)
+    )
+    assert rc == 2
+    assert message in capsys.readouterr().err
+    assert not home.exists(), "a refused port must not create the instance"
+
+
+def test_cmd_demo_smoke_refuses_populated_home(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cli_demo, "_port_is_busy", lambda p: False)
+    (tmp_path / "leftover").write_text("x")
+    monkeypatch.setattr(
+        cli_demo, "run_streaming",
+        lambda *a, **kw: pytest.fail("no agent may be created in a populated home"),
+    )
+    rc = cli_demo.cmd_demo(
+        _Args(demo_command="smoke", home=str(tmp_path), port=None, keep_server=False)
+    )
+    assert rc == 2
+    assert "not empty" in capsys.readouterr().err
+
+
+def test_load_inception_manifest_checks_did_and_database_location(tmp_path):
+    data_dir = tmp_path / "agent_data" / "console-smoke"
+    path = tmp_path / "inception.json"
+
+    path.write_text(json.dumps({
+        "agent_did": _SMOKE_DID, "db_path": str(data_dir / "kestrel_prime.db"),
+    }))
+    assert cli_demo._load_inception_manifest(path, data_dir)["agent_did"] == _SMOKE_DID
+
+    path.write_text(json.dumps({
+        "agent_did": _SMOKE_DID, "db_path": "/srv/live/kestrel_prime.db",
+    }))
+    with pytest.raises(cli_demo._SmokeSetupError, match="outside the smoke data dir"):
+        cli_demo._load_inception_manifest(path, data_dir)
+
+    path.write_text(json.dumps({"db_path": str(data_dir / "kestrel_prime.db")}))
+    with pytest.raises(cli_demo._SmokeSetupError, match="no agent DID"):
+        cli_demo._load_inception_manifest(path, data_dir)
+
+    with pytest.raises(cli_demo._SmokeSetupError, match="cannot read"):
+        cli_demo._load_inception_manifest(tmp_path / "missing.json", data_dir)
+
+
+def test_server_module_origin_resolves_under_the_given_environment(tmp_path):
+    """The probe must resolve kestrel_sovereign as a process launched with
+    the SAME env and cwd would — here, a PYTHONPATH naming this checkout."""
+    package_dir = Path(cli_demo.__file__).resolve().parent
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(package_dir.parent)
+    assert cli_demo._server_module_origin(tmp_path, env) == package_dir
+
+
+def test_server_module_origin_failure_is_a_refusal(monkeypatch, tmp_path):
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(cli_demo.subprocess, "run", fake_run)
+    with pytest.raises(cli_demo._SmokeSetupError, match="boom"):
+        cli_demo._server_module_origin(tmp_path, {})
+
+
+def _agents_urlopen(agents):
+    def fake_urlopen(req, timeout=5):
+        url = req if isinstance(req, str) else req.full_url
+        if url.endswith("/api/auth/key"):
+            return BytesIO(json.dumps({"key": "k"}).encode())
+        return BytesIO(json.dumps({"agents": agents}).encode())
+    return fake_urlopen
+
+
+def test_verify_served_identity_requires_exactly_the_fresh_agent(monkeypatch):
+    url = "http://127.0.0.1:8910"
+    monkeypatch.setattr(
+        cli_demo.urllib.request, "urlopen",
+        _agents_urlopen([{"id": _SMOKE_DID, "is_demo": True}]),
+    )
+    assert cli_demo._verify_served_identity(url, _SMOKE_DID) is None
+
+    monkeypatch.setattr(
+        cli_demo.urllib.request, "urlopen",
+        _agents_urlopen([{"id": "did:web:localhost:other", "is_demo": True}]),
+    )
+    assert "did:web:localhost:other" in cli_demo._verify_served_identity(url, _SMOKE_DID)
+
+    monkeypatch.setattr(
+        cli_demo.urllib.request, "urlopen",
+        _agents_urlopen([
+            {"id": _SMOKE_DID, "is_demo": True},
+            {"id": "did:web:localhost:other", "is_demo": True},
+        ]),
+    )
+    assert cli_demo._verify_served_identity(url, _SMOKE_DID) is not None
+
+
+def _patch_smoke_lifecycle(monkeypatch, *, playwright_rc=0, served_did=_SMOKE_DID,
+                           module_origin=None, playwright_raises=None):
+    """Mock every external effect of `kestrel demo smoke`: the setup script
+    (which writes the inception manifest), the module-origin probe, uvicorn,
+    /health, /api/agents, and Playwright."""
+    state: dict = {
+        "setup_calls": [], "setup_env": None, "playwright_calls": [],
+        "playwright_env": None, "playwright_cwd": None, "server_cwd": None,
+        "server_env": None, "started": False, "stopped": False,
+        "pid_file_during_run": None, "manifest_during_run": None,
+    }
+    monkeypatch.setattr(cli_demo, "_port_is_busy", lambda port: False)
+    monkeypatch.setattr(cli_demo, "_verify_only_demo_agents", lambda url: None)
+    monkeypatch.setattr(
+        cli_demo, "_verify_served_identity",
+        lambda url, did: None if did == served_did else f"server reports {[served_did]}",
+    )
+    package_dir = Path(cli_demo.__file__).resolve().parent
+    monkeypatch.setattr(
+        cli_demo, "_server_module_origin",
+        lambda cwd, env: module_origin or package_dir,
+    )
+
+    fake_proc = MagicMock()
+    fake_proc.pid = 4242
+    fake_proc.poll.return_value = None
+
+    def fake_start(cmd, cwd=None, env=None, stdout=None, stderr=None):
+        state.update(started=True, server_cwd=cwd, server_env=dict(env))
+        return fake_proc
+
+    monkeypatch.setattr(cli_demo, "start_background_process", fake_start)
+    monkeypatch.setattr(
+        cli_demo, "wait_for_health", lambda port, timeout=60.0, proc=None: True,
+    )
+    monkeypatch.setattr(
+        cli_demo, "stop_process",
+        lambda proc, timeout=10.0: state.update(stopped=True),
+    )
+
+    def fake_run_streaming(cmd, *, cwd=None, env=None, check=False):
+        argv = list(cmd)
+        if "setup_demo_agent.py" in " ".join(argv):
+            state["setup_calls"].append(argv)
+            state["setup_env"] = dict(env)
+            data_dir = Path(argv[argv.index("--data-dir") + 1])
+            Path(argv[argv.index("--manifest") + 1]).write_text(json.dumps({
+                "agent_name": "Kestrel Demo Agent",
+                "agent_did": _SMOKE_DID,
+                "db_path": str(data_dir / "kestrel_prime.db"),
+                "data_dir": str(data_dir),
+            }))
+            return 0
+        if argv[:3] == ["npx", "playwright", "test"]:
+            state["playwright_calls"].append(argv)
+            state["playwright_env"] = dict(env)
+            state["playwright_cwd"] = cwd
+            home = Path(env["KESTREL_HOME"])
+            pid_file = home / cli_demo.SMOKE_PID_NAME
+            state["pid_file_during_run"] = pid_file.read_text() if pid_file.exists() else None
+            manifest_path = Path(env["KESTREL_CONSOLE_SMOKE_MANIFEST"])
+            state["manifest_during_run"] = json.loads(manifest_path.read_text())
+            if playwright_raises is not None:
+                raise playwright_raises
+            return playwright_rc
+        return 0
+
+    monkeypatch.setattr(cli_demo, "run_streaming", fake_run_streaming)
+    return state
+
+
+def _smoke_args(home: Path, **overrides):
+    values = dict(demo_command="smoke", home=str(home), port=None, keep_server=False)
+    values.update(overrides)
+    return _Args(**values)
+
+
+def test_cmd_demo_smoke_happy_path_proves_origin_and_tears_down(monkeypatch, tmp_path):
+    monkeypatch.setenv("KESTREL_API_KEY", "production-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-prod")
+    home = tmp_path / "home"
+    state = _patch_smoke_lifecycle(monkeypatch)
+
+    rc = cli_demo.cmd_demo(_smoke_args(home))
+
+    assert rc == 0
+    home = home.resolve()
+    data_dir = home / "agent_data" / "console-smoke"
+    # A fresh local-LLM-only agent is created inside the home.
+    (setup,) = state["setup_calls"]
+    assert setup[setup.index("--data-dir") + 1] == str(data_dir)
+    assert "--local-llm-only" in setup
+    assert state["setup_env"]["KESTREL_DB_PATH"] == str(data_dir)
+    # The server runs from the fresh home, never the checkout.
+    assert state["server_cwd"] == home
+    sv = state["server_env"]
+    assert sv["KESTREL_HOME"] == str(home)
+    assert sv["KESTREL_DEMO_SERVER"] == "1"
+    assert "KESTREL_API_KEY" not in sv and "ANTHROPIC_API_KEY" not in sv
+    # Setup and server share the throwaway data key, or the server could not
+    # decrypt the identity setup created.
+    assert sv["KESTREL_DATA_KEY"] == state["setup_env"]["KESTREL_DATA_KEY"]
+    # Playwright runs exactly the CI smoke project from the checkout.
+    (pw,) = state["playwright_calls"]
+    assert pw[pw.index("--project") + 1] == "console-smoke"
+    assert pw[pw.index("--config") + 1] == "tests/e2e/playwright.config.cjs"
+    assert state["playwright_cwd"] == cli_demo._repo_root()
+    pw_env = state["playwright_env"]
+    assert pw_env["KESTREL_URL"] == "http://127.0.0.1:8910"
+    assert pw_env["KESTREL_DB_PATH"] == str(data_dir)
+    assert "KESTREL_DATA_KEY" not in pw_env
+    assert "KESTREL_API_KEY" not in pw_env and "ANTHROPIC_API_KEY" not in pw_env
+    # The spec receives the proven origin facts while the server runs.
+    assert state["manifest_during_run"] == {
+        "base_url": "http://127.0.0.1:8910",
+        "port": 8910,
+        "home": str(home),
+        "data_dir": str(data_dir),
+        "db_path": str(data_dir / "kestrel_prime.db"),
+        "agent_did": _SMOKE_DID,
+        "agent_name": "Kestrel Demo Agent",
+        "module_origin": str(Path(cli_demo.__file__).resolve().parent),
+        "server_pid": 4242,
+    }
+    assert state["pid_file_during_run"] == "4242\n"
+    # Teardown: server stopped and the PID file the CI step reads is gone.
+    assert state["stopped"] is True
+    assert not (home / cli_demo.SMOKE_PID_NAME).exists()
+
+
+def test_cmd_demo_smoke_failure_still_tears_down(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    state = _patch_smoke_lifecycle(monkeypatch, playwright_rc=1)
+    assert cli_demo.cmd_demo(_smoke_args(home)) == 1
+    assert state["stopped"] is True
+    assert not (home / cli_demo.SMOKE_PID_NAME).exists()
+
+
+def test_cmd_demo_smoke_cancellation_still_tears_down(monkeypatch, tmp_path):
+    """A cancelled run (SIGTERM → SystemExit, Ctrl-C → KeyboardInterrupt)
+    must still stop the server and clear the PID file."""
+    home = tmp_path / "home"
+    state = _patch_smoke_lifecycle(monkeypatch, playwright_raises=SystemExit(143))
+    with pytest.raises(SystemExit):
+        cli_demo.cmd_demo(_smoke_args(home))
+    assert state["stopped"] is True
+    assert not (home / cli_demo.SMOKE_PID_NAME).exists()
+
+
+def test_cmd_demo_smoke_keep_server_leaves_pid_for_the_operator(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    state = _patch_smoke_lifecycle(monkeypatch)
+    assert cli_demo.cmd_demo(_smoke_args(home, keep_server=True)) == 0
+    assert state["stopped"] is False
+    assert (home / cli_demo.SMOKE_PID_NAME).read_text() == "4242\n"
+
+
+def test_cmd_demo_smoke_refuses_a_server_from_another_checkout(monkeypatch, tmp_path, capsys):
+    state = _patch_smoke_lifecycle(
+        monkeypatch, module_origin=Path("/srv/primary-checkout/kestrel_sovereign"),
+    )
+    assert cli_demo.cmd_demo(_smoke_args(tmp_path / "home")) == 1
+    assert "/srv/primary-checkout/kestrel_sovereign" in capsys.readouterr().err
+    assert state["started"] is False
+    assert state["playwright_calls"] == []
+
+
+def test_cmd_demo_smoke_refuses_a_server_serving_another_database(monkeypatch, tmp_path, capsys):
+    state = _patch_smoke_lifecycle(monkeypatch, served_did="did:web:localhost:other")
+    home = tmp_path / "home"
+    assert cli_demo.cmd_demo(_smoke_args(home)) == 1
+    assert "did:web:localhost:other" in capsys.readouterr().err
+    assert state["playwright_calls"] == []
+    assert state["stopped"] is True
+    assert not (home / cli_demo.SMOKE_MANIFEST_NAME).exists()
+
+
+def test_cmd_demo_smoke_setup_failure_starts_nothing(monkeypatch, tmp_path):
+    state = _patch_smoke_lifecycle(monkeypatch)
+    monkeypatch.setattr(cli_demo, "run_streaming", lambda cmd, **kw: 1)
+    assert cli_demo.cmd_demo(_smoke_args(tmp_path / "home")) == 1
+    assert state["started"] is False
+
+
+def test_cmd_demo_smoke_converts_sigterm_while_the_server_runs(monkeypatch, tmp_path):
+    """CI cancellation sends SIGTERM. While the server runs, SIGTERM must
+    unwind into the teardown instead of killing the runner outright."""
+    state = _patch_smoke_lifecycle(monkeypatch)
+    inner = cli_demo.run_streaming
+    seen = {}
+
+    def recording_run_streaming(cmd, **kwargs):
+        if list(cmd)[:2] == ["npx", "playwright"]:
+            seen["handler"] = signal.getsignal(signal.SIGTERM)
+        return inner(cmd, **kwargs)
+
+    monkeypatch.setattr(cli_demo, "run_streaming", recording_run_streaming)
+    before = signal.getsignal(signal.SIGTERM)
+
+    assert cli_demo.cmd_demo(_smoke_args(tmp_path / "home")) == 0
+
+    assert callable(seen["handler"]) and seen["handler"] is not before
+    with pytest.raises(SystemExit):
+        seen["handler"](signal.SIGTERM, None)
+    assert signal.getsignal(signal.SIGTERM) is before
+    assert state["stopped"] is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal delivery")
+def test_sigterm_raises_exit_so_teardown_runs():
+    previous = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(SystemExit) as excinfo:
+        with cli_demo._sigterm_raises_exit():
+            os.kill(os.getpid(), signal.SIGTERM)
+            # Delivery is asynchronous; give the interpreter a bytecode boundary.
+            for _ in range(1000):
+                pass
+    assert excinfo.value.code == 128 + signal.SIGTERM
+    assert signal.getsignal(signal.SIGTERM) is previous

@@ -241,10 +241,39 @@ npx playwright test --last-failed
 npx playwright show-report
 ```
 
+### CI smoke subset
+
+Pull-request CI runs one Playwright project, `console-smoke` in
+`tests/e2e/playwright.config.cjs`, in the `console-smoke` job of
+`.github/workflows/ci.yml`. It proves the shipped console boots, bootstraps its
+own API key, routes to the right agent, shows its DID, and answers `!status`
+through the chat. It calls no LLM. Run the same subset locally with:
+
+```bash
+npx playwright install chromium   # once
+uv run kestrel demo smoke         # fresh temp home, port 8910
+uv run kestrel demo smoke --home /tmp/smoke-home --port 8920 --keep-server
+```
+
+`kestrel demo smoke` never targets your server or agents. It creates a fresh
+instance (agent, SQLite database, and throwaway data key) in a home that must
+not exist yet or must be empty, and starts it on a loopback port that is never
+8888. The instance inherits no `KESTREL_*` setting and no credential-shaped
+variable, and its only LLM route is local Ollama. Before the browser starts,
+the runner checks that the server imports this checkout's `kestrel_sovereign`
+and serves the DID this run's inception minted. It writes those facts to
+`<home>/console-smoke-instance.json`; the spec checks them again and refuses
+any other target. The server is stopped on success, failure, and Ctrl-C. Its
+log stays in `<home>/server.log`.
+
+The default `chromium` project skips the smoke spec, so a plain
+`npx playwright test` against your running server is unaffected.
+
 ### Configuration
 
 - Base URL: `http://localhost:8888` (or `KESTREL_URL` env var)
-- Timeout: 120 seconds (LLM calls can be slow)
+- Timeout: 120 seconds (LLM calls can be slow); the `console-smoke` project
+  allows 60 seconds and no retries
 - Reports: `tests/e2e/playwright-report/`
 
 ## CI/CD Integration
@@ -256,8 +285,11 @@ The GitHub Actions workflow runs:
 2. Unit tests
 3. Integration tests (with PostgreSQL/Redis services)
 4. LLM tests (with API keys from secrets)
+5. The Sovereign Console smoke (`console-smoke`, see
+   [CI smoke subset](#ci-smoke-subset)): one Chromium browser against a fresh
+   isolated instance, no secrets, no LLM
 
-E2E tests require a running server and are run manually.
+The rest of the E2E suite requires a running server and is run manually.
 
 The `lint-and-imports` job is not a repository-wide ruff or mypy gate. Broad
 lint and type enforcement is staged under the structural quality campaign

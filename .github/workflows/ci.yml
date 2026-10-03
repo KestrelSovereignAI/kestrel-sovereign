@@ -828,3 +828,118 @@ jobs:
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+
+  # Sovereign Console browser smoke (#2682).
+  #
+  # Python and jsdom tests cannot prove that the shipped console boots in a
+  # browser, bootstraps its own API key, routes to the right agent, and
+  # renders a reply. This job does, through one bounded Playwright project
+  # (`console-smoke` in tests/e2e/playwright.config.cjs). The test is
+  # tests/e2e/test_console_smoke.spec.cjs.
+  #
+  # Isolation comes from `kestrel demo smoke`, the demo-isolation rail
+  # (kestrel_sovereign/cli_demo.py): a home created here under RUNNER_TEMP, a
+  # fresh agent and SQLite database inside it, a throwaway data key, and a
+  # loopback server on port 8910, never the live 8888. No secret is referenced
+  # by this job, and the runner strips every KESTREL_* and credential-shaped
+  # variable from the instance anyway. The agent's only LLM route is a local
+  # Ollama that is not running here, and the one chat turn is `!status`, a
+  # non-cognitive command, so no LLM is ever called. Before the browser
+  # starts, the runner proves the server imports this checkout's
+  # kestrel_sovereign and serves the DID this run's inception minted; the spec
+  # re-proves the URL, database, and module origin before it touches the
+  # instance.
+  #
+  # Same `if:` as integration-tests, byte for byte: it is a browser tier, so a
+  # squash-merge to main or a duplicate issue-* push run skips it like the
+  # other expensive tiers. Pull requests always run it.
+  console-smoke:
+    runs-on: ubuntu-latest
+    # Explicit `contents: read` so this job does NOT inherit the wider grant
+    # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
+    # caller's permissions when they declare none, which would hand this
+    # `actions: write` during a release. See test_ci_workflow_permissions.py.
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    if: >-
+      (github.event_name != 'push' || github.ref != 'refs/heads/main')
+      && needs.lint-and-imports.outputs.run_expensive != 'false'
+    # Installs ~3 min, server boot and the smoke ~2 min on a healthy runner.
+    timeout-minutes: 20
+    env:
+      SMOKE_PORT: "8910"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}  # release SHA when called from publish.yml; default ref otherwise
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      # npm's download cache is keyed on package-lock.json. Playwright's
+      # browser binaries are deliberately NOT cached: Playwright's CI guidance
+      # is that restoring them takes about as long as downloading them, and on
+      # Linux the system libraries they need cannot be cached at all.
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: uv sync
+
+      # The lockfile's `file:../kestrel-flight` entry is a symlink npm
+      # tolerates when the sibling checkout is absent; the smoke does not
+      # import it.
+      - name: Install JavaScript dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Install the Chromium browser
+        run: npx playwright install --with-deps chromium
+        timeout-minutes: 5
+
+      - name: Run the Console smoke against a fresh isolated instance
+        run: uv run kestrel demo smoke --home "$RUNNER_TEMP/kestrel-console-smoke" --port "$SMOKE_PORT"
+        timeout-minutes: 10
+
+      - name: Upload the smoke report and server log
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: console-smoke-report
+          path: |
+            tests/e2e/playwright-report/
+            tests/e2e/test-results/
+            ${{ runner.temp }}/kestrel-console-smoke/server.log
+            ${{ runner.temp }}/kestrel-console-smoke/console-smoke-instance.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # Teardown on success, failure, AND cancellation. `kestrel demo smoke`
+      # stops its server in a `finally` and removes server.pid, so normally
+      # there is nothing left to stop. A cancellation can kill the runner
+      # before that `finally` runs; the PID file is then still present and the
+      # server, which runs in its own process group, is stopped here.
+      - name: Tear down the smoke instance
+        if: always()
+        run: |
+          home="$RUNNER_TEMP/kestrel-console-smoke"
+          if [ -f "$home/server.pid" ]; then
+            pid=$(cat "$home/server.pid")
+            echo "Stopping leftover smoke server process group $pid"
+            kill -TERM -- "-$pid" 2>/dev/null || echo "process group $pid already gone"
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              kill -0 -- "-$pid" 2>/dev/null || break
+              sleep 1
+            done
+            kill -KILL -- "-$pid" 2>/dev/null || true
+          fi
+          rm -rf "$home"
