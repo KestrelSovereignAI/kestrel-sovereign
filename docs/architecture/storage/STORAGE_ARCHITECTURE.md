@@ -206,12 +206,14 @@ will filter lifecycle and privacy state before ranking these projections; see
 ## Privacy And Encryption Notes
 
 - `EPHEMERAL` privacy mode avoids persistent conversation storage.
-- `DEIDENTIFIED` is a current fail-closed preset: `PrivacyEnforcingStorage`
-  denies durable user-derived writes until a Safe Harbor or Expert
-  Determination transformation and evidence pipeline exists. It is not a
-  synonym for `NORMAL` or `ANONYMOUS`; the target `storage=deidentified`
-  setting alone does not authorize a semantic, graph, vector, memory, export,
-  or training write.
+- `DEIDENTIFIED` is a fail-closed preset: `PrivacyEnforcingStorage` denies
+  every generic durable write. It is not a synonym for `NORMAL` or
+  `ANONYMOUS`; the `storage=deidentified` setting alone does not authorize a
+  semantic, graph, vector, memory, export, or training write. The only durable
+  write it admits is `store_deidentified_records`, which persists the output of
+  the `kestrel_sovereign.deidentification` pipeline together with its
+  validated Safe Harbor (or Expert Determination) evidence artifact, in one
+  transaction. See [Privacy Modes](../security/PRIVACY_MODES.md).
 - Conversation content can be encrypted at rest through the conversation store.
 - The SQLAlchemy vector backends operate on precomputed embedding columns and do
   not decrypt `content` / `rendered_content`.

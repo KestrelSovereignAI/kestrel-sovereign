@@ -204,8 +204,8 @@ Safe Harbor or Expert Determination assurance.
 
 **Use Case**: Clinical/research data that may be saved or exported only after
 de-identification.
-**Storage**: Fail-closed until an evidence-backed de-identification pipeline is
-available
+**Storage**: Evidence-gated de-identified records only; raw content never
+persists
 **Processing**: Trusted route only; generic cloud routing is not sufficient
 **Memory Anchoring**: Available for deidentified artifacts
 **Learning**: Research use without direct identifiers
@@ -216,11 +216,99 @@ knowledge that remaining information can identify the individual. Expert
 Determination is a separate path requiring a qualified expert's documented
 determination; Kestrel must not claim it without that evidence artifact.
 
-The current runtime therefore refuses persistent writes and cloud backups in
-this mode. It does not silently store raw or merely PII-redacted content while
-claiming Safe Harbor. The preset and routing restrictions exist today; durable
-deidentified storage remains gated on the missing transformation and evidence
-pipeline.
+| | `pii_redacted` (anonymous) | `deidentified` |
+|---|---|---|
+| What runs | Best-effort masking of obvious identifiers (`anonymize_text`) | The de-identification pipeline (`kestrel_sovereign.deidentification`) |
+| Coverage | E-mail, phone, SSN, card, street address, ZIP; names, places, and dates only when the spaCy model is installed | All eighteen Safe Harbor identifier categories, field by field and span by span |
+| Evidence | None | One evidence artifact per run, required for every save and export |
+| Claim | No compliance claim | `safe_harbor`, or `expert_determination` with an expert report reference |
+
+Generic writes stay refused in this mode: a conversation turn, file, graph
+node, semantic assertion, saved item, or cloud backup carries raw content and
+no evidence, so `PrivacyEnforcingStorage` rejects it exactly as before. The one
+durable write the mode admits is
+`PrivacyEnforcingStorage.store_deidentified_records(result)`, which takes the
+output of a pipeline run and re-validates its evidence before persisting
+anything.
+
+#### The de-identification pipeline
+
+A `DeidentificationPipeline` is built from a schema that classifies every field
+a record may carry; a record with an unclassified field is refused.
+
+- **Identifier fields** name one Safe Harbor category and are removed, or
+  generalized where Safe Harbor permits: a ZIP code to its first three digits
+  (`000` for the HHS-listed low-population prefixes), a date to its year, and
+  an age over 89, or any date 90 or more years old, to `90+`.
+- **Free-text fields** are scrubbed span by span: the record's own identifier
+  values, every pattern-detectable category (e-mail, URL, IP and MAC
+  addresses, SSN, telephone and fax numbers, labelled record, plan, account,
+  licence, vehicle, and device numbers, VINs, dates, ages over 89, street
+  addresses, ZIP codes, long digit runs), and names and places through a
+  named-entity detector. A schema with free text is refused when no entity
+  detector is available, because patterns cannot find names. Scrubbing repeats
+  until the text is stable, so generalizing one span cannot expose another.
+  Detection is biased toward over-removal and is still best-effort: a name the
+  entity model misses, or an identifier written in a form no pattern knows,
+  survives. That residual is what the operator's attestation covers.
+- **Non-identifying fields** are kept, but a value matching a precise
+  identifier pattern, or repeating one of the record's own identifier values,
+  refutes the classification and the run is refused. The check is
+  deliberately narrow so ordinary clinical values ("500-1000 mg", "pain
+  8/10", race "White" for a patient surnamed White) are not refused; prose
+  belongs in a free-text field, where name tokens and ambiguous numbers are
+  scrubbed.
+
+The pipeline cannot know what the operator knows, so it never makes the Safe
+Harbor actual-knowledge statement itself. A Safe Harbor run requires a
+caller-supplied `ActualKnowledgeAttestation`, made for this release: one dated
+after the run, or older than the pipeline's `attestation_max_age` (24 hours by
+default), is refused. An Expert Determination run requires an
+`ExpertDeterminationReference` (report location, report SHA-256, expert).
+Without it the run is refused before any record is read, no artifact exists,
+and the evidence-gated save stays blocked.
+
+#### The evidence artifact
+
+Each run produces one `DeidentificationEvidence` artifact recording:
+
+- the method and its assurance value (`safe_harbor` or `expert_determination`);
+- per source record, a keyed HMAC-SHA256 of the record and of its identifier
+  (never the content; an unkeyed hash of an SSN or record number is reversible
+  by enumeration), and a SHA-256 of the de-identified output;
+- per record and per category, which fields were removed, generalized, or
+  transformed, by which detector, and how many times; all eighteen categories
+  are listed even when nothing of that category was present;
+- the pipeline name, version, configuration digest, and detectors; the policy
+  version; the run timestamp and reference date; and the operator and request
+  identifiers;
+- the attestation, or the expert report reference;
+- its own SHA-256 over the canonical artifact. This is an integrity digest,
+  not a signature: it exposes corruption or an edit that did not recompute it.
+
+`validate_evidence` fails closed on an incomplete, inconsistent, or altered
+artifact, one from an unknown pipeline version, or one presented with records
+it does not describe. A feature requires a method generically, without a
+domain-specific mode:
+
+```python
+validate_evidence(result.evidence, result.records,
+                  required_assurance="safe_harbor")
+```
+
+A save additionally requires the artifact's assurance to equal the config's
+whenever the config names one (`safe_harbor` for the preset). The artifact and
+the records are written in one transaction, artifact first, as
+content-addressed files (encrypted at rest when a data key is configured)
+whose metadata holds only the evidence id, assurance, and digests.
+`DeidentificationResult.export_bundle()` is the export form: it re-verifies and
+embeds the artifact verbatim.
+
+The gate binds content, not provenance. Like the rest of the privacy layer, it
+cannot tell the pipeline from same-process code that assembles a
+self-consistent artifact; what it guarantees is that no record is saved or
+exported without an artifact describing exactly that record, and that the
+record carries no identifier pattern the pipeline would have removed.
 
 ## 4. Custom Configurations
 

@@ -9,6 +9,9 @@ The wrapper intercepts all storage operations and:
 2. ISOLATED mode: Redirects to in-memory session storage
 3. ANONYMOUS mode: Applies PII scrubbing before storage
 4. NORMAL/PUBLIC mode: Passes through to underlying storage
+5. DEIDENTIFIED mode: Refuses every generic write; the only durable write is
+   ``store_deidentified_records``, which requires a validated de-identification
+   evidence artifact (see :mod:`kestrel_sovereign.deidentification`)
 
 This is a defense-in-depth measure - even if application code forgets to
 check privacy mode, the storage layer will enforce it.
@@ -34,6 +37,13 @@ from enum import Enum
 from dataclasses import dataclass
 
 from kestrel_sovereign.turn_scope import turn_scoped
+from kestrel_sovereign.deidentification import (
+    DEIDENTIFICATION_ASSURANCES,
+    DeidentificationResult,
+    EvidenceValidationError,
+    verify_deidentified_records,
+)
+from kestrel_sovereign.deidentification.evidence import canonical_json_bytes
 from kestrel_sovereign.privacy import (
     PrivacyMode,
     PrivacyConfig,
@@ -608,9 +618,10 @@ def _resolve_transition_lock(holder):
 #
 # The knowledge graph is durable storage. In a volatile privacy mode —
 # EPHEMERAL ("leave no trace"), ISOLATED ("session buffer only"), and
-# DEIDENTIFIED (fail-closed until the Safe Harbor pipeline lands): every mode
-# whose policy disallows persistent writes — a durable graph write is a real
-# privacy leak. Facts, todos, decisions, concepts, and consolidated episodes
+# DEIDENTIFIED (raw content never persists; only evidence-backed de-identified
+# records do, through ``store_deidentified_records``): every mode whose policy
+# disallows persistent writes — a durable graph write is a real privacy leak.
+# Facts, todos, decisions, concepts, and consolidated episodes
 # are all derived from user conversation input. The pre-#2672 wrapper waved
 # every graph write through as "structural, not PII", which let those
 # user-derived nodes reach the backend directly, *outside* the #1760
@@ -1307,11 +1318,12 @@ class PrivacyPolicy:
         else:
             raise TypeError(f"Expected PrivacyMode, PrivacyConfig, or str, got {type(mode)}")
         
-        # Build policy from config flags. ``deidentified`` persistence is
-        # fail-closed until the Safe Harbor / Expert Determination evidence
-        # pipeline is in place; it must not silently degrade to full storage.
-        # When that pipeline enables writes, this branch must be replaced with
-        # evidence-backed de-identification rather than plain PII redaction.
+        # Build policy from config flags. ``deidentified`` refuses every
+        # generic write: a conversation turn, file, graph node, or assertion
+        # carries raw content and no evidence artifact, and plain PII redaction
+        # is not de-identification. The one durable write this mode admits is
+        # ``PrivacyEnforcingStorage.store_deidentified_records``, which takes a
+        # pipeline result and validates its evidence before persisting it.
         if config.requires_deidentification():
             return PrivacyPolicy(
                 allow_persistent_write=False,
@@ -1414,6 +1426,21 @@ REQUIRED_TRACE_STORES = frozenset({
     "session_projection",
 })
 
+
+DEIDENTIFICATION_EVIDENCE_KIND = "deidentification_evidence"
+DEIDENTIFIED_RECORDS_KIND = "deidentified_records"
+DEIDENTIFIED_RECORDS_SCHEMA = "kestrel.deidentification.records/v1"
+
+
+@dataclass(frozen=True)
+class DeidentifiedSaveReceipt:
+    """Where an evidence-gated de-identified save put its two documents."""
+
+    evidence_id: str
+    assurance: str
+    evidence_file_hash: str
+    records_file_hash: str
+    record_count: int
 
 
 class EphemeralPurgeReport(dict):
@@ -1627,6 +1654,10 @@ class PrivacyEnforcingStorage:
         # a transition landing between the binding and a commit would classify a
         # write under a policy that is no longer in force.
         self._active_ledger_assertion_leases = 0
+        # An evidence-gated de-identified save checks the privacy config and
+        # then awaits two durable writes; a transition must not land between
+        # the check and the commit.
+        self._active_deidentified_save_leases = 0
         # One projection lock per canonical ledger file, so overlapping passes
         # over the same ledger serialize while unrelated ledgers do not queue
         # behind one another.  Declared here rather than minted on first use:
@@ -2359,14 +2390,16 @@ class PrivacyEnforcingStorage:
                     or self._active_semantic_artifact_producer_leases > 0
                     or self._active_session_projection_leases > 0
                     or self._active_ledger_assertion_leases > 0
+                    or self._active_deidentified_save_leases > 0
                 )
             ):
                 raise PrivacyViolationError(
                     "privacy configuration transition refused while an "
                     "explicit semantic fact, vector operation, governed artifact "
-                    "producer, strategy-ledger assertion projection, or "
-                    "session-projection read is in flight; retry the transition "
-                    "after that operation completes"
+                    "producer, strategy-ledger assertion projection, "
+                    "de-identified record save, or session-projection read is "
+                    "in flight; retry the transition after that operation "
+                    "completes"
                 )
             was_ephemeral = old_config.is_ephemeral()
             is_ephemeral = new_config.is_ephemeral()
@@ -2794,6 +2827,124 @@ class PrivacyEnforcingStorage:
         if self._policy.use_session_storage and content_hash in self._session_files:
             return self._session_files[content_hash]
         return await self._storage.retrieve_file(content_hash)
+
+    # === De-identified records (evidence-gated) ===
+    #
+    # DEIDENTIFIED refuses every generic write above. This is the one durable
+    # write it admits, and it admits nothing without a de-identification
+    # evidence artifact: the records and their artifact are persisted together
+    # in one transaction, the artifact first, so no de-identified record can
+    # exist in storage without the audit record that authorized it.
+
+    def _assert_deidentified_save_allowed(self, assurance: str) -> None:
+        config = self._privacy_config
+        if config.assurance in DEIDENTIFICATION_ASSURANCES and assurance != config.assurance:
+            raise PrivacyViolationError(
+                "De-identified save blocked: the current privacy config "
+                f"requires {config.assurance!r} evidence, the artifact backs "
+                f"{assurance!r}."
+            )
+        if config.requires_deidentification():
+            return
+        if self._policy.use_session_storage or not self._policy.allow_persistent_write:
+            raise PrivacyViolationError(
+                "De-identified save blocked: persistent writes are disabled in "
+                f"the current privacy config (storage={config.storage})."
+            )
+
+    def _acquire_deidentified_save_lease(self, assurance: str) -> None:
+        with self._explicit_fact_lease_lock:
+            self._assert_deidentified_save_allowed(assurance)
+            self._active_deidentified_save_leases += 1
+
+    def _release_deidentified_save_lease(self) -> None:
+        with self._explicit_fact_lease_lock:
+            if self._active_deidentified_save_leases <= 0:
+                raise RuntimeError("de-identified save privacy lease underflow")
+            self._active_deidentified_save_leases -= 1
+
+    async def store_deidentified_records(
+        self, result: DeidentificationResult
+    ) -> "DeidentifiedSaveReceipt":
+        """Persist de-identified records together with their evidence artifact.
+
+        ``result`` must come from
+        :class:`~kestrel_sovereign.deidentification.DeidentificationPipeline`.
+        Its artifact is re-validated against the records (completeness, the
+        output digests, its own digest, residual identifier patterns) before
+        anything is written, and the records serialized are exactly the ones
+        validated. Whenever the config names a de-identification assurance
+        (``safe_harbor`` for the DEIDENTIFIED preset) the artifact must back
+        it; other persistent modes accept any valid artifact; EPHEMERAL and
+        ISOLATED refuse.
+
+        This binds content, not provenance: same-process code that assembles a
+        self-consistent artifact for records it chose cannot be told apart from
+        the pipeline, exactly as the graph boundary above states for its own
+        capability. What it cannot do is save records its artifact does not
+        describe, or records still carrying a detectable identifier pattern.
+
+        Both documents are stored as content-addressed files (encrypted at rest
+        when a data key is configured). Their metadata is content-free: the
+        evidence id, assurance, and digests.
+        """
+        # Exact type: a subclass could override verify() or records_as_dicts().
+        if type(result) is not DeidentificationResult:
+            raise PrivacyViolationError(
+                "De-identified save blocked: a DeidentificationResult produced "
+                "by the de-identification pipeline is required."
+            )
+        evidence = result.evidence
+        records = [dict(record) for record in result.records]
+        try:
+            verify_deidentified_records(evidence, records)
+        except EvidenceValidationError as exc:
+            raise PrivacyViolationError(
+                f"De-identified save blocked: invalid evidence artifact ({exc})."
+            ) from exc
+        evidence_bytes = evidence.to_json_bytes()
+        base_metadata = {
+            "evidence_id": evidence.evidence_id,
+            "assurance": evidence.assurance,
+            "artifact_digest": evidence.artifact_digest,
+            "record_count": len(records),
+        }
+        self._acquire_deidentified_save_lease(evidence.assurance)
+        try:
+            async with self._storage.transaction():
+                evidence_hash = await self._storage.store_file(
+                    evidence_bytes,
+                    f"deidentification-evidence-{evidence.evidence_id}.json",
+                    {"kind": DEIDENTIFICATION_EVIDENCE_KIND, **base_metadata},
+                )
+                records_bytes = canonical_json_bytes({
+                    "schema": DEIDENTIFIED_RECORDS_SCHEMA,
+                    "evidence_id": evidence.evidence_id,
+                    "evidence_file_hash": evidence_hash,
+                    "records": records,
+                })
+                records_hash = await self._storage.store_file(
+                    records_bytes,
+                    f"deidentified-records-{evidence.evidence_id}.json",
+                    {
+                        "kind": DEIDENTIFIED_RECORDS_KIND,
+                        "evidence_file_hash": evidence_hash,
+                        **base_metadata,
+                    },
+                )
+        finally:
+            self._release_deidentified_save_lease()
+        logger.info(
+            "Stored %d de-identified record(s) under evidence %s (assurance=%s)",
+            len(records), evidence.evidence_id, evidence.assurance,
+        )
+        return DeidentifiedSaveReceipt(
+            evidence_id=evidence.evidence_id,
+            assurance=evidence.assurance,
+            evidence_file_hash=evidence_hash,
+            records_file_hash=records_hash,
+            record_count=len(records),
+        )
     
     # === Graph Storage (privacy-governed durable writes — #2672) ===
     #

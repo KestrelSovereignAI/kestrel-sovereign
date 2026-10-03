@@ -50,8 +50,12 @@ class TestPrivacyPolicy:
         assert policy.require_anonymization is False
         assert policy.allow_cloud_backup is True
 
-    def test_deidentified_policy_fails_closed_until_evidence_pipeline_exists(self):
-        """DEIDENTIFIED must not silently degrade to ordinary persistence."""
+    def test_deidentified_policy_refuses_generic_writes(self):
+        """DEIDENTIFIED must not silently degrade to ordinary persistence.
+
+        Its only durable write is the evidence-gated
+        ``store_deidentified_records`` (tests/unit/test_deidentified_storage_gate.py).
+        """
         policy = PrivacyPolicy.for_mode(PrivacyMode.DEIDENTIFIED)
         assert policy.allow_persistent_write is False
         assert policy.require_anonymization is False
@@ -276,7 +280,7 @@ class TestNormalMode:
 
 
 class TestDeidentifiedMode:
-    """Tests for DEIDENTIFIED fail-closed enforcement."""
+    """DEIDENTIFIED refuses generic writes; raw content carries no evidence."""
 
     @pytest.fixture
     def mock_storage(self):
@@ -290,7 +294,7 @@ class TestDeidentifiedMode:
         return PrivacyEnforcingStorage(mock_storage, PrivacyMode.DEIDENTIFIED)
 
     @pytest.mark.asyncio
-    async def test_blocks_conversation_until_evidence_pipeline_exists(
+    async def test_blocks_conversation_without_evidence(
         self, deidentified_storage, mock_storage
     ):
         with pytest.raises(PrivacyViolationError):
@@ -299,7 +303,7 @@ class TestDeidentifiedMode:
         mock_storage.add_conversation.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_blocks_file_until_evidence_pipeline_exists(
+    async def test_blocks_file_without_evidence(
         self, deidentified_storage, mock_storage
     ):
         with pytest.raises(PrivacyViolationError):
