@@ -14,6 +14,11 @@ from kestrel_sovereign.features.strategic_memory.github_integration import (
     github_api_get,
     github_api_post,
 )
+from kestrel_sovereign.features.strategic_memory.run_history import (
+    RunHistory,
+    TalonRun,
+)
+from kestrel_sovereign.features.strategic_memory.timestamps import parse_instant
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +76,60 @@ EXCLUDED_OPEN_PR = "open_pr"
 EXCLUDED_STALLED_PR = "stalled_pr"
 EXCLUDED_PR_LINKAGE_UNREADABLE = "pr_linkage_unreadable"
 
+#: Exclusion reasons reported in ``diagnostics["run_exclusions"]`` (#3398).
+EXCLUDED_UNCHANGED_SINCE_RUN = "unchanged_since_run"
+EXCLUDED_RETRY_EVIDENCE_UNREADABLE = "retry_evidence_unreadable"
+
+#: Exclusions that withhold an issue because GitHub could not answer, not
+#: because it answered "busy". Counted as unreadable so an outage renders as
+#: one rather than as nothing to do.
+_UNREADABLE_EXCLUSIONS = frozenset(
+    {EXCLUDED_PR_LINKAGE_UNREADABLE, EXCLUDED_RETRY_EVIDENCE_UNREADABLE}
+)
+
+#: The label that tells Talon an issue is ready to work. Applied after a run
+#: that asked a question, it is a deliberate go-ahead. Removing
+#: ``agent-blocked`` is not: it has been used both for "retry" and for
+#: "acknowledged, stop re-picking it" (#3398), so removal authorizes nothing.
+RETRY_READINESS_LABELS = frozenset({"agent-ready"})
+
+#: Comment authors who speak for the repository: its maintainers, and the
+#: orchestrator, whose account can label issues and so is at least a
+#: collaborator. A stranger's comment on a public repository must not be able
+#: to re-arm a dispatch that writes code.
+_AUTHORIZING_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+#: How every comment Talon posts begins: ``**Kestrel Talon``
+#: (``kestreltalon/models.py`` ``TALON_COMMENT_MARKER``, #185) or a
+#: ``<!-- kestrel-talon:`` claim-record marker (``claim_record.py``). Talon
+#: posts under the operator's own account, so author association cannot tell
+#: its comments about a run from a maintainer's answer to it; its markers can.
+#: ``test_the_retry_vocabulary_matches_talons`` pins the copy.
+TALON_COMMENT_PREFIXES = ("**Kestrel Talon", "<!-- kestrel-talon:")
+
+#: What happened on an issue since a given moment that could authorize a
+#: retry: comments, labels applied, title renames, and the body's last edit.
+#: The most recent items only -- anything that authorizes a retry is newer
+#: than the run it follows, and a window full of newer items that authorize
+#: nothing withholds, which is the safe direction.
+_RETRY_EVIDENCE_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      lastEditedAt
+      timelineItems(last: 50, itemTypes: [ISSUE_COMMENT, LABELED_EVENT, RENAMED_TITLE_EVENT]) {
+        nodes {
+          __typename
+          ... on IssueComment { createdAt authorAssociation body }
+          ... on LabeledEvent { createdAt label { name } }
+          ... on RenamedTitleEvent { createdAt }
+        }
+      }
+    }
+  }
+}
+"""
+
 
 def parse_issue_ref(value: object) -> tuple[Optional[str], Optional[int]]:
     """Split an issue reference into its repository and its number.
@@ -109,7 +168,9 @@ def parse_issue_ref(value: object) -> tuple[Optional[str], Optional[int]]:
 
 
 async def pick_top_issue(
-    data: Dict[str, Any], diagnostics: Optional[Dict[str, Any]] = None
+    data: Dict[str, Any],
+    diagnostics: Optional[Dict[str, Any]] = None,
+    run_history: Optional[RunHistory] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return the highest-priority issue represented by strategic memory.
 
@@ -122,6 +183,11 @@ async def pick_top_issue(
     ``diagnostics["open_pr_exclusions"]`` lists every candidate passed over
     because an open pull request already works it (or GitHub could not say),
     so the dispatch can report what it skipped instead of staying silent.
+
+    ``diagnostics["run_exclusions"]`` does the same for candidates whose most
+    recent Talon run in ``run_history`` stopped to ask a question, with
+    nothing on the issue since that authorizes a retry (#3398). ``None``
+    means the caller has no Talon registry, so no issue has a last run.
 
     ``candidates_checked`` and ``candidates_unreadable`` do the same for the
     milestone and backlog passes: how many distinct candidates had their PR
@@ -137,6 +203,7 @@ async def pick_top_issue(
     diagnostics.setdefault("candidates_checked", 0)
     diagnostics.setdefault("candidates_unreadable", 0)
     exclusions = diagnostics.setdefault("open_pr_exclusions", [])
+    run_exclusions = diagnostics.setdefault("run_exclusions", [])
     token = get_github_token()
     if not token:
         logger.info("No GITHUB_TOKEN — cannot pick top issue")
@@ -172,6 +239,65 @@ async def pick_top_issue(
                 )
         return linkage[key]
 
+    # One post-run activity read per distinct (repo, number), like linkage.
+    awaiting: Dict[Tuple[str, int], Optional[Dict[str, Any]]] = {}
+
+    async def awaiting_new_input(
+        repo: str, issue_number: int
+    ) -> Optional[Dict[str, Any]]:
+        """The exclusion for an issue whose last Talon run is still the answer.
+
+        A run that ended blocked or clarifying has said what it needs. Until
+        something newer than that run -- a maintainer or orchestrator comment,
+        an issue edit, ``agent-ready`` applied -- changes its input, a new
+        dispatch is the same run again (#3398: #3093 dispatched three times,
+        blocked three times, nothing to implement in this repository).
+        Labels are not consulted for this: removing ``agent-blocked`` has
+        meant both "retry" and "stop".
+        """
+        run = (
+            run_history.latest(repo, issue_number)
+            if run_history is not None
+            else None
+        )
+        if run is None or not run.ended_with_question:
+            return None
+        key = (repo, issue_number)
+        if key not in awaiting:
+            evidence = await _fetch_retry_evidence(repo, issue_number, token)
+            authorized_by = (
+                None
+                if evidence is None
+                else _retry_authorization(evidence, run.completed_at)
+            )
+            if authorized_by is not None:
+                logger.info(
+                    "%s#%s: Talon job %s ended %s; retry authorized by %s",
+                    repo, issue_number, run.job_id, run.disposition, authorized_by,
+                )
+                awaiting[key] = None
+            else:
+                awaiting[key] = _run_exclusion(
+                    repo,
+                    issue_number,
+                    run,
+                    EXCLUDED_RETRY_EVIDENCE_UNREADABLE
+                    if evidence is None
+                    else EXCLUDED_UNCHANGED_SINCE_RUN,
+                )
+                run_exclusions.append(awaiting[key])
+                logger.info(
+                    "Not dispatching %s#%s: %s", repo, issue_number,
+                    describe_exclusion(awaiting[key]),
+                )
+        return awaiting[key]
+
+    async def withheld(repo: str, issue_number: int) -> Optional[Dict[str, Any]]:
+        """Why a live candidate must not be dispatched now, or ``None``."""
+        return await in_flight(repo, issue_number) or await awaiting_new_input(
+            repo, issue_number
+        )
+
     # Distinct (repo, number) per milestone/backlog candidate: the same issue
     # can sit in a milestone and in the backlog scan, and is one candidate.
     candidates_checked: set = set()
@@ -180,12 +306,12 @@ async def pick_top_issue(
     async def first_free(repo: str, issues: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         for candidate in _ranked_candidates(issues):
             key = (repo, candidate["number"])
-            exclusion = await in_flight(*key)
+            exclusion = await withheld(*key)
             candidates_checked.add(key)
             diagnostics["candidates_checked"] = len(candidates_checked)
             if exclusion is None:
                 return candidate
-            if exclusion["reason"] == EXCLUDED_PR_LINKAGE_UNREADABLE:
+            if exclusion["reason"] in _UNREADABLE_EXCLUSIONS:
                 # Withheld, correctly, but not confirmed busy: counted so an
                 # outage cannot render as an empty backlog (#3367), as the
                 # blocker pass does for its own unreadable reads.
@@ -252,12 +378,13 @@ async def pick_top_issue(
                 repo, issue_number, sorted(owned_by),
             )
             continue
-        exclusion = await in_flight(repo, issue_number)
+        exclusion = await withheld(repo, issue_number)
         if exclusion is not None:
-            if exclusion["reason"] == EXCLUDED_PR_LINKAGE_UNREADABLE:
-                # Not confirmed free of in-flight work is not confirmed at
-                # all: it counts with the unreadable issues, so a GitHub
-                # outage still renders as one rather than as "nothing to do".
+            if exclusion["reason"] in _UNREADABLE_EXCLUSIONS:
+                # Not confirmed free of in-flight work (or of a run still
+                # waiting on an answer) is not confirmed at all: it counts
+                # with the unreadable issues, so a GitHub outage still
+                # renders as one rather than as "nothing to do".
                 diagnostics["blockers_unreadable"] += 1
             continue
         return {
@@ -394,15 +521,97 @@ async def _fetch_open_linked_pull_requests(
     ]
 
 
-def _days_since(timestamp: object, now: datetime) -> Optional[int]:
-    if not isinstance(timestamp, str) or not timestamp.strip():
+async def _fetch_retry_evidence(
+    repo: str, issue_number: int, token: str
+) -> Optional[Dict[str, Any]]:
+    """The issue's recent activity, or ``None`` when GitHub cannot say.
+
+    ``{"last_edited_at": <body's last edit or None>, "timeline": [nodes]}``.
+    Never raises.
+    """
+    owner, _, name = repo.partition("/")
+    try:
+        response = await github_api_post(
+            "/graphql",
+            token,
+            {
+                "query": _RETRY_EVIDENCE_QUERY,
+                "variables": {"owner": owner, "name": name, "number": issue_number},
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - selection must not crash dispatch
+        logger.debug(
+            "Could not read post-run activity for %s#%s: %s", repo, issue_number, exc
+        )
+        return None
+    if not isinstance(response, dict) or response.get("errors"):
         return None
     try:
-        moment = datetime.fromisoformat(timestamp.strip().replace("Z", "+00:00"))
-    except ValueError:
+        issue = response["data"]["repository"]["issue"]
+        nodes = issue["timelineItems"]["nodes"]
+    except (KeyError, TypeError):
         return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
+    if not isinstance(nodes, list):
+        return None
+    return {
+        "last_edited_at": issue.get("lastEditedAt"),
+        "timeline": [node for node in nodes if isinstance(node, dict)],
+    }
+
+
+def _retry_authorization(evidence: Dict[str, Any], since: datetime) -> Optional[str]:
+    """What on the issue, strictly newer than ``since``, authorizes a retry.
+
+    ``None`` when nothing does. A body edit or title change is new input to
+    the next run; so is a maintainer's or the orchestrator's comment --
+    Talon reads the issue's comments, so a run after one is not the same run
+    again. Talon's own comments about the run it just finished, a stranger's
+    comment, and any label other than :data:`RETRY_READINESS_LABELS` are not.
+    """
+    edited = parse_instant(evidence.get("last_edited_at"))
+    if edited is not None and edited > since:
+        return f"an issue edit at {edited.isoformat()}"
+    for item in reversed(evidence.get("timeline") or ()):
+        created = parse_instant(item.get("createdAt"))
+        if created is None or created <= since:
+            continue
+        kind = item.get("__typename")
+        if kind == "IssueComment" and _comment_speaks_for_repository(item):
+            return f"a comment at {created.isoformat()}"
+        if kind == "LabeledEvent":
+            label = item.get("label")
+            name = label.get("name") if isinstance(label, dict) else None
+            if isinstance(name, str) and name.lower() in RETRY_READINESS_LABELS:
+                return f"{name} applied at {created.isoformat()}"
+        if kind == "RenamedTitleEvent":
+            return f"a title change at {created.isoformat()}"
+    return None
+
+
+def _comment_speaks_for_repository(comment: Dict[str, Any]) -> bool:
+    if comment.get("authorAssociation") not in _AUTHORIZING_ASSOCIATIONS:
+        return False
+    body = comment.get("body")
+    return not (isinstance(body, str) and body.lstrip().startswith(TALON_COMMENT_PREFIXES))
+
+
+def _run_exclusion(
+    repo: str, issue_number: int, run: TalonRun, reason: str
+) -> Dict[str, Any]:
+    return {
+        "repo": repo,
+        "issue_number": issue_number,
+        "reason": reason,
+        "job_id": run.job_id,
+        "disposition": run.disposition,
+        "completed_at": run.completed_at.isoformat(),
+    }
+
+
+def _days_since(timestamp: object, now: datetime) -> Optional[int]:
+    moment = parse_instant(timestamp)
+    if moment is None:
+        return None
     return max(0, (now - moment).days)
 
 
@@ -458,6 +667,26 @@ def describe_exclusion(exclusion: Dict[str, Any]) -> str:
     """One line an orchestrator can read: ``skipped o/r#3310 -- PR #3311 open``."""
     target = f"{exclusion['repo']}#{exclusion['issue_number']}"
     reason = exclusion.get("reason")
+    if reason in (EXCLUDED_UNCHANGED_SINCE_RUN, EXCLUDED_RETRY_EVIDENCE_UNREADABLE):
+        completed = parse_instant(exclusion.get("completed_at"))
+        when = (
+            completed.strftime("%Y-%m-%d %H:%M UTC")
+            if completed is not None
+            else exclusion.get("completed_at")
+        )
+        run = (
+            f"Talon job {str(exclusion.get('job_id'))[:8]} ended "
+            f"{exclusion.get('disposition')} at {when} without a PR"
+        )
+        if reason == EXCLUDED_RETRY_EVIDENCE_UNREADABLE:
+            return (
+                f"skipped {target} -- {run}, and GitHub could not say whether "
+                "anything since authorizes a retry"
+            )
+        return (
+            f"skipped {target} -- {run}, and nothing since authorizes a retry "
+            "(a maintainer or orchestrator comment, an issue edit, or agent-ready)"
+        )
     if reason == EXCLUDED_PR_LINKAGE_UNREADABLE:
         return (
             f"skipped {target} -- GitHub could not say whether an open PR "

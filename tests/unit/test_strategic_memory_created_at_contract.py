@@ -38,6 +38,7 @@ from kestrel_sovereign.features.strategic_memory.ledger_index import (
 )
 from kestrel_sovereign.features.strategic_memory.timestamps import (
     contract_created_at,
+    parse_instant,
     stamp_created_at,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -69,6 +70,27 @@ MIDNIGHT = "2026-07-01T00:00:00+00:00"
 )
 def test_contract_created_at(value, expected, new_york_clock):
     assert contract_created_at(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("2026-09-24T08:41:00Z", datetime(2026, 9, 24, 8, 41, tzinfo=timezone.utc)),
+        ("2026-09-24T08:41:00+00:00", datetime(2026, 9, 24, 8, 41, tzinfo=timezone.utc)),
+        ("2026-09-24T10:41:00+02:00", datetime(2026, 9, 24, 8, 41, tzinfo=timezone.utc)),
+        (" 2026-09-24T08:41:00 ", datetime(2026, 9, 24, 8, 41, tzinfo=timezone.utc)),  # naive is UTC
+        ("", None),
+        ("   ", None),
+        (None, None),
+        (1727167260, None),
+        ("yesterday", None),
+    ],
+)
+def test_parse_instant(value, expected, new_york_clock):
+    parsed = parse_instant(value)
+    assert parsed == expected
+    if parsed is not None:
+        assert parsed.utcoffset() == timedelta(0)
 
 
 def test_stamp_leaves_the_key_absent_when_nothing_is_known():
