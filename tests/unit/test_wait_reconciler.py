@@ -856,8 +856,12 @@ async def test_first_delivery_carries_no_retry_provenance(make_agent):
     payload = dispatcher.signals[0].payload
     assert payload["delivery_attempt"] == 1
     assert payload["delivery_max_attempts"] == MAX_DELIVERY_ATTEMPTS
+    assert payload["delivery_retry"] is False
     assert payload["delivery_previous_status"] == ""
     assert payload["delivery_previous_attempt_at"] == ""
+    assert payload["delivery_previous_attempts"] == 0
+    assert payload["delivery_last_delivered_at"] == ""
+    assert payload["delivery_replay"] is False
 
 
 @pytest.mark.asyncio
@@ -880,8 +884,11 @@ async def test_a_retry_is_distinguishable_from_a_first_delivery(make_agent):
 
     first, retry = quiet.signals[0].payload, quiet.signals[1].payload
     assert first["delivery_attempt"] == 1
+    assert first["delivery_retry"] is False
     assert retry["delivery_attempt"] == 2
+    assert retry["delivery_retry"] is True
     assert retry["delivery_previous_status"] == "dropped_quiet_hours"
+    assert retry["delivery_previous_attempts"] == 1
     assert retry["delivery_previous_attempt_at"], (
         "a retry must say when the attempt it is repeating was made"
     )
@@ -890,8 +897,10 @@ async def test_a_retry_is_distinguishable_from_a_first_delivery(make_agent):
     # ...and they differ ONLY in provenance — the subject did not change.
     provenance = {
         "delivery_attempt",
+        "delivery_retry",
         "delivery_previous_status",
         "delivery_previous_attempt_at",
+        "delivery_previous_attempts",
     }
     assert {k for k in first if first[k] != retry[k]} == provenance
 
@@ -929,27 +938,43 @@ async def test_a_corrected_terminal_state_is_news_not_a_retry(make_agent):
     A provider is allowed to correct a terminal state within one Outcome —
     talon's ``finished_unknown -> failed`` when the exit sidecar lands late —
     and that correction re-signals by design. It is the first wake for a new
-    transition, so it must read as attempt 1 with no prior delivery. Counting
-    it as attempt 2 of the superseded transition is the same confusion the
-    provenance exists to remove, one field inward: it labels genuinely new
-    information as a repeat, and it brings the retry cap forward against work
-    that was never retried."""
+    transition, so it reads as attempt 1 and is not a retry. Counting it as
+    attempt 2 of the superseded transition labels genuinely new information
+    as a repeat, and brings the retry cap forward against work that was never
+    retried.
+
+    It is not the handle's FIRST wake, though, and must not read as one
+    (#3390): the previous wake's real status, dispatch time, and attempt
+    count travel with it. Empty prior fields beside ``delivery_attempt=1``
+    are exactly what a first delivery carries, which is how weeks-old
+    completions replayed as news."""
     provider = _FakeProvider()
     provider.set("h1", Outcome.FAILED, data={"status": "finished_unknown"})
     dispatcher = _CapturingDispatcher()
     rec = WaitReconciler(await make_agent(provider, dispatcher))
 
     await rec.reconcile()
+    first_dispatch = (await rec._store.get("fake", "h1")).last_attempt_started_at
     await rec.reconcile()                      # delivered; attempt 1 of token A
     assert dispatcher.signals[0].payload["delivery_attempt"] == 1
+    delivered = await rec._store.get("fake", "h1")
+    assert delivered.last_delivered_at is not None
 
     provider.set("h1", Outcome.FAILED, data={"status": "failed"})
     await rec.reconcile()                      # token B — a NEW transition
 
     corrected = dispatcher.signals[1].payload
     assert corrected["delivery_attempt"] == 1
-    assert corrected["delivery_previous_status"] == ""
-    assert corrected["delivery_previous_attempt_at"] == ""
+    assert corrected["delivery_retry"] is False
+    assert corrected["delivery_previous_status"] == "ok_unbound"
+    assert corrected["delivery_previous_attempts"] == 1
+    assert corrected["delivery_previous_attempt_at"] == str(first_dispatch)
+    assert corrected["delivery_last_delivered_at"], (
+        "the handle was woken before, and the wake says so"
+    )
+    assert corrected["delivery_replay"] is False, (
+        "a provider that dates no event never has a wake labelled a replay"
+    )
     # The counter restarted in the ledger too, so the cap counts THIS
     # transition's retries rather than the handle's lifetime.
     row = await rec._store.get("fake", "h1")

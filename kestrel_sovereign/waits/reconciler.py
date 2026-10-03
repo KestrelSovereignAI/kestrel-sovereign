@@ -58,7 +58,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sdk.signals import Signal, SignalMode, Visibility
-from kestrel_sdk.tools import MonitorableWaitable, ToolResult, WaitStatus
+from kestrel_sdk.tools import MonitorableWaitable, Outcome, ToolResult, WaitStatus
 
 from kestrel_sovereign.signals.correlation import SignalWithDurableCorrelation
 from kestrel_sovereign.signals.dispatcher import (
@@ -69,13 +69,21 @@ from kestrel_sovereign.signals.durable import DurableConsumerRegistration
 from kestrel_sovereign.signals.sources.wait import (
     SOURCE_NAME as WAIT_COMPLETE_SOURCE,
 )
+from kestrel_sovereign.signals.sources.wait_replay import (
+    SOURCE_NAME as WAIT_REPLAY_SOURCE,
+)
 from kestrel_sovereign.storage.async_wait_signal_store import (
     DEFERRED_RATE_LIMITED,
     MAX_ATTEMPTS_EXCEEDED,
+    REKEY_IDENTITY_ADOPTED,
+    REKEY_IDENTITY_DROPPED,
+    REKEY_RECLASSIFIED,
+    REKEY_VIEW_SWITCHED,
     WaitSignalState,
     WaitSignalStore,
 )
 from kestrel_sovereign.waits.engine import (
+    TERMINAL_EVENT_AT_KEY,
     TERMINAL_EVENT_DETAIL_KEY,
     TERMINAL_EVENT_FINAL_KEY,
     TERMINAL_EVENT_KEY,
@@ -116,6 +124,8 @@ WAKE_REF_PAYLOAD_KEY = "ref"
 # the ledger.
 TERMINAL_EVENT_TOKEN_PREFIX = "event:"
 
+_OUTCOME_VALUES = frozenset(outcome.value for outcome in Outcome)
+
 
 def _outcome_token(status: Any) -> str:
     """The outcome-class token: the token every terminal poll got before
@@ -132,6 +142,52 @@ def _outcome_token(status: Any) -> str:
     if native:
         return f"{status.outcome.value}:{native}"
     return status.outcome.value
+
+
+def _native_status(outcome_token: str) -> Optional[str]:
+    """The native-status half of an outcome token, or ``None``.
+
+    ``"<outcome>:<native>"`` -> ``"<native>"``. ``None`` for a bare outcome
+    token, and for any string that is not an outcome token at all (an
+    unreadable identity token kept verbatim). The outcome values contain no
+    colon, so the first one separates the halves even when the native status
+    has its own.
+    """
+    outcome, sep, native = outcome_token.partition(":")
+    if not sep or not native or outcome not in _OUTCOME_VALUES:
+        return None
+    return native
+
+
+def _terminal_event_at(status: Any, kind: str, handle: str) -> Optional[datetime]:
+    """When the provider says this terminal event happened, as aware UTC
+    (:data:`~kestrel_sovereign.waits.engine.TERMINAL_EVENT_AT_KEY`), or
+    ``None`` when it does not say.
+
+    A value that does not parse is logged and treated as absent: the wake is
+    then not labelled a replay, which is what it was before the key existed.
+    """
+    raw = (status.data or {}).get(TERMINAL_EVENT_AT_KEY)
+    if raw is None or raw == "":
+        return None
+    parsed: Optional[datetime] = None
+    if isinstance(raw, datetime):
+        parsed = raw
+    elif isinstance(raw, str):
+        try:
+            parsed = datetime.fromisoformat(raw.strip())
+        except ValueError:
+            parsed = None
+    if parsed is None:
+        logger.warning(
+            "wait_reconcile: %s:%s has an unreadable %s %r; not judging "
+            "whether its wake is a replay",
+            kind, handle, TERMINAL_EVENT_AT_KEY, raw,
+        )
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _identity_part(value: Any) -> Optional[str]:
@@ -234,19 +290,51 @@ class TerminalToken:
           new execution whose first terminal read is also the view switch is
           absorbed, and the next distinct one still fires.
 
-        When one side names no event — a row delivered before its provider
-        named events, or a provider that names none — the outcome is the only
-        evidence both share, and it decides. That costs one wake at most: a
-        different event with the same outcome, settling across the upgrade,
-        is absorbed once, where the alternative replays every delivered wake.
+        When one side names no event — a provider that names none, or a row
+        delivered before its provider named events — the outcome token is the
+        only evidence both share, and only its native half when both carry
+        one. The outcome class is the provider's classification of its record,
+        not the record: when the native status is unchanged, a different class
+        is a re-labelled event, not a new one (#3390). Talon's switch to
+        classifying a clean exit by the run's disposition re-labelled every
+        ``done:complete`` job ``partial:complete`` and, compared whole, replayed
+        each as a first delivery. A native status that changes (talon
+        ``finished_unknown -> failed``) is still a new event. Without a native
+        status on both sides the whole outcome token decides. That costs one
+        wake at most across an upgrade to event names: a different event with
+        the same outcome is absorbed once, where the alternative replays every
+        delivered wake.
         """
         if self.event is None or other.event is None:
+            mine, theirs = _native_status(self.outcome), _native_status(other.outcome)
+            if mine is not None and theirs is not None:
+                return mine == theirs
             return self.outcome == other.outcome
         if self.event != other.event:
             return False
         if self.view != other.view:
             return True
         return self.detail == other.detail
+
+    def rekey_reason(self, previous: "TerminalToken") -> str:
+        """Why this token re-keys ``previous``, an earlier string for the
+        same event (one of the store's ``REKEY_*`` reasons).
+
+        A view switch explains whatever else differs (one execution can read
+        DONE through one view and PARTIAL through another). Otherwise a
+        re-labelled outcome is named before a change of token form, because a
+        classifier change that lands with the form change is the one an
+        auditor needs to see.
+        """
+        if self.switches_view_from(previous):
+            return REKEY_VIEW_SWITCHED
+        if self.outcome != previous.outcome:
+            return REKEY_RECLASSIFIED
+        # Same outcome and view: two tokens of one form would render alike,
+        # so what differs is whether the provider names the event.
+        if previous.event is None:
+            return REKEY_IDENTITY_ADOPTED
+        return REKEY_IDENTITY_DROPPED
 
     def switches_view_from(self, previous: "TerminalToken") -> bool:
         """Whether this token re-reads ``previous``'s event through another view."""
@@ -309,6 +397,27 @@ def wake_source(provider: Any) -> str:
     return getattr(provider, "signal", None) or WAIT_COMPLETE_SOURCE
 
 
+@dataclass(frozen=True)
+class _InFlightWake:
+    """What the reconciler knew about a wake when it enqueued it, kept until
+    the next tick harvests it.
+
+    In memory only, in lockstep with ``_pending_signal_tasks``: a wake whose
+    task is missing after a restart is a ``lost_at_restart`` soft-fail that is
+    re-detected and re-polled, so nothing here needs to outlive the process.
+    """
+
+    # Whether the wake was bound to an origin chat session (#2922). The
+    # reconciler decided to build the signal INTERNAL for want of an origin,
+    # so it is the honest source for "this wake never had a window to surface
+    # into".
+    bound: bool
+    # When the poll that built the wake began (#3390). This, not the harvest
+    # tick, dates the delivery: anything that finished after this instant was
+    # not in the wake, so it can never be judged older than it.
+    observed_at: datetime
+
+
 class WaitReconciler:
     """Generic two-phase wait→signal reconciler over ``agent.wait_registry``.
 
@@ -323,15 +432,11 @@ class WaitReconciler:
         # awaiting harvest. Survives across ticks because the reconciler is a
         # singleton on the agent.
         self._pending_signal_tasks: Dict[Tuple[str, str], Any] = {}
-        # (kind, handle) -> whether the in-flight wake was bound to an origin
-        # chat session (#2922). Kept beside the task map rather than derived at
-        # harvest time: the reconciler is the component that decided to build
-        # the signal INTERNAL for want of an origin, so it is the honest source
-        # for "this wake never had a window to surface into". Populated and
-        # dropped in lockstep with ``_pending_signal_tasks`` — an entry missing
-        # from that map is already a ``lost_at_restart`` soft-fail that never
-        # reaches the visibility accounting.
-        self._pending_signal_bindings: Dict[Tuple[str, str], bool] = {}
+        # (kind, handle) -> what was known about the in-flight wake when it was
+        # enqueued: its origin binding (#2922) and its poll time (#3390). Kept
+        # beside the task map rather than derived at harvest time, and
+        # populated and dropped in lockstep with it.
+        self._pending_signal_wakes: Dict[Tuple[str, str], _InFlightWake] = {}
         # The wait-signal scope is the agent's DID through the shared guard.
         # A missing identity refuses construction: an empty scope would bind
         # this agent's transitions to the solo-agent legacy bucket and read
@@ -427,7 +532,7 @@ class WaitReconciler:
                 # parent; we can't know whether the cognition turn fired.
                 # Soft-fail (DON'T set signaled_outcome) so the next tick
                 # re-detects + re-emits. record_delivery clears pending.
-                self._pending_signal_bindings.pop((kind, handle), None)
+                self._pending_signal_wakes.pop((kind, handle), None)
                 await store.record_delivery(
                     kind, handle,
                     delivery_status="lost_at_restart",
@@ -456,7 +561,8 @@ class WaitReconciler:
                 delivery_error = f"{type(e).__name__}: {e}"
 
             self._pending_signal_tasks.pop((kind, handle), None)
-            bound = self._pending_signal_bindings.pop((kind, handle), None)
+            wake = self._pending_signal_wakes.pop((kind, handle), None)
+            bound = wake.bound if wake is not None else None
 
             if status_value in _PERSISTED_STATES:
                 # The dispatcher accepted the wake and its turn ran, so the
@@ -478,6 +584,16 @@ class WaitReconciler:
                     signaled_outcome=target,
                     attempt_at=now,
                     surface_status=surface_status,
+                    # Dates the delivery for later replay checks (#3390) by
+                    # the wake's own poll time, never by ``now``: this harvest
+                    # runs a tick after the wake, and an event that finished
+                    # in between would read as older than it. A harvest that
+                    # lost its pending target has no token to date.
+                    delivered_at=(
+                        wake.observed_at
+                        if (wake is not None and target is not None)
+                        else None
+                    ),
                 )
                 signals_persisted += 1
                 if visibility == VISIBILITY_QUEUED:
@@ -579,6 +695,7 @@ class WaitReconciler:
             "signals_soft_failed": 0,
             "signals_skipped_no_dispatcher": 0,
             "signals_parked": 0,
+            "signals_rekeyed": 0,
         }
         # (kind, handle) processed this tick so a handle that is BOTH
         # monitorable-active AND explicitly watched isn't polled/emitted twice.
@@ -629,6 +746,7 @@ class WaitReconciler:
         signals_soft_failed += counters["signals_soft_failed"]
         signals_skipped_no_dispatcher += counters["signals_skipped_no_dispatcher"]
         signals_parked = counters["signals_parked"]
+        signals_rekeyed = counters["signals_rekeyed"]
 
         parts = [
             f"persisted={signals_persisted}",
@@ -655,6 +773,8 @@ class WaitReconciler:
             parts.append(f"deferred={signals_deferred}")
         if signals_parked:
             parts.append(f"parked={signals_parked}")
+        if signals_rekeyed:
+            parts.append(f"rekeyed={signals_rekeyed}")
         if signals_skipped_no_dispatcher:
             parts.append(
                 f"skipped_no_dispatcher={signals_skipped_no_dispatcher}"
@@ -688,6 +808,9 @@ class WaitReconciler:
                 # and still parked awaiting the provider's retry time.
                 "signals_deferred": signals_deferred,
                 "signals_parked": signals_parked,
+                # Delivered rows re-keyed to the token their event is now
+                # polled under, without a wake, and audited (#3390).
+                "signals_rekeyed": signals_rekeyed,
                 "signals_skipped_no_dispatcher": signals_skipped_no_dispatcher,
                 "pending_deliveries": len(self._pending_signal_tasks),
                 "transitions": transitions,
@@ -805,6 +928,11 @@ class WaitReconciler:
         the watched path passes poll-only providers here. Mutates ``counters``
         and appends to ``transitions``; a non-terminal handle is a no-op.
         """
+        # Taken BEFORE the poll, so it can only precede whatever the poll
+        # reports. A delivered wake is dated by it (#3390): an event that
+        # finishes after this instant is not in this wake, and is never judged
+        # older than it however long the harvest takes.
+        observed_at = datetime.now(timezone.utc)
         try:
             status = await provider.poll(handle)
         except Exception as e:
@@ -862,26 +990,38 @@ class WaitReconciler:
         owed = same_transition and attempts_target != delivered
 
         # A different string for the event already delivered: the provider
-        # started naming events after this row was written, re-labelled the
-        # event (#3390), or read it through another view (GitHub's Actions
-        # fallback names a run differently from the Checks API). None of those
-        # is news. Re-key the row, and any watch armed over it, to the current
-        # token without emitting, so later polls compare against it — after a
-        # view switch, a genuine re-run seen through the new view still fires.
+        # re-labelled the event (#3390 — a classifier change, any provider),
+        # started naming events after this row was written, or read it
+        # through another view (GitHub's Actions fallback names a run
+        # differently from the Checks API). None of those is news. Re-key the
+        # row, and any watch armed over it, to the current token without
+        # emitting, so later polls compare against it — after a view switch, a
+        # genuine re-run seen through the new view still fires. The store
+        # audits every re-key, since nothing else records it.
         previous = TerminalToken.parse(delivered) if delivered is not None else None
         if not owed and previous is not None and previous.names_same_event(current):
+            reason = current.rekey_reason(previous)
             adopted = await store.adopt_signaled_token(
                 kind, handle, previous=delivered, token=signaled_token,
+                reason=reason,
             )
-            if adopted and current.switches_view_from(previous):
+            if not adopted:
+                return
+            counters["signals_rekeyed"] += 1
+            if reason == REKEY_VIEW_SWITCHED:
                 logger.info(
                     "wait_reconcile: %s:%s terminal event %s now read through "
                     "view %r (was %r); not a new event — re-baselined without "
                     "a wake",
                     kind, handle, current.event, current.view, previous.view,
                 )
-            if adopted:
-                await self._retire_final_watch(store, kind, handle, state, status)
+            else:
+                logger.info(
+                    "wait_reconcile: %s:%s delivered terminal event re-keyed "
+                    "without a wake (%s): %r -> %r",
+                    kind, handle, reason, delivered, signaled_token,
+                )
+            await self._retire_final_watch(store, kind, handle, state, status)
             return
 
         if same_transition:
@@ -939,8 +1079,8 @@ class WaitReconciler:
         signal = self._build_signal(
             provider, kind, handle, status, attempts,
             origin_session_id=origin_session_id,
-            # Only THIS transition's prior attempt is provenance for it.
-            prior_state=state if same_transition else None,
+            prior_state=state,
+            same_transition=same_transition,
         )
 
         if dispatcher is None or not hasattr(dispatcher, "enqueue_signal"):
@@ -978,9 +1118,11 @@ class WaitReconciler:
         self._pending_signal_tasks[(kind, handle)] = handle_obj
         # Remember whether this wake had a chat window to surface into, so the
         # next tick's harvest can tell "nobody was listening" from "there was
-        # nowhere to listen" (#2922) instead of collapsing both into ``ok``.
-        self._pending_signal_bindings[(kind, handle)] = (
-            signal.visibility != Visibility.INTERNAL
+        # nowhere to listen" (#2922) instead of collapsing both into ``ok``,
+        # and when its poll began, which dates it if it is delivered (#3390).
+        self._pending_signal_wakes[(kind, handle)] = _InFlightWake(
+            bound=signal.visibility != Visibility.INTERNAL,
+            observed_at=observed_at,
         )
         counters["signals_enqueued"] += 1
 
@@ -1048,7 +1190,8 @@ class WaitReconciler:
         attempts: int,
         *,
         origin_session_id: Optional[str] = None,
-        prior_state: Any = None,
+        prior_state: Optional[WaitSignalState] = None,
+        same_transition: bool = False,
     ) -> Signal:
         """Build a COGNITION signal envelope for a terminal transition.
 
@@ -1058,12 +1201,30 @@ class WaitReconciler:
         spread underneath the generic kind/handle/outcome/summary keys so
         kind-specific templates (talon's) still find their fields.
 
+        A REPLAY goes to ``wait.replay`` instead (#3390): a wake whose event
+        the provider dates (``TERMINAL_EVENT_AT_KEY``) before this handle's
+        last delivered wake. The provider's own prompt may tell the agent to
+        act in the same turn, which is wrong for an event that happened before
+        the agent was last woken for it. The replay prompt says it is a
+        replay, withholds those instructions, and directs the agent to the
+        handle's current state.
+
         ``prior_state`` is this handle's ledger row as read at the top of
         :meth:`_process_handle` — the source of the delivery-provenance keys
         (#3105). A wake carries its subject's state AND its own: without the
         attempt count in the payload, a retry after a soft-failed dispatch is
         byte-identical to a first delivery, and an orchestrator woken 90
         minutes after a job ended reasonably reads it as news.
+
+        The ``delivery_previous_*`` keys describe the handle's previous
+        dispatch, whichever transition it was for (#3390). ``delivery_attempt``
+        still counts only this transition's attempts, because the retry cap
+        does, so a new transition on a handle already woken reads as attempt 1
+        — but with the earlier wake's real attempt count and status beside it,
+        never with empty fields that make it indistinguishable from the
+        handle's first wake. ``same_transition`` says whether the previous
+        dispatch was for this transition; it scopes the deferral count, which
+        belongs to a transition like the attempt count does (#3364).
 
         ``origin_session_id`` is the session that REGISTERED the work,
         resolved by :func:`_provider_origin_session` from the provider's own
@@ -1083,26 +1244,42 @@ class WaitReconciler:
         blank until a manual refresh — the persisted-but-unsurfaced half of
         the same bug. The rendered body comes from the source's
         ``result_summary`` callback (the frontend requires BOTH), which
-        ``talon.job_complete`` and ``restart.completed`` supply.
+        ``talon.job_complete``, ``wait.replay`` and ``restart.completed``
+        supply.
 
         An origin-less wake stays ``INTERNAL``: unattended cron/CLI dispatch
         has no chat window to surface into, and the notifications SSE stream
         is pinned to the agent rather than to a session, so emitting would
         paint a turn into whichever pane happens to be open.
         """
-        source = wake_source(provider)
-        prior_status = getattr(prior_state, "last_delivery_status", None)
         # A wake parked on a provider-advised wait (#3302) re-emits with its
         # refunded attempt number, so ``attempts > 1`` alone no longer says
         # "this is not the first try": a first attempt deferred for two hours
-        # is exactly the late wake #3105 exists to label.
-        deferrals = int(getattr(prior_state, "delivery_deferrals", 0) or 0)
+        # is exactly the late wake #3105 exists to label. Only this
+        # transition's deferrals count.
+        deferrals = (
+            int(prior_state.delivery_deferrals or 0)
+            if (prior_state is not None and same_transition)
+            else 0
+        )
         retried = attempts > 1 or deferrals > 0
+        prior_status = prior_state.last_delivery_status if prior_state else None
+        prior_attempts = prior_state.last_delivery_attempts if prior_state else 0
         # ``last_attempt_started_at``, not ``last_delivery_attempt_at``: the
         # latter is rewritten by Phase 0's harvest, so it answers "when did the
         # reconciler last look" rather than "when was the previous dispatch
         # tried". Measured 41 minutes apart on the live #3105 job.
-        prior_at = getattr(prior_state, "last_attempt_started_at", None)
+        prior_at = prior_state.last_attempt_started_at if prior_state else None
+        last_delivered_at = (
+            prior_state.delivered_at_utc() if prior_state is not None else None
+        )
+        event_at = _terminal_event_at(status, kind, handle)
+        replay = (
+            event_at is not None
+            and last_delivered_at is not None
+            and event_at < last_delivered_at
+        )
+        source = WAIT_REPLAY_SOURCE if replay else wake_source(provider)
         payload: Dict[str, Any] = {
             **(status.data or {}),
             "kind": kind,
@@ -1132,11 +1309,28 @@ class WaitReconciler:
             # count and make a retry read as a first delivery.
             "delivery_attempt": attempts,
             "delivery_max_attempts": MAX_DELIVERY_ATTEMPTS,
-            # Empty on a first attempt; on a retry, how the PREVIOUS dispatch
-            # of this same transition ended and when it was tried.
-            "delivery_previous_status": str(prior_status or "") if retried else "",
-            "delivery_previous_attempt_at": (
-                str(prior_at or "") if retried else ""
+            # Whether this wake re-sends a transition already dispatched.
+            "delivery_retry": retried,
+            # How this handle's previous dispatch ended, when it was tried,
+            # and how many attempts it had reached: this transition's previous
+            # attempt on a retry, the last wake of an earlier transition when
+            # this one is new (#3390). Empty only for a handle never
+            # dispatched before.
+            "delivery_previous_status": str(prior_status or ""),
+            "delivery_previous_attempt_at": str(prior_at or ""),
+            "delivery_previous_attempts": int(prior_attempts or 0),
+            # When a wake for this handle was last delivered, if one was.
+            "delivery_last_delivered_at": (
+                last_delivered_at.isoformat() if last_delivered_at else ""
+            ),
+            # The provider dates this event before that delivery (#3390).
+            "delivery_replay": replay,
+            # The provider's event time, normalized: a ``datetime`` it gave
+            # would not survive the durable payload's JSON.
+            **(
+                {TERMINAL_EVENT_AT_KEY: event_at.isoformat()}
+                if event_at is not None
+                else {}
             ),
             # How many times this wake was parked until a provider-advised
             # retry time before this dispatch (#3302). Those do not count
@@ -1468,6 +1662,12 @@ async def register_wait_resume_consumer(
     provider for the handle's actual state on every delivery. When the
     parked work is finished, retire the subscription with
     ``dispatcher.deactivate_durable_consumer(consumer_id=...)``.
+
+    A replay — a wake whose event the provider dates before the handle's
+    last delivered wake (#3390) — is announced on ``wait.replay``, not on the
+    provider's wake source, so it reaches no consumer: the consumer was
+    already woken by that later delivery, or registered after it and got
+    ``already_terminal``.
 
     The watch is armed *before* the consumer exists, and that order is an
     invariant. A consumer without a watch is an unrecoverable stall: an

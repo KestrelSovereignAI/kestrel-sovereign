@@ -24,8 +24,13 @@ from kestrel_sovereign.stop import (
     StopRequest,
     StopScope,
 )
-from kestrel_sovereign.stop.receipt import StopOperationClaim, opaque_stop_identifier
+from kestrel_sovereign.stop.receipt import (
+    STOP_OWNER_LEASE_SECONDS,
+    StopOperationClaim,
+    opaque_stop_identifier,
+)
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.database_clock import database_lease_cutoff_sql
 
 AGENT_DID = "did:test:claim-agent"
 # Older than any lease: an owner whose heartbeat reads this is proven dead.
@@ -79,6 +84,27 @@ async def _claim_row(db: AsyncDatabase, request: StopRequest):
         "WHERE operation_id = ?",
         (_operation_id(request),),
     )
+
+
+async def _outlive_one_lease(db: AsyncDatabase, request: StopRequest) -> str:
+    """Wait until the claim's current heartbeat is older than one lease.
+
+    Timed by the database clock the lease logic reads, not by asyncio's: a
+    claim still live afterwards was kept live by renewal alone. Returns the
+    heartbeat that was waited out.
+    """
+
+    _, _, heartbeat_at = await _claim_row(db, request)
+    cutoff_sql, cutoff_args = database_lease_cutoff_sql(
+        db, STOP_OWNER_LEASE_SECONDS
+    )
+    async with asyncio.timeout(STOP_OWNER_LEASE_SECONDS * 10):
+        while not await db.fetchval(
+            f"SELECT CASE WHEN ? <= {cutoff_sql} THEN 1 ELSE 0 END",
+            (heartbeat_at, *cutoff_args),
+        ):
+            await asyncio.sleep(0.05)
+    return heartbeat_at
 
 
 async def _receipt_count(db: AsyncDatabase, request: StopRequest) -> int:
@@ -139,19 +165,24 @@ async def test_a_claim_records_its_owner_and_heartbeat(db_backend):
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_a_live_owners_claim_is_never_taken_over(db_backend):
-    """Renewal keeps a claim live well past one lease; retries refuse."""
+    """Renewal keeps a claim live past its lease; retries refuse.
 
-    owner, retrier = await _stores(db_backend, 2, claim_lease_seconds=0.4)
+    This uses the production lease. A scaled-down lease turned a CI stall of a
+    few hundred milliseconds between heartbeats into a lost live claim.
+    """
+
+    owner, retrier = await _stores(db_backend, 2)
     request = _request()
     claim = await owner.claim(request)
 
     assert await retrier.claim(request) is None
     async with owner.hold_claim(claim):
-        await asyncio.sleep(1.2)  # three leases, renewed throughout
+        claimed_heartbeat = await _outlive_one_lease(owner._db, request)
         assert await retrier.claim(request) is None
 
-    claim_id, owner_id, _ = await _claim_row(owner._db, request)
+    claim_id, owner_id, heartbeat_at = await _claim_row(owner._db, request)
     assert (claim_id, owner_id) == (claim.claim_id, owner.owner_id)
+    assert heartbeat_at > claimed_heartbeat
     receipt = await owner.persist(
         request,
         _outcomes(request, StopDisposition.STOPPED),
@@ -371,7 +402,7 @@ async def test_crash_after_cancel_before_persist_retry_records_already_complete(
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_a_retry_during_a_live_owners_long_stop_is_refused(db_backend):
-    owner, retrier = await _stores(db_backend, 2, claim_lease_seconds=0.4)
+    owner, retrier = await _stores(db_backend, 2)
     request = _request()
     work = _Work()
     entered = asyncio.Event()
@@ -391,7 +422,7 @@ async def test_a_retry_during_a_live_owners_long_stop_is_refused(db_backend):
     )
     first = asyncio.create_task(authority.stop(request))
     await asyncio.wait_for(entered.wait(), timeout=5)
-    await asyncio.sleep(1.2)  # three leases into a still-running Stop
+    await _outlive_one_lease(owner._db, request)  # a still-running Stop
 
     retry = await _authority(retrier, work.cancel).stop(request)
 

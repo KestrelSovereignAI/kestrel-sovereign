@@ -551,6 +551,11 @@ async def test_clean_boot_reaches_ready(tmp_path):
         # domain feature: core hosts its six provider-neutral source contracts.
         assert all(name in agent.signal_registry for name in SOURCE_NAMES)
         assert "a2a.peer_stop" in agent.signal_registry
+        # Every wait wake the reconciler can build has a registered source:
+        # without ``wait.replay`` a replay would be dropped as unknown and
+        # locked away undelivered (#3390).
+        assert "wait.complete" in agent.signal_registry
+        assert "wait.replay" in agent.signal_registry
         from kestrel_sovereign.signals.sources.a2a import (
             DURABLE_COGNITION_CONSUMER_ID as A2A_COMPLETE_CONSUMER,
         )
