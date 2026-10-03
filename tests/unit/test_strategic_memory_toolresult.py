@@ -208,6 +208,17 @@ _TOP_ISSUE = {
 }
 
 
+def _agent_ready_issue(number, title, repo="o/r"):
+    """An open issue as GitHub's REST API returns it, on the allow-list."""
+    return {
+        "number": number,
+        "title": title,
+        "state": "open",
+        "repository_url": f"https://api.github.com/repos/{repo}",
+        "labels": [{"name": "agent-ready"}],
+    }
+
+
 def _dispatch_agent(*, registration=None, runner_result=None):
     operator_registry = SimpleNamespace(
         get_workflow_registration=lambda name: registration
@@ -573,10 +584,12 @@ async def test_signal_dispatch_does_not_call_unreadable_candidate_linkage_nothin
     monkeypatch.setattr(issue_selection, "get_github_token", lambda: "token")
 
     async def fake_get(path, token):
-        if path == "/repos/o/r/issues?state=open&per_page=5&sort=updated":
+        if path == (
+            "/repos/o/r/issues?state=open&labels=agent-ready&per_page=5&sort=updated"
+        ):
             return [
-                {"number": 1, "title": "a", "state": "open", "labels": []},
-                {"number": 2, "title": "b", "state": "open", "labels": []},
+                _agent_ready_issue(1, "a"),
+                _agent_ready_issue(2, "b"),
             ]
         raise RuntimeError(f"404 {path}")
 
@@ -802,15 +815,16 @@ def _talon_run(disposition="clarifying", job_id="9a63c66b2b71"):
 
 
 def _github_with_open_3093(monkeypatch):
-    """GitHub as the selector sees it: #3093 open and unlabelled, no PR on
-    it, and nothing on the issue newer than its last Talon run."""
+    """GitHub as the selector sees it: #3093 open, labelled ``agent-ready``
+    and no Talon state label, no PR on it, and nothing on the issue newer
+    than its last Talon run."""
     from kestrel_sovereign.features.strategic_memory import issue_selection
 
     monkeypatch.setattr(issue_selection, "get_github_token", lambda: "token")
 
     async def fake_get(path, token):
         if path == "/repos/o/r/issues/3093":
-            return {"number": 3093, "title": "epic", "state": "open", "labels": []}
+            return _agent_ready_issue(3093, "epic")
         if "/issues?" in path:
             return []
         raise RuntimeError(f"404 {path}")
@@ -982,7 +996,7 @@ async def test_signal_dispatch_does_not_redispatch_an_unanswered_run(mode, monke
     assert result.data["dispatched"] is False
     assert result.data["issue"] is None
     [skip] = result.data["skipped"]
-    assert skip["reason"] == "unchanged_since_run"
+    assert skip["reason"] == "run_history"
     assert "No actionable issue found." in result.confirmation
     assert (
         "skipped o/r#3093 -- Talon job 9a63c66b ended clarifying at "
@@ -1014,3 +1028,150 @@ async def test_signal_dispatch_reads_talons_history_without_polling(mode, monkey
     assert result.data["dispatched"] is (mode == "execute")
     assert provider.reads == 1
     assert provider.effects == []
+
+
+# ---------------------------------------------------------------------------
+# #3464: the allow-list, through signal_dispatch and the real selector
+# ---------------------------------------------------------------------------
+
+
+def _github_board(monkeypatch, issues, *, unreadable_activity=()):
+    """GitHub serving ``issues`` by ``(repo, number)``: no PR links any of
+    them, nothing on any is newer than its last Talon run, and the post-run
+    activity of each issue in ``unreadable_activity`` cannot be read."""
+    from kestrel_sovereign.features.strategic_memory import issue_selection
+
+    monkeypatch.setattr(issue_selection, "get_github_token", lambda: "token")
+    reads = []
+
+    async def fake_get(path, token):
+        reads.append(path)
+        for (repo, number), issue in issues.items():
+            if path == f"/repos/{repo}/issues/{number}":
+                return issue
+        if "/issues?" in path:
+            return []
+        raise RuntimeError(f"404 {path}")
+
+    async def fake_post(path, token, body):
+        variables = body["variables"]
+        key = (f"{variables['owner']}/{variables['name']}", variables["number"])
+        if "timelineItems" in body["query"]:
+            if key in unreadable_activity:
+                return None
+            return {"data": {"repository": {"issue": {
+                "lastEditedAt": None, "timelineItems": {"nodes": []},
+            }}}}
+        return {"data": {"repository": {"issue": {
+            "closedByPullRequestsReferences": {"nodes": []},
+        }}}}
+
+    monkeypatch.setattr(issue_selection, "github_api_get", fake_get)
+    monkeypatch.setattr(issue_selection, "github_api_post", fake_post)
+    return reads
+
+
+def _run_on(issue, disposition):
+    return {**_talon_run(disposition, job_id=f"job{issue}abcdef"), "issue": issue}
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_suggest_names_every_gate_that_refused_a_candidate(
+    monkeypatch,
+):
+    """#3464 acceptance: a suggest run is evidence that the gates work. Each
+    refused candidate is reported with its reason, and the pick is the
+    agent-ready issue in the scanned repository that owns it -- not the
+    critical row, which names a repository this agent does not scan."""
+    _github_board(
+        monkeypatch,
+        {
+            ("o/r", 3319): {
+                **_agent_ready_issue(3319, "bug only"), "labels": [{"name": "bug"}],
+            },
+            ("o/r", 3093): {**_agent_ready_issue(3093, "epic"), "state": "closed"},
+            ("o/r", 3398): _agent_ready_issue(3398, "asked a question"),
+            ("o/r", 3400): _agent_ready_issue(3400, "asked, unreadable since"),
+            ("o/r", 3464): _agent_ready_issue(3464, "allow-list the selector"),
+            ("o/talon", 35): _agent_ready_issue(35, "elsewhere", repo="o/talon"),
+        },
+        unreadable_activity={("o/r", 3400)},
+    )
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")),
+        _TalonJobs([_run_on(3398, "clarifying"), _run_on(3400, "blocked")]),
+    )
+    feat = _make_feature(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}},
+        agent=agent,
+        blockers=[
+            {"severity": "critical", "issue": "o/talon#35", "title": "loudest"},
+            {"severity": "high", "issue": "o/r#3319", "title": "bug"},
+            {"severity": "high", "issue": "o/r#3093", "title": "epic"},
+            {"severity": "high", "issue": "o/r#3398", "title": "asked"},
+            {"severity": "high", "issue": "o/r#3400", "title": "asked"},
+            {"severity": "high", "issue": "o/r#3464", "title": "ready"},
+        ],
+    )
+
+    result = await feat.signal_dispatch(mode="suggest")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["dispatched"] is False
+    assert (result.data["issue"]["repo"], result.data["issue"]["issue_number"]) == (
+        "o/r", 3464,
+    )
+    assert [
+        (skip["repo"], skip["issue_number"], skip["reason"])
+        for skip in result.data["skipped"]
+    ] == [
+        ("o/talon", 35, "wrong_repo"),
+        ("o/r", 3319, "not_agent_ready"),
+        ("o/r", 3093, "closed"),
+        ("o/r", 3398, "run_history"),
+        ("o/r", 3400, "run_history_unconfirmed"),
+    ]
+    for line in (
+        "skipped o/talon#35 -- o/talon is not in morning_signal_config.scan_repos",
+        "skipped o/r#3319 -- not labelled agent-ready",
+        "skipped o/r#3093 -- closed",
+        "skipped o/r#3398 -- Talon job job3398a ended clarifying",
+        "skipped o/r#3400 -- Talon job job3400a ended blocked",
+    ):
+        assert line in result.confirmation, line
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_with_no_eligible_candidate_dispatches_nothing(monkeypatch):
+    """When nothing passes the allow-list, execute is a no-op that says why:
+    there is no fallback to the top ledger row."""
+    reads = _github_board(
+        monkeypatch,
+        {
+            ("o/r", 3319): {
+                **_agent_ready_issue(3319, "bug only"), "labels": [{"name": "bug"}],
+            },
+        },
+    )
+    agent = _dispatch_agent(registration=SimpleNamespace(owner="feature:x"))
+    feat = _make_feature(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}},
+        agent=agent,
+        blockers=[
+            {"severity": "critical", "issue": "o/r#3319", "title": "top row"},
+            {"severity": "high", "issue": "o/talon#35", "title": "elsewhere"},
+        ],
+    )
+
+    result = await feat.signal_dispatch(mode="execute")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["dispatched"] is False
+    assert result.data["issue"] is None
+    assert "No actionable issue found." in result.confirmation
+    assert sorted(skip["reason"] for skip in result.data["skipped"]) == [
+        "not_agent_ready", "wrong_repo",
+    ]
+    assert "/repos/o/talon/issues/35" not in reads
+    agent.execute_named_tool.assert_not_awaited()
