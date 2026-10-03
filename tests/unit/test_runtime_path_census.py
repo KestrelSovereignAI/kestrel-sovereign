@@ -42,6 +42,9 @@ NOT_STORAGE_ROOTS: dict[str, str] = {
     # A read-only, operator-pinned trust-root *file*: configuration the
     # constitution tools verify against, never a directory Kestrel writes.
     "KESTREL_SOVEREIGN_TRUST_ROOT_PATH": "read-only trust-root file",
+    # The Sovereign-signed governing-constitution source descriptor (#2553):
+    # read-only, signature-verified configuration, never a directory written.
+    "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH": "read-only signed descriptor file",
     # The Kite release-evidence tool's pinned signing-key root: read-only
     # verification material the evidence runner exports to its own child.
     "KESTREL_KITE_RELEASE_EVIDENCE_ROOT": "read-only evidence trust root",

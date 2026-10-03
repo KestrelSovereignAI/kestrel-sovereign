@@ -1147,7 +1147,6 @@ def cmd_constitution_reanchor(args) -> int:
     """Reanchor an agent to the current canonical constitution."""
     import asyncio
 
-    from kestrel_sovereign.config import CONSTITUTION_PATH
     from kestrel_sovereign.multi_agent.config import (
         MULTI_AGENT_CONFIG_FILENAME, MultiAgentConfig,
     )
@@ -1249,7 +1248,15 @@ def cmd_constitution_reanchor(args) -> int:
         return 2
 
     agent_dir = (project_dir / agents[args.agent_name].data_dir).resolve()
-    canonical = Path(args.constitution_path or CONSTITUTION_PATH)
+    # Without --constitution-path the governing source decides which file is
+    # anchored: the packaged constitution, or the one a Sovereign-signed
+    # source descriptor names (#2553).
+    canonical = Path(args.constitution_path) if args.constitution_path else None
+    source_descriptor = (
+        Path(args.source_descriptor)
+        if args.source_descriptor
+        else agents[args.agent_name].constitution_source_descriptor
+    )
 
     # Pre-flight check: agent must not be running. SQLite WAL locking
     # would corrupt mid-write. We check the multi_agent's PID file rather
@@ -1277,6 +1284,7 @@ def cmd_constitution_reanchor(args) -> int:
             sovereign_trust_root_path=(
                 Path(args.trust_root) if args.trust_root else None
             ),
+            source_descriptor_path=source_descriptor,
             runtime_backend=runtime_backend,
             runtime_dsn=runtime_dsn,
         )
@@ -2296,7 +2304,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reanchor_p.add_argument(
         "--constitution-path", default=None,
-        help="Override the canonical constitution path (defaults to package's KESTREL_CONSTITUTION.md)",
+        help=(
+            "Constitution file you expect to anchor. Must be the governing "
+            "source (the package's KESTREL_CONSTITUTION.md, or the file a "
+            "verified --source-descriptor names); any other path is refused."
+        ),
+    )
+    reanchor_p.add_argument(
+        "--source-descriptor", default=None,
+        help=(
+            "Sovereign-signed governing-constitution source descriptor "
+            "(#2553). Defaults to the agent's constitution_source_descriptor "
+            "in multi_agent.toml, then KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH; "
+            "conflicting sources fail closed."
+        ),
     )
     reanchor_p.add_argument(
         "--signed-artifact", default=None,

@@ -480,6 +480,87 @@ def test_constitution_drift_fails_when_file_changed(tmp_path, monkeypatch):
     assert "DB is backed up first" in msg
 
 
+def _signed_source_descriptor(tmp_path: Path, source: Path) -> tuple[Path, Path]:
+    """An operator trust root and a descriptor selecting ``source`` (#2553)."""
+    from kestrel_sovereign.constitution.amendment_artifact import (
+        did_document_from_legacy_public_key,
+    )
+    from kestrel_sovereign.constitution.source_descriptor import (
+        build_legacy_signed_source_descriptor,
+    )
+    from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
+
+    keypair = Secp256k1Suite().generate_keypair()
+    did = "did:pkh:eip155:1:0x0000000000000000000000000000000000d02553"
+    root = tmp_path / "operator-root.did.json"
+    root.write_text(
+        json.dumps(did_document_from_legacy_public_key(did, keypair.public_key))
+    )
+    descriptor = tmp_path / "constitution-source.signed.json"
+    descriptor.write_text(
+        json.dumps(
+            build_legacy_signed_source_descriptor(
+                signer_did=did,
+                source_kind="external",
+                source_path=str(source),
+                content_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+                private_key=keypair.private_key,
+            )
+        )
+    )
+    return root, descriptor
+
+
+def test_constitution_drift_follows_a_signed_source_descriptor(tmp_path, monkeypatch):
+    """An externally governed agent is checked against its external source."""
+    package = _patch_canonical(tmp_path, b"# Kestrel Constitution\npackage\n")
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(package))
+    external = tmp_path / "CUSTOM.md"
+    external.write_bytes(b"# Custom Constitution\nexternal\n")
+    root, descriptor = _signed_source_descriptor(tmp_path, external)
+    monkeypatch.setenv("KESTREL_SOVEREIGN_TRUST_ROOT_PATH", str(root))
+    monkeypatch.setenv("KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH", str(descriptor))
+    _seed_with_anchored_constitution(
+        tmp_path,
+        constitution_text=external.read_bytes(),
+        stored_hash=hashlib.sha256(external.read_bytes()).hexdigest(),
+    )
+
+    report = diagnose(tmp_path)
+
+    assert any("constitution anchored to current file" in m for m in report.ok)
+    assert not any("constitution drift" in m for m in report.fail)
+
+    # Editing the external source after signing is a failure, not a skip.
+    external.write_bytes(b"# Custom Constitution\nedited\n")
+    report = diagnose(tmp_path)
+    assert any(
+        "cannot be trusted" in m and "changed after" in m for m in report.fail
+    ), report.fail
+
+
+def test_an_unverifiable_source_descriptor_fails_doctor(tmp_path, monkeypatch):
+    """No trust root means the agent will Safe-Mode; doctor must say so."""
+    text = b"# Kestrel Constitution\nv1\n"
+    canonical = _patch_canonical(tmp_path, text)
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical))
+    _, descriptor = _signed_source_descriptor(tmp_path, canonical)
+    monkeypatch.delenv("KESTREL_SOVEREIGN_TRUST_ROOT_PATH", raising=False)
+    monkeypatch.setenv("KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH", str(descriptor))
+    _seed_with_anchored_constitution(
+        tmp_path,
+        constitution_text=text,
+        stored_hash=hashlib.sha256(text).hexdigest(),
+    )
+
+    report = diagnose(tmp_path)
+
+    assert any(
+        "governing constitution source cannot be trusted" in m for m in report.fail
+    ), report.fail
+    assert not any("constitution anchored to current file" in m for m in report.ok)
+
+
 def test_constitution_drift_warns_on_missing_hash_property(tmp_path, monkeypatch):
     """Older agent that never anchored. Surfaced as a warning, not a fail —
     blocking would prevent users from upgrading to a hash-anchored agent."""

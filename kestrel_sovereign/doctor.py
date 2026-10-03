@@ -143,7 +143,7 @@ def diagnose(project_dir: Path) -> DoctorReport:
         else []
     )
 
-    _check_constitution_drift(readings, report)
+    _check_constitution_drift(readings, report, resolved)
     _check_anchor_consistency(readings, report)
     _check_sqlite_hold_readiness(resolved, project_dir, report)
     _check_postgres_hold_readiness(resolved, project_dir, readings, report)
@@ -2145,6 +2145,9 @@ class _AgentGovernance:
     #: reading above therefore comes from the anchor — see
     #: ``_read_agent_governance``.
     pending_replication: bool = False
+    #: The agent's ``constitution_source_descriptor`` from ``multi_agent.toml``
+    #: (#2553): operator configuration, not database state.
+    source_descriptor: Path | None = None
 
 
 def _is_placeholder_node(node: object) -> bool:
@@ -2300,13 +2303,16 @@ def _read_agent_governance(
                 source=source,
                 node=node,
                 pending_replication=pending,
+                source_descriptor=cfg.constitution_source_descriptor,
             )
         )
     return readings
 
 
 def _check_constitution_drift(
-    readings: list[_AgentGovernance], report: DoctorReport
+    readings: list[_AgentGovernance],
+    report: DoctorReport,
+    env: dict | None = None,
 ) -> None:
     """Compare each agent's anchored constitution_hash against the on-disk file.
 
@@ -2326,6 +2332,15 @@ def _check_constitution_drift(
         encryption). Stock sqlite3 can't open it. Warn + skip.
       - File is corrupt or partially written. Warn + skip with the
         underlying error so the user can debug.
+
+    The governing source is resolved the way the runtime audit resolves it
+    (#2553): the packaged constitution, unless the agent's
+    ``constitution_source_descriptor`` or the runtime environment's
+    ``KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH`` names a Sovereign-signed
+    descriptor, verified against the operator-pinned trust root. ``env`` is
+    :func:`runtime_env`'s resolution; None reads ``os.environ``. A descriptor
+    that does not verify is a failure, not a skipped check — the agent will
+    Safe-Mode at its next audit.
 
     Per-agent overlay (``<agent_dir>/CONSTITUTION.md``) and the
     ``governed_by`` governance edge are NOT compared here — overlays ARE
@@ -2406,31 +2421,54 @@ def _check_constitution_drift(
             continue
 
         # Recompute the EXPECTED hash the way the periodic integrity audit does
-        # (#2463): resolve the packaged governing bytes through the shared
-        # resolver, rendering this agent's anchored Amendment VIII emancipation
-        # contract if it has one. Hashing raw package bytes here would false-flag
-        # every emancipated agent as "drifted" and could not diagnose an active/
-        # custom agent consistently with the runtime verifier.
+        # (#2463): resolve the governing source and its bytes through the
+        # shared resolver, rendering this agent's anchored Amendment VIII
+        # emancipation contract if it has one. Hashing raw package bytes here
+        # would false-flag every emancipated agent as "drifted" and could not
+        # diagnose an active/custom agent consistently with the runtime
+        # verifier.
         contract_json = _anchored_emancipation_contract(properties)
-        try:
-            from kestrel_sovereign.constitution.emancipation import (
-                EmancipationConfigError,
-                contract_from_json,
-            )
-            from kestrel_sovereign.constitution.resolver import (
-                resolve_governing_constitution_bytes,
-            )
+        from kestrel_sovereign.constitution.emancipation import (
+            EmancipationConfigError,
+            contract_from_json,
+        )
+        from kestrel_sovereign.constitution.resolver import (
+            resolve_governing_constitution_bytes,
+            resolve_governing_source,
+        )
+        from kestrel_sovereign.constitution.source_descriptor import (
+            ConstitutionSourceError,
+        )
+        from kestrel_sovereign.constitution.trust_root import (
+            SovereignTrustRootError,
+        )
 
+        governing_path = canonical
+        try:
             contract = contract_from_json(contract_json)
+            governing_source = resolve_governing_source(
+                descriptor_path=reading.source_descriptor,
+                agent_dids={source.agent_did} if source.agent_did else frozenset(),
+                environ=env,
+            )
+            governing_path = Path(governing_source.path)
             on_disk_hash = hashlib.sha256(
                 resolve_governing_constitution_bytes(
-                    contract, constitution_path=str(canonical)
+                    contract, source=governing_source
                 )
             ).hexdigest()
+        except (ConstitutionSourceError, SovereignTrustRootError) as exc:
+            report.fail.append(
+                f"{name}: governing constitution source cannot be trusted "
+                f"({exc}); the agent will fail its integrity audit and enter "
+                f"Safe Mode. See \"Custom governing constitution sources\" in "
+                f"docs/architecture/security/SOVEREIGN_TRUST_ROOT.md."
+            )
+            continue
         except FileNotFoundError as exc:
             report.warn.append(
                 f"{name}: Constitution drift check skipped — cannot read "
-                f"canonical {canonical}: {exc}"
+                f"canonical {governing_path}: {exc}"
             )
             continue
         except EmancipationConfigError as exc:
@@ -2460,7 +2498,7 @@ def _check_constitution_drift(
         else:
             report.fail.append(
                 f"{name}: constitution drift — stored {stored_hash[:12]}… "
-                f"does not match {canonical} ({on_disk_hash[:12]}…). "
+                f"does not match {governing_path} ({on_disk_hash[:12]}…). "
                 f"Run `kestrel constitution reanchor --agent-name {name} --force` "
                 f"to update ({_rollback_advice(source)})."
             )

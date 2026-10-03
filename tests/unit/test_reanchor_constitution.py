@@ -927,3 +927,82 @@ async def test_reanchor_proceeds_when_the_anchored_blob_is_simply_absent(
 
     assert "re-anchored successfully" in result.lower(), result
     assert node.properties["constitution_hash"] == v2_digest
+
+
+# --- Signed governing-source descriptors (#2553) ---
+
+
+def _write_source_descriptor(tmp_path, source_path, content, *, keypair=ROOT_KEYPAIR):
+    from kestrel_sovereign.constitution.source_descriptor import (
+        build_legacy_signed_source_descriptor,
+    )
+
+    descriptor = build_legacy_signed_source_descriptor(
+        signer_did=ROOT_DID,
+        source_kind="external",
+        source_path=str(source_path),
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        private_key=keypair.private_key,
+        created_at="2026-10-02T00:00:00Z",
+    )
+    path = tmp_path / "constitution-source.signed.json"
+    path.write_text(json.dumps(descriptor), encoding="utf-8")
+    return path
+
+
+@pytest.mark.asyncio
+async def test_live_reanchor_follows_a_verified_source_descriptor(tmp_path):
+    """The live command anchors the descriptor's source and records it."""
+    external = tmp_path / "CUSTOM_CONSTITUTION.md"
+    v2_bytes = _DORMANT_BYTES + b"\n\n## Book III\n\nCustom v2.\n"
+    external.write_bytes(v2_bytes)
+    v2_digest = hashlib.sha256(v2_bytes).hexdigest()
+    descriptor_path = _write_source_descriptor(tmp_path, external, v2_bytes)
+    agent, node = _make_agent(stored_hash=_DORMANT_DIGEST, anchored=_DORMANT_BYTES)
+    agent._constitution_source_descriptor_path = str(descriptor_path)
+    agent.storage.store_file = AsyncMock(return_value=v2_digest)
+    artifact_path = _write_artifact(tmp_path, constitution_hash=v2_digest)
+
+    result = await agent.reanchor_constitution(
+        authorization="sovereign",
+        amendment_artifact_path=str(artifact_path),
+    )
+
+    assert "re-anchored successfully" in result.lower(), result
+    assert f"{external} (external)" in result
+    agent.storage.store_file.assert_any_call(v2_bytes, "KESTREL_CONSTITUTION.md")
+    receipt = node.properties["constitution_reanchor"]
+    assert receipt["path"] == str(external)
+    assert receipt["source_kind"] == "external"
+    assert receipt["source_descriptor_sha256"] == hashlib.sha256(
+        descriptor_path.read_bytes()
+    ).hexdigest()
+    assert receipt["source_descriptor_signer"] == ROOT_DID
+
+
+@pytest.mark.asyncio
+async def test_live_reanchor_refuses_an_untrusted_descriptor_without_writing(
+    tmp_path,
+):
+    """A descriptor signed by the agent's own key authorizes nothing."""
+    external = tmp_path / "CUSTOM_CONSTITUTION.md"
+    external.write_bytes(_DORMANT_BYTES + b"\n\nAttacker article.\n")
+    descriptor_path = _write_source_descriptor(
+        tmp_path, external, external.read_bytes(), keypair=AGENT_KEYPAIR
+    )
+    agent, node = _make_agent(stored_hash=_DORMANT_DIGEST, anchored=_DORMANT_BYTES)
+    agent._constitution_source_descriptor_path = str(descriptor_path)
+    artifact_path = _write_artifact(
+        tmp_path,
+        constitution_hash=hashlib.sha256(external.read_bytes()).hexdigest(),
+    )
+
+    result = await agent.reanchor_constitution(
+        authorization="sovereign",
+        amendment_artifact_path=str(artifact_path),
+    )
+
+    assert result.startswith("Error: Cannot resolve authoritative governing")
+    assert "signature" in result
+    agent.storage.store_file.assert_not_called()
+    assert node.properties["constitution_hash"] == _DORMANT_DIGEST

@@ -1186,12 +1186,14 @@ class ConstitutionMixin:
             )
 
         # PROOF 3 — live-source parity. Recompute the hash from the AUTHORITATIVE
-        # packaged governing source
-        # through the single production resolver (#2463) — the same source
-        # inception anchored — NOT the documentation copy under docs/ (which
-        # carries OKF frontmatter and drifts) and NOT the stored blob itself
-        # (comparing the blob to its own hash can never detect a mutation of
-        # the governing source). For an agent with an active Amendment VIII
+        # governing source through the single production resolver (#2463) —
+        # the same source inception anchored — NOT the documentation copy
+        # under docs/ (which carries OKF frontmatter and drifts) and NOT the
+        # stored blob itself (comparing the blob to its own hash can never
+        # detect a mutation of the governing source). The source is the
+        # packaged constitution unless out-of-DB configuration names a
+        # Sovereign-signed source descriptor (#2553); nothing on the agent node
+        # can select it. For an agent with an active Amendment VIII
         # emancipation contract, the resolver renders the active form so we
         # compare against the correctly-rendered governing bytes.
         from kestrel_sovereign.constitution.emancipation import (
@@ -1212,15 +1214,22 @@ class ConstitutionMixin:
             )
 
         try:
-            governing_content = resolve_governing_constitution_bytes(contract)
+            governing_source = ConstitutionMixin._governing_constitution_source(
+                self
+            )
+            governing_content = resolve_governing_constitution_bytes(
+                contract, source=governing_source
+            )
         except Exception as e:
-            # FAIL CLOSED (#2463 review): the authoritative packaged governing
-            # source is a wheel-shipped data file that MUST always be present
-            # and readable. If it is missing, unreadable, or otherwise cannot
-            # be resolved (FileNotFoundError / OSError / empty-source
-            # ValueError), we CANNOT prove the anchored constitution still
-            # matches its governing source — so we must NOT report success
-            # merely because the source could not be loaded. Treat any
+            # FAIL CLOSED (#2463 review, #2553): the governing source — the
+            # wheel-shipped packaged file, or a descriptor-verified external
+            # one — MUST always be present, readable, and (when a descriptor
+            # pins it) match its signed digest. If it is missing, unreadable,
+            # drifted, or its descriptor/trust root cannot be verified, we
+            # CANNOT prove the anchored constitution still matches its
+            # governing source — so we must NOT report success merely because
+            # the source could not be loaded, and we never substitute the
+            # packaged source for a configured descriptor. Treat any
             # resolution failure as an integrity failure and drive the agent
             # into Safe Mode.
             logging.critical(
@@ -1238,7 +1247,8 @@ class ConstitutionMixin:
             logging.critical(
                 "CONSTITUTION MISMATCH!\n"
                 f"  Anchored:  {stored_hash}\n"
-                f"  Governing: {governing_hash}"
+                f"  Governing: {governing_hash} "
+                f"({governing_source.kind} source {governing_source.path})"
             )
             return False, (
                 "INTEGRITY FAILURE: Governing constitution has been modified."
@@ -1634,6 +1644,33 @@ class ConstitutionMixin:
             agent_dids=self._agent_signing_dids(),
         )
 
+    def _governing_constitution_source(self):
+        """Resolve which source governs this agent, from out-of-DB config only.
+
+        The packaged constitution unless this agent (``KestrelAgent``'s
+        ``constitution_source_descriptor_path``) or the process
+        (``KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH``) names a
+        Sovereign-signed source descriptor (#2553). A descriptor is verified
+        against the same operator-pinned trust root that authorizes reanchor
+        (#2499). The graph database is never consulted: a writer who records
+        a different source kind on the agent node changes nothing here.
+
+        Callers invoke this as ``ConstitutionMixin._governing_constitution_source
+        (self)`` so test doubles built on ``MagicMock(spec=KestrelAgent)``
+        exercise the real resolution rather than a mocked method.
+        """
+        from kestrel_sovereign.constitution.resolver import (
+            resolve_governing_source,
+        )
+
+        return resolve_governing_source(
+            descriptor_path=getattr(
+                self, "_constitution_source_descriptor_path", None
+            ),
+            trust_root_path=getattr(self, "_sovereign_trust_root_path", None),
+            agent_dids=ConstitutionMixin._agent_signing_dids(self),
+        )
+
     def _agent_signing_dids(self) -> set[str]:
         dids: set[str] = set()
         agent_id = getattr(self, "agent_id", None)
@@ -1757,13 +1794,12 @@ class ConstitutionMixin:
         old_hash = agent_node.properties.get("constitution_hash", "none")
 
         # Resolve the new governing bytes through the SINGLE production resolver
-        # (#2463) reading the authoritative packaged source
-        # (config.CONSTITUTION_PATH), rendered to this agent's anchored
-        # Amendment VIII active form — NOT the documentation copy under docs/
-        # (which carries OKF frontmatter and drifts). Reanchoring off the docs
-        # copy would anchor a hash the periodic audit — which recomputes from
-        # the packaged source — could never match, false-tripping Safe Mode.
-        from kestrel_sovereign.config import CONSTITUTION_PATH
+        # (#2463) reading the governing source the periodic audit reads — the
+        # packaged constitution, or a descriptor-verified external source
+        # (#2553) — rendered to this agent's anchored Amendment VIII active
+        # form; NOT the documentation copy under docs/ (which carries OKF
+        # frontmatter and drifts). Reanchoring off any other bytes would
+        # anchor a hash the audit could never match, false-tripping Safe Mode.
         from kestrel_sovereign.constitution.emancipation import (
             EmancipationConfigError,
             contract_from_json,
@@ -1782,17 +1818,21 @@ class ConstitutionMixin:
                 f"Refusing to reanchor without a clean structured receipt."
             )
 
-        constitution_path_used = CONSTITUTION_PATH
         try:
+            governing_source = ConstitutionMixin._governing_constitution_source(
+                self
+            )
+            constitution_path_used = governing_source.path
             constitution_content = resolve_governing_constitution_bytes(
                 reanchor_contract,
-                constitution_path=CONSTITUTION_PATH,
+                source=governing_source,
             )
         except FileNotFoundError:
             return "Error: No constitution file found on disk."
         except Exception as e:
-            # FAIL CLOSED: an unreadable/ambiguous governing source must not be
-            # anchored (#2463).
+            # FAIL CLOSED: an unreadable/ambiguous/drifted governing source, or
+            # a source descriptor that does not verify, must not be anchored
+            # (#2463, #2553).
             return f"Error: Cannot resolve authoritative governing constitution: {e}"
 
         new_hash = hashlib.sha256(constitution_content).hexdigest()
@@ -2017,6 +2057,7 @@ class ConstitutionMixin:
                         "old_hash": old_hash,
                         "new_hash": stored_hash,
                         "path": constitution_path_used,
+                        **governing_source.receipt_fields(),
                         "signed_artifact_hash": artifact_hash,
                         "signed_artifact_path": artifact_path_used,
                         "signed_artifact_signer": verification.signer,
@@ -2069,7 +2110,7 @@ class ConstitutionMixin:
             f"Constitution re-anchored successfully.\n"
             f"  Old hash: {old_hash[:16]}...\n"
             f"  New hash: {stored_hash[:16]}...\n"
-            f"  Source:   {constitution_path_used}\n"
+            f"  Source:   {constitution_path_used} ({governing_source.kind})\n"
             f"  Artifact: {artifact_hash[:16]}... signed by {verification.signer}\n"
             f"  Auth:     {authorization or 'unspecified'}"
             f"{stale_note}"
@@ -2101,12 +2142,12 @@ class ConstitutionMixin:
                 )
             logging.warning("Constitution hash not found. Attempting to load and anchor default.")
 
-            # Auto-anchor the SAME authoritative packaged governing bytes the
-            # periodic audit later recomputes (#2463) via the single production
-            # resolver — reading config.CONSTITUTION_PATH rendered to this
-            # agent's anchored Amendment VIII form — NOT the docs/ copy (OKF
-            # frontmatter → different hash → false Safe Mode on the next audit).
-            from kestrel_sovereign.config import CONSTITUTION_PATH
+            # Auto-anchor the SAME governing bytes the periodic audit later
+            # recomputes (#2463) via the single production resolver — the
+            # governing source (packaged, or descriptor-verified per #2553)
+            # rendered to this agent's anchored Amendment VIII form — NOT the
+            # docs/ copy (OKF frontmatter → different hash → false Safe Mode on
+            # the next audit).
             from kestrel_sovereign.constitution.emancipation import (
                 EmancipationConfigError,
                 contract_from_json,
@@ -2122,11 +2163,10 @@ class ConstitutionMixin:
             except EmancipationConfigError as e:
                 return f"Error: Anchored emancipation contract is corrupted: {e}"
 
-            constitution_path_used = CONSTITUTION_PATH
             try:
                 constitution_content = resolve_governing_constitution_bytes(
                     anchor_contract,
-                    constitution_path=CONSTITUTION_PATH,
+                    source=ConstitutionMixin._governing_constitution_source(self),
                 )
             except FileNotFoundError:
                 return "Error: No constitution file found."

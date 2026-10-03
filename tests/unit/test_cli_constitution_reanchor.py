@@ -1048,3 +1048,70 @@ def test_the_guard_prescribes_the_per_agent_stop_in_subprocess_mode(tmp_path):
         ProcessManager.agent_pid_file(agent_dir), os.getpid(), port=8801
     )
     assert _agent_holder(tmp_path, "Claw", cfg) == "kestrel terminate Claw"
+
+
+def _capture_reanchor_kwargs(reanchor_env, argv):
+    args = _parse(argv)
+    result = ReanchorResult(
+        agent_name="Test",
+        db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+        canonical_path=Path("/fake/canonical.md"),
+        old_hash="a" * 64,
+        new_hash="a" * 64,
+        backup_path=None,
+        unchanged=True,
+    )
+    captured = {}
+
+    async def _capture(**kwargs):
+        captured.update(kwargs)
+        return result
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_capture,
+         ):
+        assert cmd_constitution(args) == 0
+    return captured
+
+
+def test_reanchor_without_a_path_lets_the_governing_source_decide(reanchor_env):
+    """No --constitution-path: the helper resolves the governing source
+    (packaged, or a verified descriptor's) instead of being handed the package
+    path, which would refuse every descriptor-governed agent (#2553)."""
+    captured = _capture_reanchor_kwargs(
+        reanchor_env, ["constitution", "reanchor", "--agent-name", "Test"]
+    )
+    assert captured["canonical_path"] is None
+    assert captured["source_descriptor_path"] is None
+
+
+def test_reanchor_passes_the_source_descriptor_flag(reanchor_env):
+    captured = _capture_reanchor_kwargs(
+        reanchor_env,
+        [
+            "constitution", "reanchor", "--agent-name", "Test",
+            "--source-descriptor", "/secure/source.signed.json",
+        ],
+    )
+    assert captured["source_descriptor_path"] == Path("/secure/source.signed.json")
+
+
+def test_reanchor_defaults_to_the_agents_configured_descriptor(reanchor_env):
+    """The per-agent multi_agent.toml descriptor is what the running agent
+    audits against, so the offline writer must use the same one."""
+    config_path = reanchor_env / "multi_agent.toml"
+    config = toml.loads(config_path.read_text())
+    config["agents"]["Test"]["constitution_source_descriptor"] = (
+        "/secure/test-source.signed.json"
+    )
+    config_path.write_text(toml.dumps(config))
+
+    captured = _capture_reanchor_kwargs(
+        reanchor_env, ["constitution", "reanchor", "--agent-name", "Test"]
+    )
+    assert captured["source_descriptor_path"] == Path(
+        "/secure/test-source.signed.json"
+    )

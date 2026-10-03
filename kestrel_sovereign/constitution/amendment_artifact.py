@@ -154,7 +154,29 @@ def verify_reanchor_artifact(
             constitution_sha256,
         )
 
-    data = canonical_amendment_bytes(artifact)
+    ok, reason = verify_detached_signature(
+        canonical_amendment_bytes(artifact),
+        artifact,
+        trusted_did_document=trusted_did_document,
+    )
+    return AmendmentArtifactVerification(ok, reason, signer, constitution_sha256)
+
+
+def verify_detached_signature(
+    data: bytes,
+    artifact: Mapping[str, Any],
+    *,
+    trusted_did_document: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Verify ``artifact``'s detached signature over ``data``.
+
+    The one signature check for every Sovereign-signed constitution artifact
+    (reanchor artifacts and constitution source descriptors). A hybrid
+    ``signatures`` list must satisfy ``HYBRID_REQUIRED`` against the trusted
+    document's ``verificationMethod`` entries; otherwise a legacy secp256k1
+    ``signature`` must verify against the ``publicKey`` entry its ``kid``
+    names. Returns ``(ok, reason)``; never raises for malformed material.
+    """
     if artifact.get("signatures"):
         result = verify_hybrid(
             data,
@@ -162,32 +184,18 @@ def verify_reanchor_artifact(
             trusted_did_document.get("verificationMethod") or [],
             policy=VerifyPolicy.HYBRID_REQUIRED,
         )
-        return AmendmentArtifactVerification(
+        return (
             result.ok,
-            (
-                result.reason
-                if result.ok
-                else f"hybrid signature check failed: {result.reason}"
-            ),
-            signer,
-            constitution_sha256,
+            result.reason
+            if result.ok
+            else f"hybrid signature check failed: {result.reason}",
         )
 
     signature = artifact.get("signature")
     if not isinstance(signature, Mapping):
-        return AmendmentArtifactVerification(
-            False,
-            "artifact has no signature",
-            signer,
-            constitution_sha256,
-        )
+        return False, "artifact has no signature"
     if signature.get("alg") != ALG_ECDSA_SECP256K1_SHA256:
-        return AmendmentArtifactVerification(
-            False,
-            "unsupported signature algorithm",
-            signer,
-            constitution_sha256,
-        )
+        return False, "unsupported signature algorithm"
 
     public_keys = trusted_did_document.get("publicKey") or []
     kid = str(signature.get("kid") or "")
@@ -198,20 +206,10 @@ def verify_reanchor_artifact(
             trusted_key = key
             break
     if trusted_key is None:
-        return AmendmentArtifactVerification(
-            False,
-            f"trusted DID doc has no public key for kid {kid!r}",
-            signer,
-            constitution_sha256,
-        )
+        return False, f"trusted DID doc has no public key for kid {kid!r}"
     public_key_hex = trusted_key.get("publicKeyHex")
     if not public_key_hex:
-        return AmendmentArtifactVerification(
-            False,
-            "trusted DID public key has no publicKeyHex",
-            signer,
-            constitution_sha256,
-        )
+        return False, "trusted DID public key has no publicKeyHex"
     try:
         public_key = ec.EllipticCurvePublicKey.from_encoded_point(
             ec.SECP256K1(),
@@ -219,27 +217,12 @@ def verify_reanchor_artifact(
         )
         sig_bytes = bytes.fromhex(str(signature.get("sig") or ""))
     except ValueError as exc:
-        return AmendmentArtifactVerification(
-            False,
-            f"malformed signature material: {exc}",
-            signer,
-            constitution_sha256,
-        )
+        return False, f"malformed signature material: {exc}"
 
     suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
     if not suite.verify(data, sig_bytes, public_key):
-        return AmendmentArtifactVerification(
-            False,
-            "legacy ECDSA signature check failed",
-            signer,
-            constitution_sha256,
-        )
-    return AmendmentArtifactVerification(
-        True,
-        "signature valid (legacy ecdsa)",
-        signer,
-        constitution_sha256,
-    )
+        return False, "legacy ECDSA signature check failed"
+    return True, "signature valid (legacy ecdsa)"
 
 
 def load_verified_reanchor_artifact(
