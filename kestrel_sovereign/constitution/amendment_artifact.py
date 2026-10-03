@@ -177,10 +177,13 @@ def verify_detached_signature(
     ``signature`` must verify against the ``publicKey`` entry its ``kid``
     names. Returns ``(ok, reason)``; never raises for malformed material.
     """
-    if artifact.get("signatures"):
+    signatures = artifact.get("signatures")
+    if signatures:
+        if not isinstance(signatures, list):
+            return False, "artifact signatures must be a list"
         result = verify_hybrid(
             data,
-            artifact.get("signatures") or [],
+            signatures,
             trusted_did_document.get("verificationMethod") or [],
             policy=VerifyPolicy.HYBRID_REQUIRED,
         )

@@ -43,6 +43,8 @@ def restore_environ():
 def _no_ambient_backend(monkeypatch):
     monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
     monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    monkeypatch.delenv("KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH", raising=False)
+    monkeypatch.delenv("KESTREL_SOVEREIGN_TRUST_ROOT_PATH", raising=False)
 
 
 AGENT_DID = "did:pkh:eip155:1:0x0000000000000000000000000000000000002890"
@@ -1088,15 +1090,185 @@ def test_reanchor_without_a_path_lets_the_governing_source_decide(reanchor_env):
     assert captured["source_descriptor_path"] is None
 
 
-def test_reanchor_passes_the_source_descriptor_flag(reanchor_env):
+def _configure_agent_descriptor(reanchor_env, descriptor) -> None:
+    config_path = reanchor_env / "multi_agent.toml"
+    config = toml.loads(config_path.read_text())
+    config["agents"]["Test"]["constitution_source_descriptor"] = str(descriptor)
+    config_path.write_text(toml.dumps(config))
+
+
+def _refused_without_writing(reanchor_env, argv, capsys) -> str:
+    called = False
+
+    async def _must_not_run(**_kwargs):
+        nonlocal called
+        called = True
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_must_not_run,
+         ):
+        rc = cmd_constitution(_parse(argv))
+
+    assert rc == 2
+    assert not called, "refused runs must not reach the writer"
+    return capsys.readouterr().err
+
+
+def test_the_source_descriptor_flag_confirms_the_agents_selection(reanchor_env):
+    """--source-descriptor may confirm the agent's own descriptor; the writer
+    is handed the agent's configuration, not the flag."""
+    descriptor = reanchor_env / "secure" / "source.signed.json"
+    descriptor.parent.mkdir()
+    descriptor.write_text("{}")
+    _configure_agent_descriptor(reanchor_env, descriptor)
+
     captured = _capture_reanchor_kwargs(
         reanchor_env,
         [
             "constitution", "reanchor", "--agent-name", "Test",
-            "--source-descriptor", "/secure/source.signed.json",
+            "--source-descriptor", str(descriptor),
         ],
     )
-    assert captured["source_descriptor_path"] == Path("/secure/source.signed.json")
+    assert captured["source_descriptor_path"] == descriptor
+
+
+def test_a_source_descriptor_the_agent_does_not_use_is_refused(
+    reanchor_env, capsys
+):
+    """Anchoring a descriptor's source the agent will not audit against would
+    Safe-Mode it at its next boot (#2553 review)."""
+    err = _refused_without_writing(
+        reanchor_env,
+        [
+            "constitution", "reanchor", "--agent-name", "Test", "--force",
+            "--source-descriptor", "/secure/source.signed.json",
+        ],
+        capsys,
+    )
+    assert "is not the descriptor 'Test' audits against" in err
+    assert "packaged constitution governs" in err
+
+
+def test_a_source_descriptor_other_than_the_configured_one_is_refused(
+    reanchor_env, capsys
+):
+    secure = reanchor_env / "secure"
+    secure.mkdir()
+    configured = secure / "configured.signed.json"
+    other = secure / "other.signed.json"
+    configured.write_text("{}")
+    other.write_text("{}")
+    _configure_agent_descriptor(reanchor_env, configured)
+
+    err = _refused_without_writing(
+        reanchor_env,
+        [
+            "constitution", "reanchor", "--agent-name", "Test", "--force",
+            "--source-descriptor", str(other),
+        ],
+        capsys,
+    )
+    assert str(configured) in err
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH",
+        "KESTREL_SOVEREIGN_TRUST_ROOT_PATH",
+    ],
+)
+def test_an_exported_governing_source_setting_the_agent_does_not_get_is_refused(
+    reanchor_env, restore_environ, capsys, variable
+):
+    """The shell exports A, the project .env says B. The agent and doctor
+    resolve B; reanchoring with A would anchor bytes the agent then rejects.
+    It refuses rather than choosing, as for the data key (#2553 review)."""
+    (reanchor_env / ".env").write_text(f"{variable}=/secure/from-the-file.json\n")
+    os.environ[variable] = "/secure/from-the-shell.json"
+
+    err = _refused_without_writing(
+        reanchor_env,
+        ["constitution", "reanchor", "--agent-name", "Test", "--force"],
+        capsys,
+    )
+    assert variable in err
+    assert "/secure/from-the-shell.json" in err
+    assert "/secure/from-the-file.json" in err
+
+
+def test_a_blank_project_descriptor_against_an_exported_one_is_refused(
+    reanchor_env, restore_environ, capsys
+):
+    """Blank in the file is an answer: the agent then has no descriptor."""
+    (reanchor_env / ".env").write_text(
+        "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH=\n"
+    )
+    os.environ["KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH"] = "/secure/a.json"
+
+    err = _refused_without_writing(
+        reanchor_env,
+        ["constitution", "reanchor", "--agent-name", "Test", "--force"],
+        capsys,
+    )
+    assert "unset" in err
+
+
+def test_reanchor_resolves_the_source_from_the_agents_launch_environment(
+    reanchor_env, restore_environ
+):
+    """The writer reads the descriptor and trust root from the environment the
+    agent is launched with, the one doctor reads too."""
+    (reanchor_env / ".env").write_text(
+        "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH=/secure/file.json\n"
+        "KESTREL_SOVEREIGN_TRUST_ROOT_PATH=/secure/root.json\n"
+    )
+
+    captured = _capture_reanchor_kwargs(
+        reanchor_env, ["constitution", "reanchor", "--agent-name", "Test"]
+    )
+
+    environ = captured["environ"]
+    assert environ["KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH"] == "/secure/file.json"
+    assert environ["KESTREL_SOVEREIGN_TRUST_ROOT_PATH"] == "/secure/root.json"
+
+
+def test_a_trust_root_flag_the_agent_cannot_use_is_refused(
+    reanchor_env, capsys
+):
+    """--trust-root would verify a descriptor the agent itself has no trust
+    root to verify; whatever is anchored, the agent Safe-Modes."""
+    _configure_agent_descriptor(reanchor_env, "/secure/source.signed.json")
+
+    err = _refused_without_writing(
+        reanchor_env,
+        [
+            "constitution", "reanchor", "--agent-name", "Test", "--force",
+            "--trust-root", "/secure/sovereign-root.did.json",
+        ],
+        capsys,
+    )
+    assert "KESTREL_SOVEREIGN_TRUST_ROOT_PATH" in err
+    assert "Safe Mode" in err
+
+
+def test_a_trust_root_flag_without_a_descriptor_is_only_for_the_artifact(
+    reanchor_env,
+):
+    """No descriptor: the flag verifies the reanchor artifact (#2499) only."""
+    captured = _capture_reanchor_kwargs(
+        reanchor_env,
+        [
+            "constitution", "reanchor", "--agent-name", "Test",
+            "--trust-root", "/secure/sovereign-root.did.json",
+        ],
+    )
+    assert captured["sovereign_trust_root_path"] == Path(
+        "/secure/sovereign-root.did.json"
+    )
 
 
 def test_reanchor_defaults_to_the_agents_configured_descriptor(reanchor_env):

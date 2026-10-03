@@ -39,6 +39,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -472,6 +473,7 @@ def cmd_shell(args) -> int:
             agent_dir,
             args,
             host_database_launch_context=hold_launch_context,
+            constitution_source_descriptor=agent_cfg.constitution_source_descriptor,
         )
     )
 
@@ -575,6 +577,7 @@ async def _run_shell(
     args,
     *,
     host_database_launch_context=None,
+    constitution_source_descriptor: Optional[Path] = None,
 ) -> int:
     """Run the interactive chat shell for an agent."""
     from kestrel_sovereign.storage import AsyncStorage
@@ -608,6 +611,9 @@ async def _run_shell(
         did=agent_did,
         storage_path=str(db_path),
         llm_service=llm_service,
+        # The same governing source the fleet host gives this agent (#2553);
+        # without it the shell audits the packaged constitution.
+        constitution_source_descriptor_path=constitution_source_descriptor,
     )
     from kestrel_sovereign.hold import (
         close_bound_host_context,
@@ -1143,6 +1149,94 @@ def cmd_constitution(args) -> int:
     return handler(args)
 
 
+def _governance_env_conflict(
+    launch_env: Mapping[str, str],
+) -> tuple[str, str, str] | None:
+    """Name a governing-source setting this shell and the launcher disagree on.
+
+    Returns ``(variable, exported, launched)`` for the first of the source
+    descriptor and its trust root whose value in ``os.environ`` differs from
+    the one the launched agent receives, or None. Blank is a value: a ``.env``
+    that sets a variable empty gives the agent no descriptor.
+    """
+    from kestrel_sovereign.constitution.source_descriptor import (
+        CONSTITUTION_SOURCE_DESCRIPTOR_ENV,
+    )
+    from kestrel_sovereign.constitution.trust_root import SOVEREIGN_TRUST_ROOT_ENV
+
+    for key in (CONSTITUTION_SOURCE_DESCRIPTOR_ENV, SOVEREIGN_TRUST_ROOT_ENV):
+        exported = os.environ.get(key, "").strip()
+        launched = launch_env.get(key, "").strip()
+        if exported != launched:
+            return key, exported, launched
+    return None
+
+
+def _reanchor_source_refusal(
+    agent_name: str,
+    *,
+    requested_descriptor: str | None,
+    agent_descriptor: Path | None,
+    launch_env: Mapping[str, str],
+    trust_root_flag: str | None,
+) -> str | None:
+    """Refuse a reanchor whose governing source the agent would not reproduce.
+
+    The offline writer must anchor what the running agent audits (#2553). Two
+    inputs on the command line could make them differ:
+
+    * ``--source-descriptor`` naming a file other than the agent's own
+      selection (its multi_agent.toml entry, then the launch environment);
+    * ``--trust-root`` verifying a descriptor the agent has no trust root to
+      verify, so the agent Safe-Modes whatever is anchored.
+    """
+    from kestrel_sovereign.constitution.source_descriptor import (
+        CONSTITUTION_SOURCE_DESCRIPTOR_ENV,
+        ConstitutionSourceError,
+        configured_source_descriptor_path,
+    )
+    from kestrel_sovereign.constitution.trust_root import SOVEREIGN_TRUST_ROOT_ENV
+
+    if requested_descriptor:
+        try:
+            selected = configured_source_descriptor_path(
+                explicit_path=agent_descriptor, environ=launch_env
+            )
+        except ConstitutionSourceError as exc:
+            return f"cannot confirm --source-descriptor for '{agent_name}': {exc}"
+        requested = Path(requested_descriptor).expanduser().resolve()
+        if requested != selected:
+            current = (
+                selected
+                if selected is not None
+                else "none, so the packaged constitution governs"
+            )
+            return (
+                f"--source-descriptor {requested} is not the descriptor "
+                f"'{agent_name}' audits against ({current}). Configure it as "
+                f"the agent's constitution_source_descriptor in "
+                f"multi_agent.toml (or {CONSTITUTION_SOURCE_DESCRIPTOR_ENV} in "
+                f"the project .env), then re-run."
+            )
+
+    descriptor_selected = agent_descriptor is not None or bool(
+        launch_env.get(CONSTITUTION_SOURCE_DESCRIPTOR_ENV, "").strip()
+    )
+    if (
+        descriptor_selected
+        and trust_root_flag
+        and not launch_env.get(SOVEREIGN_TRUST_ROOT_ENV, "").strip()
+    ):
+        return (
+            f"'{agent_name}' is governed through a constitution source "
+            f"descriptor, but its runtime environment sets no "
+            f"{SOVEREIGN_TRUST_ROOT_ENV}: the agent could not verify that "
+            f"descriptor and would enter Safe Mode whatever this run anchors. "
+            f"Set {SOVEREIGN_TRUST_ROOT_ENV} in the project .env, then re-run."
+        )
+    return None
+
+
 def cmd_constitution_reanchor(args) -> int:
     """Reanchor an agent to the current canonical constitution."""
     import asyncio
@@ -1234,6 +1328,28 @@ def cmd_constitution_reanchor(args) -> int:
         )
         return 2
 
+    # The governing-constitution source (#2553) has the same shape of hazard.
+    # The agent and ``kestrel doctor`` resolve the source descriptor and the
+    # trust root that verifies it from ``launch_env``; ``load_project_env``
+    # left an exported value authoritative here. A shell exporting descriptor
+    # A while the file names B would anchor A's bytes into a database whose
+    # agent audits against B and Safe-Modes on boot. Refuse, as for the key:
+    # which one governs is the operator's to settle.
+    governance_conflict = _governance_env_conflict(launch_env)
+    if governance_conflict is not None:
+        key, exported, launched = governance_conflict
+        print(
+            f"error: {key} in the environment ({exported or 'unset'}) does not "
+            f"match the one in {project_dir / '.env'} ({launched or 'unset'}).\n"
+            f"  The agent resolves its governing constitution source with the "
+            f"file's value; a reanchor run now could anchor a source the agent "
+            f"will not audit against.\n"
+            f"  Unset {key} to use the project's value, or correct the file, "
+            f"then re-run.",
+            file=sys.stderr,
+        )
+        return 2
+
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
     )
@@ -1252,11 +1368,21 @@ def cmd_constitution_reanchor(args) -> int:
     # anchored: the packaged constitution, or the one a Sovereign-signed
     # source descriptor names (#2553).
     canonical = Path(args.constitution_path) if args.constitution_path else None
-    source_descriptor = (
-        Path(args.source_descriptor)
-        if args.source_descriptor
-        else agents[args.agent_name].constitution_source_descriptor
+    # The descriptor is the one the agent itself audits against: its
+    # multi_agent.toml entry, then the launch environment. --source-descriptor
+    # may only confirm that selection; anchoring any other descriptor's source
+    # would Safe-Mode the agent at its next audit.
+    source_descriptor = agents[args.agent_name].constitution_source_descriptor
+    source_refusal = _reanchor_source_refusal(
+        args.agent_name,
+        requested_descriptor=args.source_descriptor,
+        agent_descriptor=source_descriptor,
+        launch_env=launch_env,
+        trust_root_flag=args.trust_root,
     )
+    if source_refusal is not None:
+        print(f"error: {source_refusal}", file=sys.stderr)
+        return 2
 
     # Pre-flight check: agent must not be running. SQLite WAL locking
     # would corrupt mid-write. We check the multi_agent's PID file rather
@@ -1285,6 +1411,7 @@ def cmd_constitution_reanchor(args) -> int:
                 Path(args.trust_root) if args.trust_root else None
             ),
             source_descriptor_path=source_descriptor,
+            environ=launch_env,
             runtime_backend=runtime_backend,
             runtime_dsn=runtime_dsn,
         )
@@ -2306,17 +2433,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--constitution-path", default=None,
         help=(
             "Constitution file you expect to anchor. Must be the governing "
-            "source (the package's KESTREL_CONSTITUTION.md, or the file a "
-            "verified --source-descriptor names); any other path is refused."
+            "source (the package's KESTREL_CONSTITUTION.md, or the file the "
+            "agent's verified source descriptor names); any other path is "
+            "refused."
         ),
     )
     reanchor_p.add_argument(
         "--source-descriptor", default=None,
         help=(
-            "Sovereign-signed governing-constitution source descriptor "
-            "(#2553). Defaults to the agent's constitution_source_descriptor "
-            "in multi_agent.toml, then KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH; "
-            "conflicting sources fail closed."
+            "Descriptor you expect the agent to be governed by (#2553). The "
+            "agent's own selection always applies: its "
+            "constitution_source_descriptor in multi_agent.toml, then "
+            "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH from the project "
+            ".env. Any other file is refused."
         ),
     )
     reanchor_p.add_argument(

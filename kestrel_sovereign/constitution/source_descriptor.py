@@ -43,7 +43,7 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,7 +145,10 @@ def _validate_signed_fields(descriptor: Mapping[str, Any]) -> None:
         raise ConstitutionSourceError("descriptor has no signer DID")
 
     source_kind = descriptor.get("source_kind")
-    if source_kind not in SOURCE_KINDS:
+    # Type first: a JSON list or object is unhashable, and a set-membership
+    # test on it raises TypeError, which no caller handles as an untrusted
+    # descriptor.
+    if not isinstance(source_kind, str) or source_kind not in SOURCE_KINDS:
         raise ConstitutionSourceError(
             f"unsupported source_kind {source_kind!r}; expected one of "
             f"{sorted(SOURCE_KINDS)}"
@@ -357,6 +360,35 @@ def configured_source_descriptor_path(
             "(or make every source name the same file)."
         )
     return next(iter(resolved))
+
+
+def pin_source_descriptor_launch_env(
+    env: MutableMapping[str, str],
+    *,
+    explicit_path: str | os.PathLike[str] | None,
+) -> Optional[Path]:
+    """Carry one agent's descriptor selection into a child process environment.
+
+    A process handoff cannot pass ``constitution_source_descriptor_path`` to
+    the child's ``KestrelAgent``, and the child starts with ``multi_agent.toml``
+    loading disabled, so the environment variable is the only channel. The
+    per-agent setting and the launch environment are resolved here by
+    :func:`configured_source_descriptor_path`, under the same conflict rules
+    the in-process agent applies, and the child is left exactly one answer:
+    the resolved descriptor, or an explicit blank so a ``.env`` loaded later
+    without override cannot supply one.
+
+    Raises:
+        ConstitutionSourceError: The configuration is ambiguous or names a
+            descriptor that does not exist. ``env`` is left unchanged.
+    """
+    resolved = configured_source_descriptor_path(
+        explicit_path=explicit_path, environ=env
+    )
+    env[CONSTITUTION_SOURCE_DESCRIPTOR_ENV] = (
+        "" if resolved is None else str(resolved)
+    )
+    return resolved
 
 
 def load_source_descriptor(

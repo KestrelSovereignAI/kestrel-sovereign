@@ -200,13 +200,28 @@ Configure the descriptor through exactly one of:
 2. `constitution_source_descriptor = "/abs/path"` on one agent in
    `multi_agent.toml` (an absolute path is required);
 3. `constitution_source_descriptor_path=` on `KestrelAgent` or
-   `create_kestrel_identity_async`, or `--source-descriptor` on
-   `kestrel constitution reanchor`.
+   `create_kestrel_identity_async`.
 
 An explicit path and the environment variable may both be set only when they
 resolve to the same file, the same rule as the trust root. With no descriptor
 configured the package governs and no trust root is needed. Nothing changes
 for an agent that never opts in.
+
+Every launch path gives an agent the same answer:
+
+- The in-process fleet host passes the per-agent descriptor to `KestrelAgent`.
+  Its own environment is the launcher's (`paths.spawned_agent_env`), where the
+  project `.env` outranks an exported value.
+- A managed subprocess (`ProcessManager.start_agent`) cannot receive
+  constructor arguments and starts with `multi_agent.toml` loading disabled.
+  The launcher resolves the per-agent descriptor against the launch
+  environment under the conflict rule above, then sets the child's
+  `KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH` to the one resolved file, or to
+  an explicit blank when none is configured. A conflicting or missing
+  descriptor refuses the launch.
+- `kestrel shell`'s in-process fallback passes the agent's descriptor too.
+- `kestrel doctor` and `kestrel constitution reanchor` resolve from the
+  per-agent setting and the launcher's environment.
 
 ### Fail-closed semantics
 
@@ -275,8 +290,20 @@ the trust root.
   signed over the SHA-256 of the selected source **as rendered for this
   agent**. For a dormant agent that is the source's own digest. Live:
   `!reanchor-constitution <artifact>`. Offline: `kestrel constitution
-  reanchor --agent-name X --force --signed-artifact … --trust-root …
-  --source-descriptor …`.
+  reanchor --agent-name X --force --signed-artifact …`.
+
+  The offline command anchors the source the agent will audit. It reads the
+  agent's `constitution_source_descriptor` and the project `.env`, not
+  whatever the shell exports, and it refuses rather than choosing when:
+
+  - the shell exports `KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH` or
+    `KESTREL_SOVEREIGN_TRUST_ROOT_PATH` with a value the project `.env`
+    overrides (an empty value in `.env` counts as a value);
+  - `--source-descriptor` names a file other than the agent's configured
+    descriptor. The flag only confirms that selection;
+  - `--trust-root` is given for a descriptor-governed agent whose `.env`
+    names no trust root. The agent could not verify its own descriptor and
+    would enter Safe Mode whatever was anchored.
 - **Editing an external source:** sign a new descriptor for the new bytes,
   then reanchor as above. Until both happen the agent is in Safe Mode, which
   is the intended result of an unsigned edit.
@@ -292,6 +319,28 @@ the trust root.
 - Replaying a different, still-valid descriptor is an operator-configuration
   change, in the same trust domain as replacing the trust-root file. The
   database cannot do it.
+
+### Security properties
+
+- **Path and content are both signed.** `source_kind`, `source_path`, and
+  `content_sha256` are all in the signed bytes. Changing the kind, pointing an
+  `external` descriptor at another file, or editing the pinned digest fails the
+  signature.
+- **Replay and downgrade.** A descriptor carries no expiry or counter, so an
+  older descriptor the Sovereign once signed still verifies. Using one needs
+  write access to operator configuration, and it changes which bytes govern
+  the agent. Those bytes then no longer match the anchored hash, so the agent
+  Safe-Modes until it is reanchored with a Sovereign-signed artifact for that
+  hash; an older artifact for the same hash also verifies. Rotate the trust
+  root to retire every descriptor and artifact it signed.
+- **No check-then-use gap.** The descriptor is parsed from the same bytes
+  whose signature was checked. The governing source is read once. Those bytes
+  are hashed against `content_sha256`, rendered, then anchored or compared;
+  they are never re-read from the path.
+- **Malformed input is refused, not raised.** A non-string `source_kind`, a
+  non-list `signatures`, or a signature entry whose `alg`, `kid`, or `sig` is
+  not a string makes the descriptor untrusted. It never escapes doctor's or
+  reanchor's untrusted-descriptor handling as a `TypeError`.
 
 ## Migration from `constitution_path` overrides
 
@@ -312,10 +361,11 @@ descriptors.
    write or reanchor is needed: the anchored hash already matches. If the
    file has since changed, restore the original bytes or follow
    "Editing an external source".
-3. **`kestrel constitution reanchor --constitution-path PATH`**: pass
-   `--source-descriptor` (or configure `constitution_source_descriptor` on the
-   agent). Without `--constitution-path` the command anchors the governing
-   source. With it, the path must be that source.
+3. **`kestrel constitution reanchor --constitution-path PATH`**: configure
+   `constitution_source_descriptor` on the agent (or the environment variable
+   in the project `.env`), then reanchor. Without `--constitution-path` the
+   command anchors the governing source. With it, the path must be that
+   source.
 4. **Ambiguous legacy rows** (an agent anchored to bytes that no configured
    source reproduces) stay in Safe Mode and read-only. They are never
    migrated automatically, and graph properties never establish a source.
@@ -329,7 +379,13 @@ descriptors.
   per-agent `constitution_source_descriptor` in `multi_agent.toml`,
   `constitution_source_descriptor_path=` on `KestrelAgent` and inception,
   `sovereign_trust_root_path=` on inception, and `--source-descriptor` on
-  `kestrel constitution reanchor`.
+  `kestrel constitution reanchor` (a confirmation of the agent's configured
+  descriptor, never a replacement).
+- Managed subprocess launches carry the per-agent descriptor into the child,
+  and refuse to start on a conflicting or missing one.
+- `kestrel constitution reanchor` resolves the descriptor and trust root from
+  the project `.env` the agent launches with, and refuses an exported value
+  that disagrees with it.
 - Changed: `kestrel constitution reanchor` without `--constitution-path` now
   anchors the resolved governing source rather than always the package.
 - Changed: `kestrel doctor` checks drift against each agent's resolved

@@ -45,7 +45,7 @@ from kestrel_sovereign.constitution.trust_root import (
     SovereignTrustRootError,
 )
 from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
+from kestrel_sovereign.security.crypto_suite import ALG_ED25519, Secp256k1Suite
 
 
 _SUITE = Secp256k1Suite()
@@ -356,6 +356,95 @@ def test_an_oversized_descriptor_is_refused(tmp_path, trust_root):
 
     with pytest.raises(ConstitutionSourceError, match="maximum"):
         resolve_governing_source(descriptor_path=path, trust_root_path=trust_root)
+
+
+@pytest.mark.parametrize("value", [[], {}, ["external"], {"kind": "x"}, 1, None])
+def test_a_non_string_source_kind_is_untrusted_not_a_crash(
+    tmp_path, external_source, trust_root, value
+):
+    """A JSON list or object is unhashable; testing it for membership in the
+    kind set raised TypeError, which escaped doctor's and reanchor's
+    untrusted-descriptor handling as a traceback."""
+    descriptor = _descriptor(source_path=str(external_source))
+    descriptor["source_kind"] = value
+
+    with pytest.raises(ConstitutionSourceError, match="source_kind"):
+        resolve_governing_source(
+            descriptor_path=_write(tmp_path, descriptor),
+            trust_root_path=trust_root,
+        )
+
+
+def _hybrid_root(tmp_path):
+    from kestrel_sovereign.identity.inception_did_web import (
+        create_did_web_identity,
+    )
+
+    root = create_did_web_identity("sovereign.example", "root")
+    root_path = tmp_path / "hybrid-root.did.json"
+    root_path.write_text(json.dumps(root.did_document), encoding="utf-8")
+    return root, root_path
+
+
+@pytest.mark.parametrize(
+    "signatures",
+    [
+        5,
+        True,
+        "signed",
+        {"alg": ALG_ED25519, "kid": "key-1", "sig": "00"},
+        [{"alg": ALG_ED25519, "kid": ["key-1"], "sig": "00"}],
+        [{"alg": [ALG_ED25519], "kid": "key-1", "sig": "00"}],
+        [{"alg": ALG_ED25519, "kid": "key-1", "sig": ["00"]}],
+        [{"alg": ALG_ED25519, "kid": "key-1", "sig": {"hex": "00"}}],
+        [None, 3, "x"],
+    ],
+)
+def test_malformed_signature_material_is_untrusted_not_a_crash(
+    tmp_path, external_source, signatures
+):
+    """Signature material is attacker-writable JSON. A non-list
+    ``signatures``, an unhashable ``kid``, or a non-string ``sig`` reached
+    ``verify_hybrid`` and raised TypeError instead of failing verification.
+    ``key-1`` / ``ed25519`` name the root's real classical method, so each
+    malformed field is reached rather than skipped by an earlier lookup."""
+    root, root_path = _hybrid_root(tmp_path)
+    descriptor = build_hybrid_signed_source_descriptor(
+        signer_did=root.did,
+        source_kind=SOURCE_KIND_EXTERNAL,
+        source_path=str(external_source),
+        content_sha256=_sha(EXTERNAL_TEXT),
+        keypair=root.keypair,
+    )
+    descriptor["signatures"] = signatures
+
+    with pytest.raises(ConstitutionSourceError, match="signature"):
+        resolve_governing_source(
+            descriptor_path=_write(tmp_path, descriptor), trust_root_path=root_path
+        )
+
+
+def test_a_genuine_hybrid_signature_still_verifies_beside_a_malformed_entry(
+    tmp_path, external_source
+):
+    """Skipping a malformed entry must not cost a valid one its verification."""
+    root, root_path = _hybrid_root(tmp_path)
+    descriptor = build_hybrid_signed_source_descriptor(
+        signer_did=root.did,
+        source_kind=SOURCE_KIND_EXTERNAL,
+        source_path=str(external_source),
+        content_sha256=_sha(EXTERNAL_TEXT),
+        keypair=root.keypair,
+    )
+    descriptor["signatures"] = [
+        {"alg": ALG_ED25519, "kid": ["key-1"], "sig": "00"},
+        *descriptor["signatures"],
+    ]
+
+    source = resolve_governing_source(
+        descriptor_path=_write(tmp_path, descriptor), trust_root_path=root_path
+    )
+    assert source.path == str(external_source)
 
 
 # ---------------------------------------------------------------------------

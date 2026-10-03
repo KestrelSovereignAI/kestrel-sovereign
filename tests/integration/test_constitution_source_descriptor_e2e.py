@@ -302,3 +302,51 @@ async def test_offline_reanchor_moves_a_package_agent_onto_an_external_source(
         sovereign_trust_root_path=str(trust_root),
     )
     assert ok, message
+
+
+@pytest.mark.asyncio
+async def test_offline_reanchor_resolves_the_source_from_the_agents_environment(
+    tmp_path, operator_dir, monkeypatch
+):
+    """``kestrel constitution reanchor`` passes the launcher's environment.
+
+    The descriptor and the trust root are named only there. The process
+    environment names a different, nonexistent descriptor: a writer that read
+    it for the configuration check, the source resolution, or the artifact's
+    trust root would refuse instead of anchoring what the agent audits.
+    """
+    agent_dir = tmp_path / "agent_data" / "Custom"
+    credentials = await create_kestrel_identity_async(
+        output_dir=str(agent_dir), agent_name="Custom"
+    )
+    source = operator_dir / "CUSTOM_CONSTITUTION.md"
+    descriptor = _descriptor_file(operator_dir, source, CUSTOM_CONSTITUTION)
+    trust_root = operator_dir / "sovereign-root.did.json"
+    artifact = build_legacy_signed_reanchor_artifact(
+        signer_did=_ROOT_DID,
+        constitution_sha256=_sha(CUSTOM_CONSTITUTION),
+        private_key=_ROOT_KEYPAIR.private_key,
+        reason="move to custom source",
+    )
+    artifact_path = operator_dir / "reanchor.signed.json"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    monkeypatch.setenv(
+        CONSTITUTION_SOURCE_DESCRIPTOR_ENV, str(tmp_path / "shell-only.json")
+    )
+    launch_env = {
+        CONSTITUTION_SOURCE_DESCRIPTOR_ENV: str(descriptor),
+        SOVEREIGN_TRUST_ROOT_ENV: str(trust_root),
+    }
+
+    result = await reanchor_constitution(
+        agent_name="Custom",
+        agent_dir=agent_dir,
+        force=True,
+        amendment_artifact_path=artifact_path,
+        environ=launch_env,
+    )
+
+    assert result.reanchored, result.error
+    assert result.canonical_path == source
+    properties = await _agent_properties(credentials.db_path, credentials.agent_did)
+    assert properties["constitution_hash"] == _sha(CUSTOM_CONSTITUTION)

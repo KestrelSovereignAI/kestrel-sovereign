@@ -241,7 +241,15 @@ def verify_hybrid(
         alg = entry.get("alg")
         kid = entry.get("kid")
         sig_hex = entry.get("sig")
-        if not alg or not kid or not sig_hex:
+        # Entries arrive from signed artifacts an attacker can write. A
+        # non-string ``kid`` is unhashable and a non-string ``sig`` breaks
+        # ``bytes.fromhex`` with TypeError, so drop them like any other
+        # unverifiable entry instead of raising.
+        if not (
+            isinstance(alg, str) and alg
+            and isinstance(kid, str) and kid
+            and isinstance(sig_hex, str) and sig_hex
+        ):
             continue
 
         vm = methods_by_kid.get(kid)

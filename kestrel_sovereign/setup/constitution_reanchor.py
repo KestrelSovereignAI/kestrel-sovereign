@@ -63,6 +63,7 @@ import logging
 import os
 import shutil
 import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -424,6 +425,7 @@ async def reanchor_constitution(
     amendment_artifact_path: Path | None = None,
     sovereign_trust_root_path: Path | None = None,
     source_descriptor_path: Path | None = None,
+    environ: Mapping[str, str] | None = None,
     runtime_backend: str | None = None,
     runtime_dsn: str | None = None,
     hosted_agent_did: str | None = None,
@@ -479,6 +481,11 @@ async def reanchor_constitution(
             ``KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH`` and rejects
             conflicts. Verified against the same trust root; with none
             configured, the packaged constitution governs.
+        environ: The environment the agent itself runs with, from which both
+            resolvers read their variables. ``kestrel constitution reanchor``
+            passes the launcher's (``paths.spawned_agent_env``), the one the
+            agent and ``kestrel doctor`` resolve from, so the source anchored
+            here is the source the agent audits. None reads ``os.environ``.
         hosted_agent_did: Exact DID from an embedding host's authoritative
             tenant registry. It must be paired with an explicit PostgreSQL
             DSN and no local agent directory. The host must independently
@@ -570,7 +577,9 @@ async def reanchor_constitution(
     # only known after the anchor read below.
     try:
         descriptor_configured = (
-            configured_source_descriptor_path(explicit_path=source_descriptor_path)
+            configured_source_descriptor_path(
+                explicit_path=source_descriptor_path, environ=environ
+            )
             is not None
         )
     except ConstitutionSourceError as exc:
@@ -701,6 +710,7 @@ async def reanchor_constitution(
             descriptor_path=source_descriptor_path,
             trust_root_path=sovereign_trust_root_path,
             agent_dids={agent_did} if agent_did else frozenset(),
+            environ=environ,
         )
     except ValueError as exc:
         return _result(
@@ -888,6 +898,7 @@ async def reanchor_constitution(
     try:
         trusted_did_document = load_sovereign_trust_root(
             explicit_path=sovereign_trust_root_path,
+            environ=environ,
             agent_dids={agent_did},
         )
         (
