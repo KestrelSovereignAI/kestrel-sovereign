@@ -84,6 +84,14 @@ def _make_feature(
 
 _UNSET = object()
 
+# How long a test waits for work that must finish before calling it hung. This
+# bounds a deadlock, not the work: a passing run returns as soon as the awaited
+# work completes. It must outlast a stop-the-world pass of the cyclic garbage
+# collector in a loaded xdist worker, which a 1s budget did not (#3447: 0.6s
+# measured with ~2k tests per worker; CI runs ~10k per worker on a slower
+# runner), and stay well inside CI's 60s per-test timeout.
+_HANG_GUARD_SECONDS = 30
+
 
 def _make_app(agent=None, caller=_UNSET):
     """Create a FastAPI app with the features router mounted.
@@ -371,8 +379,9 @@ class TestEnableFeature:
             async def set_config(self, config):
                 self.call_order.append("set_config")
                 if self.ingress_open and not self.ingress_finished.is_set():
-                    # A real proxy drains its admitted callback here. The bounded
-                    # rescue makes the pre-fix lock cycle observable without
+                    # A real proxy drains its admitted callback here. The rescue
+                    # below releases the drain as soon as it starts, so the
+                    # pre-fix lock cycle fails the assertions instead of
                     # leaving a permanently hung pytest task.
                     self.drain_waited_on_conversation.set()
                     await self.rescue_deadlock.wait()
@@ -388,24 +397,30 @@ class TestEnableFeature:
             app=SimpleNamespace(state=SimpleNamespace(agent=None)),
         )
 
-        async def bounded_rescue():
-            await asyncio.sleep(0.05)
+        async def rescue_on_drain():
+            # Keyed to the drain itself rather than a clock, so worker load
+            # cannot change which ordering the assertions below observe.
+            await feature.drain_waited_on_conversation.wait()
             feature.rescue_deadlock.set()
 
-        rescue = asyncio.create_task(bounded_rescue())
+        rescue = asyncio.create_task(rescue_on_drain())
         try:
             response = await asyncio.wait_for(
                 features_endpoint.enable_feature(request, feature.name),
-                timeout=1,
+                timeout=_HANG_GUARD_SECONDS,
             )
             assert response["status"] == "enabled"
             assert feature.call_order == ["set_config", "initialize"]
             assert not feature.drain_waited_on_conversation.is_set()
-            await asyncio.wait_for(feature.ingress_task, timeout=1)
+            await asyncio.wait_for(
+                feature.ingress_task, timeout=_HANG_GUARD_SECONDS
+            )
             assert feature.ingress_finished.is_set()
         finally:
             feature.rescue_deadlock.set()
-            await rescue
+            rescue.cancel()
+            with suppress(asyncio.CancelledError):
+                await rescue
             if feature.ingress_task is not None and not feature.ingress_task.done():
                 feature.ingress_task.cancel()
                 with suppress(asyncio.CancelledError):
