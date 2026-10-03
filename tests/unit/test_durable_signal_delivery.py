@@ -68,6 +68,14 @@ from kestrel_sovereign.hold import (
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 
+# How long a test waits for work it set in motion before calling it hung. This
+# bounds a deadlock, not the work: a passing run returns as soon as the awaited
+# event fires. Enqueued durable cognition reaches ``process_input`` only after
+# several SQLite worker-thread round trips, which a 1s budget did not cover in
+# a loaded xdist worker (#3454, like #3447). It must stay well inside CI's 60s
+# per-test timeout.
+_HANG_GUARD_SECONDS = 30
+
 
 class _Agent:
     def __init__(self, did: str):
@@ -1266,7 +1274,6 @@ async def test_sqlite_malformed_and_superseded_guard_family_is_replaced(tmp_path
     store = DurableSignalStore(backend)
     await store.initialize()
     agent_id = "did:agent:stale-guard"
-    source = "provider.message"
     try:
         persisted = await store.persist_signal(
             _signal(agent_id=agent_id),
@@ -8927,7 +8934,9 @@ async def test_stop_completion_waits_for_durable_cognition_terminalization(
             source_event_id="telegram:update:stop-terminal-order",
             consumer_id=consumer.consumer_id,
         )
-        await asyncio.wait_for(agent.process_started.wait(), timeout=1)
+        await asyncio.wait_for(
+            agent.process_started.wait(), timeout=_HANG_GUARD_SECONDS
+        )
         assert agent._active_request_ids == {handle.signal_id}
         request_id = handle.signal_id
         assert agent.cancel_current_request(request_id) is True
@@ -8935,12 +8944,14 @@ async def test_stop_completion_waits_for_durable_cognition_terminalization(
             agent.wait_for_request_completion(request_id)
         )
 
-        await asyncio.wait_for(terminalization_started.wait(), timeout=1)
+        await asyncio.wait_for(
+            terminalization_started.wait(), timeout=_HANG_GUARD_SECONDS
+        )
         assert completion.done() is False
 
         allow_terminalization.set()
         assert (
-            await asyncio.wait_for(completion, timeout=1)
+            await asyncio.wait_for(completion, timeout=_HANG_GUARD_SECONDS)
             is (
                 RequestCompletionDisposition.COMPLETED
                 if terminalization_succeeds
@@ -8956,6 +8967,9 @@ async def test_stop_completion_waits_for_durable_cognition_terminalization(
         )
     finally:
         allow_terminalization.set()
+        # A turn this test never stopped would otherwise hold shutdown until
+        # its next lease renewal fails, up to 20s later.
+        agent.allow_process_completion.set()
         if completion is not None and not completion.done():
             completion.cancel()
         await dispatcher.shutdown_durable_delivery()
@@ -9062,9 +9076,13 @@ async def test_late_stop_cannot_claim_completed_cognition_during_settlement(
             source_event_id=f"telegram:update:late-stop-during-{settlement_case}",
             consumer_id=consumer.consumer_id,
         )
-        await asyncio.wait_for(agent.process_started.wait(), timeout=1)
+        await asyncio.wait_for(
+            agent.process_started.wait(), timeout=_HANG_GUARD_SECONDS
+        )
         agent.allow_process_completion.set()
-        await asyncio.wait_for(settlement_started.wait(), timeout=1)
+        await asyncio.wait_for(
+            settlement_started.wait(), timeout=_HANG_GUARD_SECONDS
+        )
 
         request_id = handle.signal_id
         assert agent.cancel_current_request(request_id) is True
@@ -9075,7 +9093,7 @@ async def test_late_stop_cannot_claim_completed_cognition_during_settlement(
 
         allow_settlement.set()
         assert (
-            await asyncio.wait_for(completion, timeout=1)
+            await asyncio.wait_for(completion, timeout=_HANG_GUARD_SECONDS)
             is RequestCompletionDisposition.ABANDONED
         )
         assert (await handle.wait()).status is expected_result_status
@@ -9083,6 +9101,7 @@ async def test_late_stop_cannot_claim_completed_cognition_during_settlement(
         assert delivery.status == expected_delivery_status
     finally:
         allow_settlement.set()
+        agent.allow_process_completion.set()
         if completion is not None and not completion.done():
             completion.cancel()
         await dispatcher.shutdown_durable_delivery()
@@ -9137,9 +9156,11 @@ async def test_cancelled_durable_settlement_abandons_lifecycle_generation(
             source_event_id="telegram:update:cancelled-settlement-owner",
             consumer_id=consumer.consumer_id,
         )
-        await asyncio.wait_for(agent.process_started.wait(), timeout=1)
+        await asyncio.wait_for(
+            agent.process_started.wait(), timeout=_HANG_GUARD_SECONDS
+        )
         agent.allow_process_completion.set()
-        await asyncio.wait_for(ack_started.wait(), timeout=1)
+        await asyncio.wait_for(ack_started.wait(), timeout=_HANG_GUARD_SECONDS)
 
         request_id = handle.signal_id
         handle.task.cancel()
