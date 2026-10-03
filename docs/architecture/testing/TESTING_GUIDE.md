@@ -176,6 +176,30 @@ def check_docker():
         pytest.skip(f"Docker not available: {e}")
 ```
 
+### PostgreSQL Tests
+
+A dual-backend test runs its PostgreSQL case when `TEST_POSTGRES_URL` is set.
+That database outlives the run, and a developer's is often reused between runs
+or shared. Only an xdist worker gets a schema of its own
+([`tests/shared/postgres_worker_isolation.py`](../../../tests/shared/postgres_worker_isolation.py));
+a serial run uses the URL's schema as it is. A PostgreSQL case must therefore
+leave alone every row and column it did not create:
+
+- A case whose operation spans a whole table (a backfill, a migration, a
+  table-wide count) runs in a schema of its own:
+  `disposable_postgres_schema` from
+  [`tests/utils/postgres_schema.py`](../../../tests/utils/postgres_schema.py),
+  dropped on exit. Deleting the case's own rows at teardown does not undo a
+  write to rows it never inserted.
+- Create that schema through a connection opened with a `schema_initializer`
+  that issues no DDL. The default initializer boots the URL's schema, and the
+  startup sequence rewrites rows already there.
+- A case that needs pgvector puts the schema `pgvector_schema()` returns on its
+  search path: the extension lives in whichever schema first installed it.
+
+`tests/unit/test_embedding_vec_backfill.py` is a worked example, including a
+regression test that the case leaves a reused database unchanged (#3404).
+
 ### Test Organization
 
 ```
