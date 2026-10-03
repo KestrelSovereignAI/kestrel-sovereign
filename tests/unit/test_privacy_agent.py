@@ -108,8 +108,12 @@ async def test_anonymous_mode(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_deidentified_mode_buffers_until_evidence_pipeline_exists(tmp_path):
-    """DEIDENTIFIED should not crash chat turns or persist without evidence."""
+async def test_deidentified_mode_buffers_chat_turns_without_evidence(tmp_path):
+    """DEIDENTIFIED should not crash chat turns or persist without evidence.
+
+    A chat turn is raw content with no evidence artifact; only pipeline output
+    reaches durable storage, through ``store_deidentified_records``.
+    """
     db_path = tmp_path / "test_deidentified.db"
     storage = AsyncStorage(str(db_path))
     await storage.initialize()

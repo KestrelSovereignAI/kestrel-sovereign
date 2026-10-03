@@ -175,37 +175,50 @@ class PIIDetector:
                     ))
         
         # 2. Run NER for names, orgs, locations (things regex can't catch)
-        if self.nlp is not None:
-            doc = self.nlp(text)
-            for ent in doc.ents:
-                if ent.label_ in self.SPACY_LABEL_MAP:
-                    pii_type = self.SPACY_LABEL_MAP[ent.label_]
-                    span = (ent.start_char, ent.end_char)
-                    # Skip if overlapping with regex match (regex is more reliable for structured data)
-                    if not self._overlaps_any(span, seen_spans):
-                        # Additional filter: skip common non-PII date words and numeric-only dates
-                        if ent.label_ == "DATE":
-                            # Skip numeric-only "dates" like "1111"
-                            if ent.text.replace(" ", "").isdigit():
-                                continue
-                            # Skip common relative date words that aren't PII
-                            common_dates = {"today", "yesterday", "tomorrow", "now", "later", 
-                                           "monday", "tuesday", "wednesday", "thursday", 
-                                           "friday", "saturday", "sunday"}
-                            if ent.text.lower() in common_dates:
-                                continue
-                        seen_spans.add(span)
-                        matches.append(PIIMatch(
-                            pii_type=pii_type,
-                            text=ent.text,
-                            start=ent.start_char,
-                            end=ent.end_char,
-                            confidence=0.9  # NER confidence varies; simplified
-                        ))
-        
+        for entity in self.detect_entities(text):
+            span = (entity.start, entity.end)
+            # Skip if overlapping with regex match (regex is more reliable for structured data)
+            if not self._overlaps_any(span, seen_spans):
+                seen_spans.add(span)
+                matches.append(entity)
+
         # Sort by position for proper replacement
         matches.sort(key=lambda m: m.start)
         return matches
+
+    def detect_entities(self, text: str) -> List[PIIMatch]:
+        """Named entities found by the NER model alone; empty without a model.
+
+        Unlike :meth:`detect`, regex matches do not shadow entities here. The
+        de-identification pipeline relies on that: a greedy regex hit (the
+        address pattern spans "2 days ago with son Tom Lee and Dr") must not
+        hide the name inside it.
+        """
+        if self.nlp is None:
+            return []
+        entities: List[PIIMatch] = []
+        for ent in self.nlp(text).ents:
+            if ent.label_ not in self.SPACY_LABEL_MAP:
+                continue
+            # Additional filter: skip common non-PII date words and numeric-only dates
+            if ent.label_ == "DATE":
+                # Skip numeric-only "dates" like "1111"
+                if ent.text.replace(" ", "").isdigit():
+                    continue
+                # Skip common relative date words that aren't PII
+                common_dates = {"today", "yesterday", "tomorrow", "now", "later",
+                               "monday", "tuesday", "wednesday", "thursday",
+                               "friday", "saturday", "sunday"}
+                if ent.text.lower() in common_dates:
+                    continue
+            entities.append(PIIMatch(
+                pii_type=self.SPACY_LABEL_MAP[ent.label_],
+                text=ent.text,
+                start=ent.start_char,
+                end=ent.end_char,
+                confidence=0.9  # NER confidence varies; simplified
+            ))
+        return entities
     
     def _overlaps_any(self, span: Tuple[int, int], seen: Set[Tuple[int, int]]) -> bool:
         """Check if a span overlaps with any seen span."""

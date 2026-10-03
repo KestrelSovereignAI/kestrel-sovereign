@@ -351,43 +351,33 @@ async def await_owned_task(
 ) -> OwnedTaskOutcome[_T]:
     """Retrieve ``task`` despite repeated cancellation of its caller.
 
-    The shielded waiter carries only a successful event result, never the
-    owned task's exception. The owned result is retrieved exactly once after
+    The shielded waiter carries only a successful result, never the owned
+    task's exception. The owned result is retrieved exactly once after
     terminalization, avoiding orphaned-task and shield-future warnings.
+
+    The waiter is a plain future rather than a task: event-loop teardown
+    cancels every task, and a waiter task cancelled while ``task`` still runs
+    would make each ``shield`` raise at once, without yielding, so this loop
+    would spin and ``task`` could never finish. Nothing but this function
+    holds the future, so only ``task`` completing resolves it.
     """
 
-    completion = asyncio.Event()
+    completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     def mark_complete(_task: asyncio.Task[_T]) -> None:
-        completion.set()
+        if not completion.done():
+            completion.set_result(None)
 
     task.add_done_callback(mark_complete)
-    completion_task = asyncio.create_task(completion.wait())
     try:
         while not task.done():
             try:
-                await asyncio.shield(completion_task)
+                await asyncio.shield(completion)
             except asyncio.CancelledError as error:
                 if pending_cancellation is None:
                     pending_cancellation = error
     finally:
         task.remove_done_callback(mark_complete)
-        if not completion_task.done():
-            completion_task.cancel()
-
-        # Do not await between terminalization and result retrieval. A further
-        # Task.cancel() in that window could interrupt the bookkeeping that
-        # prevents an unobserved completion-task exception.
-        def retrieve_completion(waiter: asyncio.Task[bool]) -> None:
-            try:
-                waiter.result()
-            except asyncio.CancelledError:
-                pass
-
-        if completion_task.done():
-            retrieve_completion(completion_task)
-        else:
-            completion_task.add_done_callback(retrieve_completion)
 
     try:
         return OwnedTaskOutcome(task.result(), None, pending_cancellation)
