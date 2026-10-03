@@ -2890,7 +2890,10 @@ class PrivacyEnforcingStorage:
 
         Both documents are stored as content-addressed JSON files (encrypted at
         rest when a data key is configured). Their metadata is content-free:
-        the evidence id, assurance, and digests.
+        the evidence id, assurance, and digests. The save commits its own
+        transaction while it holds the privacy lease that blocks a transition
+        to a volatile mode, so it is refused inside a transaction the calling
+        task already has open, where it could only join it.
         """
         # Exact type: a subclass could override verify() or records_as_dicts().
         if type(result) is not DeidentificationResult:
@@ -2919,6 +2922,18 @@ class PrivacyEnforcingStorage:
             "record_count": record_count,
             "mime_type": "application/json",
         }
+        # The lease must outlive the commit. Inside a transaction this task
+        # already holds, the one below joins it: the documents would commit
+        # only with the caller's, after the lease is released, so a transition
+        # to a volatile mode could land first. The check holds until the
+        # backend decides to join or open: only this task can open a
+        # transaction this task would join.
+        if getattr(self._storage, "owns_open_transaction", None) is not False:
+            raise PrivacyViolationError(
+                "De-identified save blocked: the save must commit in its own "
+                "transaction, but this task already has one open (or the "
+                "storage cannot report whether it has)."
+            )
         self._acquire_deidentified_save_lease(evidence.assurance)
         try:
             async with self._storage.transaction():

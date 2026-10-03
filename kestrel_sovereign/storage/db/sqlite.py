@@ -406,7 +406,13 @@ class SQLiteBackend(DatabaseBackend):
     def nested_transaction_strategy(self) -> str:
         """SQLite currently joins same-task nested transaction scopes."""
         return "joined"
-    
+
+    @property
+    def owns_open_transaction(self) -> bool:
+        """Whether the current task has a transaction open here, which a
+        ``transaction()`` entered now would join rather than commit."""
+        return self._in_transaction and self._txn_owner is asyncio.current_task()
+
     @property
     def is_connected(self) -> bool:
         return self._connection is not None

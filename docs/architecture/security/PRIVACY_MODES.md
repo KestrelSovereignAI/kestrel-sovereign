@@ -309,7 +309,11 @@ A save additionally requires the artifact's assurance to equal the config's
 whenever the config names one (`safe_harbor` for the preset). The artifact and
 the records are written in one transaction, artifact first, as
 content-addressed JSON files (encrypted at rest when a data key is configured)
-whose metadata holds only the evidence id, assurance, and digests.
+whose metadata holds only the evidence id, assurance, and digests. That
+transaction commits before the save releases the privacy lease that blocks a
+transition to a volatile mode, so a save is refused inside a transaction the
+calling task already has open: there it would only join the caller's
+transaction and commit after the lease was gone.
 `DeidentificationResult.export_bundle()` is the export form: it re-verifies,
 embeds the artifact verbatim, and reads its own bytes back before returning
 them. The saved records document is that bundle, so every path that serves
@@ -326,7 +330,10 @@ describes exactly its records. `DeidentificationEvidence.from_json_bytes`
 applies the same exact round trip to a stored artifact. The residual scan of a
 saved or exported record covers field names as well as values, measures cued
 birth years against the artifact's reference date, and names a refused field
-by position: an imported bundle's field names are untrusted.
+by position: an imported bundle's field names are untrusted. It also covers
+the field names the artifact itself carries, which include removed fields that
+never reach the records; a schema field name carrying an identifier pattern is
+refused when the pipeline is built and again at each run.
 
 The gate binds content, not provenance. Like the rest of the privacy layer, it
 cannot tell the pipeline from same-process code that assembles a

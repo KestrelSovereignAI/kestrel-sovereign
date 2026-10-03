@@ -242,6 +242,128 @@ def test_float_age_is_scrubbed_from_text_in_its_integer_form():
     assert "95" not in result.records[0]["note"]
 
 
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("a 95.5-year-old woman", f"a {AGE_90_OR_OLDER}-year-old woman"),
+        ("age 95.5 at intake", f"age {AGE_90_OR_OLDER} at intake"),
+        ("an 89.5-year-old man", f"an {AGE_90_OR_OLDER}-year-old man"),
+        ("a 92.5yoF", f"a {AGE_90_OR_OLDER}yoF"),
+        ("aged 95+ cohort", f"aged {AGE_90_OR_OLDER} cohort"),
+        ("age 95.5+ cohort", f"age {AGE_90_OR_OLDER} cohort"),
+        ("Age 95.5y at intake", f"Age {AGE_90_OR_OLDER}y at intake"),
+        ("age: 95.5F", f"age: {AGE_90_OR_OLDER}F"),
+        ("Age 95y at intake", f"Age {AGE_90_OR_OLDER}y at intake"),
+        ("a 95 1/2 years old", f"a {AGE_90_OR_OLDER} years old"),
+        ("a 95½-year-old", f"a {AGE_90_OR_OLDER}-year-old"),
+        ("a 95 ½-year-old", f"a {AGE_90_OR_OLDER}-year-old"),
+        ("a 95-1/2-year-old", f"a {AGE_90_OR_OLDER}-year-old"),
+        ("95 1⁄2 years", f"{AGE_90_OR_OLDER} years"),
+        ("age 89 1/2 at intake", f"age {AGE_90_OR_OLDER} at intake"),
+        ("ages 95 and up", f"ages {AGE_90_OR_OLDER} and up"),
+        ("age >95 only", f"age >{AGE_90_OR_OLDER} only"),
+        ("age >/= 95 only", f"age >/= {AGE_90_OR_OLDER} only"),
+        ("aged over 95", f"aged over {AGE_90_OR_OLDER}"),
+        ("age=95", f"age={AGE_90_OR_OLDER}"),
+        ("age ~95", f"age ~{AGE_90_OR_OLDER}"),
+        ("age approx. 95", f"age approx. {AGE_90_OR_OLDER}"),
+        ("Age (years): 95", f"Age (years): {AGE_90_OR_OLDER}"),
+        ("Age (y): 95", f"Age (y): {AGE_90_OR_OLDER}"),
+        ("Age: ~95", f"Age: ~{AGE_90_OR_OLDER}"),
+        ("Age – 95", f"Age – {AGE_90_OR_OLDER}"),
+        ("Age 95+ %", f"Age {AGE_90_OR_OLDER} %"),
+        ("Age at death: 95", f"Age at death: {AGE_90_OR_OLDER}"),
+        ("Age/Sex: 95/F", f"Age/Sex: {AGE_90_OR_OLDER}/F"),
+        ("seen 92YOF", f"seen {AGE_90_OR_OLDER}YOF"),
+        ("a 95–year–old woman", f"a {AGE_90_OR_OLDER}–year–old woman"),
+    ],
+)
+def test_decimal_and_open_ended_ages_over_89_are_aggregated_whole(text, expected):
+    """Regression: "a 95.5-year-old" was exported unchanged, "age 95.5" became
+    "age 90+.5", "aged 95+" was kept because "+" marked the aggregate, and a
+    unit straight after a decimal ("Age 95.5y") hid the age. The cue forms
+    after these ("Age at death: 95", "age=95") were never matched."""
+    result = _run(_pipeline({"note": FieldSpec.free_text()}), {"note": text})
+    assert result.records[0]["note"] == expected
+    assert _disposition(result, SafeHarborIdentifier.DATES).generalized == 1
+    with pytest.raises(DeidentificationError, match=r"non-identifying.*pattern:age"):
+        _run(_pipeline({"value": FieldSpec.non_identifying()}), {"value": text})
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("a 92-95 years old cohort", f"a {AGE_90_OR_OLDER}-{AGE_90_OR_OLDER} years old cohort"),
+        # Regression: the upper bound's fraction hid the range in the first
+        # round, and the next compared 92 with the "90+" written over 95½.
+        ("between 92 and 95½ years old", f"between {AGE_90_OR_OLDER} and {AGE_90_OR_OLDER} years old"),
+        ("92 to 95+ years", f"{AGE_90_OR_OLDER} to {AGE_90_OR_OLDER} years"),
+    ],
+)
+def test_both_ends_of_an_age_range_over_89_are_aggregated(text, expected):
+    result = _run(_pipeline({"note": FieldSpec.free_text()}), {"note": text})
+    assert result.records[0]["note"] == expected
+    assert _disposition(result, SafeHarborIdentifier.DATES).generalized == 2
+
+
+def test_a_reading_before_an_age_range_is_not_its_lower_bound():
+    """The 90 of a 120/90 blood pressure is not the start of "90 - 95 years"."""
+    result = _run(_pipeline({"note": FieldSpec.free_text()}), {"note": "BP 120/90 - 95 years old"})
+    assert result.records[0]["note"] == f"BP 120/90 - {AGE_90_OR_OLDER} years old"
+
+
+def test_a_number_above_the_age_after_it_is_not_a_range():
+    result = _run(_pipeline({"note": FieldSpec.free_text()}), {"note": "Patient 101 – 94-year-old man"})
+    assert result.records[0]["note"] == f"Patient 101 – {AGE_90_OR_OLDER}-year-old man"
+
+
+def test_a_decimal_age_is_judged_numerically_as_the_age_field_is():
+    """89.5 is over 89 in a structured age field, so it is in free text too."""
+    schema = {"age": FieldSpec.age(), "note": FieldSpec.free_text()}
+    result = _run(_pipeline(schema), {"age": 89.5, "note": "an 89.5-year-old"})
+    assert result.records[0] == {
+        "age": AGE_90_OR_OLDER,
+        "note": f"an {AGE_90_OR_OLDER}-year-old",
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "an 89-year-old man",
+        "age 89",
+        "age 89.0",
+        "aged 89+",
+        "ages 18 to 65",
+        "18-65 years",
+        "Temp 95.5F",
+        "average 95",
+        "weight-for-age 99th percentile",
+        "BMI-for-age >95th percentile",
+        "length-for-age 99 percentile",
+        "Age: 95th percentile",
+        "age-adjusted rate 120",
+        "age 95% CI",
+        "HFE C282Y heterozygous",
+        "EGFR T790M",
+        "samples aged at 120 °C for 24 h",
+        "serum AGEs 145 AU/mL",
+        "BP 150/95 - 10 years ago",
+        "SBP > 140 or 75 years of age",
+        "The ages of 120 patients ranged from 61 to 88.",
+        "Age (months): 96",
+        f"aged {AGE_90_OR_OLDER}",
+        f"Age {AGE_90_OR_OLDER} %",
+        f"age {AGE_90_OR_OLDER}5",  # a lookahead backtracking off the "+"
+    ],
+)
+def test_ages_up_to_89_temperatures_and_the_aggregate_are_kept(text):
+    result = _run(_pipeline({"note": FieldSpec.free_text()}), {"note": text})
+    assert result.records[0]["note"] == text
+    kept = _run(_pipeline({"value": FieldSpec.non_identifying()}), {"value": text})
+    assert kept.records[0]["value"] == text
+
+
 def test_restricted_zip_list_is_configuration_recorded_in_the_digest():
     default = _pipeline({"zip": FieldSpec.zip_code()})
     custom = _pipeline({"zip": FieldSpec.zip_code()}, restricted_zip3_prefixes={"021"})
@@ -309,6 +431,27 @@ def test_free_text_removes_each_detectable_category(text, secret, category):
     assert secret not in note
     assert redaction_placeholder(category) in note
     assert _disposition(result, category).transformed >= 1
+
+
+@pytest.mark.parametrize("address", ["::abcd:1234", "::1"])
+def test_ipv6_with_leading_compression_is_removed_and_refutes(address):
+    """Regression: "::abcd:1234" survived scrubbing, verification, and export."""
+    ip = redaction_placeholder(SafeHarborIdentifier.IP_ADDRESSES)
+    result = _run(_pipeline({"note": FieldSpec.free_text()}), {"note": f"login from {address} overnight"})
+    assert result.records[0]["note"] == f"login from {ip} overnight"
+    with pytest.raises(DeidentificationError, match=r"non-identifying.*ip_addresses"):
+        _run(_pipeline({"host": FieldSpec.non_identifying()}), {"host": address})
+    sample = _sample_result()
+    forged_record = dict(sample.records[0], diagnosis=f"login from {address}")
+    forged = _forge_output(sample, forged_record)
+    with pytest.raises(EvidenceValidationError, match="still carries a ip_addresses"):
+        DeidentificationResult((forged_record,), forged)
+
+
+def test_a_bare_double_colon_is_not_an_address():
+    text = "see std::vector; a :: b"
+    result = _run(_pipeline({"value": FieldSpec.non_identifying()}), {"value": text})
+    assert result.records[0]["value"] == text
 
 
 @pytest.mark.parametrize(
@@ -662,6 +805,30 @@ def test_a_non_identifying_number_equal_to_an_identifier_is_refused():
         _run(_pipeline(schema), {"chart": "4471223", "chart_ref": 4471223})
 
 
+@pytest.mark.parametrize("duplicate", [4321.0, 4321, "4321", "ref 4321.0"])
+def test_a_float_identifier_repeated_in_a_non_identifying_field_is_refused(duplicate):
+    """Regression: a float MRN was removed from its own field but exported
+    unchanged from a non-identifying one (an integer MRN was refused)."""
+    schema = {
+        "chart": FieldSpec.remove(SafeHarborIdentifier.MEDICAL_RECORD_NUMBERS),
+        "chart_ref": FieldSpec.non_identifying(),
+    }
+    with pytest.raises(
+        DeidentificationError, match=r"non-identifying.*medical_record_numbers.*known_value"
+    ):
+        _run(_pipeline(schema), {"chart": 4321.0, "chart_ref": duplicate})
+
+
+def test_a_float_identifier_is_scrubbed_from_free_text_in_both_spellings():
+    schema = {
+        "chart": FieldSpec.remove(SafeHarborIdentifier.MEDICAL_RECORD_NUMBERS),
+        "note": FieldSpec.free_text(),
+    }
+    result = _run(_pipeline(schema), {"chart": 4321.0, "note": "chart 4321, exported as 4321.0"})
+    mrn = redaction_placeholder(SafeHarborIdentifier.MEDICAL_RECORD_NUMBERS)
+    assert result.records[0] == {"note": f"chart {mrn}, exported as {mrn}"}
+
+
 def test_a_name_token_that_is_also_a_word_does_not_refute():
     """Patient "Mary White" with race "White": the surname is scrubbed from
     free text but is not evidence against a categorical field."""
@@ -966,6 +1133,64 @@ def test_a_record_key_carrying_an_identifier_is_rejected():
     with pytest.raises(EvidenceValidationError, match="field name carrying an identifier") as caught:
         DeidentificationResult((forged_record,), forged)
     assert "078-05-1120" not in str(caught.value)
+
+
+LEAKED_FIELD_NAME = "patient.alice@example.com"
+
+
+@pytest.mark.parametrize("field_name", [LEAKED_FIELD_NAME, "notes 078-05-1120"])
+def test_a_schema_field_name_carrying_an_identifier_is_refused(field_name):
+    """Regression: a removed field named after an e-mail address left the
+    address in the artifact, which nothing scanned. No pipeline, no artifact."""
+    with pytest.raises(DeidentificationConfigError, match="schema field 1 has a name") as caught:
+        _pipeline({
+            "zip": FieldSpec.zip_code(),
+            field_name: FieldSpec.remove(SafeHarborIdentifier.NAMES),
+        })
+    assert field_name not in str(caught.value)
+
+
+def test_a_schema_field_name_is_judged_against_the_runs_reference_date():
+    """1940 is 86 years before the 2026 clock, 91 before a 2031 reference."""
+    pipeline = _pipeline({"YOB 1940 cohort": FieldSpec.remove(SafeHarborIdentifier.NAMES)})
+    _run(pipeline, {"YOB 1940 cohort": "x"})
+    with pytest.raises(DeidentificationRefused, match="schema field 0 has a name"):
+        _run(pipeline, {"YOB 1940 cohort": "x"}, reference_date=date(2031, 1, 1))
+
+
+def _rename_in_artifact(evidence, where, name):
+    if where == "transformation":
+        record = evidence.records[0]
+        renamed = dataclasses.replace(record.transformations[0], field=name)
+        draft = dataclasses.replace(evidence, records=(
+            dataclasses.replace(record, transformations=(renamed,) + record.transformations[1:]),
+        ))
+    else:
+        draft = dataclasses.replace(evidence, categories=tuple(
+            dataclasses.replace(c, fields_classified=c.fields_classified + (name,))
+            if c.category is SafeHarborIdentifier.NAMES else c
+            for c in evidence.categories
+        ))
+    return dataclasses.replace(draft, artifact_digest=draft.compute_digest())
+
+
+@pytest.mark.parametrize("where", ["transformation", "fields_classified"])
+def test_an_artifact_naming_a_field_with_an_identifier_is_rejected(where):
+    """The residual scan covers the field names the artifact carries, which
+    include those of removed fields that never reach the output records."""
+    result = _sample_result()
+    forged = _rename_in_artifact(result.evidence, where, LEAKED_FIELD_NAME)
+    validate_evidence(forged, result.records)  # self-consistent
+    with pytest.raises(EvidenceValidationError, match="names a field carrying") as caught:
+        DeidentificationResult(result.records, forged)
+    assert LEAKED_FIELD_NAME not in str(caught.value)
+    bundle = canonical_json_bytes({
+        "schema": EXPORT_SCHEMA,
+        "evidence": forged.to_dict(),
+        "records": result.records_as_dicts(),
+    })
+    with pytest.raises(EvidenceValidationError, match="names a field carrying"):
+        DeidentificationResult.from_export_bundle(bundle)
 
 
 class _ClaimsSafeHarbor(DeidentificationEvidence):

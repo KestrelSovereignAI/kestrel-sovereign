@@ -133,6 +133,29 @@ def _scannable_text(value: Any) -> Optional[str]:
     return None
 
 
+def _artifact_field_names(evidence: DeidentificationEvidence) -> List[str]:
+    """Every field name an artifact carries, in a stable order."""
+    names = {t.field for record in evidence.records for t in record.transformations}
+    names.update(name for c in evidence.categories for name in c.fields_classified)
+    return sorted(names)
+
+
+def _identifier_bearing_name(
+    names: Iterable[str], reference_year: int
+) -> Optional[Tuple[int, SafeHarborIdentifier]]:
+    """(position, category) of the first name carrying an identifier pattern.
+
+    A field name is written into the evidence artifact and the output records,
+    so one such as ``patient.jane@example.com`` would export the identifier
+    with them. Callers report the position, never the name itself.
+    """
+    for position, name in enumerate(names):
+        findings = find_identifier_patterns(name, reference_year=reference_year)
+        if findings:
+            return position, findings[0][0]
+    return None
+
+
 def verify_deidentified_records(
     evidence: DeidentificationEvidence,
     records: Sequence[Mapping[str, Any]],
@@ -150,6 +173,12 @@ def verify_deidentified_records(
     """
     validate_evidence(evidence, records, required_assurance=required_assurance)
     reference_year = date.fromisoformat(evidence.reference_date).year
+    # The artifact names every classified field, including the ones the output
+    # dropped, and is exported and stored with the records.
+    if _identifier_bearing_name(_artifact_field_names(evidence), reference_year) is not None:
+        raise EvidenceValidationError(
+            "the evidence artifact names a field carrying an identifier pattern"
+        )
     # Messages name a field by position: the records may come from an imported
     # bundle, whose field names are as untrusted as its values.
     for index, record in enumerate(records):
@@ -375,6 +404,13 @@ class DeidentificationPipeline:
             )
         if not isinstance(attestation_max_age, timedelta) or attestation_max_age <= timedelta(0):
             raise DeidentificationConfigError("attestation_max_age must be a positive timedelta")
+        unsafe = _identifier_bearing_name(schema, clock().year)
+        if unsafe is not None:
+            raise DeidentificationConfigError(
+                f"schema field {unsafe[0]} has a name carrying a "
+                f"{unsafe[1].value} identifier; field names are written into "
+                "the evidence artifact"
+            )
         has_free_text = any(spec.kind is FieldKind.FREE_TEXT for spec in schema.values())
         if entity_detector is _USE_DEFAULT:
             entity_detector = default_entity_detector() if has_free_text else None
@@ -509,6 +545,14 @@ class DeidentificationPipeline:
                 "reference_date precedes the run's year: ages measured against "
                 "it are understated, keeping birth years Safe Harbor aggregates"
             )
+        # A later reference year makes more cued birth years identifying than
+        # the construction-time check saw.
+        unsafe = _identifier_bearing_name(self._schema, reference.year)
+        if unsafe is not None:
+            raise DeidentificationRefused(
+                f"schema field {unsafe[0]} has a name carrying a "
+                f"{unsafe[1].value} identifier against this run's reference date"
+            )
 
         batch = list(records)
         if not batch:
@@ -585,6 +629,12 @@ class DeidentificationPipeline:
                 literals.append(value.strip())
             elif isinstance(value, int) and not isinstance(value, bool):
                 literals.append(str(value))
+            elif isinstance(value, float):
+                # Finite: _deidentify refuses the rest. An MRN read from a
+                # float column as 4321.0 is written "4321" elsewhere.
+                literals.append(str(value))
+                if value.is_integer():
+                    literals.append(str(int(value)))
             elif isinstance(value, datetime):
                 literals.extend((value.isoformat(), value.date().isoformat()))
             elif isinstance(value, date):

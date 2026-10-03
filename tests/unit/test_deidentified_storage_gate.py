@@ -85,6 +85,7 @@ def _mock_storage():
     storage = Mock()
     storage.store_file = AsyncMock(side_effect=["evidence-hash", "records-hash"])
     storage.add_conversation = AsyncMock()
+    storage.owns_open_transaction = False
 
     @asynccontextmanager
     async def transaction(*, immediate=False):
@@ -401,3 +402,67 @@ async def test_privacy_transition_is_refused_while_a_save_is_in_flight():
     await asyncio.wait_for(save, timeout=30)
     wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
     assert wrapper.privacy_mode is PrivacyMode.EPHEMERAL
+
+
+@pytest.mark.parametrize("outer", ["storage", "wrapper"])
+async def test_a_save_inside_an_open_transaction_is_refused(sqlite_storage, outer):
+    """Regression: a save inside a caller's transaction joined it, so its lease
+    was released before the documents committed and a transition to EPHEMERAL
+    could land in between. The save is refused, writes nothing, and holds no
+    lease afterwards."""
+    wrapper = PrivacyEnforcingStorage(sqlite_storage, PrivacyMode.DEIDENTIFIED)
+    transaction = (sqlite_storage if outer == "storage" else wrapper).transaction
+    async with transaction():
+        with pytest.raises(PrivacyViolationError, match="already has one open"):
+            await wrapper.store_deidentified_records(_result())
+        assert wrapper._active_deidentified_save_leases == 0
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+    assert await sqlite_storage.db.fetchall("SELECT content_hash FROM files") == []
+
+
+async def test_another_tasks_transaction_does_not_refuse_a_save(sqlite_storage):
+    """The check is per task: a save beside another task's transaction opens
+    its own, waits for SQLite's writer, and commits before releasing."""
+    wrapper = PrivacyEnforcingStorage(sqlite_storage, PrivacyMode.DEIDENTIFIED)
+    holding, release = asyncio.Event(), asyncio.Event()
+
+    async def hold_a_transaction():
+        async with sqlite_storage.transaction():
+            holding.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold_a_transaction())
+    await asyncio.wait_for(holding.wait(), timeout=30)
+    save = asyncio.create_task(wrapper.store_deidentified_records(_result()))
+
+    async def lease_taken():
+        while wrapper._active_deidentified_save_leases == 0:
+            if save.done():
+                save.result()  # surface a refusal instead of spinning
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(lease_taken(), timeout=30)
+    assert not save.done()  # waiting for the other task's writer slot
+    with pytest.raises(PrivacyViolationError, match="de-identified record save"):
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+    release.set()
+    await asyncio.wait_for(holder, timeout=30)
+    receipt = await asyncio.wait_for(save, timeout=30)
+    assert await sqlite_storage.files.file_exists(receipt.records_file_hash)
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize("answer", [_MISSING, None, True, "no"])
+async def test_a_save_needs_storage_that_reports_no_open_transaction(answer):
+    storage = _mock_storage()
+    if answer is _MISSING:
+        del storage.owns_open_transaction
+    else:
+        storage.owns_open_transaction = answer
+    wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.DEIDENTIFIED)
+    with pytest.raises(PrivacyViolationError, match="already has one open"):
+        await wrapper.store_deidentified_records(_result())
+    storage.store_file.assert_not_called()
+    assert wrapper._active_deidentified_save_leases == 0

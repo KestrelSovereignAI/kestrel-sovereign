@@ -449,6 +449,13 @@ class PostgresBackend(DatabaseBackend):
         return "savepoint"
 
     @property
+    def owns_open_transaction(self) -> bool:
+        """Whether the current task has a transaction open here, which a
+        ``transaction()`` entered now would join (as a savepoint) rather than
+        commit."""
+        return self._current_txn_conn() is not None
+
+    @property
     def is_connected(self) -> bool:
         return self._pool is not None
 

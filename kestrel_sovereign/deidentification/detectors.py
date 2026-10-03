@@ -236,6 +236,9 @@ _STRUCTURED_DETECTORS: Tuple[_PatternDetector, ...] = (
             r"(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}(?![\w:])"
             r"|(?<![\w:])[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*::"
             r"(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?(?![\w:])"
+            # Leading compression ("::1", "::abcd:1234"). A bare "::" names no
+            # host and is left alone.
+            r"|(?<![\w:])::[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*(?![\w:])"
         ),
     ),
     _PatternDetector(
@@ -373,19 +376,61 @@ _BARE_YEAR = re.compile(r"\b(?P<year>\d{4})\b")
 # without crossing into the next sentence.
 _BIRTH_CUE_WINDOW = 40
 _SENTENCE_BREAK = re.compile(r"[;\n]|\.\s")
+# An age, with any fractional part and an open-ended "+": "95.5", "95 1/2",
+# "95-½", and "95+" are matched whole, so each is compared as a number and
+# replaced as one span rather than leaving ".5", "1/2", or "+" behind "90+".
+# The aggregate "90+" itself matches too and is skipped by ``_age_matches``.
+_AGE_FRACTION = r"(?:\.\d+|[\s-]?(?:[13][/⁄][24]|[½¼¾]))"
+_AGE_NUMBER = rf"\d{{2,3}}{_AGE_FRACTION}?\+?"
+_AGE_DECIMAL = re.compile(r"\d{2,3}(?:\.\d+)?")
+# Hyphen-minus, hyphen, non-breaking hyphen, and en dash ("95–year–old").
+_DASH = r"[-‐‑–]"
+_AGE_UNIT = rf"\s*(?:{_DASH}\s*)?(?:years?|yrs?|y/o|y\.\s?o\.?|yo)(?![A-Za-z])"
+# What may stand between "age" and its number: a qualifier ("age at death"),
+# a unit in parentheses ("Age (years)"), a separator, and a comparison
+# ("age >/= 95", "age approx. 95"). Every optional part begins with a
+# non-space character, so a run of whitespace can be matched only one way.
+# "weight-for-age" is growth-chart language, followed by a percentile;
+# "AGEs" are advanced glycation end-products, so "ages" is not upper case,
+# and it takes no qualifier ("the ages of 120 patients" is a count).
+_AGE_CUE = (
+    r"(?<!for-)\b(?:(?:age(?:\s*/\s*sex)?|aged)"
+    r"(?:\s+(?:of|is|was|at\s+(?:first\s+|initial\s+|last\s+)?"
+    r"(?:death|diagnosis|dx|onset|admission|presentation|enrol+ment|baseline|"
+    r"surgery|interview|visit|exam|screening|transplant|delivery)))?"
+    r"|(?-i:[Aa]ges))\s*"
+    r"(?:\((?:years?|yrs?|y)\)\s*)?"
+    rf"(?:[:=~]\s*|{_DASH}\s*){{0,2}}"
+    r"(?:(?:>/?=?|≥|over|above|approx(?:\.|imately)?|about|around)\s*)?"
+)
 _AGE_PATTERNS: Tuple["re.Pattern[str]", ...] = (
+    re.compile(rf"(?<![\d.])(?P<age>{_AGE_NUMBER})(?={_AGE_UNIT})", re.IGNORECASE),
+    # The lower bound of a range: "92-95 years old", "between 92 and 95 yrs".
+    # Not a reading ("120/90 - 95 years"), and not a number above its "upper
+    # bound" ("150/95 - 10 years ago", "Bed 412 - 92 y/o F"; see _age_matches).
     re.compile(
-        r"(?<![\d.])(?P<age>\d{2,3})"
-        r"(?=\s*-?\s*(?:years?|yrs?|y/o|y\.\s?o\.?|yo)(?![A-Za-z]))",
+        rf"(?<![\d./])(?P<age>{_AGE_NUMBER})(?=\s*(?:{_DASH}|to|or|and)\s*"
+        rf"(?P<upper>{_AGE_NUMBER}){_AGE_UNIT})",
         re.IGNORECASE,
     ),
+    # After the cue the number may run straight into a unit ("Age 95.5y"),
+    # but not on into another digit, an ordinal, or a percentage ("age 95%
+    # CI"); "95+ %" is still the open-ended age.
     re.compile(
-        r"\b(?:age|aged)(?:\s+(?:of|is|was))?\s*[:\-]?\s*(?P<age>\d{2,3})\b(?!\+)",
+        rf"{_AGE_CUE}(?P<age>{_AGE_NUMBER})"
+        r"(?!\.?\d|(?:st|nd|rd|th)\b|(?<!\+)\s?%)",
         re.IGNORECASE,
     ),
-    # "95F", "92yoM", "93 y/o F". Case-sensitive, and no bare space before the
-    # sex, so a "101 F" temperature is not read as an age.
-    re.compile(r"(?<![\d.])(?P<age>\d{2,3})(?:\s?(?:yo|y/o)\s?)?[MF]\b"),
+    # "95F", "92yoM", "92YOF", "93 y/o F". Not after a letter, so "T790M" (a
+    # mutation) is not an age, and no bare space before the sex, so a "101 F"
+    # temperature is not read as one.
+    re.compile(
+        r"(?<![\w.])(?P<age>\d{2,3})(?:\s?(?i:yo|y/o)\s?(?i:[mf])|[MF])\b"
+    ),
+    # A fraction only with an explicit "yo": "95.5F" is a temperature.
+    re.compile(
+        rf"(?<![\w.])(?P<age>\d{{2,3}}{_AGE_FRACTION})\s?(?i:yo|y/o)\s?(?i:[mf])\b"
+    ),
 )
 _GEOGRAPHIC_DETECTORS: Tuple[_PatternDetector, ...] = (
     _PatternDetector(
@@ -677,11 +722,37 @@ def parse_date_year(text: str) -> Optional[int]:
     return None
 
 
+def _age_value(age: str) -> float:
+    """An age match as a number, for comparison with 89 only.
+
+    A written fraction ("1/2", "¾") counts as at least a quarter: what matters
+    is that any fraction puts 89 over 89.
+    """
+    number = _AGE_DECIMAL.match(age)
+    value = float(number.group())
+    if number.end() < len(age.rstrip("+")):
+        value += 0.25
+    return value
+
+
 def _age_matches(text: str) -> List[_Match]:
     matches = []
     for pattern in _AGE_PATTERNS:
         for m in pattern.finditer(text):
-            if int(m.group("age")) > 89:
+            age = m.group("age")
+            # The aggregate Safe Harbor permits, including its digits alone
+            # when a lookahead backtracked off its "+" ("age 90+5").
+            if text.startswith(AGE_90_OR_OLDER, m.start("age")):
+                continue
+            # Not the lower bound of a range: it is above its upper bound. The
+            # upper bound reads every age form, so a true range is caught in
+            # the round (and in the source text) before that bound is
+            # rewritten to the aggregate.
+            upper = m.groupdict().get("upper")
+            if upper is not None and _age_value(age) > _age_value(upper):
+                continue
+            # Numerically, as the structured age field is: 89.5 is over 89.
+            if _age_value(age) > 89:
                 matches.append(_Match(
                     m.start("age"), m.end("age"), AGE_90_OR_OLDER, Category.DATES,
                     TransformationAction.GENERALIZED, AGE_DETECTOR,

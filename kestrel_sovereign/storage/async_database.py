@@ -1283,7 +1283,18 @@ class AsyncDatabase:
         """
         strategy = getattr(self._backend, "nested_transaction_strategy", None)
         return strategy if strategy in {"savepoint", "joined"} else None
-    
+
+    @property
+    def owns_open_transaction(self) -> bool | None:
+        """Whether the current task has a transaction open on this database.
+
+        When it does, a ``transaction()`` entered now joins it, and its writes
+        commit only when the outer one does. Unknown backends return ``None``
+        so callers that must commit before acting fail closed.
+        """
+        owns = getattr(self._backend, "owns_open_transaction", None)
+        return owns if isinstance(owns, bool) else None
+
     async def _init_schema(self) -> None:
         """Create database tables if they don't exist."""
         # Through the accessor, not CORE_SCHEMA directly: conversation_history
