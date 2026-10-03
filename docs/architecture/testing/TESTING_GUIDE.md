@@ -258,11 +258,13 @@ uv run kestrel demo smoke --home /tmp/smoke-home --port 8920 --keep-server
 `kestrel demo smoke` never targets your server or agents. It creates a fresh
 instance (agent, SQLite database, and throwaway data key) in a home that must
 not exist yet or must be empty, and starts it on a loopback port that is never
-8888. The instance inherits no `KESTREL_*` setting and no credential-shaped
-variable, its server reads no dotenv file (`KESTREL_SKIP_DOTENV=1`), and its
-only LLM route is local Ollama. Before the browser starts,
-the runner checks that the server imports this checkout's `kestrel_sovereign`
-and serves the DID this run's inception minted. It writes those facts to
+8888. The instance inherits no `KESTREL_*` setting, no `OTEL_*` exporter
+setting, and no credential-shaped variable. Its tracing is off
+(`KESTREL_TRACING_ENABLED=0`), its server reads no dotenv file
+(`KESTREL_SKIP_DOTENV=1`), and its only LLM route is local Ollama. Before the
+browser starts, the runner checks that the server imports this checkout's
+`kestrel_sovereign` and serves the DID this run's inception minted. It writes
+those facts to
 `<home>/console-smoke-instance.json`; the spec checks them again and refuses
 any other target. The server is stopped on success, failure, and Ctrl-C. Its
 log stays in `<home>/server.log`.
