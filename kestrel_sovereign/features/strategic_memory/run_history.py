@@ -32,6 +32,13 @@ while previewing. A provider without ``finished_runs()`` therefore has an
 unconfirmed history, never an empty one, and neither of the other two is
 called here.
 
+``finished_runs()`` first shipped in kestrel-feature-talon 0.2.10, and core
+declares no dependency on feature packages (``pyproject.toml`` keeps them out
+of its optional extras). :data:`FINISHED_RUNS_REQUIREMENT` is therefore where
+that floor is declared: an older provider is refused with
+:class:`TalonProviderOutdated`, which names the requirement rather than
+reporting an unreadable registry.
+
 Only the ``talon`` kind is read. A sibling provider such as ``A2AWaitable``
 spreads peer-returned data into what it reports, and a peer must not be able
 to stand down dispatch of an issue by naming it in a payload.
@@ -54,6 +61,11 @@ TALON_WAIT_KIND = "talon"
 #: The provider operation run history is read from (see the module docstring).
 FINISHED_RUNS_METHOD = "finished_runs"
 
+#: The first kestrel-feature-talon release whose ``TalonWaitable`` has
+#: ``finished_runs()`` (kestrel-feature-talon #37). Earlier releases cannot
+#: report a complete history, so every read through them is refused.
+FINISHED_RUNS_REQUIREMENT = "kestrel-feature-talon>=0.2.10"
+
 #: kestrel-feature-talon ``run_disposition`` values for a run that stopped to
 #: ask a question rather than open a PR: ``BLOCKED`` (Talon also labels the
 #: issue ``agent-blocked``) and ``CLARIFYING`` (``agent-clarifying``). Core
@@ -71,6 +83,21 @@ class RunHistoryUnreadable(Exception):
     read may be exactly the run that asked the question, and an issue whose
     last run is unknown is not an issue whose last run is known to be fine.
     """
+
+    #: The package requirement that would make the history readable, when the
+    #: cause is a provider too old to report it rather than a registry read.
+    requirement: Optional[str] = None
+
+
+class TalonProviderOutdated(RunHistoryUnreadable):
+    """The ``talon`` wait provider has no ``finished_runs()`` to read from.
+
+    Not a fault in Talon's registry, and not one a retry clears: every read
+    through this provider is unconfirmed until kestrel-feature-talon is
+    upgraded, so the refusal names the release that fixes it.
+    """
+
+    requirement = FINISHED_RUNS_REQUIREMENT
 
 
 @dataclass(frozen=True)
@@ -119,8 +146,9 @@ async def read_run_history(agent: Any) -> RunHistory:
 
     An agent with no ``talon`` wait provider has no Talon registry, so no
     issue on it has a last run: the history is empty. A registered provider
-    whose ``finished_runs()`` is missing, fails, or does not report a complete
-    read raises :class:`RunHistoryUnreadable`.
+    with no ``finished_runs()`` raises :class:`TalonProviderOutdated`; one
+    whose ``finished_runs()`` fails or does not report a complete read raises
+    :class:`RunHistoryUnreadable`.
     """
     registry = getattr(agent, "wait_registry", None)
     provider = registry.get(TALON_WAIT_KIND) if registry is not None else None
@@ -128,9 +156,13 @@ async def read_run_history(agent: Any) -> RunHistory:
         return RunHistory()
     read = getattr(provider, FINISHED_RUNS_METHOD, None)
     if not callable(read):
-        raise RunHistoryUnreadable(
-            f"the {TALON_WAIT_KIND!r} wait provider has no read-only "
-            f"{FINISHED_RUNS_METHOD}() that reports whether it read every job"
+        raise TalonProviderOutdated(
+            f"the {TALON_WAIT_KIND!r} wait provider "
+            f"({type(provider).__name__}) has no read-only "
+            f"{FINISHED_RUNS_METHOD}() that reports whether it read every job; "
+            f"reading Talon's run history requires {FINISHED_RUNS_REQUIREMENT}, "
+            "the first release with it -- upgrade kestrel-feature-talon and "
+            "restart the host"
         )
     try:
         report = read()
