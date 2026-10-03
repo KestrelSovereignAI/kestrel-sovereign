@@ -246,14 +246,20 @@ a record may carry; a record with an unclassified field is refused.
   licence, vehicle, and device numbers, VINs, dates, ages over 89, street
   addresses, ZIP codes, long digit runs), and names and places through a
   named-entity detector. A schema with free text is refused when no entity
-  detector is available, because patterns cannot find names. Scrubbing repeats
+  detector is available, because patterns cannot find names. Every detector
+  reads the text as written, before any replacement, and whatever it finds
+  there is removed even when an earlier replacement split it: replacing the
+  patient's given name cannot hide a caregiver's surname from the entity
+  detector, or a house number from the address pattern. Scrubbing repeats
   until the text is stable, so generalizing one span cannot expose another.
   Detection is biased toward over-removal and is still best-effort: a name the
   entity model misses, or an identifier written in a form no pattern knows,
   survives. That residual is what the operator's attestation covers.
 - **Non-identifying fields** are kept, but a value matching a precise
-  identifier pattern, or repeating one of the record's own identifier values,
-  refutes the classification and the run is refused. The check is
+  identifier pattern, repeating one of the record's own identifier values, or
+  giving a birth date Safe Harbor does not permit ("DOB: 1931", a birth year
+  90 or more years before the run's reference date) refutes the
+  classification and the run is refused. The check is
   deliberately narrow so ordinary clinical values ("500-1000 mg", "pain
   8/10", race "White" for a patient surnamed White) are not refused; prose
   belongs in a free-text field, where name tokens and ambiguous numbers are
@@ -266,7 +272,10 @@ after the run, or older than the pipeline's `attestation_max_age` (24 hours by
 default), is refused. An Expert Determination run requires an
 `ExpertDeterminationReference` (report location, report SHA-256, expert).
 Without it the run is refused before any record is read, no artifact exists,
-and the evidence-gated save stays blocked.
+and the evidence-gated save stays blocked. A run's `reference_date`, the date
+ages are measured against, defaults to the run date and may never fall in an
+earlier year: ages are measured in years, and a past year understates every
+age, keeping birth years Safe Harbor aggregates.
 
 #### The evidence artifact
 
@@ -299,10 +308,25 @@ validate_evidence(result.evidence, result.records,
 A save additionally requires the artifact's assurance to equal the config's
 whenever the config names one (`safe_harbor` for the preset). The artifact and
 the records are written in one transaction, artifact first, as
-content-addressed files (encrypted at rest when a data key is configured)
+content-addressed JSON files (encrypted at rest when a data key is configured)
 whose metadata holds only the evidence id, assurance, and digests.
-`DeidentificationResult.export_bundle()` is the export form: it re-verifies and
-embeds the artifact verbatim.
+`DeidentificationResult.export_bundle()` is the export form: it re-verifies,
+embeds the artifact verbatim, and reads its own bytes back before returning
+them. The saved records document is that bundle, so every path that serves
+it — including a download by content hash through `GET /api/files/{hash}` —
+carries the artifact with the records. The save takes the evidence it stores,
+and the assurance it checks, from those verified bytes rather than from the
+objects it was handed.
+`DeidentificationResult.from_export_bundle(payload, required_assurance=...)`
+reads a bundle back and fails closed unless the payload is exactly what
+`export_bundle()` writes for the result it parses to — canonical, so a
+duplicate key cannot read differently to another parser, and carrying no
+field the bundle or artifact does not define — and its artifact validates and
+describes exactly its records. `DeidentificationEvidence.from_json_bytes`
+applies the same exact round trip to a stored artifact. The residual scan of a
+saved or exported record covers field names as well as values, measures cued
+birth years against the artifact's reference date, and names a refused field
+by position: an imported bundle's field names are untrusted.
 
 The gate binds content, not provenance. Like the rest of the privacy layer, it
 cannot tell the pipeline from same-process code that assembles a

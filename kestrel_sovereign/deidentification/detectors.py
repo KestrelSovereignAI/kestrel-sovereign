@@ -4,7 +4,7 @@ Structured fields are handled by their schema classification. Text is harder:
 a clinical note, a free-form comment, or a mislabelled "non-identifying" string
 can carry an identifier of any category. This module finds those spans.
 
-Three sources contribute, in order:
+Three sources contribute:
 
 1. **Known values** — the record's own identifier values (its name, MRN,
    address, ...) wherever they recur in its text.
@@ -15,6 +15,13 @@ Three sources contribute, in order:
 3. **Entities** — names and places, which no pattern can find. These need a
    named-entity detector. The pipeline refuses free text when none is
    configured, because without one Safe Harbor category (A) cannot be covered.
+
+Every source reads the text as written, before anything is replaced, and what
+it finds there is removed even when an earlier replacement split it. A
+detector shown only already-scrubbed text misses whatever a substitution
+broke: the record's given name replaced inside "Avery Brown" leaves a surname
+the entity model no longer recognizes, and a surname replaced inside
+"12 Doe Street" leaves a house number no address pattern matches.
 
 Detection is deliberately biased toward over-removal: replacing a lab value
 that looks like a ZIP code loses a little utility, missing a ZIP code loses the
@@ -483,9 +490,16 @@ def _uncovered_segments(
     return segments
 
 
-def _apply(text: str, matches: Iterable[_Match], counts: Dict[CountKey, int]) -> str:
+def _apply(
+    text: str, origin: Sequence[int], matches: Iterable[_Match], counts: Dict[CountKey, int]
+) -> Tuple[str, List[int]]:
     """Replace matches (earliest, then longest first) without re-matching a
-    span that is already a placeholder."""
+    span that is already a placeholder.
+
+    ``origin`` maps each character of ``text`` to its index in the source text,
+    or ``-1`` for a character a replacement wrote; the returned origin does the
+    same for the returned text.
+    """
     protected = [(m.start(), m.end()) for m in _PROTECTED_RE.finditer(text)]
     chosen: List[_Match] = []
     cursor = 0
@@ -496,17 +510,53 @@ def _apply(text: str, matches: Iterable[_Match], counts: Dict[CountKey, int]) ->
             chosen.append(segment)
             cursor = segment.end
     if not chosen:
-        return text
+        return text, list(origin)
     pieces: List[str] = []
+    new_origin: List[int] = []
     position = 0
     for match in chosen:
         pieces.append(text[position:match.start])
+        new_origin.extend(origin[position:match.start])
         pieces.append(match.replacement)
+        new_origin.extend([-1] * len(match.replacement))
         position = match.end
         key = (match.category, match.action, match.detector)
         counts[key] = counts.get(key, 0) + 1
     pieces.append(text[position:])
-    return "".join(pieces)
+    new_origin.extend(origin[position:])
+    return "".join(pieces), new_origin
+
+
+def _surviving_source_spans(
+    source_matches: Iterable[_Match], text: str, origin: Sequence[int]
+) -> List[_Match]:
+    """What survives of matches found in the source text, as matches in ``text``.
+
+    Each run of characters still carried verbatim from inside a source match
+    becomes a span of that match's category, replaced by its placeholder. Runs
+    of punctuation alone carry no identifier and are left in place.
+    """
+    position = {source: index for index, source in enumerate(origin) if source >= 0}
+    spans: List[_Match] = []
+    for match in source_matches:
+        indices = [position[i] for i in range(match.start, match.end) if i in position]
+        runs: List[List[int]] = []
+        for index in indices:
+            if runs and index == runs[-1][1]:
+                runs[-1][1] = index + 1
+            else:
+                runs.append([index, index + 1])
+        for run_start, run_end in runs:
+            piece = text[run_start:run_end]
+            core = piece.strip()
+            if not any(ch.isalnum() for ch in core):
+                continue
+            start = run_start + len(piece) - len(piece.lstrip())
+            spans.append(_Match(
+                start, start + len(core), redaction_placeholder(match.category),
+                match.category, TransformationAction.TRANSFORMED, match.detector,
+            ))
+    return spans
 
 
 def _pattern_matches(detector: _PatternDetector, text: str) -> List[_Match]:
@@ -657,36 +707,9 @@ def _entity_matches(text: str, detector: EntityDetector) -> List[_Match]:
     return matches
 
 
-def scrub_free_text(
-    text: str,
-    *,
-    known_values: Sequence[Tuple[str, Category]],
-    reference_year: int,
-    entity_detector: EntityDetector,
-) -> Tuple[str, Dict[CountKey, int]]:
-    """Remove or generalize every detectable identifier span in ``text``.
-
-    Returns the scrubbed text and, per (category, action, detector), how many
-    spans were replaced. Each pass runs on the previous pass's output, so a
-    span replaced once is never matched again.
-
-    Known values run twice. The first pass leaves a digit-bearing value alone
-    where it is joined into a larger structure (a date, a code) so that
-    structure is removed whole. The closing pass matches on word boundaries
-    alone, catching what remains — including a value that only appears once a
-    date is generalized: "04/02/1931" becomes "1931", and when that is the
-    record's own 90+ birth year it must not survive as a bare year.
-
-    The pattern passes repeat until the text stops changing, because a
-    generalization can expose a new match: "Insurance: Jan 5, 2024" becomes
-    "Insurance: 2024", which now reads as a labelled plan number. The entity
-    detector runs once, between two such settlements, so a context-sensitive
-    model cannot keep the loop from settling. Its placeholders cannot create a
-    new pattern match, and the second settlement confirms that. The result is
-    stable under every pattern, which is what lets
-    :func:`find_identifier_patterns` treat any later hit as a residual.
-    """
-    counts: Dict[CountKey, int] = {}
+def _scrub_passes(
+    known_values: Sequence[Tuple[str, Category]], reference_year: int
+) -> List[Callable[[str], List[_Match]]]:
     passes: List[Callable[[str], List[_Match]]] = [
         (lambda t, d=detector: _pattern_matches(d, t))
         for detector in _CONTAINER_DETECTORS
@@ -704,28 +727,104 @@ def scrub_free_text(
         for detector in _GEOGRAPHIC_DETECTORS
     )
     passes.append(lambda t: _known_value_matches(t, known_values, joined=True))
-    text = _settle(text, passes, counts)
-    text = _apply(text, _entity_matches(text, entity_detector), counts)
-    return _settle(text, passes, counts), counts
+    return passes
+
+
+def scrub_free_text(
+    text: str,
+    *,
+    known_values: Sequence[Tuple[str, Category]],
+    reference_year: int,
+    entity_detector: EntityDetector,
+) -> Tuple[str, Dict[CountKey, int]]:
+    """Remove or generalize every detectable identifier span in ``text``.
+
+    Returns the scrubbed text and, per (category, action, detector), how many
+    spans were replaced.
+
+    Every detector — each pattern and known-value pass, and the entity
+    detector — first reads the source text. The passes then run in order, each
+    on the previous pass's output, so a span replaced once is never matched
+    again; that ordering is what keeps a container (an e-mail address, a date)
+    whole when a smaller match sits inside it. Once they settle, any character still carried
+    verbatim from inside a source-text detection is replaced too. The result
+    is the union: no detector's finding in the source survives because an
+    earlier replacement split it.
+
+    Known values run twice. The first pass leaves a digit-bearing value alone
+    where it is joined into a larger structure (a date, a code) so that
+    structure is removed whole. The closing pass matches on word boundaries
+    alone, catching what remains — including a value that only appears once a
+    date is generalized: "04/02/1931" becomes "1931", and when that is the
+    record's own 90+ birth year it must not survive as a bare year.
+
+    The pattern passes repeat until the text stops changing, because a
+    generalization can expose a new match: "Insurance: Jan 5, 2024" becomes
+    "Insurance: 2024", which now reads as a labelled plan number. The entity
+    detector reads the source and the settled text once each, between two
+    such settlements, so a context-sensitive model cannot keep the loop from
+    settling. Its placeholders cannot create a new pattern match, and the
+    second settlement confirms that. The result is stable under every pattern,
+    which is what lets :func:`find_identifier_patterns` treat any later hit as
+    a residual.
+    """
+    counts: Dict[CountKey, int] = {}
+    passes = _scrub_passes(known_values, reference_year)
+    # A match that keeps its own text (a recent birth year after "born") is a
+    # decision to keep, not a span to remove.
+    source_matches = [
+        match
+        for find in passes
+        for match in find(text)
+        if text[match.start:match.end] != match.replacement
+    ]
+    source_matches.extend(_entity_matches(text, entity_detector))
+    current, origin = _settle(text, range(len(text)), passes, counts)
+    current, origin = _apply(
+        current,
+        origin,
+        _surviving_source_spans(source_matches, current, origin)
+        + _entity_matches(current, entity_detector),
+        counts,
+    )
+    current, _ = _settle(current, origin, passes, counts)
+    return current, counts
 
 
 def _settle(
-    text: str, passes: Sequence[Callable[[str], List[_Match]]], counts: Dict[CountKey, int]
-) -> str:
+    text: str,
+    origin: Sequence[int],
+    passes: Sequence[Callable[[str], List[_Match]]],
+    counts: Dict[CountKey, int],
+) -> Tuple[str, List[int]]:
+    origin = list(origin)
     for _ in range(_MAX_SCRUB_ROUNDS):
         before = text
         for find in passes:
-            text = _apply(text, find(text), counts)
+            text, origin = _apply(text, origin, find(text), counts)
         if text == before:
-            return text
+            return text, origin
     raise DeidentificationError(
         f"free text did not reach a stable de-identified form in "
         f"{_MAX_SCRUB_ROUNDS} rounds"
     )
 
 
+def _retained_birth_dates(text: str, reference_year: int) -> bool:
+    """Whether a birth cue in ``text`` is followed by a date Safe Harbor does
+    not permit: one with a day or month, or a year 90 or more years before
+    ``reference_year`` ("DOB: 1931"). A recent birth year alone is permitted."""
+    return any(
+        text[match.start:match.end] != match.replacement
+        for match in _birth_date_matches(text, reference_year)
+    )
+
+
 def find_identifier_patterns(
-    text: str, *, known_values: Sequence[Tuple[str, Category]] = ()
+    text: str,
+    *,
+    reference_year: int,
+    known_values: Sequence[Tuple[str, Category]] = (),
 ) -> List[Tuple[Category, str]]:
     """Precise identifier patterns present in ``text`` as (category, detector).
 
@@ -733,6 +832,8 @@ def find_identifier_patterns(
     check a de-identified record for residual identifiers before it is saved.
     Only detectors precise enough to be evidence are consulted; a bare
     five-digit number or a long digit run alone does not refute.
+    ``reference_year`` is the run's: a cued birth year is an identifier when it
+    is 90 or more years before it.
     """
     findings: List[Tuple[Category, str]] = []
     for literal, category in known_values:
@@ -741,6 +842,8 @@ def find_identifier_patterns(
     for detector in _CONTAINER_DETECTORS + _STRUCTURED_DETECTORS + _GEOGRAPHIC_DETECTORS:
         if detector.refutes and detector.pattern.search(text):
             findings.append((detector.category, detector.name))
+    if _retained_birth_dates(text, reference_year):
+        findings.append((Category.DATES, BIRTH_DATE_DETECTOR))
     if any(pattern.search(text) for pattern in _DATE_PATTERNS):
         findings.append((Category.DATES, DATE_DETECTOR))
     if _age_matches(text):

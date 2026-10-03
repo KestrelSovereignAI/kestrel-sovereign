@@ -41,7 +41,10 @@ from kestrel_sovereign.deidentification import (
 )
 from kestrel_sovereign.deidentification import NerEntityDetector
 from kestrel_sovereign.deidentification import detectors as detectors_module
-from kestrel_sovereign.deidentification.evidence import output_record_digest
+from kestrel_sovereign.deidentification.evidence import (
+    canonical_json_bytes,
+    output_record_digest,
+)
 from kestrel_sovereign.features.privacy.pii_detector import PIIDetector, PIIMatch, PIIType
 from kestrel_sovereign.privacy import get_privacy_preset
 
@@ -442,6 +445,60 @@ def test_overlapping_entity_spans_are_trimmed_not_dropped():
     assert result.records[0]["note"] == f"{names} {names} moved to {places} {places}."
 
 
+class RecordingNames(ListedNames):
+    """A :class:`ListedNames` that remembers every text it was shown."""
+
+    def __init__(self, *names):
+        super().__init__(*names)
+        self.seen = []
+
+    def detect(self, text):
+        self.seen.append(text)
+        return super().detect(text)
+
+
+def test_entity_detector_reads_the_note_before_known_values_replace_it():
+    """Regression: the record's given name replaced first used to leave
+    "[REDACTED:NAMES] Brown", which the entity detector no longer recognized."""
+    detector = RecordingNames("Avery Brown")
+    schema = {"name": FieldSpec.remove(SafeHarborIdentifier.NAMES), "note": FieldSpec.free_text()}
+    note = "Caregiver Avery Brown came to visit."
+    result = _run(
+        _pipeline(schema, entity_detector=detector), {"name": "Avery Doe", "note": note}
+    )
+    names = redaction_placeholder(SafeHarborIdentifier.NAMES)
+    assert result.records[0]["note"] == f"Caregiver {names} {names} came to visit."
+    assert note in detector.seen
+    assert "entity:synthetic-names" in {t.detector for t in _transformations(result, "note")}
+
+
+@pytest.mark.parametrize(
+    "note, survivors",
+    [
+        # The surname split the address, so no address pattern matched the rest.
+        ("lives at 12 Doe Street with family.", ("12", "Street")),
+        # The surname split the record number, stranding its digits.
+        ("MRN: Doe-4471 on file", ("4471",)),
+    ],
+)
+def test_a_pattern_split_by_a_known_value_is_still_removed(note, survivors):
+    schema = {"name": FieldSpec.remove(SafeHarborIdentifier.NAMES), "note": FieldSpec.free_text()}
+    result = _run(_pipeline(schema), {"name": "Avery Doe", "note": note})
+    scrubbed = result.records[0]["note"]
+    assert "Doe" not in scrubbed
+    for survivor in survivors:
+        assert survivor not in scrubbed
+
+
+def test_a_permitted_value_found_in_the_source_text_is_kept():
+    """A recent birth year after a cue is a keep decision in the source text
+    too, not a span the union removes."""
+    schema = {"name": FieldSpec.remove(SafeHarborIdentifier.NAMES), "note": FieldSpec.free_text()}
+    result = _run(_pipeline(schema), {"name": "Avery Doe", "note": "Doe was born in 1985."})
+    names = redaction_placeholder(SafeHarborIdentifier.NAMES)
+    assert result.records[0]["note"] == f"{names} was born in 1985."
+
+
 def test_free_text_scrubs_the_records_own_identifier_values():
     schema = {
         "name": FieldSpec.remove(SafeHarborIdentifier.NAMES),
@@ -545,6 +602,55 @@ def test_non_identifying_classification_is_refuted_by_its_value(value):
     }
     with pytest.raises(DeidentificationError, match="non-identifying"):
         _run(_pipeline(schema), {"name": "Avery Quillfeather", "diagnosis": value})
+
+
+@pytest.mark.parametrize("value", ["DOB: 1931", "born in 1931", "year of birth 1931"])
+def test_a_cued_birth_year_over_89_refutes_a_non_identifying_value(value):
+    """Regression: "DOB: 1931" passed the classification check and the
+    residual scan, keeping a birth year that implies an age over 89."""
+    with pytest.raises(DeidentificationError, match=r"non-identifying.*birth_date"):
+        _run(_pipeline({"cohort": FieldSpec.non_identifying()}), {"cohort": value})
+
+
+def test_a_cued_birth_year_is_judged_against_the_reference_date():
+    pipeline = _pipeline({"cohort": FieldSpec.non_identifying()})
+    kept = _run(pipeline, {"cohort": "YOB 1940"})  # 86 years before the 2026 run
+    assert kept.records[0]["cohort"] == "YOB 1940"
+    with pytest.raises(DeidentificationError, match="non-identifying"):
+        _run(pipeline, {"cohort": "YOB 1940"}, reference_date=date(2031, 1, 1))
+
+
+def test_a_reference_date_before_the_run_is_refused():
+    """Regression: measured against 1980, a 1925 birth year was kept for
+    someone 101 years old at release."""
+    pipeline = _pipeline({"dob": FieldSpec.birth_date()})
+    with pytest.raises(DeidentificationRefused, match="precedes the run"):
+        _run(pipeline, {"dob": "1925-03-04"}, reference_date=date(1980, 1, 1))
+    with pytest.raises(DeidentificationRefused, match="must be a date"):
+        _run(pipeline, {"dob": "1925-03-04"}, reference_date=FIXED_NOW)
+    assert _run(pipeline, {"dob": "1925-03-04"}).records[0] == {"dob": AGE_90_OR_OLDER}
+    # Ages are measured in years, so an earlier date in the run's year is
+    # harmless (a caller's local "today" may trail the UTC run date).
+    same_year = _run(pipeline, {"dob": "1936-03-04"}, reference_date=date(2026, 1, 1))
+    assert same_year.records[0] == {"dob": AGE_90_OR_OLDER}
+
+
+def test_a_run_west_of_utc_on_new_years_eve_is_not_refused():
+    """The run year and the artifact's created_at year come from the same
+    instant in the same offset, so a run late on 31 December west of UTC
+    (already 1 January in UTC) validates."""
+    west = datetime(2026, 12, 31, 22, 0, tzinfo=timezone(timedelta(hours=-5)))
+    pipeline = DeidentificationPipeline(
+        {"zip": FieldSpec.zip_code()}, source_digest_key=KEY, clock=lambda: west
+    )
+    attestation = ActualKnowledgeAttestation(
+        "operator:synthetic", True, attested_at=west.isoformat()
+    )
+    result = pipeline.run(
+        [SourceRecord("rec-0", {"zip": "02139"})], operator=OPERATOR, attestation=attestation
+    )
+    assert result.evidence.reference_date == "2026-12-31"
+    DeidentificationResult.from_export_bundle(result.export_bundle())
 
 
 def test_a_non_identifying_number_equal_to_an_identifier_is_refused():
@@ -791,6 +897,9 @@ def _tamper(evidence, mutate):
         (lambda d: d.update(policy_version="made-up/v0"), "policy_version"),
         (lambda d: d["operator"].update(operator_id=" "), "operator_id"),
         (lambda d: d.update(created_at="2026-10-03T12:00:00"), "UTC offset"),
+        (lambda d: d.update(reference_date="1980-01-01"), "precedes the run's year"),
+        (lambda d: d.update(policy_version=[]), "policy_version"),
+        (lambda d: d["pipeline"].update(version=[]), "pipeline.version"),
     ],
 )
 def test_tampered_evidence_is_rejected(mutate, message):
@@ -814,18 +923,86 @@ def test_result_records_are_read_only():
         result.records[0]["diagnosis"] = "changed"
 
 
-def test_forged_result_with_residual_identifier_is_rejected():
-    """Self-consistent but forged evidence cannot launder a raw identifier."""
-    result = _sample_result()
-    forged_record = dict(result.records[0], diagnosis="contact rowan@example.test")
+def _forge_output(result, forged_record):
+    """A self-consistent artifact describing ``forged_record`` instead."""
     record_evidence = dataclasses.replace(
         result.evidence.records[0], output_digest=output_record_digest(forged_record)
     )
     draft = dataclasses.replace(result.evidence, records=(record_evidence,))
     forged = dataclasses.replace(draft, artifact_digest=draft.compute_digest())
     validate_evidence(forged, (forged_record,))  # the artifact itself is consistent
+    return forged
+
+
+@pytest.mark.parametrize("residual", ["contact rowan@example.test", "DOB: 1931"])
+def test_forged_result_with_residual_identifier_is_rejected(residual):
+    """Self-consistent but forged evidence cannot launder a raw identifier."""
+    result = _sample_result()
+    forged_record = dict(result.records[0], diagnosis=residual)
+    forged = _forge_output(result, forged_record)
     with pytest.raises(EvidenceValidationError, match="still carries"):
         DeidentificationResult((forged_record,), forged)
+
+
+def test_the_residual_scan_measures_against_the_artifacts_reference_date():
+    """1940 is 86 years before the 2026 run clock but 91 before the artifact's
+    2031 reference date, so a forged "YOB 1940" is a residual identifier."""
+    result = _run(
+        _pipeline({"cohort": FieldSpec.non_identifying()}),
+        {"cohort": "YOB 1945"},
+        reference_date=date(2031, 1, 1),
+    )
+    forged_record = {"cohort": "YOB 1940"}
+    forged = _forge_output(result, forged_record)
+    with pytest.raises(EvidenceValidationError, match="still carries"):
+        DeidentificationResult((forged_record,), forged)
+
+
+def test_a_record_key_carrying_an_identifier_is_rejected():
+    """Keys are serialized with the values; the residual scan covers both."""
+    result = _sample_result()
+    forged_record = {"078-05-1120": "synthetic condition"}
+    forged = _forge_output(result, forged_record)
+    with pytest.raises(EvidenceValidationError, match="field name carrying an identifier") as caught:
+        DeidentificationResult((forged_record,), forged)
+    assert "078-05-1120" not in str(caught.value)
+
+
+class _ClaimsSafeHarbor(DeidentificationEvidence):
+    """Evidence that reports ``safe_harbor`` whatever its method is."""
+
+    @property
+    def assurance(self):
+        return "safe_harbor"
+
+
+def _expert_result_claiming_safe_harbor():
+    report = ExpertDeterminationReference(
+        report_reference="doc:expert-report/synthetic-1",
+        report_digest=hashlib.sha256(b"synthetic expert report").hexdigest(),
+        expert_id="expert:synthetic",
+    )
+    expert = _run(
+        _pipeline({"zip": FieldSpec.zip_code()}),
+        {"zip": "02139"},
+        method="expert_determination",
+        attestation=None,
+        expert_determination=report,
+    )
+    fields = {f.name: getattr(expert.evidence, f.name) for f in dataclasses.fields(expert.evidence)}
+    draft = _ClaimsSafeHarbor(**fields)
+    claim = dataclasses.replace(draft, artifact_digest=draft.compute_digest())
+    return DeidentificationResult(expert.records, claim)
+
+
+def test_an_export_is_verified_as_bytes_not_as_the_objects_that_wrote_it():
+    """The object passes its own checks, but the bytes it serializes pair an
+    Expert Determination method (and no attestation) with safe_harbor."""
+    result = _expert_result_claiming_safe_harbor()
+    assert result.evidence.assurance == "safe_harbor"
+    assert result.evidence.attestation is None
+    with pytest.raises(EvidenceValidationError, match="assurance does not match method"):
+        result.export_bundle()
 
 
 def test_required_assurance_is_a_generic_check():
@@ -844,6 +1021,150 @@ def test_export_bundle_always_embeds_its_evidence():
     assert bundle["records"] == result.records_as_dicts()
     restored = DeidentificationEvidence.from_dict(bundle["evidence"])
     validate_evidence(restored, bundle["records"], required_assurance="safe_harbor")
+
+
+def test_export_bundle_round_trips_and_verifies():
+    result = _sample_result()
+    restored = DeidentificationResult.from_export_bundle(
+        result.export_bundle(), required_assurance="safe_harbor"
+    )
+    assert restored.evidence == result.evidence
+    assert restored.records_as_dicts() == result.records_as_dicts()
+
+
+def _rewrite_bundle(result, mutate):
+    bundle = json.loads(result.export_bundle())
+    mutate(bundle)
+    return canonical_json_bytes(bundle)
+
+
+@pytest.mark.parametrize(
+    "mutate, message",
+    [
+        (lambda b: b["records"][0].update(diagnosis="other"), "output digest"),
+        (lambda b: b["evidence"]["operator"].update(request_id="request-9"), "artifact_digest"),
+        (lambda b: b.update(schema="kestrel.deidentification.export/v0"), "schema"),
+        (lambda b: b.pop("evidence"), "exactly"),
+        (lambda b: b.update(extra="value"), "exactly"),
+        (lambda b: b.update(records={"0": {}}), "list of objects"),
+        (lambda b: b["evidence"].pop("attestation"), "malformed"),
+    ],
+)
+def test_an_altered_export_bundle_is_rejected(mutate, message):
+    with pytest.raises(EvidenceValidationError, match=message):
+        DeidentificationResult.from_export_bundle(_rewrite_bundle(_sample_result(), mutate))
+
+
+def test_only_the_canonical_encoding_is_accepted():
+    """A duplicate key reads differently to a parser that keeps the first one,
+    so bytes that validate here could carry a value nobody validated."""
+    result = _sample_result()
+    bundle = result.export_bundle()
+    duplicated = bundle.replace(
+        b'"diagnosis":', b'"diagnosis":"SSN 078-05-1120","diagnosis":', 1
+    )
+    assert duplicated != bundle
+    respaced = json.dumps(json.loads(bundle)).encode()
+    for payload in (duplicated, respaced):
+        with pytest.raises(EvidenceValidationError, match="canonical"):
+            DeidentificationResult.from_export_bundle(payload)
+    evidence = json.dumps(json.loads(result.evidence.to_json_bytes())).encode()
+    with pytest.raises(EvidenceValidationError, match="canonical"):
+        DeidentificationEvidence.from_json_bytes(evidence)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda b: b["evidence"].update(patient="078-05-1120"),
+        lambda b: b["evidence"]["operator"].update(patient="078-05-1120"),
+        lambda b: b["evidence"]["records"][0]["transformations"][0].update(note="x"),
+    ],
+    ids=["artifact", "operator", "transformation"],
+)
+def test_content_the_parser_would_drop_is_rejected(mutate):
+    """Regression: canonical bytes with a field the artifact does not define
+    validated, and the field rode along in the stored and served bundle."""
+    result = _sample_result()
+    with pytest.raises(EvidenceValidationError, match="does not define"):
+        DeidentificationResult.from_export_bundle(_rewrite_bundle(result, mutate))
+    artifact = result.evidence.to_dict()
+    artifact["patient"] = "078-05-1120"
+    with pytest.raises(EvidenceValidationError, match="does not define"):
+        DeidentificationEvidence.from_json_bytes(canonical_json_bytes(artifact))
+
+
+def test_a_bytes_subclass_is_not_accepted_as_a_payload():
+    class Disguised(bytes):
+        def decode(self, *args, **kwargs):
+            return "{}"
+
+    for load in (DeidentificationResult.from_export_bundle, DeidentificationEvidence.from_json_bytes):
+        with pytest.raises(EvidenceValidationError, match="must be bytes"):
+            load(Disguised(b"anything"))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda b: b.update(schema="078-05-1120"),
+        lambda b: b["evidence"].update(schema="078-05-1120"),
+        lambda b: b["evidence"].update(method="078-05-1120"),
+        lambda b: b["evidence"].update(policy_version="078-05-1120"),
+        lambda b: b["evidence"]["pipeline"].update(name="078-05-1120"),
+        lambda b: b["evidence"]["pipeline"].update(version="078-05-1120"),
+    ],
+    ids=["bundle-schema", "evidence-schema", "method", "policy", "pipeline-name",
+         "pipeline-version"],
+)
+def test_rejections_do_not_echo_untrusted_bundle_content(mutate):
+    """An imported bundle is untrusted end to end; its refusal must not carry
+    a value from it into a log or a response."""
+    with pytest.raises(EvidenceValidationError) as caught:
+        DeidentificationResult.from_export_bundle(_rewrite_bundle(_sample_result(), mutate))
+    assert "078-05-1120" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [{"Jane Quillfeather": [1]}, {"Jane Quillfeather": "SSN 078-05-1120"}],
+    ids=["non-scalar", "residual"],
+)
+def test_residual_rejections_name_a_field_by_position(record):
+    """An imported record's field names are untrusted, and a name the entity
+    model would catch is invisible to the residual patterns."""
+    forged = _forge_output(_sample_result(), record)
+    with pytest.raises(EvidenceValidationError) as caught:
+        DeidentificationResult((record,), forged)
+    assert "record 0 field 0" in str(caught.value)
+    for value in ("Jane", "Quillfeather", "078-05-1120"):
+        assert value not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"not json",
+        b"[]",
+        "{}",
+        b"\xff\xfe",
+        b'{"records": ' + b"9" * 5000 + b"}",  # past the int digit limit
+        b"[" * 100_000,  # nesting deeper than the recursion limit
+        b'{"x":NaN}',
+        b'{"x":"\\ud800"}',  # a lone surrogate cannot be re-encoded
+    ],
+    ids=["not-json", "array", "str", "bad-utf8", "huge-int", "deep-nesting", "nan",
+         "lone-surrogate"],
+)
+@pytest.mark.parametrize(
+    "load",
+    [DeidentificationResult.from_export_bundle, DeidentificationEvidence.from_json_bytes],
+    ids=["bundle", "evidence"],
+)
+def test_untrusted_json_fails_closed_as_an_evidence_error(load, payload):
+    """A hostile upload is a validation failure, never an unhandled error."""
+    with pytest.raises(EvidenceValidationError):
+        load(payload)
 
 
 def test_batch_run_produces_one_artifact_covering_every_record():

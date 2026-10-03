@@ -41,9 +41,7 @@ from kestrel_sovereign.deidentification import (
     DEIDENTIFICATION_ASSURANCES,
     DeidentificationResult,
     EvidenceValidationError,
-    verify_deidentified_records,
 )
-from kestrel_sovereign.deidentification.evidence import canonical_json_bytes
 from kestrel_sovereign.privacy import (
     PrivacyMode,
     PrivacyConfig,
@@ -1429,7 +1427,6 @@ REQUIRED_TRACE_STORES = frozenset({
 
 DEIDENTIFICATION_EVIDENCE_KIND = "deidentification_evidence"
 DEIDENTIFIED_RECORDS_KIND = "deidentified_records"
-DEIDENTIFIED_RECORDS_SCHEMA = "kestrel.deidentification.records/v1"
 
 
 @dataclass(frozen=True)
@@ -2834,7 +2831,10 @@ class PrivacyEnforcingStorage:
     # write it admits, and it admits nothing without a de-identification
     # evidence artifact: the records and their artifact are persisted together
     # in one transaction, the artifact first, so no de-identified record can
-    # exist in storage without the audit record that authorized it.
+    # exist in storage without the audit record that authorized it. The records
+    # document is itself the export bundle, which embeds the artifact, so every
+    # path that serves it by content hash (``GET /api/files/{hash}``) serves
+    # the evidence with the records.
 
     def _assert_deidentified_save_allowed(self, assurance: str) -> None:
         config = self._privacy_config
@@ -2873,7 +2873,11 @@ class PrivacyEnforcingStorage:
         Its artifact is re-validated against the records (completeness, the
         output digests, its own digest, residual identifier patterns) before
         anything is written, and the records serialized are exactly the ones
-        validated. Whenever the config names a de-identification assurance
+        validated: the records document is ``result.export_bundle()``, which
+        embeds the artifact and is read back with
+        ``DeidentificationResult.from_export_bundle``. A download of the
+        records therefore always carries a verifiable artifact. Whenever the
+        config names a de-identification assurance
         (``safe_harbor`` for the DEIDENTIFIED preset) the artifact must back
         it; other persistent modes accept any valid artifact; EPHEMERAL and
         ISOLATED refuse.
@@ -2884,9 +2888,9 @@ class PrivacyEnforcingStorage:
         capability. What it cannot do is save records its artifact does not
         describe, or records still carrying a detectable identifier pattern.
 
-        Both documents are stored as content-addressed files (encrypted at rest
-        when a data key is configured). Their metadata is content-free: the
-        evidence id, assurance, and digests.
+        Both documents are stored as content-addressed JSON files (encrypted at
+        rest when a data key is configured). Their metadata is content-free:
+        the evidence id, assurance, and digests.
         """
         # Exact type: a subclass could override verify() or records_as_dicts().
         if type(result) is not DeidentificationResult:
@@ -2894,20 +2898,26 @@ class PrivacyEnforcingStorage:
                 "De-identified save blocked: a DeidentificationResult produced "
                 "by the de-identification pipeline is required."
             )
-        evidence = result.evidence
-        records = [dict(record) for record in result.records]
         try:
-            verify_deidentified_records(evidence, records)
+            # Verifies the artifact against the records, then serializes them.
+            records_bytes = result.export_bundle()
+            # Everything persisted below is taken from those verified bytes,
+            # parsed into plain types, never from objects a caller could
+            # subclass to report one assurance and serialize another.
+            persisted = DeidentificationResult.from_export_bundle(records_bytes)
         except EvidenceValidationError as exc:
             raise PrivacyViolationError(
                 f"De-identified save blocked: invalid evidence artifact ({exc})."
             ) from exc
+        evidence = persisted.evidence
+        record_count = len(persisted.records)
         evidence_bytes = evidence.to_json_bytes()
         base_metadata = {
             "evidence_id": evidence.evidence_id,
             "assurance": evidence.assurance,
             "artifact_digest": evidence.artifact_digest,
-            "record_count": len(records),
+            "record_count": record_count,
+            "mime_type": "application/json",
         }
         self._acquire_deidentified_save_lease(evidence.assurance)
         try:
@@ -2917,12 +2927,6 @@ class PrivacyEnforcingStorage:
                     f"deidentification-evidence-{evidence.evidence_id}.json",
                     {"kind": DEIDENTIFICATION_EVIDENCE_KIND, **base_metadata},
                 )
-                records_bytes = canonical_json_bytes({
-                    "schema": DEIDENTIFIED_RECORDS_SCHEMA,
-                    "evidence_id": evidence.evidence_id,
-                    "evidence_file_hash": evidence_hash,
-                    "records": records,
-                })
                 records_hash = await self._storage.store_file(
                     records_bytes,
                     f"deidentified-records-{evidence.evidence_id}.json",
@@ -2936,14 +2940,14 @@ class PrivacyEnforcingStorage:
             self._release_deidentified_save_lease()
         logger.info(
             "Stored %d de-identified record(s) under evidence %s (assurance=%s)",
-            len(records), evidence.evidence_id, evidence.assurance,
+            record_count, evidence.evidence_id, evidence.assurance,
         )
         return DeidentifiedSaveReceipt(
             evidence_id=evidence.evidence_id,
             assurance=evidence.assurance,
             evidence_file_hash=evidence_hash,
             records_file_hash=records_hash,
-            record_count=len(records),
+            record_count=record_count,
         )
     
     # === Graph Storage (privacy-governed durable writes — #2672) ===

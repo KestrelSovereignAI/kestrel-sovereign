@@ -11,16 +11,19 @@ import hashlib
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from kestrel_sdk.storage.database.interface import TransactionError
 
 from kestrel_sovereign.deidentification import (
+    EXPORT_SCHEMA,
     ActualKnowledgeAttestation,
     DeidentificationEvidence,
     DeidentificationPipeline,
     DeidentificationResult,
+    EvidenceValidationError,
     ExpertDeterminationReference,
     FieldSpec,
     OperatorContext,
@@ -28,12 +31,13 @@ from kestrel_sovereign.deidentification import (
     SourceRecord,
     validate_evidence,
 )
+from kestrel_sovereign.endpoints.files import serve_file
 from kestrel_sovereign.privacy import PrivacyConfig, PrivacyMode
 from kestrel_sovereign.storage import AsyncStorage
+from kestrel_sovereign.storage.async_graph_store import GraphNode
 from kestrel_sovereign.storage.privacy_wrapper import (
     DEIDENTIFICATION_EVIDENCE_KIND,
     DEIDENTIFIED_RECORDS_KIND,
-    DEIDENTIFIED_RECORDS_SCHEMA,
     PrivacyEnforcingStorage,
     PrivacyViolationError,
 )
@@ -125,12 +129,16 @@ async def test_deidentified_save_persists_records_with_their_evidence(sqlite_sto
     stored_evidence = DeidentificationEvidence.from_json_bytes(evidence_bytes)
     assert stored_evidence == result.evidence
 
-    records_doc = json.loads(await wrapper.retrieve_file(receipt.records_file_hash))
-    assert records_doc["schema"] == DEIDENTIFIED_RECORDS_SCHEMA
-    assert records_doc["evidence_id"] == receipt.evidence_id
-    assert records_doc["evidence_file_hash"] == receipt.evidence_file_hash
-    assert records_doc["records"] == result.records_as_dicts()
-    validate_evidence(stored_evidence, records_doc["records"], required_assurance="safe_harbor")
+    # The records document is the export bundle: it carries its own artifact.
+    records_bytes = await wrapper.retrieve_file(receipt.records_file_hash)
+    assert records_bytes == result.export_bundle()
+    assert json.loads(records_bytes)["schema"] == EXPORT_SCHEMA
+    restored = DeidentificationResult.from_export_bundle(
+        records_bytes, required_assurance="safe_harbor"
+    )
+    assert restored.evidence == stored_evidence
+    assert restored.records_as_dicts() == result.records_as_dicts()
+    validate_evidence(stored_evidence, restored.records, required_assurance="safe_harbor")
 
     evidence_meta = await sqlite_storage.get_file_metadata(receipt.evidence_file_hash)
     records_meta = await sqlite_storage.get_file_metadata(receipt.records_file_hash)
@@ -140,6 +148,39 @@ async def test_deidentified_save_persists_records_with_their_evidence(sqlite_sto
     for meta in (evidence_meta, records_meta):
         assert meta["evidence_id"] == receipt.evidence_id
         assert meta["artifact_digest"] == result.evidence.artifact_digest
+        assert meta["mime_type"] == "application/json"
+
+
+async def test_downloaded_records_carry_a_verifiable_evidence_artifact(tmp_path):
+    """GET /api/files/{hash} serves stored bytes as they are, so the records
+    document itself must embed the artifact that authorizes it."""
+    agent_id = "did:test:deidentified-download"
+    storage = AsyncStorage(str(tmp_path / "download.db"), agent_id=agent_id)
+    await storage.initialize()
+    try:
+        await storage.graph.add_node(GraphNode(agent_id, "agent", "Synthetic", {}))
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.DEIDENTIFIED)
+        result = _result()
+        receipt = await wrapper.store_deidentified_records(result)
+
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=SimpleNamespace(storage=wrapper, agent_id=agent_id))
+        )
+        response = await serve_file(receipt.records_file_hash, request)
+
+        assert response.media_type == "application/json"
+        downloaded = DeidentificationResult.from_export_bundle(
+            bytes(response.body), required_assurance="safe_harbor"
+        )
+        assert downloaded.evidence == result.evidence
+        assert downloaded.records_as_dicts() == result.records_as_dicts()
+        assert downloaded.evidence.attestation.no_actual_knowledge is True
+        with pytest.raises(EvidenceValidationError, match="not the required"):
+            DeidentificationResult.from_export_bundle(
+                bytes(response.body), required_assurance="expert_determination"
+            )
+    finally:
+        await storage.close()
 
 
 SOURCE_VALUES = ("Avery", "Quillfeather", "chart-778812", "02139", "1950-02-03")
@@ -194,6 +235,50 @@ async def test_records_are_never_stored_without_their_evidence(sqlite_storage, m
     evidence_hash = hashlib.sha256(result.evidence.to_json_bytes()).hexdigest()
     assert await sqlite_storage.files.file_exists(evidence_hash) is False
     assert wrapper._active_deidentified_save_leases == 0
+
+
+class _ClaimsSafeHarbor(DeidentificationEvidence):
+    """Evidence that reports ``safe_harbor`` whatever its method is, and
+    serializes that claim."""
+
+    @property
+    def assurance(self):
+        return "safe_harbor"
+
+
+class _ClaimsSafeHarborOnlyInProcess(_ClaimsSafeHarbor):
+    """Serializes its true assurance, so its bytes are a valid Expert
+    Determination artifact; only the in-process property claims safe_harbor."""
+
+    def _body(self):
+        body = super()._body()
+        body["assurance"] = self.method.value
+        return body
+
+
+@pytest.mark.parametrize(
+    "evidence_type, message",
+    [
+        (_ClaimsSafeHarbor, "assurance does not match method"),
+        (_ClaimsSafeHarborOnlyInProcess, "requires 'safe_harbor'"),
+    ],
+)
+async def test_save_takes_its_assurance_from_the_verified_bytes(evidence_type, message):
+    """Regression: an Expert Determination artifact with no attestation, wrapped
+    to report safe_harbor, passed the DEIDENTIFIED gate on the object alone."""
+    expert = _result("expert_determination")
+    fields = {f.name: getattr(expert.evidence, f.name) for f in dataclasses.fields(expert.evidence)}
+    draft = evidence_type(**fields)
+    claim = dataclasses.replace(draft, artifact_digest=draft.compute_digest())
+    result = DeidentificationResult(expert.records, claim)
+    assert result.evidence.assurance == "safe_harbor"
+    assert result.evidence.attestation is None
+
+    storage = _mock_storage()
+    wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.DEIDENTIFIED)
+    with pytest.raises(PrivacyViolationError, match=message):
+        await wrapper.store_deidentified_records(result)
+    storage.store_file.assert_not_called()
 
 
 @pytest.mark.parametrize("not_a_result", [None, {"records": [], "evidence": {}}, "bundle"])

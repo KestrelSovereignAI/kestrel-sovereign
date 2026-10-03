@@ -103,6 +103,30 @@ def canonical_json_bytes(value: Any) -> bytes:
         ) from None
 
 
+def load_json_object(payload: bytes, name: str) -> Dict[str, Any]:
+    """Decode ``payload`` as one JSON object in canonical form, failing closed.
+
+    Only the canonical encoding is accepted. Any other spelling of the same
+    object — a duplicate key, extra whitespace, an escape — can read
+    differently to another parser (most keep the first duplicate, Python keeps
+    the last), so bytes validated here could carry a value nobody validated.
+    """
+    # Exactly bytes: a subclass could decode, or compare equal, as other content.
+    if type(payload) is not bytes:
+        raise EvidenceValidationError(f"{name} must be bytes")
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (ValueError, RecursionError):
+        # ValueError covers invalid UTF-8, malformed JSON, and an integer past
+        # the interpreter's digit limit; RecursionError, hostile nesting.
+        raise EvidenceValidationError(f"{name} is not valid JSON") from None
+    if not isinstance(data, dict):
+        raise EvidenceValidationError(f"{name} must be a JSON object")
+    if canonical_json_bytes(data) != payload:
+        raise EvidenceValidationError(f"{name} is not in canonical form")
+    return data
+
+
 def output_record_digest(record: Mapping[str, Any]) -> str:
     """SHA-256 of a de-identified output record's canonical encoding."""
     return hashlib.sha256(canonical_json_bytes(dict(record))).hexdigest()
@@ -142,7 +166,7 @@ def _enum(enum_type, value: Any, name: str):
     try:
         return enum_type(value)
     except ValueError:
-        raise EvidenceValidationError(f"{name} {value!r} is not recognized") from None
+        raise EvidenceValidationError(f"{name} is not recognized") from None
 
 
 @dataclass(frozen=True)
@@ -448,9 +472,7 @@ class DeidentificationEvidence:
         """Rebuild a persisted artifact. Call :func:`validate_evidence` on it."""
         try:
             if data["schema"] != EVIDENCE_SCHEMA:
-                raise EvidenceValidationError(
-                    f"unsupported evidence schema {data['schema']!r}"
-                )
+                raise EvidenceValidationError("unsupported evidence schema")
             method = _enum(DeidentificationMethod, data["method"], "method")
             if data["assurance"] != method.value:
                 raise EvidenceValidationError("assurance does not match method")
@@ -495,13 +517,18 @@ class DeidentificationEvidence:
 
     @classmethod
     def from_json_bytes(cls, payload: bytes) -> "DeidentificationEvidence":
-        try:
-            data = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise EvidenceValidationError("evidence artifact is not valid JSON") from None
-        if not isinstance(data, dict):
-            raise EvidenceValidationError("evidence artifact must be a JSON object")
-        return cls.from_dict(data)
+        """Rebuild an artifact from :meth:`to_json_bytes` output, exactly.
+
+        The bytes must re-encode from the parsed artifact unchanged, so they
+        carry no field the artifact does not define. Call
+        :func:`validate_evidence` on the result.
+        """
+        evidence = cls.from_dict(load_json_object(payload, "evidence artifact"))
+        if evidence.to_json_bytes() != payload:
+            raise EvidenceValidationError(
+                "evidence artifact carries content its schema does not define"
+            )
+        return evidence
 
 
 def _validate_method(evidence: DeidentificationEvidence) -> None:
@@ -590,25 +617,32 @@ def validate_evidence(
             )
     if not isinstance(evidence.evidence_id, str) or not _EVIDENCE_ID.match(evidence.evidence_id):
         raise EvidenceValidationError("evidence_id must be a 32-character hex identifier")
-    parse_timestamp(evidence.created_at, "created_at")
+    created_at = parse_timestamp(evidence.created_at, "created_at")
     _require_text(evidence.reference_date, "reference_date")
     try:
-        date.fromisoformat(evidence.reference_date)
+        reference_date = date.fromisoformat(evidence.reference_date)
     except ValueError:
         raise EvidenceValidationError("reference_date must be an ISO date") from None
-    if evidence.policy_version not in SUPPORTED_POLICY_VERSIONS:
+    # Ages are measured in years, so only the year can understate one.
+    if reference_date.year < created_at.year:
         raise EvidenceValidationError(
-            f"policy_version {evidence.policy_version!r} is not supported"
+            "reference_date precedes the run's year; ages measured against it "
+            "would be understated"
         )
+    if (
+        not isinstance(evidence.policy_version, str)
+        or evidence.policy_version not in SUPPORTED_POLICY_VERSIONS
+    ):
+        raise EvidenceValidationError("policy_version is not supported")
     if evidence.pipeline_name != PIPELINE_NAME:
         raise EvidenceValidationError(
-            f"pipeline.name {evidence.pipeline_name!r} is not the Kestrel "
-            "de-identification pipeline"
+            "pipeline.name is not the Kestrel de-identification pipeline"
         )
-    if evidence.pipeline_version not in SUPPORTED_PIPELINE_VERSIONS:
-        raise EvidenceValidationError(
-            f"pipeline.version {evidence.pipeline_version!r} is not supported"
-        )
+    if (
+        not isinstance(evidence.pipeline_version, str)
+        or evidence.pipeline_version not in SUPPORTED_PIPELINE_VERSIONS
+    ):
+        raise EvidenceValidationError("pipeline.version is not supported")
     _require_hex64(evidence.config_digest, "pipeline.config_digest")
     if not evidence.detectors:
         raise EvidenceValidationError("pipeline.detectors must not be empty")
@@ -627,8 +661,7 @@ def validate_evidence(
         for t in record.transformations:
             if t.detector not in evidence.detectors:
                 raise EvidenceValidationError(
-                    f"transformation detector {t.detector!r} is not a recorded "
-                    "pipeline detector"
+                    "a transformation detector is not a recorded pipeline detector"
                 )
     _validate_categories(evidence)
     if evidence.artifact_digest != evidence.compute_digest():

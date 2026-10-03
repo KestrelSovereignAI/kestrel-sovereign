@@ -16,8 +16,9 @@ What a run does, per field:
   generalized — the record's own identifier values, every pattern-detectable
   category, and names/places via a named-entity detector;
 * **non-identifying** fields are kept, but a value that matches a precise
-  identifier pattern (or repeats one of the record's own identifier values)
-  refutes the classification and the run is refused.
+  identifier pattern (or repeats one of the record's own identifier values,
+  or gives a birth date Safe Harbor does not permit) refutes the
+  classification and the run is refused.
 
 This is distinct from PII redaction (``storage="pii_redacted"``): redaction is
 best-effort masking of obvious identifiers, with no evidence and no claim. A
@@ -64,6 +65,7 @@ from kestrel_sovereign.deidentification.evidence import (
     OperatorContext,
     RecordEvidence,
     canonical_json_bytes,
+    load_json_object,
     output_record_digest,
     parse_timestamp,
     summarize_categories,
@@ -141,24 +143,38 @@ def verify_deidentified_records(
 
     Validates the artifact against the records, then scans the records for
     residual identifiers with the same precise patterns that refute a
-    non-identifying classification. The pipeline scrubs text until those
-    patterns no longer match, so a hit means the records are not the output
-    the artifact describes. Raises :class:`EvidenceValidationError`.
+    non-identifying classification, measuring ages against the artifact's
+    reference date. The pipeline scrubs text until those patterns no longer
+    match, so a hit means the records are not the output the artifact
+    describes. Raises :class:`EvidenceValidationError`.
     """
     validate_evidence(evidence, records, required_assurance=required_assurance)
+    reference_year = date.fromisoformat(evidence.reference_date).year
+    # Messages name a field by position: the records may come from an imported
+    # bundle, whose field names are as untrusted as its values.
     for index, record in enumerate(records):
-        for field_name, value in record.items():
+        for position, (field_name, value) in enumerate(record.items()):
+            # Keys are serialized with the values, so they are scanned too.
+            if not isinstance(field_name, str):
+                raise EvidenceValidationError(
+                    f"record {index} field {position} has a non-string name"
+                )
+            if find_identifier_patterns(field_name, reference_year=reference_year):
+                raise EvidenceValidationError(
+                    f"record {index} field {position} has a field name carrying "
+                    "an identifier pattern"
+                )
             if not isinstance(value, _SCALAR_TYPES):
                 raise EvidenceValidationError(
-                    f"record {index} field {field_name!r} is not a JSON scalar"
+                    f"record {index} field {position} is not a JSON scalar"
                 )
             text = _scannable_text(value)
             if text is not None:
-                findings = find_identifier_patterns(text)
+                findings = find_identifier_patterns(text, reference_year=reference_year)
                 if findings:
                     category, detector = findings[0]
                     raise EvidenceValidationError(
-                        f"record {index} field {field_name!r} still carries a "
+                        f"record {index} field {position} still carries a "
                         f"{category.value} identifier ({detector})"
                     )
 
@@ -196,14 +212,58 @@ class DeidentificationResult:
         """The canonical export of these records with their evidence artifact.
 
         An export never leaves without its artifact: the bundle is produced only
-        after :meth:`verify` passes, and it embeds the artifact verbatim.
+        after :meth:`verify` passes, and it embeds the artifact verbatim. The
+        bytes themselves are then read back with :meth:`from_export_bundle`, so
+        what leaves is verified as the bytes a recipient will parse, not only as
+        the in-process objects that produced them.
         """
         self.verify()
-        return canonical_json_bytes({
+        payload = canonical_json_bytes({
             "schema": EXPORT_SCHEMA,
             "evidence": self.evidence.to_dict(),
             "records": self.records_as_dicts(),
         })
+        DeidentificationResult.from_export_bundle(payload)
+        return payload
+
+    @classmethod
+    def from_export_bundle(
+        cls, payload: bytes, *, required_assurance: Optional[str] = None
+    ) -> "DeidentificationResult":
+        """Rebuild a result from :meth:`export_bundle` bytes, failing closed.
+
+        The bytes must be exactly what :meth:`export_bundle` writes for the
+        result they parse to: canonical, and carrying no field the bundle or
+        its artifact does not define. The embedded artifact must validate and
+        describe exactly the embedded records, which must carry no residual
+        identifier pattern. Raises :class:`EvidenceValidationError`.
+        """
+        data = load_json_object(payload, "export bundle")
+        if set(data) != {"schema", "evidence", "records"}:
+            raise EvidenceValidationError(
+                "an export bundle holds exactly a schema, evidence, and records"
+            )
+        if data["schema"] != EXPORT_SCHEMA:
+            raise EvidenceValidationError("unsupported export bundle schema")
+        records, evidence = data["records"], data["evidence"]
+        if not isinstance(records, list) or not all(isinstance(r, dict) for r in records):
+            raise EvidenceValidationError("export bundle records must be a list of objects")
+        if not isinstance(evidence, dict):
+            raise EvidenceValidationError("export bundle evidence must be an object")
+        result = cls(tuple(records), DeidentificationEvidence.from_dict(evidence))
+        # Parsing drops what the artifact does not define; re-encoding what was
+        # parsed and validated must give back every byte that was presented.
+        if canonical_json_bytes({
+            "schema": EXPORT_SCHEMA,
+            "evidence": result.evidence.to_dict(),
+            "records": result.records_as_dicts(),
+        }) != payload:
+            raise EvidenceValidationError(
+                "export bundle carries content its schema does not define"
+            )
+        if required_assurance is not None:
+            result.verify(required_assurance=required_assurance)
+        return result
 
 
 def _encode_source_value(value: Any) -> Any:
@@ -386,7 +446,8 @@ class DeidentificationPipeline:
 
         ``reference_date`` is the date ages are measured against when deciding
         whether a date is 90 or more years old (and so aggregated to 90+); it
-        defaults to the run date. The attestation must be dated within
+        defaults to the run date and may not fall in an earlier year, which
+        would understate every age. The attestation must be dated within
         ``attestation_max_age`` before the run and not after it.
         """
         try:
@@ -439,6 +500,15 @@ class DeidentificationPipeline:
                     )
         except EvidenceValidationError as exc:
             raise DeidentificationRefused(str(exc)) from None
+        reference = now.date() if reference_date is None else reference_date
+        if not isinstance(reference, date) or isinstance(reference, datetime):
+            raise DeidentificationRefused("reference_date must be a date")
+        # Ages are measured in years, so only an earlier year can understate one.
+        if reference.year < now.year:
+            raise DeidentificationRefused(
+                "reference_date precedes the run's year: ages measured against "
+                "it are understated, keeping birth years Safe Harbor aggregates"
+            )
 
         batch = list(records)
         if not batch:
@@ -447,7 +517,6 @@ class DeidentificationPipeline:
         if len(set(record_ids)) != len(record_ids):
             raise DeidentificationError("record_id values must be unique within a run")
 
-        reference = reference_date or now.date()
         outputs: List[Dict[str, Any]] = []
         record_evidence: List[RecordEvidence] = []
         for record in batch:
@@ -626,7 +695,9 @@ class DeidentificationPipeline:
                     )
                 text = _scannable_text(value)
                 if text is not None:
-                    findings = find_identifier_patterns(text, known_values=whole_values)
+                    findings = find_identifier_patterns(
+                        text, reference_year=reference_year, known_values=whole_values
+                    )
                     if findings:
                         category, detector = findings[0]
                         raise DeidentificationError(
