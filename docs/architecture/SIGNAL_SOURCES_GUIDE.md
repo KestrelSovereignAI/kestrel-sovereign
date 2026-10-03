@@ -547,9 +547,10 @@ Authorization and protocol decisions are final and never retried.
 The registration is an `InFlightControlActionRegistration`. It acts only on
 work already running, so the dispatcher:
 
-- persists only a fixed durable marker (no payload, caller, or chain) and
-  therefore does not wait on the privacy-transition lock that every running
-  turn holds;
+- persists only a fixed durable marker (no payload, caller, or chain). Like
+  every source it persists under the agent's durable persistence gate, which
+  only a privacy transition holds exclusively; turns do not hold it, so a Stop
+  never queues behind the turn it is meant to stop (#3316);
 - does not apply Hold's begin-work disposition, so a held agent still receives
   Stop for work in flight.
 

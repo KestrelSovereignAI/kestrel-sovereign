@@ -32,7 +32,10 @@ from kestrel_sovereign.agent.turn_lifecycle import (
     capture_turn_session_binding,
 )
 from kestrel_sovereign.signals import OrderedLockManager
-from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
+from kestrel_sovereign.storage.privacy_wrapper import (
+    DurablePersistenceGate,
+    ReentrantTransitionLock,
+)
 
 
 class _StubAgent(TurnLifecycleMixin):
@@ -43,9 +46,13 @@ class _StubAgent(TurnLifecycleMixin):
     def __init__(self) -> None:
         self._lock_manager = OrderedLockManager()
         self._privacy_transition_lock = ReentrantTransitionLock()
+        self._durable_persistence_gate = DurablePersistenceGate()
 
     def _get_privacy_transition_lock(self):
         return self._privacy_transition_lock
+
+    def _get_durable_persistence_gate(self):
+        return self._durable_persistence_gate
 
 
 class _PrivateAccessorOnlyAgent(_StubAgent):

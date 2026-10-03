@@ -29,6 +29,7 @@ from kestrel_sovereign.signals import (
 )
 from kestrel_sovereign.features.channels.route_ownership import ChannelRouteOwnershipStore
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
+from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
 
 
 def _signal(agent_id: str) -> Signal:
@@ -53,11 +54,11 @@ class _DispatcherAgent:
     def __init__(self, did: str, privacy_config) -> None:
         self.did = did
         self.privacy_config = privacy_config
-        self._privacy_transition_lock = asyncio.Lock()
+        self._durable_persistence_gate = DurablePersistenceGate()
         self.tasks: list[asyncio.Task] = []
 
-    def _get_privacy_transition_lock(self):
-        return self._privacy_transition_lock
+    def _get_durable_persistence_gate(self):
+        return self._durable_persistence_gate
 
     def _track_background_task(self, coro, *, name: str):
         task = asyncio.create_task(coro, name=name)
