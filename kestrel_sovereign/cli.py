@@ -460,11 +460,33 @@ def cmd_shell(args) -> int:
         resolve_host_database_launch_context,
     )
 
+    launch_env = spawned_agent_env(project_dir)
+    # The in-process agent resolves its governing constitution source (#2553)
+    # from this process's environment, where ``load_project_env`` above left an
+    # exported value authoritative. The launcher and doctor resolve it from
+    # ``launch_env``, where the project ``.env`` wins. A shell exporting
+    # descriptor B while the file names A would audit B, or refuse the
+    # per-agent/environment conflict, and put a healthy agent in Safe Mode.
+    # Refuse before building the agent, as ``constitution reanchor`` does
+    # (#3451): which setting governs is the operator's to settle.
+    governance_conflict = _governance_env_conflict(launch_env)
+    if governance_conflict is not None:
+        print(
+            _governance_env_conflict_error(
+                governance_conflict,
+                project_dir,
+                "an in-process shell now would audit a source the agent does "
+                "not, and could put a healthy agent in Safe Mode.",
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
     # Resolve fleet custody from the same pre-agent launch environment used by
     # ProcessManager. Applying the selected agent root first would partition an
     # offline shell away from a Hold set through the normal host.
     hold_launch_context = resolve_host_database_launch_context(
-        env=spawned_agent_env(project_dir),
+        env=launch_env,
         base_dir=project_dir,
         project_root=project_dir,
     )
@@ -1172,6 +1194,27 @@ def _governance_env_conflict(
     return None
 
 
+def _governance_env_conflict_error(
+    conflict: tuple[str, str, str],
+    project_dir: Path,
+    consequence: str,
+) -> str:
+    """The refusal for a :func:`_governance_env_conflict`, naming both values.
+
+    ``consequence`` says what this command would get wrong by using the
+    exported value.
+    """
+    key, exported, launched = conflict
+    return (
+        f"error: {key} in the environment ({exported or 'unset'}) does not "
+        f"match the one in {project_dir / '.env'} ({launched or 'unset'}).\n"
+        f"  The agent resolves its governing constitution source with the "
+        f"file's value; {consequence}\n"
+        f"  Unset {key} to use the project's value, or correct the file, "
+        f"then re-run."
+    )
+
+
 def _reanchor_source_refusal(
     agent_name: str,
     *,
@@ -1337,15 +1380,13 @@ def cmd_constitution_reanchor(args) -> int:
     # which one governs is the operator's to settle.
     governance_conflict = _governance_env_conflict(launch_env)
     if governance_conflict is not None:
-        key, exported, launched = governance_conflict
         print(
-            f"error: {key} in the environment ({exported or 'unset'}) does not "
-            f"match the one in {project_dir / '.env'} ({launched or 'unset'}).\n"
-            f"  The agent resolves its governing constitution source with the "
-            f"file's value; a reanchor run now could anchor a source the agent "
-            f"will not audit against.\n"
-            f"  Unset {key} to use the project's value, or correct the file, "
-            f"then re-run.",
+            _governance_env_conflict_error(
+                governance_conflict,
+                project_dir,
+                "a reanchor run now could anchor a source the agent will not "
+                "audit against.",
+            ),
             file=sys.stderr,
         )
         return 2

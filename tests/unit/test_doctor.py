@@ -480,8 +480,12 @@ def test_constitution_drift_fails_when_file_changed(tmp_path, monkeypatch):
     assert "DB is backed up first" in msg
 
 
-def _signed_source_descriptor(tmp_path: Path, source: Path) -> tuple[Path, Path]:
-    """An operator trust root and a descriptor selecting ``source`` (#2553)."""
+def _signed_source_descriptor(
+    tmp_path: Path, source: Path, *, source_kind: str = "external"
+) -> tuple[Path, Path]:
+    """An operator trust root and a descriptor selecting ``source`` (#2553).
+
+    A ``package`` descriptor pins ``source``'s bytes and names no path."""
     from kestrel_sovereign.constitution.amendment_artifact import (
         did_document_from_legacy_public_key,
     )
@@ -501,8 +505,8 @@ def _signed_source_descriptor(tmp_path: Path, source: Path) -> tuple[Path, Path]
         json.dumps(
             build_legacy_signed_source_descriptor(
                 signer_did=did,
-                source_kind="external",
-                source_path=str(source),
+                source_kind=source_kind,
+                source_path=str(source) if source_kind == "external" else None,
                 content_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
                 private_key=keypair.private_key,
             )
@@ -559,6 +563,151 @@ def test_an_unverifiable_source_descriptor_fails_doctor(tmp_path, monkeypatch):
         "governing constitution source cannot be trusted" in m for m in report.fail
     ), report.fail
     assert not any("constitution anchored to current file" in m for m in report.ok)
+
+
+def _externally_governed(tmp_path: Path, monkeypatch) -> Path:
+    """An agent anchored to, and governed by, a descriptor-selected external
+    source. Returns that source."""
+    package = _patch_canonical(tmp_path, b"# Kestrel Constitution\npackage\n")
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(package))
+    external = tmp_path / "CUSTOM.md"
+    external.write_bytes(b"# Custom Constitution\nexternal\n")
+    root, descriptor = _signed_source_descriptor(tmp_path, external)
+    monkeypatch.setenv("KESTREL_SOVEREIGN_TRUST_ROOT_PATH", str(root))
+    monkeypatch.setenv("KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH", str(descriptor))
+    _seed_with_anchored_constitution(
+        tmp_path,
+        constitution_text=external.read_bytes(),
+        stored_hash=hashlib.sha256(external.read_bytes()).hexdigest(),
+    )
+    return external
+
+
+def _make_unreadable(path: Path, how: str) -> None:
+    if how == "deleted":
+        path.unlink()
+    elif how == "empty":
+        path.write_bytes(b"")
+    else:
+        if os.geteuid() == 0:
+            pytest.skip("root reads a mode-000 file")
+        path.chmod(0)
+
+
+def _drift_messages(report) -> list[str]:
+    return [
+        m
+        for m in (*report.warn, *report.fail)
+        if "constitution" in m.lower() and "skipped" in m
+    ]
+
+
+@pytest.mark.parametrize("how", ["deleted", "unreadable", "empty"])
+def test_an_unreadable_descriptor_selected_source_fails_doctor(
+    tmp_path, monkeypatch, how
+):
+    """A selected source never falls back to the package, so the runtime
+    audit Safe-Modes the agent; doctor must not call that a skipped check
+    and report Ready (#3451)."""
+    external = _externally_governed(tmp_path, monkeypatch)
+    _make_unreadable(external, how)
+    try:
+        report = diagnose(tmp_path)
+    finally:
+        if external.exists():
+            external.chmod(0o600)
+
+    assert not report.ready
+    failures = [m for m in report.fail if str(external) in m]
+    assert len(failures) == 1, report.fail
+    assert "Test:" in failures[0]
+    assert "Safe Mode" in failures[0]
+    assert _drift_messages(report) == [], report.warn
+    assert not any("constitution anchored to current file" in m for m in report.ok)
+
+
+def test_an_unreadable_package_pinned_by_a_descriptor_fails_doctor(
+    tmp_path, monkeypatch
+):
+    """A ``package`` descriptor selects the package too: once a descriptor
+    chose it, an unreadable package is the agent's audit failure."""
+    text = b"# Kestrel Constitution\nv1\n"
+    package = _patch_canonical(tmp_path, text)
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(package))
+    root, descriptor = _signed_source_descriptor(
+        tmp_path, package, source_kind="package"
+    )
+    monkeypatch.setenv("KESTREL_SOVEREIGN_TRUST_ROOT_PATH", str(root))
+    monkeypatch.setenv("KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH", str(descriptor))
+    _seed_with_anchored_constitution(
+        tmp_path,
+        constitution_text=text,
+        stored_hash=hashlib.sha256(text).hexdigest(),
+    )
+    assert any("constitution anchored to current file" in m for m in diagnose(tmp_path).ok)
+
+    package.unlink()
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any(str(package) in m and "Safe Mode" in m for m in report.fail), report.fail
+    assert _drift_messages(report) == [], report.warn
+
+
+def test_an_unreadable_package_does_not_hide_an_external_source(
+    tmp_path, monkeypatch
+):
+    """The package is not this agent's source, so it is not this agent's
+    readability question (#3451): the external source is still checked."""
+    external = _externally_governed(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(tmp_path / "does_not_exist.md"),
+    )
+
+    report = diagnose(tmp_path)
+
+    assert any("constitution anchored to current file" in m for m in report.ok)
+    assert _drift_messages(report) == [], report.warn
+    assert not any("constitution" in m for m in report.fail), report.fail
+
+    # ...including its failures: a tampered source is not hidden either.
+    external.write_bytes(b"# Custom Constitution\ntampered\n")
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any(
+        "cannot be trusted" in m and "changed after" in m for m in report.fail
+    ), report.fail
+    assert _drift_messages(report) == [], report.warn
+
+
+def test_an_unreadable_package_is_reported_once_for_the_fleet(
+    tmp_path, monkeypatch
+):
+    """With no descriptor the package governs every agent, and its being
+    unreadable is one fact, not one per agent."""
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(tmp_path / "does_not_exist.md"),
+    )
+    _seed_ready(tmp_path)
+    multi_agent = MultiAgentConfig.load(tmp_path / MULTI_AGENT_CONFIG_FILENAME)
+    multi_agent.agents["Other"] = LocalAgentConfig(
+        data_dir=Path("agent_data/other"), port=8802, autostart=True
+    )
+    multi_agent.save(tmp_path / MULTI_AGENT_CONFIG_FILENAME)
+    (tmp_path / "agent_data" / "other").mkdir(parents=True)
+    (tmp_path / "agent_data" / "other" / "kestrel_prime.db").write_bytes(b"")
+
+    report = diagnose(tmp_path)
+
+    warnings = [
+        m
+        for m in report.warn
+        if "Constitution drift check skipped — cannot read canonical" in m
+    ]
+    assert len(warnings) == 1, report.warn
 
 
 def test_constitution_drift_warns_on_missing_hash_property(tmp_path, monkeypatch):

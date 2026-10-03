@@ -220,6 +220,11 @@ Every launch path gives an agent the same answer:
   an explicit blank when none is configured. A conflicting or missing
   descriptor refuses the launch.
 - `kestrel shell`'s in-process fallback passes the agent's descriptor too.
+  It refuses to start when the shell exports
+  `KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH` or
+  `KESTREL_SOVEREIGN_TRUST_ROOT_PATH` with a value the project `.env`
+  overrides, as offline reanchor does, rather than audit a source the
+  launched agent does not.
 - `kestrel doctor` and `kestrel constitution reanchor` resolve from the
   per-agent setting and the launcher's environment.
 
@@ -390,5 +395,10 @@ descriptors.
   anchors the resolved governing source rather than always the package.
 - Changed: `kestrel doctor` checks drift against each agent's resolved
   source. An untrusted descriptor is reported as a failure.
+- Fixed (#3451): `kestrel doctor` fails, rather than skipping the check,
+  when a source a descriptor selected is missing, unreadable, or empty.
+  An unreadable packaged constitution no longer hides the checks of
+  agents governed by an external source. `kestrel shell` refuses a
+  descriptor or trust-root export that the project `.env` overrides.
 - Unchanged: agents with no descriptor configured resolve, audit, and
   reanchor exactly as before, and need no trust root to boot.

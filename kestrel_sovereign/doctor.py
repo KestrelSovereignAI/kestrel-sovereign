@@ -14,9 +14,11 @@ Checks performed:
   - At least one agent registered in ``multi_agent.toml``
   - For each registered agent, ``kestrel_prime.db`` exists
   - For each registered agent, the anchored ``constitution_hash``
-    matches the SHA256 of the canonical KESTREL_CONSTITUTION.md.
-    Drift here means the agent is silently governing itself by an
-    older constitution than what's on disk — see ``_check_constitution_drift``.
+    matches the SHA256 of its governing constitution: the packaged
+    KESTREL_CONSTITUTION.md, or the source a Sovereign-signed descriptor
+    selects (#2553). Drift here means the agent is silently governing
+    itself by an older constitution than what's on disk — see
+    ``_check_constitution_drift``.
   - For each registered agent, the ``governed_by`` graph edge targets the
     anchored ``constitution_hash`` (integrity proof 2) and any per-agent
     ``CONSTITUTION.md`` overlay is anchored and unmodified (#1722). The
@@ -2319,7 +2321,7 @@ def _check_constitution_drift(
     For each local multi_agent agent: open ``kestrel_prime.db`` with stock
     ``sqlite3``, read the agent node's ``constitution_hash`` property
     (plain JSON in ``graph_nodes.properties``), and compare to the SHA256
-    of the canonical ``KESTREL_CONSTITUTION.md`` shipped in the package.
+    of the agent's governing constitution (resolved as described below).
 
     Why we don't need ``KESTREL_DATA_KEY`` here: the file content is
     Fernet-encrypted at the blob level in the ``files`` table, but the
@@ -2340,7 +2342,11 @@ def _check_constitution_drift(
     descriptor, verified against the operator-pinned trust root. ``env`` is
     :func:`runtime_env`'s resolution; None reads ``os.environ``. A descriptor
     that does not verify is a failure, not a skipped check — the agent will
-    Safe-Mode at its next audit.
+    Safe-Mode at its next audit. So is a source a descriptor selected that is
+    missing, unreadable or empty (#3451): a selected source never falls back
+    to the package, so the runtime audit fails on it exactly as on a bad
+    signature. Only the unpinned packaged default, which no descriptor chose,
+    is reported as a skipped check when it cannot be read.
 
     Per-agent overlay (``<agent_dir>/CONSTITUTION.md``) and the
     ``governed_by`` governance edge are NOT compared here — overlays ARE
@@ -2350,26 +2356,25 @@ def _check_constitution_drift(
     if not readings:
         return
 
-    canonical = _canonical_constitution_path()
-    # Up-front readability guard: if the canonical governing source itself
-    # cannot be read, no agent can be drift-checked against it, and the failure
-    # is independent of any per-agent DB state. Surface it once and stop rather
-    # than letting an empty/unreadable per-agent DB short-circuit the loop
-    # before the canonical read is ever reached (#2463). The per-agent resolve
-    # below still renders each agent's Amendment VIII contract for the actual
-    # hash comparison; this only pre-checks that the file exists and is readable.
-    try:
-        canonical.read_bytes()
-    except OSError as exc:
-        report.warn.append(
-            f"Constitution drift check skipped — cannot read canonical "
-            f"{canonical}: {exc}"
-        )
-        return
+    from kestrel_sovereign.constitution.emancipation import (
+        EmancipationConfigError,
+        contract_from_json,
+    )
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
 
     for reading in readings:
         name = reading.name
         source = reading.source
+        # Readability is a property of the source that governs this agent, so
+        # it is checked on that source (#3451), and before any database state,
+        # so an empty or unreadable database cannot hide an unreadable source
+        # (#2463). Reading the package first and stopping when it failed let an
+        # unreadable package hide every descriptor-governed agent's own
+        # verification and drift findings, about files the package is not.
+        governing_source = _readable_governing_source(reading, report, env)
+
         if isinstance(source, _UnreadableDB):
             _report_unexamined(name, source.reason, source, report)
             continue
@@ -2420,69 +2425,40 @@ def _check_constitution_drift(
             )
             continue
 
-        # Recompute the EXPECTED hash the way the periodic integrity audit does
-        # (#2463): resolve the governing source and its bytes through the
-        # shared resolver, rendering this agent's anchored Amendment VIII
-        # emancipation contract if it has one. Hashing raw package bytes here
-        # would false-flag every emancipated agent as "drifted" and could not
-        # diagnose an active/custom agent consistently with the runtime
-        # verifier.
-        contract_json = _anchored_emancipation_contract(properties)
-        from kestrel_sovereign.constitution.emancipation import (
-            EmancipationConfigError,
-            contract_from_json,
-        )
-        from kestrel_sovereign.constitution.resolver import (
-            resolve_governing_constitution_bytes,
-            resolve_governing_source,
-        )
-        from kestrel_sovereign.constitution.source_descriptor import (
-            ConstitutionSourceError,
-        )
-        from kestrel_sovereign.constitution.trust_root import (
-            SovereignTrustRootError,
-        )
-
-        governing_path = canonical
         try:
-            contract = contract_from_json(contract_json)
-            governing_source = resolve_governing_source(
-                descriptor_path=reading.source_descriptor,
-                agent_dids={source.agent_did} if source.agent_did else frozenset(),
-                environ=env,
-            )
-            governing_path = Path(governing_source.path)
-            on_disk_hash = hashlib.sha256(
-                resolve_governing_constitution_bytes(
-                    contract, source=governing_source
-                )
-            ).hexdigest()
-        except (ConstitutionSourceError, SovereignTrustRootError) as exc:
-            report.fail.append(
-                f"{name}: governing constitution source cannot be trusted "
-                f"({exc}); the agent will fail its integrity audit and enter "
-                f"Safe Mode. See \"Custom governing constitution sources\" in "
-                f"docs/architecture/security/SOVEREIGN_TRUST_ROOT.md."
-            )
-            continue
-        except FileNotFoundError as exc:
-            report.warn.append(
-                f"{name}: Constitution drift check skipped — cannot read "
-                f"canonical {governing_path}: {exc}"
-            )
-            continue
+            contract = contract_from_json(_anchored_emancipation_contract(properties))
         except EmancipationConfigError as exc:
             report.fail.append(
                 f"{name}: anchored emancipation contract is corrupted ({exc}); "
                 f"the agent will fail its integrity audit. Re-anchor it."
             )
             continue
-        except (OSError, ValueError) as exc:
-            report.warn.append(
-                f"{name}: constitution drift check skipped — cannot resolve "
-                f"governing constitution: {exc}"
-            )
+        if governing_source is None:
+            # Unusable, and already reported by _readable_governing_source.
             continue
+
+        # Recompute the EXPECTED hash the way the periodic integrity audit does
+        # (#2463): the governing source's bytes through the shared resolver,
+        # rendering this agent's anchored Amendment VIII emancipation contract
+        # if it has one. Hashing raw package bytes here would false-flag every
+        # emancipated agent as "drifted" and could not diagnose an
+        # active/custom agent consistently with the runtime verifier.
+        try:
+            on_disk_hash = hashlib.sha256(
+                resolve_governing_constitution_bytes(
+                    contract, source=governing_source
+                )
+            ).hexdigest()
+        except (OSError, ValueError) as exc:
+            if not _fail_unusable_governing_source(
+                name, governing_source, exc, report
+            ):
+                report.warn.append(
+                    f"{name}: constitution drift check skipped — cannot "
+                    f"resolve governing constitution: {exc}"
+                )
+            continue
+        governing_path = Path(governing_source.path)
 
         if reading.pending_replication:
             report.warn.append(
@@ -2502,6 +2478,99 @@ def _check_constitution_drift(
                 f"Run `kestrel constitution reanchor --agent-name {name} --force` "
                 f"to update ({_rollback_advice(source)})."
             )
+
+
+def _readable_governing_source(
+    reading: _AgentGovernance,
+    report: DoctorReport,
+    env: dict | None,
+):
+    """The source that governs this agent, once it is known to be usable.
+
+    Resolves the source from operator configuration (#2553) and reads it
+    through the shared resolver, so it meets the runtime audit's own tests:
+    present, readable, non-empty, and, when a descriptor pins it, still the
+    signed bytes. Returns the :class:`GoverningSource`, or None after
+    reporting why the agent cannot use it.
+
+    An unreadable packaged default is the same fact for every agent it
+    governs, so its warning is reported once.
+    """
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+        resolve_governing_source,
+    )
+
+    source = reading.source
+    agent_did = source.agent_did if isinstance(source, _GovernanceSource) else None
+    governing_source = None
+    try:
+        governing_source = resolve_governing_source(
+            descriptor_path=reading.source_descriptor,
+            agent_dids={agent_did} if agent_did else frozenset(),
+            environ=env,
+        )
+        resolve_governing_constitution_bytes(source=governing_source)
+    except (OSError, ValueError) as exc:
+        if not _fail_unusable_governing_source(
+            reading.name, governing_source, exc, report
+        ):
+            message = (
+                f"Constitution drift check skipped — cannot read canonical "
+                f"{governing_source.path}: {exc}"
+            )
+            if message not in report.warn:
+                report.warn.append(message)
+        return None
+    return governing_source
+
+
+def _fail_unusable_governing_source(
+    name: str,
+    governing_source,
+    exc: Exception,
+    report: DoctorReport,
+) -> bool:
+    """Fail readiness when the runtime audit would fail on this source.
+
+    Returns False, reporting nothing, only for the unpinned packaged default
+    that no descriptor selected, which the caller reports as a skipped check.
+    Anything a descriptor configured fails closed at the audit and so fails
+    here: a descriptor or trust root that cannot be resolved or verified, and
+    a source it selected that is missing, unreadable, empty or ambiguous
+    (#3451). Calling those a skipped check let doctor report Ready for an
+    agent its next audit puts in Safe Mode.
+    """
+    from kestrel_sovereign.constitution.source_descriptor import (
+        ConstitutionSourceError,
+    )
+    from kestrel_sovereign.constitution.trust_root import (
+        SovereignTrustRootError,
+    )
+
+    if governing_source is None or isinstance(
+        exc, (ConstitutionSourceError, SovereignTrustRootError)
+    ):
+        report.fail.append(
+            f"{name}: governing constitution source cannot be trusted "
+            f"({exc}); the agent will fail its integrity audit and enter "
+            f"Safe Mode. See \"Custom governing constitution sources\" in "
+            f"docs/architecture/security/SOVEREIGN_TRUST_ROOT.md."
+        )
+        return True
+    if governing_source.descriptor is not None:
+        report.fail.append(
+            f"{name}: governing constitution source {governing_source.path} "
+            f"is unusable ({exc}). The Sovereign-signed source descriptor "
+            f"{governing_source.descriptor.descriptor_path} selects it, and a "
+            f"selected source never falls back to the package: the agent "
+            f"will fail its integrity audit and enter Safe Mode. Restore the "
+            f"bytes the descriptor pins, or sign a new descriptor and "
+            f"reanchor. See \"Custom governing constitution sources\" in "
+            f"docs/architecture/security/SOVEREIGN_TRUST_ROOT.md."
+        )
+        return True
+    return False
 
 
 # Mirror kestrel_sovereign.setup.overlay_anchor — importing that module here
@@ -2887,17 +2956,6 @@ def _rollback_advice(source: _GovernanceSource) -> str:
         "file to copy, so snapshot that database first if you want to be able "
         "to undo it"
     )
-
-
-def _canonical_constitution_path() -> Path:
-    """Return the package's canonical constitution path (config.CONSTITUTION_PATH).
-
-    Imported lazily — pulling kestrel_sovereign.config at module top would
-    drag in a chunk of the package and slow doctor's cold-start path.
-    """
-    from kestrel_sovereign.config import CONSTITUTION_PATH
-
-    return Path(CONSTITUTION_PATH)
 
 
 #: The queries doctor issues, per backend.
