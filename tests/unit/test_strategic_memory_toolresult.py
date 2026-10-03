@@ -1035,14 +1035,18 @@ async def test_signal_dispatch_reads_talons_history_without_polling(mode, monkey
 # ---------------------------------------------------------------------------
 
 
-def _github_board(monkeypatch, issues, *, unreadable_activity=()):
+def _github_board(monkeypatch, issues, *, unreadable_activity=(), backlog=None):
     """GitHub serving ``issues`` by ``(repo, number)``: no PR links any of
     them, nothing on any is newer than its last Talon run, and the post-run
-    activity of each issue in ``unreadable_activity`` cannot be read."""
+    activity of each issue in ``unreadable_activity`` cannot be read.
+
+    ``backlog`` maps a repository to the issues its listing reads return;
+    absent, they return none."""
     from kestrel_sovereign.features.strategic_memory import issue_selection
 
     monkeypatch.setattr(issue_selection, "get_github_token", lambda: "token")
     reads = []
+    backlog = backlog or {}
 
     async def fake_get(path, token):
         reads.append(path)
@@ -1050,7 +1054,7 @@ def _github_board(monkeypatch, issues, *, unreadable_activity=()):
             if path == f"/repos/{repo}/issues/{number}":
                 return issue
         if "/issues?" in path:
-            return []
+            return list(backlog.get(path.partition("/issues?")[0][len("/repos/"):], []))
         raise RuntimeError(f"404 {path}")
 
     async def fake_post(path, token, body):
@@ -1137,6 +1141,59 @@ async def test_signal_dispatch_suggest_names_every_gate_that_refused_a_candidate
         "skipped o/r#3093 -- closed",
         "skipped o/r#3398 -- Talon job job3398a ended clarifying",
         "skipped o/r#3400 -- Talon job job3400a ended blocked",
+    ):
+        assert line in result.confirmation, line
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_suggest_does_not_return_an_epic_assigned_to_the_sovereign(
+    monkeypatch,
+):
+    """#3468 acceptance: after #3464 the suggest run's top issue was #375, an
+    agent-ready epic assigned to the Sovereign. It is now skipped with its
+    reason, as is the Sovereign's other issue, and the pick is the bounded,
+    unassigned agent-ready issue."""
+    epic = {
+        **_agent_ready_issue(375, "Epic: Incubator"),
+        "labels": [{"name": "agent-ready"}, {"name": "epic"}],
+        "assignees": [{"login": "UncleSaurus"}],
+    }
+    theirs = {
+        **_agent_ready_issue(380, "the Sovereign's"),
+        "assignees": [{"login": "UncleSaurus"}],
+    }
+    bounded = {**_agent_ready_issue(3468, "bounded"), "assignees": [], "comments": 4}
+    _github_board(
+        monkeypatch,
+        {},
+        backlog={"o/r": [{**epic, "comments": 0}, {**theirs, "comments": 0}, bounded]},
+    )
+    agent = _dispatch_agent(registration=SimpleNamespace(owner="feature:x"))
+    feat = _make_feature(
+        {
+            "morning_signal_config": {
+                "scan_repos": ["o/r"], "sovereign_login": "UncleSaurus",
+            },
+        },
+        agent=agent,
+    )
+
+    result = await feat.signal_dispatch(mode="suggest")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["dispatched"] is False
+    assert (result.data["issue"]["repo"], result.data["issue"]["issue_number"]) == (
+        "o/r", 3468,
+    )
+    assert [
+        (skip["repo"], skip["issue_number"], skip["reason"])
+        for skip in result.data["skipped"]
+    ] == [("o/r", 375, "epic"), ("o/r", 380, "sovereign_assigned")]
+    assert "#375" not in result.confirmation.partition("**Skipped:**")[0]
+    for line in (
+        "skipped o/r#375 -- labelled epic",
+        "skipped o/r#380 -- assigned to UncleSaurus; UncleSaurus is the Sovereign",
     ):
         assert line in result.confirmation, line
     agent.execute_named_tool.assert_not_awaited()

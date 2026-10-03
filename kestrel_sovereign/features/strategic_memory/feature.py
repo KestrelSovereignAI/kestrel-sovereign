@@ -1771,12 +1771,13 @@ class StrategicMemoryFeature(Feature):
             self._strategy_data_view(), selection, run_history=run_history
         )
         # Candidates passed over because they are not on the allow-list --
-        # closed, not agent-ready, in the wrong repository (#3464) -- because
-        # a pull request already works them (#3317), or because their last
-        # Talon run asked a question nothing since has answered (#3398). Every
-        # outcome carries them: "skipped #3310 -- PR #3311 open" is what an
-        # orchestrator reading the run needs, not a silence, and a suggest run
-        # that names each refusal is evidence the gates hold.
+        # closed, not agent-ready, in the wrong repository (#3464), an epic or
+        # the Sovereign's (#3468) -- because a pull request already works
+        # them (#3317), or because their last Talon run asked a question
+        # nothing since has answered (#3398). Every outcome carries them:
+        # "skipped #3310 -- PR #3311 open" is what an orchestrator reading the
+        # run needs, not a silence, and a suggest run that names each refusal
+        # is evidence the gates hold.
         skipped = (
             list(selection.get("eligibility_exclusions") or [])
             + list(selection.get("open_pr_exclusions") or [])
