@@ -670,7 +670,54 @@ def test_build_smoke_env_inherits_no_kestrel_setting_or_credential(tmp_path):
         "KESTREL_DEMO_SERVER": "1",
         "KESTREL_SKIP_REACHABILITY_PROBE": "1",
         "KESTREL_PHOENIX_ENABLED": "0",
+        "KESTREL_TRACING_ENABLED": "0",
     }
+
+
+@pytest.mark.parametrize("operator_tracing", ["0", "1", None])
+def test_build_smoke_env_inherits_no_otlp_exporter_and_disables_tracing(
+    monkeypatch, tmp_path, operator_tracing,
+):
+    """The operator's trace collector never receives smoke traffic (#3455).
+
+    The OTLP endpoint and its auth headers are dropped, and tracing is off
+    whatever ``KESTREL_TRACING_ENABLED`` the operator exported. An explicit
+    ``0`` used to be removed with the other ``KESTREL_*`` settings, and the
+    inherited endpoint then turned tracing back on.
+    """
+    from kestrel_sovereign import telemetry
+
+    parent = {
+        "PATH": "/usr/bin",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "https://collector.example:4317",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://collector.example/v1/traces",
+        "OTEL_EXPORTER_OTLP_HEADERS": "authorization=Bearer operator-credential",
+        "OTEL_SERVICE_NAME": "operator-fleet",
+    }
+    if operator_tracing is not None:
+        parent["KESTREL_TRACING_ENABLED"] = operator_tracing
+    home = tmp_path / "home"
+    env = cli_demo._build_smoke_env(
+        parent, home, home / "agent_data" / "console-smoke", "ephemeral-key",
+    )
+
+    assert env["PATH"] == "/usr/bin"
+    assert [name for name in env if name.startswith("OTEL_")] == []
+    assert "operator-credential" not in json.dumps(env)
+    assert env["KESTREL_TRACING_ENABLED"] == "0"
+
+    # Evaluate the server's own tracing switches under each environment, as
+    # though the OpenTelemetry packages were installed.
+    monkeypatch.setattr(telemetry, "_OTEL_AVAILABLE", True)
+    # Control: the parent environment really does configure an exporter, so
+    # its absence below is the filter's doing.
+    with patch.dict(os.environ, parent, clear=True):
+        assert telemetry._resolved_otlp_endpoint() is not None
+        assert telemetry.is_tracing_enabled() is (operator_tracing != "0")
+    with patch.dict(os.environ, env, clear=True):
+        assert telemetry._resolved_otlp_endpoint() is None
+        assert telemetry.is_tracing_enabled() is False
+        assert telemetry._configure_kestrel_tracer().enabled is False
 
 
 def test_ephemeral_data_key_is_fresh_each_run():

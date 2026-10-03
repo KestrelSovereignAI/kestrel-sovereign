@@ -151,6 +151,11 @@ _PROVIDER_KEY_ENV = (
 # use a production key is safer refusing all keys than enumerating them.
 _CREDENTIAL_ENV_NAME = re.compile(r"(?:_KEY|_TOKEN|_SECRET|_PASSWORD)$")
 
+# Variable prefixes the smoke never inherits. ``KESTREL_*`` configures another
+# Kestrel install; ``OTEL_*`` is OpenTelemetry configuration, including the
+# operator's collector endpoint and the credential in its headers.
+_SMOKE_STRIPPED_ENV_PREFIXES = ("KESTREL_", "OTEL_")
+
 # Resolves ``kestrel_sovereign`` without importing it, as the
 # LIVE_AGENT_DOGFOODING runbook's origin check does.
 _MODULE_ORIGIN_PROBE = (
@@ -338,6 +343,12 @@ def _build_smoke_env(
     ``KESTREL_*`` variable is dropped and only the instance's own settings
     are set. Provider keys and every credential-shaped variable are dropped
     too, so the instance cannot reach a paid LLM or a production service.
+    Every ``OTEL_*`` variable is dropped as well: the SDK's LLM-span tracer
+    exports whenever an OTLP endpoint is set, and the lifecycle tracer does too
+    unless tracing is switched off, so an inherited endpoint and its auth
+    headers would ship smoke traffic to the operator's collector.
+    ``KESTREL_TRACING_ENABLED=0`` switches the lifecycle tracer off, whatever
+    the operator exported.
 
     ``KESTREL_HOME`` is the fresh home, so the project resolver stays inside
     the instance. Removing a variable here is not enough on its own: the
@@ -356,7 +367,7 @@ def _build_smoke_env(
     env = {
         name: value
         for name, value in parent_env.items()
-        if not name.startswith("KESTREL_")
+        if not name.startswith(_SMOKE_STRIPPED_ENV_PREFIXES)
         and name not in _PROVIDER_KEY_ENV
         and not _CREDENTIAL_ENV_NAME.search(name)
     }
@@ -369,6 +380,7 @@ def _build_smoke_env(
     env["KESTREL_DEMO_SERVER"] = "1"
     env["KESTREL_SKIP_REACHABILITY_PROBE"] = "1"
     env["KESTREL_PHOENIX_ENABLED"] = "0"
+    env["KESTREL_TRACING_ENABLED"] = "0"
     return env
 
 
