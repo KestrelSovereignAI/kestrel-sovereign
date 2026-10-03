@@ -58,6 +58,11 @@ from kestrel_sovereign.host_features.storage import (
 def project_dir(tmp_path, monkeypatch):
     """Create a project directory with agent data directories."""
     monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+    # An operator's exported governing-source settings (#2553) are not this
+    # project's: the offline shell refuses one its launch environment lacks
+    # (#3451), and tests that fake ``spawned_agent_env`` do not inherit it.
+    monkeypatch.delenv("KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH", raising=False)
+    monkeypatch.delenv("KESTREL_SOVEREIGN_TRUST_ROOT_PATH", raising=False)
     # Create agent directories
     claw_dir = tmp_path / "agent_data" / "claw"
     claw_dir.mkdir(parents=True)
