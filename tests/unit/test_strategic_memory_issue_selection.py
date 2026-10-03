@@ -2058,3 +2058,272 @@ def test_agent_ready_is_the_label_talon_reads():
     """kestreltalon/processor.py: ``agent-ready`` in context.labels. Change
     both or neither."""
     assert issue_selection.AGENT_READY_LABEL == "agent-ready"
+
+
+# ---------------------------------------------------------------------------
+# #3468: epics and the Sovereign's issues are refused before ranking
+# ---------------------------------------------------------------------------
+
+
+def _assigned(issue, *logins):
+    return {**issue, "assignees": [{"login": login} for login in logins]}
+
+
+def _sovereign_config(login="UncleSaurus", **extra):
+    config = {"scan_repos": ["o/r"], **extra}
+    if login is not None:
+        config["sovereign_login"] = login
+    return config
+
+
+@pytest.mark.asyncio
+async def test_the_live_shape_an_agent_ready_epic_is_skipped(monkeypatch):
+    """10-03, the first suggest run after #3464: #375, open and agent-ready,
+    was the top issue -- an epic, which no single claim can finish. The
+    unassigned agent-ready issue behind it is the pick."""
+    calls = []
+    _stub_github(monkeypatch, {_BACKLOG: [
+        _assigned(
+            _labelled(375, "agent-ready", "epic", title="Epic: Incubator"),
+            "UncleSaurus",
+        ),
+        {**_open(400, "bounded"), "assignees": [], "comments": 2},
+    ]}, calls)
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": _sovereign_config()}, diagnostics
+    )
+
+    assert picked is not None and picked["issue_number"] == 400
+    assert _reasons(diagnostics) == [("o/r", 375, "epic")]
+    assert issue_selection.describe_exclusion(
+        diagnostics["eligibility_exclusions"][0]
+    ) == (
+        "skipped o/r#375 -- labelled epic; an epic is not a unit of work one "
+        "claim can finish"
+    )
+    # Refused before ranking: no read is spent asking whether it is in flight.
+    assert ("graphql", "o/r", 375) not in calls
+    assert diagnostics["candidates_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_epic_blocker_does_not_outrank_a_bounded_one(monkeypatch):
+    """The critical row names an unassigned, agent-ready epic. Severity orders
+    eligible blockers; it cannot make an epic one."""
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _labelled(1, "agent-ready", "Epic"),
+        "/repos/o/r/issues/2": _open(2, "bounded"),
+    })
+    data = {
+        "morning_signal_config": _sovereign_config(),
+        "blockers": [
+            {"severity": "critical", "issue": "o/r#1", "title": "epic row"},
+            {"severity": "high", "issue": "o/r#2", "title": "bounded row"},
+        ],
+    }
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(data, diagnostics)
+
+    assert picked is not None and picked["issue_number"] == 2
+    assert _reasons(diagnostics) == [("o/r", 1, "epic")]
+    assert diagnostics["blockers_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured", ["UncleSaurus", "unclesaurus", "@UncleSaurus"])
+async def test_an_issue_assigned_to_the_sovereign_is_skipped(monkeypatch, configured):
+    """An issue assigned to the Sovereign is the Sovereign's work. The login
+    comes from config, matched as GitHub matches logins: case-insensitively."""
+    calls = []
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _assigned(_open(1, "theirs"), "UncleSaurus"),
+        "/repos/o/r/issues/2": _open(2, "ours"),
+    }, calls)
+    data = {
+        "morning_signal_config": _sovereign_config(configured),
+        "blockers": [
+            {"severity": "critical", "issue": "o/r#1", "title": "top row"},
+            {"severity": "high", "issue": "o/r#2", "title": "next row"},
+        ],
+    }
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(data, diagnostics)
+
+    assert picked is not None and picked["issue_number"] == 2
+    assert _reasons(diagnostics) == [("o/r", 1, "sovereign_assigned")]
+    [exclusion] = diagnostics["eligibility_exclusions"]
+    assert exclusion["assignees"] == ["UncleSaurus"]
+    assert issue_selection.describe_exclusion(exclusion) == (
+        f"skipped o/r#1 -- assigned to UncleSaurus; {configured.lstrip('@')} is "
+        "the Sovereign"
+    )
+    assert ("graphql", "o/r", 1) not in calls
+
+
+@pytest.mark.asyncio
+async def test_an_issue_assigned_to_someone_else_stays_eligible(monkeypatch):
+    """With the Sovereign's login configured, only their assignment withholds
+    an issue; ranking still prefers the unassigned one."""
+    _stub_github(monkeypatch, {_BACKLOG: [
+        _assigned({**_open(1), "comments": 0}, "UncleSaurus", "helper"),
+        _assigned({**_open(2), "comments": 0}, "helper"),
+        {**_open(3), "assignees": [], "comments": 5},
+    ]})
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": _sovereign_config()}, diagnostics
+    )
+
+    assert picked is not None and picked["issue_number"] == 3
+    assert _reasons(diagnostics) == [("o/r", 1, "sovereign_assigned")]
+
+    _stub_github(monkeypatch, {_BACKLOG: [
+        _assigned({**_open(2), "comments": 0}, "helper"),
+    ]})
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": _sovereign_config()}
+    )
+    assert picked is not None and picked["issue_number"] == 2
+
+
+@pytest.mark.asyncio
+async def test_without_a_configured_login_every_assigned_issue_is_skipped(monkeypatch):
+    """Nothing can say an assignee is not the Sovereign, so no assigned issue
+    is dispatched. An unassigned agent-ready issue still is."""
+    _stub_github(monkeypatch, {_BACKLOG: [
+        _assigned({**_open(1), "comments": 0}, "helper"),
+        {**_open(2), "assignees": [], "comments": 9},
+    ]})
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": _sovereign_config(None)}, diagnostics
+    )
+
+    assert picked is not None and picked["issue_number"] == 2
+    assert _reasons(diagnostics) == [("o/r", 1, "assigned")]
+    assert issue_selection.describe_exclusion(
+        diagnostics["eligibility_exclusions"][0]
+    ) == (
+        "skipped o/r#1 -- assigned to helper, and no "
+        "morning_signal_config.sovereign_login says that is not the Sovereign"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", ["   ", "@", ["UncleSaurus"], 7, {"login": "x"}])
+async def test_a_malformed_login_withholds_every_assigned_issue(
+    monkeypatch, caplog, malformed
+):
+    """Hand-edited YAML: a value that is not a login is not guessed at. It
+    fails closed, as an unset login does, and says so."""
+    _stub_github(monkeypatch, {_BACKLOG: [
+        _assigned(_open(1), "helper"),
+        _assigned(_open(2), "UncleSaurus"),
+    ]})
+    diagnostics = {}
+
+    with caplog.at_level("WARNING", logger=issue_selection.logger.name):
+        picked = await issue_selection.pick_top_issue(
+            {"morning_signal_config": _sovereign_config(malformed)}, diagnostics
+        )
+
+    assert picked is None
+    assert _reasons(diagnostics) == [("o/r", 1, "assigned"), ("o/r", 2, "assigned")]
+    assert "sovereign_login" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "assignees",
+    [[{"login": "helper"}, {"id": 7}], [None], "UncleSaurus", [{"login": ""}]],
+    ids=["unnamed-entry", "null-entry", "not-a-list", "blank-login"],
+)
+async def test_an_assignee_github_did_not_name_may_be_the_sovereign(
+    monkeypatch, assignees
+):
+    """What GitHub did not state is refused: an assignee without a login
+    cannot be ruled out as the Sovereign."""
+    _stub_github(monkeypatch, {_BACKLOG: [{**_open(1), "assignees": assignees}]})
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        {"morning_signal_config": _sovereign_config()}, diagnostics
+    ) is None
+    [exclusion] = diagnostics["eligibility_exclusions"]
+    assert exclusion["reason"] == "assigned"
+    assert exclusion["unnamed_assignee"] is True
+    assert issue_selection.describe_exclusion(exclusion).endswith(
+        "an assignee GitHub did not name, who may be the Sovereign"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_single_assignee_field_is_read_too(monkeypatch):
+    """GitHub's legacy ``assignee`` names the Sovereign as surely as the
+    ``assignees`` list does."""
+    _stub_github(monkeypatch, {_BACKLOG: [
+        {**_open(1), "assignee": {"login": "UncleSaurus"}},
+    ]})
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        {"morning_signal_config": _sovereign_config()}, diagnostics
+    ) is None
+    assert _reasons(diagnostics) == [("o/r", 1, "sovereign_assigned")]
+
+
+@pytest.mark.asyncio
+async def test_when_only_epics_and_the_sovereigns_issues_remain_nothing_is_picked(
+    monkeypatch,
+):
+    """No fallback to the top ledger row, and no read spent asking whether a
+    refused issue is in flight."""
+    calls = []
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _labelled(1, "agent-ready", "epic"),
+        "/repos/o/r/issues/2": _assigned(_open(2), "UncleSaurus"),
+        _BACKLOG: [_labelled(1, "agent-ready", "epic"), _assigned(_open(2), "UncleSaurus")],
+    }, calls)
+    diagnostics = {}
+
+    data = {**_blockers(1, 2), "morning_signal_config": _sovereign_config()}
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert _reasons(diagnostics) == [
+        ("o/r", 1, "epic"),
+        ("o/r", 2, "sovereign_assigned"),
+    ]
+    assert not [c for c in calls if isinstance(c, tuple)], calls
+    assert diagnostics["open_pr_exclusions"] == diagnostics["run_exclusions"] == []
+
+
+@pytest.mark.asyncio
+async def test_agent_ready_is_still_the_first_reason_for_an_unauthorized_epic(
+    monkeypatch,
+):
+    """The allow-list reports the authorization it lacks before anything else:
+    an epic nobody labelled agent-ready is not agent-ready."""
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": _assigned(
+        _labelled(1, "epic"), "UncleSaurus"
+    )})
+    diagnostics = {}
+
+    data = {**_blockers(1), "morning_signal_config": _sovereign_config()}
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert _reasons(diagnostics) == [("o/r", 1, "not_agent_ready")]
+
+
+@pytest.mark.asyncio
+async def test_a_non_mapping_config_does_not_crash_selection(monkeypatch):
+    """``configured_repos`` already tolerates hand-edited YAML that is not a
+    mapping; the selector's own reads of the same block must too."""
+    _stub_github(monkeypatch, {})
+
+    assert await issue_selection.pick_top_issue(
+        {"morning_signal_config": ["o/r"]}
+    ) is None

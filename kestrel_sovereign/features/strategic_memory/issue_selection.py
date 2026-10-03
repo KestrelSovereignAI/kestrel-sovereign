@@ -10,6 +10,12 @@ only orders the issues that pass. Refusing bad picks one at a time did not
 converge: the run-history gate (#3398) withheld #3093, and the next morning a
 high-severity ledger row picked #3319, a ``bug``-only issue whose fix belonged
 to another repository.
+
+``agent-ready`` authorizes; it does not make an issue a unit of work one claim
+can finish, and it does not hand over work the Sovereign has taken. The
+allow-list therefore also refuses epics and issues assigned to the Sovereign
+(#3468: the first suggest run after #3464 picked #375, an agent-ready epic
+assigned to the Sovereign).
 """
 
 import logging
@@ -75,6 +81,17 @@ TALON_STATE_LABELS = frozenset(
 #: strategy-ledger row is a note about an issue: it never makes one eligible.
 AGENT_READY_LABEL = "agent-ready"
 
+#: The label that marks an issue as an epic: a tracker for sub-issues, not a
+#: bounded unit of work a single claim can finish. Never dispatched, whatever
+#: else it is labelled (#3468).
+EPIC_LABEL = "epic"
+
+#: Where the Sovereign's GitHub login is configured. An issue assigned to the
+#: Sovereign is the Sovereign's work, not the agent's (#3468). Unset, no
+#: assignee can be ruled out as the Sovereign, so every assigned issue is
+#: refused.
+SOVEREIGN_LOGIN_KEY = "sovereign_login"
+
 #: How blocker severity orders eligible blockers, most urgent first. Severity
 #: orders; it never authorizes. A row of any other severity is not a blocker
 #: here, though the milestone or backlog pass may still reach its issue.
@@ -88,6 +105,11 @@ EXCLUDED_NOT_AN_ISSUE = "not_an_issue"
 EXCLUDED_CLOSED = "closed"
 EXCLUDED_TALON_OWNED = "talon_owned"
 EXCLUDED_NOT_AGENT_READY = "not_agent_ready"
+EXCLUDED_EPIC = "epic"
+EXCLUDED_SOVEREIGN_ASSIGNED = "sovereign_assigned"
+#: Assigned, and no configured ``sovereign_login`` (or no legible assignee
+#: login) can say the assignee is not the Sovereign.
+EXCLUDED_ASSIGNED = "assigned"
 
 
 #: Days an open pull request may go without an update before an exclusion
@@ -221,7 +243,10 @@ async def pick_top_issue(
     Eligibility is an allow-list, decided for every candidate before any is
     ranked (#3464): GitHub serves the issue, open, from the scanned
     repository the candidate names, and it is labelled
-    :data:`AGENT_READY_LABEL` with no Talon state label. Blocker severity, and
+    :data:`AGENT_READY_LABEL` with no Talon state label. It is not an epic,
+    and it is not assigned to the Sovereign named by
+    ``morning_signal_config.sovereign_login`` -- when that is unset, it is
+    not assigned at all (#3468). Blocker severity, and
     every other ledger signal, only orders the issues that pass -- a ledger
     row alone never makes one eligible. When none passes the answer is
     ``None``, never the top ledger row. ``diagnostics["eligibility_exclusions"]``
@@ -266,6 +291,8 @@ async def pick_top_issue(
         return None
 
     config = data.get("morning_signal_config", {})
+    if not isinstance(config, dict):
+        config = {}
     # Each scanned repository under the spelling scan_repos gives it. GitHub
     # names are case-insensitive; one spelling per repository is what lets the
     # per-issue reads below recognise the same issue across passes.
@@ -273,6 +300,7 @@ async def pick_top_issue(
     for scanned_repo in configured_repos(data):
         scanned.setdefault(scanned_repo.lower(), scanned_repo)
     stalled_after_days = _stalled_pr_days(config)
+    sovereign_login = _sovereign_login(config)
 
     reported: set = set()
 
@@ -386,7 +414,7 @@ async def pick_top_issue(
             number = issue.get("number")
             if isinstance(number, bool) or not isinstance(number, int):
                 continue
-            refusal = _ineligibility(repo, number, issue)
+            refusal = _ineligibility(repo, number, issue, sovereign_login)
             if refusal is not None:
                 refuse(refusal)
                 continue
@@ -445,7 +473,7 @@ async def pick_top_issue(
         diagnostics["blockers_checked"] += 1
         if issue is None:
             diagnostics["blockers_unreadable"] += 1
-        refusal = _ineligibility(repo, issue_number, issue)
+        refusal = _ineligibility(repo, issue_number, issue, sovereign_login)
         if refusal is not None:
             if refusal["reason"] == EXCLUDED_TALON_OWNED:
                 diagnostics["blockers_talon_owned"] += 1
@@ -598,14 +626,18 @@ async def _fetch_issue(
 
 
 def _ineligibility(
-    repo: str, issue_number: int, issue: Optional[Dict[str, Any]]
+    repo: str,
+    issue_number: int,
+    issue: Optional[Dict[str, Any]],
+    sovereign_login: Optional[str],
 ) -> Optional[Dict[str, Any]]:
     """Why GitHub's answer for ``repo#issue_number`` keeps it off the allow-list.
 
     ``None`` only when GitHub served exactly that issue, from that repository,
     open, labelled :data:`AGENT_READY_LABEL` and carrying no Talon state
-    label. What GitHub did not state is refused: this decides what a dispatch
-    that writes code may touch.
+    label, not an epic, and not assigned to ``sovereign_login`` -- or, with
+    no login configured, not assigned at all. What GitHub did not state is
+    refused: this decides what a dispatch that writes code may touch.
     """
     if not isinstance(issue, dict):
         # Unreadable is not open: a lookup failure must not be read as a live
@@ -647,9 +679,80 @@ def _ineligibility(
         return _eligibility_exclusion(
             repo, issue_number, EXCLUDED_TALON_OWNED, labels=sorted(owned_by)
         )
-    if AGENT_READY_LABEL not in _label_names(issue):
+    labels = _label_names(issue)
+    if AGENT_READY_LABEL not in labels:
         return _eligibility_exclusion(repo, issue_number, EXCLUDED_NOT_AGENT_READY)
+    if EPIC_LABEL in labels:
+        # agent-ready on an epic authorizes work under it, not a claim on the
+        # epic itself: no single run can finish one (#3468 -- #375).
+        return _eligibility_exclusion(repo, issue_number, EXCLUDED_EPIC)
+    return _sovereign_assignment(repo, issue_number, issue, sovereign_login)
+
+
+def _sovereign_assignment(
+    repo: str,
+    issue_number: int,
+    issue: Dict[str, Any],
+    sovereign_login: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """The exclusion for an issue that may be the Sovereign's, or ``None``.
+
+    An issue assigned to the Sovereign is the Sovereign's work; dispatching it
+    to Talon takes it from them (#3468). Without a configured login, or with
+    an assignee GitHub did not name, nothing can say an assignee is not the
+    Sovereign, so the assignment withholds the issue.
+    """
+    logins, illegible = _assignee_logins(issue)
+    if not logins and not illegible:
+        return None
+    if sovereign_login is not None and sovereign_login.lower() in {
+        login.lower() for login in logins
+    }:
+        return _eligibility_exclusion(
+            repo,
+            issue_number,
+            EXCLUDED_SOVEREIGN_ASSIGNED,
+            assignees=logins,
+            sovereign_login=sovereign_login,
+        )
+    if sovereign_login is None or illegible:
+        return _eligibility_exclusion(
+            repo,
+            issue_number,
+            EXCLUDED_ASSIGNED,
+            assignees=logins,
+            unnamed_assignee=illegible,
+            sovereign_login=sovereign_login,
+        )
     return None
+
+
+def _assignee_logins(issue: Dict[str, Any]) -> Tuple[List[str], bool]:
+    """The assignee logins on ``issue``, and whether any assignee was illegible.
+
+    Reads ``assignees`` and the legacy single ``assignee`` alike. An assignee
+    without a string login cannot be ruled out as the Sovereign.
+    """
+    raw = issue.get("assignees")
+    if raw is None:
+        entries: List[Any] = []
+    elif isinstance(raw, list):
+        entries = list(raw)
+    else:
+        return [], True
+    single = issue.get("assignee")
+    if single is not None:
+        entries.append(single)
+    logins: List[str] = []
+    illegible = False
+    for entry in entries:
+        login = entry.get("login") if isinstance(entry, dict) else None
+        if not isinstance(login, str) or not login.strip():
+            illegible = True
+            continue
+        if login.strip().lower() not in {known.lower() for known in logins}:
+            logins.append(login.strip())
+    return logins, illegible
 
 
 def _served_repository(issue: Dict[str, Any]) -> Optional[str]:
@@ -676,6 +779,26 @@ def _stalled_pr_days(config: Dict[str, Any]) -> int:
         )
         return DEFAULT_STALLED_PR_DAYS
     return value
+
+
+def _sovereign_login(config: Dict[str, Any]) -> Optional[str]:
+    """The Sovereign's GitHub login from ``config``, or ``None`` when unset.
+
+    ``None`` withholds every assigned issue, so a malformed value fails
+    closed rather than being guessed at. A leading ``@`` is accepted: GitHub
+    logins cannot contain one, and it is how a login is usually written.
+    """
+    value = config.get(SOVEREIGN_LOGIN_KEY)
+    if value is None or value == "":
+        return None
+    login = value.strip().lstrip("@").strip() if isinstance(value, str) else ""
+    if not login:
+        logger.warning(
+            "Ignoring morning_signal_config.%s=%r; every assigned issue is withheld",
+            SOVEREIGN_LOGIN_KEY, value,
+        )
+        return None
+    return login
 
 
 async def _fetch_open_linked_pull_requests(
@@ -880,6 +1003,28 @@ def describe_exclusion(exclusion: Dict[str, Any]) -> str:
         )
     if reason == EXCLUDED_NOT_AGENT_READY:
         return f"skipped {target} -- not labelled {AGENT_READY_LABEL}"
+    if reason == EXCLUDED_EPIC:
+        return (
+            f"skipped {target} -- labelled {EPIC_LABEL}; an epic is not a unit "
+            "of work one claim can finish"
+        )
+    if reason in (EXCLUDED_SOVEREIGN_ASSIGNED, EXCLUDED_ASSIGNED):
+        named = list(exclusion.get("assignees") or ())
+        if reason == EXCLUDED_SOVEREIGN_ASSIGNED:
+            return (
+                f"skipped {target} -- assigned to {', '.join(named)}; "
+                f"{exclusion.get('sovereign_login')} is the Sovereign"
+            )
+        if exclusion.get("unnamed_assignee"):
+            named.append("an assignee GitHub did not name")
+        who = ", ".join(named)
+        if exclusion.get("sovereign_login") is None:
+            return (
+                f"skipped {target} -- assigned to {who}, and no "
+                f"morning_signal_config.{SOVEREIGN_LOGIN_KEY} says that is not "
+                "the Sovereign"
+            )
+        return f"skipped {target} -- assigned to {who}, who may be the Sovereign"
     if reason in (EXCLUDED_RUN_HISTORY, EXCLUDED_RUN_HISTORY_UNCONFIRMED):
         completed = parse_instant(exclusion.get("completed_at"))
         when = (
