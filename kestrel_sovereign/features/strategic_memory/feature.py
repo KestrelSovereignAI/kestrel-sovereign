@@ -1761,6 +1761,9 @@ class StrategicMemoryFeature(Feature):
                     "dispatched": False,
                     "skipped": [],
                     "reason_code": "RUN_HISTORY_UNCONFIRMED",
+                    # Set when the provider predates the read (#3446): an
+                    # upgrade fixes it, where a retry does not.
+                    "requirement": exc.requirement,
                 },
             )
         selection: Dict[str, Any] = {}

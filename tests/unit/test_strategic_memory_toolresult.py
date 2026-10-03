@@ -857,8 +857,40 @@ async def test_signal_dispatch_does_not_select_without_talons_run_history(mode):
     assert result.status is ToolResultStatus.PARTIAL
     assert result.data["reason_code"] == "RUN_HISTORY_UNCONFIRMED"
     assert result.data["dispatched"] is False
+    assert result.data["requirement"] is None
     assert "jobs.json unreadable" in result.confirmation
+    assert "kestrel-feature-talon>=" not in result.confirmation
     assert "No actionable issue found" not in result.confirmation
+    pick.assert_not_awaited()
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["execute", "suggest"])
+async def test_signal_dispatch_names_the_talon_release_it_needs(mode):
+    """#3446: on kestrel-feature-talon <=0.2.9 the ``talon`` provider has no
+    ``finished_runs()``, so every dispatch is refused even over a healthy,
+    empty registry. The refusal names the release that fixes it, in the text
+    and in the data an orchestrator reads, and still dispatches nothing."""
+    provider = _SilentlyUnreadableTalon()
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")), provider
+    )
+    feat = _make_feature({}, agent=agent)
+    pick = AsyncMock(return_value=_TOP_ISSUE)
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue", new=pick
+    ):
+        result = await feat.signal_dispatch(mode=mode)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["reason_code"] == "RUN_HISTORY_UNCONFIRMED"
+    assert result.data["requirement"] == "kestrel-feature-talon>=0.2.10"
+    assert result.data["dispatched"] is False
+    assert "kestrel-feature-talon>=0.2.10" in result.confirmation
+    assert "kestrel-feature-talon>=0.2.10" in result.error
+    assert provider.effects == []
     pick.assert_not_awaited()
     agent.execute_named_tool.assert_not_awaited()
 

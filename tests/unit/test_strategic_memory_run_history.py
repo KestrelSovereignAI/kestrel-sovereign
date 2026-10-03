@@ -4,10 +4,13 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from packaging.requirements import Requirement
 
 from kestrel_sovereign.features.strategic_memory.run_history import (
+    FINISHED_RUNS_REQUIREMENT,
     RunHistory,
     RunHistoryUnreadable,
+    TalonProviderOutdated,
     TalonRun,
     read_run_history,
 )
@@ -249,6 +252,74 @@ async def test_a_registry_read_that_fails_silently_is_unconfirmed_not_empty():
         await read_run_history(_agent(provider))
 
     assert provider.listed == 0
+
+
+# ---------------------------------------------------------------------------
+# A provider that predates finished_runs() names the release with it (#3446)
+# ---------------------------------------------------------------------------
+
+
+class _NotCallableFinishedRuns(_SilentlyUnreadableRegistry):
+    finished_runs = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider",
+    [
+        pytest.param(_SilentlyUnreadableRegistry(), id="no-finished-runs"),
+        pytest.param(_NotCallableFinishedRuns(), id="finished-runs-not-callable"),
+    ],
+)
+async def test_a_provider_without_finished_runs_names_the_release_that_has_it(provider):
+    """kestrel-feature-talon <=0.2.9 has no ``finished_runs()``, so every
+    dispatch on such a host is refused even over a healthy, empty registry.
+    The refusal says what fixes it rather than calling the registry
+    unreadable; it is still a refusal, never an empty history."""
+    with pytest.raises(TalonProviderOutdated) as raised:
+        await read_run_history(_agent(provider))
+
+    assert isinstance(raised.value, RunHistoryUnreadable)
+    assert raised.value.requirement == "kestrel-feature-talon>=0.2.10"
+    assert "kestrel-feature-talon>=0.2.10" in str(raised.value)
+    assert type(provider).__name__ in str(raised.value)
+    assert provider.listed == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider",
+    [
+        pytest.param(_Provider(error=OSError("jobs.json locked")), id="read-failed"),
+        pytest.param(
+            _Provider(complete=False, reason="jobs.json: JSONDecodeError"),
+            id="incomplete-read",
+        ),
+        pytest.param(_Provider([_run(completed_at=None)]), id="malformed-run"),
+    ],
+)
+async def test_an_unreadable_registry_is_not_blamed_on_the_release(provider):
+    """A provider that has ``finished_runs()`` and cannot read the registry
+    stays an unconfirmed history; upgrading would not fix it, so no
+    requirement is named."""
+    with pytest.raises(RunHistoryUnreadable) as raised:
+        await read_run_history(_agent(provider))
+
+    assert not isinstance(raised.value, TalonProviderOutdated)
+    assert raised.value.requirement is None
+    assert "kestrel-feature-talon>=" not in str(raised.value)
+
+
+def test_the_requirement_is_the_first_release_with_finished_runs():
+    """``TalonWaitable.finished_runs`` is absent at kestrel-feature-talon tag
+    v0.2.9 and present at v0.2.10 (feature-talon #37). Core cannot import the
+    package, so the floor is pinned here."""
+    requirement = Requirement(FINISHED_RUNS_REQUIREMENT)
+
+    assert requirement.name == "kestrel-feature-talon"
+    assert not requirement.specifier.contains("0.2.9")
+    assert requirement.specifier.contains("0.2.10")
+    assert requirement.specifier.contains("0.3.0")
 
 
 @pytest.mark.asyncio
