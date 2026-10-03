@@ -11,7 +11,21 @@ const { defineConfig, devices } = require('@playwright/test');
  * The `console-smoke` project is the CI subset. It runs only through
  * `uv run kestrel demo smoke`, which creates its isolated instance.
  */
+const { MANIFEST_ENV } = require('./console_smoke_proof.cjs');
+
 const SMOKE_SPEC = '**/test_console_smoke.spec.cjs';
+
+// The CI smoke subset (#2682): `kestrel demo smoke` runs exactly this project
+// against a fresh isolated instance. No LLM, so it is bounded: one minute per
+// test, and no retries, because a retry would let a flaky boot pass the gate.
+const CONSOLE_SMOKE_PROJECT = {
+  name: 'console-smoke',
+  testMatch: SMOKE_SPEC,
+  retries: 0,
+  timeout: 60000,
+  expect: { timeout: 15000 },
+  use: { ...devices['Desktop Chrome'] },
+};
 
 module.exports = defineConfig({
   testDir: './',
@@ -40,18 +54,10 @@ module.exports = defineConfig({
       testIgnore: SMOKE_SPEC,
       use: { ...devices['Desktop Chrome'] },
     },
-    {
-      // The CI smoke subset (#2682): `kestrel demo smoke` runs exactly this
-      // project against a fresh isolated instance. No LLM, so it is bounded:
-      // one minute per test, and no retries, because a retry would let a
-      // flaky boot pass the gate.
-      name: 'console-smoke',
-      testMatch: SMOKE_SPEC,
-      retries: 0,
-      timeout: 60000,
-      expect: { timeout: 15000 },
-      use: { ...devices['Desktop Chrome'] },
-    },
+    // Registered only when `kestrel demo smoke` launched this run and named
+    // its instance manifest. Otherwise a plain `npx playwright test` would
+    // select it too and fail on the missing manifest.
+    ...(process.env[MANIFEST_ENV] ? [CONSOLE_SMOKE_PROJECT] : []),
   ],
 
   // Optionally start server before tests

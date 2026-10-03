@@ -842,10 +842,11 @@ jobs:
   # fresh agent and SQLite database inside it, a throwaway data key, and a
   # loopback server on port 8910, never the live 8888. No secret is referenced
   # by this job, and the runner strips every KESTREL_* and credential-shaped
-  # variable from the instance anyway. The agent's only LLM route is a local
-  # Ollama that is not running here, and the one chat turn is `!status`, a
-  # non-cognitive command, so no LLM is ever called. Before the browser
-  # starts, the runner proves the server imports this checkout's
+  # variable from the instance anyway; its server reads no dotenv file
+  # (KESTREL_SKIP_DOTENV=1) that could refill them. The agent's only LLM
+  # route is a local Ollama that is not running here, and the one chat turn
+  # is `!status`, a non-cognitive command, so no LLM is ever called. Before
+  # the browser starts, the runner proves the server imports this checkout's
   # kestrel_sovereign and serves the DID this run's inception minted; the spec
   # re-proves the URL, database, and module origin before it touches the
   # instance.

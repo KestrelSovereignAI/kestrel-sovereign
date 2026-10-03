@@ -660,6 +660,7 @@ def test_build_smoke_env_inherits_no_kestrel_setting_or_credential(tmp_path):
     # Every KESTREL_* setting is the instance's own.
     assert {k: v for k, v in env.items() if k.startswith("KESTREL_")} == {
         "KESTREL_HOME": str(home),
+        "KESTREL_SKIP_DOTENV": "1",
         "KESTREL_DATA_KEY": "ephemeral-key",
         "KESTREL_DID_WEB_DOMAIN": "localhost",
         "KESTREL_DB_BACKEND": "sqlite",
@@ -1019,6 +1020,153 @@ def test_cmd_demo_smoke_converts_sigterm_while_the_server_runs(monkeypatch, tmp_
         seen["handler"](signal.SIGTERM, None)
     assert signal.getsignal(signal.SIGTERM) is before
     assert state["stopped"] is True
+
+
+# The smoke server reads no .env file (PR #3453 review). ``server.py`` loads
+# its .env files with ``override=False``, which fills in exactly the variables
+# that are absent -- so the scrubbing in ``_build_smoke_env`` alone let a legacy
+# ``kestrel_sovereign/.env`` put the operator's ``KESTREL_API_KEY`` and
+# ``KESTREL_EXPECTED_DID`` back into the "isolated" instance.
+
+_PLANTED_PACKAGE_DOTENV = {
+    "KESTREL_API_KEY": "production-from-package",
+    "KESTREL_EXPECTED_DID": "did:web:production:agent",
+}
+_PLANTED_HOME_DOTENV = {
+    "ANTHROPIC_API_KEY": "sk-ant-from-home",
+    "KESTREL_SOVEREIGN_TRUST_ROOT_PATH": "/srv/live/trust-root.json",
+}
+
+
+def _plant_dotenv(directory: Path, values: dict) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / ".env").write_text(
+        "".join(f"{key}={value}\n" for key, value in values.items()),
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def server_process_environ(monkeypatch):
+    """Give the test process exactly a server child's environment and cwd.
+
+    ``load_dotenv`` writes ``os.environ`` directly, which ``monkeypatch`` does
+    not track, so the real environment is restored wholesale afterwards.
+    """
+    from kestrel_sovereign import paths
+
+    before = dict(os.environ)
+
+    def _become(env: dict, cwd: Path) -> None:
+        os.environ.clear()
+        os.environ.update(env)
+        monkeypatch.chdir(cwd)
+        paths.reset_cache()
+
+    yield _become
+    os.environ.clear()
+    os.environ.update(before)
+    paths.reset_cache()
+
+
+def _smoke_server_launch(monkeypatch, tmp_path):
+    """The environment and cwd `kestrel demo smoke` hands its server, with a
+    legacy package-level .env and a home/cwd .env planted for it to find."""
+    state = _patch_smoke_lifecycle(monkeypatch)
+    assert cli_demo.cmd_demo(_smoke_args(tmp_path / "home")) == 0
+    package = tmp_path / "package"
+    _plant_dotenv(package, _PLANTED_PACKAGE_DOTENV)
+    # The server's cwd is the home, which is also KESTREL_HOME.
+    _plant_dotenv(state["server_cwd"], _PLANTED_HOME_DOTENV)
+    return state["server_env"], state["server_cwd"], package
+
+
+def test_smoke_server_loads_no_dotenv_not_even_the_package_one(
+    monkeypatch, tmp_path, server_process_environ,
+):
+    from kestrel_sovereign import server
+
+    env, cwd, package = _smoke_server_launch(monkeypatch, tmp_path)
+    server_process_environ(env, cwd)
+
+    server.load_server_dotenv(package_dir=package)
+
+    leaked = {
+        key: os.environ[key]
+        for key in (*_PLANTED_PACKAGE_DOTENV, *_PLANTED_HOME_DOTENV)
+        if key in os.environ
+    }
+    assert leaked == {}, f"the smoke server loaded a .env file: {leaked}"
+    assert dict(os.environ) == env
+
+
+def test_without_the_opt_out_the_planted_dotenvs_do_reach_the_server(
+    monkeypatch, tmp_path, server_process_environ,
+):
+    """Control for the test above: the planted files are ones the server's
+    loader really reads, so their absence there is the opt-out's doing."""
+    from kestrel_sovereign import server
+    from kestrel_sovereign.paths import SKIP_DOTENV_ENV
+
+    env, cwd, package = _smoke_server_launch(monkeypatch, tmp_path)
+    del env[SKIP_DOTENV_ENV]
+    server_process_environ(env, cwd)
+
+    server.load_server_dotenv(package_dir=package)
+
+    for key, value in {**_PLANTED_PACKAGE_DOTENV, **_PLANTED_HOME_DOTENV}.items():
+        assert os.environ.get(key) == value, key
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "2", " 1"])
+def test_server_refuses_an_unrecognised_dotenv_opt_out(
+    monkeypatch, tmp_path, server_process_environ, value,
+):
+    """A misspelled opt-out must not silently mean "load the files"."""
+    from kestrel_sovereign import server
+    from kestrel_sovereign.paths import SKIP_DOTENV_ENV
+
+    env, cwd, package = _smoke_server_launch(monkeypatch, tmp_path)
+    env[SKIP_DOTENV_ENV] = value
+    server_process_environ(env, cwd)
+
+    with pytest.raises(ValueError, match=SKIP_DOTENV_ENV):
+        server.load_server_dotenv(package_dir=package)
+    assert dict(os.environ) == env
+
+
+def test_server_reads_dotenv_files_only_through_its_opt_out_aware_loader():
+    """The opt-out is only as good as its wiring: every ``load_dotenv`` call in
+    ``server.py`` must sit inside ``load_server_dotenv``, and the module must
+    run that loader at import, which is when uvicorn loads ``server:app``."""
+    import ast
+
+    tree = ast.parse(
+        (Path(cli_demo.__file__).resolve().parent / "server.py").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    def called_name(node: ast.AST) -> str:
+        if not isinstance(node, ast.Call):
+            return ""
+        func = node.func
+        return getattr(func, "id", None) or getattr(func, "attr", "")
+
+    (loader,) = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "load_server_dotenv"
+    ]
+    inside_loader = {id(node) for node in ast.walk(loader)}
+    dotenv_calls = [
+        node for node in ast.walk(tree) if called_name(node) == "load_dotenv"
+    ]
+    assert dotenv_calls, "server.py no longer loads any .env file"
+    assert all(id(call) in inside_loader for call in dotenv_calls)
+    assert any(
+        isinstance(node, ast.Expr) and called_name(node.value) == "load_server_dotenv"
+        for node in tree.body
+    ), "server.py no longer runs load_server_dotenv() at import"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signal delivery")

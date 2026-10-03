@@ -36,9 +36,11 @@ differs from a demo wherever a demo would let host state in:
 
 * The instance lives in a fresh home (``--home``, which must be absent or
   empty, or a new temp dir). That home is the server's ``KESTREL_HOME`` and
-  working directory, so the ``.env`` files the server reads from its project
-  home and launch directory are the fresh home's (there are none), never a
-  checkout's or the operator's. It gets a throwaway ``KESTREL_DATA_KEY``.
+  working directory. The server also reads no ``.env`` file at all
+  (``KESTREL_SKIP_DOTENV=1``): not its project home's, not its launch
+  directory's, and not a legacy one next to the package source, any of which
+  would refill the variables the smoke removed. It gets a throwaway
+  ``KESTREL_DATA_KEY``.
 * No ``KESTREL_*`` setting, provider key, or credential-shaped variable is
   inherited, and the agent is configured with only the local Ollama route, so
   no paid LLM can be selected. The smoke sends only ``!status``, a
@@ -92,6 +94,7 @@ from kestrel_sovereign._subprocess_helpers import (
     stop_process,
     wait_for_health,
 )
+from kestrel_sovereign.paths import SKIP_DOTENV_ENV
 
 
 # Ports the runner refuses to use. ``8888`` is the live server in the
@@ -336,8 +339,13 @@ def _build_smoke_env(
     are set. Provider keys and every credential-shaped variable are dropped
     too, so the instance cannot reach a paid LLM or a production service.
 
-    ``KESTREL_HOME`` is the fresh home, so the project resolver (and the
-    ``.env`` the server loads from it) stays inside the instance.
+    ``KESTREL_HOME`` is the fresh home, so the project resolver stays inside
+    the instance. Removing a variable here is not enough on its own: the
+    server loads its ``.env`` files with ``override=False``, which fills in
+    exactly the variables that are absent, and one of those files sits next to
+    the package source rather than in the home. ``KESTREL_SKIP_DOTENV`` tells
+    the server to read none of them, so this mapping is the instance's whole
+    environment.
     ``KESTREL_DATA_KEY`` is a throwaway key minted for this run, and the
     born-hybrid identity's did:web domain is ``localhost``, the same default
     ``kestrel setup --quickstart`` uses.
@@ -354,6 +362,7 @@ def _build_smoke_env(
     }
     _pin_demo_database_env(env, data_dir)
     env["KESTREL_HOME"] = str(home)
+    env[SKIP_DOTENV_ENV] = "1"
     env["KESTREL_DATA_KEY"] = data_key
     env["KESTREL_DID_WEB_DOMAIN"] = "localhost"
     env["KESTREL_MULTI_AGENT_CONFIG"] = str(home / "multi_agent-disabled.toml")
