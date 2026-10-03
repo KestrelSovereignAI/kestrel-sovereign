@@ -38,6 +38,7 @@ from kestrel_sovereign.signals.sources.wait import (
     build_wait_complete_registration,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
+from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
 from kestrel_sovereign.waits.engine import TERMINAL_EVENT_KEY, WaitRegistry
 from kestrel_sovereign.waits.reconciler import (
     DurableResumeUnsupportedError,
@@ -55,13 +56,13 @@ class _Agent:
 
     def __init__(self):
         self.tasks: list[asyncio.Task] = []
-        self._privacy_transition_lock = asyncio.Lock()
+        self._durable_persistence_gate = DurablePersistenceGate()
 
     async def process_input(self, prompt: str, **kwargs):
         return "wake turn ran"
 
-    def _get_privacy_transition_lock(self):
-        return self._privacy_transition_lock
+    def _get_durable_persistence_gate(self):
+        return self._durable_persistence_gate
 
     def _track_background_task(self, coro, *, name: str):
         task = asyncio.create_task(coro, name=name)

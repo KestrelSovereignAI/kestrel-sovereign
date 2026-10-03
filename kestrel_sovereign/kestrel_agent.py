@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace as _replace_dataclass
 from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
 from kestrel_sovereign.storage.privacy_wrapper import (
+    DurablePersistenceGate,
     ReentrantTransitionLock,
     EphemeralPurgeReport,
     StorePurgeResult,
@@ -1645,6 +1646,9 @@ class KestrelAgent(
         # — which already holds this lock across the whole turn — re-enters
         # instead of self-deadlocking on its own task's lock (#2672 review P1).
         self._privacy_transition_lock = ReentrantTransitionLock()
+        # Serializes durable signal persistence against a privacy transition
+        # without the privacy-transition lock every turn holds (#3316).
+        self._durable_persistence_gate = DurablePersistenceGate()
         # A data-destructive privacy transition (e.g. PUBLIC → EPHEMERAL) staged
         # awaiting explicit confirmation via confirm_privacy_transition. None when
         # no transition is pending. Guarded by _privacy_transition_lock.
@@ -4215,6 +4219,19 @@ class KestrelAgent(
             lock = ReentrantTransitionLock()
             self._privacy_transition_lock = lock
         return lock
+
+    def _get_durable_persistence_gate(self) -> DurablePersistenceGate:
+        """Return the gate between durable signal persistence and a privacy flip.
+
+        ``SignalDispatcher`` holds it shared around a signal's privacy
+        projection and durable commit; ``privacy_transition()`` holds it
+        exclusive after CONVERSATION and the privacy-transition lock (#3316).
+        """
+        gate = getattr(self, "_durable_persistence_gate", None)
+        if gate is None:
+            gate = DurablePersistenceGate()
+            self._durable_persistence_gate = gate
+        return gate
 
     @staticmethod
     def _evaluate_pre_turn_guard(guard) -> None:

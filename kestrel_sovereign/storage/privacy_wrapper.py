@@ -33,6 +33,7 @@ from typing import Dict, List, Optional, Any, Sequence, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
 
+from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.turn_scope import turn_scoped
 from kestrel_sovereign.privacy import (
     PrivacyMode,
@@ -602,6 +603,100 @@ def _resolve_transition_lock(holder):
     if hasattr(holder, "__aenter__"):
         return holder
     return None
+
+
+class DurablePersistenceGate:
+    """Shared/exclusive gate between durable signal persistence and a privacy flip (#3316).
+
+    Durable signal persistence computes a privacy projection of the envelope
+    and then awaits its commit. Unguarded, a NORMAL projection can be computed,
+    the mode can change to EPHEMERAL while the commit is blocked, and the stale
+    plaintext projection can commit after the transition. That
+    projection-vs-commit race is the only thing this gate guards:
+
+      * ``SignalDispatcher.dispatch_signal`` holds it SHARED around projection
+        and durable commit, so concurrent dispatches never serialize on each
+        other;
+      * ``privacy_transition()`` holds it EXCLUSIVE, acquired after
+        CONVERSATION and the privacy-transition lock, so a mode change waits
+        for every in-flight persist and no persist can straddle it.
+
+    It is deliberately NOT the privacy-transition lock. Every turn holds that
+    lock for its whole body (#3310), so persisting under it queued every signal
+    — inbound channel/A2A ACK ingress and the scheduler's cron dispatches alike
+    — behind whatever turn was in flight.
+
+    The gate is a leaf: nothing acquires CONVERSATION or the privacy-transition
+    lock while holding it, so the global order stays CONVERSATION -> privacy
+    transition -> persistence gate. Exclusive ownership is task-reentrant, and
+    the owning task's shared acquisitions are admitted without waiting, so a
+    signal dispatched inline by the transition body persists under the mode it
+    is installing instead of waiting on its own task. Writer preference comes
+    from :class:`AsyncReaderWriterLock`: once a transition queues, new persists
+    wait behind it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = AsyncReaderWriterLock()
+        self._owner: Optional["asyncio.Task"] = None
+
+    def locked(self) -> bool:
+        """Whether a persist or a transition currently holds the gate."""
+        return self._lock.locked()
+
+    def _owned_by_current_task(self) -> bool:
+        task = asyncio.current_task()
+        return task is not None and self._owner is task
+
+    @asynccontextmanager
+    async def shared(self):
+        """Hold the gate for one durable projection-and-commit."""
+        if self._owned_by_current_task():
+            yield
+            return
+        async with self._lock.read():
+            yield
+
+    @asynccontextmanager
+    async def exclusive(self):
+        """Hold the gate for one privacy transition.
+
+        A nested acquisition by the owning task holds nothing extra; only the
+        outermost frame releases the gate.
+        """
+        if self._owned_by_current_task():
+            yield
+            return
+        await self._lock.acquire()
+        self._owner = asyncio.current_task()
+        try:
+            yield
+        finally:
+            self._owner = None
+            self._lock.release()
+
+
+@asynccontextmanager
+async def optional_durable_persistence_gate(gate):
+    """Hold ``gate`` shared for the block if provided, else run unguarded.
+
+    ``None`` is the lightweight embedding with no privacy-transition machinery
+    (a host or test shape that exposes no ``_get_durable_persistence_gate``);
+    it has no transition to race, so it persists unguarded as before.
+    """
+    if gate is None:
+        yield
+    else:
+        async with gate.shared():
+            yield
+
+
+def _resolve_durable_persistence_gate(holder) -> Optional[DurablePersistenceGate]:
+    """Return ``holder``'s durable persistence gate, or ``None`` if it has none."""
+    getter = getattr(holder, "_get_durable_persistence_gate", None)
+    if not callable(getter):
+        return None
+    return getter()
 
 
 # ── Privacy-aware graph write policy (#2672) ─────────────────────────────────

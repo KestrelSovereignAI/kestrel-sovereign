@@ -811,21 +811,30 @@ class TurnLifecycleMixin:
         therefore acquires only the task-reentrant privacy mutex, avoiding a
         recursive ``CONVERSATION`` deadlock.  The global lock order remains
         CONVERSATION -> privacy everywhere.
+
+        Both paths then take the durable persistence gate exclusive, last, so
+        the transition waits for every in-flight durable signal persist and no
+        persist can straddle the mode change (#3316). Signal persistence holds
+        only that gate, never the privacy mutex, so it is not queued behind a
+        turn.
         """
 
         transition_lock = self._get_privacy_transition_lock()
+        persistence_gate = self._get_durable_persistence_gate()
         mgr = self._get_lock_manager()
         if self._caller_belongs_to_live_turn() or mgr.is_owned_by_current_task(
             ResourceLock.CONVERSATION
         ):
             async with transition_lock:
-                yield
+                async with persistence_gate.exclusive():
+                    yield
             return
 
         label = f"{getattr(self, 'agent_name', None) or 'agent'} privacy-transition"
         async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
             async with transition_lock:
-                yield
+                async with persistence_gate.exclusive():
+                    yield
 
     @asynccontextmanager
     async def _turn_lifecycle(self) -> AsyncIterator[str]:

@@ -693,13 +693,26 @@ The dispatcher pipeline:
 8. **Release locks** in reverse acquisition order.
 9. **Log** the routed outcome per the source's redaction policy.
 
+Step 3 serializes against a privacy transition through the agent's
+**durable persistence gate**, not the privacy-transition lock (#3316). The
+gate guards exactly one race: a NORMAL projection computed, the mode changed
+to EPHEMERAL while the commit is blocked, and the stale plaintext projection
+committed after the transition. The dispatcher holds it shared around
+projection and commit, so concurrent dispatches do not serialize on each
+other; `privacy_transition()` holds it exclusive, acquired after CONVERSATION
+and the privacy-transition lock, so a mode change waits for in-flight persists
+and no persist straddles it. Every turn holds the privacy-transition lock for
+its whole body (#3310), so persisting under that lock queued inbound ACK
+ingress and cron dispatches behind any in-flight turn. The global order is
+CONVERSATION → privacy transition → persistence gate; nothing is acquired
+while the gate is held.
+
 An `InFlightControlActionRegistration` (today only `a2a.peer_stop`, #3169)
 is an ACTION that acts on work already running. Step 3 persists only a fixed
-marker for it (no payload, caller, or chain) without taking the privacy
-transition lock every running turn holds, and Hold's begin-work disposition
-does not apply to it. Validation, cycle/TTL, durable deduplication, and rate
-limiting are unchanged. See the peer Stop section of
-[`SIGNAL_SOURCES_GUIDE.md`](./SIGNAL_SOURCES_GUIDE.md).
+marker for it (no payload, caller, or chain), and Hold's begin-work
+disposition does not apply to it. Validation, cycle/TTL, durable
+deduplication, rate limiting, and the persistence gate are unchanged. See the
+peer Stop section of [`SIGNAL_SOURCES_GUIDE.md`](./SIGNAL_SOURCES_GUIDE.md).
 
 The dispatcher lives as a sibling component the agent holds a reference to. Easier to test than another mixin.
 
