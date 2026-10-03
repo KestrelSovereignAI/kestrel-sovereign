@@ -83,6 +83,13 @@ from kestrel_sovereign.waits import WaitRegistry
 
 _TEST_AGENT_DID = "did:test:isolated-runtime"
 _TEST_CONFIG_NODE_ID = f"feature_config:v2:{_TEST_AGENT_DID}:TestFeature"
+# How long a test waits for work it set in motion before calling it hung. This
+# bounds a deadlock, not the work: a passing run returns as soon as the awaited
+# event fires. A foreign owner loop runs on its own thread, which a loaded
+# xdist worker may not schedule within a fixed number of host-loop turns
+# (#3456, like #3447 and #3454). It must stay well inside CI's 60s per-test
+# timeout.
+_HANG_GUARD_SECONDS = 30
 
 
 def test_proxy_declares_config_before_runtime_initialize():
@@ -21381,18 +21388,20 @@ async def test_precompleted_foreign_future_is_consumed_only_by_owner_after_resum
     def run_foreign_loop():
         asyncio.set_event_loop(foreign_loop)
         state["owner_thread"] = threading.get_ident()
-        running.set()
+        # Signal from inside the loop: dispatch requires ``is_running()``,
+        # which becomes true only once ``run_forever`` has begun.
+        foreign_loop.call_soon(running.set)
         foreign_loop.run_forever()
         foreign_loop.close()
 
     foreign_thread = threading.Thread(target=run_foreign_loop)
     foreign_thread.start()
-    assert running.wait(timeout=1)
+    assert running.wait(timeout=_HANG_GUARD_SECONDS)
     try:
         # Retrying the retained operation asks the now-running owner loop to
         # acknowledge the exact source; it does not issue another facade call.
         operation.cancel()
-        await asyncio.wait_for(notified.wait(), timeout=1)
+        await asyncio.wait_for(notified.wait(), timeout=_HANG_GUARD_SECONDS)
         assert operation.done() is True
         assert operation.foreign_settlement_disposition == "succeeded"
         assert state["result_threads"] == [state["owner_thread"]]
@@ -21436,7 +21445,10 @@ async def test_terminal_retirement_retries_stopped_foreign_operation_after_owner
     def run_foreign_loop():
         asyncio.set_event_loop(foreign_loop)
         state["owner_thread"] = threading.get_ident()
-        foreign_running.set()
+        # Signal from inside the loop: the retry below dispatches only once
+        # ``is_running()`` is true, which holds only after ``run_forever``
+        # has begun.
+        foreign_loop.call_soon(foreign_running.set)
         foreign_loop.run_forever()
         foreign_loop.close()
 
@@ -21457,10 +21469,14 @@ async def test_terminal_retirement_retries_stopped_foreign_operation_after_owner
         operation = feature._terminal_lifecycle_tasks[0].task
         assert operation.done() is False
         assert state["result_threads"] == []
+        # Registered after the lifecycle owner's release callback, so its
+        # FIFO host-loop delivery runs only once that release has run.
+        settlement_delivered = asyncio.Event()
+        operation.add_done_callback(lambda _completed: settlement_delivered.set())
 
         foreign_thread = threading.Thread(target=run_foreign_loop)
         foreign_thread.start()
-        assert foreign_running.wait(timeout=1)
+        assert foreign_running.wait(timeout=_HANG_GUARD_SECONDS)
 
         # The next cleanup retries cancellation plus observation on the same
         # retained operation.  It remains fenced for this pass, never issuing
@@ -21468,10 +21484,7 @@ async def test_terminal_retirement_retries_stopped_foreign_operation_after_owner
         assert await feature._retire_terminal_clients() is False
         assert client.stop_calls == 1
 
-        for _ in range(100):
-            if not feature._terminal_lifecycle_tasks:
-                break
-            await asyncio.sleep(0)
+        await asyncio.wait_for(settlement_delivered.wait(), timeout=_HANG_GUARD_SECONDS)
         assert feature._terminal_lifecycle_tasks == []
         assert operation.foreign_settlement_disposition == "cancelled"
         assert state["result_threads"] == [state["owner_thread"]]
