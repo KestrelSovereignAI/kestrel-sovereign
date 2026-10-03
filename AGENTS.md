@@ -53,6 +53,10 @@ behavior matches the code, then file → fix via Talon → re-verify).
 # E2E tests (requires running server)
 uv run python -m kestrel_sovereign.server --host 127.0.0.1 --port 8888 &
 cd tests/e2e && npx playwright test
+
+# The Playwright subset pull-request CI runs: the Sovereign Console smoke,
+# against a fresh isolated instance it creates (never your server), no LLM
+uv run kestrel demo smoke
 ```
 
 ### Testing a sibling feature repo: unset `VIRTUAL_ENV` first

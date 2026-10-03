@@ -189,6 +189,12 @@ def spawned_agent_data_key(env: dict, agent_name: str) -> str | None:
 #: The project home (see :func:`project_dir`).
 HOME_ENV = "KESTREL_HOME"
 
+#: ``1`` tells ``server.load_server_dotenv`` to read no ``.env`` file at all.
+#: Set by a launcher that hands the server its complete environment
+#: (``kestrel demo smoke``): ``override=False`` would otherwise refill every
+#: variable that launcher deliberately removed.
+SKIP_DOTENV_ENV = "KESTREL_SKIP_DOTENV"
+
 #: Explicit host-feature database path (see ``host_features.storage``).
 HOST_DB_PATH_ENV = "KESTREL_HOST_DB_PATH"
 
