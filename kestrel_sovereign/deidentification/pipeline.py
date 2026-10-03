@@ -386,12 +386,14 @@ class DeidentificationPipeline:
         """
         if not isinstance(schema, Mapping) or not schema:
             raise DeidentificationConfigError("the field schema must be a non-empty mapping")
-        for name, spec in schema.items():
+        for position, (name, spec) in enumerate(schema.items()):
             if not isinstance(name, str) or not name:
                 raise DeidentificationConfigError("schema field names must be non-empty strings")
             if not isinstance(spec, FieldSpec):
+                # By position: the name has not yet been checked for an
+                # identifier pattern (see below).
                 raise DeidentificationConfigError(
-                    f"schema field {name!r} must map to a FieldSpec"
+                    f"schema field {position} must map to a FieldSpec"
                 )
         if not isinstance(source_digest_key, bytes) or len(source_digest_key) < MIN_SOURCE_DIGEST_KEY_BYTES:
             raise DeidentificationConfigError(
@@ -694,10 +696,15 @@ class DeidentificationPipeline:
         if not isinstance(record.fields, Mapping):
             raise DeidentificationError("record fields must be a mapping")
         fields = dict(record.fields)
-        unknown = sorted(str(name) for name in fields if name not in self._schema)
+        # By position, never by name: an unclassified key is source data no
+        # check has read, and may itself be an identifier.
+        unknown = [
+            position for position, name in enumerate(fields) if name not in self._schema
+        ]
         if unknown:
             raise DeidentificationError(
-                f"record carries field(s) the schema does not classify: {unknown}"
+                f"record carries {len(unknown)} field(s) the schema does not "
+                f"classify, at position(s) {unknown}"
             )
         for name, value in fields.items():
             if not isinstance(value, _SCALAR_TYPES + (date, bytes)):

@@ -9,6 +9,8 @@ import asyncio
 import dataclasses
 import hashlib
 import json
+import sqlite3
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -402,6 +404,240 @@ async def test_privacy_transition_is_refused_while_a_save_is_in_flight():
     await asyncio.wait_for(save, timeout=30)
     wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
     assert wrapper.privacy_mode is PrivacyMode.EPHEMERAL
+
+
+@pytest.fixture
+def delayed_sqlite_commit(sqlite_storage, monkeypatch):
+    """Hold the SQLite worker inside COMMIT until the test releases it.
+
+    The commit runs on aiosqlite's worker thread exactly as a real one does, so
+    a caller cancelled while awaiting it returns at once while the worker
+    still commits afterwards.
+    """
+    connection = sqlite_storage.db._backend._connection
+    real_commit = connection._conn.commit
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked_commit():
+        entered.set()
+        release.wait(timeout=30)
+        real_commit()
+
+    async def commit():
+        await connection._execute(blocked_commit)
+
+    monkeypatch.setattr(connection, "commit", commit)
+    try:
+        yield SimpleNamespace(entered=entered, release=release)
+    finally:
+        release.set()  # never leave the worker blocked behind a failed assertion
+
+
+async def _file_rows(storage):
+    return await storage.db.fetchall("SELECT content_hash FROM files")
+
+
+async def test_a_cancelled_save_holds_its_lease_until_its_commit_resolves(
+    sqlite_storage, delayed_sqlite_commit
+):
+    """Regression: cancelling a save while SQLite's worker was committing handed
+    the commit to the backend's cancellation drain and returned at once. The
+    lease was released, a transition to EPHEMERAL succeeded, and the worker
+    then committed both documents under EPHEMERAL. The save now owns its
+    commit: the transition stays refused until the commit has resolved, and
+    the documents it wrote were committed before any transition."""
+    wrapper = PrivacyEnforcingStorage(sqlite_storage, PrivacyMode.DEIDENTIFIED)
+    save = asyncio.create_task(wrapper.store_deidentified_records(_result()))
+    await asyncio.wait_for(asyncio.to_thread(delayed_sqlite_commit.entered.wait, 30), timeout=30)
+
+    save.cancel()
+    for _ in range(20):  # the old path released the lease within one step
+        await asyncio.sleep(0)
+    assert not save.done()
+    with pytest.raises(PrivacyViolationError, match="de-identified record save"):
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+    assert wrapper.privacy_mode is PrivacyMode.DEIDENTIFIED
+
+    delayed_sqlite_commit.release.set()
+    await asyncio.wait({save}, timeout=30)
+    assert save.cancelled()  # the caller's cancellation is still delivered
+    assert len(await _file_rows(sqlite_storage)) == 2
+    assert wrapper._active_deidentified_save_leases == 0
+
+    wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+    assert len(await _file_rows(sqlite_storage)) == 2
+
+
+def _commit_task():
+    (commit,) = [
+        task for task in asyncio.all_tasks()
+        if task.get_name().startswith("deidentified-save:")
+    ]
+    return commit
+
+
+async def test_a_commit_task_cancelled_during_commit_keeps_the_fence_closed(
+    sqlite_storage, delayed_sqlite_commit
+):
+    """Only event-loop teardown can cancel the commit task itself. Cancelled
+    during COMMIT, whether its documents committed is unknown, so the lease is
+    kept and transitions stay refused rather than following a commit that may
+    still land."""
+    wrapper = PrivacyEnforcingStorage(sqlite_storage, PrivacyMode.DEIDENTIFIED)
+    save = asyncio.create_task(wrapper.store_deidentified_records(_result()))
+    await asyncio.wait_for(asyncio.to_thread(delayed_sqlite_commit.entered.wait, 30), timeout=30)
+
+    _commit_task().cancel()
+    with pytest.raises(PrivacyViolationError, match="commit outcome is unknown"):
+        await asyncio.wait_for(save, timeout=30)
+    assert wrapper._active_deidentified_save_leases == 1
+    with pytest.raises(PrivacyViolationError, match="de-identified record save"):
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+
+
+async def test_a_commit_that_fails_after_commit_was_issued_keeps_the_fence_closed(
+    sqlite_storage, monkeypatch
+):
+    """A COMMIT that raises may still have landed (a COMMIT sent to PostgreSQL
+    completes on the server whatever the client saw), so the wrapper cannot
+    treat the failure as a known rollback."""
+    wrapper = PrivacyEnforcingStorage(sqlite_storage, PrivacyMode.DEIDENTIFIED)
+    connection = sqlite_storage.db._backend._connection
+
+    async def failing_commit():
+        raise sqlite3.OperationalError("synthetic disk I/O error")
+
+    monkeypatch.setattr(connection, "commit", failing_commit)
+    with pytest.raises(PrivacyViolationError, match="commit outcome is unknown") as failed:
+        await wrapper.store_deidentified_records(_result())
+    assert isinstance(failed.value.__cause__, TransactionError)
+    assert wrapper._active_deidentified_save_leases == 1
+    with pytest.raises(PrivacyViolationError, match="de-identified record save"):
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+
+
+async def test_a_commit_task_cancelled_before_commit_releases_the_lease():
+    """Cancelled while still writing, the transaction rolls back and nothing
+    commits, so the outcome is known and the lease is released."""
+    storage = _mock_storage()
+    writing = asyncio.Event()
+
+    async def blocked_store_file(content, original_name, metadata=None):
+        writing.set()
+        await asyncio.Event().wait()
+
+    storage.store_file = blocked_store_file
+    wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.DEIDENTIFIED)
+    save = asyncio.create_task(wrapper.store_deidentified_records(_result()))
+    await asyncio.wait_for(writing.wait(), timeout=30)
+
+    _commit_task().cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(save, timeout=30)
+    assert wrapper._active_deidentified_save_leases == 0
+    wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+
+
+def _recording_storage(on_commit=None):
+    """Mock storage whose transaction records how it ended; ``on_commit``
+    runs where leaving the transaction would issue COMMIT."""
+    storage = _mock_storage()
+    storage.ended = []
+
+    @asynccontextmanager
+    async def transaction(*, immediate=False):
+        try:
+            yield
+        except BaseException:
+            storage.ended.append("rolled back")
+            raise
+        if on_commit is not None:
+            await on_commit()
+        storage.ended.append("committed")
+
+    storage.transaction = transaction
+    return storage
+
+
+async def test_a_caller_cancelled_while_writing_withdraws_the_save():
+    """Before COMMIT is issued, cancelling the commit task rolls it back, so
+    the caller's cancellation withdraws the save: a wait inside the
+    transaction (a row lock its own parent holds, say) stays cancellable."""
+    storage = _recording_storage()
+    writing = asyncio.Event()
+
+    async def blocked_store_file(content, original_name, metadata=None):
+        writing.set()
+        await asyncio.Event().wait()
+
+    storage.store_file = blocked_store_file
+    wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.DEIDENTIFIED)
+    save = asyncio.create_task(wrapper.store_deidentified_records(_result()))
+    await asyncio.wait_for(writing.wait(), timeout=30)
+
+    save.cancel("caller timeout")
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await asyncio.wait_for(save, timeout=30)
+    assert storage.ended == ["rolled back"]
+    assert wrapper._active_deidentified_save_leases == 0
+    assert not getattr(cancelled.value, "__notes__", None)  # withdrawn, not failed
+    wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+
+
+async def test_a_caller_cancelled_once_commit_is_issued_lets_it_finish():
+    """Once COMMIT is issued, the caller's cancellation no longer withdraws
+    the save, even when it lands before the caller has woken for that point.
+    Interrupting a COMMIT would leave its outcome unknown and the fence closed
+    for good, so the commit finishes first."""
+    release, save = asyncio.Event(), None
+
+    async def on_commit():
+        save.cancel()  # the caller has not yet seen COMMIT being issued
+        await release.wait()
+
+    storage = _recording_storage(on_commit)
+    wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.DEIDENTIFIED)
+    save = asyncio.create_task(wrapper.store_deidentified_records(_result()))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not save.done()
+    with pytest.raises(PrivacyViolationError, match="de-identified record save"):
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+
+    release.set()
+    await asyncio.wait({save}, timeout=30)
+    assert save.cancelled()
+    assert storage.ended == ["committed"]
+    assert wrapper._active_deidentified_save_leases == 0
+
+
+async def test_a_save_cancelled_before_its_transaction_starts_is_withdrawn(sqlite_storage):
+    """Until its transaction starts nothing is written, so the caller's
+    cancellation (a timeout around a save queued behind another writer) still
+    withdraws it: the lease is released and nothing is written later."""
+    wrapper = PrivacyEnforcingStorage(sqlite_storage, PrivacyMode.DEIDENTIFIED)
+    holding, release = asyncio.Event(), asyncio.Event()
+
+    async def hold_a_transaction():
+        async with sqlite_storage.transaction():
+            holding.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold_a_transaction())
+    await asyncio.wait_for(holding.wait(), timeout=30)
+    save = asyncio.create_task(wrapper.store_deidentified_records(_result()))
+    while wrapper._active_deidentified_save_leases == 0:
+        assert not save.done()
+        await asyncio.sleep(0)
+
+    save.cancel()
+    await asyncio.wait({save}, timeout=30)
+    assert save.cancelled()
+    assert wrapper._active_deidentified_save_leases == 0
+    wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+    release.set()
+    await asyncio.wait_for(holder, timeout=30)
+    assert await _file_rows(sqlite_storage) == []
 
 
 @pytest.mark.parametrize("outer", ["storage", "wrapper"])

@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 import threading
+from pathlib import Path
 
 import pytest
 
+import kestrel_sovereign
 from kestrel_sovereign._async_ownership import (
     OwnedAsyncIterator,
     await_owned_task,
@@ -116,6 +121,60 @@ async def test_preexisting_cancellation_is_propagated_after_owned_result():
 
     with pytest.raises(asyncio.CancelledError, match="already cancelled"):
         raise_owned_outcome(outcome, operation="test operation")
+
+
+_TEARDOWN_SCENARIO = """
+import asyncio
+
+from kestrel_sovereign._async_ownership import await_owned_task
+
+
+async def owned():
+    try:
+        await asyncio.sleep(30)
+    except asyncio.CancelledError:
+        for _ in range(3):  # unwinds over several loop iterations
+            await asyncio.sleep(0)
+        raise
+
+
+async def owner():
+    return await await_owned_task(asyncio.create_task(owned()))
+
+
+async def main():
+    owner_task = asyncio.create_task(owner())
+    await asyncio.sleep(0.01)
+    for task in asyncio.all_tasks():
+        if task is not asyncio.current_task():
+            task.cancel()
+    await asyncio.wait({owner_task}, timeout=5)
+    print("owner done:", owner_task.done())
+
+
+asyncio.run(main())
+"""
+
+
+def test_teardown_cancelling_every_task_does_not_spin_the_owner():
+    """Regression: event-loop teardown cancels every task, including the waiter
+    task this helper used to create. A cancelled waiter made each ``shield``
+    raise without yielding, so the owner spun and the owned task never ran
+    again. A spinning loop cannot be interrupted from inside, so the scenario
+    runs in a subprocess that is killed if it does not finish."""
+    # Only the directory holding this package: other tests put directories on
+    # sys.path that shadow the standard library in a fresh interpreter.
+    package_root = Path(kestrel_sovereign.__file__).resolve().parent.parent
+    env = {**os.environ, "PYTHONPATH": str(package_root)}
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _TEARDOWN_SCENARIO],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("the owner spun instead of yielding to the event loop")
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "owner done: True"
 
 
 @pytest.mark.asyncio

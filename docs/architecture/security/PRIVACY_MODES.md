@@ -234,7 +234,9 @@ anything.
 #### The de-identification pipeline
 
 A `DeidentificationPipeline` is built from a schema that classifies every field
-a record may carry; a record with an unclassified field is refused.
+a record may carry; a record with an unclassified field is refused, and the
+refusal names that field by position, never by its key, which no check has
+read.
 
 - **Identifier fields** name one Safe Harbor category and are removed, or
   generalized where Safe Harbor permits: a ZIP code to its first three digits
@@ -252,6 +254,9 @@ a record may carry; a record with an unclassified field is refused.
   patient's given name cannot hide a caregiver's surname from the entity
   detector, or a house number from the address pattern. Scrubbing repeats
   until the text is stable, so generalizing one span cannot expose another.
+  Only placeholders and `90+` aggregates the scrubber wrote are protected from
+  later passes; source text spelled like one (`[REDACTED:ALICE]` for a patient
+  named Alice) is scanned like any other text.
   Detection is biased toward over-removal and is still best-effort: a name the
   entity model misses, or an identifier written in a form no pattern knows,
   survives. That residual is what the operator's attestation covers.
@@ -309,11 +314,19 @@ A save additionally requires the artifact's assurance to equal the config's
 whenever the config names one (`safe_harbor` for the preset). The artifact and
 the records are written in one transaction, artifact first, as
 content-addressed JSON files (encrypted at rest when a data key is configured)
-whose metadata holds only the evidence id, assurance, and digests. That
-transaction commits before the save releases the privacy lease that blocks a
-transition to a volatile mode, so a save is refused inside a transaction the
-calling task already has open: there it would only join the caller's
-transaction and commit after the lease was gone.
+whose metadata holds only the evidence id, assurance, and digests. The save
+holds the privacy lease that blocks a transition to a volatile mode until that
+transaction has committed or rolled back. A backend cancelled while awaiting
+COMMIT returns at once and finishes the commit afterwards, so the commit runs
+in a task of its own. Until that task issues COMMIT, the caller's cancellation
+(a timeout around a save queued behind another writer, say) withdraws the save
+and its transaction rolls back; once COMMIT is issued, the caller's
+cancellation is delivered only after the commit has resolved. If COMMIT was
+issued and then failed or was interrupted, a COMMIT sent to PostgreSQL may
+still complete on the server, so the outcome is unknown: the lease is kept and
+transitions are refused until restart. A save is refused inside a transaction
+the calling task already has open, which would commit only after the lease
+was gone.
 `DeidentificationResult.export_bundle()` is the export form: it re-verifies,
 embeds the artifact verbatim, and reads its own bytes back before returning
 them. The saved records document is that bundle, so every path that serves

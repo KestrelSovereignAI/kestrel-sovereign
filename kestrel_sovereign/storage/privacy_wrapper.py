@@ -36,6 +36,7 @@ from typing import Dict, List, Optional, Any, Sequence, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
 
+from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign.turn_scope import turn_scoped
 from kestrel_sovereign.deidentification import (
     DEIDENTIFICATION_ASSURANCES,
@@ -1427,6 +1428,21 @@ REQUIRED_TRACE_STORES = frozenset({
 
 DEIDENTIFICATION_EVIDENCE_KIND = "deidentification_evidence"
 DEIDENTIFIED_RECORDS_KIND = "deidentified_records"
+
+
+class _DeidentifiedCommitProgress:
+    """How far one de-identified save's commit task got.
+
+    ``committing`` resolves once both documents are written, as leaving the
+    transaction issues COMMIT. Before then, cancelling the task rolls the
+    transaction back; from then on a failure or cancellation leaves the
+    commit's outcome unknown to the wrapper.
+    """
+
+    __slots__ = ("committing",)
+
+    def __init__(self) -> None:
+        self.committing: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
 
 @dataclass(frozen=True)
@@ -2863,6 +2879,36 @@ class PrivacyEnforcingStorage:
                 raise RuntimeError("de-identified save privacy lease underflow")
             self._active_deidentified_save_leases -= 1
 
+    async def _commit_deidentified_documents(
+        self,
+        progress: _DeidentifiedCommitProgress,
+        evidence_id: str,
+        evidence_bytes: bytes,
+        records_bytes: bytes,
+        base_metadata: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """Write the evidence, then the records, in one transaction.
+
+        Returns (evidence file hash, records file hash).
+        """
+        async with self._storage.transaction():
+            evidence_hash = await self._storage.store_file(
+                evidence_bytes,
+                f"deidentification-evidence-{evidence_id}.json",
+                {"kind": DEIDENTIFICATION_EVIDENCE_KIND, **base_metadata},
+            )
+            records_hash = await self._storage.store_file(
+                records_bytes,
+                f"deidentified-records-{evidence_id}.json",
+                {
+                    "kind": DEIDENTIFIED_RECORDS_KIND,
+                    "evidence_file_hash": evidence_hash,
+                    **base_metadata,
+                },
+            )
+            progress.committing.set_result(None)
+        return evidence_hash, records_hash
+
     async def store_deidentified_records(
         self, result: DeidentificationResult
     ) -> "DeidentifiedSaveReceipt":
@@ -2890,10 +2936,19 @@ class PrivacyEnforcingStorage:
 
         Both documents are stored as content-addressed JSON files (encrypted at
         rest when a data key is configured). Their metadata is content-free:
-        the evidence id, assurance, and digests. The save commits its own
-        transaction while it holds the privacy lease that blocks a transition
-        to a volatile mode, so it is refused inside a transaction the calling
-        task already has open, where it could only join it.
+        the evidence id, assurance, and digests.
+
+        The save holds the privacy lease that blocks a transition to a
+        volatile mode until its commit has resolved. The commit runs in a task
+        of the save's own. Until that task issues COMMIT, the caller's
+        cancellation withdraws the save and its transaction rolls back; once
+        COMMIT is issued, the caller's cancellation is delivered only after
+        the documents have committed or rolled back. If COMMIT was issued and
+        then failed or was interrupted, whether the documents committed is
+        unknown here, so the lease is kept and transitions stay refused until
+        restart. A save is refused inside a transaction the calling task
+        already has open, which that task would hold until after the save
+        returns.
         """
         # Exact type: a subclass could override verify() or records_as_dicts().
         if type(result) is not DeidentificationResult:
@@ -2923,11 +2978,12 @@ class PrivacyEnforcingStorage:
             "mime_type": "application/json",
         }
         # The lease must outlive the commit. Inside a transaction this task
-        # already holds, the one below joins it: the documents would commit
-        # only with the caller's, after the lease is released, so a transition
-        # to a volatile mode could land first. The check holds until the
-        # backend decides to join or open: only this task can open a
-        # transaction this task would join.
+        # already holds, the documents could commit only with the caller's,
+        # after the lease is released, so a transition to a volatile mode
+        # could land first; and the commit task below, being another task,
+        # would wait on the caller's open transaction while the caller waits
+        # on it. Only this task can open a transaction this task holds, so the
+        # answer stands until the commit task starts.
         if getattr(self._storage, "owns_open_transaction", None) is not False:
             raise PrivacyViolationError(
                 "De-identified save blocked: the save must commit in its own "
@@ -2935,24 +2991,63 @@ class PrivacyEnforcingStorage:
                 "storage cannot report whether it has)."
             )
         self._acquire_deidentified_save_lease(evidence.assurance)
+        # A backend cancelled while awaiting COMMIT returns at once and
+        # finishes the commit afterwards: SQLite hands it to a background
+        # drain queued behind the worker's COMMIT, and a COMMIT already sent to
+        # PostgreSQL may still complete on the server. A lease released on the
+        # caller's cancellation would therefore let a transition to a volatile
+        # mode land before the documents commit. The commit runs in a task of
+        # its own, and the lease is released only once that task has ended
+        # with a known outcome.
+        progress = _DeidentifiedCommitProgress()
+        commit = asyncio.create_task(
+            self._commit_deidentified_documents(
+                progress, evidence.evidence_id, evidence_bytes, records_bytes, base_metadata
+            ),
+            name=f"deidentified-save:{evidence.evidence_id}",
+        )
+        withdrawn = False
         try:
-            async with self._storage.transaction():
-                evidence_hash = await self._storage.store_file(
-                    evidence_bytes,
-                    f"deidentification-evidence-{evidence.evidence_id}.json",
-                    {"kind": DEIDENTIFICATION_EVIDENCE_KIND, **base_metadata},
-                )
-                records_hash = await self._storage.store_file(
-                    records_bytes,
-                    f"deidentified-records-{evidence.evidence_id}.json",
-                    {
-                        "kind": DEIDENTIFIED_RECORDS_KIND,
-                        "evidence_file_hash": evidence_hash,
-                        **base_metadata,
-                    },
-                )
-        finally:
-            self._release_deidentified_save_lease()
+            # Until COMMIT is issued, cancelling the commit task rolls its
+            # transaction back, so the caller's cancellation still withdraws
+            # the save with a known outcome. Waits for a writer slot, a pool
+            # connection, or a row lock stay cancellable: a timeout can still
+            # break a wait on a transaction the caller's own parent holds.
+            await asyncio.wait(
+                {commit, progress.committing}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError as cancelled:
+            withdrawn = not progress.committing.done()
+            if withdrawn:
+                commit.cancel()
+            outcome = await await_owned_task(commit, cancelled)
+        else:
+            outcome = await await_owned_task(commit)
+        if outcome.error is not None and progress.committing.done():
+            # COMMIT was issued and then failed or was interrupted (once it
+            # is issued, only event-loop teardown cancels the commit task). Whether the documents committed is unknown here, so
+            # the lease is kept: no transition may follow a commit that can
+            # still land.
+            logger.error(
+                "De-identified save %s failed while committing; privacy "
+                "transitions stay refused until restart",
+                evidence.evidence_id,
+            )
+            if outcome.cancellation is not None:
+                raise outcome.cancellation from outcome.error
+            raise PrivacyViolationError(
+                "De-identified save failed while committing, so its commit "
+                "outcome is unknown; privacy transitions stay refused until "
+                "restart."
+            ) from outcome.error
+        self._release_deidentified_save_lease()
+        if withdrawn and isinstance(outcome.error, asyncio.CancelledError):
+            # That error is the cancellation that withdrew the save, not a
+            # failure of its own.
+            raise outcome.cancellation
+        evidence_hash, records_hash = raise_owned_outcome(
+            outcome, operation="de-identified save"
+        )
         logger.info(
             "Stored %d de-identified record(s) under evidence %s (assurance=%s)",
             record_count, evidence.evidence_id, evidence.assurance,

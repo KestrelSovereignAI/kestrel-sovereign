@@ -49,7 +49,11 @@ AGE_DETECTOR = "pattern:age"
 
 # Already-replaced text no later pass may touch: placeholders, and the 90+
 # aggregate (a record aged exactly 90 must not turn "90+" into "[...]+").
-_PROTECTED_RE = re.compile(r"\[REDACTED:[A-Z_]+\]|(?<![\d.])90\+")
+# Only text a replacement wrote is protected; see ``_protected_spans``.
+_PROTECTED_RE = re.compile(r"\[REDACTED:[A-Z_]+\]|90\+")
+# The aggregate as a token of its own in the source text ("aged 90+ at
+# admission"), not the start of a longer one ("90+5", "90+3317").
+_STANDALONE_AGGREGATE = re.compile(rf"{re.escape(AGE_90_OR_OLDER)}(?![\w+]|\.\d)")
 # Each round can expose at most a few new matches; real text settles in two or
 # three. Text that is still changing after this many is refused, not passed.
 _MAX_SCRUB_ROUNDS = 8
@@ -535,17 +539,32 @@ def _uncovered_segments(
     return segments
 
 
+def _protected_spans(text: str, origin: Sequence[int]) -> List[Tuple[int, int]]:
+    """Placeholders and 90+ aggregates that a replacement in this run wrote.
+
+    Protection follows provenance, not shape: source text spelled like a
+    placeholder ("[REDACTED:ALICE]", where ALICE is the record's name) or
+    holding "90+" inside an identifier ("LOT90+3317") is scanned like any
+    other text. Only characters a replacement wrote (origin ``-1``) count.
+    """
+    return [
+        (m.start(), m.end())
+        for m in _PROTECTED_RE.finditer(text)
+        if all(origin[i] < 0 for i in range(m.start(), m.end()))
+    ]
+
+
 def _apply(
     text: str, origin: Sequence[int], matches: Iterable[_Match], counts: Dict[CountKey, int]
 ) -> Tuple[str, List[int]]:
     """Replace matches (earliest, then longest first) without re-matching a
-    span that is already a placeholder.
+    placeholder or aggregate an earlier replacement wrote.
 
     ``origin`` maps each character of ``text`` to its index in the source text,
     or ``-1`` for a character a replacement wrote; the returned origin does the
     same for the returned text.
     """
-    protected = [(m.start(), m.end()) for m in _PROTECTED_RE.finditer(text)]
+    protected = _protected_spans(text, origin)
     chosen: List[_Match] = []
     cursor = 0
     for match in sorted(matches, key=lambda m: (m.start, m.start - m.end)):
@@ -642,6 +661,15 @@ def _known_value_matches(
         pattern = _known_value_pattern(literal, joined=joined)
         placeholder = redaction_placeholder(category)
         for m in pattern.finditer(text):
+            # The aggregate Safe Harbor permits is not an occurrence of an age
+            # or date value 90 (a record aged exactly 90), as ``_age_matches``
+            # holds. Another category's "90" (an account number) is removed.
+            if (
+                category is Category.DATES
+                and m.group() + "+" == AGE_90_OR_OLDER
+                and _STANDALONE_AGGREGATE.match(text, m.start())
+            ):
+                continue
             matches.append(_Match(
                 m.start(), m.end(), placeholder, category,
                 TransformationAction.TRANSFORMED, KNOWN_VALUE_DETECTOR,

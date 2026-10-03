@@ -235,6 +235,39 @@ def test_an_age_of_exactly_ninety_does_not_mangle_the_aggregate():
     )
 
 
+@pytest.mark.parametrize(
+    "note, expected",
+    [
+        # The aggregate written in the source is not the record's age 90.
+        ("Aged 90+ at admission.", "Aged 90+ at admission."),
+        # A generated aggregate is protected after a "." as anywhere else.
+        ("age approx.90yo", "age approx.90+yo"),
+        # The age at the start of a longer token is still the age.
+        ("code 90+3317", f"code {redaction_placeholder(SafeHarborIdentifier.DATES)}+3317"),
+    ],
+)
+def test_the_aggregate_is_kept_for_a_record_aged_exactly_ninety(note, expected):
+    """Regression: once source text lost shape-based protection, the record's
+    age literal "90" rewrote a source "90+" to "[REDACTED:DATES]+", and a
+    generated "90+" after a "." was never protected at all."""
+    schema = {"age": FieldSpec.age(), "note": FieldSpec.free_text()}
+    result = _run(_pipeline(schema), {"age": 90, "note": note})
+    assert result.records[0]["note"] == expected
+
+
+def test_only_an_age_or_date_value_of_ninety_is_read_as_the_aggregate():
+    """Another category's "90" beside a "+" is that identifier, not the
+    aggregate, and is removed."""
+    schema = {
+        "acct": FieldSpec.remove(SafeHarborIdentifier.ACCOUNT_NUMBERS),
+        "note": FieldSpec.free_text(),
+    }
+    result = _run(_pipeline(schema), {"acct": "90", "note": "acct 90+ closed"})
+    assert result.records[0]["note"] == (
+        f"acct {redaction_placeholder(SafeHarborIdentifier.ACCOUNT_NUMBERS)}+ closed"
+    )
+
+
 def test_float_age_is_scrubbed_from_text_in_its_integer_form():
     schema = {"age": FieldSpec.age(), "note": FieldSpec.free_text()}
     result = _run(_pipeline(schema), {"age": 95.0, "note": "Patient, 95, fell at home."})
@@ -633,6 +666,60 @@ def test_a_pattern_split_by_a_known_value_is_still_removed(note, survivors):
         assert survivor not in scrubbed
 
 
+@pytest.mark.parametrize(
+    "fields, detector, survivor",
+    [
+        # The record's own name, spelled inside a placeholder.
+        (
+            {"name": "ALICE", "note": "Met [REDACTED:ALICE] at the clinic."},
+            ListedNames("Rowan Example"),
+            "ALICE",
+        ),
+        # A name only the entity detector finds.
+        (
+            {"name": "Avery Doe", "note": "Met [REDACTED:ROWAN_EXAMPLE] today."},
+            ListedNames("ROWAN_EXAMPLE"),
+            "ROWAN_EXAMPLE",
+        ),
+    ],
+)
+def test_placeholder_shaped_source_text_is_scanned_like_any_other(fields, detector, survivor):
+    """Regression: source text spelled like a placeholder was protected as if
+    the scrubber had written it, so the identifier inside it survived with no
+    transformation recorded. Only placeholders a replacement wrote are."""
+    schema = {"name": FieldSpec.remove(SafeHarborIdentifier.NAMES), "note": FieldSpec.free_text()}
+    result = _run(_pipeline(schema, entity_detector=detector), fields)
+    note = result.records[0]["note"]
+    assert survivor not in note
+    names = redaction_placeholder(SafeHarborIdentifier.NAMES)
+    assert note == fields["note"].replace(survivor, names)
+    assert [(t.category, t.occurrences) for t in _transformations(result, "note")] == [
+        (SafeHarborIdentifier.NAMES, 1)
+    ]
+
+
+def test_an_aggregate_shaped_part_of_an_identifier_is_not_protected():
+    """Regression: "90+" inside a device identifier was protected as the
+    aggregate, so the rest was replaced around it and "90+" survived."""
+    schema = {
+        "device": FieldSpec.remove(SafeHarborIdentifier.DEVICE_IDENTIFIERS),
+        "note": FieldSpec.free_text(),
+    }
+    result = _run(_pipeline(schema), {"device": "LOT90+3317", "note": "implant LOT90+3317 placed"})
+    assert result.records[0]["note"] == (
+        f"implant {redaction_placeholder(SafeHarborIdentifier.DEVICE_IDENTIFIERS)} placed"
+    )
+
+
+def test_a_source_aggregate_and_placeholder_that_hide_nothing_are_kept():
+    schema = {"name": FieldSpec.remove(SafeHarborIdentifier.NAMES), "note": FieldSpec.free_text()}
+    names = redaction_placeholder(SafeHarborIdentifier.NAMES)
+    note = f"Aged 90+ at admission; prior note {names} kept."
+    result = _run(_pipeline(schema), {"name": "Avery Doe", "note": note})
+    assert result.records[0]["note"] == note
+    assert _transformations(result, "note") == []
+
+
 def test_a_permitted_value_found_in_the_source_text_is_kept():
     """A recent birth year after a cue is a keep decision in the source text
     too, not a span the union removes."""
@@ -725,6 +812,25 @@ def test_free_text_without_an_entity_detector_is_refused(monkeypatch):
 def test_unclassified_field_is_refused():
     with pytest.raises(DeidentificationError, match="does not classify"):
         _run(_pipeline({"zip": FieldSpec.zip_code()}), {"zip": "02139", "nickname": "Ro"})
+
+
+def test_an_unclassified_field_is_refused_without_echoing_its_name():
+    """Regression: the refusal listed unclassified keys verbatim, so a key
+    such as an e-mail address left through the error channel."""
+    key = "patient.alice@example.com"
+    with pytest.raises(DeidentificationError) as refused:
+        _run(_pipeline({"zip": FieldSpec.zip_code()}), {"zip": "02139", key: "x", 7: "y"})
+    for rendered in (str(refused.value), repr(refused.value), repr(refused.value.args)):
+        assert "alice" not in rendered
+        assert "example.com" not in rendered
+    assert "2 field(s)" in str(refused.value)
+    assert "position(s) [1, 2]" in str(refused.value)
+
+
+def test_a_schema_entry_that_is_not_a_field_spec_is_reported_by_position():
+    with pytest.raises(DeidentificationConfigError, match="schema field 1 must map") as refused:
+        _pipeline({"zip": FieldSpec.zip_code(), "patient.alice@example.com": "free text"})
+    assert "alice" not in str(refused.value)
 
 
 @pytest.mark.parametrize(
