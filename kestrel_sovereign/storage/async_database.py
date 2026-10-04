@@ -845,6 +845,10 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     delivery_deferred_until TIMESTAMP,
     -- How many times this transition's wake was parked that way.
     delivery_deferrals INTEGER NOT NULL DEFAULT 0,
+    -- The recorded attempt count a wake was locked at when it reached the
+    -- retry cap (#3391), copied from last_delivery_attempts by the lock
+    -- itself. NULL on every row that is not currently locked.
+    delivery_locked_attempts INTEGER,
     pending_signal_id TEXT,
     pending_signaled_target TEXT,
     pending_signal_enqueued_at TIMESTAMP,
@@ -1541,6 +1545,13 @@ class AsyncDatabase:
         await self._migrate_add_column(
             "wait_signal_state", "delivery_deferrals",
             "INTEGER NOT NULL DEFAULT 0",
+        )
+        # The attempt count a lock fired at (#3391). No backfill: a legacy
+        # lock's counter may have been rewritten by a later dispatch, so NULL
+        # ("not recorded") is the honest answer, and ``wait_status`` reports
+        # the live counter beside it.
+        await self._migrate_add_column(
+            "wait_signal_state", "delivery_locked_attempts", "INTEGER"
         )
         # Watch re-arm baseline (#3399), same reasoning again. A legacy row
         # reads NULL: a watch that already fired stays retired exactly as it

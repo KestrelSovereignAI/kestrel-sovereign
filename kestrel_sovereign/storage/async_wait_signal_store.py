@@ -25,6 +25,10 @@ one row per ``(agent_id, kind, handle)`` the reconciler has observed, tracking
     time is PARKED until then, and that attempt is refunded (#3302). The
     retry cap guards against a signal the dispatcher will always reject; it
     must not be spent waiting out a rate limit the provider has dated.
+  - ``delivery_locked_attempts`` — the recorded attempt count a wake was
+    locked at when it reached the retry cap (#3391), copied from the row's own
+    counter by the only method that writes the lock. ``NULL`` on every row
+    that is not currently locked, and on locks written before the column.
   - ``watching`` / ``watch_baseline`` — an explicit ``wait(mode="signal")``
     watch, and the terminal-event token it was armed over: the one in flight
     or last delivered when the agent registered it (#3399). Delivering any
@@ -93,7 +97,7 @@ _STATE_COLUMNS = """
     watching, last_surface_status,
     attempts_signaled_target, last_attempt_started_at,
     delivery_deferred_until, delivery_deferrals,
-    watch_baseline, last_delivered_at
+    watch_baseline, last_delivered_at, delivery_locked_attempts
 """
 
 
@@ -184,6 +188,9 @@ class WaitSignalState:
     # poll that built it began. ``None`` when none was delivered, and on
     # legacy rows whose delivered wake could not be dated.
     last_delivered_at: Optional[str] = None
+    # The recorded attempt count this row's wake was locked at (#3391), or
+    # ``None`` when it is not locked, or was locked before the column existed.
+    delivery_locked_attempts: Optional[int] = None
 
     def deferred_until_utc(self) -> Optional[datetime]:
         """``delivery_deferred_until`` as an aware UTC datetime, or ``None``.
@@ -324,6 +331,14 @@ class WaitSignalStore:
         record, not a confirmed delivery). Upsert via try-UPDATE / fallback
         INSERT so an existing row keeps its prior ``last_signaled_outcome``
         instead of an ``INSERT OR REPLACE`` blowing it away.
+
+        A dispatch also ends any lock on the row (#3391): a locked transition
+        is never re-sent, so a wake dispatched after one is a new transition,
+        and the counter this sets belongs to it. ``last_delivery_status``
+        keeps the lock's status until this wake is harvested, so it is still
+        the "previous status" the wake reports. The pending fields set here
+        are what keep :meth:`list_undelivered` from reporting a wake in flight
+        as locked.
         """
         attempt_dt = _coerce_ts(attempt_at) or datetime.now(timezone.utc).replace(
             tzinfo=None
@@ -343,6 +358,7 @@ class WaitSignalStore:
                 attempts_signaled_target = ?,
                 last_attempt_started_at = ?,
                 delivery_deferred_until = NULL,
+                delivery_locked_attempts = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
@@ -424,7 +440,17 @@ class WaitSignalStore:
         later, and an event that finished in between — after the wake, before
         its harvest — would otherwise read as older than the wake and be
         announced as a replay.
+
+        It never writes the retry-cap lock: ``MAX_ATTEMPTS_EXCEEDED`` is
+        refused, because only :meth:`lock_at_max_attempts` checks the row's
+        recorded attempts before locking (#3391). Any status written here
+        replaces a lock, so it also clears ``delivery_locked_attempts``.
         """
+        if delivery_status == MAX_ATTEMPTS_EXCEEDED:
+            raise ValueError(
+                "the retry-cap lock checks the recorded attempts: use "
+                "lock_at_max_attempts"
+            )
         delivered_dt = _coerce_ts(delivered_at)
         if delivered_dt is not None and signaled_outcome is None:
             raise ValueError(
@@ -455,6 +481,7 @@ class WaitSignalStore:
                     pending_signal_id = NULL,
                     pending_signaled_target = NULL,
                     pending_signal_enqueued_at = NULL,
+                    delivery_locked_attempts = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE agent_id = ? AND kind = ? AND handle = ?
                 """,
@@ -482,6 +509,7 @@ class WaitSignalStore:
                     pending_signal_id = NULL,
                     pending_signaled_target = NULL,
                     pending_signal_enqueued_at = NULL,
+                    delivery_locked_attempts = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE agent_id = ? AND kind = ? AND handle = ?
                 """,
@@ -559,6 +587,7 @@ class WaitSignalStore:
                 pending_signal_id = NULL,
                 pending_signaled_target = NULL,
                 pending_signal_enqueued_at = NULL,
+                delivery_locked_attempts = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
@@ -595,6 +624,69 @@ class WaitSignalStore:
                 ),
             )
 
+    async def lock_at_max_attempts(
+        self,
+        kind: str,
+        handle: str,
+        *,
+        target: str,
+        max_attempts: int,
+        attempt_at: TimeArg = None,
+    ) -> bool:
+        """Lock ``target``'s undelivered wake once its recorded attempts reach
+        ``max_attempts`` (#3391).
+
+        The only writer of ``MAX_ATTEMPTS_EXCEEDED``. It is a compare-and-set
+        on the row itself, not on what the caller read: the row must still be
+        counting ``target``'s transition (``attempts_signaled_target``), its
+        recorded ``last_delivery_attempts`` must have reached the cap, and no
+        wake may be in flight. Whatever the caller believed, a lock below the
+        cap, on another transition's counter, or over a wake being dispatched
+        is refused.
+
+        The lock copies the row's own counter into
+        ``delivery_locked_attempts``, so the locked row reports the attempt
+        count it was locked at. It locks ``target`` like a hard fail, disarms
+        an explicit watch armed over another token, and keeps the row's
+        ``last_delivery_error``: the last real failure is the only account of
+        why the wake never landed. Returns whether it locked.
+        """
+        attempt_dt = _coerce_ts(attempt_at) or datetime.now(timezone.utc).replace(
+            tzinfo=None
+        )
+        rowcount = await self._db.execute(
+            """
+            UPDATE wait_signal_state
+            SET last_delivery_status = ?,
+                last_surface_status = NULL,
+                last_delivery_attempt_at = ?,
+                last_signaled_outcome = ?,
+                delivery_locked_attempts = last_delivery_attempts,
+                watching = CASE
+                    WHEN watch_baseline IS NULL OR watch_baseline <> ?
+                    THEN 0
+                    ELSE watching
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE agent_id = ? AND kind = ? AND handle = ?
+                  AND attempts_signaled_target = ?
+                  AND last_delivery_attempts >= ?
+                  AND pending_signal_id IS NULL
+            """,
+            (
+                MAX_ATTEMPTS_EXCEEDED,
+                attempt_dt,
+                target,
+                target,
+                self._agent_id,
+                kind,
+                handle,
+                target,
+                int(max_attempts),
+            ),
+        )
+        return rowcount > 0
+
     async def list_undelivered(self, limit: int = 50) -> List[WaitSignalState]:
         """Wakes for THIS agent that have not reached it and will not soon.
 
@@ -603,6 +695,11 @@ class WaitSignalStore:
           * locked — the retry cap was reached and the transition was locked
             as ``max_attempts_exceeded`` without ever being delivered;
           * parked — the wake is deferred until a provider-advised retry time.
+
+        A row whose lock is followed by a wake still in flight is neither
+        (#3391). That wake is for a new transition: until its harvest the row
+        keeps the lock's status beside the new wake's attempt counter, and
+        reporting it read as a wake locked after one attempt.
 
         The read surface behind ``wait_status`` (#3302): before it, the only
         way to learn that a job's completion wake had been locked away was to
@@ -613,7 +710,8 @@ class WaitSignalStore:
             SELECT {_STATE_COLUMNS}
             FROM wait_signal_state
             WHERE agent_id = ?
-                  AND (last_delivery_status = ?
+                  AND ((last_delivery_status = ?
+                        AND pending_signal_id IS NULL)
                        OR delivery_deferred_until IS NOT NULL)
             ORDER BY updated_at DESC
             LIMIT ?
@@ -878,4 +976,5 @@ class WaitSignalStore:
             delivery_deferrals=int(r[15]) if r[15] is not None else 0,
             watch_baseline=str(r[16]) if r[16] is not None else None,
             last_delivered_at=str(r[17]) if r[17] is not None else None,
+            delivery_locked_attempts=int(r[18]) if r[18] is not None else None,
         )

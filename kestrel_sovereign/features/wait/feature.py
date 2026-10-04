@@ -23,7 +23,11 @@ import time
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.storage.async_wait_signal_store import MAX_ATTEMPTS_EXCEEDED
-from kestrel_sovereign.waits.reconciler import list_undelivered_wakes, register_wait_watch
+from kestrel_sovereign.waits.reconciler import (
+    MAX_DELIVERY_ATTEMPTS,
+    list_undelivered_wakes,
+    register_wait_watch,
+)
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -353,6 +357,21 @@ class WaitFeature(Feature):
                 "last_error": error,
             }
             if row.last_delivery_status == MAX_ATTEMPTS_EXCEEDED:
+                # The count the lock fired at, recorded by the lock itself
+                # (#3391), beside the cap: a lock that does not match its cap
+                # is visible here rather than only in the database. ``None``
+                # for a lock written before the count was recorded.
+                locked_at = row.delivery_locked_attempts
+                entry["locked_at_attempts"] = locked_at
+                entry["delivery_max_attempts"] = MAX_DELIVERY_ATTEMPTS
+                entry["attempt_count_mismatch"] = (
+                    (locked_at if locked_at is not None else row.last_delivery_attempts)
+                    < MAX_DELIVERY_ATTEMPTS
+                    or (
+                        locked_at is not None
+                        and locked_at != row.last_delivery_attempts
+                    )
+                )
                 locked.append(entry)
             else:
                 entry["deferred_until"] = row.delivery_deferred_until or ""
@@ -368,8 +387,7 @@ class WaitFeature(Feature):
                     "never delivered, will not be re-sent:"
                 )
                 lines.extend(
-                    f"  • {e['ref']} ({e['transition']}), "
-                    f"{e['delivery_attempts']} attempt(s)"
+                    f"  • {e['ref']} ({e['transition']}), {self._lock_count(e)}"
                     + (f"; last error: {e['last_error']}" if e["last_error"] else "")
                     for e in locked
                 )
@@ -388,3 +406,23 @@ class WaitFeature(Feature):
             confirmation=confirmation,
             data={"locked": locked, "deferred": deferred},
         )
+
+    @staticmethod
+    def _lock_count(entry: dict) -> str:
+        """How many attempts a locked wake's lock fired at, against the cap
+        and the row's live counter (#3391)."""
+        locked_at = entry["locked_at_attempts"]
+        cap = entry["delivery_max_attempts"]
+        counter = entry["delivery_attempts"]
+        if locked_at is None:
+            text = (
+                f"locked at an unrecorded attempt count "
+                f"(counter reads {counter} of {cap})"
+            )
+        else:
+            text = f"locked at {locked_at} of {cap} attempt(s)"
+            if counter != locked_at:
+                text += f", counter now reads {counter}"
+        if entry["attempt_count_mismatch"]:
+            text += " — ATTEMPT COUNT MISMATCH"
+        return text
