@@ -26,6 +26,7 @@ from kestrel_sovereign.resume_monitor import (
 )
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
 from kestrel_sovereign.heartbeat import HeartbeatConfig, HeartbeatRunner, HeartbeatResult
+from tests.utils.scheduler_ticks import tick_and_settle
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +253,7 @@ class TestSchedulerMisfireGrace:
         runner = SchedulerRunner(
             db, "test-agent", executor, misfire_grace_seconds=600
         )
-        await runner._tick()
+        await tick_and_settle(runner)
 
         executor.assert_not_called()  # the slept-through run is skipped
         outcome = next(
@@ -280,7 +281,7 @@ class TestSchedulerMisfireGrace:
         runner = SchedulerRunner(
             db, "test-agent", executor, misfire_grace_seconds=600
         )
-        await runner._tick()
+        await tick_and_settle(runner)
 
         executor.assert_called_once_with("wellness_check", {})
 
@@ -296,7 +297,7 @@ class TestSchedulerMisfireGrace:
         runner = SchedulerRunner(
             db, "test-agent", executor, misfire_grace_seconds=0
         )
-        await runner._tick()
+        await tick_and_settle(runner)
 
         # Legacy behaviour: even a 5h-late task fires.
         executor.assert_called_once_with("wellness_check", {})

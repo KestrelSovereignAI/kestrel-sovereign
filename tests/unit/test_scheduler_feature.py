@@ -41,6 +41,7 @@ from kestrel_sovereign.hold import HeldWorkDisposition
 from kestrel_sovereign.signals.sources.scheduler import cron_source_name
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+from tests.utils.scheduler_ticks import tick_and_settle
 
 
 # =========================================================================
@@ -1732,7 +1733,7 @@ class TestSchedulerRunner:
         db.fetchall = AsyncMock(return_value=[])
         executor = AsyncMock()
         runner = SchedulerRunner(db, "test-agent", executor)
-        await runner._tick()
+        await tick_and_settle(runner)
         executor.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1745,7 +1746,7 @@ class TestSchedulerRunner:
         ])
         executor = AsyncMock(return_value='{"status": "ok"}')
         runner = SchedulerRunner(db, "test-agent", executor)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         executor.assert_called_once_with("wellness_check", {})
 
@@ -1776,7 +1777,7 @@ class TestSchedulerRunner:
             return "ok"
 
         runner = SchedulerRunner(db, "test-agent", executor, max_concurrent_tasks=2)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         assert len(ran) == 6          # every due task executed
         assert peak == 2              # never exceeded the cap
@@ -1807,7 +1808,7 @@ class TestSchedulerRunner:
             return "ok"
 
         runner = SchedulerRunner(db, "test-agent", executor, max_concurrent_tasks=1)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         assert peak == 1              # strictly serial
 
@@ -1832,7 +1833,7 @@ class TestSchedulerRunner:
             return "ok"
 
         runner = SchedulerRunner(db, "test-agent", executor, max_concurrent_tasks=3)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         # All three were attempted despite the first raising.
         assert len(ran) == 3
@@ -1847,7 +1848,7 @@ class TestSchedulerRunner:
         ])
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         # A durable scheduler first claims the row, records a ``claimed``
         # execution identity, and only then commits the terminal outcome.
@@ -1872,7 +1873,7 @@ class TestSchedulerRunner:
         ])
         executor = AsyncMock(side_effect=ValueError("task not found"))
         runner = SchedulerRunner(db, "test-agent", executor)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         # The durable log starts claimed then transitions to failed via CAS.
         outcome_call = next(
@@ -1907,7 +1908,7 @@ class TestSchedulerRunner:
         )
         runner = SchedulerRunner(db, "test-agent", executor)
 
-        await runner._tick()
+        await tick_and_settle(runner)
 
         outcome_call = next(
             c for c in db.execute.call_args_list
@@ -1974,7 +1975,7 @@ class TestSchedulerRunner:
                 ),
             )
 
-            await runner._tick()
+            await tick_and_settle(runner)
 
             schedule = await db.fetchone(
                 "SELECT enabled, last_run_at FROM scheduled_tasks WHERE id = ?",
@@ -1999,7 +2000,7 @@ class TestSchedulerRunner:
             assert "resume the schedule" in history[1]
 
             # A later poll cannot redispatch the disabled schedule.
-            await runner._tick()
+            await tick_and_settle(runner)
             executor.assert_awaited_once()
         finally:
             await db.close()
@@ -2014,7 +2015,7 @@ class TestSchedulerRunner:
         ])
         executor = AsyncMock(return_value="done")
         runner = SchedulerRunner(db, "test-agent", executor)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         # Locate the claim-CAS completion update (the first writes are claim
         # metadata and the durable ``claimed`` execution log).
@@ -2096,7 +2097,7 @@ class TestSchedulerRunner:
             )
 
             # --- Phase 1: feature enabled → the tool executes on the tick.
-            await runner._tick()
+            await tick_and_settle(runner)
             assert job_feature.calls == 1
             status, _text = await _latest_log_status()
             assert status == "success"
@@ -2104,7 +2105,7 @@ class TestSchedulerRunner:
             # --- Phase 2: soft-disable, tick again → the tool is NOT invoked.
             job_feature.enabled = False
             await _make_due()
-            await runner._tick()
+            await tick_and_settle(runner)
             assert job_feature.calls == 1  # never ran while disabled
             status, text = await _latest_log_status()
             # Benign skip recorded as success, NOT a failure — no per-tick spam.
@@ -2119,7 +2120,7 @@ class TestSchedulerRunner:
             # --- Phase 3: re-enable, tick again → execution is restored.
             job_feature.enabled = True
             await _make_due()
-            await runner._tick()
+            await tick_and_settle(runner)
             assert job_feature.calls == 2
             status, _text = await _latest_log_status()
             assert status == "success"
@@ -2655,7 +2656,7 @@ class TestTaskExecutor:
                 ),
             )
 
-            await runner._tick()
+            await tick_and_settle(runner)
 
             rows = await db.fetchall(
                 "SELECT status, result_text FROM task_execution_log "
@@ -3199,7 +3200,7 @@ class TestRunnerOutcomeSignal:
         db.fetchone = AsyncMock(return_value=("0 8 * * *", 1))
         executor = AsyncMock(return_value=("dispatched", 0.75))
         runner = SchedulerRunner(db, "test-agent", executor)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         outcome_call = next(
             c for c in db.execute.call_args_list
@@ -3219,7 +3220,7 @@ class TestRunnerOutcomeSignal:
         db.fetchone = AsyncMock(return_value=("0 */4 * * *", 1))
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         outcome_call = next(c for c in db.execute.call_args_list if "UPDATE task_execution_log" in c[0][0])
         assert outcome_call[0][1][4] is None
@@ -3236,7 +3237,7 @@ class TestRunnerOutcomeSignal:
         db.fetchone = AsyncMock(return_value=("0 8 * * *", 1))
         executor = AsyncMock(return_value=("dispatched", "high"))
         runner = SchedulerRunner(db, "test-agent", executor)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         outcome_call = next(c for c in db.execute.call_args_list if "UPDATE task_execution_log" in c[0][0])
         assert outcome_call[0][1][4] is None
@@ -3253,7 +3254,7 @@ class TestRunnerOutcomeSignal:
         db.fetchone = AsyncMock(return_value=("0 8 * * *", 1))
         executor = AsyncMock(return_value=("dispatched", 2.5))
         runner = SchedulerRunner(db, "test-agent", executor)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         outcome_call = next(c for c in db.execute.call_args_list if "UPDATE task_execution_log" in c[0][0])
         assert outcome_call[0][1][4] == 1.0
@@ -3280,7 +3281,7 @@ class TestRunnerCronReload:
         db.fetchone = AsyncMock(return_value=("*/5 * * * *", 1))
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         # Find the UPDATE scheduled_tasks call that sets next_run_at
         update_call = next(
@@ -3308,7 +3309,7 @@ class TestRunnerCronReload:
         ])
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         completion = next(
             c for c in db.execute.call_args_list
@@ -3331,7 +3332,7 @@ class TestRunnerCronReload:
         db.fetchone = AsyncMock(return_value=None)
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         executor.assert_not_awaited()
         assert not any(

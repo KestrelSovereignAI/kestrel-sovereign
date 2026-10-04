@@ -41,6 +41,7 @@ from kestrel_sovereign.signals.sources.self_followup import (
     SelfFollowupIntentError,
     normalize_intent,
 )
+from tests.utils.scheduler_ticks import tick_and_settle
 
 SOURCE = cron_source_name(SELF_FOLLOWUP)
 
@@ -104,7 +105,7 @@ async def test_scheduled_follow_up_fires_exactly_once_with_intent_in_the_turn(
     assert created.status is ToolResultStatus.OK
     schedule_id = created.data["task_id"]
 
-    await runner._tick()
+    await tick_and_settle(runner)
     await _drain(agent)
 
     # A real turn ran, and the intention reached it.
@@ -134,7 +135,7 @@ async def test_scheduled_follow_up_fires_exactly_once_with_intent_in_the_turn(
     assert schedule_row[0] == 0, "a one-shot follow-up must not stay enabled"
 
     # Exactly once: a second tick must not re-fire a spent one-shot.
-    await runner._tick()
+    await tick_and_settle(runner)
     await _drain(agent)
     assert len(agent.turn_prompts) == 1
 
@@ -149,7 +150,7 @@ async def test_intent_is_not_stored_raw_in_the_signal_audit(followup_env):
     agent, feature, runner, _db, backend = followup_env
 
     await _schedule(feature)
-    await runner._tick()
+    await tick_and_settle(runner)
     await _drain(agent)
 
     row = await backend.fetch_one(
@@ -195,7 +196,7 @@ async def test_dropped_cognition_occurrence_is_recorded_missed_not_success(
 
     agent.dispatcher.dispatch_signal = _dropped
 
-    await runner._tick()
+    await tick_and_settle(runner)
     await _drain(agent)
 
     assert agent.turn_prompts == [], "no turn should have run"
@@ -261,7 +262,7 @@ async def test_follow_up_scheduled_in_a_chat_turn_returns_to_that_window(
     # The follow-up fires outside the originating turn, so the live accessor
     # no longer answers: the session must come from the persisted row.
     agent.turn_session_id = None
-    await runner._tick()
+    await tick_and_settle(runner)
     await _drain(agent)
 
     assert len(captured) == 1
@@ -288,7 +289,7 @@ async def test_unattended_follow_up_stays_internal(followup_env):
         return await real_dispatch(signal)
 
     agent.dispatcher.dispatch_signal = _capture
-    await runner._tick()
+    await tick_and_settle(runner)
     await _drain(agent)
 
     assert len(captured) == 1
@@ -673,7 +674,7 @@ async def test_projection_reports_pending_then_fired(followup_env):
     # which to consult the dispatcher's surface_record (#3112 P2).
     assert entry["delivery_observed"] is None
 
-    await runner._tick()
+    await tick_and_settle(runner)
     await _drain(agent)
 
     fired = await feature.schedule_self_followups()
@@ -700,7 +701,7 @@ async def test_projection_counts_a_dropped_turn_as_missed(followup_env):
         )
 
     agent.dispatcher.dispatch_signal = _dropped
-    await runner._tick()
+    await tick_and_settle(runner)
     await _drain(agent)
 
     projected = await feature.schedule_self_followups()

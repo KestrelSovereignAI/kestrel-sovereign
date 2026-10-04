@@ -102,9 +102,20 @@ evidence that scheduler infrastructure failed during this process. Runtime
 telemetry runs on an independently-owned heartbeat, so a long cognition task
 does not make a live worker look stale. Those writes are bounded, best-effort
 observers and cannot kill or indefinitely delay the polling loop.
-Occurrence-level failures remain isolated inside a tick and are
-finalized independently, so one failed scheduled task neither cancels its
-siblings nor kills the polling worker.
+A tick admits each due row it selects onto its own runner-owned task and
+returns without waiting for any of them (#3465). Before that change, a tick
+awaited its whole batch, so one occurrence that blocked for 20 minutes kept
+the runner from claiming any later cron row until that row was past its
+misfire grace. The runner records every admitted occurrence until its task
+ends, and a later tick skips a row that is still in flight rather than
+admitting a second claimant. `max_concurrent_tasks` bounds the occurrences
+holding a slot across all ticks; with a value of 1, occurrences run strictly
+serially and one blocked occurrence still holds the only slot. Misfire
+lateness is still measured when an occurrence claims, so a row that waited
+for a slot past its grace is skipped exactly as before. Occurrence-level
+failures are isolated and finalized on their own tasks, so one failed
+scheduled task neither cancels its siblings nor kills the polling worker.
+`stop()` cancels and joins in-flight occurrences along with the worker.
 
 Every poller emits one row per `(authorized agent, worker owner)` pair to
 `scheduler_runtime_status`, including agents with zero schedules. Publication
@@ -145,6 +156,13 @@ or unclaimed work older than both the telemetry threshold and its misfire grace
 fails the critical `scheduler_liveness` check. A due batch owned by a current
 tick remains healthy while rows wait behind the bounded concurrency semaphore,
 but that exemption expires after the telemetry threshold plus one claim lease.
+The poll itself returns at once, so the reported tick stays unfinished from
+the poll that admitted the oldest row still waiting for a slot until a poll
+completes with no admitted row waiting. A row that got a free slot does not
+hold the batch open, so a busy runner that admits work on every poll still
+closes each batch. The in-process watchdog counts an admitted row from its
+admission until its claim returns, so a hung claim is a stall even after the
+poll loop has moved on.
 An unfinished tick past that same bound is explicitly `tick_stalled` and fails
 both public worker availability and detailed scheduler health even when the
 queue contains zero schedules; a tick that later completes recovers those live
@@ -290,10 +308,13 @@ positive `authorized_agent_ids_page_size`, and `is_agent_authorized(agent_id)`.
 The page provider must return unique DIDs in ascending keyset order, strictly
 after `after`, and no more than `limit` values. The runner uses only one page
 for rollout reconciliation, due selection, runtime status, and claim
-membership, then advances the cursor only after that batch completes. An empty
+membership, then advances the cursor once that batch is admitted. An empty
 page wraps the next batch to the start. Cancellation retries the uncommitted
 page, while the required live callback makes removal between selection and a
-rollout or claim effect fail closed. The legacy full-snapshot provider remains
+rollout or claim effect fail closed. An occurrence keeps the page membership
+it was admitted under while the poll moves on to later pages, so its claim,
+renewal, and finalization are not refused merely because the cursor advanced;
+the live callback still revokes it. Unpaged scopes stay strictly current. The legacy full-snapshot provider remains
 available for small fleets and compatibility.
 
 Protocol failures and unresolved scheduler identities are safety outages: they

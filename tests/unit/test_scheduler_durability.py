@@ -41,6 +41,7 @@ from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+from tests.utils.scheduler_ticks import tick_and_settle
 
 
 async def _database(path):
@@ -105,7 +106,7 @@ async def test_two_database_runners_claim_one_occurrence(tmp_path):
     try:
         await runner_a._ensure_tables()
         await _seed_due(db_a)
-        await asyncio.gather(runner_a._tick(), runner_b._tick())
+        await asyncio.gather(tick_and_settle(runner_a), tick_and_settle(runner_b))
 
         assert len(calls) == 1
         history = await db_a.fetchall(
@@ -450,7 +451,7 @@ async def test_dynamic_registration_rollback_preserves_schedule_adopted_by_claim
                 "UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ?",
                 (due, task_id),
             )
-            await replica._tick()
+            await tick_and_settle(replica)
         else:
             now = datetime.now(timezone.utc).isoformat()
             await db_replica.execute(
@@ -1065,7 +1066,7 @@ async def test_expired_lease_recovers_the_same_execution_identity(tmp_path):
             ),
         )
 
-        await runner._tick()
+        await tick_and_settle(runner)
         assert len(seen) == 1
         assert seen[0].id == "execution-1"
         assert seen[0].attempt == 2
@@ -1179,7 +1180,7 @@ async def test_crash_before_outcome_commit_retries_with_same_idempotency_key(tmp
     try:
         await crashing._ensure_tables()
         await _seed_due(db)
-        await crashing._tick()
+        await tick_and_settle(crashing)
         row = await db.fetchone(
             "SELECT claim_execution_id, lease_expires_at FROM scheduled_tasks WHERE id = ?",
             ("task-1",),
@@ -1190,7 +1191,7 @@ async def test_crash_before_outcome_commit_retries_with_same_idempotency_key(tmp
             "UPDATE scheduled_tasks SET lease_expires_at = ? WHERE id = ?",
             ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), "task-1"),
         )
-        await recovering._tick()
+        await tick_and_settle(recovering)
 
         assert len(delivered) == 2
         assert delivered[0].id == delivered[1].id
@@ -1220,12 +1221,12 @@ async def test_death_during_dispatch_releases_to_recovery_with_same_key(tmp_path
     try:
         await dying._ensure_tables()
         await _seed_due(db)
-        await dying._tick()
+        await tick_and_settle(dying)
         await db.execute(
             "UPDATE scheduled_tasks SET lease_expires_at = ? WHERE id = ?",
             ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), "task-1"),
         )
-        await recovery._tick()
+        await tick_and_settle(recovery)
 
         assert len(delivered) == 2
         assert delivered[0].id == delivered[1].id
@@ -1243,8 +1244,8 @@ async def test_one_shot_deadline_becomes_terminal_after_one_fire(tmp_path):
     try:
         await runner._ensure_tables()
         await _seed_due(db, kind="one_shot", policy="fire_once")
-        await runner._tick()
-        await runner._tick()
+        await tick_and_settle(runner)
+        await tick_and_settle(runner)
 
         executor.assert_awaited_once_with("test_task", {})
         row = await db.fetchone(
@@ -1351,7 +1352,7 @@ async def test_fire_once_misfire_policy_executes_one_late_occurrence(tmp_path):
             "UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ?",
             ((datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(), "task-1"),
         )
-        await runner._tick()
+        await tick_and_settle(runner)
 
         executor.assert_awaited_once_with("test_task", {})
         row = await db.fetchone(
@@ -1404,7 +1405,7 @@ async def test_claim_lease_starts_after_a_semaphore_queue_wait(tmp_path):
         await _seed_due(db, task_id="first-task", task_name="first")
         await _seed_due(db, task_id="second-task", task_name="second")
 
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(first_started.wait(), timeout=1)
         # This deliberately exceeds the whole configured lease interval while
         # the second due row waits behind the semaphore.
@@ -1441,7 +1442,7 @@ async def test_one_second_lease_renews_strictly_before_expiry(tmp_path):
     try:
         await runner._ensure_tables()
         await _seed_due(db)
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(dispatch_started.wait(), timeout=1)
         initial_expiry = await db.fetchval(
             "SELECT lease_expires_at FROM scheduled_tasks WHERE id = ?", ("task-1",)
@@ -1504,7 +1505,7 @@ async def test_sqlite_rollout_gate_allows_executor_write_and_delays_fence(tmp_pa
         await db_a.execute("CREATE TABLE scheduler_gate_effects (value TEXT NOT NULL)")
         await _seed_due(db_a)
 
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(entered_executor.wait(), timeout=1)
         assert await db_a.fetchval("SELECT COUNT(*) FROM scheduler_gate_effects") == 1
 
@@ -1655,7 +1656,7 @@ async def test_sqlite_same_did_effects_share_admission_while_fence_drains_them(
         await _seed_due(db_a, task_id="shared-effect-a")
         await _seed_due(db_a, task_id="shared-effect-b")
 
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(both_effects_started.wait(), timeout=2)
         assert set(admitted_effects) == {"shared-effect-a", "shared-effect-b"}
 
@@ -1738,13 +1739,13 @@ async def test_steady_state_rollout_probe_does_not_block_unrelated_due_work(tmp_
         await fleet._ensure_tables()
         await _seed_due(db_a, task_id="held-agent-a", agent_id="agent-a")
 
-        first_tick = asyncio.create_task(first._tick())
+        first_tick = asyncio.create_task(tick_and_settle(first))
         await asyncio.wait_for(first_effect_started.wait(), timeout=1)
         await _seed_due(db_a, task_id="ready-agent-b", agent_id="agent-b")
 
         # Before this probe/read split, fleet._tick() waited for agent-a's
         # effect while taking an exclusive transition gate for every DID.
-        second_tick = asyncio.create_task(fleet._tick())
+        second_tick = asyncio.create_task(tick_and_settle(fleet))
         await asyncio.wait_for(second_effect_finished.wait(), timeout=0.4)
         await asyncio.wait_for(second_tick, timeout=0.4)
         assert await db_a.fetchone(
@@ -1890,7 +1891,7 @@ async def test_renewal_stays_alive_while_terminal_cas_is_contended(
         await runner._ensure_tables()
         await _seed_due(db)
         monkeypatch.setattr(db, "execute", gated_execute)
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(terminal_cas_entered.wait(), timeout=1)
         # The final CAS is intentionally holding the DB write transaction. A
         # first renewal still wakes and tries to renew before we permit that
@@ -1923,7 +1924,7 @@ async def test_attempts_reset_for_next_cron_occurrence_but_recovery_increments(t
     try:
         await runner._ensure_tables()
         first_occurrence = await _seed_due(db)
-        await runner._tick()
+        await tick_and_settle(runner)
         assert observed[-1].attempt == 1
         assert await db.fetchone(
             "SELECT attempt_count FROM scheduled_tasks WHERE id = ?", ("task-1",)
@@ -1936,7 +1937,7 @@ async def test_attempts_reset_for_next_cron_occurrence_but_recovery_increments(t
             "UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ?",
             (second_occurrence, "task-1"),
         )
-        await runner._tick()
+        await tick_and_settle(runner)
         assert observed[-1].attempt == 1
         assert [row[0] for row in await db.fetchall(
             "SELECT attempt_count FROM task_execution_log WHERE task_id = ? ORDER BY rowid",
@@ -1971,7 +1972,7 @@ async def test_attempts_reset_for_next_cron_occurrence_but_recovery_increments(t
             """,
             (recovery_occurrence, recovery_occurrence, recovery_key, recovery_occurrence),
         )
-        await runner._tick()
+        await tick_and_settle(runner)
 
         assert observed[-1].id == "recovery-exec"
         assert observed[-1].attempt == 2
@@ -1998,7 +1999,7 @@ async def test_invalid_persisted_idempotency_key_is_disabled_with_visible_termin
             ("é" * 224, "task-1"),  # 448 UTF-8 bytes
         )
 
-        await runner._tick()
+        await tick_and_settle(runner)
 
         executor.assert_not_awaited()
         assert await db.fetchone(
@@ -2400,7 +2401,7 @@ async def test_preexisting_legacy_table_requires_nonce_before_v2_execution(
             "rollout_ambiguous_legacy_occurrence",
         )
 
-        await activated._tick()
+        await tick_and_settle(activated)
         # This row was due when the legacy selector was fenced. Its effect may
         # already have happened in the exact select → dispatch → re-read
         # ordering of origin/main, so ACK never replays it automatically.
@@ -2505,7 +2506,7 @@ async def test_legacy_selected_then_fenced_then_dispatched_and_disabled_reread_s
             "SELECT enabled, last_run_at, next_run_at, terminal_status FROM scheduled_tasks WHERE id = ?",
             ("legacy-task",),
         ) == (0, legacy_last_run, due, "rollout_ambiguous_legacy_occurrence")
-        await acknowledged._tick()
+        await tick_and_settle(acknowledged)
         v2_calls.assert_not_awaited()
     finally:
         await db.close()
@@ -2573,7 +2574,7 @@ async def test_legacy_enabled_reread_before_fence_cannot_conditionally_reschedul
             "SELECT enabled, next_run_at, terminal_status FROM scheduled_tasks WHERE id = ?",
             ("legacy-task",),
         ) == (0, due, "rollout_ambiguous_legacy_occurrence")
-        await acknowledged._tick()
+        await tick_and_settle(acknowledged)
         v2_calls.assert_not_awaited()
     finally:
         await db.close()
@@ -2639,7 +2640,7 @@ async def test_legacy_insert_omitting_protocol_on_v2_schema_is_quiesced(
         )
 
         with pytest.raises(SchedulerRolloutQuiescenceRequired):
-            await runner._tick()
+            await tick_and_settle(runner)
 
         assert await db.fetchone(
             """
@@ -2885,7 +2886,7 @@ async def test_rollout_fence_revokes_live_claim_and_recovers_stable_occurrence_a
             ("task-1",),
         ) == (0, None)
 
-        await recovery._tick()
+        await tick_and_settle(recovery)
         assert len(delivered) == 1
         assert delivered[0].id == claimed.claim_execution_id
         assert delivered[0].attempt == 2
@@ -2980,7 +2981,7 @@ async def test_host_runner_skips_claim_for_soft_disabled_scheduler_feature(tmp_p
             task_name="custom_tool",
         )
 
-        await runner._tick()
+        await tick_and_settle(runner)
 
         dispatched.assert_not_awaited()
         assert await db.fetchone(
@@ -3032,7 +3033,7 @@ async def test_host_runner_skips_cold_tenant_that_excludes_scheduler_feature(tmp
             task_name="custom_tool",
         )
 
-        await runner._tick()
+        await tick_and_settle(runner)
 
         manager._initialize_agent.assert_not_awaited()
         assert await db.fetchone(
@@ -3079,7 +3080,7 @@ async def test_host_runner_preserves_claim_when_cold_load_lacks_scheduler_featur
             task_name="custom_tool",
         )
 
-        await runner._tick()
+        await tick_and_settle(runner)
 
         manager._initialize_agent.assert_awaited_once()
         claim = await db.fetchone(
@@ -3120,7 +3121,7 @@ async def test_host_runner_preserves_claim_when_cold_load_lacks_scheduler_featur
             "UPDATE scheduled_tasks SET lease_expires_at = ? WHERE id = ?",
             (expired, "cold-missing-custom-tool"),
         )
-        await runner._tick()
+        await tick_and_settle(runner)
         manager._initialize_agent.assert_awaited_once()
         assert await db.fetchone(
             "SELECT id, status, attempt_count FROM task_execution_log WHERE task_id = ?",
@@ -3283,7 +3284,7 @@ async def test_prepared_agent_manager_cold_load_precedes_admission_and_holds_del
     try:
         await runner._ensure_tables()
         await _seed_due(db)
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(admission_entered.wait(), timeout=1)
         await asyncio.wait_for(dispatch_started.wait(), timeout=1)
         assert await db.fetchone(
@@ -3366,7 +3367,7 @@ async def test_structural_host_executor_needs_no_private_marker(tmp_path):
     try:
         await runner._ensure_tables()
         await _seed_due(db)
-        await runner._tick()
+        await tick_and_settle(runner)
 
         assert len(executions) == 1
         assert executions[0].agent_id == "agent-1"
@@ -3390,7 +3391,7 @@ async def test_host_runner_cannot_claim_or_advance_foreign_fleet_rows(tmp_path):
             db, task_id="foreign-task", agent_id="did:foreign:fleet"
         )
 
-        await runner._tick()
+        await tick_and_settle(runner)
 
         executor.assert_awaited_once_with("test_task", {})
         foreign = await db.fetchone(
@@ -3411,7 +3412,7 @@ async def test_host_runner_cannot_claim_or_advance_foreign_fleet_rows(tmp_path):
         # The next local occurrence is in the future, and the foreign row is
         # still due. A second host tick must neither redeliver local work nor
         # terminalize the row belonging to another fleet.
-        await runner._tick()
+        await tick_and_settle(runner)
         executor.assert_awaited_once()
         assert await db.fetchone(
             "SELECT next_run_at FROM scheduled_tasks WHERE id = ?",
@@ -3465,10 +3466,10 @@ async def test_paged_host_authority_is_bounded_and_reaches_later_did(tmp_path):
         await _seed_due(db, task_id="foreign-before", agent_id="agent-0")
         await _seed_due(db, task_id="foreign-between", agent_id="agent-3.5")
 
-        await runner._tick()
-        await runner._tick()
+        await tick_and_settle(runner)
+        await tick_and_settle(runner)
         executor.assert_not_awaited()
-        await runner._tick()
+        await tick_and_settle(runner)
         executor.assert_awaited_once_with("test_task", {})
 
         assert provider_calls == [(None, 2), ("agent-2", 2), ("agent-4", 2)]
@@ -3516,10 +3517,10 @@ async def test_paged_host_authority_retries_cancelled_page(tmp_path):
 
         runner._ensure_protocol_rollout = cancel_first_rollout
         with pytest.raises(asyncio.CancelledError):
-            await runner._tick()
+            await tick_and_settle(runner)
         assert runner._authorized_agent_ids_page_cursor is None
 
-        await runner._tick()
+        await tick_and_settle(runner)
         assert provider_cursors == [None, None]
         assert runner._authorized_agent_ids_page_cursor == "agent-1"
     finally:
@@ -3553,7 +3554,7 @@ async def test_paged_host_authority_removal_before_claim_fails_closed(tmp_path):
     try:
         await runner._ensure_tables()
         await _seed_due(db, task_id="revoked-page", agent_id="agent-1")
-        await runner._tick()
+        await tick_and_settle(runner)
         assert await db.fetchone(
             "SELECT enabled, lease_owner FROM scheduled_tasks WHERE id = ?",
             ("revoked-page",),
@@ -3638,7 +3639,7 @@ async def test_renewal_exception_before_effect_fails_closed(tmp_path, caplog):
         await _seed_due(db)
 
         with caplog.at_level("ERROR", logger="kestrel_sovereign.features.scheduler.runner"):
-            await runner._tick()
+            await tick_and_settle(runner)
 
         await asyncio.wait_for(renewal_started.wait(), timeout=1)
         executor.assert_not_awaited()
@@ -3648,7 +3649,7 @@ async def test_renewal_exception_before_effect_fails_closed(tmp_path, caplog):
         ) == [("claimed", 1)]
         assert any("lease renewal failed" in record.getMessage() for record in caplog.records)
 
-        await runner._tick()
+        await tick_and_settle(runner)
         executor.assert_not_awaited()
     finally:
         await db.close()
@@ -3709,7 +3710,7 @@ async def test_final_admission_read_failure_preserves_claim_without_dispatch(
             # verification at the final pre-effect admission boundary.
             runner._claim_token_is_live = read_final_claim_token
 
-        await runner._tick()
+        await tick_and_settle(runner)
 
         executor.assert_not_awaited()
         assert isinstance(runner.readiness_failure, RuntimeError)
@@ -3776,7 +3777,7 @@ async def test_renewal_loss_during_preparation_never_enters_effect(tmp_path):
     try:
         await runner._ensure_tables()
         await _seed_due(db)
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(preparation_started.wait(), timeout=1)
         await asyncio.wait_for(renewal_started.wait(), timeout=1)
 
@@ -3853,7 +3854,7 @@ async def test_detached_child_observes_runner_revocation_not_absence(tmp_path):
     try:
         await runner._ensure_tables()
         await _seed_due(db)
-        await runner._tick()
+        await tick_and_settle(runner)
         assert get_current_scheduler_execution() is None
 
         release_child.set()
@@ -3904,7 +3905,7 @@ async def test_renewal_loss_during_effect_cancels_owned_work_without_finalizing(
     try:
         await runner._ensure_tables()
         await _seed_due(db)
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(effect_started.wait(), timeout=1)
         await asyncio.wait_for(renewal_started.wait(), timeout=1)
 
@@ -3973,7 +3974,7 @@ async def test_host_lifecycle_runner_claims_and_wakes_a_cold_agent(monkeypatch, 
         await runner.stop()
         await _seed_due(db)
 
-        await runner._tick()
+        await tick_and_settle(runner)
 
         manager.load_agent.assert_awaited_once_with(
             "Cold",
