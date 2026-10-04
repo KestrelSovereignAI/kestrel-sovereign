@@ -420,6 +420,8 @@ Embeddings join the same recorder with `modality="embedding"` rather than gettin
 
 `ProviderEmbeddingService` records every dispatched `aembed`, `aembed_query` and `aembed_batch` call, whether it returns, raises or is cancelled. An empty batch dispatches nothing and records nothing. `LLMService` builds every embedding service it uses, including route, pin and parity probes, through one factory that attaches the recorder.
 
+The embedding methods take no invocation context, and most embeddings happen deep inside an agent turn: retrieval queries, conversation persistence and tools. So `process_input` and `process_input_streaming` publish the turn's identity inputs for the turn's `LLMService` while the turn runs: the caller's `invocation_context` and the turn's `session_id`. The embedding snapshot resolves them with the same `_resolve_invocation_context` call the turn's chat makes. A caller that passes `invocation_context` explicitly therefore gets its embeddings attributed and metered exactly as a caller that set ambient identity. The binding is declared turn-scoped (`kestrel_sovereign/turn_scope.py`), so an inline tool running on a task older than the turn carries it. It is keyed to its service, so another agent's service on the same task never reads it. `decide` still resolves its context at entry and does not read the binding.
+
 | Sink | What is written for an embedding call |
 |---|---|
 | `model_usage` | input tokens against (model, provider), when the route reports them |

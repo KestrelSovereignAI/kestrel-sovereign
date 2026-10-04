@@ -33,7 +33,10 @@ from kestrel_sovereign.agent.invocation import (
 from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.semantic_recall import persistence_dependency_metadata
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
-from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+from kestrel_sovereign.llm.invocation_context import (
+    LLMInvocationContext,
+    turn_invocation_scope,
+)
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
     check_prompt_injection,
@@ -1191,7 +1194,13 @@ class StreamingMixin:
                         # #1914: bind a per-turn part buffer so tools/features can
                         # ``emit_part`` typed component bubbles; the orchestrator
                         # drains it into PART sentinels at the point each tool ran.
-                        with part_collector():
+                        # #3426: publish the turn's identity for the embeddings it
+                        # makes, as process_input does.
+                        with part_collector(), turn_invocation_scope(
+                            getattr(self, "llm_service", None),
+                            invocation_context,
+                            session_id=session_id,
+                        ):
                             async for chunk in self._process_input_streaming_traced_locked(
                                 user_input, model_override, session_id, _otel_span,
                                 request_id=request_id, attachments=attachments,

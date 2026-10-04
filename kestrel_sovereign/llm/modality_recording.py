@@ -17,7 +17,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Optional, Protocol, Set
 
-from .invocation_context import LLMInvocationContext
+from .invocation_context import LLMInvocationContext, turn_invocation_for
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +63,20 @@ class ModalityRecordingMixin:
     """Records :class:`ModalityCall` objects for ``LLMService``."""
 
     def snapshot_invocation_context(self) -> LLMInvocationContext:
-        """Freeze the caller's identity before the call's first await (§8.3)."""
+        """Freeze the caller's identity before the call's first await (§8.3).
 
-        return self._resolve_invocation_context()
+        Inside one of this service's agent turns, the turn's own identity is
+        resolved exactly as the turn's chat call resolves it, so a turn whose
+        caller passed ``invocation_context`` explicitly attributes and meters
+        its embeddings like a turn that set ambient identity (#3426).
+        """
+
+        turn = turn_invocation_for(self)
+        if turn is None:
+            return self._resolve_invocation_context()
+        return self._resolve_invocation_context(
+            turn.context, session_id=turn.session_id
+        )
 
     async def record_modality_call(self, call: ModalityCall) -> None:
         """Write ``call`` without letting it alter the caller's outcome.

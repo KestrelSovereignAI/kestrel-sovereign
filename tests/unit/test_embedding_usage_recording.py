@@ -11,6 +11,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import math
+import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -528,3 +530,244 @@ def test_reported_usage_accumulates_and_ignores_implausible_values() -> None:
     usage.add(input_tokens=3, cost=0.25, model="m")
     usage.add(input_tokens=4, cost=0.5)
     assert (usage.input_tokens, usage.cost, usage.model) == (7, 0.75, "m")
+
+
+# ---------------------------------------------------------------------------
+# A turn's identity reaches its embeddings, however the caller supplied it
+# ---------------------------------------------------------------------------
+
+TURN_SESSION = "3426-turn-session"
+# The caller's identity carries no session: the turn's own ``session_id``
+# argument fills it, for embeddings as for chat.
+TURN_IDENTITY = dict(companion_id="companion-3426", user_id="user-3426")
+TURN_ATTRIBUTION = (TURN_SESSION, "companion-3426", "user-3426")
+UNATTRIBUTED = (None, None, None)
+TOOL_TEXT = "a note the inline tool embeds"
+
+
+def _attribution(row: Dict[str, Any]) -> tuple:
+    return (row["session_id"], row["companion_id"], row["user_id"])
+
+
+@pytest.mark.asyncio
+async def test_a_turns_identity_reaches_only_its_own_service_during_the_turn() -> None:
+    from kestrel_sovereign.llm.invocation_context import turn_invocation_scope
+
+    llm, embed = _embedding_service(UsageReportingAdapter())
+    other, other_embed = _embedding_service(UsageReportingAdapter())
+
+    with turn_invocation_scope(
+        llm, LLMInvocationContext(**TURN_IDENTITY), session_id=TURN_SESSION
+    ):
+        await embed.aembed("inside the turn")
+        await other_embed.aembed("another agent's service, same task")
+    await embed.aembed("after the turn")
+
+    inside, after = _logged(llm)
+    [foreign] = _logged(other)
+    assert _attribution(inside) == TURN_ATTRIBUTION
+    assert _attribution(foreign) == UNATTRIBUTED
+    assert _attribution(after) == UNATTRIBUTED
+
+
+class _TurnSinks:
+    """A booted agent's ``llm_calls`` store and metering callback."""
+
+    def __init__(self) -> None:
+        self.store = SimpleNamespace(log_llm_call=AsyncMock())
+        self.bills: List[Dict[str, Any]] = []
+
+    async def meter(self, *, companion_id, user_id, provider, model, prompt_tokens,
+                    completion_tokens, modality):
+        self.bills.append(dict(companion_id=companion_id, user_id=user_id,
+                               model=model, prompt_tokens=prompt_tokens,
+                               modality=modality))
+
+    def embedding_rows(self) -> List[Dict[str, Any]]:
+        return [
+            call.kwargs
+            for call in self.store.log_llm_call.await_args_list
+            if (call.kwargs.get("metadata") or {}).get("modality") == "embedding"
+        ]
+
+    def embedding_bills(self) -> List[Dict[str, Any]]:
+        return [bill for bill in self.bills if bill["modality"] == "embedding"]
+
+
+@asynccontextmanager
+async def _booted_agent(tmp_path, monkeypatch, adapter: Any, sinks: _TurnSinks,
+                        generate=None):
+    """A real agent on real storage, with an embedding route that reports usage.
+
+    Only the chat provider calls are scripted. Every embedding the turn makes
+    (retrieval queries, conversation persistence, tools) goes through the
+    agent's own ``LLMService`` recorder to the sinks in ``sinks``.
+    """
+    from kestrel_sovereign.bootstrap import BootstrapState
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.llm.adapter import LLMResponse
+    from kestrel_sovereign.llm.service import LLMService
+    from tests.shared.genesis_audit import complete_deterministic_genesis_audit
+
+    credentials = await create_kestrel_identity_async(
+        output_dir=str(tmp_path), is_test_instance=True, agent_name="EmbedMeter"
+    )
+    llm_service = LLMService()
+    agent = KestrelAgent(
+        did=credentials.agent_did,
+        storage_path=os.path.join(str(tmp_path), "kestrel_prime.db"),
+        llm_service=llm_service,
+    )
+    try:
+        await agent.initialize()
+        await complete_deterministic_genesis_audit(
+            agent, provenance="test:embedding_turn_metering"
+        )
+        await agent.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
+
+        embedding = llm_service._new_embedding_service(_provider(adapter))
+        monkeypatch.setattr(
+            llm_service, "get_embedding_service", lambda *_a, **_k: embedding
+        )
+        llm_service.set_observability_store(sinks.store)
+        llm_service.set_metering_callback(sinks.meter)
+
+        async def generate_with_messages(*_args, **kwargs):
+            if generate is not None:
+                await generate(**kwargs)
+            return LLMResponse(content="Noted.")
+
+        async def stream_with_tool_detection(*_args, **_kwargs):
+            yield "Noted."
+
+        monkeypatch.setattr(llm_service, "generate_with_messages", generate_with_messages)
+        monkeypatch.setattr(
+            llm_service, "stream_with_tool_detection", stream_with_tool_detection
+        )
+        yield agent
+        await llm_service.drain_modality_records()
+    finally:
+        await agent.shutdown()
+        await llm_service.close()
+
+
+TURN_MESSAGE = "Please remember that the heron came back to the mill pond today."
+
+
+async def _run_turn(agent, entry_point: str, identity: str,
+                    message: str = TURN_MESSAGE) -> str:
+    """Run one turn, its identity supplied ``explicit``-ly or as ``ambient`` state."""
+    kwargs: Dict[str, Any] = {}
+    if identity == "explicit":
+        kwargs["invocation_context"] = LLMInvocationContext(**TURN_IDENTITY)
+    else:
+        agent.llm_service.set_observability_context(
+            session_id=TURN_SESSION, **TURN_IDENTITY
+        )
+    if entry_point == "process_input":
+        return await agent.process_input(message, session_id=TURN_SESSION, **kwargs)
+    return "".join(
+        [
+            chunk
+            async for chunk in agent.process_input_streaming(
+                message, session_id=TURN_SESSION, **kwargs
+            )
+        ]
+    )
+
+
+def _assert_every_embedding_is_the_turns(adapter, sinks: _TurnSinks) -> None:
+    rows = sinks.embedding_rows()
+    # One record per dispatched call: the adapter saw every embedding.
+    assert len(rows) == len(adapter.texts)
+    assert [_attribution(row) for row in rows] == [TURN_ATTRIBUTION] * len(rows)
+    assert sinks.embedding_bills() == [
+        dict(companion_id="companion-3426", user_id="user-3426", model=MODEL,
+             prompt_tokens=7, modality="embedding")
+    ] * len(rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity", ["explicit", "ambient"])
+@pytest.mark.parametrize("entry_point", ["process_input", "process_input_streaming"])
+async def test_a_turn_attributes_and_meters_its_embeddings(
+    tmp_path, monkeypatch, entry_point, identity
+) -> None:
+    """``invocation_context`` reaches the turn's embeddings, not only its chat.
+
+    ``explicit`` sets no ambient ``set_observability_context`` at all: the
+    identity exists only as the argument the caller passed to the turn. It must
+    be recorded and billed exactly as the ``ambient`` turn is.
+    """
+    adapter = UsageReportingAdapter(tokens=7, cost=0.0003)
+    sinks = _TurnSinks()
+    async with _booted_agent(tmp_path, monkeypatch, adapter, sinks) as agent:
+        assert await _run_turn(agent, entry_point, identity) == "Noted."
+
+    # The turn really made the embeddings #3426 is about: retrieval queries and
+    # conversation-persistence writes. Without them the identity assertions
+    # below would hold vacuously.
+    operations = {row["metadata"]["operation"] for row in sinks.embedding_rows()}
+    assert {"query", "document"} <= operations
+    _assert_every_embedding_is_the_turns(adapter, sinks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry_point", ["process_input", "process_input_streaming"])
+async def test_a_command_turn_attributes_its_embeddings(
+    tmp_path, monkeypatch, entry_point
+) -> None:
+    """A ``!`` command runs before the turn's LLM body, and a streamed one is
+    delegated to ``process_input``. Its embeddings are still the turn's."""
+    adapter = UsageReportingAdapter(tokens=7, cost=0.0003)
+    sinks = _TurnSinks()
+    async with _booted_agent(tmp_path, monkeypatch, adapter, sinks) as agent:
+        await _run_turn(agent, entry_point, "explicit", message="!recall heron")
+
+    assert adapter.texts, "the command made no embedding call"
+    _assert_every_embedding_is_the_turns(adapter, sinks)
+
+
+@pytest.mark.asyncio
+async def test_an_inline_tool_on_a_task_older_than_the_turn_carries_its_identity(
+    tmp_path, monkeypatch
+) -> None:
+    """The codex app-server runs each tool on a reader task spawned before the
+    turn, so the turn's identity reaches it only as declared turn-scoped state.
+    """
+    adapter = UsageReportingAdapter(tokens=7, cost=0.0003)
+    sinks = _TurnSinks()
+    requests: asyncio.Queue = asyncio.Queue()
+
+    async def reader() -> None:
+        while (request := await requests.get()) is not None:
+            executor, done = request
+            try:
+                done.set_result(await executor("embed_note", {}))
+            except Exception as exc:  # noqa: BLE001 - re-raised via the future
+                done.set_exception(exc)
+
+    async def generate(*, tool_executor, **_kwargs) -> None:
+        done = asyncio.get_running_loop().create_future()
+        await requests.put((tool_executor, done))
+        await done
+
+    async with _booted_agent(
+        tmp_path, monkeypatch, adapter, sinks, generate=generate
+    ) as agent:
+        async def execute_named_tool(name, args, *, session_id, source, _capture):
+            _capture["effective_args"] = args
+            return await agent.llm_service.get_embedding_service().aembed(TOOL_TEXT)
+
+        monkeypatch.setattr(agent, "execute_named_tool", execute_named_tool)
+        reader_task = asyncio.create_task(reader())
+        await asyncio.sleep(0)  # the reader is running before the turn starts
+        try:
+            assert await _run_turn(agent, "process_input", "explicit") == "Noted."
+        finally:
+            await requests.put(None)
+            await reader_task
+
+    assert TOOL_TEXT in adapter.texts
+    _assert_every_embedding_is_the_turns(adapter, sinks)
