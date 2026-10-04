@@ -1,9 +1,10 @@
 """Durability contracts for scheduler claims, leases, deadlines, and zones."""
 
 import asyncio
+import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
@@ -48,6 +49,57 @@ async def _database(path):
     backend = SQLiteBackend(str(path))
     await backend.connect()
     return AsyncDatabase(backend)
+
+
+# Bounds a wait that is expected to finish quickly. It only stops a hung test;
+# no assertion depends on how long the wait took.
+_HANG_GUARD_SECONDS = 30
+
+
+class _PeerSQLiteWriter:
+    """Another connection writing the same SQLite file in the middle of a unit.
+
+    ``write`` first tries without waiting, so whether it lands inside the unit
+    is decided by SQLite's locks, not by timing. A write the unit locks out is
+    retried in the background with an ordinary busy timeout, as a replica's
+    telemetry would be.
+    """
+
+    def __init__(self, path):
+        self._path = str(path)
+        self._retry = None
+        with closing(sqlite3.connect(self._path)) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS peer_writes (id INTEGER PRIMARY KEY)"
+            )
+            connection.commit()
+
+    def _insert(self, busy_timeout):
+        with closing(
+            sqlite3.connect(self._path, timeout=busy_timeout, isolation_level=None)
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("INSERT INTO peer_writes DEFAULT VALUES")
+            connection.execute("COMMIT")
+
+    def write(self):
+        try:
+            self._insert(busy_timeout=0)
+        except sqlite3.OperationalError as error:
+            if "database is locked" not in str(error):
+                raise
+            self._retry = asyncio.create_task(
+                asyncio.to_thread(self._insert, _HANG_GUARD_SECONDS)
+            )
+
+    async def settle(self):
+        if self._retry is not None:
+            await self._retry
+
+    async def committed(self):
+        await self.settle()
+        with closing(sqlite3.connect(self._path)) as connection:
+            return connection.execute("SELECT COUNT(*) FROM peer_writes").fetchone()[0]
 
 
 async def _seed_due(
@@ -4035,7 +4087,9 @@ async def test_shared_host_runner_owners_do_not_collide_for_pid_one_replicas(
         for app in apps[:2]:
             await server._start_host_scheduler(app, manager, object())
             started_apps.append(app)
-            await asyncio.wait_for(wait_for_initial_tick(app), timeout=2)
+            await asyncio.wait_for(
+                wait_for_initial_tick(app), timeout=_HANG_GUARD_SECONDS
+            )
 
         first = apps[0].state.host_scheduler_runner
         peer = apps[1].state.host_scheduler_runner
@@ -4081,7 +4135,9 @@ async def test_shared_host_runner_owners_do_not_collide_for_pid_one_replicas(
 
         await server._start_host_scheduler(apps[2], manager, object())
         started_apps.append(apps[2])
-        await asyncio.wait_for(wait_for_initial_tick(apps[2]), timeout=2)
+        await asyncio.wait_for(
+            wait_for_initial_tick(apps[2]), timeout=_HANG_GUARD_SECONDS
+        )
         replacement = apps[2].state.host_scheduler_runner
         assert replacement._owner_id not in {stopped_owner, peer._owner_id}
         await replacement._publish_runtime_status("running")
@@ -4115,6 +4171,116 @@ async def test_shared_host_runner_owners_do_not_collide_for_pid_one_replicas(
     finally:
         for app in reversed(started_apps):
             await server._shutdown_host_scheduler(app)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_replica_bootstrap_waits_for_a_peer_write(monkeypatch, tmp_path):
+    """A peer's write during a replica's bootstrap waits instead of failing it.
+
+    Bootstrap reads protocol state before its first write. In a deferred
+    SQLite transaction, a write another connection committed after that read
+    failed the first bootstrap write with "database is locked" at once,
+    without waiting out the busy timeout (#3352).
+    """
+
+    path = tmp_path / "replicas.db"
+    live_db = await _database(path)
+    replica_db = None
+    peer = None
+    try:
+        await SchedulerRunner(
+            live_db, "agent-1", AsyncMock(), owner_id="live"
+        )._ensure_tables()
+        peer = _PeerSQLiteWriter(path)
+        replica_db = await _database(path)
+        replica = SchedulerRunner(
+            replica_db, "agent-1", AsyncMock(), owner_id="replica"
+        )
+        inspect_protocol = replica._reject_newer_scheduler_protocol_state
+        inspections = []
+
+        async def peer_writes_after_inspection():
+            await inspect_protocol()
+            if not inspections:
+                peer.write()
+            inspections.append(True)
+
+        monkeypatch.setattr(
+            replica,
+            "_reject_newer_scheduler_protocol_state",
+            peer_writes_after_inspection,
+        )
+
+        await replica.start(polling=False)
+
+        assert inspections
+        assert replica._protocol_ready is True
+        assert await peer.committed() == 1
+        assert await live_db.fetchone(
+            "SELECT protocol_version, state FROM scheduler_protocol_rollout "
+            "WHERE agent_id = ?",
+            ("agent-1",),
+        ) == (SCHEDULER_PROTOCOL_VERSION, SCHEDULER_ROLLOUT_STATE_ACTIVE)
+    finally:
+        if peer is not None:
+            await peer.settle()
+        if replica_db is not None:
+            await replica_db.close()
+        await live_db.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_rollout_fence_waits_for_a_peer_write(monkeypatch, tmp_path):
+    """A steady-state rollout fence reads before writing, like bootstrap."""
+
+    path = tmp_path / "rollout-fence.db"
+    db = await _database(path)
+    peer = None
+    try:
+        runner = SchedulerRunner(db, "agent-1", AsyncMock(), owner_id="fencer")
+        await runner._ensure_tables()
+        peer = _PeerSQLiteWriter(path)
+        due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at)
+            VALUES ('late-legacy', 'agent-1', 'legacy', '* * * * *', '{}', 1, ?, ?)
+            """,
+            (due, due),
+        )
+        rotate = runner._rotate_rollout_nonce
+        rotations = []
+
+        async def peer_writes_before_rotation(*args, **kwargs):
+            if not rotations:
+                peer.write()
+            rotations.append(True)
+            return await rotate(*args, **kwargs)
+
+        monkeypatch.setattr(
+            runner, "_rotate_rollout_nonce", peer_writes_before_rotation
+        )
+
+        with pytest.raises(SchedulerRolloutQuiescenceRequired):
+            await runner._ensure_protocol_rollout(preexisting_schedule_table=True)
+
+        assert rotations
+        assert await peer.committed() == 1
+        assert await db.fetchone(
+            "SELECT enabled, scheduler_rollout_fenced FROM scheduled_tasks "
+            "WHERE id = ?",
+            ("late-legacy",),
+        ) == (0, 1)
+        assert await db.fetchone(
+            "SELECT state FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            ("agent-1",),
+        ) == ("quiescing",)
+    finally:
+        if peer is not None:
+            await peer.settle()
+        await db.close()
 
 
 @pytest.mark.asyncio

@@ -2040,12 +2040,24 @@ class SchedulerRunner:
         )
 
     @asynccontextmanager
-    async def _transaction(self):
+    async def _transaction(self, *, immediate: bool = False):
+        """Open one scheduler transaction.
+
+        Pass ``immediate`` for a unit that reads before its first write. A
+        deferred SQLite transaction that has already read cannot become a
+        writer once another connection has committed or holds the writer slot:
+        SQLite answers "database is locked" at once without honoring
+        ``busy_timeout``. ``BEGIN IMMEDIATE`` takes the slot first, so that
+        unit waits its turn instead. Other backends ignore the distinction.
+        """
         transaction = getattr(self._db, "transaction", None)
         if not callable(transaction):
             yield
             return
-        context = transaction()
+        if immediate and self._database_backend_type() == "sqlite":
+            context = transaction(immediate=True)
+        else:
+            context = transaction()
         if not hasattr(context, "__aenter__"):
             yield
             return
@@ -2444,7 +2456,10 @@ class SchedulerRunner:
         takes a global writer lock *before* its write transaction, then takes
         normal per-DID writer gates in deterministic order. That ordering
         avoids a bootstrap writer holding the database writer while waiting
-        for admitted effects to leave their DID leases.
+        for admitted effects to leave their DID leases. The SQLite transaction
+        is ``BEGIN IMMEDIATE`` because bootstrap reads protocol state before
+        its first write, and a peer connection on the same file (a ticking
+        replica, its telemetry) may write in between.
         """
 
         async with self._sqlite_rollout_gate(_SCHEDULER_BOOTSTRAP_LOCK_SCOPE):
@@ -2456,7 +2471,7 @@ class SchedulerRunner:
                 async with self._postgres_rollout_effect_gates(
                     self._authorized_agent_ids
                 ):
-                    async with self._transaction():
+                    async with self._transaction(immediate=True):
                         await self._acquire_scheduler_schema_lock()
                         yield
 
@@ -4904,7 +4919,9 @@ class SchedulerRunner:
     ) -> Optional[str]:
         """Reconcile one DID's rollout row and return a required ACK nonce."""
 
-        async with self._transaction():
+        # Reads the control row before writing it, so SQLite must hold its
+        # writer slot from BEGIN (see ``_transaction``).
+        async with self._transaction(immediate=True):
             # Conditional state writes make PostgreSQL's read-committed
             # transactions safe when two new replicas observe an active row
             # concurrently. A loser rereads the winner's nonce rather than
