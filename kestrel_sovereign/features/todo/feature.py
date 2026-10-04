@@ -121,6 +121,17 @@ def _as_dict(
     return dict(value), None
 
 
+def _ok_with_warnings(
+    confirmation: str, data: Dict[str, Any], warnings: List[str]
+) -> ToolResult:
+    """An OK result for a committed write, carrying any projection warnings."""
+    if warnings:
+        confirmation = f"{confirmation} (warning: {'; '.join(warnings)})"
+    return ToolResult.ok(
+        confirmation=confirmation, data={**data, "warnings": warnings}
+    )
+
+
 def _coerce_limit(
     value: Any, *, default: int = 50, maximum: int = 500
 ) -> tuple[Optional[int], Optional[str]]:
@@ -237,6 +248,43 @@ class TodoFeature(Feature):
                 properties=props,
             )
         )
+
+    async def _project_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        label: str,
+        properties: Dict[str, Any],
+        *,
+        external_reference: bool = False,
+    ) -> List[str]:
+        """Write a graph edge that projects a todo change already persisted.
+
+        The todo node is the record and the edge only mirrors it into the
+        graph. By the time this runs the todo is durable, so a failed edge is
+        returned as a warning for the caller's successful result, never as
+        its error: reporting a committed write as failed invites a retry that
+        repeats it (#3091).
+        """
+        try:
+            graph = self._graph()
+            write = (
+                graph.add_external_reference_edge
+                if external_reference
+                else graph.add_edge
+            )
+            await write(source_id, target_id, label, properties)
+        except Exception as e:  # noqa: BLE001 - reported to the caller
+            logger.warning(
+                "todo %s graph edge %s -> %s was not written: %s",
+                label,
+                source_id,
+                target_id,
+                e,
+                exc_info=True,
+            )
+            return [f"The todo is saved, but its {label} graph edge was not: {e}"]
+        return []
 
     async def active_preturn_items(
         self, limit: int = 200,
@@ -506,21 +554,23 @@ class TodoFeature(Feature):
 
         try:
             await self._persist(props)
-            if superseded_by:
-                await self._graph().add_edge(
-                    superseded_by,
-                    todo_id,
-                    "supersedes",
-                    {"created_at": props["updated_at"], "agent_id": self.agent_id},
-                )
         except Exception as e:
             logger.error("todo_update write failed: %s", e, exc_info=True)
             return ToolResult.failed(str(e))
+        warnings: List[str] = []
+        if superseded_by:
+            warnings = await self._project_edge(
+                superseded_by,
+                todo_id,
+                "supersedes",
+                {"created_at": props["updated_at"], "agent_id": self.agent_id},
+            )
 
         self._emit_todo_part(props)
-        return ToolResult.ok(
-            confirmation=f"Updated todo {todo_id}: {', '.join(updates)}",
-            data={"todo": props, "updates": updates},
+        return _ok_with_warnings(
+            f"Updated todo {todo_id}: {', '.join(updates)}",
+            {"todo": props, "updates": updates},
+            warnings,
         )
 
     @tool(
@@ -543,7 +593,11 @@ class TodoFeature(Feature):
         url: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
-        """Append one external link to a todo."""
+        """Append one external link to a todo.
+
+        Idempotent on ``(todo_id, link_type, target)``: repeating a call
+        returns the existing link unchanged instead of adding a second one.
+        """
         node, err = await self._get_owned_node(todo_id)
         if err:
             return ToolResult.failed(err)
@@ -555,6 +609,28 @@ class TodoFeature(Feature):
 
         props = dict(node.properties or {})
         links = list(props.get("links") or [])
+        existing = next(
+            (
+                link
+                for link in links
+                if isinstance(link, dict)
+                and link.get("type") == link_type
+                and link.get("target") == target
+            ),
+            None,
+        )
+        if existing is not None:
+            # The earlier call may have stored the link but not its edge
+            # (#3091), so the projection is retried; it is an idempotent upsert.
+            warnings = await self._project_link_edge(todo_id, existing)
+            return _ok_with_warnings(
+                f"Todo {todo_id} already links {link_type}:{target}; "
+                "returned the existing link unchanged",
+                {"todo": props, "link": existing, "already_linked": True},
+                warnings,
+            )
+
+        now = _utc_now_iso()
         link = {
             "type": link_type,
             "target": target,
@@ -562,27 +638,40 @@ class TodoFeature(Feature):
             "status": status,
             "url": url,
             "metadata": meta or {},
-            "created_at": _utc_now_iso(),
+            "created_at": now,
         }
         links.append(link)
         props["links"] = links
-        props["updated_at"] = _utc_now_iso()
+        props["updated_at"] = now
 
         try:
             await self._persist(props)
-            await self._graph().add_edge(
-                todo_id,
-                f"{link_type}:{target}",
-                "linked_to",
-                {"link": link, "agent_id": self.agent_id},
-            )
         except Exception as e:
             logger.error("todo_link_task write failed: %s", e, exc_info=True)
             return ToolResult.failed(str(e))
 
-        return ToolResult.ok(
-            confirmation=f"Linked {link_type}:{target} to todo {todo_id}",
-            data={"todo": props, "link": link},
+        warnings = await self._project_link_edge(todo_id, link)
+        return _ok_with_warnings(
+            f"Linked {link_type}:{target} to todo {todo_id}",
+            {"todo": props, "link": link, "already_linked": False},
+            warnings,
+        )
+
+    async def _project_link_edge(
+        self, todo_id: str, link: Dict[str, Any]
+    ) -> List[str]:
+        """Write the ``linked_to`` edge for a link stored on the todo.
+
+        The target names something outside the graph (a GitHub issue, a
+        URL), so the edge is an external reference: only the todo's
+        ownership is checked.
+        """
+        return await self._project_edge(
+            todo_id,
+            f"{link['type']}:{link['target']}",
+            "linked_to",
+            {"link": link, "agent_id": self.agent_id},
+            external_reference=True,
         )
 
     @tool(
@@ -703,21 +792,23 @@ class TodoFeature(Feature):
 
         try:
             await self._persist(props)
-            if superseded_by:
-                await self._graph().add_edge(
-                    superseded_by,
-                    todo_id,
-                    "supersedes",
-                    {"created_at": now, "agent_id": self.agent_id},
-                )
         except Exception as e:
             logger.error("todo_complete write failed: %s", e, exc_info=True)
             return ToolResult.failed(str(e))
+        warnings: List[str] = []
+        if superseded_by:
+            warnings = await self._project_edge(
+                superseded_by,
+                todo_id,
+                "supersedes",
+                {"created_at": now, "agent_id": self.agent_id},
+            )
 
         self._emit_todo_part(props)
-        return ToolResult.ok(
-            confirmation=f"Completed todo {todo_id} as {props['status']}",
-            data={"todo": props},
+        return _ok_with_warnings(
+            f"Completed todo {todo_id} as {props['status']}",
+            {"todo": props},
+            warnings,
         )
 
     @tool(
