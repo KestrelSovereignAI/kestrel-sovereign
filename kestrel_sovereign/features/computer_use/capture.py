@@ -32,6 +32,10 @@ directory is a git worktree — the ``HEAD`` before and after. A review's
 verdict is about a specific tree, and during the 2026-08-31 run the head
 moved three times in eight hours. ``head_moved`` is how a later reader can
 tell that a verdict was about a tree that no longer exists.
+
+A review artifact is worth keeping for a while and not forever, and the
+local backend puts no cap on its size, so :func:`prune` retires whole
+artifact sets once their manifest passes the retention cutoff (#3279).
 """
 
 from __future__ import annotations
@@ -40,11 +44,13 @@ import asyncio
 import json
 import logging
 import os
+import re
+import stat
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +71,14 @@ _FILE_MODE = 0o600
 # a command, so the argv is fixed and the window is short. A repository that
 # does not answer in this long simply has no SHA recorded.
 _GIT_HEAD_TIMEOUT = 5
+
+# The runtime names every run ``uuid4().hex``. Pruning only ever considers
+# names of that shape, so an operator file that happens to sit in the
+# directory -- or a capture dir pointed somewhere shared -- is never a
+# candidate however old it is.
+_RUN_ID = re.compile(r"[0-9a-f]{32}")
+_MANIFEST_SUFFIX = ".json"
+_STREAM_SUFFIXES = (".stdout", ".stderr")
 
 
 @dataclass(frozen=True)
@@ -243,6 +257,124 @@ async def write_manifest(bundle: CaptureBundle, body: dict[str, Any]) -> None:
             os.close(fd)
 
     await asyncio.to_thread(_write)
+
+
+def prune(
+    capture_dir: Path | str,
+    *,
+    cutoff: float,
+    protected: Iterable[Path] = (),
+) -> int:
+    """Delete the artifact sets whose manifest was last written before ``cutoff``.
+
+    ``cutoff`` is a POSIX timestamp. Returns the number of sets pruned.
+
+    A set is keyed by its manifest because the manifest is written last: a
+    run still in flight has streams and no manifest, so it is never a
+    candidate. Only direct children of ``capture_dir`` named like a run are
+    considered -- never a subdirectory -- and a manifest that is not a
+    regular file is skipped rather than followed. ``protected`` names files
+    that survive whatever they are called; the feature passes its audit log.
+
+    The streams go first and the manifest last, so a prune interrupted
+    midway leaves a set the next prune still recognises, rather than
+    streams nothing would ever retire.
+
+    Synchronous; a caller on the event loop runs it in a thread. A file that
+    cannot be removed is logged and its set skipped, never raised:
+    retention is housekeeping, and it must not fail the run that triggered
+    it.
+    """
+    base = Path(capture_dir)
+    keep = _identities(protected)
+    if keep is None:
+        return 0
+    try:
+        with os.scandir(base) as it:
+            entries = list(it)
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        logger.warning("could not list capture dir %s for pruning: %s", base, exc)
+        return 0
+
+    removed = 0
+    for entry in entries:
+        if not entry.name.endswith(_MANIFEST_SUFFIX):
+            continue
+        run_id = entry.name[: -len(_MANIFEST_SUFFIX)]
+        if not _RUN_ID.fullmatch(run_id):
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_mtime >= cutoff:
+            continue
+        members = [base / f"{run_id}{suffix}" for suffix in _STREAM_SUFFIXES]
+        members.append(base / entry.name)
+        if _unlink_unprotected(members, keep):
+            removed += 1
+    return removed
+
+
+def _identities(paths: Iterable[Path]) -> Optional[set[tuple[int, int]]]:
+    """The ``(device, inode)`` of each protected path and of what it names.
+
+    Identity, not a path comparison: a case-insensitive filesystem or a link
+    spells one file several ways, and a protected file must survive all of
+    them. Both the entry itself (``lstat``) and the file it resolves to
+    (``stat``) are kept, so a protected path that is a link keeps the link
+    and its target. ``None`` when a protected path exists but cannot be
+    identified, since then no entry is known to be safe to delete.
+    """
+    ids: set[tuple[int, int]] = set()
+    for path in paths:
+        for read in (os.lstat, os.stat):
+            try:
+                st = read(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                logger.warning(
+                    "not pruning captures: cannot identify protected file %s: %s",
+                    path,
+                    exc,
+                )
+                return None
+            ids.add((st.st_dev, st.st_ino))
+    return ids
+
+
+def _unlink_unprotected(paths: list[Path], keep: set[tuple[int, int]]) -> bool:
+    """Unlink each entry in order, except a protected file's.
+
+    ``lstat``, because what is unlinked is the directory entry: a symbolic
+    link to a protected file may go, while the protected file's own entry --
+    or a hard link to it -- stays. Returns whether the whole set is gone, so
+    a set that had to keep a protected member is not counted as pruned.
+    """
+    retired = True
+    for path in paths:
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("could not inspect capture artifact %s: %s", path, exc)
+            return False
+        if (st.st_dev, st.st_ino) in keep:
+            logger.warning("not pruning %s: it is a protected file", path)
+            retired = False
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("could not prune capture artifact %s: %s", path, exc)
+            return False
+    return retired
 
 
 def _read_window(path: Path, max_chars: int) -> str:
