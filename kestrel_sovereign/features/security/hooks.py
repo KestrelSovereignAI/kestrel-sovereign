@@ -47,6 +47,26 @@ FEATURE_LIFECYCLE_SESSION_ID = "feature-lifecycle"
 NON_INTERACTIVE_SESSION_IDS = frozenset({"scheduler", FEATURE_LIFECYCLE_SESSION_ID})
 
 
+def reserved_session_id(session_id: object) -> Optional[str]:
+    """The reserved non-interactive id ``session_id`` names, or ``None``.
+
+    Membership in :data:`NON_INTERACTIVE_SESSION_IDS` asserts that no human is
+    attached, so only the code paths that own those ids may present one. A
+    request door asks this before it adopts a caller's ``session_id``: a chat
+    caller who sent ``"scheduler"`` had every ASK-gated tool in the turn
+    refused with "no interactive approver" and the turn's history filed under
+    the reserved label (#3284).
+
+    Surrounding whitespace is ignored because the turn lifecycle strips it
+    from the session it binds (``turn_lifecycle._normalize_session_id``), so a
+    padded value reaches the turn's features as the bare reserved id.
+    """
+    if not isinstance(session_id, str):
+        return None
+    candidate = session_id.strip()
+    return candidate if candidate in NON_INTERACTIVE_SESSION_IDS else None
+
+
 class SecurityHook(Hook):
     """
     PreToolUse hook that checks permissions and queues for approval.
