@@ -332,6 +332,16 @@ In practice, current tools already use descriptive names (`list_models`, `memory
 
 Regression coverage: `tests/unit/test_tool_allowlist_registry.py`.
 
+### Dispatcher arguments carried to direct tools (#3396)
+
+**Risk**: A feature dispatcher takes `task` and `context`, and callers keep passing them after a feature's tools become direct. A `@tool` method that does not declare them raised `TypeError` before running, losing the rest of the call (a `shell` call's `capture_output=true`, for one). A misspelt argument is the opposite risk: dropping it would run the tool with a default.
+
+**Mitigation**: Both direct-tool paths, `_dispatch_direct_tool` and `execute_named_tool`, pass the arguments through `kestrel_sovereign.agent.direct_tool_arguments.normalize_direct_tool_arguments` before `PRE_TOOL_USE`:
+
+- `task` and `context` are dropped when the tool does not declare them.
+- Any other undeclared argument refuses the call. The error lists the tool's parameters and suggests the closest one (`pr_number` → `pull_number`). The refusal writes a `tool_validation` audit row.
+- The declared set is the advertised schema. A `ToolSchema` parameter list is closed. A JSON-Schema object (the MCP shape) is closed only when `additionalProperties` is `false` and it has no `patternProperties`. A tool whose schema is neither shape receives its arguments unchanged.
+
 ### Session persistence
 
 **Risk**: If explored tools persist across sessions, the tool list could be stale after feature code changes or restarts.
