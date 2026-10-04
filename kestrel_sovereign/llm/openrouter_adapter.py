@@ -39,6 +39,7 @@ from kestrel_sdk.llm.decisions import (
 from .decisions.http import post_systemone, systemone_body
 from .openai_adapter import OpenAIAdapter
 from .model_metadata import ModelInfo, ModelCategory
+from .output_ceiling import reported_token_limit
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 from kestrel_sovereign.kestrel_config.defaults import get_openrouter_api_base
 
@@ -314,7 +315,9 @@ class OpenRouterAdapter(OpenAIAdapter):
         - Model ID (e.g., "anthropic/claude-3-opus")
         - Display name
         - Description
-        - Context length
+        - Context length (``context_length``) and output ceiling
+          (``top_provider.max_completion_tokens``); a limit the catalog does
+          not report stays ``None`` rather than becoming a guessed number
         - Pricing (per token)
         - Supported features (vision, tools, etc.)
 
@@ -381,7 +384,15 @@ class OpenRouterAdapter(OpenAIAdapter):
                     category=category,
                     is_featured=False,  # Will be enriched from catalog
                     is_hidden=False,
-                    context_limit=m.get("context_length", 4096),
+                    # #3355: a record without ``context_length`` has an
+                    # unknown window, not a 4,096-token one. ``None`` lets
+                    # the catalog override apply and the token counter name
+                    # the model as unknown; a number here would be persisted
+                    # to the discovered-limits cache as if reported.
+                    context_limit=reported_token_limit(m.get("context_length")),
+                    output_limit=reported_token_limit(
+                        (m.get("top_provider") or {}).get("max_completion_tokens")
+                    ),
                     supports_vision=supports_vision,
                     supports_tools=supports_tools,
                     supports_streaming=True,  # OpenRouter streams every chat route
@@ -517,13 +528,12 @@ class OpenRouterAdapter(OpenAIAdapter):
             modality = (entry.get("architecture") or {}).get("modality") or ""
             if not model_id or not str(modality).endswith("decisions"):
                 continue
-            context = entry.get("context_length")
             created = entry.get("created")
             results.append(DecisionModelInfo(
                 id=str(model_id),
                 vendor="openrouter",
                 route="",
-                context_limit=int(context) if isinstance(context, int) and context > 0 else None,
+                context_limit=reported_token_limit(entry.get("context_length")),
                 created_at=str(created) if created is not None else None,
             ))
         logger.info(f"OpenRouter: discovered {len(results)} decision models")

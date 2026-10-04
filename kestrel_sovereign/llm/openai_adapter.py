@@ -65,9 +65,44 @@ except ImportError:  # pragma: no cover - compatibility with SDK v4 checkouts.
     TokenCount = TokenCountMode = WebSearchOptions = None
 from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo, ModelCategory
+from .output_ceiling import (
+    attach_stop_reason,
+    join_output_ceiling_notice,
+    output_ceiling_notice_chunk,
+    output_limit_cut_notice,
+)
 from .retry import with_retry
 
 logger = logging.getLogger(__name__)
+
+#: The chat-completions ``finish_reason`` for a response cut at the output
+#: limit (OpenRouter forwards every upstream's cut as this value too).
+_LENGTH_FINISH_REASON = "length"
+
+
+def _finish_reason(choice: Any) -> Optional[str]:
+    """A chat-completions choice's ``finish_reason``, if the provider gave one."""
+    reason = getattr(choice, "finish_reason", None)
+    return reason if isinstance(reason, str) and reason else None
+
+
+def _caller_output_budget(request_kwargs: Dict[str, Any]) -> bool:
+    """Whether the request carries an output budget a caller chose.
+
+    The adapter never sends one of its own (#3355): without one the provider
+    applies the model's own limit, so a ``length`` stop is a cut nobody chose.
+    A ``max_tokens`` kwarg, a raw request option, or an ``extra_body`` field
+    all count, since each reaches the wire.
+    """
+    sources = [request_kwargs]
+    extra_body = request_kwargs.get("extra_body")
+    if isinstance(extra_body, dict):
+        sources.append(extra_body)
+    return any(
+        source.get(key) is not None
+        for source in sources
+        for key in ("max_completion_tokens", "max_tokens")
+    )
 
 _split_thinking_from_content = split_thinking_from_content
 _ThinkingContentSplitter = ThinkingContentSplitter
@@ -423,6 +458,26 @@ class OpenAIAdapter(LLMAdapter):
         """
         return prepend_gpt5_overlay(base, model_id)
 
+    def _output_limit_notice(
+        self,
+        model: str,
+        finish_reason: Optional[str],
+        caller_budget: bool,
+    ) -> Optional[str]:
+        """The notice for a ``length`` cut at a limit nobody chose, else None.
+
+        No output budget is sent unless a caller chose one, so the limit a
+        ``length`` stop hit is the provider's own and its size is not reported
+        (#3355). A request with a caller's budget keeps its text untouched.
+        """
+        return output_limit_cut_notice(
+            provider=self.name,
+            model=model,
+            stop_reason=finish_reason,
+            cut_reason=_LENGTH_FINISH_REASON,
+            caller_budget=caller_budget,
+        )
+
     async def get_response(
         self,
         client: openai.AsyncOpenAI,
@@ -509,6 +564,9 @@ class OpenAIAdapter(LLMAdapter):
             )
 
             message = response.choices[0].message
+            # #3355: the provider's own verdict on whether the response is
+            # finished; ``length`` means it was cut at an output limit.
+            finish_reason = _finish_reason(response.choices[0])
 
             # Parse tool calls if present
             # Use getattr to safely access tool_calls (may not exist on mock objects)
@@ -550,7 +608,13 @@ class OpenAIAdapter(LLMAdapter):
                 getattr(message, 'reasoning_content', None),
             )
 
-            return LLMResponse(
+            notice = self._output_limit_notice(
+                model, finish_reason, _caller_output_budget(extra_kwargs),
+            )
+            if notice is not None:
+                content = join_output_ceiling_notice(content, notice)
+
+            return attach_stop_reason(LLMResponse(
                 content=content,
                 tool_calls=parsed_tool_calls,
                 raw=response,
@@ -559,7 +623,7 @@ class OpenAIAdapter(LLMAdapter):
                 total_tokens=total_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            )
+            ), finish_reason)
 
         except openai.RateLimitError as e:
             logger.error(f"OpenAI rate limit exceeded: {e}")
@@ -655,7 +719,10 @@ class OpenAIAdapter(LLMAdapter):
 
             splitter = _ThinkingContentSplitter(provider=self.name)
             chunk_count = 0
+            finish_reason = None
             async for chunk in stream:
+                # #3355: the finish reason rides on the last choice chunk.
+                finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
                 delta = chunk.choices[0].delta
                 reasoning_content = getattr(delta, "reasoning_content", None)
                 if isinstance(reasoning_content, str) and reasoning_content:
@@ -671,6 +738,14 @@ class OpenAIAdapter(LLMAdapter):
                 if isinstance(item, str):
                     chunk_count += 1
                 yield item
+
+            # #3355: the streamed text is already on screen, so a cut at the
+            # provider's output limit is marked by a final chunk.
+            notice = self._output_limit_notice(
+                model, finish_reason, _caller_output_budget(extra_kwargs),
+            )
+            if notice is not None:
+                yield output_ceiling_notice_chunk(notice, follows_text=chunk_count > 0)
 
             logger.info(f"Stream completed. Total chunks: {chunk_count}")
 
@@ -792,6 +867,7 @@ class OpenAIAdapter(LLMAdapter):
             cache_creation_input_tokens = None
             cache_read_input_tokens = None
             call_cost = None
+            finish_reason = None
 
             async for chunk in stream:
                 # Extract usage from final chunk (OpenAI sends it with stream_options)
@@ -821,6 +897,8 @@ class OpenAIAdapter(LLMAdapter):
                 if not chunk.choices:
                     continue
 
+                # #3355: the finish reason rides on the last choice chunk.
+                finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
                 delta = chunk.choices[0].delta
 
                 # Handle text content - yield immediately for real-time streaming
@@ -894,6 +972,19 @@ class OpenAIAdapter(LLMAdapter):
                     text_content += item
                 yield item
 
+            # #3355: the text has already streamed, so a cut at the provider's
+            # output limit is marked by a final chunk — and carried on the
+            # terminal response's content, which mirrors what was shown.
+            notice = self._output_limit_notice(
+                model, finish_reason, _caller_output_budget(extra_kwargs),
+            )
+            if notice is not None:
+                notice_chunk = output_ceiling_notice_chunk(
+                    notice, follows_text=bool(text_content),
+                )
+                text_content += notice_chunk
+                yield notice_chunk
+
             # Assemble any tool calls collected during the stream.
             parsed_tool_calls = None
             if tool_calls_accumulator:
@@ -928,7 +1019,7 @@ class OpenAIAdapter(LLMAdapter):
                 _raw["reasoning_content"] = reasoning_content
             if call_cost is not None:
                 _raw["cost"] = call_cost
-            yield LLMResponse(
+            yield attach_stop_reason(LLMResponse(
                 content=text_content if text_content else None,
                 tool_calls=parsed_tool_calls,
                 raw=_raw or None,
@@ -937,7 +1028,7 @@ class OpenAIAdapter(LLMAdapter):
                 total_tokens=total_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            )
+            ), finish_reason)
 
         except openai.RateLimitError as e:
             logger.error(f"OpenAI rate limit exceeded during streaming with tools: {e}")

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import sys
 import types
-from unittest.mock import patch
+from types import SimpleNamespace
 
 import pytest
 
@@ -142,8 +142,12 @@ async def test_google_adapter_get_response_uses_routed_model():
         captured["config"] = config
         return _Response()
 
+    async def _get(*, model):
+        return SimpleNamespace(output_token_limit=65_536)
+
     class _Models:
         generate_content = staticmethod(_generate_content)
+        get = staticmethod(_get)
 
     class _Aio:
         models = _Models()
