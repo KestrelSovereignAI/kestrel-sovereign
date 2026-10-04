@@ -159,17 +159,19 @@ runtime rather than by a shell it does not have. Two parameters:
 * **`cwd=<worktree>`** — replaces `cd <worktree> &&`. Policy-checked, and
   relative paths in the command resolve against it.
 * **`capture_output=true`** — replaces `> review.txt`. stdout and stderr are
-  written to runtime-owned files; the result carries `stdout_path`,
-  `stderr_path` and a `manifest_path`, and the inline text becomes a bounded
-  preview showing the head *and the tail*, so a verdict at the end of a long
-  review is visible without opening the file. On the **local** backend the
-  child writes to the file directly and there is no cap on it. On the
-  **docker** backend — which is the DEFAULT — there is: the capture is
-  written from a string the executor already clipped at `max_output_bytes`
-  (1 MiB unless `[features.computer_use.docker].max_output_bytes` says
-  otherwise), so a review past that ceiling still comes back clipped and
-  PARTIAL. Streaming it is #3277. Check `complete`, as below, rather than
-  assuming the file is whole.
+  written to runtime-owned files, by default under the agent's own storage
+  dir, and deleted after `capture_retention_days` (default 14); the result
+  carries `stdout_path`, `stderr_path` and a `manifest_path`, and the inline
+  text becomes a bounded preview showing the head *and the tail*, so a verdict
+  at the end of a long review is visible without opening the file. On the
+  **local** backend the child writes to the file directly and there is no cap
+  on it. On the **docker** backend — which is the DEFAULT — there is: the
+  capture is written from a string the executor already clipped at
+  `max_output_bytes` (1 MiB unless
+  `[features.computer_use.docker].max_output_bytes` says otherwise), so a
+  review past that ceiling still comes back clipped and PARTIAL. Streaming it
+  is #3277. Check `complete`, as below, rather than assuming the file is
+  whole.
 
 The manifest records what ran, where, how it ended, which backend ran it
 (`backend` — the result itself does not carry it), and the git `HEAD` before

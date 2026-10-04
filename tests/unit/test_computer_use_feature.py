@@ -66,6 +66,7 @@ def _config(workspace: Path, *, enabled: bool = True, backend: str = "local") ->
         "denied_binaries": ["rm"],
         "auto_approve_read": True,
         "audit_log_path": str(workspace / "audit.jsonl"),
+        "capture_dir": str(workspace / "captures"),
     }
 
 
@@ -780,6 +781,7 @@ def _f137_config(root: Path) -> dict[str, Any]:
         "denied_binaries": ["rm"],
         "auto_approve_read": True,
         "audit_log_path": str(root / "audit.jsonl"),
+        "capture_dir": str(root / "captures"),
     }
 
 

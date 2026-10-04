@@ -98,8 +98,21 @@ denied_binaries = ["dd", "mkfs", "shutdown", "sudo", "ssh"]
 # to still prompt should add it explicitly to denied_binaries until
 # #1741's ALWAYS_ASK primitive lands.
 auto_approve_read = true              # only inside allowed_paths
+# Audit log for every tool invocation (allowed AND denied). Path is
+# relative to the agent's storage dir (agent_data/<Agent>/); an absolute
+# path, or one starting with ~, is used as written.
 audit_log_path = ".kestrel/computer_use_audit.jsonl"
+# Where `shell(capture_output=true)` writes each run's stdout, stderr and
+# manifest. Path is relative to the agent's storage dir, like the audit log.
+capture_dir = ".kestrel/computer_use_captures"
+# Capture artifact sets whose manifest is older than this are deleted at
+# feature initialize and at most once a day after that. 0 disables pruning.
+capture_retention_days = 14
 ```
+
+Because both paths resolve against each agent's own storage dir, two agents on one host never share an audit log or a capture directory. An agent with no storage dir refuses a relative path rather than fall back to the host's working directory, and the feature stays unready until an absolute path is configured (#3279).
+
+Releases before #3279 resolved a relative path against the host process's working directory, so every agent on a host wrote to one `<cwd>/.kestrel/computer_use_audit.jsonl`. That file is not moved or rewritten: it holds several agents' rows interleaved, and splitting it is an operator decision. Startup logs one INFO line naming the legacy file and the agent's new audit log when both exist and differ.
 
 `allowed_binaries` is accepted as a one-release deprecation synonym for `auto_approved_binaries`. If both are set the canonical key wins and a warning is logged; if only the legacy key is set it still works and a deprecation warning is logged. Rename it when you next edit your kestrel.toml.
 
@@ -138,6 +151,12 @@ Denials append `denied:<stage>` to `allowed_by` and set `outcome="denied"`:
 ```
 
 Reading those rows back is the canonical way to reconstruct what happened.
+
+## Capture retention
+
+`shell(capture_output=true)` writes `<run_id>.stdout`, `<run_id>.stderr` and the `<run_id>.json` manifest into `capture_dir`. The local backend puts no cap on their size, so the feature prunes them: on initialize, and then at most once a day when a run is captured, it deletes every artifact set whose manifest was last written more than `capture_retention_days` ago (default 14; `0` disables pruning).
+
+Pruning only considers direct children of the resolved `capture_dir` that carry the runtime's run-id naming (32 lowercase hex characters). It does not recurse, does not follow a linked manifest, keeps a run whose manifest has not been written yet, and never deletes the audit log, wherever it is configured.
 
 ## Threat model
 
