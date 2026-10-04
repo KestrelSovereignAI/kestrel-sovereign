@@ -8,9 +8,13 @@ so callers pass them to direct tools by habit. The call's
 only visible fallback.
 
 The ruling: in the direct-tool dispatcher, drop ``task``/``context`` when the
-tool does not declare them, and refuse any other undeclared argument with an
-error that lists the tool's parameters and suggests a close match. A misspelt
-argument is never dropped, because that would run the tool with a default.
+tool's schema does not accept them, and refuse any other argument it does not
+accept with an error that lists the tool's parameters and suggests a close
+match. A misspelt argument is never dropped, because that would run the tool
+with a default. "Accepts" is the schema's own answer, not membership of
+``properties``: an MCP schema that leaves ``additionalProperties`` open, or
+whose ``patternProperties`` match the name, accepts ``task``/``context`` as
+tool data, and they reach the tool unchanged.
 
 Both direct-tool paths are driven: the chat loop's ``_dispatch_direct_tool``
 and ``execute_named_tool``, which the codex inline executor uses. The shell
@@ -73,6 +77,30 @@ class _JsonSchemaTool:
     def __init__(self, name: str, parameters: dict):
         self.name = name
         self.schema = SimpleNamespace(parameters=parameters)
+        self.calls: list[dict] = []
+
+    async def execute(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"success": True}
+
+
+def _object_schema(**keywords) -> dict:
+    return {"type": "object", "properties": {"url": {"type": "string"}}, **keywords}
+
+
+#: JSON-Schema shapes that accept ``context`` without listing it in
+#: ``properties``. The review of #3396 found the first fix dropping it here.
+SCHEMAS_THAT_ACCEPT_CONTEXT = {
+    "additionalProperties absent": _object_schema(),
+    "additionalProperties true": _object_schema(additionalProperties=True),
+    "additionalProperties a schema": _object_schema(
+        additionalProperties={"type": "string"}
+    ),
+    "patternProperties matches": _object_schema(
+        additionalProperties=False,
+        patternProperties={"^context$": {"type": "string"}},
+    ),
+}
 
 
 # --- the rules ---------------------------------------------------------------
@@ -209,20 +237,25 @@ def test_a_non_string_argument_name_is_refused_not_raised():
     assert error == "shell does not accept argument 1. Valid parameters: command."
 
 
-def test_an_open_json_schema_passes_unknown_arguments_and_drops_generic_ones():
-    """``additionalProperties`` absent means open (JSON Schema). The MCP
-    server owns validation of what its schema admits."""
-    tool = _JsonSchemaTool(
-        "mcp__fetch__fetch",
-        {"type": "object", "properties": {"url": {"type": "string"}}},
-    )
+@pytest.mark.parametrize(
+    "schema",
+    [
+        _object_schema(),
+        _object_schema(additionalProperties=True),
+        _object_schema(additionalProperties={"type": "string"}),
+    ],
+    ids=["absent", "true", "schema"],
+)
+def test_an_open_json_schema_passes_every_argument_unchanged(schema):
+    """Unless ``additionalProperties`` is ``false``, JSON Schema accepts every
+    name, ``task`` and ``context`` included. The MCP server validates them."""
+    tool = _JsonSchemaTool("mcp__fetch__fetch", schema)
+    supplied = {"url": "u", "max_length": 5, "context": "c", "task": "t"}
 
-    args, error = normalize_direct_tool_arguments(
-        tool.name, tool, {"url": "u", "max_length": 5, "context": "c"}
-    )
+    args, error = normalize_direct_tool_arguments(tool.name, tool, supplied)
 
     assert error is None
-    assert args == {"url": "u", "max_length": 5}
+    assert args is supplied
 
 
 def test_a_closed_json_schema_refuses_unknown_arguments():
@@ -245,18 +278,20 @@ def test_a_closed_json_schema_refuses_unknown_arguments():
     )
 
 
-def test_pattern_properties_keep_a_json_schema_open():
-    """``patternProperties`` admits names beyond ``properties`` even when
-    ``additionalProperties`` is false; matching them is the server's job."""
-    tool = _JsonSchemaTool(
-        "mcp__api__call",
-        {
-            "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "patternProperties": {"^x-": {"type": "string"}},
-            "additionalProperties": False,
-        },
-    )
+def _patterned_schema(*patterns: str) -> dict:
+    return {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "patternProperties": {pattern: {"type": "string"} for pattern in patterns},
+        "additionalProperties": False,
+    }
+
+
+def test_a_closed_schema_accepts_names_its_patterns_match():
+    """``patternProperties`` admit names beyond ``properties`` even when
+    ``additionalProperties`` is false. ``context`` matches no pattern here, so
+    the schema does not accept it, and it is dropped."""
+    tool = _JsonSchemaTool("mcp__api__call", _patterned_schema("^x-"))
 
     args, error = normalize_direct_tool_arguments(
         tool.name, tool, {"path": "/", "x-trace": "1", "context": "c"}
@@ -264,6 +299,147 @@ def test_pattern_properties_keep_a_json_schema_open():
 
     assert error is None
     assert args == {"path": "/", "x-trace": "1"}
+
+
+def test_a_pattern_that_matches_a_generic_name_passes_it_through():
+    tool = _JsonSchemaTool("mcp__api__call", _patterned_schema("^context$"))
+
+    args, error = normalize_direct_tool_arguments(
+        tool.name, tool, {"path": "/", "context": "c", "task": "t"}
+    )
+
+    assert error is None
+    assert args == {"path": "/", "context": "c"}
+
+
+@pytest.mark.parametrize(
+    ("pattern", "kept"),
+    [
+        ("^context$", {"context"}),
+        ("^cont", {"context"}),
+        ("text$", {"context"}),
+        # JSON Schema patterns are unanchored.
+        ("ontex", {"context"}),
+        ("as", {"task"}),
+        ("t", {"context", "task"}),
+        ("^con$", set()),
+        ("^$", set()),
+        ("", {"context", "task"}),
+    ],
+)
+def test_a_literal_pattern_is_matched_as_json_schema_defines(pattern, kept):
+    tool = _JsonSchemaTool("mcp__api__call", _patterned_schema(pattern))
+
+    args, error = normalize_direct_tool_arguments(
+        tool.name, tool, {"path": "/", "context": "c", "task": "t"}
+    )
+
+    assert error is None
+    assert set(args) == {"path"} | kept
+
+
+def test_a_pattern_schema_leaves_other_names_to_the_tool():
+    """Only ``task``/``context`` are compared with patterns, so any other
+    name outside ``properties`` reaches the tool, which validates it."""
+    tool = _JsonSchemaTool("mcp__api__call", _patterned_schema("^x-"))
+
+    args, error = normalize_direct_tool_arguments(
+        tool.name, tool, {"pth": "/", "x-trace": "1", "context": "c"}
+    )
+
+    assert error is None
+    assert args == {"pth": "/", "x-trace": "1"}
+
+
+def test_a_pattern_is_never_run_as_a_regular_expression():
+    """``^[0-9]+$`` matches neither name, but finding that out means running
+    the server's pattern, and ``(?:x?){4000000000}`` exhausts memory on
+    ``task``. A pattern that is not a literal may match, so both names pass
+    through for the server to validate."""
+    tool = _JsonSchemaTool("mcp__api__call", _patterned_schema("^x-", "^[0-9]+$"))
+    supplied = {"path": "/", "context": "c", "task": "t"}
+
+    assert normalize_direct_tool_arguments(tool.name, tool, supplied) == (
+        supplied,
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "pattern_properties",
+    [
+        {r"^\p{L}+$": {}},
+        {"(?:x?){4000000000}": {}},
+        {"^(a+)+$": {}},
+        {"^context\\$": {}},
+        {7: {}},
+        ["^x-"],
+    ],
+    ids=[
+        "unicode-property",
+        "repeat-bomb",
+        "backtracking",
+        "escaped-anchor",
+        "non-string-pattern",
+        "not-a-mapping",
+    ],
+)
+def test_patterns_this_check_does_not_evaluate_leave_every_argument_alone(
+    pattern_properties,
+):
+    """A pattern that is not a literal, or patterns that cannot be read, may
+    match any name, so nothing is dropped or refused on their account."""
+    tool = _JsonSchemaTool(
+        "mcp__api__call",
+        {
+            "properties": {"path": {}},
+            "patternProperties": pattern_properties,
+            "additionalProperties": False,
+        },
+    )
+    supplied = {"path": "/", "context": "c", "zzz": 1}
+
+    assert normalize_direct_tool_arguments(tool.name, tool, supplied) == (
+        supplied,
+        None,
+    )
+
+
+class _ImpersonatesTask:
+    """An in-process key that hashes and compares like ``"task"``."""
+
+    def __hash__(self):
+        return hash("task")
+
+    def __eq__(self, other):
+        return other == "task"
+
+
+class _UncomparableKey:
+    def __eq__(self, other):
+        raise TypeError("not comparable")
+
+    __hash__ = object.__hash__
+
+
+def test_a_key_that_merely_equals_task_is_not_pattern_matched():
+    tool = _JsonSchemaTool("mcp__api__call", _patterned_schema("^x-"))
+    supplied = {_ImpersonatesTask(): 1}
+
+    assert normalize_direct_tool_arguments(tool.name, tool, supplied) == (
+        supplied,
+        None,
+    )
+
+
+def test_an_uncomparable_key_is_refused_not_raised():
+    tool = _SchemaTool("shell", "command")
+    key = _UncomparableKey()
+
+    _, error = normalize_direct_tool_arguments(tool.name, tool, {key: 1})
+
+    assert error.startswith("shell does not accept argument ")
+    assert error.endswith("Valid parameters: command.")
 
 
 def test_a_flood_of_unknown_arguments_is_summarized():
@@ -529,6 +705,34 @@ async def test_inline_executor_path_refuses_an_unknown_argument():
     assert tool.calls == []
     assert agent.hooks_manager.pre_calls == []
     assert [row["action"] for row in agent.audit.rows] == [ACTION_TOOL_VALIDATION]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "schema",
+    list(SCHEMAS_THAT_ACCEPT_CONTEXT.values()),
+    ids=list(SCHEMAS_THAT_ACCEPT_CONTEXT),
+)
+@pytest.mark.parametrize("path", ["chat", "inline_executor"])
+async def test_context_a_json_schema_accepts_reaches_the_tool_unchanged(path, schema):
+    """The review of the first #3396 fix: dropping ``context`` whenever
+    ``properties`` omits it silently stripped tool data from an MCP server
+    whose schema accepts the name some other way."""
+    tool = _JsonSchemaTool("mcp__api__call", schema)
+    agent = _Orchestrator(direct_tools={tool.name: tool})
+    supplied = {"url": "u", "context": "the server's own context field"}
+
+    if path == "chat":
+        result = await _dispatch_direct(agent, tool.name, dict(supplied))
+    else:
+        result = await agent.execute_named_tool(
+            tool.name, dict(supplied), session_id="s-3396", source="mcp",
+        )
+
+    assert result == {"success": True}
+    assert tool.calls == [supplied]
+    assert agent.hooks_manager.pre_calls == [supplied]
+    assert agent.audit.rows == []
 
 
 # --- the whole chat loop --------------------------------------------------------

@@ -338,9 +338,11 @@ Regression coverage: `tests/unit/test_tool_allowlist_registry.py`.
 
 **Mitigation**: Both direct-tool paths, `_dispatch_direct_tool` and `execute_named_tool`, pass the arguments through `kestrel_sovereign.agent.direct_tool_arguments.normalize_direct_tool_arguments` before `PRE_TOOL_USE`:
 
-- `task` and `context` are dropped when the tool does not declare them.
-- Any other undeclared argument refuses the call. The error lists the tool's parameters and suggests the closest one (`pr_number` → `pull_number`). The refusal writes a `tool_validation` audit row.
-- The declared set is the advertised schema. A `ToolSchema` parameter list is closed. A JSON-Schema object (the MCP shape) is closed only when `additionalProperties` is `false` and it has no `patternProperties`. A tool whose schema is neither shape receives its arguments unchanged.
+- An argument the tool's schema accepts passes through unchanged, `task` and `context` included.
+- `task` and `context` are dropped when the schema does not accept them.
+- Any other argument the schema does not accept refuses the call. The error lists the tool's parameters and suggests the closest one (`pr_number` → `pull_number`). The refusal writes a `tool_validation` audit row.
+- What a schema accepts is the schema's own answer, not membership of `properties`. A `ToolSchema` parameter list accepts exactly its parameters. A JSON-Schema object (the MCP shape) accepts its `properties` and every name a `patternProperties` pattern matches (unanchored, as JSON Schema defines). Unless `additionalProperties` is `false`, it accepts every other name as well, and validating those is left to the server. A schema of neither shape leaves the arguments unchanged.
+- A server's pattern is never run as a regular expression: `(?:x?){4000000000}` exhausts memory matching even `task`, and `^(a+)+$` backtracks for minutes on a long model-chosen name, all on the event loop. Patterns are compared with `task` and `context` only, and only a literal one, optionally anchored with `^`/`$` (`^x-`, `^context$`), is evaluated, by string comparison. A generic name that any other pattern might match passes through, as does any other name a closed schema leaves to its patterns; the server validates them.
 
 ### Session persistence
 
