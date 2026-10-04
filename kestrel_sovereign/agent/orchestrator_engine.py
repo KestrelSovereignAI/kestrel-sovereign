@@ -2483,7 +2483,9 @@ class OrchestratorEngineMixin:
         if user_message:
             messages.append({"role": "user", "content": user_message})
             logging.debug(
-                f"[{log_prefix}] Added user message to context: {user_message[:100]}..."
+                "[%s] Added user message to context: chars=%d",
+                log_prefix,
+                len(user_message),
             )
         else:
             logging.warning(

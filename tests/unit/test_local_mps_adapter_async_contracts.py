@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import stat
 import threading
@@ -25,6 +26,8 @@ from kestrel_sovereign.features.training.types import (
     GenerationState,
     TrainingConfig,
 )
+from kestrel_sovereign.logging_config import content_log_summary
+from tests.utils.log_records import records_containing
 
 
 MODULE = "kestrel_sovereign.features.training.adapters.local_mps_adapter"
@@ -258,6 +261,41 @@ async def test_generate_image_offloads_temp_lora_and_output_file_io(
     assert "_create_generation_artifact" in call_names
     assert "_read_generation_artifact" in call_names
     assert "_cleanup_generation_workspace" in call_names
+
+
+@pytest.mark.asyncio
+async def test_generate_image_logs_facts_about_the_prompt_never_its_text(
+    adapter, caplog
+):
+    """#3318: the prompt is caller content; the log gets its length and digest."""
+    prompt = "ZqXjVw portrait of my neighbour at her kitchen table"
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def communicate(self):
+            _write_fd(self.payload["output_fd"], b"png-bytes")
+            return b"OK", b""
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        return FakeProcess(json.loads(args[3]))
+
+    caplog.set_level(logging.DEBUG)
+    with patch(
+        f"{MODULE}.asyncio.create_subprocess_exec",
+        side_effect=fake_create_subprocess_exec,
+    ):
+        result = await adapter.generate_image(
+            config=GenerationConfig(prompt=prompt, lora_path=""),
+            lora_bytes=b"lora",
+        )
+
+    assert result.state is GenerationState.COMPLETED
+    assert any(content_log_summary(prompt) in r.getMessage() for r in caplog.records)
+    assert not records_containing(caplog.records, "ZqXjVw")
 
 
 @pytest.mark.asyncio

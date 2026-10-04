@@ -38,6 +38,7 @@ from ..types import (
     GenerationResult,
     GenerationState,
 )
+from kestrel_sovereign.logging_config import content_log_summary
 from kestrel_sovereign.paths import (
     DATA_DIR_ENV,
     TRAINING_WORKING_DIR_ENV,
@@ -720,7 +721,10 @@ class LocalMPSTrainingAdapter(TrainingProvider):
                 width=width,
                 height=height,
             )
-            logger.info(f"Generating selfie via subprocess: {prompt[:60]}...")
+            logger.info(
+                "Generating selfie via subprocess: prompt %s",
+                content_log_summary(prompt),
+            )
             start_time = time.monotonic()
 
             inherited_fds = [output_artifact.fd]
