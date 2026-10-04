@@ -26,7 +26,10 @@ from kestrel_sovereign.security.assertion_tenant_resolver import (
 )
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse
-from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+from kestrel_sovereign.llm.invocation_context import (
+    LLMInvocationContext,
+    turn_invocation_scope,
+)
 from kestrel_sovereign.config import (
     SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
     SEMANTIC_CAPABILITIES_CONFIG_ENV,
@@ -6441,7 +6444,13 @@ Expected Duration: {expected_duration}
             # turn stays absent rather than carrying an empty attribute.
             KESTREL_SESSION_ID: session_id or None,
             "agent.input_length": len(user_input),
-        }) as _otel_span:
+        }) as _otel_span, turn_invocation_scope(
+            # #3426: chat receives this turn's identity as an argument; the
+            # embeddings the turn makes (retrieval, persistence, tools) cannot.
+            getattr(self, "llm_service", None),
+            invocation_context,
+            session_id=session_id,
+        ):
             try:
                 async with self._turn_lifecycle():
                     # Correlation is optional evidence, never cancellation

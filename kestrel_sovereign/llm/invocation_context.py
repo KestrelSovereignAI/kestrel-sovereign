@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Iterator, Optional
 
 from kestrel_sovereign.logging_config import correlation_id_var, session_id_var
+from kestrel_sovereign.turn_scope import turn_scoped
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +187,71 @@ def set_ambient_invocation_context(context: LLMInvocationContext) -> None:
     """Set the standalone compatibility context for the current async task."""
 
     _COMPATIBILITY_INVOCATION_CONTEXT_STATE.set(context)
+
+
+@dataclass(frozen=True, slots=True)
+class TurnInvocation:
+    """The identity an agent turn hands its own LLM calls (#3426).
+
+    A turn passes ``context`` and ``session_id`` explicitly to its chat calls.
+    Embeddings are made deeper down (retrieval queries, conversation
+    persistence, tools) by code that has no invocation-context parameter, so
+    the turn publishes the same two inputs here for ``owner``, the turn's
+    ``LLMService``. They are resolved by that service's own resolver, exactly
+    as the turn's chat call resolves them. Another service in the same task
+    never reads them.
+    """
+
+    owner: object
+    context: Optional[LLMInvocationContext]
+    session_id: Optional[str]
+
+
+_TURN_INVOCATION: ContextVar[Optional[TurnInvocation]] = ContextVar(
+    "kestrel_llm_turn_invocation", default=None
+)
+
+
+@contextmanager
+def turn_invocation_scope(
+    owner: object,
+    context: Optional[LLMInvocationContext],
+    *,
+    session_id: Optional[str],
+) -> Iterator[TurnInvocation]:
+    """Publish one turn's identity for ``owner`` for the extent of the turn."""
+
+    turn = TurnInvocation(owner, context, session_id)
+    with bind_turn_invocation(turn):
+        yield turn
+
+
+def turn_invocation_for(owner: object) -> Optional[TurnInvocation]:
+    """The identity of ``owner``'s turn running on this task, if any."""
+
+    turn = _TURN_INVOCATION.get()
+    if turn is None or turn.owner is not owner:
+        return None
+    return turn
+
+
+@contextmanager
+def bind_turn_invocation(turn: Optional[TurnInvocation]) -> Iterator[None]:
+    """Re-present a captured turn identity on a task that predates the turn."""
+
+    token = _TURN_INVOCATION.set(turn)
+    try:
+        yield
+    finally:
+        _TURN_INVOCATION.reset(token)
+
+
+turn_scoped(
+    "llm_turn_invocation",
+    variables=(_TURN_INVOCATION,),
+    capture=lambda _agent: _TURN_INVOCATION.get(),
+    bind=bind_turn_invocation,
+)
 
 
 def _first_defined(*values: Optional[str]) -> Optional[str]:

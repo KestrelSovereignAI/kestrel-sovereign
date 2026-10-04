@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from .adapter import (
     LLMAdapter,
     LLMResponse,
+    ReportedUsage,
     ThinkingContentSplitter,
     ThinkingDelta,
     ToolCall,
@@ -325,6 +326,20 @@ class OllamaAdapter(LLMAdapter):
             dim = None
         return {"dimensions": int(dim)} if dim else {}
 
+    @staticmethod
+    def _report_embedding_usage(
+        usage_sink: Optional[ReportedUsage], response: Any
+    ) -> None:
+        """Copy ``/api/embed``'s ``prompt_eval_count`` into ``usage_sink`` (#3426)."""
+        if usage_sink is None:
+            return
+        if isinstance(response, dict):
+            tokens, served = response.get("prompt_eval_count"), response.get("model")
+        else:
+            tokens = getattr(response, "prompt_eval_count", None)
+            served = getattr(response, "model", None)
+        usage_sink.add(input_tokens=tokens, model=served)
+
     async def aembed(
         self,
         client: "ollama.AsyncClient",
@@ -332,6 +347,7 @@ class OllamaAdapter(LLMAdapter):
         *,
         model: Optional[str] = None,
         dimensions: Optional[int] = None,
+        usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
         try:
@@ -343,6 +359,7 @@ class OllamaAdapter(LLMAdapter):
         except Exception as exc:
             logger.warning("Ollama embedding failed: %s", exc)
             return None
+        self._report_embedding_usage(usage_sink, response)
         embeddings = response.get("embeddings", []) if isinstance(response, dict) else getattr(response, "embeddings", [])
         return list(embeddings[0]) if embeddings else None
 
@@ -353,6 +370,7 @@ class OllamaAdapter(LLMAdapter):
         *,
         model: Optional[str] = None,
         dimensions: Optional[int] = None,
+        usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
         if not texts:
@@ -366,6 +384,7 @@ class OllamaAdapter(LLMAdapter):
         except Exception as exc:
             logger.warning("Ollama batch embedding failed: %s", exc)
             return [None] * len(texts)
+        self._report_embedding_usage(usage_sink, response)
         embeddings = response.get("embeddings", []) if isinstance(response, dict) else getattr(response, "embeddings", [])
         out = [list(item) if item is not None else None for item in embeddings]
         return (out + [None] * len(texts))[:len(texts)]

@@ -44,7 +44,12 @@ from .error_handling import (
     LLMAllProvidersFailedError
 )
 from .openai_adapter import OpenAIAdapter
-from .adapter import LLMResponse, messages_for, response_usage_available
+from .adapter import (
+    LLMResponse,
+    messages_for,
+    provider_usage_cost,
+    response_usage_available,
+)
 from .output_ceiling import response_stop_reason
 from .model_discovery import ModelDiscoveryMixin
 from .mandate import ModelMandateMixin
@@ -58,6 +63,7 @@ from .invocation_context import (
 from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import BackendType, RemoteBackendMixin
 from .decision_service import DecisionServiceMixin
+from .modality_recording import ModalityRecordingMixin
 from .decisions.resolve import RouteDecisionState
 from .decisions.config import DecisionRouteConfig
 from kestrel_sovereign.kestrel_config.constants import (
@@ -350,7 +356,7 @@ def _warn_no_llm_config_found() -> None:
     logger.warning("\n  ".join(hint_lines))
 
 
-class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, StreamingMixin, ConstitutionalAwarenessMixin, RemoteBackendMixin):
+class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, StreamingMixin, ConstitutionalAwarenessMixin, RemoteBackendMixin):
     """Unified LLM service with provider fallback and remote GPU support."""
 
     # Class-level default so tests that construct via ``__new__`` (bypassing
@@ -1017,10 +1023,9 @@ class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, U
         if target.get("is_local") or not target.get("is_cloud", True):
             return
 
-        from .embedding_service import ProviderEmbeddingService
         from .embedding_space import DEFAULT_PARITY_CANARIES
 
-        service = ProviderEmbeddingService(target)
+        service = self._new_embedding_service(target)
         canary = DEFAULT_PARITY_CANARIES[0]
         try:
             vector = await service.aembed(canary)
@@ -1464,10 +1469,9 @@ class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, U
             caps["embedding_dim"] = int(dim)
         probe_provider["capabilities"] = caps
 
-        from .embedding_service import ProviderEmbeddingService
         from .embedding_space import DEFAULT_PARITY_CANARIES
 
-        service = ProviderEmbeddingService(probe_provider)
+        service = self._new_embedding_service(probe_provider)
         canary = DEFAULT_PARITY_CANARIES[0]
         try:
             vector = await service.aembed(canary)
@@ -2806,7 +2810,6 @@ class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, U
         """
         if provider is None:
             return None
-        from .embedding_service import ProviderEmbeddingService
 
         pin = self._pin_for_provider(provider)
         verified = (
@@ -2815,12 +2818,34 @@ class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, U
             and self._verified_space_pins[pin.name].passed
         )
         if pin is not None and verified:
-            return ProviderEmbeddingService(
+            return self._new_embedding_service(
                 provider,
                 space_id_override=pin.space_id,
                 normalized_override=pin.normalized,
             )
-        return ProviderEmbeddingService(provider)
+        return self._new_embedding_service(provider)
+
+    def _new_embedding_service(
+        self,
+        provider: Dict[str, Any],
+        *,
+        space_id_override: Optional[str] = None,
+        normalized_override: Optional[bool] = None,
+    ):
+        """Construct a :class:`ProviderEmbeddingService` that records its calls.
+
+        Every embedding service this class builds comes from here, so every
+        dispatched embedding call (reads, writes, route and pin probes, parity
+        canaries) reaches the same usage sinks as chat (#3426).
+        """
+        from .embedding_service import ProviderEmbeddingService
+
+        return ProviderEmbeddingService(
+            provider,
+            space_id_override=space_id_override,
+            normalized_override=normalized_override,
+            recorder=self,
+        )
 
     async def verify_embedding_space_parity(
         self,
@@ -2847,7 +2872,6 @@ class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, U
         Returns a ``{pin_name: ParityResult}`` map for the pins probed.
         """
         from .embedding_space import ParityResult, probe_parity
-        from .embedding_service import ProviderEmbeddingService
 
         results: Dict[str, "ParityResult"] = {}
         pins = self._embedding_space_pins
@@ -2873,7 +2897,7 @@ class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, U
                         "pin the SAME dims value"
                     )
                     break
-                member_services.append(ProviderEmbeddingService(target))
+                member_services.append(self._new_embedding_service(target))
 
             if dim_mismatch is not None:
                 result = ParityResult(
@@ -3366,6 +3390,10 @@ class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, U
         Callbacks that don't declare an optional keyword (or ``**kwargs``) are
         still called with the original signature — see #1806 and #3019.
 
+        Decision and embedding calls that report usage are billed too, as
+        prompt tokens with zero completion tokens. A callback that names
+        ``modality`` receives ``"chat"``, ``"decision"`` or ``"embedding"``.
+
         Args:
             callback: Async function to call after each LLM call
         """
@@ -3376,8 +3404,9 @@ class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, U
             "cost",
             "cache_creation_input_tokens",
             "cache_read_input_tokens",
-            # #3424: which modality the usage came from ("chat" | "decision").
-            # Passed only to callbacks that name it explicitly.
+            # #3424/#3426: which modality the usage came from ("chat" |
+            # "decision" | "embedding"). Passed only to callbacks that name it
+            # explicitly.
             "modality",
         }
         accepted_optional: set[str] = set()
@@ -3536,21 +3565,7 @@ class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, U
         usage = getattr(raw, "usage", None)
         if usage is None and isinstance(raw, dict):
             usage = raw.get("usage")
-        if usage is None:
-            return None
-        cost = getattr(usage, "cost", None)
-        if cost is None:
-            # openai-python v2 stashes unknown response fields (OpenRouter's
-            # ``cost`` extension) on the pydantic model's ``model_extra``.
-            extra = getattr(usage, "model_extra", None)
-            if isinstance(extra, dict):
-                cost = extra.get("cost")
-            elif isinstance(usage, dict):
-                cost = usage.get("cost")
-        try:
-            return float(cost) if cost is not None else None
-        except (TypeError, ValueError):
-            return None
+        return provider_usage_cost(usage)
 
     async def _finalize_invocation(
         self,
@@ -3651,34 +3666,20 @@ class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, U
         if stop_reason is not None:
             record_metadata.setdefault("stop_reason", stop_reason)
 
-        usage_tracker_ready = (
-            hasattr(self, "_db_initialized")
-            or "_track_model_usage" in getattr(self, "__dict__", {})
-        )
         tracked_tokens = total_tokens
         if tracked_tokens is None and (
             input_tokens is not None or output_tokens is not None
         ):
             tracked_tokens = (input_tokens or 0) + (output_tokens or 0)
-        if track_model_usage and usage_tracker_ready and tracked_tokens is not None:
-            try:
-                cache_usage: dict[str, int] = {}
-                if cache_creation_input_tokens is not None:
-                    cache_usage["cache_creation_input_tokens"] = (
-                        cache_creation_input_tokens
-                    )
-                if cache_read_input_tokens is not None:
-                    cache_usage["cache_read_input_tokens"] = cache_read_input_tokens
-                await self._track_model_usage(
-                    model,
-                    provider_name,
-                    tokens=tracked_tokens,
-                    **cache_usage,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - independent best-effort sink
-                logger.warning("Usage DB failed for %s LLM invocation: %s", path, exc)
+        if track_model_usage and tracked_tokens is not None:
+            await self._record_model_usage(
+                model,
+                provider_name,
+                tokens=tracked_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                label=path,
+            )
 
         await self._log_llm_call(
             provider=provider_name,
@@ -3882,7 +3883,10 @@ class LLMService(DecisionServiceMixin, ModelDiscoveryMixin, ModelMandateMixin, U
         ``modality`` selects the Prometheus series: chat calls keep
         ``kestrel_llm_*`` exactly as before; decision calls (#3424) count only
         in ``kestrel_llm_decision_*`` (labelled by ``caller``) so they never
-        change what the chat series mean.
+        change what the chat series mean. Embedding calls (#3426) count in
+        ``kestrel_llm_*`` under their embedding model's label, input tokens
+        only. Decisions and embeddings arrive content-free through
+        :meth:`record_modality_call`.
 
         This is called automatically by get_response() and generate().
         Also triggers metering callback for billing (Vending Machine).
@@ -4881,7 +4885,7 @@ No other text or formatting.
     async def close(self):
         """Close all async HTTP clients properly."""
         await self.drain_preference_persistence()
-        await self.drain_decision_records()
+        await self.drain_modality_records()
 
         for provider in self.providers:
             # Adapter-owned resources (e.g. CodexAdapter's app-server

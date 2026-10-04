@@ -145,6 +145,42 @@ class UsageTrackingMixin:
             logger.warning(f"Failed to initialize usage tracking: {e}")
             self._usage_db = None
 
+    async def _record_model_usage(
+        self,
+        model_id: str,
+        provider: str,
+        *,
+        tokens: int,
+        cache_creation_input_tokens: int | None = None,
+        cache_read_input_tokens: int | None = None,
+        label: str,
+    ) -> None:
+        """Write one call's usage to ``model_usage`` as an isolated sink.
+
+        Shared by chat finalization and the decision/embedding recorder. A
+        usage-DB failure is logged and never suppresses the other sinks
+        (``llm_calls``, Prometheus, metering). Cancellation propagates.
+        """
+        usage_tracker_ready = (
+            hasattr(self, "_db_initialized")
+            or "_track_model_usage" in getattr(self, "__dict__", {})
+        )
+        if not usage_tracker_ready:
+            return
+        cache_usage: dict[str, int] = {}
+        if cache_creation_input_tokens is not None:
+            cache_usage["cache_creation_input_tokens"] = cache_creation_input_tokens
+        if cache_read_input_tokens is not None:
+            cache_usage["cache_read_input_tokens"] = cache_read_input_tokens
+        try:
+            await self._track_model_usage(
+                model_id, provider, tokens=tokens, **cache_usage
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - independent best-effort sink
+            logger.warning("Usage DB failed for %s LLM invocation: %s", label, exc)
+
     async def _track_model_usage(
         self,
         model_id: str,

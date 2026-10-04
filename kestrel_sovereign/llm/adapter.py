@@ -23,6 +23,7 @@ framework-side.
 """
 
 from dataclasses import dataclass
+import math
 import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
 
@@ -55,6 +56,73 @@ def response_usage_available(response: Any) -> bool:
             "cache_read_input_tokens",
         )
     )
+
+
+def provider_usage_cost(usage: Any) -> Optional[float]:
+    """Provider-reported USD cost on a usage object, or ``None`` (#1806).
+
+    OpenRouter adds ``cost`` to the OpenAI-shaped ``usage`` object. The
+    openai-python v2 models keep that unknown field on ``model_extra``; a
+    dict-shaped usage carries it as a key.
+    """
+
+    if usage is None:
+        return None
+    cost = getattr(usage, "cost", None)
+    if cost is None:
+        extra = getattr(usage, "model_extra", None)
+        if isinstance(extra, dict):
+            cost = extra.get("cost")
+        elif isinstance(usage, dict):
+            cost = usage.get("cost")
+    try:
+        return float(cost) if cost is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+class ReportedUsage:
+    """Usage a provider reported for one decision or embedding dispatch.
+
+    Embedding adapters return bare vectors (the SDK contract), so the
+    embedding service hands one of these to an adapter whose ``aembed`` /
+    ``aembed_batch`` explicitly names a ``usage_sink`` parameter, and the
+    adapter fills it from the provider response (#3426). ``None`` means the
+    provider reported nothing, which telemetry keeps distinct from zero.
+    Values that are not plausible counts or costs are ignored.
+    """
+
+    __slots__ = ("input_tokens", "cost", "model")
+
+    def __init__(self) -> None:
+        self.input_tokens: Optional[int] = None
+        self.cost: Optional[float] = None
+        self.model: Optional[str] = None
+
+    def add(
+        self,
+        *,
+        input_tokens: Any = None,
+        cost: Any = None,
+        model: Any = None,
+    ) -> None:
+        """Accumulate one provider response's usage."""
+
+        if (
+            isinstance(input_tokens, int)
+            and not isinstance(input_tokens, bool)
+            and input_tokens >= 0
+        ):
+            self.input_tokens = (self.input_tokens or 0) + input_tokens
+        if (
+            isinstance(cost, (int, float))
+            and not isinstance(cost, bool)
+            and math.isfinite(cost)
+            and cost >= 0
+        ):
+            self.cost = (self.cost or 0.0) + float(cost)
+        if isinstance(model, str) and model:
+            self.model = model
 
 
 @dataclass(frozen=True)
