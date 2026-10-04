@@ -6321,7 +6321,7 @@ class _PrivacyGoverningGraphStore:
     ``compare_and_swap_node`` methods — closing the bypass where ``.graph``
     returned the raw store.
 
-    The four write entry points are governed methods ON this proxy. Everything
+    The five write entry points are governed methods ON this proxy. Everything
     else is handled by :meth:`__getattr__`, which forwards ONLY a fixed allowlist
     of non-write surfaces (reads, deletes, ``bind_agent``, read-only metadata) and
     FAILS CLOSED on anything else. In particular it refuses the raw ``db`` handle
@@ -6336,7 +6336,7 @@ class _PrivacyGoverningGraphStore:
     #: Non-write attributes safe to forward to the wrapped ``AsyncGraphStore``.
     #: Reads, removals (a delete is not a durable user-content WRITE — it takes
     #: content away, which volatile modes never forbid), agent-scope binding, and
-    #: read-only metadata. The four durable WRITE entry points are governed
+    #: read-only metadata. The five durable WRITE entry points are governed
     #: methods on this proxy and never reach ``__getattr__``. Any name NOT here —
     #: notably the raw ``db`` handle and any newly-added write method — fails
     #: closed (#2672 review P1). Extending this set REQUIRES confirming the target
@@ -6409,9 +6409,21 @@ class _PrivacyGoverningGraphStore:
             source_id, target_id, label, properties
         )
 
+    async def add_external_reference_edge(
+        self, source_id, target_id, label, properties=None,
+        *, capability: Any = None,
+    ):
+        self._wrapper._assert_graph_edge_write_allowed(
+            label, "graph.add_external_reference_edge", properties,
+            capability=capability,
+        )
+        return await self._store.add_external_reference_edge(
+            source_id, target_id, label, properties
+        )
+
     def __getattr__(self, name):
         # Reached for any attribute not defined on this proxy (i.e. anything but
-        # the four governed writers). Forward ONLY the allowlisted non-write
+        # the five governed writers). Forward ONLY the allowlisted non-write
         # surface; fail closed on everything else so a caller cannot reach the raw
         # ``db`` handle — or any un-vetted / future write method — and bypass the
         # volatile-mode graph-write policy through the ``.graph`` surface
@@ -6425,8 +6437,9 @@ class _PrivacyGoverningGraphStore:
             raise AttributeError(name)
         raise PrivacyViolationError(
             f"Graph proxy refuses to forward {name!r}: the privacy-governing "
-            f"graph view exposes only its four governed writers (add_node / "
-            f"add_edge / compare_and_swap_node / add_trusted_cross_agent_edge) "
+            f"graph view exposes only its five governed writers (add_node / "
+            f"add_edge / compare_and_swap_node / add_trusted_cross_agent_edge / "
+            f"add_external_reference_edge) "
             f"plus a fixed allowlist of reads/deletes/bind_agent. Raw handles "
             f"such as 'db' and any other attribute are refused so a caller cannot "
             f"bypass the volatile-mode graph-write policy through the '.graph' "
