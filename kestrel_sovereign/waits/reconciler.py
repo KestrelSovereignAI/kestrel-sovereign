@@ -102,6 +102,9 @@ logger = logging.getLogger(__name__)
 # that: it is parked until the provider's time and its attempt is refunded
 # (#3302), so a two-hour rate limit cannot burn ten one-minute retries and
 # lock the wake away before the route comes back.
+#
+# The lock reads the transition's recorded attempt count in the ledger row,
+# and records the count it fired at, which ``wait_status`` reports (#3391).
 MAX_DELIVERY_ATTEMPTS = 10
 
 # Dispatcher result statuses that mean the wake was ACCEPTED and its turn ran
@@ -1049,16 +1052,24 @@ class WaitReconciler:
         )
         if attempts_so_far >= MAX_DELIVERY_ATTEMPTS:
             # Retry cap reached — lock signaled and surface a synthetic
-            # delivery status for operator review.
-            await store.record_delivery(
+            # delivery status for operator review. The store checks the row's
+            # own recorded attempts for this transition, not this read of it,
+            # and records the count it locked at (#3391). It keeps the last
+            # real failure: the only account of why the wake never landed.
+            locked = await store.lock_at_max_attempts(
                 kind, handle,
-                delivery_status=MAX_ATTEMPTS_EXCEEDED,
-                # Keep the last real failure: it is the only account of why
-                # the wake never landed, and ``wait_status`` reports it.
-                delivery_error=state.last_delivery_error if state else None,
-                signaled_outcome=signaled_token,
+                target=signaled_token,
+                max_attempts=MAX_DELIVERY_ATTEMPTS,
                 attempt_at=datetime.now(timezone.utc),
             )
+            if not locked:
+                logger.warning(
+                    "wait_reconcile: %s:%s not locked: its row no longer "
+                    "records %d attempts for %r with no wake in flight; "
+                    "re-reading it next tick",
+                    kind, handle, attempts_so_far, signaled_token,
+                )
+                return
             counters["signals_hard_failed"] += 1
             logger.warning(
                 "wait_reconcile: %s:%s locked after %d delivery attempts "
