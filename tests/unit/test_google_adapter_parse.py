@@ -15,7 +15,9 @@ def _client_returning(response):
     client = SimpleNamespace()
     client.aio = SimpleNamespace()
     client.aio.models = SimpleNamespace(
-        generate_content=AsyncMock(return_value=response)
+        generate_content=AsyncMock(return_value=response),
+        # The model's own output ceiling (#3355), looked up on first use.
+        get=AsyncMock(return_value=SimpleNamespace(output_token_limit=65_536)),
     )
     return client
 

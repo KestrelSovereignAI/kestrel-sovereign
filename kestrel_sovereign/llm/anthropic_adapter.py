@@ -39,11 +39,13 @@ from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
 from .output_ceiling import (
     OutputCeilingUnknownError,
+    OutputCeilings,
     attach_stop_reason,
     context_window_notice,
     join_output_ceiling_notice,
-    output_ceiling_notice,
     output_ceiling_notice_chunk,
+    output_limit_cut_notice,
+    reported_token_limit,
 )
 from contextlib import asynccontextmanager
 
@@ -391,24 +393,13 @@ class AnthropicAdapter(LLMAdapter):
         # model discovery has not described, by one Models API lookup on
         # first use. Per adapter instance, so each route asks with its own
         # credentials.
-        self._output_ceilings: Dict[str, int] = {}
+        self._output_ceilings = OutputCeilings()
 
     # ---- Output ceiling (#3300) --------------------------------------------
 
-    @staticmethod
-    def _reported_output_limit(info: ModelInfo) -> Optional[int]:
-        """``info.output_limit`` when it is a real ceiling, else ``None``."""
-        limit = info.output_limit
-        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
-            return limit
-        return None
-
     def _learn_output_ceilings(self, models: List[ModelInfo]) -> None:
         """Remember the output ceiling each discovered model reports."""
-        for info in models:
-            limit = self._reported_output_limit(info)
-            if limit is not None:
-                self._output_ceilings[info.id] = limit
+        self._output_ceilings.learn(models)
 
     async def _model_output_ceiling(
         self,
@@ -433,12 +424,12 @@ class AnthropicAdapter(LLMAdapter):
             with_retry(client.models.retrieve, wire_model),
             cancel_token,
         )
-        limit = self._reported_output_limit(anthropic_model_info(record))
+        limit = reported_token_limit(anthropic_model_info(record).output_limit)
         if limit is None:
             raise OutputCeilingUnknownError(wire_model, provider="Anthropic")
         # Keyed by the id that was asked for: an alias may come back as a
         # dated snapshot id, and the next request will ask by the alias.
-        self._output_ceilings[wire_model] = limit
+        self._output_ceilings.remember(wire_model, limit)
         return limit
 
     async def _apply_output_ceiling(
@@ -501,20 +492,16 @@ class AnthropicAdapter(LLMAdapter):
                 model, stop_reason,
             )
             return context_window_notice(stop_reason=stop_reason)
-        if stop_reason != _MAX_TOKENS_STOP_REASON:
-            return None
-        if model_ceiling is None:
-            logger.info(
-                "Anthropic response for %s stopped at the caller's max_tokens "
-                "budget (stop_reason=%s)", model, stop_reason,
-            )
-            return None
-        logger.warning(
-            "Anthropic response for %s reached the model's output ceiling of "
-            "%d tokens (stop_reason=%s); the response is incomplete",
-            model, model_ceiling, stop_reason,
+        # ``_apply_output_ceiling`` returns no ceiling exactly when the caller
+        # chose the budget.
+        return output_limit_cut_notice(
+            provider="Anthropic",
+            model=model,
+            stop_reason=stop_reason,
+            cut_reason=_MAX_TOKENS_STOP_REASON,
+            caller_budget=model_ceiling is None,
+            model_ceiling=model_ceiling,
         )
-        return output_ceiling_notice(ceiling=model_ceiling, stop_reason=stop_reason)
 
     def provider_capabilities(self) -> ProviderCapabilities:
         # Data-plane features that hit api.anthropic.com directly — the
