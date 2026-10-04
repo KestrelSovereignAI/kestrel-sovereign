@@ -15,7 +15,7 @@ import re
 import time
 from dataclasses import replace
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from kestrel_sdk.llm.decisions import (
     DecisionModelInfo,
@@ -32,6 +32,7 @@ from kestrel_sdk.llm.decisions import (
 
 from kestrel_sovereign.config import load_section
 
+from .adapter import ReportedUsage
 from .decisions.config import (
     DecisionRouteConfig,
     DecisionSelector,
@@ -48,12 +49,9 @@ from .decisions.resolve import (
     select_candidate,
 )
 from .decisions.thresholds import ThresholdBook
+from .modality_recording import ModalityCall
 
 logger = logging.getLogger(__name__)
-
-#: How long ``decide`` waits for its telemetry record before handing it to a
-#: background task (§8.2). The caller's outcome is never delayed past this.
-DECISION_RECORD_TIMEOUT = 2.0
 
 #: Fixed synthetic request for pin canaries (§4.1): no caller content.
 CANARY_REQUEST: ValidatedDecisionRequest = validate_decision_request(
@@ -431,44 +429,7 @@ class DecisionServiceMixin:
     # Accounting (§8.2, §8.3)
     # ------------------------------------------------------------------
 
-    async def _finish_decision_record(self, **record: Any) -> None:
-        """Write one decision record without letting it alter the outcome.
-
-        The write runs as its own task under ``asyncio.shield`` so cancelling
-        the caller does not cancel it. The caller waits at most
-        :data:`DECISION_RECORD_TIMEOUT`; a slower write finishes in the
-        background. Nothing raised here reaches the caller.
-        """
-
-        task = asyncio.ensure_future(self._write_decision_record(**record))
-        self._pending_decision_records().add(task)
-        task.add_done_callback(self._decision_record_done)
-        try:
-            await asyncio.wait_for(asyncio.shield(task), DECISION_RECORD_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Decision record for %s is late; finishing in the background",
-                record.get("caller"),
-            )
-        except asyncio.CancelledError:
-            # A new cancellation while waiting: the shielded write carries on
-            # by itself, and the cancellation propagates to the caller.
-            raise
-        except Exception:  # noqa: BLE001 - logged by the done callback
-            pass
-
-    def _pending_decision_records(self) -> "Set[asyncio.Task[None]]":
-        return self.__dict__.setdefault("_decision_record_tasks", set())
-
-    def _decision_record_done(self, task: "asyncio.Task[None]") -> None:
-        self._pending_decision_records().discard(task)
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            logger.warning("Decision telemetry record failed: %s", type(exc).__name__)
-
-    async def _write_decision_record(
+    async def _finish_decision_record(
         self,
         *,
         provider: Mapping[str, Any],
@@ -481,50 +442,28 @@ class DecisionServiceMixin:
         calibrated: Optional[bool],
         context: Any,
     ) -> None:
-        usage = body.get("usage") if isinstance(body, Mapping) else None
-        input_tokens = None
-        cost = None
-        if isinstance(usage, Mapping):
-            tokens = usage.get("input_tokens")
-            if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0:
-                input_tokens = tokens
-            raw_cost = usage.get("cost")
-            if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool):
-                cost = float(raw_cost)
-        success = error is None
-        provider_name = str(provider.get("name"))
-        if input_tokens is not None:
-            await self._track_model_usage(model, provider_name, tokens=input_tokens)
-        await self._log_llm_call(
-            provider=provider_name,
-            model=model,
-            duration_ms=duration_ms,
-            success=success,
-            # §8.3: decision telemetry carries no content — not the state,
-            # not the questions, not a vendor error body.
-            system_prompt=None,
-            user_prompt=None,
-            response=None,
-            error_message=type(error).__name__ if error is not None else None,
-            metadata={
-                "modality": "decision",
-                "caller": caller,
-                "question_count": question_count,
-                "calibrated": calibrated,
-                "usage_available": input_tokens is not None,
-            },
-            input_tokens=input_tokens,
-            output_tokens=None,
-            cost=cost,
-            usage_available=input_tokens is not None,
-            invocation_context=context,
-            modality="decision",
-            caller=caller,
+        """Record one dispatched decision through the shared recorder."""
+
+        usage = ReportedUsage()
+        reported = body.get("usage") if isinstance(body, Mapping) else None
+        if isinstance(reported, Mapping):
+            usage.add(input_tokens=reported.get("input_tokens"), cost=reported.get("cost"))
+        await self.record_modality_call(
+            ModalityCall(
+                modality="decision",
+                provider=str(provider.get("name")),
+                model=model,
+                duration_ms=duration_ms,
+                success=error is None,
+                context=context,
+                error_class=type(error).__name__ if error is not None else None,
+                input_tokens=usage.input_tokens,
+                cost=usage.cost,
+                caller=caller,
+                metadata={
+                    "caller": caller,
+                    "question_count": question_count,
+                    "calibrated": calibrated,
+                },
+            )
         )
-
-    async def drain_decision_records(self) -> None:
-        """Wait for late decision telemetry records (called from ``close``)."""
-
-        tasks = set(self._pending_decision_records())
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)

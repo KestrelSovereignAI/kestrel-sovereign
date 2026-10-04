@@ -26,9 +26,11 @@ from kestrel_sdk.llm import ToolCallStarted
 from .adapter import (
     LLMAdapter,
     LLMResponse,
+    ReportedUsage,
     ThinkingContentSplitter,
     ThinkingDelta,
     ToolCall,
+    provider_usage_cost,
     split_thinking_from_content,
 )
 from kestrel_sdk.llm import (
@@ -328,6 +330,27 @@ class OpenAIAdapter(LLMAdapter):
         except httpx.HTTPError:
             return False
 
+    @staticmethod
+    def _report_embedding_usage(
+        usage_sink: Optional[ReportedUsage], response: Any
+    ) -> None:
+        """Copy an embeddings response's usage into ``usage_sink`` (#3426).
+
+        ``usage.prompt_tokens`` is the billed input (embeddings have no
+        output); OpenRouter adds ``usage.cost``.
+        """
+        if usage_sink is None:
+            return
+        usage = getattr(response, "usage", None)
+        tokens = getattr(usage, "prompt_tokens", None)
+        if tokens is None:
+            tokens = getattr(usage, "total_tokens", None)
+        usage_sink.add(
+            input_tokens=tokens,
+            cost=provider_usage_cost(usage),
+            model=getattr(response, "model", None),
+        )
+
     async def aembed(
         self,
         client: openai.AsyncOpenAI,
@@ -335,6 +358,7 @@ class OpenAIAdapter(LLMAdapter):
         *,
         model: Optional[str] = None,
         dimensions: Optional[int] = None,
+        usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
         create_kwargs: Dict[str, Any] = {
@@ -350,6 +374,7 @@ class OpenAIAdapter(LLMAdapter):
             client.embeddings.create,
             **create_kwargs,
         )
+        self._report_embedding_usage(usage_sink, response)
         data = getattr(response, "data", None) or []
         if not data:
             return None
@@ -363,6 +388,7 @@ class OpenAIAdapter(LLMAdapter):
         *,
         model: Optional[str] = None,
         dimensions: Optional[int] = None,
+        usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
         if not texts:
@@ -377,6 +403,7 @@ class OpenAIAdapter(LLMAdapter):
             client.embeddings.create,
             **create_kwargs,
         )
+        self._report_embedding_usage(usage_sink, response)
         embeddings: List[Optional[List[float]]] = [None] * len(texts)
         for item in getattr(response, "data", None) or []:
             index = getattr(item, "index", None)

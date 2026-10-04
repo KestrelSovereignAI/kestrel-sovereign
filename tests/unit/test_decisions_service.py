@@ -25,7 +25,7 @@ from kestrel_sdk.llm.decisions import (
     UnavailableReason,
 )
 
-from kestrel_sovereign.llm import decision_service as decision_service_mod
+from kestrel_sovereign.llm import modality_recording as modality_recording_mod
 from kestrel_sovereign.llm.decision_service import DecisionServiceMixin
 from kestrel_sovereign.llm.decisions.config import (
     DecisionRouteConfig,
@@ -199,14 +199,14 @@ async def test_cancellation_propagates_and_the_record_survives() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await service.drain_decision_records()
+    await service.drain_modality_records()
     [row] = _logged(service)
     assert row["success"] is False and row["error_message"] == "CancelledError"
 
 
 @pytest.mark.asyncio
 async def test_a_slow_record_does_not_hold_the_caller(monkeypatch) -> None:
-    monkeypatch.setattr(decision_service_mod, "DECISION_RECORD_TIMEOUT", 0.01)
+    monkeypatch.setattr(modality_recording_mod, "USAGE_RECORD_TIMEOUT", 0.01)
     adapter = FakeDecisionAdapter(["nimble"])
     service = _service([_route("ollama:local", adapter, local=True)])
     release = asyncio.Event()
@@ -217,10 +217,10 @@ async def test_a_slow_record_does_not_hold_the_caller(monkeypatch) -> None:
     service._observability_store.log_llm_call = AsyncMock(side_effect=slow_log)
     result = await service.decide(_request(), caller="c", timeout_seconds=5)
     assert result.model == "nimble"
-    assert service._pending_decision_records()
+    assert service._pending_modality_records()
     release.set()
-    await service.drain_decision_records()
-    assert not service._pending_decision_records()
+    await service.drain_modality_records()
+    assert not service._pending_modality_records()
 
 
 @pytest.mark.asyncio

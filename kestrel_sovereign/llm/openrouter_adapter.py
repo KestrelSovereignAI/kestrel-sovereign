@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 from pydantic import BaseModel
 
-from .adapter import LLMResponse
+from .adapter import LLMResponse, ReportedUsage
 from kestrel_sdk.llm import ProviderCapabilities
 from kestrel_sdk.llm.decisions import (
     DecisionModelInfo,
@@ -135,6 +135,7 @@ class OpenRouterAdapter(OpenAIAdapter):
         *,
         model: Optional[str] = None,
         dimensions: Optional[int] = None,
+        usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
         """Embed one text via OpenRouter's OpenAI-compatible ``/v1/embeddings``.
@@ -154,7 +155,12 @@ class OpenRouterAdapter(OpenAIAdapter):
         if dimensions is None:
             dimensions = self._embedding_dim
         return await super().aembed(
-            client, text, model=model, dimensions=dimensions, **kwargs
+            client,
+            text,
+            model=model,
+            dimensions=dimensions,
+            usage_sink=usage_sink,
+            **kwargs,
         )
 
     async def aembed_batch(
@@ -164,6 +170,7 @@ class OpenRouterAdapter(OpenAIAdapter):
         *,
         model: Optional[str] = None,
         dimensions: Optional[int] = None,
+        usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
         model = model or self._embedding_model
@@ -177,7 +184,12 @@ class OpenRouterAdapter(OpenAIAdapter):
         if dimensions is None:
             dimensions = self._embedding_dim
         return await super().aembed_batch(
-            client, texts, model=model, dimensions=dimensions, **kwargs
+            client,
+            texts,
+            model=model,
+            dimensions=dimensions,
+            usage_sink=usage_sink,
+            **kwargs,
         )
 
     def _get_client(self) -> openai.AsyncOpenAI:
