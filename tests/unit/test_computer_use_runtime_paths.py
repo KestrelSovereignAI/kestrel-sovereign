@@ -312,6 +312,207 @@ async def test_an_unusable_path_value_is_refused(tmp_path: Path, elsewhere: Path
     assert f._backend is None
 
 
+# --- a refused re-initialisation fails closed (#3476) ---------------------------
+#
+# A refusal used to return before touching anything, so the backend built by an
+# earlier, good initialize stayed live: readiness passed and calls kept running
+# while the log said no computer-use call would run.
+
+
+async def _working_feature(
+    tmp_path: Path, agent: FakeAgent | None = None, **over: Any
+) -> tuple[ComputerUseFeature, Path]:
+    """A feature whose first initialize succeeded and whose tools run."""
+    emma = _agent_dir(tmp_path, "Emma")
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "note.txt").write_text("hello")
+    if agent is None:
+        agent = FakeAgent(storage_path=str(emma / "kestrel_prime.db"))
+    else:
+        agent.storage_path = str(emma / "kestrel_prime.db")
+    f = await _feature(agent, _enabled(allowed_paths=[str(work)], **over))
+    envs = await _calls(f, work)
+    assert [e.status for e in envs] == [ToolResultStatus.OK] * 3, [e.error for e in envs]
+    return f, work
+
+
+async def _calls(f: ComputerUseFeature, work: Path) -> list:
+    return [
+        await f.shell(command="echo STILL_RUNS", timeout=10),
+        await f.fs_read(path=str(work / "note.txt")),
+        await f.fs_list(path=str(work)),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["capture_dir", "audit_log_path"])
+async def test_a_refused_reinitialise_leaves_nothing_running(
+    tmp_path: Path, elsewhere: Path, key: str
+):
+    f, work = await _working_feature(tmp_path)
+
+    f._cfg[key] = ""
+    await f.initialize()
+
+    assert f._backend is None
+    assert f._capture_dir is None
+    for env in await _calls(f, work):
+        assert env.status is ToolResultStatus.ERROR
+        assert env.error.startswith("readiness:backend not initialized: ")
+        # The caller is told why, not only that it is unready.
+        assert f"features.computer_use.{key}" in env.error
+
+
+@pytest.mark.asyncio
+async def test_a_refused_reinitialise_audits_its_refusals_with_the_reason(
+    tmp_path: Path, elsewhere: Path
+):
+    """The audit log could still be placed, so it records the refusals."""
+    f, work = await _working_feature(tmp_path)
+
+    f._cfg["capture_dir"] = ""
+    await f.initialize()
+    await _calls(f, work)
+
+    rows = [json.loads(line) for line in f._audit.path.read_text().splitlines()][-3:]
+    assert [r["allowed_by"] for r in rows] == [["denied:readiness:backend"]] * 3
+    assert all("features.computer_use.capture_dir" in r["error"] for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_reinitialise_writes_nothing_to_the_audit_log_it_no_longer_names(
+    tmp_path: Path, elsewhere: Path
+):
+    """A refused first initialize with this config has no audit log, and a
+    refused re-initialise must leave the same state, not the old file."""
+    f, work = await _working_feature(tmp_path)
+    old_audit = f._audit.path
+    before = old_audit.read_bytes()
+
+    f._cfg["audit_log_path"] = ""
+    await f.initialize()
+    await _calls(f, work)
+
+    assert f._audit is None
+    assert old_audit.read_bytes() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["capture_dir", "audit_log_path"])
+async def test_a_good_initialise_after_a_refused_one_restores_service(
+    tmp_path: Path, elsewhere: Path, key: str
+):
+    f, work = await _working_feature(tmp_path)
+    f._cfg[key] = ""
+    await f.initialize()
+
+    del f._cfg[key]
+    await f.initialize()
+
+    envs = await _calls(f, work)
+    assert [e.status for e in envs] == [ToolResultStatus.OK] * 3, [e.error for e in envs]
+    env = await f.shell(command="echo back", capture_output=True, timeout=10)
+    assert env.status is ToolResultStatus.OK, env.error
+    assert Path(env.data["stdout_path"]).read_text() == "back\n"
+
+
+@pytest.mark.asyncio
+async def test_a_backend_refusal_on_reinitialise_is_reported_to_the_caller(
+    tmp_path: Path, elsewhere: Path
+):
+    agent = FakeAgent()
+    f, work = await _working_feature(tmp_path, agent)
+
+    agent.granted_capabilities = frozenset({"filesystem_read"})
+    await f.initialize()
+
+    assert f._backend is None
+    for env in await _calls(f, work):
+        assert env.status is ToolResultStatus.ERROR
+        assert "backend refused init" in env.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shutdown_first", [False, True], ids=["reinit", "shutdown-reinit"])
+async def test_the_previous_backend_is_shut_down_exactly_once(
+    tmp_path: Path, elsewhere: Path, shutdown_first: bool
+):
+    f, _ = await _working_feature(tmp_path)
+    old = f._backend
+    shut: list[Any] = []
+
+    async def _shutdown() -> None:
+        shut.append(old)
+
+    old.shutdown = _shutdown
+
+    if shutdown_first:
+        await f.shutdown()
+    f._cfg["capture_dir"] = ""
+    await f.initialize()
+    await f.shutdown()
+
+    assert shut == [old]
+
+
+@pytest.mark.asyncio
+async def test_no_call_runs_after_shutdown(tmp_path: Path, elsewhere: Path):
+    f, work = await _working_feature(tmp_path)
+
+    await f.shutdown()
+
+    for env in await _calls(f, work):
+        assert env.error.startswith("readiness:backend not initialized")
+
+
+class _ReinitialisingApprovalQueue:
+    """Re-initialises the feature while a call waits for its approval."""
+
+    def __init__(self, change):
+        self.change = change
+        self.feature: ComputerUseFeature | None = None
+
+    async def request_approval(self, feature_name, tool_name, tool_args, timeout):
+        self.change(self.feature._cfg)
+        await self.feature.initialize()
+        return True, "once"
+
+
+def _refuse(cfg: dict[str, Any]) -> None:
+    cfg["capture_dir"] = ""
+
+
+def _rebuild(cfg: dict[str, Any]) -> None:
+    """Same configuration: a new backend these gates never evaluated."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [_refuse, _rebuild], ids=["refused", "rebuilt"])
+async def test_a_call_authorised_across_a_reinitialise_does_not_run(
+    tmp_path: Path, elsewhere: Path, change
+):
+    emma = _agent_dir(tmp_path, "Emma")
+    agent = FakeAgent(storage_path=str(emma / "kestrel_prime.db"))
+    queue = _ReinitialisingApprovalQueue(change)
+    agent.features["security"].approval_queue = queue
+    audit = tmp_path / "audit.jsonl"
+    f = await _feature(agent, _enabled(audit_log_path=str(audit)))
+    queue.feature = f
+    target = tmp_path / "ran"
+
+    # ``touch`` is not auto-approved, so the call waits in the queue.
+    env = await f.shell(command=f"touch {target}", timeout=10)
+
+    assert env.status is ToolResultStatus.ERROR
+    assert env.error.startswith("readiness:feature was re-initialised")
+    assert not target.exists(), "the command ran"
+    last = json.loads(audit.read_text().splitlines()[-1])
+    assert last["allowed_by"][-1] == "denied:readiness:reinitialized"
+    if change is _refuse:
+        assert "features.computer_use.capture_dir" in env.error
+
+
 # --- the legacy shared file -----------------------------------------------------
 
 

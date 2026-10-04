@@ -282,6 +282,15 @@ class ComputerUseFeature(Feature):
     def __init__(self, agent=None):
         super().__init__(agent)
         self._cfg: Dict[str, Any] = {}
+        self._clear_runtime_state()
+
+    def _clear_runtime_state(self) -> None:
+        """Forget everything an initialize built from configuration.
+
+        Every initialize starts here, so what the feature does afterwards
+        depends only on the configuration it was given, never on what an
+        earlier initialize built (#3476).
+        """
         self._backend: Optional[SandboxBackend] = None
         self._path_policy: Optional[PathPolicy] = None
         self._binary_policy: Optional[BinaryPolicy] = None
@@ -290,6 +299,8 @@ class ComputerUseFeature(Feature):
         self._capture_dir: Optional[Path] = None
         self._capture_retention_days: int = _DEFAULT_CAPTURE_RETENTION_DAYS
         self._last_capture_prune: Optional[float] = None
+        # Why the last initialize built no backend, for the readiness refusal.
+        self._init_refusal: Optional[str] = None
 
     @property
     def tool_description(self) -> str:
@@ -310,6 +321,16 @@ class ComputerUseFeature(Feature):
         await self._setup_from_config()
 
     async def _setup_from_config(self) -> None:
+        # A re-initialisation that refuses must not leave the previous
+        # backend live: it would keep running calls on a host-touching
+        # capability whose refusal the operator has just read in the log.
+        # Cleared before the old backend is shut down, so a call arriving
+        # mid-initialize is refused rather than run on half-built state.
+        previous = self._backend
+        self._clear_runtime_state()
+        if previous is not None:
+            await previous.shutdown()
+
         enabled = bool(self._cfg.get("enabled", False))
         try:
             audit_path = self._resolve_runtime_path(
@@ -327,6 +348,9 @@ class ComputerUseFeature(Feature):
             )
         except _RuntimePathError as exc:
             # No backend is built, so every call is refused at readiness.
+            # Whatever did resolve stays: an audit log that could be placed
+            # still records those refusals.
+            self._init_refusal = str(exc)
             logger.log(
                 logging.ERROR if enabled else logging.WARNING,
                 "ComputerUseFeature: %s. No computer-use call will run.",
@@ -416,6 +440,7 @@ class ComputerUseFeature(Feature):
         except CapabilityBlocked as exc:
             logger.warning("ComputerUseFeature: backend refused init: %s", exc)
             self._backend = None
+            self._init_refusal = f"backend refused init: {exc}"
             return
 
         logger.info(
@@ -428,8 +453,11 @@ class ComputerUseFeature(Feature):
         )
 
     async def shutdown(self) -> None:
-        if self._backend is not None:
-            await self._backend.shutdown()
+        # Cleared first: a shut-down backend must not run another call, and a
+        # later initialize must not shut it down a second time.
+        backend, self._backend = self._backend, None
+        if backend is not None:
+            await backend.shutdown()
 
     def _load_config(self) -> Dict[str, Any]:
         """Read [features.computer_use] from kestrel.toml. Best-effort."""
@@ -722,8 +750,17 @@ class ComputerUseFeature(Feature):
             await self._audit_denied(tool_name, payload, ["denied:readiness:disabled"])
             return _GateOutcome(False, allowed_by, "readiness:feature not enabled")
         if self._backend is None:
-            await self._audit_denied(tool_name, payload, ["denied:readiness:backend"])
-            return _GateOutcome(False, allowed_by, "readiness:backend not initialized")
+            await self._audit_denied(
+                tool_name,
+                payload,
+                ["denied:readiness:backend"],
+                error=self._init_refusal,
+            )
+            reason = "readiness:backend not initialized"
+            if self._init_refusal:
+                reason = f"{reason}: {self._init_refusal}"
+            return _GateOutcome(False, allowed_by, reason)
+        gated_backend = self._backend
 
         # 1. Privacy
         if not self._privacy_allows():
@@ -916,6 +953,26 @@ class ComputerUseFeature(Feature):
                 )
                 return _GateOutcome(False, allowed_by, f"approval:{scope}")
             allowed_by.append(f"approval:{scope}")
+
+        # 6. Still the feature these gates ran against. The approval wait can
+        # last minutes, and an initialize in that time either refused, leaving
+        # no backend, or built a new one from configuration these gates never
+        # evaluated -- possibly a different backend than the capability that
+        # was checked. Either way the authorisation no longer applies (#3476).
+        if self._backend is not gated_backend:
+            await self._audit_denied(
+                tool_name,
+                payload,
+                allowed_by + ["denied:readiness:reinitialized"],
+                error=self._init_refusal,
+            )
+            reason = (
+                "readiness:feature was re-initialised while this call was "
+                "being authorised"
+            )
+            if self._init_refusal:
+                reason = f"{reason}: {self._init_refusal}"
+            return _GateOutcome(False, allowed_by, reason)
 
         # Stash the resolved values on the outcome via the payload so
         # callers don't have to re-resolve.
