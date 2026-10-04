@@ -478,6 +478,28 @@ class _LeaseRenewalState:
         self.lost.set()
 
 
+@dataclass
+class _AdmittedOccurrence:
+    """One due row a tick handed to its own runner-owned task (#3465).
+
+    The record lives from admission until that task ends, which is what stops
+    a later tick from admitting a second claimant for the same row.
+    """
+
+    agent_id: str
+    task: asyncio.Task[None]
+    admitted_monotonic: float
+    # Database time at which the admitting poll started. ``None`` when a
+    # caller ran a tick outside the polling loop.
+    admitted_at: Optional[str]
+    # True until the occurrence holds a concurrency slot: the row is queued
+    # behind the cap, so the batch that admitted it is still open.
+    awaiting_slot: bool = True
+    # True until the claim compare-and-set returns. The stall watchdog
+    # counts the row from admission until then, so a hung claim is a stall.
+    awaiting_claim: bool = True
+
+
 _current_execution: contextvars.ContextVar[Optional[_SchedulerExecutionScope]] = (
     contextvars.ContextVar("scheduler_execution", default=None)
 )
@@ -1114,6 +1136,10 @@ class SchedulerRunner:
         self._poll_interval = poll_interval
         self._misfire_grace_seconds = max(0, int(misfire_grace_seconds))
         self._max_concurrent_tasks = max(1, int(max_concurrent_tasks))
+        # Bounds the occurrences between claim and finalization across every
+        # tick (#1675). It is runner-wide because occurrences outlive the
+        # tick that admitted them.
+        self._occurrence_slots = asyncio.Semaphore(self._max_concurrent_tasks)
         self._lease_seconds = normalized_lease_seconds
         self._owner_id = owner_id or f"scheduler:{uuid.uuid4()}"
         # Standalone runners retain their fixed one-DID scope. Hosted runners
@@ -1141,9 +1167,20 @@ class SchedulerRunner:
         self._arm_requested_monotonic: Optional[float] = None
         self._arm_requested_at: Optional[str] = None
         self._running = False
+        # The reported tick stays open from the poll that admitted the oldest
+        # row still waiting for a slot, so rows queued behind the cap stay
+        # inside an open batch as they did when one tick awaited its batch.
         self._last_tick_started_at: Optional[str] = None
         self._last_tick_completed_at: Optional[str] = None
+        # Start of the poll in progress, if any.
         self._tick_started_monotonic: Optional[float] = None
+        self._tick_started_at: Optional[str] = None
+        # Admitted occurrences that have not finished, keyed by schedule row
+        # id in admission order. The poll loop never waits for them (#3465).
+        self._occurrences: dict[str, _AdmittedOccurrence] = {}
+        # Immutable view of the oldest admission still awaiting its claim,
+        # for synchronous health-probe threads.
+        self._oldest_unclaimed_admission_monotonic: Optional[float] = None
         self._live_claim_deadlines: dict[str, float] = {}
         self._live_claim_deadline_snapshot: tuple[float, ...] = ()
         self._tick_in_progress_limit_seconds = (
@@ -1196,9 +1233,24 @@ class SchedulerRunner:
 
     @property
     def tick_stalled(self) -> bool:
-        """Whether polling is over-bound without a live claimed execution."""
+        """Whether polling is over-bound without a live claimed execution.
 
-        started = self._tick_started_monotonic
+        An admitted occurrence counts from its admission until its claim
+        returns, so a hung claim is a stall even though the poll loop itself
+        has moved on.
+        """
+
+        started = min(
+            (
+                value
+                for value in (
+                    self._tick_started_monotonic,
+                    self._oldest_unclaimed_admission_monotonic,
+                )
+                if value is not None
+            ),
+            default=None,
+        )
         return bool(
             self._running
             and started is not None
@@ -1241,9 +1293,26 @@ class SchedulerRunner:
     async def _agent_is_currently_authorized(self, agent_id: str) -> bool:
         """Check the current fleet scope and an optional live authority view."""
 
-        if agent_id not in await self._current_authorized_agent_ids():
+        if agent_id not in await self._current_authorized_agent_ids() and not (
+            self._admitted_by_earlier_authority_page(agent_id)
+        ):
             return False
         return await self._live_agent_authority_allows(agent_id)
+
+    def _admitted_by_earlier_authority_page(self, agent_id: str) -> bool:
+        """Whether a paged host admitted work for this DID on an earlier page.
+
+        The poll loop moves on to later pages while an occurrence it admitted
+        is still claiming or executing. That occurrence keeps the membership
+        it was selected under; the required live ``is_agent_authorized``
+        check still revokes it. Unpaged scopes stay strictly current, so a
+        tenant removed from them drops out immediately.
+        """
+
+        return self._authorized_agent_ids_page_provider is not None and any(
+            occurrence.agent_id == agent_id
+            for occurrence in self._occurrences.values()
+        )
 
     async def _live_agent_authority_allows(self, agent_id: str) -> bool:
         """Revalidate one DID at a provider-effect or claim boundary."""
@@ -1283,8 +1352,9 @@ class SchedulerRunner:
         """Resolve one strict bounded keyset page without advancing it.
 
         The cursor is committed only after rollout reconciliation, selection,
-        and the claim batch complete. Cancellation or infrastructure failure
-        therefore retries the same page instead of skipping tenants.
+        and admission of the due batch complete. Cancellation or
+        infrastructure failure therefore retries the same page instead of
+        skipping tenants.
         """
 
         provider = self._authorized_agent_ids_page_provider
@@ -1368,9 +1438,17 @@ class SchedulerRunner:
         self._arm_requested_at = None
         self._running = False
         self._tick_started_monotonic = None
+        # Admission is synchronous once a poll has its due rows, so while
+        # this task runs the worker is suspended outside it: every occurrence
+        # it will ever admit is already in ``_occurrences``.
         owned_tasks = tuple(dict.fromkeys(
             task
-            for task in (self._task, self._worker_task, self._telemetry_task)
+            for task in (
+                self._task,
+                self._worker_task,
+                self._telemetry_task,
+                *(occurrence.task for occurrence in self._occurrences.values()),
+            )
             if task is not None
         ))
         for task in owned_tasks:
@@ -1720,25 +1798,43 @@ class SchedulerRunner:
             self._tick_started_monotonic = time.monotonic()
             self._runtime_worker_state = "running"
             self._runtime_status_wake.set()
-            # Per-occurrence failures are isolated and finalized by ``_tick``.
-            # Infrastructure failures escape to the supervisor, which reports
+            # Per-occurrence failures are isolated on their own tasks. Poll
+            # infrastructure failures escape to the supervisor, which reports
             # and replaces this worker instead of letting it vanish.
             try:
-                self._last_tick_started_at = (
+                self._tick_started_at = (
                     await scheduler_database_clock(self._db)
                 ).isoformat()
+                self._last_tick_started_at = self._open_tick_started_at()
                 await self._tick()
-                self._last_tick_completed_at = (
+                # Let every admitted occurrence take its first step, which is
+                # its slot acquisition. Only a row genuinely queued behind the
+                # cap may then keep the batch open; one that got a free slot
+                # must not hold it open until the next poll.
+                await asyncio.sleep(0)
+                tick_completed_at = (
                     await scheduler_database_clock(self._db)
                 ).isoformat()
+                self._last_tick_started_at = self._open_tick_started_at()
+                if self._oldest_queued_admission() is None:
+                    self._last_tick_completed_at = tick_completed_at
             finally:
                 self._tick_started_monotonic = None
+                self._tick_started_at = None
             self._consecutive_worker_failures = 0
             self._last_worker_error_type = None
             self._runtime_status_wake.set()
             await asyncio.sleep(self._poll_interval)
 
     async def _tick(self):
+        """Poll once and start every due occurrence not already in flight.
+
+        Each occurrence runs on its own runner-owned task and this method
+        returns without waiting for any of them (#3465). Awaiting the whole
+        batch let one slow occurrence stop the runner claiming any other due
+        work until it returned, so later cron rows silently misfired.
+        """
+
         authority_page_next_cursor: Optional[str] = None
         if self._authorized_agent_ids_page_provider is not None:
             authority_page, authority_page_next_cursor = (
@@ -1746,7 +1842,7 @@ class SchedulerRunner:
             )
             # Rollout, selection, telemetry, and claim membership all observe
             # this same bounded page. The cursor remains uncommitted until the
-            # complete batch succeeds.
+            # complete batch is admitted.
             self._authorized_agent_ids_page = authority_page
         # A legacy binary can insert a row after this runner started. Check the
         # durable per-agent protocol state before every claim batch so an
@@ -1760,46 +1856,123 @@ class SchedulerRunner:
                 raise
         now = datetime.now(timezone.utc)
         rows = await self._due_rows(now)
-        if not rows:
-            if self._authorized_agent_ids_page_provider is not None:
-                self._authorized_agent_ids_page_cursor = authority_page_next_cursor
-            return
-        semaphore = asyncio.Semaphore(self._max_concurrent_tasks)
+        # No await from here on: ``stop`` relies on admission being atomic.
+        for task in [ScheduledTask.from_row(row) for row in rows]:
+            if task.id in self._occurrences:
+                # Its earlier occurrence is still claiming or executing; a
+                # second claimant would race that occurrence's own claim.
+                continue
+            self._admit_occurrence(task)
+        if self._authorized_agent_ids_page_provider is not None:
+            self._authorized_agent_ids_page_cursor = authority_page_next_cursor
 
-        async def run_one(task: ScheduledTask) -> None:
-            async with semaphore:
-                # ``now`` above is only the polling cutoff. A task can wait
-                # behind the semaphore longer than its full lease interval, so
-                # begin its lease at the actual compare-and-set transition.
-                if not await self._executor_accepts_scheduled_agent(task.agent_id):
-                    return
-                claimed = await self._claim(task, datetime.now(timezone.utc))
+    def _admit_occurrence(self, task: ScheduledTask) -> None:
+        """Start one due row on its own task and record it as in flight."""
+
+        occurrence = asyncio.create_task(
+            self._run_occurrence(task), name=f"scheduler-occurrence:{task.id}"
+        )
+        self._occurrences[task.id] = _AdmittedOccurrence(
+            agent_id=task.agent_id,
+            task=occurrence,
+            admitted_monotonic=time.monotonic(),
+            admitted_at=self._tick_started_at,
+        )
+        self._refresh_unclaimed_admission_snapshot()
+        # A done callback, not ``finally``: a task cancelled before its first
+        # step never runs its body, and its row must still leave the registry.
+        occurrence.add_done_callback(
+            lambda done: self._occurrence_finished(task.id, done)
+        )
+
+    async def _run_occurrence(self, task: ScheduledTask) -> None:
+        """Claim and execute one admitted row, isolating its failures."""
+
+        try:
+            async with self._occurrence_slots:
+                self._slot_acquired(task.id)
+                try:
+                    # The poll's ``now`` is only its selection cutoff. An
+                    # occurrence can wait for a slot longer than its full
+                    # lease interval, so begin its lease at the actual
+                    # compare-and-set transition.
+                    if not await self._executor_accepts_scheduled_agent(
+                        task.agent_id
+                    ):
+                        return
+                    claimed = await self._claim(task, datetime.now(timezone.utc))
+                finally:
+                    self._end_claim_phase(task.id)
                 if claimed is not None:
                     await self._execute_claim(claimed)
-
-        tasks = [ScheduledTask.from_row(row) for row in rows]
-        results = await asyncio.gather(
-            *(run_one(task) for task in tasks), return_exceptions=True
-        )
-        for task, result in zip(tasks, results):
-            if not isinstance(result, BaseException):
-                continue
-            if isinstance(result, asyncio.CancelledError):
-                logger.warning(
-                    "Scheduled occurrence for task %s (%s) was cancelled",
-                    task.id,
-                    task.task_name,
-                )
-                continue
+        except asyncio.CancelledError:
+            logger.warning(
+                "Scheduled occurrence for task %s (%s) was cancelled",
+                task.id,
+                task.task_name,
+            )
+            raise
+        except Exception as error:
+            # Executor failures are normalized and finalized inside
+            # ``_execute_claim``; anything reaching here is scheduler
+            # infrastructure. It must not cancel sibling occurrences or kill
+            # the poll loop, so latch readiness fail-closed instead.
             logger.error(
                 "Scheduled occurrence for task %s (%s) failed outside normal finalization",
                 task.id,
                 task.task_name,
-                exc_info=(type(result), result, result.__traceback__),
+                exc_info=(type(error), error, error.__traceback__),
             )
-            self._latch_protocol_failure(result)
-        if self._authorized_agent_ids_page_provider is not None:
-            self._authorized_agent_ids_page_cursor = authority_page_next_cursor
+            self._latch_protocol_failure(error)
+
+    def _slot_acquired(self, schedule_id: str) -> None:
+        occurrence = self._occurrences.get(schedule_id)
+        if occurrence is not None:
+            occurrence.awaiting_slot = False
+
+    def _end_claim_phase(self, schedule_id: str) -> None:
+        occurrence = self._occurrences.get(schedule_id)
+        if occurrence is not None and occurrence.awaiting_claim:
+            occurrence.awaiting_claim = False
+            self._refresh_unclaimed_admission_snapshot()
+
+    def _occurrence_finished(
+        self, schedule_id: str, finished: asyncio.Task[None]
+    ) -> None:
+        occurrence = self._occurrences.get(schedule_id)
+        if occurrence is not None and occurrence.task is finished:
+            del self._occurrences[schedule_id]
+            self._refresh_unclaimed_admission_snapshot()
+
+    def _refresh_unclaimed_admission_snapshot(self) -> None:
+        # ``_occurrences`` is in admission order, so the first unclaimed
+        # entry is the oldest.
+        self._oldest_unclaimed_admission_monotonic = next(
+            (
+                occurrence.admitted_monotonic
+                for occurrence in self._occurrences.values()
+                if occurrence.awaiting_claim
+            ),
+            None,
+        )
+
+    def _oldest_queued_admission(self) -> Optional[_AdmittedOccurrence]:
+        """The oldest row the polling loop admitted that still awaits a slot."""
+
+        return next(
+            (
+                occurrence
+                for occurrence in self._occurrences.values()
+                if occurrence.awaiting_slot and occurrence.admitted_at is not None
+            ),
+            None,
+        )
+
+    def _open_tick_started_at(self) -> Optional[str]:
+        """Start of the oldest poll with a row still queued behind the cap."""
+
+        queued = self._oldest_queued_admission()
+        return queued.admitted_at if queued is not None else self._tick_started_at
 
     async def _executor_accepts_scheduled_agent(self, agent_id: str) -> bool:
         """Return whether an optional hosted executor can admit this DID.

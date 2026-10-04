@@ -27,6 +27,7 @@ from kestrel_sovereign.features.scheduler.runner import (
 )
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from tests.utils.scheduler_ticks import tick_and_settle
 
 
 @asynccontextmanager
@@ -111,7 +112,7 @@ async def test_two_replicas_claim_one_due_occurrence_on_backend(db_backend, monk
             """,
             (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
         )
-        await asyncio.gather(first._tick(), second._tick())
+        await asyncio.gather(tick_and_settle(first), tick_and_settle(second))
 
         assert len(seen) == 1
         rows = await db.fetchall(
@@ -191,7 +192,7 @@ async def test_finalization_terminal_timestamp_condition_is_backend_portable(
             ),
         )
 
-        await runner._tick()
+        await tick_and_settle(runner)
 
         schedule_row = await db.fetchone(
             """
@@ -324,7 +325,7 @@ async def test_recovery_claim_upsert_qualifies_existing_execution_log_columns(
             (execution_id, task_id, agent_id, due, due, occurrence_key, due),
         )
 
-        await runner._tick()
+        await tick_and_settle(runner)
 
         assert len(seen) == 1
         assert seen[0].id == execution_id
@@ -545,7 +546,7 @@ async def test_postgres_long_executor_renews_while_admission_gate_is_held(
             """,
             (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
         )
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(executor_started.wait(), timeout=2)
         initial = await db.fetchval(
             "SELECT lease_expires_at FROM scheduled_tasks WHERE id = ?", (task_id,)
@@ -652,7 +653,7 @@ async def test_postgres_scheduled_mutator_does_not_deadlock_rollout_admission(
             """,
             (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
         )
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(tick, timeout=3)
         assert len(mutation_result) == 1
         assert mutation_result[0].data["status"] == "paused"
@@ -725,7 +726,7 @@ async def test_postgres_rollout_transition_waits_for_admitted_effect(
             """,
             (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
         )
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(executor_started.wait(), timeout=2)
 
         # Simulate an origin/main process adding a legacy-visible row after
@@ -841,7 +842,7 @@ async def test_postgres_same_did_effects_share_admission_before_transition(
                 ),
             )
 
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(both_effects_started.wait(), timeout=3)
         assert set(effect_ids) == set(task_ids)
 
@@ -934,7 +935,7 @@ async def test_postgres_bootstrap_waits_for_admitted_effect(
             """,
             (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
         )
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(executor_started.wait(), timeout=2)
 
         bootstrap = asyncio.create_task(rebootstrap._ensure_tables())
@@ -1027,7 +1028,7 @@ async def test_postgres_single_query_connection_effect_renews_while_fence_waits(
                 """,
                 (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
             )
-            tick = asyncio.create_task(runner._tick())
+            tick = asyncio.create_task(tick_and_settle(runner))
             await asyncio.wait_for(executor_started.wait(), timeout=3)
             await asyncio.wait_for(renewed_during_effect.wait(), timeout=3)
 
@@ -1285,7 +1286,7 @@ async def test_postgres_cold_schema_bootstrap_precedes_admission_and_holds_lifec
             (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
         )
 
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(dispatch_started.wait(), timeout=3)
         assert preparation_complete.is_set()
 
@@ -1375,7 +1376,7 @@ async def test_postgres_renewal_does_not_resurrect_expired_token_after_row_lock_
             """,
             (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
         )
-        tick = asyncio.create_task(runner._tick())
+        tick = asyncio.create_task(tick_and_settle(runner))
         await asyncio.wait_for(executor_started.wait(), timeout=2)
         initial = await db.fetchone(
             "SELECT lease_expires_at, claim_token FROM scheduled_tasks WHERE id = ?",
@@ -1494,7 +1495,7 @@ async def test_host_runner_never_claims_another_fleets_rows_on_backend(db_backen
                 (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
             )
 
-        await runner._tick()
+        await tick_and_settle(runner)
 
         assert seen == [("task", {})]
         assert await db.fetchone(

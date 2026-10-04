@@ -31,6 +31,7 @@ from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
+from tests.utils.scheduler_ticks import tick_and_settle
 
 
 def _NO_REASON_CODES(task_name: str) -> frozenset[str]:
@@ -572,7 +573,7 @@ async def test_dispatch_audit_and_scheduler_history_agree_end_to_end(
         ),
     )
 
-    await runner._tick()
+    await tick_and_settle(runner)
     pending = [task for task in agent.background_tasks if not task.done()]
     if pending:
         await asyncio.gather(*pending)
@@ -708,7 +709,7 @@ async def test_builtin_json_envelopes_follow_scheduler_result_contract(
         ),
     )
 
-    await runner._tick()
+    await tick_and_settle(runner)
     pending = [task for task in agent.background_tasks if not task.done()]
     if pending:
         await asyncio.gather(*pending)
@@ -1234,7 +1235,7 @@ async def test_due_builtin_whose_owner_loads_later_runs_once_after_barrier(
 
     # A tick that reaches the scheduler before the barrier (the standalone
     # runner is only armed from on_agent_ready; this is the defensive gate).
-    await runner._tick()
+    await tick_and_settle(runner)
 
     assert calls == []
     assert await db.fetchone(
@@ -1262,7 +1263,7 @@ async def test_due_builtin_whose_owner_loads_later_runs_once_after_barrier(
         (expired, "restart-task"),
     )
 
-    await runner._tick()
+    await tick_and_settle(runner)
 
     assert owner_ran.is_set()
     assert len(calls) == 1
@@ -1282,8 +1283,8 @@ async def test_due_builtin_whose_owner_loads_later_runs_once_after_barrier(
     assert next_run_at > due_at
 
     # A later poll (or a restarted runner) does not re-run the occurrence.
-    await runner._tick()
-    await SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task)._tick()
+    await tick_and_settle(runner)
+    await tick_and_settle(SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task))
     assert len(calls) == 1
     assert len(await db.fetchall(
         "SELECT id FROM task_execution_log WHERE task_id = ?", ("restart-task",),
@@ -1333,8 +1334,8 @@ async def test_builtin_with_permanently_absent_owner_fails_honestly(
             db, agent.did, schedule_id, "restart_coordinator", cron=cron
         )
 
-    await runner._tick()
-    await runner._tick()
+    await tick_and_settle(runner)
+    await tick_and_settle(runner)
 
     history = await db.fetchall(
         "SELECT status, result_text FROM task_execution_log WHERE task_id = ?",

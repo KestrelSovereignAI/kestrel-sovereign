@@ -80,6 +80,7 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from kestrel_sovereign.ui_contributions import compute_ui_manifest
 from kestrel_sovereign.waits import WaitRegistry
+from tests.utils.scheduler_ticks import tick_and_settle
 
 _TEST_AGENT_DID = "did:test:isolated-runtime"
 _TEST_CONFIG_NODE_ID = f"feature_config:v2:{_TEST_AGENT_DID}:TestFeature"
@@ -4068,7 +4069,7 @@ async def test_scheduler_records_terminal_isolated_admission_as_failed(tmp_path,
             ("terminal-admission-task", _TEST_AGENT_DID, due, due, SCHEDULER_PROTOCOL_VERSION),
         )
 
-        await runner._tick()
+        await tick_and_settle(runner)
 
         status, result_text = await db.fetchone(
             "SELECT status, result_text FROM task_execution_log WHERE task_id = ?",

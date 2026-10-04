@@ -22,6 +22,7 @@ from kestrel_sovereign.features.scheduler.feature import (
     SELF_FOLLOWUP_TASK_NAME,
 )
 from kestrel_sovereign.privacy import PrivacyConfig
+from tests.utils.scheduler_ticks import tick_and_settle
 
 SENTINEL = "fire-time-privacy-XYZZY"
 
@@ -213,7 +214,7 @@ async def test_a_turn_stopped_mid_dispatch_is_recorded_failed_not_success(
 
     feature._dispatch_scheduled_task = _flip_then_dispatch
     runner._executor = _flip_then_dispatch
-    await runner._tick()
+    await tick_and_settle(runner)
 
     assert not agent.turn_prompts
 

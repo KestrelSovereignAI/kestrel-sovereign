@@ -76,6 +76,7 @@ from kestrel_sovereign.spawn.lifecycle import (
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.stop import AuthoritativeStopDescendant
 from tests.utils.aiosqlite_workers import aiosqlite_worker
+from tests.utils.scheduler_ticks import tick_and_settle
 
 
 def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC"):
@@ -7541,7 +7542,7 @@ class TestAgentManagerBasics:
 
             # This is the former race: a scope publication here let the host
             # claim the row, clear its nonce, and make rollback retain it.
-            await host_runner._tick()
+            await tick_and_settle(host_runner)
             assert await db.fetchone(
                 "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
                 ("pending-owned-schedule",),
