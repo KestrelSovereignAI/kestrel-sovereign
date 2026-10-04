@@ -19,15 +19,26 @@ an argument it does not accept:
   parameters and the nearest one when a close match exists. It is never
   dropped: a misspelt argument must not run the tool with a default.
 
-Which names a schema accepts depends on its shape. An SDK ``ToolSchema``
-lists its parameters, and that list is closed: it is generated from the
-method signature, which takes nothing else. A JSON-Schema ``parameters``
-object (the MCP shape) follows JSON Schema. It accepts every name in
-``properties`` and every name a ``patternProperties`` pattern matches. When
+Which names a tool accepts is decided by its original schema wherever it has
+one, never by a list derived from it. An original schema is a JSON Schema and
+means what JSON Schema says. It accepts every name in ``properties`` and
+every name a ``patternProperties`` pattern matches. When
 ``additionalProperties`` is anything but ``false`` (``true``, absent, or a
 schema object), it accepts every other name too, and validating those is the
-tool's job. A tool whose schema is neither shape is passed its arguments
-unchanged, because nothing says what it accepts.
+tool's job. A tool carries its original schema in one of two places:
+
+* ``input_schema`` (or ``inputSchema``) on the tool itself, for a proxy whose
+  ``schema.parameters`` list was derived from it, such as an isolated
+  feature's tool. That list keeps ``properties`` and loses
+  ``additionalProperties`` and ``patternProperties``, so it is never consulted
+  for such a tool. A proxy whose service advertised no schema object passes
+  its arguments unchanged.
+* ``schema.parameters`` itself, as an MCP server's tool carries it.
+
+Only a tool with no original schema is judged by its ``ToolSchema`` parameter
+list, and that list is closed: it is generated from a native ``@tool``
+method's signature, which takes nothing else. A tool with neither is passed
+its arguments unchanged, because nothing says what it accepts.
 
 A server's pattern is never run as a regular expression: ``(?:x?){4000000000}``
 exhausts memory matching even ``task``, and ``^(a+)+$`` backtracks for
@@ -61,6 +72,12 @@ _MAX_NAMED_ARGUMENTS = 10
 #: Characters with a meaning in an ECMA-262 regular expression. A pattern
 #: with none of them inside its optional ``^``/``$`` anchors is a literal.
 _REGEX_SYNTAX = frozenset("\\.^$*+?()[]{}|")
+
+#: Where a proxy tool carries the JSON Schema its parameter list was derived
+#: from (``IsolatedFeatureTool.input_schema``). Both spellings the isolated
+#: feature wire protocol accepts.
+_RAW_SCHEMA_ATTRIBUTES = ("input_schema", "inputSchema")
+_NOT_CARRIED = object()
 
 
 @dataclass(frozen=True)
@@ -133,8 +150,41 @@ def _pattern_properties(pattern_properties: Any) -> Optional[Tuple[str, ...]]:
     return patterns
 
 
+def _json_schema_parameters(schema: Dict[str, Any]) -> Optional[_DeclaredParameters]:
+    """The names a JSON-Schema object accepts, or ``None`` when unknowable."""
+    properties = schema.get("properties")
+    names = tuple(properties) if isinstance(properties, dict) else ()
+    if not all(isinstance(name, str) for name in names):
+        return None
+    if schema.get("additionalProperties") is not False:
+        return _DeclaredParameters(names=names, patterns=None)
+    return _DeclaredParameters(
+        names=names,
+        patterns=_pattern_properties(schema.get("patternProperties")),
+    )
+
+
+def _carried_json_schema(tool: Any) -> Any:
+    """The original JSON Schema a proxy ``tool`` carries.
+
+    ``None`` when the tool carries the slot empty, and ``_NOT_CARRIED`` when
+    it has no such slot. Only a dict or ``None`` counts as the slot: a test
+    double that answers every attribute does not carry one.
+    """
+    values = [
+        getattr(tool, attribute, _NOT_CARRIED) for attribute in _RAW_SCHEMA_ATTRIBUTES
+    ]
+    for value in values:
+        if isinstance(value, dict):
+            return value
+    return None if any(value is None for value in values) else _NOT_CARRIED
+
+
 def _declared_parameters(tool: Any) -> Optional[_DeclaredParameters]:
     """The parameters ``tool`` advertises, or ``None`` when unknowable."""
+    original = _carried_json_schema(tool)
+    if original is not _NOT_CARRIED:
+        return None if original is None else _json_schema_parameters(original)
     parameters = getattr(getattr(tool, "schema", None), "parameters", None)
     if isinstance(parameters, (list, tuple)):
         names = tuple(getattr(parameter, "name", None) for parameter in parameters)
@@ -142,16 +192,7 @@ def _declared_parameters(tool: Any) -> Optional[_DeclaredParameters]:
             return None
         return _DeclaredParameters(names=names, patterns=())
     if isinstance(parameters, dict):
-        properties = parameters.get("properties")
-        names = tuple(properties) if isinstance(properties, dict) else ()
-        if not all(isinstance(name, str) for name in names):
-            return None
-        if parameters.get("additionalProperties") is not False:
-            return _DeclaredParameters(names=names, patterns=None)
-        return _DeclaredParameters(
-            names=names,
-            patterns=_pattern_properties(parameters.get("patternProperties")),
-        )
+        return _json_schema_parameters(parameters)
     return None
 
 

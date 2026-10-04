@@ -14,7 +14,9 @@ match. A misspelt argument is never dropped, because that would run the tool
 with a default. "Accepts" is the schema's own answer, not membership of
 ``properties``: an MCP schema that leaves ``additionalProperties`` open, or
 whose ``patternProperties`` match the name, accepts ``task``/``context`` as
-tool data, and they reach the tool unchanged.
+tool data, and they reach the tool unchanged. An isolated feature's tool is
+judged by the schema its service advertised, not by the parameter list
+derived from it, which keeps only ``properties``.
 
 Both direct-tool paths are driven: the chat loop's ``_dispatch_direct_tool``
 and ``execute_named_tool``, which the codex inline executor uses. The shell
@@ -31,6 +33,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
+from kestrel_sdk.isolated_feature import ToolMetadata
 from kestrel_sdk.tools.base import ToolCategory, ToolParameter, ToolSchema
 
 from kestrel_sovereign.agent.direct_tool_arguments import (
@@ -39,6 +42,7 @@ from kestrel_sovereign.agent.direct_tool_arguments import (
 )
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.features.computer_use.feature import ComputerUseFeature
+from kestrel_sovereign.features.isolated_runtime import IsolatedFeatureTool
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyConfig
 from kestrel_sovereign.security.tool_audit import (
@@ -473,6 +477,163 @@ def test_a_tool_whose_parameters_are_unknowable_is_left_alone(tool):
     assert normalize_direct_tool_arguments("t", tool, supplied) == (supplied, None)
 
 
+# --- isolated feature tools ---------------------------------------------------
+
+
+class _IsolatedService:
+    """The ``ProxyFeature`` surface an ``IsolatedFeatureTool`` forwards to.
+
+    ``calls`` is what the isolated service receives.
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_isolated_tool(self, name: str, args: dict) -> dict:
+        self.calls.append((name, dict(args)))
+        return {"success": True}
+
+
+ISOLATED_TOOL_NAME = "fetch_page"
+
+
+def _isolated_tool(
+    input_schema: dict, service: _IsolatedService | None = None
+) -> IsolatedFeatureTool:
+    """A real ``IsolatedFeatureTool`` over the SDK wire metadata."""
+    metadata = ToolMetadata(
+        name=ISOLATED_TOOL_NAME,
+        description="isolated test tool",
+        input_schema=input_schema,
+    )
+    return IsolatedFeatureTool(service or _IsolatedService(), metadata)
+
+
+#: Isolated-service schemas whose ``additionalProperties`` accept every name.
+OPEN_ISOLATED_SCHEMAS = {
+    "additionalProperties absent": _object_schema(),
+    "additionalProperties true": _object_schema(additionalProperties=True),
+    "additionalProperties a schema": _object_schema(
+        additionalProperties={"type": "string"}
+    ),
+}
+
+CLOSED_ISOLATED_SCHEMA = _object_schema(additionalProperties=False)
+
+#: An unknown argument beside the habitual ones.
+ISOLATED_CALL = {"url": "u", "task": "t", "context": "c", "extra": 1}
+
+
+@pytest.mark.parametrize(
+    "schema", list(OPEN_ISOLATED_SCHEMAS.values()), ids=list(OPEN_ISOLATED_SCHEMAS)
+)
+def test_an_isolated_tool_is_judged_by_its_advertised_schema(schema):
+    """The review of the second #3396 fix: an isolated tool's parameter list
+    is derived from its schema and keeps only ``properties``, so judging the
+    list dropped ``context`` and refused ``extra``, though the service
+    accepts both."""
+    tool = _isolated_tool(schema)
+    assert [parameter.name for parameter in tool.schema.parameters] == ["url"]
+
+    args, error = normalize_direct_tool_arguments(tool.name, tool, ISOLATED_CALL)
+
+    assert error is None
+    assert args is ISOLATED_CALL
+
+
+def test_an_isolated_tool_whose_patterns_admit_context_receives_it():
+    tool = _isolated_tool(SCHEMAS_THAT_ACCEPT_CONTEXT["patternProperties matches"])
+
+    args, error = normalize_direct_tool_arguments(
+        tool.name, tool, {"url": "u", "context": "c", "task": "t"}
+    )
+
+    assert error is None
+    assert args == {"url": "u", "context": "c"}
+
+
+def test_an_isolated_tool_with_a_closed_schema_drops_and_refuses():
+    tool = _isolated_tool(CLOSED_ISOLATED_SCHEMA)
+
+    args, error = normalize_direct_tool_arguments(
+        tool.name, tool, {"url": "u", "task": "t", "context": "c"}
+    )
+    assert (args, error) == ({"url": "u"}, None)
+
+    _, error = normalize_direct_tool_arguments(tool.name, tool, ISOLATED_CALL)
+    assert error == (
+        "fetch_page does not accept argument 'extra'. Valid parameters: url."
+    )
+
+
+@pytest.mark.parametrize(
+    "schema, expected_error",
+    [
+        (_object_schema(), None),
+        (
+            CLOSED_ISOLATED_SCHEMA,
+            "fetch_page does not accept argument 'extra'. Valid parameters: url.",
+        ),
+    ],
+    ids=["open", "closed"],
+)
+def test_an_isolated_tool_reads_the_camel_case_schema_spelling(schema, expected_error):
+    """The wire protocol accepts ``inputSchema`` as well as ``input_schema``."""
+    tool = IsolatedFeatureTool(
+        _IsolatedService(),
+        {
+            "name": ISOLATED_TOOL_NAME,
+            "description": "isolated test tool",
+            "inputSchema": schema,
+        },
+    )
+
+    assert tool.input_schema == schema
+    _, error = normalize_direct_tool_arguments(tool.name, tool, ISOLATED_CALL)
+    assert error == expected_error
+
+
+@pytest.mark.parametrize("schema", [None, "not a schema"], ids=["absent", "not-an-object"])
+def test_an_isolated_tool_without_a_schema_object_is_left_alone(schema):
+    """Its derived parameter list is empty, and says nothing."""
+    metadata = {"name": ISOLATED_TOOL_NAME, "description": "isolated test tool"}
+    if schema is not None:
+        metadata["input_schema"] = schema
+    tool = IsolatedFeatureTool(_IsolatedService(), metadata)
+    assert tool.input_schema is None
+
+    args, error = normalize_direct_tool_arguments(tool.name, tool, ISOLATED_CALL)
+
+    assert error is None
+    assert args is ISOLATED_CALL
+
+
+def test_any_proxy_carrying_its_original_schema_is_judged_by_it():
+    proxy = _SchemaTool("proxied", "url")
+    proxy.inputSchema = _object_schema()
+
+    args, error = normalize_direct_tool_arguments(proxy.name, proxy, ISOLATED_CALL)
+
+    assert error is None
+    assert args is ISOLATED_CALL
+
+
+def test_a_test_double_does_not_carry_an_original_schema():
+    """A ``MagicMock`` answers ``input_schema`` with another mock. That is not
+    a schema, so its ``ToolSchema`` list still decides."""
+    tool = MagicMock()
+    tool.schema = _SchemaTool("get_pull_request", "pull_number").schema
+
+    _, error = normalize_direct_tool_arguments(
+        "get_pull_request", tool, {"pr_number": 12}
+    )
+
+    assert error == (
+        "get_pull_request does not accept argument 'pr_number' "
+        "(did you mean 'pull_number'?). Valid parameters: pull_number."
+    )
+
+
 # --- the dispatch paths -------------------------------------------------------
 
 
@@ -733,6 +894,55 @@ async def test_context_a_json_schema_accepts_reaches_the_tool_unchanged(path, sc
     assert tool.calls == [supplied]
     assert agent.hooks_manager.pre_calls == [supplied]
     assert agent.audit.rows == []
+
+
+async def _dispatch_isolated(path: str, tool: IsolatedFeatureTool, args: dict):
+    """Dispatch ``tool`` the way each door finds an isolated feature's tool."""
+    if path == "chat":
+        agent = _Orchestrator(direct_tools={tool.name: tool})
+        return agent, await _dispatch_direct(agent, tool.name, dict(args))
+    feature = SimpleNamespace(name="IsolatedFetchFeature", get_tools=lambda: [tool])
+    agent = _Orchestrator(features={"IsolatedFetchFeature": feature})
+    return agent, await agent.execute_named_tool(
+        tool.name, dict(args), session_id="s-3396", source="codex_app_server",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "schema", list(OPEN_ISOLATED_SCHEMAS.values()), ids=list(OPEN_ISOLATED_SCHEMAS)
+)
+@pytest.mark.parametrize("path", ["chat", "inline_executor"])
+async def test_an_open_isolated_service_receives_every_argument(path, schema):
+    service = _IsolatedService()
+    tool = _isolated_tool(schema, service)
+
+    agent, result = await _dispatch_isolated(path, tool, ISOLATED_CALL)
+
+    assert result == {"success": True}
+    assert service.calls == [(ISOLATED_TOOL_NAME, ISOLATED_CALL)]
+    assert agent.hooks_manager.pre_calls == [ISOLATED_CALL]
+    assert agent.audit.rows == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["chat", "inline_executor"])
+async def test_a_closed_isolated_service_gets_neither_extras_nor_typos(path):
+    service = _IsolatedService()
+    tool = _isolated_tool(CLOSED_ISOLATED_SCHEMA, service)
+
+    agent, result = await _dispatch_isolated(
+        path, tool, {"url": "u", "task": "t", "context": "c"}
+    )
+    assert result == {"success": True}
+    assert service.calls == [(ISOLATED_TOOL_NAME, {"url": "u"})]
+
+    agent, result = await _dispatch_isolated(path, tool, ISOLATED_CALL)
+    assert result["success"] is False
+    assert "fetch_page does not accept argument 'extra'." in result["error"]
+    assert service.calls == [(ISOLATED_TOOL_NAME, {"url": "u"})]
+    assert agent.hooks_manager.pre_calls == []
+    assert [row["action"] for row in agent.audit.rows] == [ACTION_TOOL_VALIDATION]
 
 
 # --- the whole chat loop --------------------------------------------------------
