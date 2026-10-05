@@ -307,6 +307,18 @@ The `Typing :: Typed` classifier is backed by the PEP 561 marker
 builds the wheel, checks that its metadata and contents agree, and confirms a
 clean install exposes the marker.
 
+The clean-install matrix and `scripts/ci/clean_install_local.sh` validate
+package installation, quickstart files, identity/constitution/memory storage,
+server health, host routing, and DID persistence. They create an explicitly
+marked test instance with `KESTREL_AUDIT_MODE=skip`: its hash-bound genesis
+receipt is **pending**, not passed, and first cognition remains blocked. The
+harness makes no audit or embedding model call, even if the developer runs
+Ollama locally. The local script requires a fresh checkout, isolates host
+state and chooses disposable loopback ports; it does not reuse an operator's
+agent or serve as evidence that a real agent passed genesis. Live acceptance
+requires a configured auditor's completed low/medium-risk result and the
+normal durable integrity checks for the exact governing source.
+
 ## Troubleshooting
 
 ### "Docker credential store not available"
