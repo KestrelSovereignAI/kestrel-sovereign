@@ -86,6 +86,10 @@ verify() { "${PY[@]}" scripts/ci/clean_install_verify.py "$@"; }
 echo "==> Setup wizard (kestrel setup --quickstart)"
 "${KESTREL[@]}" setup --quickstart
 
+# A developer may already have a real Kestrel host on 8888 or an agent on
+# 8801. Rebind only this newly-created test config to free loopback ports.
+"${PY[@]}" scripts/ci/clean_install_local_ports.py
+
 echo "==> Readiness assertions"
 verify wizard-artifacts
 "${KESTREL[@]}" doctor

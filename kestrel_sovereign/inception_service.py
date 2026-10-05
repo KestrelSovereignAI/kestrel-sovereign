@@ -874,8 +874,13 @@ async def create_kestrel_identity_async(
         # survives. Lazy/programmatic creation is explicit: it records pending
         # and the runtime must complete the audit before first cognition.
         from kestrel_sovereign.constitution.genesis_audit import (
+            defer_test_genesis_audit,
             evaluate_genesis_constitution,
             pending_genesis_audit,
+        )
+
+        defer_test_audit = defer_test_genesis_audit(
+            is_test_instance, auditor=genesis_auditor
         )
 
         if genesis_audit_provenance:
@@ -1095,7 +1100,11 @@ async def create_kestrel_identity_async(
         file_hash=constitution_hash,
         content=constitution_text,
         chunk_size=500,
-        compute_embeddings=True
+        # Install/test inception records pending, not passed. Chunk text and
+        # governance edges remain durable; optional vectors can be reindexed
+        # after a real provider is configured. No ambient model call belongs
+        # in a clean-install release gate.
+        compute_embeddings=not defer_test_audit,
     )
     logging.info(f"Indexed Kestrel Constitution for RAG: {chunks_created} chunks created")
 
@@ -1113,7 +1122,7 @@ async def create_kestrel_identity_async(
                 file_hash=us_hash,
                 content=us_content,
                 chunk_size=500,
-                compute_embeddings=True
+                compute_embeddings=not defer_test_audit,
             )
             logging.info(f"Indexed US Constitution for RAG: {us_chunks} chunks created")
     except Exception as e:

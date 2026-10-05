@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from kestrel_sovereign.constitution.genesis_audit import defer_test_genesis_audit
 from kestrel_sovereign.constitution.emancipation import (
     EmancipationConfigError,
     EmancipationContract,
@@ -114,8 +114,8 @@ def create_agent(
         # service on the developer's machine merely because /api/tags answers.
         # This never turns a pending audit into a pass, and cannot suppress an
         # explicitly injected auditor or a non-test agent's configured lane.
-        defer_test_audit = (
-            is_test_instance and os.environ.get("KESTREL_AUDIT_MODE") == "skip"
+        defer_test_audit = defer_test_genesis_audit(
+            is_test_instance, auditor=genesis_auditor
         )
         if (
             genesis_auditor is None

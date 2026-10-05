@@ -8,6 +8,7 @@ shape.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -19,6 +20,26 @@ GENESIS_AUDIT_PASSED = "passed"
 GENESIS_AUDIT_FAILED = "failed"
 
 GenesisAuditor = Callable[[str], Awaitable[Mapping[str, Any]]]
+
+
+def defer_test_genesis_audit(
+    is_test_instance: bool,
+    *,
+    auditor: GenesisAuditor | None,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Defer only an uninjected, explicitly marked install/test inception.
+
+    This leaves a hash-bound *pending* receipt and no cognition authority. The
+    same predicate also suppresses optional inception-time model embeddings,
+    keeping clean-install QA independent of an ambient local/cloud provider.
+    """
+    source = os.environ if environ is None else environ
+    return bool(
+        is_test_instance
+        and auditor is None
+        and source.get("KESTREL_AUDIT_MODE") == "skip"
+    )
 
 
 class GenesisAuditError(ValueError):
