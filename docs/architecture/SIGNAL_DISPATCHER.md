@@ -707,6 +707,49 @@ ingress and cron dispatches behind any in-flight turn. The global order is
 CONVERSATION → privacy transition → persistence gate; nothing is acquired
 while the gate is held.
 
+The same gate, held shared, is the lock the agent hands to Workflows as
+`workflow_await_signal_privacy_transition_lock` (#3484). Workflows holds it
+around an `await_signal` "privacy check, then matcher/CAS" and needs only that
+no transition completes inside that span. It does not wait for a turn. A
+shared hold is carried in a ContextVar, so the holder and any task it creates
+and awaits while holding (`asyncio.wait_for` on Python 3.11, an awaited
+`create_task`) re-enter the same lease. A holder that dispatches a signal,
+directly or from such a child, is therefore not wedged by a transition queued
+behind it. A hold dies when its `async with` exits: a detached task that runs
+afterwards acquires the gate like any other caller, and the lease stays held
+until every task inside it has left. A task inside its own shared hold that
+asks for the gate exclusive is refused rather than left waiting on itself; a
+task that only inherited a hold may be detached from its holder, so its
+transition waits like any other.
+
+Step 3 also writes the event's **ingress trust receipt** in the same
+transaction as the event (#3484), in `durable_signal_ingress_receipts`:
+
+```
+{version: 1, receipt_id, event_id, agent_id, source, source_sequence,
+ policy_epoch, sanitized_at_ingress}
+```
+
+- `sanitized_at_ingress` is true exactly when the source's sanitizer ran on
+  this envelope: an UNTRUSTED signal (by registration or by its own
+  downgrade) in a non-ACTION mode. A registered sanitizer that did not run is
+  false.
+- `policy_epoch` is `<privacy mode>:<agent instance>:<epoch>`, read under the
+  persistence gate. A transition that installs a mode advances the epoch while
+  it holds the gate exclusive.
+- `receipt_id` is the SHA-256 of the canonical JSON (sorted keys, no
+  whitespace, UTF-8) of the other fields.
+
+The receipt is never derived from the current `SourceRegistry`, and nothing
+updates it. A duplicate source event keeps its original receipt. An event
+committed before the table existed, or by an embedding whose agent names no
+privacy policy, has none. `SignalDispatcher.verify_durable_ingress_trust_receipt`
+(exposed to Workflows as `workflow_await_signal_event_trust_verifier`) rebuilds
+the receipt from its row and returns it only when the rebuilt `receipt_id`
+matches the stored one and the receipt names the delivery's own `event_id`,
+`agent_id`, `source` and `source_sequence`. Everything else returns `None`.
+An encoded receipt never exceeds 4096 bytes.
+
 An `InFlightControlActionRegistration` (today only `a2a.peer_stop`, #3169)
 is an ACTION that acts on work already running. Step 3 persists only a fixed
 marker for it (no payload, caller, or chain), and Hold's begin-work

@@ -9,10 +9,12 @@ import math
 import sys
 import time
 from dataclasses import dataclass, replace as _replace_dataclass
+from uuid import uuid4
 from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
 from kestrel_sovereign.storage.privacy_wrapper import (
     DurablePersistenceGate,
+    DurablePersistenceGateSharedLock,
     ReentrantTransitionLock,
     EphemeralPurgeReport,
     StorePurgeResult,
@@ -1652,6 +1654,12 @@ class KestrelAgent(
         # Serializes durable signal persistence against a privacy transition
         # without the privacy-transition lock every turn holds (#3316).
         self._durable_persistence_gate = DurablePersistenceGate()
+        # Names the privacy policy each durable signal is committed under, for
+        # its ingress trust receipt (#3484). The instance nonce keeps epochs
+        # from two runs of one agent distinct; the counter advances each time
+        # a transition installs a mode.
+        self._privacy_policy_instance = uuid4().hex
+        self._privacy_policy_epoch = 0
         # A data-destructive privacy transition (e.g. PUBLIC → EPHEMERAL) staged
         # awaiting explicit confirmation via confirm_privacy_transition. None when
         # no transition is pending. Guarded by _privacy_transition_lock.
@@ -4236,6 +4244,53 @@ class KestrelAgent(
             self._durable_persistence_gate = gate
         return gate
 
+    def _get_privacy_policy_epoch(self) -> str:
+        """Name the privacy policy in force, as ``<mode>:<instance>:<epoch>``.
+
+        ``SignalDispatcher`` reads it under the durable persistence gate and
+        records it in each event's ingress trust receipt (#3484). The epoch
+        advances only while a transition holds that gate exclusive, so a
+        persist cannot pair one policy's mode with another's epoch.
+        """
+        instance = getattr(self, "_privacy_policy_instance", None)
+        if instance is None:
+            instance = uuid4().hex
+            self._privacy_policy_instance = instance
+        epoch = getattr(self, "_privacy_policy_epoch", 0)
+        return f"{self._privacy_mode.value}:{instance}:{epoch}"
+
+    @property
+    def workflow_await_signal_privacy_transition_lock(
+        self,
+    ) -> DurablePersistenceGateSharedLock:
+        """The lock Workflows holds around an ``await_signal`` privacy check.
+
+        Workflows enters it around "privacy check, then matcher/CAS" and needs
+        one guarantee: no privacy transition completes while it is held. This
+        is the durable persistence gate held SHARED, which
+        ``privacy_transition()`` takes exclusive (#3484). It is deliberately
+        not the privacy-transition lock: every turn holds that lock for its
+        whole body, so workflow wait processing would queue behind every turn
+        (the #3316 stall).
+        """
+        return self._get_durable_persistence_gate().shared_lock()
+
+    async def workflow_await_signal_event_trust_verifier(
+        self, delivery: Any
+    ) -> Optional[dict[str, Any]]:
+        """Return ``delivery``'s immutable ingress trust receipt, or ``None``.
+
+        The receipt was written by the dispatcher in the same transaction as
+        the event (#3484). It is returned only when it exists, is internally
+        consistent, and names the delivery's own ``event_id``, ``agent_id``,
+        ``source`` and ``source_sequence``. Anything else, including an event
+        committed before receipts existed, verifies as ``None``.
+        """
+        dispatcher = getattr(self, "dispatcher", None)
+        if dispatcher is None:
+            return None
+        return await dispatcher.verify_durable_ingress_trust_receipt(delivery)
+
     @staticmethod
     def _evaluate_pre_turn_guard(guard) -> None:
         """Run a source's pre-turn admission. Refusal raises; admission returns.
@@ -4443,6 +4498,9 @@ class KestrelAgent(
                 retryable_conflict=True,
             )
         self._privacy_mode = mode
+        # Under the persistence gate held exclusive: a later durable signal
+        # receipt names this installation, not the one it replaced (#3484).
+        self._privacy_policy_epoch = getattr(self, "_privacy_policy_epoch", 0) + 1
         status_message = self.privacy_agent.set_mode(mode)
 
         # Context clauses are immutable between deliberate transitions. A

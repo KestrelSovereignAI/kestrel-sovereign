@@ -995,6 +995,105 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+INGRESS_TRUST_RECEIPT_VERSION = 1
+# The Workflows ``await_signal`` gate refuses an encoded receipt above this
+# size, so a receipt that would exceed it is never written.
+MAX_INGRESS_TRUST_RECEIPT_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class DurableIngressAttestation:
+    """What the dispatcher observed while admitting one event (#3484).
+
+    ``policy_epoch`` names the privacy policy in force when the event was
+    committed. ``sanitized_at_ingress`` is true exactly when the source
+    registration's sanitizer ran on this envelope, which the dispatcher does
+    only for an UNTRUSTED signal in a non-ACTION mode. Both are facts about
+    this dispatch. Neither may be derived from the current ``SourceRegistry``,
+    which can change after the event is committed.
+    """
+
+    policy_epoch: str
+    sanitized_at_ingress: bool
+
+    def __post_init__(self) -> None:
+        if type(self.policy_epoch) is not str or not self.policy_epoch:
+            raise ValueError("policy_epoch must be a non-empty string")
+        if type(self.sanitized_at_ingress) is not bool:
+            raise ValueError("sanitized_at_ingress must be a bool")
+
+
+def _stored_strict_bool(value: Any) -> Optional[bool]:
+    """Read a stored boolean column, or ``None`` for anything but 0/1/bool."""
+
+    if type(value) is bool:
+        return value
+    if type(value) is int and value in (0, 1):
+        return bool(value)
+    return None
+
+
+def _canonical_receipt_bytes(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def build_ingress_trust_receipt(
+    *,
+    event_id: str,
+    agent_id: str,
+    source: str,
+    source_sequence: int,
+    policy_epoch: str,
+    sanitized_at_ingress: bool,
+) -> dict[str, Any]:
+    """Return the version-1 ingress trust receipt for one committed event.
+
+    ``receipt_id`` is the SHA-256 of the canonical JSON (sorted keys, no
+    whitespace, UTF-8) of every other field, so a stored row whose fields were
+    edited no longer matches its own identifier. The store builds the receipt
+    when it commits the event and rebuilds it from the stored row on every
+    read. Raises ``ValueError`` for a malformed field or a receipt whose
+    encoding exceeds :data:`MAX_INGRESS_TRUST_RECEIPT_BYTES`.
+    """
+
+    for name, value in (
+        ("event_id", event_id),
+        ("agent_id", agent_id),
+        ("source", source),
+        ("policy_epoch", policy_epoch),
+    ):
+        if type(value) is not str or not value:
+            raise ValueError(f"{name} must be a non-empty string")
+    if (
+        type(source_sequence) is not int
+        or not 1 <= source_sequence <= _MAX_SOURCE_SEQUENCE
+    ):
+        raise ValueError("source_sequence must be a positive 64-bit integer")
+    if type(sanitized_at_ingress) is not bool:
+        raise ValueError("sanitized_at_ingress must be a bool")
+    body = {
+        "version": INGRESS_TRUST_RECEIPT_VERSION,
+        "event_id": event_id,
+        "agent_id": agent_id,
+        "source": source,
+        "source_sequence": source_sequence,
+        "policy_epoch": policy_epoch,
+        "sanitized_at_ingress": sanitized_at_ingress,
+    }
+    receipt = {
+        **body,
+        "receipt_id": hashlib.sha256(_canonical_receipt_bytes(body)).hexdigest(),
+    }
+    if len(_canonical_receipt_bytes(receipt)) > MAX_INGRESS_TRUST_RECEIPT_BYTES:
+        raise ValueError(
+            "ingress trust receipt exceeds "
+            f"{MAX_INGRESS_TRUST_RECEIPT_BYTES} encoded bytes"
+        )
+    return receipt
+
+
 class DurableSignalStore(UnifiedStoreBase):
     """Backend-neutral pending-delivery ledger.
 
@@ -1061,6 +1160,10 @@ class DurableSignalStore(UnifiedStoreBase):
     # Payload-eliding privacy modes cannot retain their canonical input in the
     # event row. This side table stores only a fixed-width integrity binding.
     EVENT_INTEGRITY = "durable_signal_event_integrity"
+    # One immutable ingress trust receipt per event, written in the event's
+    # own transaction (#3484). Events committed before this table existed
+    # have none, and verify as having none.
+    INGRESS_TRUST_RECEIPTS = "durable_signal_ingress_receipts"
 
     def __init__(self, backend: DatabaseBackend):
         # ``SignalLogStore`` historically accepts the ``AsyncDatabase``
@@ -1261,6 +1364,20 @@ class DurableSignalStore(UnifiedStoreBase):
             CREATE TABLE IF NOT EXISTS {self.EVENT_INTEGRITY} (
                 event_id TEXT PRIMARY KEY,
                 integrity_binding TEXT NOT NULL,
+                FOREIGN KEY (event_id) REFERENCES {self.EVENTS}(event_id)
+                    ON DELETE CASCADE
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.INGRESS_TRUST_RECEIPTS} (
+                event_id TEXT PRIMARY KEY,
+                receipt_version INTEGER NOT NULL,
+                receipt_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                source_sequence BIGINT NOT NULL,
+                policy_epoch TEXT NOT NULL,
+                sanitized_at_ingress {bool_type} NOT NULL,
                 FOREIGN KEY (event_id) REFERENCES {self.EVENTS}(event_id)
                     ON DELETE CASCADE
             )
@@ -3428,6 +3545,7 @@ class DurableSignalStore(UnifiedStoreBase):
         caller_identity_factory: Optional[Callable[[], str]] = None,
         before_commit: Optional[Callable[[DurableEventPersistence], None]] = None,
         on_rollback: Optional[Callable[[DurableEventPersistence], None]] = None,
+        ingress_attestation: Optional[DurableIngressAttestation] = None,
     ) -> DurableEventPersistence:
         """Commit a persisted signal and all matching initial deliveries.
 
@@ -3459,6 +3577,11 @@ class DurableSignalStore(UnifiedStoreBase):
         callbacks are synchronous deliberately:
         yielding between installing the sidecar and committing would reopen
         the very visibility race this handoff closes.
+
+        ``ingress_attestation`` records what the dispatcher observed at
+        ingress as the event's immutable ingress trust receipt, inserted in
+        this same transaction. A duplicate source event keeps the receipt (or
+        the absence of one) written with its original event.
         """
         if retention_days < 0:
             raise ValueError("retention_days must be >= 0")
@@ -3479,6 +3602,12 @@ class DurableSignalStore(UnifiedStoreBase):
             )
         if caller_identity_factory is not None and not callable(caller_identity_factory):
             raise ValueError("caller_identity_factory must be callable when set")
+        if ingress_attestation is not None and not isinstance(
+            ingress_attestation, DurableIngressAttestation
+        ):
+            raise ValueError(
+                "ingress_attestation must be a DurableIngressAttestation when set"
+            )
         source_event_id = self._normalize_source_event_id(source_event_id)
         payload_json = _json_dump(signal.payload)
         chain_json = _json_dump(_serialize_chain(signal.causation_chain))
@@ -3573,6 +3702,35 @@ class DurableSignalStore(UnifiedStoreBase):
                         VALUES (?, ?)
                         """,
                         (signal.id, integrity_binding),
+                    )
+
+                if ingress_attestation is not None:
+                    receipt = build_ingress_trust_receipt(
+                        event_id=signal.id,
+                        agent_id=agent_id,
+                        source=signal.source,
+                        source_sequence=source_sequence,
+                        policy_epoch=ingress_attestation.policy_epoch,
+                        sanitized_at_ingress=ingress_attestation.sanitized_at_ingress,
+                    )
+                    await self._backend.execute(
+                        f"""
+                        INSERT INTO {self.INGRESS_TRUST_RECEIPTS} (
+                            event_id, receipt_version, receipt_id, agent_id,
+                            source, source_sequence, policy_epoch,
+                            sanitized_at_ingress
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            receipt["event_id"],
+                            receipt["version"],
+                            receipt["receipt_id"],
+                            receipt["agent_id"],
+                            receipt["source"],
+                            receipt["source_sequence"],
+                            receipt["policy_epoch"],
+                            self.to_bool_param(receipt["sanitized_at_ingress"]),
+                        ),
                     )
 
                 consumer_rows = await self._backend.fetch_all(
@@ -4942,6 +5100,78 @@ class DurableSignalStore(UnifiedStoreBase):
             (event_id, agent_id),
         )
         return str(row[0]) if row is not None else None
+
+    async def get_ingress_trust_receipt(
+        self, *, agent_id: str, event_id: str
+    ) -> Optional[dict[str, Any]]:
+        """Return one agent-scoped event's ingress trust receipt, or ``None``.
+
+        The receipt is rebuilt from its stored row and returned only when the
+        rebuilt ``receipt_id`` equals the stored one and the receipt names the
+        same ``agent_id``, ``source`` and ``source_sequence`` as the committed
+        event row. A missing, edited, or inconsistent row is ``None``.
+        """
+
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("event_id", event_id)
+        row = await self._backend.fetch_one(
+            f"""
+            SELECT receipt.receipt_version, receipt.receipt_id,
+                   receipt.event_id, receipt.agent_id, receipt.source,
+                   receipt.source_sequence, receipt.policy_epoch,
+                   receipt.sanitized_at_ingress,
+                   event.agent_id, event.source, event.source_sequence
+            FROM {self.INGRESS_TRUST_RECEIPTS} receipt
+            JOIN {self.EVENTS} event ON event.event_id = receipt.event_id
+            WHERE receipt.event_id = ? AND event.agent_id = ?
+            """,
+            (event_id, agent_id),
+        )
+        if row is None:
+            return None
+        (
+            version,
+            stored_receipt_id,
+            receipt_event_id,
+            receipt_agent_id,
+            receipt_source,
+            receipt_sequence,
+            policy_epoch,
+            stored_sanitized,
+            event_agent_id,
+            event_source,
+            event_sequence,
+        ) = tuple(row)
+        sanitized = _stored_strict_bool(stored_sanitized)
+        if (
+            type(version) is not int
+            or version != INGRESS_TRUST_RECEIPT_VERSION
+            or type(stored_receipt_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", stored_receipt_id) is None
+            or sanitized is None
+        ):
+            return None
+        try:
+            receipt = build_ingress_trust_receipt(
+                event_id=receipt_event_id,
+                agent_id=receipt_agent_id,
+                source=receipt_source,
+                source_sequence=receipt_sequence,
+                policy_epoch=policy_epoch,
+                sanitized_at_ingress=sanitized,
+            )
+        except ValueError:
+            return None
+        if not secrets.compare_digest(receipt["receipt_id"], stored_receipt_id):
+            return None
+        if (
+            receipt["event_id"] != event_id
+            or receipt["agent_id"] != event_agent_id
+            or receipt["source"] != event_source
+            or receipt["source_sequence"] != event_sequence
+        ):
+            return None
+        return receipt
 
     async def list_deliveries(
         self,

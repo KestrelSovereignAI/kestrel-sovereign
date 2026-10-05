@@ -143,6 +143,7 @@ from kestrel_sovereign.signals.durable import (
     TERMINAL_ACKABLE,
     DurableConsumerRegistration,
     DurableDelivery,
+    DurableIngressAttestation,
     DurableSourceBoundary,
     DurableSignalStore,
 )
@@ -166,6 +167,7 @@ from kestrel_sovereign.storage.db.write_audit import (
 )
 from kestrel_sovereign.storage.privacy_wrapper import (
     _resolve_durable_persistence_gate,
+    _resolve_privacy_policy_epoch,
     optional_durable_persistence_gate,
 )
 from kestrel_sovereign.storage.session_id_column import new_session_id
@@ -1674,6 +1676,50 @@ class SignalDispatcher:
                 agent_id=self._agent.did,
                 source=source,
             )
+
+    async def verify_durable_ingress_trust_receipt(
+        self, delivery: Any
+    ) -> Optional[dict[str, Any]]:
+        """Return the ingress trust receipt committed with ``delivery``'s event.
+
+        The receipt was written in the event's own transaction and records
+        the privacy policy epoch and whether the source sanitizer ran on that
+        envelope (#3484). It is returned only when it exists, is internally
+        consistent, and names the delivery's ``event_id``, ``agent_id``,
+        ``source`` and ``source_sequence``. Anything else is ``None``: a
+        missing receipt (an event committed before receipts existed, or by a
+        dispatcher with no privacy policy), an edited row, another tenant's
+        event, or a delivery whose event does not match its receipt.
+        """
+
+        event = getattr(delivery, "event", None)
+        event_id = getattr(event, "event_id", None)
+        agent_id = getattr(event, "agent_id", None)
+        source = getattr(event, "source", None)
+        source_sequence = getattr(event, "source_sequence", None)
+        if (
+            type(event_id) is not str
+            or not event_id
+            or type(agent_id) is not str
+            or type(source) is not str
+            or type(source_sequence) is not int
+        ):
+            return None
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            receipt = await self._durable_store.get_ingress_trust_receipt(
+                agent_id=self._agent.did,
+                event_id=event_id,
+            )
+        if (
+            receipt is None
+            or receipt["event_id"] != event_id
+            or receipt["agent_id"] != agent_id
+            or receipt["source"] != source
+            or receipt["source_sequence"] != source_sequence
+        ):
+            return None
+        return receipt
 
     async def deactivate_durable_consumer(self, *, consumer_id: str) -> bool:
         """Deactivate one of this agent's durable consumers.
@@ -3560,7 +3606,10 @@ class SignalDispatcher:
         else:
             signal.origin_trust = registration.trust
 
-        # UNTRUSTED → run sanitizer for non-ACTION modes
+        # UNTRUSTED → run sanitizer for non-ACTION modes. Whether it ran is
+        # recorded in this event's ingress trust receipt (#3484): it is a fact
+        # about this envelope, which the registry can no longer attest later.
+        sanitized_at_ingress = False
         if (
             signal.origin_trust.value == "untrusted"
             and signal.mode != SignalMode.ACTION
@@ -3576,6 +3625,7 @@ class SignalDispatcher:
                     error=f"Sanitizer raised: {type(e).__name__}: {e}",
                     registration=registration,
                 )
+            sanitized_at_ingress = True
 
         # Schema validation runs AFTER sanitization so the schema validates
         # the canonical, scrubbed form that downstream handlers/templates
@@ -3631,6 +3681,18 @@ class SignalDispatcher:
                 signal.caller = self._canonical_caller_identity(signal.caller)
                 durable_projection = self._signal_for_durable_persistence(
                     signal, registration
+                )
+                # Read under the gate with the projection: a transition that
+                # installs a new policy holds it exclusive, so the receipt
+                # names the policy this projection was computed under.
+                policy_epoch = _resolve_privacy_policy_epoch(self._agent)
+                ingress_attestation = (
+                    DurableIngressAttestation(
+                        policy_epoch=policy_epoch,
+                        sanitized_at_ingress=sanitized_at_ingress,
+                    )
+                    if policy_epoch is not None
+                    else None
                 )
                 # Snapshot the normalized payload before the durable commit so
                 # a deepcopy failure cannot leave a committed marker with no
@@ -3739,6 +3801,7 @@ class SignalDispatcher:
                         if durable_projection.payload_elided
                         else None
                     ),
+                    "ingress_attestation": ingress_attestation,
                 }
                 if durable_projection.payload_elided:
                     # Keep a local initial claimant outside the store's

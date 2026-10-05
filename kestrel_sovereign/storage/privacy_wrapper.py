@@ -614,6 +614,49 @@ def _resolve_transition_lock(holder):
     return None
 
 
+# ── Shared-lease reentry for the durable persistence gate (#3484) ──
+#
+# A task holding the gate shared must be able to persist again without waiting:
+# once a transition queues, writer preference makes every NEW shared acquire
+# wait behind it, and the transition waits for the holder, so a holder that
+# acquired again would wait on itself. Keying that reentry on the task is not
+# enough. The holder may await work on a child task (``asyncio.wait_for`` on
+# Python 3.11, an awaited ``create_task``), and the child's acquire then waits
+# behind the queued transition while the holder awaits the child.
+#
+# Each ``shared()`` frame therefore publishes a hold in this ContextVar. A task
+# created inside the frame inherits it, and a live inherited hold admits the
+# child to the same lease without waiting. A hold dies when its frame exits, so
+# a detached child that runs later finds a dead hold and acquires normally. The
+# lease's read lock is released only when its last hold exits, so a child still
+# inside when its parent exits keeps the gate held, and a transition still
+# waits for every live holder.
+_DURABLE_GATE_SHARED_HOLDS: "contextvars.ContextVar[Tuple[_SharedGateHold, ...]]" = (
+    contextvars.ContextVar("kestrel_durable_persistence_gate_shared_holds", default=())
+)
+
+
+class _SharedGateLease:
+    """One read lease on a gate's lock, released when its last hold exits."""
+
+    __slots__ = ("holds",)
+
+    def __init__(self) -> None:
+        self.holds = 0
+
+
+class _SharedGateHold:
+    """One ``shared()`` frame's claim on a lease; live until that frame exits."""
+
+    __slots__ = ("gate", "lease", "task", "live")
+
+    def __init__(self, gate: "DurablePersistenceGate", lease: _SharedGateLease) -> None:
+        self.gate = gate
+        self.lease = lease
+        self.task = asyncio.current_task()
+        self.live = True
+
+
 class DurablePersistenceGate:
     """Shared/exclusive gate between durable signal persistence and a privacy flip (#3316).
 
@@ -635,19 +678,37 @@ class DurablePersistenceGate:
     — inbound channel/A2A ACK ingress and the scheduler's cron dispatches alike
     — behind whatever turn was in flight.
 
+    A third holder takes it SHARED: the Workflows ``await_signal`` host hook
+    (``KestrelAgent.workflow_await_signal_privacy_transition_lock``, #3484)
+    holds it around "privacy check, then matcher/CAS", so no privacy
+    transition completes inside that span, and the hook never queues behind
+    a turn.
+
     The gate is a leaf: nothing acquires CONVERSATION or the privacy-transition
     lock while holding it, so the global order stays CONVERSATION -> privacy
     transition -> persistence gate. Exclusive ownership is task-reentrant, and
     the owning task's shared acquisitions are admitted without waiting, so a
     signal dispatched inline by the transition body persists under the mode it
-    is installing instead of waiting on its own task. Writer preference comes
-    from :class:`AsyncReaderWriterLock`: once a transition queues, new persists
+    is installing instead of waiting on its own task.
+
+    Shared ownership is reentrant by context, not by task: a shared frame's
+    hold is carried in a ContextVar, so the holder and every task created
+    while it holds (and awaited by it) re-enter the same lease without
+    waiting. A hook holder that dispatches a signal, directly or from a child
+    task, therefore cannot deadlock against a transition queued while it
+    holds. A hold dies with its frame; a task that runs after that acquires
+    normally. A task inside its own shared frame cannot take the gate
+    exclusive; that upgrade would wait on itself, so it is refused. A task
+    that only inherited a live hold may be detached from its holder, so its
+    transition waits for the lease like any other. Writer preference comes from
+    :class:`AsyncReaderWriterLock`: once a transition queues, new persists
     wait behind it.
     """
 
     def __init__(self) -> None:
         self._lock = AsyncReaderWriterLock()
         self._owner: Optional["asyncio.Task"] = None
+        self._shared_lock = DurablePersistenceGateSharedLock(self)
 
     def locked(self) -> bool:
         """Whether a persist or a transition currently holds the gate."""
@@ -657,14 +718,50 @@ class DurablePersistenceGate:
         task = asyncio.current_task()
         return task is not None and self._owner is task
 
+    def _live_shared_hold(self) -> Optional[_SharedGateHold]:
+        """The innermost live shared hold on this gate in the current context."""
+        for hold in reversed(_DURABLE_GATE_SHARED_HOLDS.get()):
+            if hold.gate is self and hold.live:
+                return hold
+        return None
+
+    def _held_shared_by_current_task(self) -> bool:
+        """Whether the current task is inside one of its own shared frames."""
+        task = asyncio.current_task()
+        return any(
+            hold.gate is self and hold.live and hold.task is task
+            for hold in _DURABLE_GATE_SHARED_HOLDS.get()
+        )
+
     @asynccontextmanager
     async def shared(self):
         """Hold the gate for one durable projection-and-commit."""
         if self._owned_by_current_task():
             yield
             return
-        async with self._lock.read():
+        inherited = self._live_shared_hold()
+        if inherited is None:
+            await self._lock.acquire_read()
+            lease = _SharedGateLease()
+        else:
+            lease = inherited.lease
+        lease.holds += 1
+        hold = _SharedGateHold(self, lease)
+        token = _DURABLE_GATE_SHARED_HOLDS.set(
+            _DURABLE_GATE_SHARED_HOLDS.get() + (hold,)
+        )
+        try:
             yield
+        finally:
+            hold.live = False
+            lease.holds -= 1
+            if lease.holds == 0:
+                self._lock.release_read()
+            _DURABLE_GATE_SHARED_HOLDS.reset(token)
+
+    def shared_lock(self) -> "DurablePersistenceGateSharedLock":
+        """Return this gate's reusable ``async with`` shared-lease object."""
+        return self._shared_lock
 
     @asynccontextmanager
     async def exclusive(self):
@@ -676,6 +773,11 @@ class DurablePersistenceGate:
         if self._owned_by_current_task():
             yield
             return
+        if self._held_shared_by_current_task():
+            raise RuntimeError(
+                "A task holding the durable persistence gate shared cannot "
+                "take it exclusive: the transition would wait on itself"
+            )
         await self._lock.acquire()
         self._owner = asyncio.current_task()
         try:
@@ -683,6 +785,53 @@ class DurablePersistenceGate:
         finally:
             self._owner = None
             self._lock.release()
+
+
+class DurablePersistenceGateSharedLock:
+    """A reusable async context manager that holds a gate SHARED (#3484).
+
+    :meth:`DurablePersistenceGate.shared` returns a one-shot context manager.
+    An integration that is handed one lock object and enters it repeatedly,
+    from several tasks at once, needs ``__aenter__``/``__aexit__`` on the
+    object itself. Each entry is one :meth:`DurablePersistenceGate.shared`
+    frame, released by the task that entered it; nested entries by one task
+    unwind in order. An entry made while the caller's context already holds
+    the gate, including from a task created inside the holder's span,
+    re-enters that lease instead of queueing behind a transition.
+
+    Holding it guarantees one thing: no privacy transition completes while it
+    is held, because ``privacy_transition()`` takes the same gate exclusive.
+    It does not wait for an in-flight turn, which holds the privacy-transition
+    lock and never this gate.
+    """
+
+    def __init__(self, gate: DurablePersistenceGate) -> None:
+        self._gate = gate
+        self._held: Dict["asyncio.Task", List[Any]] = {}
+
+    async def __aenter__(self) -> "DurablePersistenceGateSharedLock":
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError(
+                "The durable persistence gate lock requires an asyncio task"
+            )
+        lease = self._gate.shared()
+        await lease.__aenter__()
+        self._held.setdefault(task, []).append(lease)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> Optional[bool]:
+        task = asyncio.current_task()
+        leases = self._held.get(task) if task is not None else None
+        if not leases:
+            raise RuntimeError(
+                "The durable persistence gate lock was released by a task "
+                "that does not hold it"
+            )
+        lease = leases.pop()
+        if not leases:
+            del self._held[task]
+        return await lease.__aexit__(exc_type, exc, tb)
 
 
 @asynccontextmanager
@@ -706,6 +855,24 @@ def _resolve_durable_persistence_gate(holder) -> Optional[DurablePersistenceGate
     if not callable(getter):
         return None
     return getter()
+
+
+def _resolve_privacy_policy_epoch(holder) -> Optional[str]:
+    """Return ``holder``'s privacy policy epoch, or ``None`` if it has none.
+
+    ``None`` is the lightweight embedding with no privacy-transition
+    machinery: it cannot name the policy an event was committed under, so the
+    dispatcher writes that event no ingress trust receipt (#3484). A getter
+    that exists but answers with anything other than a non-empty string is a
+    defect, not an absent policy, and fails the persist.
+    """
+    getter = getattr(holder, "_get_privacy_policy_epoch", None)
+    if not callable(getter):
+        return None
+    epoch = getter()
+    if type(epoch) is not str or not epoch:
+        raise TypeError("privacy policy epoch must be a non-empty string")
+    return epoch
 
 
 # ── Privacy-aware graph write policy (#2672) ─────────────────────────────────
