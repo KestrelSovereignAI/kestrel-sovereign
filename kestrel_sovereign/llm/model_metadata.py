@@ -40,9 +40,10 @@ class ModelInfo(_SDKModelInfo):
 
     The canonical shape still lives in the SDK; this subclass only ADDS the
     optional field (never reshapes existing ones) so external adapters that
-    construct the SDK ``ModelInfo`` remain forward-compatible — they simply
-    leave ``underlying_provider`` at ``None``. All in-tree code imports
-    ``ModelInfo`` from this module, so it uniformly gets the extended type.
+    construct the SDK ``ModelInfo`` remain forward-compatible: model discovery
+    lifts their records into this type, with ``underlying_provider`` at
+    ``None`` (#3270). All in-tree code imports ``ModelInfo`` from this module,
+    so it uniformly gets the extended type.
     """
 
     underlying_provider: Optional[str] = None
