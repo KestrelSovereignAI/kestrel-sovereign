@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -21,6 +22,7 @@ from kestrel_sdk.signals import (
 )
 from kestrel_sovereign.signals import (
     DurableConsumerRegistration,
+    DurableIngressAttestation,
     DurableSignalStore,
     OrderedLockManager,
     SignalDispatcher,
@@ -28,6 +30,7 @@ from kestrel_sovereign.signals import (
     SourceRegistry,
 )
 from kestrel_sovereign.features.channels.route_ownership import ChannelRouteOwnershipStore
+from kestrel_sovereign.signals.durable import build_ingress_trust_receipt
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
 
@@ -3914,6 +3917,196 @@ async def test_durable_retry_and_lease_expiry_transitions_work_on_both_backends(
     assert terminal is not None
     assert terminal.status == "failed"
     assert terminal.last_error == "lease expired before acknowledgement"
+
+
+def _ingress_attestation(*, sanitized: bool) -> DurableIngressAttestation:
+    return DurableIngressAttestation(
+        policy_epoch="normal:parity:0", sanitized_at_ingress=sanitized
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_ingress_trust_receipt_has_backend_parity(db_backend):
+    """The #3484 receipt commits with its event and reads back identically."""
+    store = DurableSignalStore(db_backend)
+    await store.initialize()
+    agent_id = f"did:test:ingress-receipt:{uuid4()}"
+    receipted = _signal(agent_id)
+    persisted = await store.persist_signal(
+        receipted,
+        agent_id=agent_id,
+        source_event_id=None,
+        retention_days=7,
+        ingress_attestation=_ingress_attestation(sanitized=True),
+    )
+    expected = build_ingress_trust_receipt(
+        event_id=receipted.id,
+        agent_id=agent_id,
+        source="provider.message",
+        source_sequence=persisted.source_sequence,
+        policy_epoch="normal:parity:0",
+        sanitized_at_ingress=True,
+    )
+    assert await store.get_ingress_trust_receipt(
+        agent_id=agent_id, event_id=receipted.id
+    ) == expected
+    # Tenant scope is part of the SQL, not a caller-side filter.
+    assert await store.get_ingress_trust_receipt(
+        agent_id=f"{agent_id}:other", event_id=receipted.id
+    ) is None
+
+    unreceipted = _signal(agent_id)
+    await store.persist_signal(
+        unreceipted, agent_id=agent_id, source_event_id=None, retention_days=7
+    )
+    assert await store.get_ingress_trust_receipt(
+        agent_id=agent_id, event_id=unreceipted.id
+    ) is None
+
+    def abort(_persisted) -> None:
+        raise RuntimeError("abort before commit")
+
+    rolled_back = _signal(agent_id)
+    with pytest.raises(TransactionError, match="abort before commit"):
+        await store.persist_signal(
+            rolled_back,
+            agent_id=agent_id,
+            source_event_id=None,
+            retention_days=7,
+            before_commit=abort,
+            ingress_attestation=_ingress_attestation(sanitized=True),
+        )
+    for table in ("durable_signal_events", "durable_signal_ingress_receipts"):
+        assert await db_backend.fetch_val(
+            f"SELECT COUNT(*) FROM {table} WHERE event_id = ?", (rolled_back.id,)
+        ) == 0
+
+    # Editing a stored field without its receipt_id fails closed on both
+    # engines, whichever boolean representation the engine stores.
+    await db_backend.execute(
+        "UPDATE durable_signal_ingress_receipts SET sanitized_at_ingress = ? "
+        "WHERE event_id = ?",
+        (store.to_bool_param(False), receipted.id),
+    )
+    assert await store.get_ingress_trust_receipt(
+        agent_id=agent_id, event_id=receipted.id
+    ) is None
+
+
+class _ReceiptingDispatcherAgent(_DispatcherAgent):
+    """A dispatcher agent that names its privacy policy, so it writes receipts."""
+
+    def _get_privacy_policy_epoch(self) -> str:
+        return "normal:parity:0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_dispatcher_ingress_receipt_verifies_on_both_backends(db_backend):
+    """Dispatch writes the receipt; the verifier binds it to the claimed event."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    agent_id = f"did:test:ingress-dispatch:{uuid4()}"
+    agent = _ReceiptingDispatcherAgent(agent_id, get_privacy_preset("normal"))
+    registry = SourceRegistry()
+
+    async def artifact(_signal):
+        return {"ok": True}
+
+    registry.register(
+        SourceRegistration(
+            name="provider.reply",
+            schema=lambda payload: payload,
+            default_mode=SignalMode.ARTIFACT,
+            allowed_modes=frozenset({SignalMode.ARTIFACT}),
+            artifact_handler=artifact,
+            sanitizer=lambda payload: dict(payload),
+            trust=Trust.UNTRUSTED,
+            log_redaction=RedactionPolicy(summarize=lambda payload: "<redacted>"),
+            retention_days=7,
+        )
+    )
+    log_store = SignalLogStore(db_backend)
+    await log_store.initialize()
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=log_store,
+    )
+    try:
+        await dispatcher.register_durable_consumer(
+            DurableConsumerRegistration(
+                consumer_id="workflow-wait",
+                source="provider.reply",
+                agent_id=agent_id,
+            )
+        )
+        signal = Signal(
+            source="provider.reply",
+            kind="reply",
+            mode=SignalMode.ARTIFACT,
+            payload={"reply": "OK"},
+            target_agent=agent_id,
+        )
+        assert (await dispatcher.dispatch_signal(signal)).status is Status.OK
+        delivery = await dispatcher.claim_durable_delivery(
+            consumer_id="workflow-wait", executor_id="workflow-worker"
+        )
+        assert delivery is not None
+
+        receipt = await dispatcher.verify_durable_ingress_trust_receipt(delivery)
+
+        assert receipt is not None
+        assert receipt["event_id"] == signal.id
+        assert receipt["sanitized_at_ingress"] is True
+        assert receipt["policy_epoch"] == "normal:parity:0"
+        assert receipt["source_sequence"] == delivery.event.source_sequence == 1
+        assert await dispatcher.verify_durable_ingress_trust_receipt(
+            replace(
+                delivery,
+                event=replace(delivery.event, source_sequence=2),
+            )
+        ) is None
+    finally:
+        await _finish_dispatcher(agent, dispatcher)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_ingress_receipt_table_is_added_to_an_existing_ledger(db_backend):
+    """Bootstrap adds the receipt table additively; older events have none."""
+    async with _isolated_durable_schema(db_backend) as backend:
+        store = DurableSignalStore(backend)
+        await store.initialize()
+        agent_id = f"did:test:ingress-upgrade:{uuid4()}"
+        legacy = _signal(agent_id)
+        await store.persist_signal(
+            legacy, agent_id=agent_id, source_event_id=None, retention_days=7
+        )
+        # Model a ledger created before the receipt table existed.
+        await backend.execute("DROP TABLE durable_signal_ingress_receipts")
+
+        upgraded = DurableSignalStore(backend)
+        await upgraded.initialize()
+
+        assert await upgraded.get_ingress_trust_receipt(
+            agent_id=agent_id, event_id=legacy.id
+        ) is None
+        current = _signal(agent_id)
+        await upgraded.persist_signal(
+            current,
+            agent_id=agent_id,
+            source_event_id=None,
+            retention_days=7,
+            ingress_attestation=_ingress_attestation(sanitized=False),
+        )
+        receipt = await upgraded.get_ingress_trust_receipt(
+            agent_id=agent_id, event_id=current.id
+        )
+        assert receipt is not None
+        assert receipt["sanitized_at_ingress"] is False
 
 
 @pytest.mark.asyncio
