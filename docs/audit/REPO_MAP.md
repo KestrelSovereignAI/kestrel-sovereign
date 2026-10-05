@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-04
-**Scope:** 2593 tracked files (1808 `.py`, 351 `.md`, 434 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-05
+**Scope:** 2598 tracked files (1813 `.py`, 351 `.md`, 434 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -917,7 +917,7 @@ Repo entry points and standard project files.
   - `class NoLLMProvidersError`; `class NoReachableProvidersError`; `class IdentityIsolationError`; `def is_isolated_nonproduction_kite_environment(env)`; `def verify_llm_providers_initialized(llm_service)`; `async def verify_llm_providers_reachable(llm_service)`; `def verify_identity_isolation(db_did, expected_did)`; `async def warn_stale_bootstrap_pending(agent)`
 - **kestrel_sovereign/llm/LLM_SERVICE_HARDENING.md** — LLM Service Hardening Implementation — ## Overview
 - **kestrel_sovereign/llm/adapter.py** — Framework-side LLM adapter base.
-  - `def response_usage_available(response)`; `class ThinkingDelta`; `def split_thinking_from_content(content, reasoning_content)`; `class ThinkingContentSplitter`; `def build_messages(user_prompt, system_prompt)`; `def messages_for(adapter)`; `class LLMAdapter`
+  - `def response_usage_available(response)`; `def provider_usage_cost(usage)`; `class ReportedUsage`; `class ThinkingDelta`; `def split_thinking_from_content(content, reasoning_content)`; `class ThinkingContentSplitter`; `def build_messages(user_prompt, system_prompt)`; `def messages_for(adapter)`; `…`
 - **kestrel_sovereign/llm/anthropic_adapter.py** — Anthropic Claude Adapter
   - `def anthropic_model_info(model_data)`; `class AnthropicAdapter`
 - **kestrel_sovereign/llm/anthropic_oauth.py** — Claude subscription (Claude Pro/Max) OAuth token lifecycle.
@@ -977,11 +977,13 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/llm/inference_leases.py** — Provider-neutral orchestration for owner-scoped inference leases.
   - `class InferenceLeaseProviderDiscoveryError`; `class InferenceLeaseRecord`; `def discover_inference_lease_providers()`; `class InferenceLeaseCoordinator`
 - **kestrel_sovereign/llm/invocation_context.py** — Request-scoped identity for LLM invocation telemetry.
-  - `class LLMInvocationContext`; `class LLMInvocationContextState`; `def set_ambient_invocation_context(context)`; `def resolve_invocation_context(context)`
+  - `class LLMInvocationContext`; `class LLMInvocationContextState`; `def set_ambient_invocation_context(context)`; `class TurnInvocation`; `def turn_invocation_scope(owner, context)`; `def turn_invocation_for(owner)`; `def bind_turn_invocation(turn)`; `def resolve_invocation_context(context)`
 - **kestrel_sovereign/llm/mandate.py** — Model mandate management for LLM Service.
   - `class ModelMandateMixin`
 - **kestrel_sovereign/llm/mock_adapter.py** — —
   - `class MockAdapter`
+- **kestrel_sovereign/llm/modality_recording.py** — One recording path for the content-free modalities (#3424, #3426).
+  - `class ModalityCall`; `class ModalityRecorder`; `class ModalityRecordingMixin`
 - **kestrel_sovereign/llm/model_cache.py** — Shared Model Discovery Cache
   - `class SharedModelCache`; `def get_shared_model_cache()`
 - **kestrel_sovereign/llm/model_catalog.py** — Model Catalog Service
@@ -999,7 +1001,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/llm/openrouter_adapter.py** — OpenRouter LLM Adapter
   - `class OpenRouterAdapter`
 - **kestrel_sovereign/llm/output_ceiling.py** — A model's output ceiling, and what a response that reaches it looks like.
-  - `class OutputCeilingUnknownError`; `def attach_stop_reason(response, stop_reason)`; `def response_stop_reason(response)`; `def output_ceiling_notice()`; `def context_window_notice()`; `def output_ceiling_notice_chunk(notice)`; `def join_output_ceiling_notice(text, notice)`
+  - `class OutputCeilingUnknownError`; `def reported_token_limit(value)`; `class OutputCeilings`; `def attach_stop_reason(response, stop_reason)`; `def response_stop_reason(response)`; `def output_ceiling_notice()`; `def output_limit_cut_notice()`; `def context_window_notice()`; `…`
 - **kestrel_sovereign/llm/provider_registry.py** — Provider Registry for LLM Service.
   - `class ProviderInitializationError`; `class ProviderRegistry`; `def provider_cache_body(provider)`
 - **kestrel_sovereign/llm/remote_backend.py** — Readiness-gated private inference routing for :class:`LLMService`.
@@ -3183,6 +3185,8 @@ Repo entry points and standard project files.
   - `class TestModelNotFoundIsWarningNotError`; `def test_cosine_similarity_returns_zero_for_dimension_mismatch()`
 - **tests/unit/test_embedding_space.py** — Shared local/cloud embedding space (#2290).
   - `def test_space_id_keyed_on_model_and_dim_not_route()`; `def test_matryoshka_dim_changes_the_space()`; `def test_covers_matches_full_route_and_bare_vendor()`; `def test_parse_valid_pin()`; `def test_parse_no_spaces_returns_empty()`; `def test_parse_malformed_raises_loudly(entry)`; `async def test_probe_parity_pass_identical_vectors()`; `async def test_probe_parity_fail_drifted_vectors()`; `…`
+- **tests/unit/test_embedding_usage_recording.py** — Embedding calls record usage through the shared modality recorder (#3426).
+  - `class UsageReportingAdapter`; `class SinklessAdapter`; `def test_every_llm_service_embedding_builder_attaches_the_recorder()`; `def test_production_code_builds_embedding_services_only_through_the_factory()`; `async def test_successful_embedding_records_usage_without_content()`; `async def test_query_and_batch_operations_are_recorded()`; `async def test_an_adapter_that_reports_nothing_records_unknown_usage()`; `async def test_a_failed_embedding_is_recorded_and_reraised_without_its_message()`; `…`
 - **tests/unit/test_embedding_vec_backfill.py** — Verify/backfill of ``embedding_vec`` from the legacy ``embedding`` column (#3402).
   - `async def retired_sqlite_db(tmp_path)`; `async def sqlite_db(retired_sqlite_db)`; `async def test_backfill_copies_only_missing_rows_and_second_run_changes_nothing(sqlite_db)`; `async def test_non_finite_legacy_embedding_is_unbackfillable_not_fatal(sqlite_db)`; `async def test_verify_reports_without_writing(sqlite_db)`; `async def test_interrupted_backfill_keeps_committed_batches_and_resumes(sqlite_db, monkeypatch)`; `async def test_missing_embedding_vec_column_is_reported_not_created(sqlite_db)`; `async def test_retired_table_reports_every_vector_as_embedding_vec_only(retired_sqlite_db, write)`; `…`
 - **tests/unit/test_embedding_vec_readers.py** — Stored-embedding readers use ``embedding_vec`` (#3409, parent #2684).
@@ -3277,6 +3281,8 @@ Repo entry points and standard project files.
   - `def clear_cache()`; `async def test_discovers_org_repos_with_configured_includes_and_excludes(monkeypatch)`; `async def test_include_private_false_requests_public_org_repos(monkeypatch)`; `async def test_repo_discovery_cache_avoids_repeat_github_calls(monkeypatch)`; `async def test_github_repos_endpoint_returns_plain_slug_list(monkeypatch)`; `def test_repo_scoped_request_slug(path, expected_slug)`; `def test_repo_scoped_request_rebuilds_safe_upstream(path, expected_upstream)`; `async def test_proxy_forwards_allowed_repo_path(monkeypatch)`; `…`
 - **tests/unit/test_google_adapter_parse.py** — Regression (#2129): GoogleAdapter.get_response must not crash on google-genai response shapes with no usable parts (safety-block / MAX_TOKENS) or on text parts whose always-present ``function_call``…
   - `async def test_safety_blocked_candidate_content_none()`; `async def test_max_tokens_empty_parts_none()`; `async def test_no_candidates()`; `async def test_cached_usage_is_normalized_on_direct_google_route()`; `async def test_text_part_with_none_function_call()`; `async def test_real_function_call_part_parsed()`; `async def test_mixed_text_and_function_call_parts()`
+- **tests/unit/test_google_output_ceiling.py** — #3355: a Gemini turn's output ceiling is the model's own, and a response cut at it is never presented as a finished one.
+  - `async def test_default_ceiling_is_the_models_output_token_limit_not_8192()`; `async def test_each_model_gets_its_own_ceiling_and_is_looked_up_once()`; `async def test_discovered_ceiling_is_used_without_another_lookup(monkeypatch)`; `async def test_explicit_max_tokens_wins_and_skips_the_lookup()`; `async def test_unknown_ceiling_is_a_named_error_not_a_guess(reported)`; `async def test_unknown_ceiling_fails_the_streaming_paths_too()`; `async def test_max_tokens_cut_at_the_models_ceiling_is_marked_incomplete()`; `async def test_cut_with_no_text_is_still_visible()`; `…`
 - **tests/unit/test_google_vertex_client_build.py** — Regression guards for #2117 (findings F045 + F046).
   - `def test_vertex_service_account_route_builds_client(monkeypatch)`; `def test_vertex_service_account_route_rejects_bogus_kwarg(monkeypatch)`; `def test_google_route_builds_genai_client(monkeypatch)`; `async def test_google_adapter_get_response_uses_routed_model()`
 - **tests/unit/test_governed_assertion_corpus.py** — Public, backend-neutral contract tests for governed learning corpus reads.
@@ -3291,6 +3297,8 @@ Repo entry points and standard project files.
   - `class AllowHook`; `class WarnHook`; `class DenyHook`; `class TestHookOutputWarnFactory`; `class TestHookOutputSerialization`; `class TestWarningAccumulation`
 - **tests/unit/test_graph_created_at_stamps.py** — Every graph ``created_at`` stamp is a UTC ISO-8601 string (#3256).
   - `def test_scanner_recognises_the_removed_shape()`; `def test_no_graph_created_at_is_stamped_naive()`; `async def test_spawned_agent_node_created_at_is_utc(monkeypatch, tmp_path, new_york_clock)`; `async def test_sovereignty_receipt_created_at_is_utc(monkeypatch, new_york_clock)`
+- **tests/unit/test_graph_external_reference_edge.py** — Edges from an owned node to a reference outside the graph (#3091).
+  - `async def db(db_backend)`; `async def test_edge_to_a_target_outside_the_graph_is_admitted(db)`; `async def test_repeated_external_reference_edge_is_one_edge(db)`; `async def test_target_owned_by_the_writer_is_admitted(db)`; `async def test_edge_between_two_tenants_nodes_is_still_refused(db)`; `async def test_another_tenants_reservation_is_not_an_external_reference(db)`; `async def test_ownerless_legacy_node_is_not_an_external_reference(db)`; `async def test_source_owned_by_another_tenant_is_refused(db)`; `…`
 - **tests/unit/test_graph_property_indexes.py** — Tests for JSON-path property indexes and query_nodes_by_type_and_property.
   - `async def db(tmp_path)`; `async def graph(db)`; `class TestJsonExtract`; `class TestJsonExtractPostgres`; `class TestJsonPathIndexes`; `class TestPostgresIndexParity`; `class TestQueryNodesByTypeAndProperty`; `class TestIndexUsage`; `…`
 - **tests/unit/test_health_check_ollama.py** — Unit tests for kestrel_sovereign.health_check._resolve_expected_ollama_model.
@@ -3581,6 +3589,8 @@ Repo entry points and standard project files.
   - `async def test_chat_discovery_reaches_bootstrap_openrouter_route(monkeypatch)`; `async def test_embedding_path_still_reaches_bootstrap_route(monkeypatch)`
 - **tests/unit/test_openrouter_embeddings.py** — OpenRouter embeddings support (#2288).
   - `def test_no_embedding_model_configured_advertises_no_embeddings()`; `def test_configured_embedding_model_advertises_real_values()`; `def test_supports_embeddings_false_without_model_even_if_forced()`; `async def test_aembed_uses_configured_model_and_dimensions()`; `async def test_aembed_explicit_dimensions_override_config()`; `async def test_aembed_batch_forwards_model_and_dimensions()`; `async def test_aembed_without_any_model_raises()`; `async def test_aembed_omits_dimensions_when_unset()`; `…`
+- **tests/unit/test_openrouter_output_limits.py** — #3355: OpenRouter's model limits come from its catalog, an unreported one stays unknown, and a ``length`` cut is visible.
+  - `async def test_catalog_limits_land_on_model_info(monkeypatch)`; `async def test_unreported_limits_are_unknown_not_4096(monkeypatch)`; `async def test_no_output_budget_is_invented(monkeypatch)`; `async def test_length_cut_is_marked_incomplete(monkeypatch)`; `async def test_cut_at_the_callers_budget_keeps_its_text(monkeypatch, budget)`; `async def test_finished_response_is_untouched_and_records_its_reason(monkeypatch)`; `async def test_streamed_length_cut_ends_with_the_notice_and_terminal_mirrors_it(monkeypatch)`; `async def test_text_only_stream_carries_the_notice_too(monkeypatch)`; `…`
 - **tests/unit/test_operator_notice_lifecycle.py** — Operator-notice lifecycle: audit truth and retry behaviour (#2530).
   - `def test_core_schema_statements_are_executable()`; `async def test_init_schema_creates_the_operator_notice_table(tmp_path)`; `async def test_collect_phase_row_claims_nothing_and_is_visible_as_unsettled(tmp_path)`; `async def test_first_terminal_settle_wins(tmp_path)`; `async def test_settle_refuses_a_non_terminal_state(tmp_path)`; `async def test_rows_are_scoped_to_the_owning_agent(tmp_path)`; `async def test_first_chunk_settles_delivered_and_does_not_requeue(tmp_path)`; `async def test_consumer_break_after_first_chunk_stays_delivered(tmp_path)`; `…`
 - **tests/unit/test_operator_runtime.py** — Focused contract tests for Sovereign's generic operator runtime registry.
