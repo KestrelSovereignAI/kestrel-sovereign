@@ -31,7 +31,9 @@ def test_agent_root_adopts_but_cannot_author_platform_base():
     assert (
         "A Sovereign's agent-specific root signature cannot, by itself, rewrite" in text
     )
-    assert "a new versioned release" in text
+    assert "operator-selected, trust-root-signed source descriptor" in text
+    assert "trust-root-signed, digest-pinned source revision" in text
+    assert "followed by that agent's explicit, signed reanchor" in text
     assert "The Sovereign's signature ratifies adoption" in text
     assert "does not independently authorize an in-place rewrite" in text
     assert "A Sovereign may instead leave and build or use another platform" in text
