@@ -21,7 +21,6 @@ from pathlib import Path
 
 import pytest
 
-
 _SCRIPT_PATH = (
     Path(__file__).resolve().parents[2]
     / "scripts" / "ci" / "clean_install_verify.py"
@@ -367,7 +366,7 @@ def test_kestrel_uses_current_interpreter_and_module_entrypoint(monkeypatch):
     ]
 
 
-def test_start_and_health_tears_down_with_terminate(tmp_path, monkeypatch):
+def test_start_and_health_uses_fenced_cleanup(tmp_path, monkeypatch):
     _make_post_wizard_project(tmp_path)
     monkeypatch.chdir(tmp_path)
     calls: list[tuple[str, ...]] = []
@@ -377,13 +376,14 @@ def test_start_and_health_tears_down_with_terminate(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(verify, "_kestrel", fake_kestrel)
+    monkeypatch.setattr(verify, "_safe_stop", lambda: True)
     monkeypatch.setattr(verify, "_poll_health", lambda *_args, **_kwargs: True)
 
     assert _run(verify.cmd_start_and_health, agent_name="Kestrel") == 0
-    assert calls == [("start", "Kestrel"), ("terminate", "Kestrel")]
+    assert calls == [("start", "Kestrel")]
 
 
-def test_host_probe_tears_down_with_terminate(tmp_path, monkeypatch):
+def test_host_probe_uses_fenced_cleanup(tmp_path, monkeypatch):
     _make_post_wizard_project(tmp_path)
     monkeypatch.chdir(tmp_path)
     calls: list[tuple[str, ...]] = []
@@ -393,6 +393,7 @@ def test_host_probe_tears_down_with_terminate(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(verify, "_kestrel", fake_kestrel)
+    monkeypatch.setattr(verify, "_safe_stop", lambda: True)
     monkeypatch.setattr(verify, "_poll_health", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         verify,
@@ -401,7 +402,33 @@ def test_host_probe_tears_down_with_terminate(tmp_path, monkeypatch):
     )
 
     assert _run(verify.cmd_host_and_chat_503) == 0
-    assert calls == [("start",), ("terminate",)]
+    assert calls == [("start",)]
+
+
+@pytest.mark.parametrize("handler,arguments", [
+    (verify.cmd_start_and_health, {"agent_name": "Kestrel"}),
+    (verify.cmd_host_and_chat_503, {}),
+])
+def test_failed_start_still_uses_fenced_cleanup(
+    tmp_path, monkeypatch, handler, arguments
+):
+    _make_post_wizard_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    commands = []
+    cleanup_calls = []
+
+    def failed_start(*args):
+        commands.append(args)
+        return subprocess.CompletedProcess(args, 1, "", "failed")
+
+    monkeypatch.setattr(verify, "_kestrel", failed_start)
+    monkeypatch.setattr(
+        verify, "_safe_stop", lambda: cleanup_calls.append(True) or True
+    )
+    assert _run(handler, **arguments) == 1
+    assert len(commands) == 1
+    assert commands[0][0] == "start"
+    assert cleanup_calls == [True]
 
 
 def test_main_dispatch_unknown_subcommand_exits():

@@ -28,16 +28,11 @@ import sqlite3
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import TextIO
-
-if sys.version_info >= (3, 11):
-    import tomllib
-else:  # pragma: no cover — clean-install matrix uses 3.13
-    import tomli as tomllib  # type: ignore[no-redef]
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -207,6 +202,7 @@ def _run_captured(command: list[str]) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         encoding="utf-8",
         errors="backslashreplace",
+        check=False,
     )
 
 
@@ -228,6 +224,26 @@ def _kestrel(*args: str) -> subprocess.CompletedProcess[str]:
     return _run_captured(
         [sys.executable, "-m", "kestrel_sovereign.cli", *args],
     )
+
+
+def _safe_stop() -> bool:
+    """Stop only PID-record-fenced processes belonging to this checkout.
+
+    The ordinary CLI terminate command has an orphan-port fallback that can
+    signal unrelated listeners. The install gate must never use it.
+    """
+    cleanup = _run_captured(
+        [
+            sys.executable,
+            str(Path(__file__).with_name("clean_install_local_cleanup.py")),
+            "--root",
+            str(Path.cwd()),
+            "--check-ports",
+        ]
+    )
+    _write_captured(sys.stdout, cleanup.stdout)
+    _write_captured(sys.stderr, cleanup.stderr)
+    return cleanup.returncode == 0
 
 
 def _poll_health(port: int, timeout_s: int = 30) -> bool:
@@ -258,13 +274,12 @@ def cmd_start_and_health(args: argparse.Namespace) -> int:
         return _fail(f"multi_agent.toml missing port for {args.agent_name}")
     print(f"Agent port from multi_agent.toml: {port}")
 
-    start = _kestrel("start", args.agent_name)
-    _write_captured(sys.stdout, start.stdout)
-    _write_captured(sys.stderr, start.stderr)
-    if start.returncode != 0:
-        return _fail(f"kestrel start exited {start.returncode}")
-
     try:
+        start = _kestrel("start", args.agent_name)
+        _write_captured(sys.stdout, start.stdout)
+        _write_captured(sys.stderr, start.stderr)
+        if start.returncode != 0:
+            return _fail(f"kestrel start exited {start.returncode}")
         if not _poll_health(port, timeout_s=30):
             return _fail(
                 f"Agent did not respond on http://localhost:{port}/health "
@@ -272,11 +287,10 @@ def cmd_start_and_health(args: argparse.Namespace) -> int:
             )
         print(f"Health endpoint responding on port {port}")
     finally:
-        # Always try to stop, even if the health check failed — leaves
-        # the runner clean for the DID-persistence step.
-        stop = _kestrel("terminate", args.agent_name)
-        _write_captured(sys.stdout, stop.stdout)
-        _write_captured(sys.stderr, stop.stderr)
+        # A failed start may still leave a detached child. Never delegate to
+        # the CLI's port-based orphan reaper; preserve state on uncertainty.
+        if not _safe_stop():
+            raise RuntimeError("fenced clean-install cleanup was inconclusive")
 
     return _ok(f"Health endpoint verified on port {port}")
 
@@ -346,13 +360,12 @@ def cmd_host_and_chat_503(args: argparse.Namespace) -> int:
         return _fail(".env missing KESTREL_API_KEY (wizard should have generated it)")
     print(f"Host port from multi_agent.toml: {port}")
 
-    start = _kestrel("start")  # no agent name → multi-agent host
-    _write_captured(sys.stdout, start.stdout)
-    _write_captured(sys.stderr, start.stderr)
-    if start.returncode != 0:
-        return _fail(f"kestrel start (host mode) exited {start.returncode}")
-
     try:
+        start = _kestrel("start")  # no agent name → multi-agent host
+        _write_captured(sys.stdout, start.stdout)
+        _write_captured(sys.stderr, start.stderr)
+        if start.returncode != 0:
+            return _fail(f"kestrel start (host mode) exited {start.returncode}")
         if not _poll_health(port, timeout_s=30):
             return _fail(
                 f"Host did not respond on http://localhost:{port}/health "
@@ -374,9 +387,8 @@ def cmd_host_and_chat_503(args: argparse.Namespace) -> int:
                 "pre-#1110 misleading body. Body: " + body[:200]
             )
     finally:
-        stop = _kestrel("terminate")
-        _write_captured(sys.stdout, stop.stdout)
-        _write_captured(sys.stderr, stop.stderr)
+        if not _safe_stop():
+            raise RuntimeError("fenced clean-install cleanup was inconclusive")
 
     return _ok(
         f"Top-level /v1/chat/completions on host:{port} returned 503 with "
