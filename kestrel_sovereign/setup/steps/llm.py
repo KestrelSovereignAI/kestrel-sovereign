@@ -17,6 +17,7 @@ import logging
 import os
 from dataclasses import dataclass
 
+from kestrel_sovereign.constitution.genesis_audit import defer_test_genesis_audit
 from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
 from kestrel_sovereign.setup.context import Flow, SetupContext
 from kestrel_sovereign.setup.env_file import read_env, write_env
@@ -348,7 +349,14 @@ def _select_vendors(
         # already wrote in this run, not just the ones in the parent
         # shell.
         existing_keys = read_env(ctx.env_path)
-        detected = _detect_available_vendors(existing_keys)
+        # A clean-install test instance must not probe whatever Ollama daemon
+        # happens to run on the developer's host. The fallback below writes
+        # the same Ollama-only config without using it as audit authority.
+        detected = (
+            []
+            if defer_test_genesis_audit(ctx.is_test_instance, auditor=None)
+            else _detect_available_vendors(existing_keys)
+        )
         if detected:
             labels = ", ".join(v.key for v in detected)
             logger.info(f"Auto-detected LLM vendors for quickstart: {labels}")

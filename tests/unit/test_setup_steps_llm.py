@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import toml
+import pytest
 
 from kestrel_sovereign.setup.context import Flow, SetupContext
 from kestrel_sovereign.setup.env_file import read_env, write_env
@@ -70,6 +70,24 @@ def test_llm_quickstart_picks_ollama_when_only_ollama_reachable(
     llm.run(ctx)
     config = read_toml(tmp_path / "kestrel.toml")
     assert config["llm"]["route_priority"] == ["ollama:local"]
+
+
+def test_clean_install_quickstart_does_not_probe_ambient_providers(
+    tmp_path, monkeypatch
+):
+    """A marked install test writes its fallback route without discovery."""
+    monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
+    monkeypatch.setattr(
+        llm,
+        "_detect_available_vendors",
+        lambda *_args: pytest.fail("clean-install probed ambient provider state"),
+    )
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    ctx.is_test_instance = True
+    llm.run(ctx)
+    assert read_toml(tmp_path / "kestrel.toml")["llm"]["route_priority"] == [
+        "ollama:local"
+    ]
 
 
 def test_llm_quickstart_picks_openrouter_when_key_in_env(tmp_path, monkeypatch):

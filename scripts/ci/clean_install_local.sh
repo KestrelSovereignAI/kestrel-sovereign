@@ -25,6 +25,19 @@ AGENT_NAME="Kestrel"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Never inherit an operator's Kestrel database, Hold, identity or deployment
+# selector into this rehearsal. Refuse rather than silently redirecting a
+# potentially live backend; KESTREL_PY_VERSION only selects the test runtime.
+while IFS= read -r env_name; do
+  case "$env_name" in
+    KESTREL_PY_VERSION) ;;
+    KESTREL_*|DATABASE_URL)
+      echo "error: unset $env_name before running the isolated clean-install rehearsal" >&2
+      exit 2
+      ;;
+  esac
+done < <(env | cut -d= -f1)
+
 # Inception writes durable identity/config files. Refuse an existing local
 # checkout rather than backing up or reusing a developer's agent, which would
 # make this a dirty-state test and could silently select their cloud routes.
@@ -40,8 +53,23 @@ done
 # checkout has no persisted provider keys; the quickstart chooses local Ollama
 # (or its no-provider default), and genesis remains explicitly pending.
 HARNESS_DIR="$(mktemp -d)"
-trap 'rm -rf -- "$HARNESS_DIR"' EXIT
+HARNESS_PORTS_READY=0
+cleanup_harness() {
+  local run_status=$?
+  trap - EXIT
+  if [ "$HARNESS_PORTS_READY" = 0 ]; then
+    rm -rf -- "$HARNESS_DIR"
+  elif "${PY[@]}" scripts/ci/clean_install_local_cleanup.py --root "$REPO_ROOT" --check-ports; then
+    rm -rf -- "$HARNESS_DIR"
+  else
+    echo "warning: preserving clean-install harness $HARNESS_DIR; verify and stop its processes before removing it" >&2
+    run_status=1
+  fi
+  exit "$run_status"
+}
+trap cleanup_harness EXIT
 export KESTREL_HOST_DB_PATH="$HARNESS_DIR/host-features.db"
+export KESTREL_DB_BACKEND="sqlite"
 unset KESTREL_HOME KESTREL_DB_PATH AGENT_DATA_DIR KESTREL_DATA_DIR KESTREL_MULTI_AGENT_CONFIG
 unset OPENAI_API_KEY ANTHROPIC_API_KEY OPENROUTER_API_KEY OPENROUTER_MANAGEMENT_API_KEY
 unset GOOGLE_API_KEY GEMINI_API_KEY DEEPSEEK_API_KEY XAI_API_KEY MOONSHOT_API_KEY
@@ -51,6 +79,7 @@ unset GOOGLE_API_KEY GEMINI_API_KEY DEEPSEEK_API_KEY XAI_API_KEY MOONSHOT_API_KE
 # test-instance + audit-mode settings defer genesis as *pending* (never passed)
 # even when this host happens to run Ollama; no model is called by the harness.
 export KESTREL_AUDIT_MODE="skip"
+export KESTREL_SKIP_REACHABILITY_PROBE="1"
 export KESTREL_NONINTERACTIVE="1"
 export KESTREL_TEST_INSTANCE="1"
 export PYTHONSAFEPATH="1"
@@ -89,6 +118,7 @@ echo "==> Setup wizard (kestrel setup --quickstart)"
 # A developer may already have a real Kestrel host on 8888 or an agent on
 # 8801. Rebind only this newly-created test config to free loopback ports.
 "${PY[@]}" scripts/ci/clean_install_local_ports.py
+HARNESS_PORTS_READY=1
 
 echo "==> Readiness assertions"
 verify wizard-artifacts
