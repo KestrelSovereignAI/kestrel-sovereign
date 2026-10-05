@@ -635,19 +635,32 @@ class DurablePersistenceGate:
     — inbound channel/A2A ACK ingress and the scheduler's cron dispatches alike
     — behind whatever turn was in flight.
 
+    A third holder takes it SHARED: the Workflows ``await_signal`` host hook
+    (``KestrelAgent.workflow_await_signal_privacy_transition_lock``, #3484)
+    holds it around "privacy check, then matcher/CAS", so no privacy
+    transition completes inside that span, and the hook never queues behind
+    a turn.
+
     The gate is a leaf: nothing acquires CONVERSATION or the privacy-transition
     lock while holding it, so the global order stays CONVERSATION -> privacy
     transition -> persistence gate. Exclusive ownership is task-reentrant, and
     the owning task's shared acquisitions are admitted without waiting, so a
     signal dispatched inline by the transition body persists under the mode it
-    is installing instead of waiting on its own task. Writer preference comes
-    from :class:`AsyncReaderWriterLock`: once a transition queues, new persists
+    is installing instead of waiting on its own task. Shared ownership is
+    task-reentrant too: a task already holding a shared lease is admitted
+    again without waiting, so a hook holder that dispatches a signal cannot
+    deadlock against a transition queued between its two acquisitions. A task
+    holding a shared lease cannot take the gate exclusive; that upgrade would
+    wait on itself, so it is refused. Writer preference comes from
+    :class:`AsyncReaderWriterLock`: once a transition queues, new persists
     wait behind it.
     """
 
     def __init__(self) -> None:
         self._lock = AsyncReaderWriterLock()
         self._owner: Optional["asyncio.Task"] = None
+        self._shared_holders: set["asyncio.Task"] = set()
+        self._shared_lock = DurablePersistenceGateSharedLock(self)
 
     def locked(self) -> bool:
         """Whether a persist or a transition currently holds the gate."""
@@ -660,11 +673,25 @@ class DurablePersistenceGate:
     @asynccontextmanager
     async def shared(self):
         """Hold the gate for one durable projection-and-commit."""
-        if self._owned_by_current_task():
+        task = asyncio.current_task()
+        if task is not None and (
+            self._owner is task or task in self._shared_holders
+        ):
             yield
             return
         async with self._lock.read():
-            yield
+            if task is None:
+                yield
+                return
+            self._shared_holders.add(task)
+            try:
+                yield
+            finally:
+                self._shared_holders.discard(task)
+
+    def shared_lock(self) -> "DurablePersistenceGateSharedLock":
+        """Return this gate's reusable ``async with`` shared-lease object."""
+        return self._shared_lock
 
     @asynccontextmanager
     async def exclusive(self):
@@ -676,6 +703,11 @@ class DurablePersistenceGate:
         if self._owned_by_current_task():
             yield
             return
+        if asyncio.current_task() in self._shared_holders:
+            raise RuntimeError(
+                "A task holding the durable persistence gate shared cannot "
+                "take it exclusive: the transition would wait on itself"
+            )
         await self._lock.acquire()
         self._owner = asyncio.current_task()
         try:
@@ -683,6 +715,50 @@ class DurablePersistenceGate:
         finally:
             self._owner = None
             self._lock.release()
+
+
+class DurablePersistenceGateSharedLock:
+    """A reusable async context manager that holds a gate SHARED (#3484).
+
+    :meth:`DurablePersistenceGate.shared` returns a one-shot context manager.
+    An integration that is handed one lock object and enters it repeatedly,
+    from several tasks at once, needs ``__aenter__``/``__aexit__`` on the
+    object itself. Each entry takes its own shared lease, and the task that
+    entered releases it; nested entries by one task unwind in order.
+
+    Holding it guarantees one thing: no privacy transition completes while it
+    is held, because ``privacy_transition()`` takes the same gate exclusive.
+    It does not wait for an in-flight turn, which holds the privacy-transition
+    lock and never this gate.
+    """
+
+    def __init__(self, gate: DurablePersistenceGate) -> None:
+        self._gate = gate
+        self._held: Dict["asyncio.Task", List[Any]] = {}
+
+    async def __aenter__(self) -> "DurablePersistenceGateSharedLock":
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError(
+                "The durable persistence gate lock requires an asyncio task"
+            )
+        lease = self._gate.shared()
+        await lease.__aenter__()
+        self._held.setdefault(task, []).append(lease)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> Optional[bool]:
+        task = asyncio.current_task()
+        leases = self._held.get(task) if task is not None else None
+        if not leases:
+            raise RuntimeError(
+                "The durable persistence gate lock was released by a task "
+                "that does not hold it"
+            )
+        lease = leases.pop()
+        if not leases:
+            del self._held[task]
+        return await lease.__aexit__(exc_type, exc, tb)
 
 
 @asynccontextmanager
@@ -706,6 +782,24 @@ def _resolve_durable_persistence_gate(holder) -> Optional[DurablePersistenceGate
     if not callable(getter):
         return None
     return getter()
+
+
+def _resolve_privacy_policy_epoch(holder) -> Optional[str]:
+    """Return ``holder``'s privacy policy epoch, or ``None`` if it has none.
+
+    ``None`` is the lightweight embedding with no privacy-transition
+    machinery: it cannot name the policy an event was committed under, so the
+    dispatcher writes that event no ingress trust receipt (#3484). A getter
+    that exists but answers with anything other than a non-empty string is a
+    defect, not an absent policy, and fails the persist.
+    """
+    getter = getattr(holder, "_get_privacy_policy_epoch", None)
+    if not callable(getter):
+        return None
+    epoch = getter()
+    if type(epoch) is not str or not epoch:
+        raise TypeError("privacy policy epoch must be a non-empty string")
+    return epoch
 
 
 # ── Privacy-aware graph write policy (#2672) ─────────────────────────────────
