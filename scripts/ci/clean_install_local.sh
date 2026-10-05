@@ -25,9 +25,61 @@ AGENT_NAME="Kestrel"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Never inherit an operator's Kestrel database, Hold, identity or deployment
+# selector into this rehearsal. Refuse rather than silently redirecting a
+# potentially live backend; KESTREL_PY_VERSION only selects the test runtime.
+while IFS= read -r env_name; do
+  case "$env_name" in
+    KESTREL_PY_VERSION) ;;
+    KESTREL_*|DATABASE_URL)
+      echo "error: unset $env_name before running the isolated clean-install rehearsal" >&2
+      exit 2
+      ;;
+  esac
+done < <(env | cut -d= -f1)
+
+# Inception writes durable identity/config files. Refuse an existing local
+# checkout rather than backing up or reusing a developer's agent, which would
+# make this a dirty-state test and could silently select their cloud routes.
+for state_path in .env kestrel.toml multi_agent.toml agent_data; do
+  if [ -e "$state_path" ] || [ -L "$state_path" ]; then
+    echo "error: clean-install rehearsal requires no existing $state_path; use a fresh checkout" >&2
+    exit 2
+  fi
+done
+
+# Keep host-feature state out of the operator's ~/.kestrel, and never discover
+# a paid route from credentials exported in the invoking shell. A fresh
+# checkout has no persisted provider keys; the quickstart chooses local Ollama
+# (or its no-provider default), and genesis remains explicitly pending.
+HARNESS_DIR="$(mktemp -d)"
+HARNESS_PORTS_READY=0
+cleanup_harness() {
+  local run_status=$?
+  trap - EXIT
+  if [ "$HARNESS_PORTS_READY" = 0 ]; then
+    rm -rf -- "$HARNESS_DIR"
+  elif "${PY[@]}" scripts/ci/clean_install_local_cleanup.py --root "$REPO_ROOT" --check-ports; then
+    rm -rf -- "$HARNESS_DIR"
+  else
+    echo "warning: preserving clean-install harness $HARNESS_DIR; verify and stop its processes before removing it" >&2
+    run_status=1
+  fi
+  exit "$run_status"
+}
+trap cleanup_harness EXIT
+export KESTREL_HOST_DB_PATH="$HARNESS_DIR/host-features.db"
+export KESTREL_DB_BACKEND="sqlite"
+unset KESTREL_HOME KESTREL_DB_PATH AGENT_DATA_DIR KESTREL_DATA_DIR KESTREL_MULTI_AGENT_CONFIG
+unset OPENAI_API_KEY ANTHROPIC_API_KEY OPENROUTER_API_KEY OPENROUTER_MANAGEMENT_API_KEY
+unset GOOGLE_API_KEY GEMINI_API_KEY DEEPSEEK_API_KEY XAI_API_KEY MOONSHOT_API_KEY
+
 # Mirror the workflow env so the wizard takes its non-interactive, test-instance
-# path and never blocks on a prompt or pollutes a real agent DB.
+# path and never blocks on a prompt or pollutes a real agent DB.  The paired
+# test-instance + audit-mode settings defer genesis as *pending* (never passed)
+# even when this host happens to run Ollama; no model is called by the harness.
 export KESTREL_AUDIT_MODE="skip"
+export KESTREL_SKIP_REACHABILITY_PROBE="1"
 export KESTREL_NONINTERACTIVE="1"
 export KESTREL_TEST_INSTANCE="1"
 export PYTHONSAFEPATH="1"
@@ -41,8 +93,7 @@ if [ "${INSTALL_METHOD}" = "wheel" ]; then
   # genuinely disposable venv OUTSIDE the checkout. A bare `uv venv` would
   # reuse the project's ./.venv and overwrite the developer's editable install
   # with the wheel; an explicit out-of-tree path keeps the dev env untouched.
-  WHEEL_VENV="$(mktemp -d)/venv"
-  trap 'rm -rf "$(dirname "${WHEEL_VENV}")"' EXIT
+  WHEEL_VENV="$HARNESS_DIR/venv"
   uv build --wheel
   uv venv --python "${PYTHON_VERSION}" "${WHEEL_VENV}"
   uv pip install --python "${WHEEL_VENV}" dist/*.whl
@@ -63,6 +114,11 @@ verify() { "${PY[@]}" scripts/ci/clean_install_verify.py "$@"; }
 
 echo "==> Setup wizard (kestrel setup --quickstart)"
 "${KESTREL[@]}" setup --quickstart
+
+# A developer may already have a real Kestrel host on 8888 or an agent on
+# 8801. Rebind only this newly-created test config to free loopback ports.
+"${PY[@]}" scripts/ci/clean_install_local_ports.py
+HARNESS_PORTS_READY=1
 
 echo "==> Readiness assertions"
 verify wizard-artifacts

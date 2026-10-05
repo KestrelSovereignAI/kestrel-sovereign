@@ -15,9 +15,9 @@ import toml
 
 from kestrel_sovereign.multi_agent.config import (
     DEFAULT_AGENT_START_PORT,
-    LocalAgentConfig,
     MULTI_AGENT_CONFIG_FILENAME,
     HostConfig,
+    LocalAgentConfig,
     MultiAgentConfig,
 )
 from kestrel_sovereign.setup.context import Flow, SetupContext
@@ -280,6 +280,107 @@ def test_create_agent_default_is_not_test_instance(tmp_path):
         )
 
     assert captured.get("is_test_instance") is False
+
+
+@pytest.mark.parametrize("ambient_ollama_reachable", [False, True])
+def test_clean_install_test_agent_defers_ambient_genesis_auditor(
+    tmp_path, monkeypatch, ambient_ollama_reachable
+):
+    """Install QA never calls an unrelated host's model, even if reachable."""
+    monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
+    (tmp_path / "kestrel.toml").write_text(
+        toml.dumps(
+            {
+                "llm": {
+                    "route_priority": ["ollama:local"],
+                    "vendors": {
+                        "ollama": {
+                            "routes": {
+                                "local": {
+                                    "adapter": "OllamaAdapter",
+                                    "host": "http://localhost:11434",
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+        )
+    )
+    captured: dict = {}
+
+    async def _capturing_inception(**kwargs):
+        captured.update(kwargs)
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "kestrel_prime.db").write_bytes(b"")
+        return _FakeCreds(did="did:test", db_path=str(out / "kestrel_prime.db"))
+
+    with (
+        patch(
+            "kestrel_sovereign.setup.steps.llm._is_ollama_reachable",
+            return_value=ambient_ollama_reachable,
+        ) as probe,
+        patch(
+            "kestrel_sovereign.setup.steps.agent._build_configured_genesis_auditor"
+        ) as build,
+        patch(
+            "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+            side_effect=_capturing_inception,
+        ),
+    ):
+        agent.create_agent(
+            name="CleanInstall",
+            project_dir=tmp_path,
+            agent_data_root=tmp_path / "agent_data",
+            is_test_instance=True,
+        )
+
+    probe.assert_not_called()
+    build.assert_not_called()
+    assert captured["genesis_auditor"] is None
+    assert captured["genesis_audit_provenance"] is None
+    assert captured["is_test_instance"] is True
+
+
+def test_clean_install_audit_mode_cannot_defer_real_agent(tmp_path, monkeypatch):
+    """The harness setting alone cannot weaken a non-test inception."""
+    monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
+    captured: dict = {}
+    auditor = object()
+
+    async def _capturing_inception(**kwargs):
+        captured.update(kwargs)
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "kestrel_prime.db").write_bytes(b"")
+        return _FakeCreds(did="did:real", db_path=str(out / "kestrel_prime.db"))
+
+    with (
+        patch(
+            "kestrel_sovereign.setup.steps.agent._configured_genesis_auditor_available",
+            return_value=True,
+        ) as available,
+        patch(
+            "kestrel_sovereign.setup.steps.agent._build_configured_genesis_auditor",
+            return_value=auditor,
+        ) as build,
+        patch(
+            "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+            side_effect=_capturing_inception,
+        ),
+    ):
+        agent.create_agent(
+            name="RealAgent",
+            project_dir=tmp_path,
+            agent_data_root=tmp_path / "agent_data",
+        )
+
+    available.assert_called_once_with(tmp_path)
+    build.assert_called_once_with(tmp_path)
+    assert captured["genesis_auditor"] is auditor
+    assert captured["genesis_audit_provenance"] == "setup:configured_llm"
+    assert captured["is_test_instance"] is False
 
 
 def test_wizard_run_propagates_ctx_is_test_instance(tmp_path):
