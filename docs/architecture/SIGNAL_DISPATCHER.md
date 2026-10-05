@@ -710,10 +710,17 @@ while the gate is held.
 The same gate, held shared, is the lock the agent hands to Workflows as
 `workflow_await_signal_privacy_transition_lock` (#3484). Workflows holds it
 around an `await_signal` "privacy check, then matcher/CAS" and needs only that
-no transition completes inside that span. It does not wait for a turn. Shared
-leases are task-reentrant, so a holder that dispatches a signal is not wedged
-by a transition queued behind it; a shared holder that asks for the gate
-exclusive is refused rather than left waiting on itself.
+no transition completes inside that span. It does not wait for a turn. A
+shared hold is carried in a ContextVar, so the holder and any task it creates
+and awaits while holding (`asyncio.wait_for` on Python 3.11, an awaited
+`create_task`) re-enter the same lease. A holder that dispatches a signal,
+directly or from such a child, is therefore not wedged by a transition queued
+behind it. A hold dies when its `async with` exits: a detached task that runs
+afterwards acquires the gate like any other caller, and the lease stays held
+until every task inside it has left. A task inside its own shared hold that
+asks for the gate exclusive is refused rather than left waiting on itself; a
+task that only inherited a hold may be detached from its holder, so its
+transition waits like any other.
 
 Step 3 also writes the event's **ingress trust receipt** in the same
 transaction as the event (#3484), in `durable_signal_ingress_receipts`:

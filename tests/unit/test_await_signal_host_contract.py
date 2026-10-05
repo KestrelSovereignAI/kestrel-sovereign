@@ -610,24 +610,30 @@ async def test_hook_lock_does_not_wait_for_an_in_flight_turn(rig):
         assert await asyncio.wait_for(turn, timeout=_HANG_GUARD_SECONDS) == "turn done"
 
 
-@pytest.mark.asyncio
-async def test_hook_holder_can_persist_while_a_transition_is_queued(rig):
-    """Shared leases are task-reentrant, so a queued writer cannot wedge a holder."""
-    agent = rig.agent
+async def _queue_transition(agent: KestrelAgent) -> tuple[asyncio.Task, asyncio.Event]:
+    """Start a privacy transition and return once it waits on the gate."""
     gate = agent._get_durable_persistence_gate()
-    transitioned = asyncio.Event()
+    entered = asyncio.Event()
 
     async def transition() -> None:
         async with agent.privacy_transition():
-            transitioned.set()
+            entered.set()
 
+    pending = asyncio.create_task(transition())
+    for _ in range(200):
+        if gate._lock._waiting_writers:
+            break
+        await asyncio.sleep(0)
+    assert gate._lock._waiting_writers == 1, "the transition is queued on the gate"
+    return pending, entered
+
+
+@pytest.mark.asyncio
+async def test_hook_holder_can_persist_while_a_transition_is_queued(rig):
+    """A queued writer cannot wedge a holder that dispatches a signal."""
+    agent = rig.agent
     async with agent.workflow_await_signal_privacy_transition_lock:
-        pending = asyncio.create_task(transition())
-        for _ in range(200):
-            if gate._lock._waiting_writers:
-                break
-            await asyncio.sleep(0)
-        assert gate._lock._waiting_writers == 1, "the transition is queued on the gate"
+        pending, transitioned = await _queue_transition(agent)
 
         result = await asyncio.wait_for(
             rig.dispatcher.dispatch_signal(_signal(agent, _SANITIZED)),
@@ -637,6 +643,195 @@ async def test_hook_holder_can_persist_while_a_transition_is_queued(rig):
         assert not transitioned.is_set()
     await asyncio.wait_for(pending, timeout=_HANG_GUARD_SECONDS)
     assert transitioned.is_set()
+
+
+@pytest.mark.asyncio
+async def test_hook_lock_reenters_on_the_holding_task_while_a_transition_is_queued(
+    rig,
+):
+    agent = rig.agent
+    lock = agent.workflow_await_signal_privacy_transition_lock
+    gate = agent._get_durable_persistence_gate()
+    # ``asyncio.timeout`` bounds a hang without leaving the current task.
+    async with asyncio.timeout(_HANG_GUARD_SECONDS):
+        async with lock:
+            pending, transitioned = await _queue_transition(agent)
+            async with lock:
+                async with gate.shared():
+                    assert not transitioned.is_set()
+            result = await rig.dispatcher.dispatch_signal(_signal(agent, _SANITIZED))
+            assert result.status is Status.OK
+            assert not transitioned.is_set()
+        await pending
+    assert transitioned.is_set()
+    assert not gate.locked()
+
+
+async def _reenter_and_persist(rig: _Rig) -> Status:
+    """What a hook holder's child does: take the hook lock, persist a signal."""
+    async with rig.agent.workflow_await_signal_privacy_transition_lock:
+        result = await rig.dispatcher.dispatch_signal(
+            _signal(rig.agent, _SANITIZED)
+        )
+    return result.status
+
+
+@pytest.mark.asyncio
+async def test_hook_lock_reenters_from_wait_for_while_a_transition_is_queued(rig):
+    """On Python 3.11 ``wait_for`` runs its coroutine on a separate task."""
+    agent = rig.agent
+    async with agent.workflow_await_signal_privacy_transition_lock:
+        pending, transitioned = await _queue_transition(agent)
+        status = await asyncio.wait_for(
+            _reenter_and_persist(rig), timeout=_HANG_GUARD_SECONDS
+        )
+        assert status is Status.OK
+        assert not transitioned.is_set()
+    await asyncio.wait_for(pending, timeout=_HANG_GUARD_SECONDS)
+    assert transitioned.is_set()
+
+
+@pytest.mark.asyncio
+async def test_hook_lock_reenters_from_an_awaited_child_task_while_a_transition_is_queued(
+    rig,
+):
+    agent = rig.agent
+    async with agent.workflow_await_signal_privacy_transition_lock:
+        pending, transitioned = await _queue_transition(agent)
+        child = asyncio.create_task(_reenter_and_persist(rig))
+        async with asyncio.timeout(_HANG_GUARD_SECONDS):
+            status = await child
+        assert status is Status.OK
+        assert not transitioned.is_set()
+    await asyncio.wait_for(pending, timeout=_HANG_GUARD_SECONDS)
+    assert transitioned.is_set()
+    assert not agent._get_durable_persistence_gate().locked()
+
+
+@pytest.mark.asyncio
+async def test_a_detached_child_that_runs_after_release_does_not_hold_the_gate(rig):
+    agent = rig.agent
+    gate = agent._get_durable_persistence_gate()
+    parent_released = asyncio.Event()
+    child_entered = asyncio.Event()
+
+    async def detached() -> None:
+        await parent_released.wait()
+        async with agent.workflow_await_signal_privacy_transition_lock:
+            child_entered.set()
+
+    async with agent.workflow_await_signal_privacy_transition_lock:
+        child = asyncio.create_task(detached())
+        await _spin()
+    assert not gate.locked()
+
+    in_transition = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def transition() -> None:
+        async with agent.privacy_transition():
+            in_transition.set()
+            await finish.wait()
+
+    holder = asyncio.create_task(transition())
+    try:
+        await asyncio.wait_for(in_transition.wait(), timeout=_HANG_GUARD_SECONDS)
+        parent_released.set()
+        await _spin()
+        assert not child_entered.is_set(), (
+            "a child spawned under a released hold entered during a transition"
+        )
+    finally:
+        finish.set()
+        await asyncio.wait_for(holder, timeout=_HANG_GUARD_SECONDS)
+    await asyncio.wait_for(child, timeout=_HANG_GUARD_SECONDS)
+    assert child_entered.is_set()
+    assert not gate.locked()
+
+
+@pytest.mark.asyncio
+async def test_a_detached_child_that_runs_after_release_can_transition(rig):
+    """A dead inherited hold neither admits the child nor refuses its upgrade."""
+    agent = rig.agent
+    parent_released = asyncio.Event()
+
+    async def detached() -> str:
+        await parent_released.wait()
+        async with agent.privacy_transition():
+            return "transitioned"
+
+    async with agent.workflow_await_signal_privacy_transition_lock:
+        child = asyncio.create_task(detached())
+        await _spin()
+    parent_released.set()
+    assert await asyncio.wait_for(child, timeout=_HANG_GUARD_SECONDS) == "transitioned"
+    assert not agent._get_durable_persistence_gate().locked()
+
+
+@pytest.mark.asyncio
+async def test_a_child_still_inside_after_its_parent_left_keeps_the_gate_held(rig):
+    agent = rig.agent
+    lock = agent.workflow_await_signal_privacy_transition_lock
+    gate = agent._get_durable_persistence_gate()
+    child_in = asyncio.Event()
+    child_release = asyncio.Event()
+    nested = asyncio.Event()
+
+    async def child() -> None:
+        async with lock:
+            child_in.set()
+            await child_release.wait()
+            # Its parent has left and a transition is queued; the child's own
+            # hold still admits it.
+            async with lock:
+                async with gate.shared():
+                    nested.set()
+
+    async with lock:
+        spawned = asyncio.create_task(child())
+        await asyncio.wait_for(child_in.wait(), timeout=_HANG_GUARD_SECONDS)
+    assert gate.locked(), "the parent's exit released a lease its child still holds"
+
+    pending, transitioned = await _queue_transition(agent)
+    await _spin()
+    assert not transitioned.is_set(), "a transition completed inside a live hold"
+
+    child_release.set()
+    await asyncio.wait_for(spawned, timeout=_HANG_GUARD_SECONDS)
+    assert nested.is_set()
+    await asyncio.wait_for(pending, timeout=_HANG_GUARD_SECONDS)
+    assert transitioned.is_set()
+    assert not gate.locked()
+
+
+@pytest.mark.asyncio
+async def test_the_transition_waits_for_every_independent_holder(rig):
+    agent = rig.agent
+    lock = agent.workflow_await_signal_privacy_transition_lock
+    gate = agent._get_durable_persistence_gate()
+    releases = {name: asyncio.Event() for name in ("a", "b")}
+    entered = {name: asyncio.Event() for name in ("a", "b")}
+
+    async def holder(name: str) -> None:
+        async with lock:
+            entered[name].set()
+            await releases[name].wait()
+
+    holders = {name: asyncio.create_task(holder(name)) for name in releases}
+    for event in entered.values():
+        await asyncio.wait_for(event.wait(), timeout=_HANG_GUARD_SECONDS)
+    pending, transitioned = await _queue_transition(agent)
+
+    releases["a"].set()
+    await asyncio.wait_for(holders["a"], timeout=_HANG_GUARD_SECONDS)
+    await _spin()
+    assert not transitioned.is_set(), "a transition completed inside a live hold"
+
+    releases["b"].set()
+    await asyncio.wait_for(holders["b"], timeout=_HANG_GUARD_SECONDS)
+    await asyncio.wait_for(pending, timeout=_HANG_GUARD_SECONDS)
+    assert transitioned.is_set()
+    assert not gate.locked()
 
 
 @pytest.mark.asyncio
@@ -669,6 +864,25 @@ async def test_a_hook_holder_cannot_take_the_gate_exclusive(rig):
         with pytest.raises(RuntimeError, match="cannot take it exclusive"):
             async with gate.exclusive():
                 pass
+    assert not gate.locked()
+
+
+@pytest.mark.asyncio
+async def test_a_child_inside_its_own_reentered_hold_cannot_take_the_gate_exclusive(
+    rig,
+):
+    gate = rig.agent._get_durable_persistence_gate()
+
+    async def upgrade() -> None:
+        async with gate.shared():
+            async with gate.exclusive():
+                pass
+
+    async with rig.agent.workflow_await_signal_privacy_transition_lock:
+        child = asyncio.create_task(upgrade())
+        with pytest.raises(RuntimeError, match="cannot take it exclusive"):
+            async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                await child
     assert not gate.locked()
 
 
