@@ -25,8 +25,31 @@ AGENT_NAME="Kestrel"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Inception writes durable identity/config files. Refuse an existing local
+# checkout rather than backing up or reusing a developer's agent, which would
+# make this a dirty-state test and could silently select their cloud routes.
+for state_path in .env kestrel.toml multi_agent.toml agent_data; do
+  if [ -e "$state_path" ] || [ -L "$state_path" ]; then
+    echo "error: clean-install rehearsal requires no existing $state_path; use a fresh checkout" >&2
+    exit 2
+  fi
+done
+
+# Keep host-feature state out of the operator's ~/.kestrel, and never discover
+# a paid route from credentials exported in the invoking shell. A fresh
+# checkout has no persisted provider keys; the quickstart chooses local Ollama
+# (or its no-provider default), and genesis remains explicitly pending.
+HARNESS_DIR="$(mktemp -d)"
+trap 'rm -rf -- "$HARNESS_DIR"' EXIT
+export KESTREL_HOST_DB_PATH="$HARNESS_DIR/host-features.db"
+unset KESTREL_HOME KESTREL_DB_PATH AGENT_DATA_DIR KESTREL_DATA_DIR KESTREL_MULTI_AGENT_CONFIG
+unset OPENAI_API_KEY ANTHROPIC_API_KEY OPENROUTER_API_KEY OPENROUTER_MANAGEMENT_API_KEY
+unset GOOGLE_API_KEY GEMINI_API_KEY DEEPSEEK_API_KEY XAI_API_KEY MOONSHOT_API_KEY
+
 # Mirror the workflow env so the wizard takes its non-interactive, test-instance
-# path and never blocks on a prompt or pollutes a real agent DB.
+# path and never blocks on a prompt or pollutes a real agent DB.  The paired
+# test-instance + audit-mode settings defer genesis as *pending* (never passed)
+# even when this host happens to run Ollama; no model is called by the harness.
 export KESTREL_AUDIT_MODE="skip"
 export KESTREL_NONINTERACTIVE="1"
 export KESTREL_TEST_INSTANCE="1"
@@ -41,8 +64,7 @@ if [ "${INSTALL_METHOD}" = "wheel" ]; then
   # genuinely disposable venv OUTSIDE the checkout. A bare `uv venv` would
   # reuse the project's ./.venv and overwrite the developer's editable install
   # with the wheel; an explicit out-of-tree path keeps the dev env untouched.
-  WHEEL_VENV="$(mktemp -d)/venv"
-  trap 'rm -rf "$(dirname "${WHEEL_VENV}")"' EXIT
+  WHEEL_VENV="$HARNESS_DIR/venv"
   uv build --wheel
   uv venv --python "${PYTHON_VERSION}" "${WHEEL_VENV}"
   uv pip install --python "${WHEEL_VENV}" dist/*.whl

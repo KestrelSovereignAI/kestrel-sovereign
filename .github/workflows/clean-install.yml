@@ -61,6 +61,9 @@ concurrency:
 env:
   PYTHON_VERSION: "3.13"
   KESTREL_AUDIT_MODE: "skip"
+  # Only alongside KESTREL_TEST_INSTANCE=1: persist a pending genesis audit
+  # without probing/calling an ambient model. This is install/readiness QA,
+  # never evidence that a live agent passed its genesis gate.
   KESTREL_SKIP_REACHABILITY_PROBE: "1"
   # Force the wizard's non-TTY branch so it never blocks on a prompt.
   # With this set, build_context() returns NonInteractivePrompter which

@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
-
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from kestrel_sovereign.constitution.emancipation import (
     EmancipationConfigError,
@@ -28,8 +28,8 @@ from kestrel_sovereign.constitution.emancipation import (
 )
 from kestrel_sovereign.multi_agent.config import (
     DEFAULT_AGENT_START_PORT,
-    LocalAgentConfig,
     MULTI_AGENT_CONFIG_FILENAME,
+    LocalAgentConfig,
     MultiAgentConfig,
 )
 from kestrel_sovereign.paths import HOME_ENV, runtime_path_env, spawned_agent_env
@@ -109,8 +109,18 @@ def create_agent(
     already_existed = db_path.exists()
     if not already_existed:
         agent_dir.mkdir(parents=True, exist_ok=True)
-        if genesis_auditor is None and _configured_genesis_auditor_available(
-            project_dir
+        # The clean-install harness deliberately creates a marked test agent
+        # with a *pending* audit.  Do not discover or call an ambient Ollama
+        # service on the developer's machine merely because /api/tags answers.
+        # This never turns a pending audit into a pass, and cannot suppress an
+        # explicitly injected auditor or a non-test agent's configured lane.
+        defer_test_audit = (
+            is_test_instance and os.environ.get("KESTREL_AUDIT_MODE") == "skip"
+        )
+        if (
+            genesis_auditor is None
+            and not defer_test_audit
+            and _configured_genesis_auditor_available(project_dir)
         ):
             genesis_auditor = _build_configured_genesis_auditor(project_dir)
             genesis_audit_provenance = "setup:configured_llm"
