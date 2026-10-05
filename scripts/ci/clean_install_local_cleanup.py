@@ -15,6 +15,21 @@ from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentCon
 from kestrel_sovereign.multi_agent.process_manager import PidStatus, ProcessManager
 
 
+def _wait_for_exit(pid_file: Path, timeout_seconds: float = 5) -> bool:
+    """Wait for a recorded process to become absent/stale, never guess."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        status = ProcessManager.read_pid_record(pid_file).status
+        if status in (PidStatus.ABSENT, PidStatus.STALE):
+            return True
+        if status is not PidStatus.LIVE:
+            return False
+        time.sleep(0.1)
+    return ProcessManager.read_pid_record(pid_file).status in (
+        PidStatus.ABSENT, PidStatus.STALE
+    )
+
+
 def stop_owned_process(pid_file: Path, root: Path, port: int) -> bool:
     """Stop only the process proven by this checkout's fenced PID record."""
     record = ProcessManager.read_pid_record(pid_file)
@@ -27,19 +42,14 @@ def stop_owned_process(pid_file: Path, root: Path, port: int) -> bool:
         ):
             return False
         ProcessManager.kill_process(record.pid, started_at=record.started_at)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
+        if not _wait_for_exit(pid_file):
             if ProcessManager.read_pid_record(pid_file).status is not PidStatus.LIVE:
-                break
-            time.sleep(0.1)
-        else:
+                return False
             ProcessManager.kill_process(
                 record.pid, force=True, started_at=record.started_at
             )
-        if ProcessManager.read_pid_record(pid_file).status not in (
-            PidStatus.ABSENT, PidStatus.STALE
-        ):
-            return False
+            if not _wait_for_exit(pid_file):
+                return False
     elif record.status in (PidStatus.UNDECIDABLE, PidStatus.UNREADABLE):
         return False
 

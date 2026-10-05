@@ -40,6 +40,44 @@ def test_failed_start_terminates_only_fenced_harness_pid(tmp_path, monkeypatch):
     assert signals == [((12345,), {"started_at": 100.0})]
 
 
+def test_forced_stop_waits_for_asynchronous_exit(tmp_path, monkeypatch):
+    records = iter(
+        [_record(PidStatus.LIVE, tmp_path, 62220),
+         _record(PidStatus.LIVE, tmp_path, 62220)]
+    )
+    signals = []
+    waits = iter([False, True])
+    monkeypatch.setattr(cleanup.ProcessManager, "read_pid_record", lambda _: next(records))
+    monkeypatch.setattr(cleanup, "_wait_for_exit", lambda _path: next(waits))
+    monkeypatch.setattr(
+        cleanup.ProcessManager,
+        "kill_process",
+        lambda *args, **kwargs: signals.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(cleanup.ProcessManager, "is_port_in_use", lambda *_: False)
+
+    assert cleanup.stop_owned_process(tmp_path / "agent.pid", tmp_path, 62220)
+    assert signals == [
+        ((12345,), {"started_at": 100.0}),
+        ((12345,), {"force": True, "started_at": 100.0}),
+    ]
+
+
+def test_wait_for_exit_polls_live_then_stale(tmp_path, monkeypatch):
+    statuses = iter([PidStatus.LIVE, PidStatus.STALE])
+    clock = iter([0.0, 0.1, 0.2])
+    sleeps = []
+    monkeypatch.setattr(cleanup.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(cleanup.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(
+        cleanup.ProcessManager,
+        "read_pid_record",
+        lambda _: _record(next(statuses), tmp_path, 62220),
+    )
+    assert cleanup._wait_for_exit(tmp_path / "agent.pid")
+    assert sleeps == [0.1]
+
+
 def test_mismatched_pid_record_is_not_signalled_or_cleaned(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cleanup.ProcessManager,
