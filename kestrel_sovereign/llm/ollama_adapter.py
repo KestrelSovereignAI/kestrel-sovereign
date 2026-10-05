@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from .adapter import (
     LLMAdapter,
     LLMResponse,
+    ReportedUsage,
     ThinkingContentSplitter,
     ThinkingDelta,
     ToolCall,
@@ -30,6 +31,12 @@ from kestrel_sdk.llm import (
     ToolStreamingMode,
     VisionInputMode,
 )
+from kestrel_sdk.llm.decisions import (
+    DecisionModelInfo,
+    DecisionTransportError,
+    ValidatedDecisionRequest,
+)
+from .decisions.http import post_systemone, systemone_body
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import get_base64_only
 from .retry import with_retry
@@ -47,6 +54,39 @@ if TYPE_CHECKING:
     from .embedding_discovery import EmbeddingModelInfo
 
 logger = logging.getLogger(__name__)
+
+#: Ollama's published ``/v1/systemone`` limits (docs.ollama.com/api/systemone,
+#: v0.35): 1–64 questions, 2–26 options, 64 KiB body without images. Ollama
+#: evaluates questions one after another on Qwen3.5-family models.
+OLLAMA_DECISION_MAX_QUESTIONS = 64
+OLLAMA_DECISION_MAX_OPTIONS = 26
+OLLAMA_DECISION_MAX_REQUEST_BYTES = 64 * 1024
+
+
+def _show_field(info: Any, name: str) -> Any:
+    if isinstance(info, dict):
+        return info.get(name)
+    return getattr(info, name, None)
+
+
+def _num_ctx(parameters: Any) -> Optional[int]:
+    """The serving ``num_ctx`` from ``/api/show`` ``parameters`` text, if set.
+
+    This is the effective limit; ``model_info.<arch>.context_length`` is the
+    base model's, which for decision fine-tunes is far larger than what the
+    model is served with (Nimble: 256K base, ``num_ctx 8194``).
+    """
+    if not isinstance(parameters, str):
+        return None
+    for line in parameters.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "num_ctx":
+            try:
+                value = int(parts[1])
+            except ValueError:
+                return None
+            return value if value > 0 else None
+    return None
 
 
 def _extract_message_fields(payload: Any) -> tuple[Optional[str], Optional[str]]:
@@ -128,6 +168,9 @@ class OllamaAdapter(LLMAdapter):
             supports_structured_output=True,
             supports_embeddings=True,
             supports_raw_passthrough=True,
+            # Ollama >= 0.35 serves /v1/systemone; which installed models are
+            # decision models is discovery state (#3424).
+            supports_decisions=True,
             structured_output_mode=StructuredOutputMode.SCHEMA_FORMAT,
             tool_streaming_mode=ToolStreamingMode.NONSTREAM_FALLBACK,
             vision_input_mode=VisionInputMode.OLLAMA_IMAGES,
@@ -223,6 +266,12 @@ class OllamaAdapter(LLMAdapter):
             result = await target(payload, **kwargs)
         return RawResponse(operation=operation, data=result, raw=result)
 
+    @staticmethod
+    def _client_host(client: Any) -> Optional[str]:
+        """The daemon URL the route's ``ollama.AsyncClient`` was built for."""
+        http_client = getattr(client, "_client", None)
+        return str(getattr(http_client, "base_url", "") or "") or None
+
     async def probe_reachable(
         self,
         client: Any,
@@ -231,10 +280,7 @@ class OllamaAdapter(LLMAdapter):
         timeout: float = 1.5,
     ) -> Optional[bool]:
         """Probe Ollama's lightweight model-tags endpoint."""
-        host = base_url
-        if not host:
-            http_client = getattr(client, "_client", None)
-            host = str(getattr(http_client, "base_url", "") or "") or None
+        host = base_url or self._client_host(client)
         if not host:
             return None
 
@@ -280,6 +326,20 @@ class OllamaAdapter(LLMAdapter):
             dim = None
         return {"dimensions": int(dim)} if dim else {}
 
+    @staticmethod
+    def _report_embedding_usage(
+        usage_sink: Optional[ReportedUsage], response: Any
+    ) -> None:
+        """Copy ``/api/embed``'s ``prompt_eval_count`` into ``usage_sink`` (#3426)."""
+        if usage_sink is None:
+            return
+        if isinstance(response, dict):
+            tokens, served = response.get("prompt_eval_count"), response.get("model")
+        else:
+            tokens = getattr(response, "prompt_eval_count", None)
+            served = getattr(response, "model", None)
+        usage_sink.add(input_tokens=tokens, model=served)
+
     async def aembed(
         self,
         client: "ollama.AsyncClient",
@@ -287,6 +347,7 @@ class OllamaAdapter(LLMAdapter):
         *,
         model: Optional[str] = None,
         dimensions: Optional[int] = None,
+        usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
         try:
@@ -298,6 +359,7 @@ class OllamaAdapter(LLMAdapter):
         except Exception as exc:
             logger.warning("Ollama embedding failed: %s", exc)
             return None
+        self._report_embedding_usage(usage_sink, response)
         embeddings = response.get("embeddings", []) if isinstance(response, dict) else getattr(response, "embeddings", [])
         return list(embeddings[0]) if embeddings else None
 
@@ -308,6 +370,7 @@ class OllamaAdapter(LLMAdapter):
         *,
         model: Optional[str] = None,
         dimensions: Optional[int] = None,
+        usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
         if not texts:
@@ -321,6 +384,7 @@ class OllamaAdapter(LLMAdapter):
         except Exception as exc:
             logger.warning("Ollama batch embedding failed: %s", exc)
             return [None] * len(texts)
+        self._report_embedding_usage(usage_sink, response)
         embeddings = response.get("embeddings", []) if isinstance(response, dict) else getattr(response, "embeddings", [])
         out = [list(item) if item is not None else None for item in embeddings]
         return (out + [None] * len(texts))[:len(texts)]
@@ -806,6 +870,17 @@ class OllamaAdapter(LLMAdapter):
             tools=tools
         )
 
+    @staticmethod
+    def _is_decision_only(info: Any) -> bool:
+        """The runtime reports decision capability and no chat (completion).
+
+        Decided from Ollama's own capability report, never the model name, so
+        a decision model is kept out of chat listings while a model that
+        serves both stays selectable for chat (#3424).
+        """
+        capabilities = _show_field(info, "capabilities") or []
+        return "decision" in capabilities and "completion" not in capabilities
+
     async def _check_tool_support(self, client: "ollama.AsyncClient", model_name: str) -> bool:
         """Check if a model supports tool calling via /api/show metadata.
 
@@ -820,26 +895,30 @@ class OllamaAdapter(LLMAdapter):
         """
         try:
             info = await client.show(model_name)
-            # Extract template — check for .Tools presence
-            template = ""
-            capabilities = []
-            if isinstance(info, dict):
-                template = info.get("template", "")
-                capabilities = info.get("capabilities") or []
-            elif hasattr(info, "template"):
-                template = info.template or ""
-                capabilities = getattr(info, "capabilities", None) or []
-
-            has_tools_template = ".Tools" in template
-            supports = "tools" in capabilities or has_tools_template
-            logger.debug(
-                f"Tool support for {model_name}: template={has_tools_template}, "
-                f"capabilities={capabilities}, supports_tools={supports}"
-            )
-            return supports
         except Exception as e:
             logger.warning(f"Could not check tool support for {model_name}: {e}")
             return False
+        return self._tool_support_from_show(model_name, info)
+
+    @staticmethod
+    def _tool_support_from_show(model_name: str, info: Any) -> bool:
+        """Tool support from one ``/api/show`` result (capabilities or template)."""
+        template = ""
+        capabilities = []
+        if isinstance(info, dict):
+            template = info.get("template", "")
+            capabilities = info.get("capabilities") or []
+        elif hasattr(info, "template"):
+            template = info.template or ""
+            capabilities = getattr(info, "capabilities", None) or []
+
+        has_tools_template = ".Tools" in template
+        supports = "tools" in capabilities or has_tools_template
+        logger.debug(
+            f"Tool support for {model_name}: template={has_tools_template}, "
+            f"capabilities={capabilities}, supports_tools={supports}"
+        )
+        return supports
 
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """List available models from the local Ollama instance.
@@ -916,8 +995,21 @@ class OllamaAdapter(LLMAdapter):
                 # Detect vision support
                 supports_vision = any(v in lower_name for v in ["vision", "llava", "llama3.2"])
 
-                # Detect tool support from API metadata (template + param count)
-                supports_tools = await self._check_tool_support(client, model_name)
+                try:
+                    show_info = await client.show(model_name)
+                except Exception as e:  # noqa: BLE001 - per-model metadata is best-effort
+                    logger.warning(f"Could not read metadata for {model_name}: {e}")
+                    show_info = None
+                if show_info is not None and self._is_decision_only(show_info):
+                    logger.debug(f"Skipping decision-only model {model_name} in chat listing")
+                    continue
+
+                # Detect tool support from the same /api/show metadata
+                supports_tools = (
+                    self._tool_support_from_show(model_name, show_info)
+                    if show_info is not None
+                    else False
+                )
 
                 models.append(ModelInfo(
                     id=model_name,
@@ -939,6 +1031,67 @@ class OllamaAdapter(LLMAdapter):
         except Exception as e:
             logger.error(f"Failed to list Ollama models: {e}", exc_info=True)
             return []
+
+    async def adecide(
+        self,
+        client: Any,
+        model: str,
+        request: ValidatedDecisionRequest,
+        *,
+        timeout: float,
+    ) -> Dict[str, Any]:
+        """Answer a decision request via Ollama's ``/v1/systemone`` (>= 0.35, #3424).
+
+        Posts to the same daemon the route's client targets, with an explicit
+        ``timeout`` (the chat ``AsyncClient`` carries none). A runtime too old
+        to serve the endpoint answers 404, which surfaces as a transport error.
+        """
+        host = self._client_host(client)
+        if not host:
+            raise DecisionTransportError("ollama: route has no daemon host")
+        return await post_systemone(
+            f"{host.rstrip('/')}/v1/systemone",
+            systemone_body(model, request),
+            timeout=timeout,
+            route="ollama",
+        )
+
+    async def list_decision_models(self, client: Any = None) -> List[DecisionModelInfo]:
+        """Installed models whose ``/api/show`` capabilities include ``"decision"``.
+
+        ``context_limit`` is the served ``num_ctx`` parameter; a model without
+        one has an unknown limit and cannot pass the fit check unless pinned
+        with ``decision_context_limit``. Failures propagate so discovery can
+        mark the route stale.
+        """
+        if not OLLAMA_AVAILABLE or client is None:
+            return []
+        response = await client.list()
+        raw_models = getattr(response, "models", None)
+        if raw_models is None and isinstance(response, dict):
+            raw_models = response.get("models", [])
+        results: List[DecisionModelInfo] = []
+        for entry in raw_models or []:
+            name = _show_field(entry, "model") or _show_field(entry, "name")
+            if not name:
+                continue
+            info = await client.show(name)
+            if "decision" not in (_show_field(info, "capabilities") or []):
+                continue
+            modified = _show_field(entry, "modified_at")
+            results.append(DecisionModelInfo(
+                id=str(name),
+                vendor="ollama",
+                route="",
+                context_limit=_num_ctx(_show_field(info, "parameters")),
+                max_questions=OLLAMA_DECISION_MAX_QUESTIONS,
+                max_options=OLLAMA_DECISION_MAX_OPTIONS,
+                max_request_bytes=OLLAMA_DECISION_MAX_REQUEST_BYTES,
+                parallel_questions=False,
+                created_at=str(modified) if modified is not None else None,
+            ))
+        logger.info(f"Ollama: discovered {len(results)} decision models")
+        return results
 
     async def _check_embedding_support(
         self, client: "ollama.AsyncClient", model_name: str

@@ -320,27 +320,39 @@ traffic with `KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE` and
 positive integers. These are independent host budgets: scheduler effect gates
 use the scheduler host's own storage pool, not the agents' advisory pool.
 
-#### SDK 0.37–0.38 release cascade
+#### SDK 0.39 release cascade
 
-Core requires `kestrel-sovereign-sdk[tracing]>=0.37.1,<0.39`; the
-`observability` extra carries the same SDK line with `metrics`. This is a
-runtime contract for durable isolated execution, provider-neutral private
-inference leases (including bounded owner-scoped idle renewal), and private
-host ingress, plus feature-owned operator and context-clause contribution
-contracts. SDK 0.38.1 adds the optional awaited preparation hook that Core
-invokes before synchronously rendering a context-clause batch; Core continues
-to resolve that hook defensively for features built against 0.37.1. It is not
-a preference that a downstream package may relax. The Core-owned
-release-cascade contract is:
+Core requires `kestrel-sovereign-sdk[tracing]>=0.39.0,<0.40`; the
+`observability` extra carries the same SDK line with `metrics`. 0.39.0 adds
+the decisions contract (LLM contract v7, epic #3424) that `LLMService.decide`
+is built on, on top of the runtime contracts of the 0.37–0.38 line: durable
+isolated execution, provider-neutral private inference leases (including
+bounded owner-scoped idle renewal), private host ingress, feature-owned
+operator and context-clause contribution contracts, and the awaited
+context-clause preparation hook. It is not a preference that a downstream
+package may relax. The Core-owned release-cascade contract is:
 
 | Downstream release gate | Required published SDK constraint before Core ships | Core assertion |
 |---|---|---|
-| Frinz | `kestrel-sovereign-sdk>=0.37.1,<0.38` | External prerequisite; Core does not claim Frinz has changed. |
-| Observability fleet | `kestrel-sovereign-sdk>=0.37.1,<0.38` | External prerequisite; Core does not claim observability has changed. |
+| kestrel-feature-talon | `kestrel-sovereign-sdk>=0.37.1,<0.40` | External prerequisite (PyPI release). |
+| kestrel-feature-story-archive | `kestrel-sovereign-sdk>=0.17,<0.40` | External prerequisite (PyPI release). |
+| kestrel-feature-eye | `kestrel-sovereign-sdk>=0.37.1,<0.40` | External prerequisite (editable manifest; lift on `main`). |
+| kestrel-feature-flight | `kestrel-sovereign-sdk>=0.37.1,<0.40` | External prerequisite (editable manifest; lift on `main`). |
+| kestrel-claws | `kestrel-sovereign-sdk>=0.37.1,<0.40` | External prerequisite (editable manifest; lift on `main`). |
+| kestrel-feature-features | `kestrel-sovereign-sdk>=0.36.0,<0.40` | External prerequisite (PyPI release). |
+| kestrel-channel-telegram | `kestrel-sovereign-sdk>=0.36,<0.40` | External prerequisite (PyPI release). |
+| Frinz | `kestrel-sovereign-sdk>=0.39.0,<0.40` | External prerequisite; Core does not claim Frinz has changed. |
+| Observability fleet | `kestrel-sovereign-sdk>=0.39.0,<0.40` | External prerequisite; Core does not claim observability has changed. |
 
-Verify the published Frinz and observability constraints and tests before the
-Core publish. Do not weaken Core's requirement to make an older sibling
-resolver succeed.
+A Core release that raises the SDK floor without these lifts makes
+`kestrel update` refuse every feature whose cap excludes the new line — or
+worse, lets `kestrel feature sync` downgrade the SDK under Core while
+installing a capped package. Survey **every** package in the host feature
+manifest using its *published* metadata (PyPI `requires_dist`, or the
+checkout's `origin/main` for editable entries), not a local checkout's
+`pyproject.toml`, and pull editable checkouts before `kestrel update`. Verify
+the published downstream constraints and tests before the Core publish. Do not
+weaken Core's requirement to make an older sibling resolver succeed.
 
 The Core dependency-contract test verifies the base and observability
 declarations and lockfile resolve the same SDK line. It cannot validate another

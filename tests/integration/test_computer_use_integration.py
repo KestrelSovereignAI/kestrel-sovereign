@@ -161,6 +161,7 @@ def _config_for(workspace: Path, *, backend: str = "local") -> dict:
         "denied_binaries": ["rm", "sudo"],
         "auto_approve_read": True,
         "audit_log_path": str(workspace / "audit.jsonl"),
+        "capture_dir": str(workspace / "captures"),
     }
 
 

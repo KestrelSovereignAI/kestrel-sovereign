@@ -596,7 +596,8 @@
         "kestrel_sovereign/features/scheduler/runner.py",
         "kestrel_sovereign/features/security/approval_queue.py",
         "kestrel_sovereign/heartbeat.py",
-        "kestrel_sovereign/kestrel_agent.py"
+        "kestrel_sovereign/kestrel_agent.py",
+        "kestrel_sovereign/waits/engine.py"
       ],
       "findings": [],
       "missing_code_refs": [],
@@ -1005,6 +1006,20 @@
       "render": "public",
       "status": "current",
       "title": "Panel extraction playbook",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [
+        "kestrel_sovereign/turn_scope.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/llm/DECISIONS.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "draft",
+      "title": "Decisions \u2014 Typed Choice / Score / Noul as an LLM Modality",
       "type": "Architecture Spec"
     },
     {
@@ -1597,8 +1612,12 @@
       "existing_code_refs": [
         "run_tests.py",
         "server.py",
+        "tests/e2e/playwright.config.cjs",
+        "tests/shared/postgres_worker_isolation.py",
         "tests/unit/test_docs_verify.py",
-        "tests/unit/test_packaging_typed_marker.py"
+        "tests/unit/test_embedding_vec_backfill.py",
+        "tests/unit/test_packaging_typed_marker.py",
+        "tests/utils/postgres_schema.py"
       ],
       "findings": [],
       "missing_code_refs": [],

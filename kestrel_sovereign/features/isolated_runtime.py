@@ -6424,16 +6424,27 @@ class IsolatedFeatureTool(AgentTool):
         return str(_meta_get(self._metadata, "name", ""))
 
     @property
-    def schema(self) -> ToolSchema:
+    def input_schema(self) -> Optional[Dict[str, Any]]:
+        """The JSON Schema the service advertised, or ``None`` without one.
+
+        ``schema.parameters`` is derived from its ``properties`` and loses
+        ``additionalProperties`` and ``patternProperties``, so it cannot say
+        which other argument names the service accepts. The direct-tool
+        argument check reads this instead (#3396).
+        """
         input_schema = _meta_get(self._metadata, "input_schema", None)
         if input_schema is None:
             # camelCase spelling tolerated on the wire (see protocol.from_dict)
             input_schema = _meta_get(self._metadata, "inputSchema", None)
+        return input_schema if isinstance(input_schema, dict) else None
+
+    @property
+    def schema(self) -> ToolSchema:
         return ToolSchema(
             name=self.name,
             description=str(_meta_get(self._metadata, "description", "")),
             category=_coerce_category(_meta_get(self._metadata, "category")),
-            parameters=_input_schema_to_parameters(input_schema),
+            parameters=_input_schema_to_parameters(self.input_schema),
             command_prefix=_meta_get(self._metadata, "command_prefix"),
         )
 

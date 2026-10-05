@@ -65,6 +65,7 @@ from kestrel_sovereign.features.restart_coordinator.update_profiles import (
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
+from kestrel_sovereign.storage.session_id_column import is_stampable_session_id
 
 
 # ---------------------------------------------------------------------------
@@ -3232,7 +3233,8 @@ class _RealDispatchAgent(TurnLifecycleMixin, OrchestratorEngineMixin):
         self.background_tasks: list[asyncio.Task] = []
         self.process_input_calls: list[str] = []
         # Session ids the wake turns were dispatched into (#1809) — parallel
-        # to process_input_calls. None = system-initiated (no origin session).
+        # to process_input_calls. A wake with no origin session gets a fresh
+        # one minted by the dispatcher (#3429), never None.
         self.process_input_sessions: list = []
         # When set, process_input raises to model a wake that failed
         # inside the resuming turn (dispatcher records Status.FAILED).
@@ -5035,8 +5037,13 @@ async def test_wake_routes_into_origin_session(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_wake_without_origin_session_is_system_initiated(tmp_path):
-    """A row with no origin session wakes system-initiated (session_id None)."""
+async def test_wake_without_origin_session_runs_in_a_fresh_session(tmp_path):
+    """A row with no origin session wakes into a fresh session of its own.
+
+    #3429: passing ``session_id=None`` left the turn with no session, so the
+    store filed its rows through the time-gap heuristic at write time. The
+    session is now fixed when the turn starts.
+    """
     feat, backend, agent = await _real_dispatch_feature(tmp_path)
     req = await insert_request(
         backend, requested_by_agent="did:test:agent", reason="r",
@@ -5050,24 +5057,19 @@ async def test_wake_without_origin_session_is_system_initiated(tmp_path):
     await agent.drain_background_tasks()
 
     assert agent.process_input_calls
-    assert agent.process_input_sessions == [None]
+    [turn_session] = agent.process_input_sessions
+    assert is_stampable_session_id(turn_session)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("origin_session_id", "expected_turn_session"),
-    [("chat-chain-9", "chat-chain-9"), ("", None)],
-)
-async def test_restart_wake_followup_preserves_explicit_origin_binding(
-    tmp_path, origin_session_id, expected_turn_session,
-):
-    """A wake chain preserves a bound origin and leaves no-origin unbound."""
+async def test_restart_wake_followup_preserves_explicit_origin_binding(tmp_path):
+    """A wake chain resumes its bound origin, and work it files records it."""
     feat, backend, agent = await _real_dispatch_feature(tmp_path)
     req = await insert_request(
         backend,
         requested_by_agent="did:test:agent",
         reason="first restart",
-        origin_session_id=origin_session_id,
+        origin_session_id="chat-chain-9",
     )
     await update_status(
         backend,
@@ -5083,8 +5085,44 @@ async def test_restart_wake_followup_preserves_explicit_origin_binding(
 
     pending = await list_requests(backend, status="pending")
     followup = next(row for row in pending if row.reason == "follow-up restart")
-    assert agent.process_input_sessions == [expected_turn_session]
-    assert followup.origin_session_id == origin_session_id
+    assert agent.process_input_sessions == ["chat-chain-9"]
+    assert followup.origin_session_id == "chat-chain-9"
+
+
+@pytest.mark.asyncio
+async def test_unbound_restart_wake_followup_records_the_turn_session(tmp_path):
+    """#3429: an unbound wake's turn session becomes the chain's origin.
+
+    Before, the wake ran with no session, so a restart it filed captured an
+    empty origin and that restart's own wake was unbound again — the chain
+    fed itself, one time-gap session per hop. The turn now runs in a fresh
+    session and the follow-up records exactly that session, so its wake
+    returns there.
+    """
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    req = await insert_request(
+        backend,
+        requested_by_agent="did:test:agent",
+        reason="first restart",
+        origin_session_id="",
+    )
+    await update_status(
+        backend,
+        req.id,
+        status="executing",
+        expected_current_status="pending",
+    )
+    agent.restart_request_reason = "follow-up restart"
+
+    await feat.initialize()
+    await feat.on_agent_ready()
+    await agent.drain_background_tasks()
+
+    pending = await list_requests(backend, status="pending")
+    followup = next(row for row in pending if row.reason == "follow-up restart")
+    [turn_session] = agent.process_input_sessions
+    assert is_stampable_session_id(turn_session)
+    assert followup.origin_session_id == turn_session
 
 
 @pytest.mark.asyncio

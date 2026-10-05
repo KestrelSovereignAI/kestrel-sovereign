@@ -45,6 +45,14 @@ from tests.utils.aiosqlite_workers import (
 )
 
 
+# How long a test waits for work it set in motion before calling it hung. This
+# bounds a deadlock, not the work: a passing run returns as soon as the awaited
+# event fires. A loaded xdist worker can stretch a 0.5s shutdown past a tight
+# wall-clock bound (#3458), so it must stay generous yet well inside CI's 60s
+# per-test timeout.
+_HANG_GUARD_SECONDS = 30
+
+
 def _no_confirm_evaluate():
     # evaluate_transition mock for non-destructive transitions (never
     # PUBLIC→EPHEMERAL): the agent applies rather than staging pending.
@@ -2815,19 +2823,35 @@ class TestLifecycle:
         an operator's total shutdown budget.  The resolver gives that tail all
         available time, but execution must not recompute the original larger
         value and silently run beyond the outer deadline.
+
+        The bound is read from the timeout the tail hands ``asyncio.wait`` for
+        storage close, not from how long shutdown took: a loaded xdist worker
+        can fire the abandoning timer late, but cannot change the timeout the
+        tail asked for (#3458).
         """
+        budget = 0.50
         agent = KestrelAgent(
             did="did:test:sqlite-requirement-clamp",
             storage_path=str(tmp_path / "agent.db"),
         )
         close_started = asyncio.Event()
+        release_close = asyncio.Event()
+        close_task = None
 
         class OversizedCloseStorage:
-            minimum_close_timeout_s = 1.11
+            # Far past the budget and the hang guard alike: a tail that kept
+            # this requirement instead of the clamp could not return within
+            # the hang guard either.
+            minimum_close_timeout_s = 10.0 * _HANG_GUARD_SECONDS
 
             async def close(self):
+                nonlocal close_task
+                close_task = asyncio.current_task()
                 close_started.set()
-                await asyncio.Event().wait()
+                # Only the test's cleanup releases this, so an unclamped tail
+                # unwinds at once instead of holding close for the whole
+                # requirement.
+                await release_close.wait()
 
         agent.features = {}
         agent.llm_service = None
@@ -2836,24 +2860,49 @@ class TestLifecycle:
         agent._sync_service = None
         agent.storage = OversizedCloseStorage()
 
+        real_wait = asyncio.wait
+        bounded_waits = []
+
+        async def recording_wait(
+            aws, *, timeout=None, return_when=asyncio.ALL_COMPLETED
+        ):
+            aws = set(aws)
+            bounded_waits.append((aws, timeout))
+            return await real_wait(aws, timeout=timeout, return_when=return_when)
+
         with patch(
             "kestrel_sovereign.kestrel_agent.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
-            0.50,
+            budget,
         ), patch(
             "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
             0.02,
         ), patch(
             "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
             0.01,
-        ):
-            started_at = asyncio.get_running_loop().time()
-            await agent.shutdown()
-            elapsed = asyncio.get_running_loop().time() - started_at
+        ), patch.object(asyncio, "wait", recording_wait):
+            shutdown_task = asyncio.create_task(agent.shutdown())
+            try:
+                await asyncio.wait_for(
+                    close_started.wait(), timeout=_HANG_GUARD_SECONDS
+                )
+                close_bounds = [
+                    timeout
+                    for aws, timeout in bounded_waits
+                    if close_task in aws
+                ]
+                # The requirement cannot fit, so the resolver hands the tail
+                # the whole budget and storage close gets what is left of it,
+                # never the requirement it declared.
+                assert close_bounds, "storage close was not run under a bound"
+                assert max(close_bounds) <= budget, close_bounds
 
-        assert close_started.is_set()
-        # A little scheduler tolerance is enough; the old recomputed 1.11s
-        # tail would exceed this substantially.
-        assert elapsed < 0.75
+                await asyncio.wait_for(shutdown_task, timeout=_HANG_GUARD_SECONDS)
+            finally:
+                release_close.set()
+                if not shutdown_task.done():
+                    await asyncio.wait_for(
+                        shutdown_task, timeout=_HANG_GUARD_SECONDS
+                    )
 
     @pytest.mark.asyncio
     async def test_cancellation_during_force_snapshot_completes_it_and_stops(

@@ -9,6 +9,9 @@ The wrapper intercepts all storage operations and:
 2. ISOLATED mode: Redirects to in-memory session storage
 3. ANONYMOUS mode: Applies PII scrubbing before storage
 4. NORMAL/PUBLIC mode: Passes through to underlying storage
+5. DEIDENTIFIED mode: Refuses every generic write; the only durable write is
+   ``store_deidentified_records``, which requires a validated de-identification
+   evidence artifact (see :mod:`kestrel_sovereign.deidentification`)
 
 This is a defense-in-depth measure - even if application code forgets to
 check privacy mode, the storage layer will enforce it.
@@ -33,7 +36,14 @@ from typing import Dict, List, Optional, Any, Sequence, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
 
+from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.turn_scope import turn_scoped
+from kestrel_sovereign.deidentification import (
+    DEIDENTIFICATION_ASSURANCES,
+    DeidentificationResult,
+    EvidenceValidationError,
+)
 from kestrel_sovereign.privacy import (
     PrivacyMode,
     PrivacyConfig,
@@ -604,13 +614,108 @@ def _resolve_transition_lock(holder):
     return None
 
 
+class DurablePersistenceGate:
+    """Shared/exclusive gate between durable signal persistence and a privacy flip (#3316).
+
+    Durable signal persistence computes a privacy projection of the envelope
+    and then awaits its commit. Unguarded, a NORMAL projection can be computed,
+    the mode can change to EPHEMERAL while the commit is blocked, and the stale
+    plaintext projection can commit after the transition. That
+    projection-vs-commit race is the only thing this gate guards:
+
+      * ``SignalDispatcher.dispatch_signal`` holds it SHARED around projection
+        and durable commit, so concurrent dispatches never serialize on each
+        other;
+      * ``privacy_transition()`` holds it EXCLUSIVE, acquired after
+        CONVERSATION and the privacy-transition lock, so a mode change waits
+        for every in-flight persist and no persist can straddle it.
+
+    It is deliberately NOT the privacy-transition lock. Every turn holds that
+    lock for its whole body (#3310), so persisting under it queued every signal
+    — inbound channel/A2A ACK ingress and the scheduler's cron dispatches alike
+    — behind whatever turn was in flight.
+
+    The gate is a leaf: nothing acquires CONVERSATION or the privacy-transition
+    lock while holding it, so the global order stays CONVERSATION -> privacy
+    transition -> persistence gate. Exclusive ownership is task-reentrant, and
+    the owning task's shared acquisitions are admitted without waiting, so a
+    signal dispatched inline by the transition body persists under the mode it
+    is installing instead of waiting on its own task. Writer preference comes
+    from :class:`AsyncReaderWriterLock`: once a transition queues, new persists
+    wait behind it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = AsyncReaderWriterLock()
+        self._owner: Optional["asyncio.Task"] = None
+
+    def locked(self) -> bool:
+        """Whether a persist or a transition currently holds the gate."""
+        return self._lock.locked()
+
+    def _owned_by_current_task(self) -> bool:
+        task = asyncio.current_task()
+        return task is not None and self._owner is task
+
+    @asynccontextmanager
+    async def shared(self):
+        """Hold the gate for one durable projection-and-commit."""
+        if self._owned_by_current_task():
+            yield
+            return
+        async with self._lock.read():
+            yield
+
+    @asynccontextmanager
+    async def exclusive(self):
+        """Hold the gate for one privacy transition.
+
+        A nested acquisition by the owning task holds nothing extra; only the
+        outermost frame releases the gate.
+        """
+        if self._owned_by_current_task():
+            yield
+            return
+        await self._lock.acquire()
+        self._owner = asyncio.current_task()
+        try:
+            yield
+        finally:
+            self._owner = None
+            self._lock.release()
+
+
+@asynccontextmanager
+async def optional_durable_persistence_gate(gate):
+    """Hold ``gate`` shared for the block if provided, else run unguarded.
+
+    ``None`` is the lightweight embedding with no privacy-transition machinery
+    (a host or test shape that exposes no ``_get_durable_persistence_gate``);
+    it has no transition to race, so it persists unguarded as before.
+    """
+    if gate is None:
+        yield
+    else:
+        async with gate.shared():
+            yield
+
+
+def _resolve_durable_persistence_gate(holder) -> Optional[DurablePersistenceGate]:
+    """Return ``holder``'s durable persistence gate, or ``None`` if it has none."""
+    getter = getattr(holder, "_get_durable_persistence_gate", None)
+    if not callable(getter):
+        return None
+    return getter()
+
+
 # ── Privacy-aware graph write policy (#2672) ─────────────────────────────────
 #
 # The knowledge graph is durable storage. In a volatile privacy mode —
 # EPHEMERAL ("leave no trace"), ISOLATED ("session buffer only"), and
-# DEIDENTIFIED (fail-closed until the Safe Harbor pipeline lands): every mode
-# whose policy disallows persistent writes — a durable graph write is a real
-# privacy leak. Facts, todos, decisions, concepts, and consolidated episodes
+# DEIDENTIFIED (raw content never persists; only evidence-backed de-identified
+# records do, through ``store_deidentified_records``): every mode whose policy
+# disallows persistent writes — a durable graph write is a real privacy leak.
+# Facts, todos, decisions, concepts, and consolidated episodes
 # are all derived from user conversation input. The pre-#2672 wrapper waved
 # every graph write through as "structural, not PII", which let those
 # user-derived nodes reach the backend directly, *outside* the #1760
@@ -1307,11 +1412,12 @@ class PrivacyPolicy:
         else:
             raise TypeError(f"Expected PrivacyMode, PrivacyConfig, or str, got {type(mode)}")
         
-        # Build policy from config flags. ``deidentified`` persistence is
-        # fail-closed until the Safe Harbor / Expert Determination evidence
-        # pipeline is in place; it must not silently degrade to full storage.
-        # When that pipeline enables writes, this branch must be replaced with
-        # evidence-backed de-identification rather than plain PII redaction.
+        # Build policy from config flags. ``deidentified`` refuses every
+        # generic write: a conversation turn, file, graph node, or assertion
+        # carries raw content and no evidence artifact, and plain PII redaction
+        # is not de-identification. The one durable write this mode admits is
+        # ``PrivacyEnforcingStorage.store_deidentified_records``, which takes a
+        # pipeline result and validates its evidence before persisting it.
         if config.requires_deidentification():
             return PrivacyPolicy(
                 allow_persistent_write=False,
@@ -1414,6 +1520,35 @@ REQUIRED_TRACE_STORES = frozenset({
     "session_projection",
 })
 
+
+DEIDENTIFICATION_EVIDENCE_KIND = "deidentification_evidence"
+DEIDENTIFIED_RECORDS_KIND = "deidentified_records"
+
+
+class _DeidentifiedCommitProgress:
+    """How far one de-identified save's commit task got.
+
+    ``committing`` resolves once both documents are written, as leaving the
+    transaction issues COMMIT. Before then, cancelling the task rolls the
+    transaction back; from then on a failure or cancellation leaves the
+    commit's outcome unknown to the wrapper.
+    """
+
+    __slots__ = ("committing",)
+
+    def __init__(self) -> None:
+        self.committing: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+
+@dataclass(frozen=True)
+class DeidentifiedSaveReceipt:
+    """Where an evidence-gated de-identified save put its two documents."""
+
+    evidence_id: str
+    assurance: str
+    evidence_file_hash: str
+    records_file_hash: str
+    record_count: int
 
 
 class EphemeralPurgeReport(dict):
@@ -1627,6 +1762,10 @@ class PrivacyEnforcingStorage:
         # a transition landing between the binding and a commit would classify a
         # write under a policy that is no longer in force.
         self._active_ledger_assertion_leases = 0
+        # An evidence-gated de-identified save checks the privacy config and
+        # then awaits two durable writes; a transition must not land between
+        # the check and the commit.
+        self._active_deidentified_save_leases = 0
         # One projection lock per canonical ledger file, so overlapping passes
         # over the same ledger serialize while unrelated ledgers do not queue
         # behind one another.  Declared here rather than minted on first use:
@@ -2359,14 +2498,16 @@ class PrivacyEnforcingStorage:
                     or self._active_semantic_artifact_producer_leases > 0
                     or self._active_session_projection_leases > 0
                     or self._active_ledger_assertion_leases > 0
+                    or self._active_deidentified_save_leases > 0
                 )
             ):
                 raise PrivacyViolationError(
                     "privacy configuration transition refused while an "
                     "explicit semantic fact, vector operation, governed artifact "
-                    "producer, strategy-ledger assertion projection, or "
-                    "session-projection read is in flight; retry the transition "
-                    "after that operation completes"
+                    "producer, strategy-ledger assertion projection, "
+                    "de-identified record save, or session-projection read is "
+                    "in flight; retry the transition after that operation "
+                    "completes"
                 )
             was_ephemeral = old_config.is_ephemeral()
             is_ephemeral = new_config.is_ephemeral()
@@ -2794,6 +2935,225 @@ class PrivacyEnforcingStorage:
         if self._policy.use_session_storage and content_hash in self._session_files:
             return self._session_files[content_hash]
         return await self._storage.retrieve_file(content_hash)
+
+    # === De-identified records (evidence-gated) ===
+    #
+    # DEIDENTIFIED refuses every generic write above. This is the one durable
+    # write it admits, and it admits nothing without a de-identification
+    # evidence artifact: the records and their artifact are persisted together
+    # in one transaction, the artifact first, so no de-identified record can
+    # exist in storage without the audit record that authorized it. The records
+    # document is itself the export bundle, which embeds the artifact, so every
+    # path that serves it by content hash (``GET /api/files/{hash}``) serves
+    # the evidence with the records.
+
+    def _assert_deidentified_save_allowed(self, assurance: str) -> None:
+        config = self._privacy_config
+        if config.assurance in DEIDENTIFICATION_ASSURANCES and assurance != config.assurance:
+            raise PrivacyViolationError(
+                "De-identified save blocked: the current privacy config "
+                f"requires {config.assurance!r} evidence, the artifact backs "
+                f"{assurance!r}."
+            )
+        if config.requires_deidentification():
+            return
+        if self._policy.use_session_storage or not self._policy.allow_persistent_write:
+            raise PrivacyViolationError(
+                "De-identified save blocked: persistent writes are disabled in "
+                f"the current privacy config (storage={config.storage})."
+            )
+
+    def _acquire_deidentified_save_lease(self, assurance: str) -> None:
+        with self._explicit_fact_lease_lock:
+            self._assert_deidentified_save_allowed(assurance)
+            self._active_deidentified_save_leases += 1
+
+    def _release_deidentified_save_lease(self) -> None:
+        with self._explicit_fact_lease_lock:
+            if self._active_deidentified_save_leases <= 0:
+                raise RuntimeError("de-identified save privacy lease underflow")
+            self._active_deidentified_save_leases -= 1
+
+    async def _commit_deidentified_documents(
+        self,
+        progress: _DeidentifiedCommitProgress,
+        evidence_id: str,
+        evidence_bytes: bytes,
+        records_bytes: bytes,
+        base_metadata: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """Write the evidence, then the records, in one transaction.
+
+        Returns (evidence file hash, records file hash).
+        """
+        async with self._storage.transaction():
+            evidence_hash = await self._storage.store_file(
+                evidence_bytes,
+                f"deidentification-evidence-{evidence_id}.json",
+                {"kind": DEIDENTIFICATION_EVIDENCE_KIND, **base_metadata},
+            )
+            records_hash = await self._storage.store_file(
+                records_bytes,
+                f"deidentified-records-{evidence_id}.json",
+                {
+                    "kind": DEIDENTIFIED_RECORDS_KIND,
+                    "evidence_file_hash": evidence_hash,
+                    **base_metadata,
+                },
+            )
+            progress.committing.set_result(None)
+        return evidence_hash, records_hash
+
+    async def store_deidentified_records(
+        self, result: DeidentificationResult
+    ) -> "DeidentifiedSaveReceipt":
+        """Persist de-identified records together with their evidence artifact.
+
+        ``result`` must come from
+        :class:`~kestrel_sovereign.deidentification.DeidentificationPipeline`.
+        Its artifact is re-validated against the records (completeness, the
+        output digests, its own digest, residual identifier patterns) before
+        anything is written, and the records serialized are exactly the ones
+        validated: the records document is ``result.export_bundle()``, which
+        embeds the artifact and is read back with
+        ``DeidentificationResult.from_export_bundle``. A download of the
+        records therefore always carries a verifiable artifact. Whenever the
+        config names a de-identification assurance
+        (``safe_harbor`` for the DEIDENTIFIED preset) the artifact must back
+        it; other persistent modes accept any valid artifact; EPHEMERAL and
+        ISOLATED refuse.
+
+        This binds content, not provenance: same-process code that assembles a
+        self-consistent artifact for records it chose cannot be told apart from
+        the pipeline, exactly as the graph boundary above states for its own
+        capability. What it cannot do is save records its artifact does not
+        describe, or records still carrying a detectable identifier pattern.
+
+        Both documents are stored as content-addressed JSON files (encrypted at
+        rest when a data key is configured). Their metadata is content-free:
+        the evidence id, assurance, and digests.
+
+        The save holds the privacy lease that blocks a transition to a
+        volatile mode until its commit has resolved. The commit runs in a task
+        of the save's own. Until that task issues COMMIT, the caller's
+        cancellation withdraws the save and its transaction rolls back; once
+        COMMIT is issued, the caller's cancellation is delivered only after
+        the documents have committed or rolled back. If COMMIT was issued and
+        then failed or was interrupted, whether the documents committed is
+        unknown here, so the lease is kept and transitions stay refused until
+        restart. A save is refused inside a transaction the calling task
+        already has open, which that task would hold until after the save
+        returns.
+        """
+        # Exact type: a subclass could override verify() or records_as_dicts().
+        if type(result) is not DeidentificationResult:
+            raise PrivacyViolationError(
+                "De-identified save blocked: a DeidentificationResult produced "
+                "by the de-identification pipeline is required."
+            )
+        try:
+            # Verifies the artifact against the records, then serializes them.
+            records_bytes = result.export_bundle()
+            # Everything persisted below is taken from those verified bytes,
+            # parsed into plain types, never from objects a caller could
+            # subclass to report one assurance and serialize another.
+            persisted = DeidentificationResult.from_export_bundle(records_bytes)
+        except EvidenceValidationError as exc:
+            raise PrivacyViolationError(
+                f"De-identified save blocked: invalid evidence artifact ({exc})."
+            ) from exc
+        evidence = persisted.evidence
+        record_count = len(persisted.records)
+        evidence_bytes = evidence.to_json_bytes()
+        base_metadata = {
+            "evidence_id": evidence.evidence_id,
+            "assurance": evidence.assurance,
+            "artifact_digest": evidence.artifact_digest,
+            "record_count": record_count,
+            "mime_type": "application/json",
+        }
+        # The lease must outlive the commit. Inside a transaction this task
+        # already holds, the documents could commit only with the caller's,
+        # after the lease is released, so a transition to a volatile mode
+        # could land first; and the commit task below, being another task,
+        # would wait on the caller's open transaction while the caller waits
+        # on it. Only this task can open a transaction this task holds, so the
+        # answer stands until the commit task starts.
+        if getattr(self._storage, "owns_open_transaction", None) is not False:
+            raise PrivacyViolationError(
+                "De-identified save blocked: the save must commit in its own "
+                "transaction, but this task already has one open (or the "
+                "storage cannot report whether it has)."
+            )
+        self._acquire_deidentified_save_lease(evidence.assurance)
+        # A backend cancelled while awaiting COMMIT returns at once and
+        # finishes the commit afterwards: SQLite hands it to a background
+        # drain queued behind the worker's COMMIT, and a COMMIT already sent to
+        # PostgreSQL may still complete on the server. A lease released on the
+        # caller's cancellation would therefore let a transition to a volatile
+        # mode land before the documents commit. The commit runs in a task of
+        # its own, and the lease is released only once that task has ended
+        # with a known outcome.
+        progress = _DeidentifiedCommitProgress()
+        commit = asyncio.create_task(
+            self._commit_deidentified_documents(
+                progress, evidence.evidence_id, evidence_bytes, records_bytes, base_metadata
+            ),
+            name=f"deidentified-save:{evidence.evidence_id}",
+        )
+        withdrawn = False
+        try:
+            # Until COMMIT is issued, cancelling the commit task rolls its
+            # transaction back, so the caller's cancellation still withdraws
+            # the save with a known outcome. Waits for a writer slot, a pool
+            # connection, or a row lock stay cancellable: a timeout can still
+            # break a wait on a transaction the caller's own parent holds.
+            await asyncio.wait(
+                {commit, progress.committing}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError as cancelled:
+            withdrawn = not progress.committing.done()
+            if withdrawn:
+                commit.cancel()
+            outcome = await await_owned_task(commit, cancelled)
+        else:
+            outcome = await await_owned_task(commit)
+        if outcome.error is not None and progress.committing.done():
+            # COMMIT was issued and then failed or was interrupted (once it
+            # is issued, only event-loop teardown cancels the commit task). Whether the documents committed is unknown here, so
+            # the lease is kept: no transition may follow a commit that can
+            # still land.
+            logger.error(
+                "De-identified save %s failed while committing; privacy "
+                "transitions stay refused until restart",
+                evidence.evidence_id,
+            )
+            if outcome.cancellation is not None:
+                raise outcome.cancellation from outcome.error
+            raise PrivacyViolationError(
+                "De-identified save failed while committing, so its commit "
+                "outcome is unknown; privacy transitions stay refused until "
+                "restart."
+            ) from outcome.error
+        self._release_deidentified_save_lease()
+        if withdrawn and isinstance(outcome.error, asyncio.CancelledError):
+            # That error is the cancellation that withdrew the save, not a
+            # failure of its own.
+            raise outcome.cancellation
+        evidence_hash, records_hash = raise_owned_outcome(
+            outcome, operation="de-identified save"
+        )
+        logger.info(
+            "Stored %d de-identified record(s) under evidence %s (assurance=%s)",
+            record_count, evidence.evidence_id, evidence.assurance,
+        )
+        return DeidentifiedSaveReceipt(
+            evidence_id=evidence.evidence_id,
+            assurance=evidence.assurance,
+            evidence_file_hash=evidence_hash,
+            records_file_hash=records_hash,
+            record_count=record_count,
+        )
     
     # === Graph Storage (privacy-governed durable writes — #2672) ===
     #
@@ -5021,7 +5381,7 @@ class PrivacyEnforcingStorage:
     async def query_session_rows(
         self, session_id: str, limit: int = 100
     ) -> List[Tuple]:
-        """Resolve every message belonging to ``session_id``, respecting privacy.
+        """Resolve ``session_id``'s most recent ``limit`` messages, respecting privacy.
 
         Unlike :meth:`query_conversation_messages` (which only time-gap walks
         forward from a row-id anchor), this delegates to the store's canonical
@@ -5058,7 +5418,9 @@ class PrivacyEnforcingStorage:
                     conv.get("model"),
                     conv.get("provider"),
                 ))
-            return rows[:limit]
+            # The session's most recent ``limit``, as the persistent resolver
+            # answers (#3431).
+            return rows[-limit:] if limit > 0 else []
 
         # Preserve the live-anchor guard the previous detail-read path had
         # (via query_conversation_start's `deleted_at IS NULL` filter): for a
@@ -5959,7 +6321,7 @@ class _PrivacyGoverningGraphStore:
     ``compare_and_swap_node`` methods — closing the bypass where ``.graph``
     returned the raw store.
 
-    The four write entry points are governed methods ON this proxy. Everything
+    The five write entry points are governed methods ON this proxy. Everything
     else is handled by :meth:`__getattr__`, which forwards ONLY a fixed allowlist
     of non-write surfaces (reads, deletes, ``bind_agent``, read-only metadata) and
     FAILS CLOSED on anything else. In particular it refuses the raw ``db`` handle
@@ -5974,7 +6336,7 @@ class _PrivacyGoverningGraphStore:
     #: Non-write attributes safe to forward to the wrapped ``AsyncGraphStore``.
     #: Reads, removals (a delete is not a durable user-content WRITE — it takes
     #: content away, which volatile modes never forbid), agent-scope binding, and
-    #: read-only metadata. The four durable WRITE entry points are governed
+    #: read-only metadata. The five durable WRITE entry points are governed
     #: methods on this proxy and never reach ``__getattr__``. Any name NOT here —
     #: notably the raw ``db`` handle and any newly-added write method — fails
     #: closed (#2672 review P1). Extending this set REQUIRES confirming the target
@@ -6047,9 +6409,21 @@ class _PrivacyGoverningGraphStore:
             source_id, target_id, label, properties
         )
 
+    async def add_external_reference_edge(
+        self, source_id, target_id, label, properties=None,
+        *, capability: Any = None,
+    ):
+        self._wrapper._assert_graph_edge_write_allowed(
+            label, "graph.add_external_reference_edge", properties,
+            capability=capability,
+        )
+        return await self._store.add_external_reference_edge(
+            source_id, target_id, label, properties
+        )
+
     def __getattr__(self, name):
         # Reached for any attribute not defined on this proxy (i.e. anything but
-        # the four governed writers). Forward ONLY the allowlisted non-write
+        # the five governed writers). Forward ONLY the allowlisted non-write
         # surface; fail closed on everything else so a caller cannot reach the raw
         # ``db`` handle — or any un-vetted / future write method — and bypass the
         # volatile-mode graph-write policy through the ``.graph`` surface
@@ -6063,8 +6437,9 @@ class _PrivacyGoverningGraphStore:
             raise AttributeError(name)
         raise PrivacyViolationError(
             f"Graph proxy refuses to forward {name!r}: the privacy-governing "
-            f"graph view exposes only its four governed writers (add_node / "
-            f"add_edge / compare_and_swap_node / add_trusted_cross_agent_edge) "
+            f"graph view exposes only its five governed writers (add_node / "
+            f"add_edge / compare_and_swap_node / add_trusted_cross_agent_edge / "
+            f"add_external_reference_edge) "
             f"plus a fixed allowlist of reads/deletes/bind_agent. Raw handles "
             f"such as 'db' and any other attribute are refused so a caller cannot "
             f"bypass the volatile-mode graph-write policy through the '.graph' "

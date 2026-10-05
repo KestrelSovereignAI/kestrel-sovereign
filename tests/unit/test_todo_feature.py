@@ -6,7 +6,10 @@ import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.todo.feature import TODO_NODE_TYPE, TodoFeature
-from kestrel_sovereign.storage.async_graph_store import GraphNode
+from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.storage import AsyncStorage
+from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
+from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 
 
 def _make_agent():
@@ -19,6 +22,7 @@ def _make_agent():
     agent.storage.graph = MagicMock()
     agent.storage.graph.add_node = AsyncMock()
     agent.storage.graph.add_edge = AsyncMock()
+    agent.storage.graph.add_external_reference_edge = AsyncMock()
     agent.storage.graph.get_node = AsyncMock(return_value=None)
     agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[])
     return agent
@@ -225,14 +229,196 @@ async def test_todo_link_task_adds_link_and_edge():
     )
 
     assert result.status is ToolResultStatus.OK
+    assert result.data["warnings"] == []
     persisted = agent.storage.graph.add_node.await_args[0][0]
     assert persisted.properties["links"][0]["type"] == "github_issue"
-    agent.storage.graph.add_edge.assert_awaited()
-    assert agent.storage.graph.add_edge.await_args[0][:3] == (
+    agent.storage.graph.add_edge.assert_not_awaited()
+    agent.storage.graph.add_external_reference_edge.assert_awaited_once()
+    assert agent.storage.graph.add_external_reference_edge.await_args[0][:3] == (
         "todo:1",
         "github_issue:KestrelSovereignAI/kestrel-sovereign#1832",
         "linked_to",
     )
+
+
+class TestTodoLinksOnARealGraph:
+    """#3091: what a todo call reports matches what it wrote.
+
+    The mocked tests above cannot see this bug. It lived in the store: the
+    ``linked_to`` edge to a GitHub issue failed the "both endpoints owned"
+    check after the link was already persisted on the todo, and the call
+    reported the committed write as ``Transaction failed``. These run the
+    feature against a real bound graph behind the privacy wrapper, as an
+    agent does.
+    """
+
+    AGENT = "did:test:todo-agent"
+    ISSUE = "KestrelSovereignAI/kestrel-sovereign#3087"
+
+    @pytest.fixture
+    async def raw(self, tmp_path):
+        async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=self.AGENT) as raw:
+            yield raw
+
+    async def _feature(self, raw):
+        agent = _make_agent()
+        agent.storage = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        return await _make_feature(agent)
+
+    async def _add_todo(self, feature, **kwargs):
+        result = await feature.todo_add(title="Fix the host DB leak", **kwargs)
+        assert result.status is ToolResultStatus.OK, result
+        return result.data["todo"]["id"]
+
+    def _link_issue(self, feature, todo_id, **overrides):
+        kwargs = {
+            "todo_id": todo_id,
+            "link_type": "github_issue",
+            "target": self.ISSUE,
+            "title": "The unit suite opens and writes the operator's real host DB",
+            "url": "https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3087",
+        }
+        kwargs.update(overrides)
+        return feature.todo_link_task(**kwargs)
+
+    async def _stored(self, raw, todo_id):
+        return (await raw.graph.get_node(todo_id)).properties
+
+    async def _edge_targets(self, raw, todo_id, label="linked_to"):
+        edges = await raw.graph.get_edges(todo_id, direction="out")
+        return [edge.target_id for edge in edges if edge.label == label]
+
+    async def test_linking_a_github_issue_succeeds_with_one_link_and_its_edge(self, raw):
+        feature = await self._feature(raw)
+        todo_id = await self._add_todo(feature)
+
+        result = await self._link_issue(feature, todo_id)
+
+        assert result.status is ToolResultStatus.OK, result
+        assert result.data["warnings"] == []
+        assert result.data["already_linked"] is False
+        links = (await self._stored(raw, todo_id))["links"]
+        assert [(link["type"], link["target"]) for link in links] == [
+            ("github_issue", self.ISSUE)
+        ]
+        assert await self._edge_targets(raw, todo_id) == [f"github_issue:{self.ISSUE}"]
+
+    async def test_repeating_the_link_returns_the_existing_one(self, raw):
+        feature = await self._feature(raw)
+        todo_id = await self._add_todo(feature)
+        first = await self._link_issue(feature, todo_id)
+        stored_after_first = await self._stored(raw, todo_id)
+
+        second = await self._link_issue(feature, todo_id, title="A different title")
+
+        assert second.status is ToolResultStatus.OK, second
+        assert second.data["already_linked"] is True
+        assert second.data["link"] == first.data["link"]
+        stored = await self._stored(raw, todo_id)
+        assert len(stored["links"]) == 1
+        assert stored["links"][0]["title"] == first.data["link"]["title"]
+        assert stored["updated_at"] == stored_after_first["updated_at"]
+        assert await self._edge_targets(raw, todo_id) == [f"github_issue:{self.ISSUE}"]
+
+    async def test_retry_writes_the_edge_a_failed_call_left_out(self, raw):
+        """Links written while the bug was live have no edge; a retry adds it
+        without adding a second link."""
+        feature = await self._feature(raw)
+        todo_id = await self._add_todo(
+            feature, links=[{"type": "github_issue", "target": self.ISSUE}]
+        )
+        assert await self._edge_targets(raw, todo_id) == []
+
+        result = await self._link_issue(feature, todo_id)
+
+        assert result.status is ToolResultStatus.OK, result
+        assert result.data["already_linked"] is True
+        assert len((await self._stored(raw, todo_id))["links"]) == 1
+        assert await self._edge_targets(raw, todo_id) == [f"github_issue:{self.ISSUE}"]
+
+    async def test_edge_failure_is_a_warning_on_a_successful_link(self, raw, monkeypatch):
+        feature = await self._feature(raw)
+        todo_id = await self._add_todo(feature)
+
+        async def projection_fails(self, *args, **kwargs):
+            raise RuntimeError("graph edge store unavailable")
+
+        monkeypatch.setattr(
+            AsyncGraphStore, "add_external_reference_edge", projection_fails
+        )
+
+        result = await self._link_issue(feature, todo_id)
+
+        assert result.status is ToolResultStatus.OK, result
+        assert result.error is None
+        [warning] = result.data["warnings"]
+        assert "linked_to graph edge was not" in warning
+        assert "graph edge store unavailable" in warning
+        assert "graph edge store unavailable" in result.confirmation
+        links = (await self._stored(raw, todo_id))["links"]
+        assert [link["target"] for link in links] == [self.ISSUE]
+        assert await self._edge_targets(raw, todo_id) == []
+
+    async def test_link_into_another_agents_node_is_still_refused(self, raw):
+        """The relaxed rule covers references outside the graph only: an
+        edge from this agent's todo to another agent's node is refused, so
+        the link reports a warning and no edge is written."""
+        foreign = AsyncGraphStore(raw.graph.db, agent_id="did:test:other-agent")
+        await foreign.add_node(
+            GraphNode(
+                node_id="todo:theirs",
+                node_type=TODO_NODE_TYPE,
+                label="Theirs",
+                properties={"agent_id": "did:test:other-agent"},
+            )
+        )
+        feature = await self._feature(raw)
+        todo_id = await self._add_todo(feature)
+        graph = feature.agent.storage.graph
+
+        for write in (graph.add_edge, graph.add_external_reference_edge):
+            with pytest.raises(Exception, match="not both owned by the bound agent"):
+                await write(todo_id, "todo:theirs", "linked_to")
+
+        result = await feature.todo_link_task(
+            todo_id=todo_id, link_type="todo", target="theirs"
+        )
+
+        assert result.status is ToolResultStatus.OK, result
+        [warning] = result.data["warnings"]
+        assert "not both owned by the bound agent" in warning
+        assert len((await self._stored(raw, todo_id))["links"]) == 1
+        assert await self._edge_targets(raw, todo_id) == []
+        assert await raw.graph.db.fetchone(
+            "SELECT 1 FROM graph_edges WHERE source_id = ? AND target_id = ?",
+            (todo_id, "todo:theirs"),
+        ) is None
+
+    async def test_supersedes_edge_failure_is_a_warning_on_a_completed_todo(self, raw):
+        feature = await self._feature(raw)
+        todo_id = await self._add_todo(feature)
+
+        result = await feature.todo_complete(
+            todo_id=todo_id, outcome="superseded", superseded_by="todo:missing"
+        )
+
+        assert result.status is ToolResultStatus.OK, result
+        [warning] = result.data["warnings"]
+        assert "supersedes graph edge was not" in warning
+        stored = await self._stored(raw, todo_id)
+        assert stored["status"] == "cancelled"
+        assert stored["superseded_by"] == "todo:missing"
+
+    async def test_supersedes_edge_between_own_todos_is_written(self, raw):
+        feature = await self._feature(raw)
+        old_id = await self._add_todo(feature)
+        new_id = await self._add_todo(feature)
+
+        result = await feature.todo_update(todo_id=old_id, superseded_by=new_id)
+
+        assert result.status is ToolResultStatus.OK, result
+        assert result.data["warnings"] == []
+        assert await self._edge_targets(raw, new_id, "supersedes") == [old_id]
 
 
 @pytest.mark.asyncio

@@ -38,7 +38,8 @@ from kestrel_sovereign.signals.sources.wait import (
     build_wait_complete_registration,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
-from kestrel_sovereign.waits.engine import WaitRegistry
+from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
+from kestrel_sovereign.waits.engine import TERMINAL_EVENT_KEY, WaitRegistry
 from kestrel_sovereign.waits.reconciler import (
     DurableResumeUnsupportedError,
     WaitReconciler,
@@ -55,13 +56,13 @@ class _Agent:
 
     def __init__(self):
         self.tasks: list[asyncio.Task] = []
-        self._privacy_transition_lock = asyncio.Lock()
+        self._durable_persistence_gate = DurablePersistenceGate()
 
     async def process_input(self, prompt: str, **kwargs):
         return "wake turn ran"
 
-    def _get_privacy_transition_lock(self):
-        return self._privacy_transition_lock
+    def _get_durable_persistence_gate(self):
+        return self._durable_persistence_gate
 
     def _track_background_task(self, coro, *, name: str):
         task = asyncio.create_task(coro, name=name)
@@ -686,3 +687,51 @@ async def test_expired_first_lease_is_visibly_released_without_a_claim(rig):
     assert delivery.status == RETRY
     assert delivery.lease_owner is None
     assert delivery.last_error == EXPIRED_INITIAL_HANDOFF_ERROR
+
+
+class _RerunProvider:
+    """A poll-only Waitable that names its terminal events, like ``ci``."""
+
+    kind = "rerun"
+
+    def __init__(self):
+        self.outcome = Outcome.PENDING
+        self.event = ""
+
+    async def poll(self, handle):
+        data = {TERMINAL_EVENT_KEY: self.event} if self.event else {}
+        return WaitStatus(self.outcome, f"{handle} is {self.outcome.value}", data=data)
+
+
+@pytest.mark.asyncio
+async def test_re_registering_resumes_on_the_next_distinct_event(rig):
+    """#3399: registering again after the handle's wake was delivered re-arms
+    the watch behind the consumer. A stale read of the delivered event does
+    not resume it; the re-run's own terminal event does."""
+    rerun = _RerunProvider()
+    rig.agent.wait_registry.register(rerun)
+    consumer = "workflows:wait:run-11"
+    rerun.outcome, rerun.event = Outcome.FAILED, "attempt-1"
+    await register_wait_resume_consumer(rig.agent, "rerun:pr-1", consumer_id=consumer)
+    await rig.tick()
+    first = await _claim(rig.dispatcher, consumer)
+    assert first is not None
+    assert await rig.dispatcher.ack_durable_delivery(
+        consumer_id=consumer,
+        delivery_id=first.delivery_id,
+        lease_token=first.lease_token,
+    )
+
+    result = await register_wait_resume_consumer(
+        rig.agent, "rerun:pr-1", consumer_id=consumer
+    )
+    assert result.already_terminal is not None, "the stale read is reported"
+    await rig.tick()
+    assert await _claim(rig.dispatcher, consumer) is None
+
+    rerun.outcome, rerun.event = Outcome.FAILED, "attempt-2"
+    await rig.tick()
+
+    second = await _claim(rig.dispatcher, consumer)
+    assert second is not None
+    assert second.event.payload[TERMINAL_EVENT_KEY] == "attempt-2"

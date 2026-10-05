@@ -17,6 +17,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+from kestrel_sovereign.logging_config import content_log_summary
 from kestrel_sovereign.security.input_guardrails import wrap_user_input
 
 from .system_prompt_assembler import (
@@ -379,7 +380,12 @@ class ContextBuilder:
         Returns:
             Formatted context string with relevant documents
         """
-        logger.info(f"Retrieving context for query: '{query}'")
+        # The query is the turn's user message, which the store encrypts; the
+        # host log is plaintext, so it gets non-content facts only (#3318).
+        logger.info(
+            "Retrieving context for query: %s session=%s",
+            content_log_summary(query), session_id,
+        )
 
         # 1. Search document chunks (RAG). Forward ``min_score`` only
         # when the caller set it so the storage layer's existing

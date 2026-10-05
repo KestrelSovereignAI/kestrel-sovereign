@@ -1,7 +1,8 @@
 """Verify/backfill of ``embedding_vec`` from the legacy ``embedding`` column (#3402).
 
-The SQLite cases run everywhere. The PostgreSQL case runs when
-``TEST_POSTGRES_URL`` is set, which the CI unit tier provides.
+The SQLite cases run everywhere. The PostgreSQL cases run when
+``TEST_POSTGRES_URL`` is set, which the CI unit tier provides, each in a schema
+of its own so the table-wide backfill sees only the rows it inserted (#3404).
 
 A freshly booted database has already lost the legacy column (#3411), so the
 fixtures restore it and the rows stand in for data an older release wrote.
@@ -9,9 +10,11 @@ fixtures restore it and the rows stand in for data an older release wrote.
 
 from __future__ import annotations
 
+import json
 import os
 import struct
-from uuid import uuid4
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 import pytest
 from kestrel_sdk.storage.database.interface import TransactionError
@@ -29,6 +32,7 @@ from kestrel_sovereign.storage.embedding_vec_backfill import (
 )
 from tests.utils.legacy_embedding_column import restore_legacy_embedding_column
 from tests.utils.postgres_schema import (
+    disposable_postgres_schema,
     pgvector_schema,
     quoted_search_path,
     with_search_path,
@@ -414,111 +418,158 @@ def test_pgvector_text_repacks_to_the_stored_float32():
 
 
 async def _run_no_schema_ddl(db):
-    """Schema initializer for a connection opened after the core schema boot."""
+    """Schema initializer for a connection that must not boot its schema."""
 
 
-@pytest.fixture
-async def postgres_db():
+@dataclass(frozen=True)
+class _PostgresSchema:
+    """A booted core schema a case owns, and the URL that selects it."""
+
+    db: AsyncDatabase
+    url: str
+    vector_schema: str
+
+
+@asynccontextmanager
+async def _own_postgres_schema(url):
+    """Boot the core schema into a fresh schema on *url*'s database.
+
+    The backfill walks the whole ``document_chunks`` table, so a case run in
+    *url*'s own schema rewrites rows it never inserted whenever
+    ``TEST_POSTGRES_URL`` names a reused or shared database (#3404). Booting
+    *url* would too: the startup sequence backfills legacy rows (#3414). So
+    *url* is opened without DDL, only to create the schema, which is dropped
+    on exit.
+
+    The boot's path names only the new schema, so no unqualified name in it
+    can reach another schema's table. The connection handed out also names
+    pgvector's schema, which can be any schema on the database, for the
+    helper's ``::vector`` cast (#3401).
+    """
+    admin = await AsyncDatabase.postgres(url, schema_initializer=_run_no_schema_ddl)
+    try:
+        vector_schema = await pgvector_schema(admin)
+        async with disposable_postgres_schema(admin, "embedding_vec_backfill") as schema:
+            boot = await AsyncDatabase.postgres(with_search_path(url, schema))
+            await boot.close()
+            schema_url = with_search_path(url, quoted_search_path(schema, vector_schema))
+            db = await AsyncDatabase.postgres(
+                schema_url, schema_initializer=_run_no_schema_ddl
+            )
+            try:
+                # The boot retires the legacy column once no row needs it (#3411).
+                await restore_legacy_embedding_column(db, "document_chunks")
+                yield _PostgresSchema(db, schema_url, vector_schema)
+            finally:
+                await db.close()
+    finally:
+        await admin.close()
+
+
+# Parametrized with "postgres" so the #3381 guard fails these cases, rather
+# than letting them skip, in a job that provides PostgreSQL.
+@pytest.fixture(params=["postgres"])
+def postgres_url(request):
     url = os.environ.get("TEST_POSTGRES_URL")
     if not url:
         pytest.skip("TEST_POSTGRES_URL is not set")
-    # Boot the core schema on the worker's own search_path, then reconnect
-    # with pgvector's schema named after it. An xdist worker's path names only
-    # its own schema, and the extension lives wherever it was first
-    # installed, so neither this test's ``vector(4)`` DDL nor the helper's
-    # ``::vector`` cast would otherwise resolve the type (#3401).
-    boot = await AsyncDatabase.postgres(url)
-    try:
-        vector_schema = await pgvector_schema(boot)
-        (schemas,) = await boot.fetchone("SELECT current_schemas(false)", ())
-    finally:
-        await boot.close()
-    db = await AsyncDatabase.postgres(
-        with_search_path(url, quoted_search_path(*schemas, vector_schema)),
-        schema_initializer=_run_no_schema_ddl,
+    return url
+
+
+def _report_counts(report):
+    return (
+        report.total_rows,
+        report.rows_with_both,
+        report.rows_missing_embedding_vec,
+        report.rows_embedding_vec_only,
+        report.rows_without_any_embedding,
+        report.rows_disagreeing,
+        report.rows_backfilled,
+        report.rows_unbackfillable,
     )
-    file_hash = f"embedding-vec-backfill-{uuid4()}"
-    try:
-        # The boot retires the legacy column once no row needs it (#3411).
-        await restore_legacy_embedding_column(db, "document_chunks")
-        yield db, file_hash
-    finally:
-        try:
-            await db.execute(
-                "DELETE FROM document_chunks WHERE file_hash = ?", (file_hash,)
-            )
-        finally:
-            await db.close()
 
 
-async def test_postgres_backfill_is_idempotent(postgres_db):
-    db, file_hash = postgres_db
-    column = await db.fetchone(
-        "SELECT a.atttypmod FROM pg_attribute a "
-        "WHERE a.attrelid = to_regclass('document_chunks') "
-        "AND a.attname = 'embedding_vec' AND NOT a.attisdropped",
+async def _backfill_case(case: _PostgresSchema) -> None:
+    db = case.db
+    legacy = [_pack([float(i + 1)] * 4) for i in range(3)]
+    for index, blob in enumerate(legacy):
+        await db.execute(
+            "INSERT INTO document_chunks (file_hash, content, embedding) "
+            "VALUES (?, ?, ?)",
+            ("doc", f"chunk {index}", blob),
+        )
+    # A chunk never embedded: no vector in either column (#3415).
+    await db.execute(
+        "INSERT INTO document_chunks (file_hash, content) VALUES (?, ?)",
+        ("doc", "never embedded"),
+    )
+
+    # The startup migration defers the column until a legacy row exists, so
+    # the fresh schema has none. Report that state, then create the column.
+    absent = await verify_embedding_vec(db, "document_chunks")
+    assert absent.embedding_vec_present is False
+    assert _report_counts(absent) == (4, 0, 3, 0, 1, 0, 0, 3)
+    await db.execute(
+        "ALTER TABLE document_chunks "
+        f'ADD COLUMN embedding_vec "{case.vector_schema}".vector(4)',
         (),
     )
-    created_column = column is None
-    if created_column:
-        # The startup migration defers the column until a legacy row exists.
-        # Report that state, then create the column for the rest of the case.
-        absent = await verify_embedding_vec(db, "document_chunks")
-        assert absent.embedding_vec_present is False
-        assert absent.rows_backfilled == 0
-        await db.execute(
-            "ALTER TABLE document_chunks ADD COLUMN embedding_vec vector(4)", ()
+
+    first = await backfill_embedding_vec(db, "document_chunks", batch_size=2)
+
+    assert first.embedding_vec_present is True
+    # The table holds only this case's rows, so the counts are exact.
+    assert _report_counts(first) == (4, 3, 0, 0, 1, 0, 3, 0)
+    rows = await db.fetchall(
+        "SELECT embedding, embedding_vec::text FROM document_chunks "
+        "WHERE embedding IS NOT NULL ORDER BY chunk_id",
+        (),
+    )
+    assert [bytes(blob) for blob, _ in rows] == legacy
+    assert [_pgvector_text_to_bytes(text) for _, text in rows] == legacy
+
+    second = await backfill_embedding_vec(db, "document_chunks", batch_size=2)
+
+    assert _report_counts(second) == (4, 3, 0, 0, 1, 0, 0, 0)
+
+
+async def test_postgres_backfill_is_idempotent(postgres_url):
+    async with _own_postgres_schema(postgres_url) as case:
+        await _backfill_case(case)
+
+
+async def _document_chunks(db):
+    """Every ``document_chunks`` row, keyed by column, so a dropped column shows."""
+    rows = await db.fetchall(
+        "SELECT row_to_json(chunk)::text FROM document_chunks chunk "
+        "ORDER BY chunk_id",
+        (),
+    )
+    return [json.loads(text) for (text,) in rows]
+
+
+async def test_postgres_case_leaves_a_reused_database_unchanged(postgres_url):
+    # TEST_POSTGRES_URL can name a reused database (#3404). Stand one up in a
+    # schema of this test's own, holding a legacy-only chunk the case did not
+    # insert: exactly the row the backfill repairs.
+    async with _own_postgres_schema(postgres_url) as reused:
+        await reused.db.execute(
+            "ALTER TABLE document_chunks "
+            f'ADD COLUMN embedding_vec "{reused.vector_schema}".vector(4)',
+            (),
         )
-        dimension = 4
-    else:
-        dimension = column[0] if column[0] > 0 else 4
-    try:
-        legacy = [_pack([float(i + 1)] * dimension) for i in range(3)]
-        for index, blob in enumerate(legacy):
-            await db.execute(
-                "INSERT INTO document_chunks (file_hash, content, embedding) "
-                "VALUES (?, ?, ?)",
-                (file_hash, f"chunk {index}", blob),
-            )
-        # A chunk never embedded: no vector in either column (#3415).
-        await db.execute(
-            "INSERT INTO document_chunks (file_hash, content) VALUES (?, ?)",
-            (file_hash, "never embedded"),
+        bystander = _pack([0.5, 1.5, 2.5, 3.5])
+        await reused.db.execute(
+            "INSERT INTO document_chunks (file_hash, content, embedding) "
+            "VALUES (?, ?, ?)",
+            ("bystander", "not the case's", bystander),
         )
+        before = await _document_chunks(reused.db)
+        assert [
+            (row["file_hash"], row["embedding"], row["embedding_vec"]) for row in before
+        ] == [("bystander", "\\x" + bystander.hex(), None)]
 
-        first = await backfill_embedding_vec(db, "document_chunks", batch_size=2)
+        async with _own_postgres_schema(reused.url) as case:
+            await _backfill_case(case)
 
-        assert first.embedding_vec_present is True
-        assert first.rows_backfilled >= 3
-        assert first.rows_missing_embedding_vec == first.rows_unbackfillable
-        # Other rows may share this table, so the partition is asserted, not
-        # the exact counts; the report refuses to exist without it.
-        assert first.rows_without_any_embedding >= 1
-        assert (
-            first.rows_with_both
-            + first.rows_missing_embedding_vec
-            + first.rows_embedding_vec_only
-            + first.rows_without_any_embedding
-        ) == first.total_rows
-        rows = await db.fetchall(
-            "SELECT embedding, embedding_vec::text FROM document_chunks "
-            "WHERE file_hash = ? AND embedding IS NOT NULL ORDER BY chunk_id",
-            (file_hash,),
-        )
-        assert [bytes(blob) for blob, _ in rows] == legacy
-        assert [_pgvector_text_to_bytes(text) for _, text in rows] == legacy
-
-        second = await backfill_embedding_vec(db, "document_chunks", batch_size=2)
-
-        assert second.rows_backfilled == 0
-        assert second.rows_missing_embedding_vec == first.rows_missing_embedding_vec
-        assert second.rows_with_both == first.rows_with_both
-        assert second.rows_without_any_embedding == first.rows_without_any_embedding
-    finally:
-        if created_column:
-            await db.execute(
-                "DELETE FROM document_chunks WHERE file_hash = ?", (file_hash,)
-            )
-            await db.execute(
-                "ALTER TABLE document_chunks DROP COLUMN IF EXISTS embedding_vec", ()
-            )
+        assert await _document_chunks(reused.db) == before

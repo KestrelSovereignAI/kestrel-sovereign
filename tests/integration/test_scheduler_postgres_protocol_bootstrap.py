@@ -34,6 +34,7 @@ from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.spawn.mandate import SpawnMandate
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from tests.utils.scheduler_ticks import tick_and_settle
 
 
 @asynccontextmanager
@@ -1596,7 +1597,7 @@ async def test_live_postgres_runtime_create_spawn_execute_remove_and_failure_rol
                 """,
                 (due, spawned_id),
             )
-            tick = asyncio.create_task(host_runner._tick())
+            tick = asyncio.create_task(tick_and_settle(host_runner))
             await asyncio.wait_for(dispatch_started.wait(), timeout=3)
 
             removal = asyncio.create_task(manager.remove_agent("Spawned"))
@@ -1904,7 +1905,7 @@ async def test_postgres_registration_rollback_preserves_owner_row_adopted_by_cla
         )
 
         if shared_action == "claim":
-            await replica._tick()
+            await tick_and_settle(replica)
         else:
             await db_replica.execute(
                 """

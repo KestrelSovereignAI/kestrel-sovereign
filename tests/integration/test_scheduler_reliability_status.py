@@ -40,6 +40,7 @@ from kestrel_sovereign.features.scheduler.status import (
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.database_clock import database_clock
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+from tests.utils.scheduler_ticks import tick_and_settle
 
 scheduler_database_clock = database_clock
 
@@ -544,9 +545,9 @@ async def test_paged_runtime_status_retains_other_authority_pages(tmp_path):
     )
     try:
         await runner._ensure_tables()
-        await runner._tick()
+        await tick_and_settle(runner)
         await runner._publish_runtime_status("running")
-        await runner._tick()
+        await tick_and_settle(runner)
         await runner._publish_runtime_status("running")
 
         assert await db.fetchall(
@@ -1254,7 +1255,10 @@ async def test_live_claimed_execution_is_not_a_stalled_poller(
         "agent-1",
         execute,
         owner_id="long-claimed-execution",
-        poll_interval=0.01,
+        # The loop no longer waits for an execution (#3465). One poll admits
+        # the long-running row; the long interval then keeps the loop from
+        # re-stamping the tick fields staged below or claiming "starved".
+        poll_interval=3600,
         lease_seconds=1,
     )
     runner._tick_in_progress_limit_seconds = 0.05
@@ -1287,6 +1291,7 @@ async def test_live_claimed_execution_is_not_a_stalled_poller(
         # hard bounds, without spending real seconds waiting in this test.
         runner._tick_started_monotonic = time.monotonic() - 1
         runner._last_tick_started_at = (now - timedelta(seconds=5)).isoformat()
+        runner._last_tick_completed_at = (now - timedelta(seconds=6)).isoformat()
         await runner._publish_runtime_status_best_effort()
 
         assert runner._active_claimed_execution_count == 1

@@ -2742,6 +2742,9 @@ class AgentManager:
                     host_context_clause_registry=self._host_context_clause_registry,
                     hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
                     identity_export_dir=identity_export_dir,
+                    constitution_source_descriptor_path=(
+                        config.constitution_source_descriptor
+                    ),
                     isolated_runtime_root=runtime_root,
                     isolated_runtime_namespace=runtime_namespace,
                     isolated_runtime_legacy_root=resolved_dir / "feature_venvs",
@@ -2781,6 +2784,9 @@ class AgentManager:
                     host_context_clause_registry=self._host_context_clause_registry,
                     hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
                     identity_export_dir=identity_export_dir,
+                    constitution_source_descriptor_path=(
+                        config.constitution_source_descriptor
+                    ),
                     semantic_inference_profile=semantic_inference_profile,
                     semantic_inference_limits=semantic_inference_limits,
                     semantic_maintenance_limits=semantic_maintenance_limits,

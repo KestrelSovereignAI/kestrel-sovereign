@@ -1695,6 +1695,143 @@ class TestCmdShell:
         local_shell.assert_called_once()
 
 
+_GOVERNANCE_VARIABLES = (
+    "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH",
+    "KESTREL_SOVEREIGN_TRUST_ROOT_PATH",
+)
+
+
+class TestCmdShellGoverningSource:
+    """The in-process shell resolves its governing constitution source (#2553)
+    from the environment the launcher gives the agent, or refuses (#3451).
+
+    ``load_project_env`` leaves an exported value authoritative; the launcher
+    and doctor let the project ``.env`` win. A shell exporting descriptor B
+    while the file names A would audit B and Safe-Mode a healthy agent.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore_environ(self, monkeypatch):
+        """``load_project_env`` writes through ``os.environ.setdefault``, which
+        ``monkeypatch`` does not track."""
+        import os
+
+        for variable in _GOVERNANCE_VARIABLES:
+            monkeypatch.delenv(variable, raising=False)
+        saved = dict(os.environ)
+        yield
+        os.environ.clear()
+        os.environ.update(saved)
+
+    @staticmethod
+    def _home(multi_agent_env, **values):
+        with (multi_agent_env / ".env").open("a") as env_file:
+            for key, value in values.items():
+                env_file.write(f"{key}={value}\n")
+        return multi_agent_env
+
+    @staticmethod
+    def _shell(project_dir, *, server=None):
+        args = build_parser().parse_args(["shell", "claw"])
+        with patch(
+            "kestrel_sovereign.cli._get_project_dir", return_value=project_dir
+        ), patch(
+            "kestrel_sovereign.cli._detect_running_agent_server",
+            return_value=server,
+        ), patch(
+            "kestrel_sovereign.cli._run_http_shell", return_value=0
+        ) as http_shell, patch(
+            "kestrel_sovereign.cli._run_shell"
+        ) as in_process, patch(
+            "kestrel_sovereign.cli.asyncio.run", return_value=0
+        ) as local_shell:
+            rc = cmd_shell(args)
+        return rc, http_shell, in_process, local_shell
+
+    @pytest.mark.parametrize("variable", _GOVERNANCE_VARIABLES)
+    def test_an_exported_value_the_agent_does_not_get_is_refused(
+        self, multi_agent_env, monkeypatch, capsys, variable
+    ):
+        """.env says A, the shell exports B: refuse before building the agent,
+        naming the variable and both values."""
+        home = self._home(multi_agent_env, **{variable: "/secure/from-the-file.json"})
+        monkeypatch.setenv(variable, "/secure/from-the-shell.json")
+
+        rc, _, in_process, local_shell = self._shell(home)
+
+        assert rc == 1
+        in_process.assert_not_called()
+        local_shell.assert_not_called()
+        err = capsys.readouterr().err
+        assert variable in err
+        assert "/secure/from-the-shell.json" in err
+        assert "/secure/from-the-file.json" in err
+        assert str(home / ".env") in err
+
+    def test_a_blank_project_descriptor_against_an_exported_one_is_refused(
+        self, multi_agent_env, monkeypatch, capsys
+    ):
+        """Blank in the file is an answer: the launched agent has no descriptor."""
+        variable = "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH"
+        home = self._home(multi_agent_env, **{variable: ""})
+        monkeypatch.setenv(variable, "/secure/a.json")
+
+        rc, _, in_process, local_shell = self._shell(home)
+
+        assert rc == 1
+        in_process.assert_not_called()
+        local_shell.assert_not_called()
+        err = capsys.readouterr().err
+        assert "/secure/a.json" in err
+        assert "unset" in err
+
+    def test_agreeing_values_start_the_in_process_agent(
+        self, multi_agent_env, monkeypatch
+    ):
+        variable = "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH"
+        home = self._home(multi_agent_env, **{variable: "/secure/same.json"})
+        monkeypatch.setenv(variable, "/secure/same.json")
+
+        rc, _, in_process, local_shell = self._shell(home)
+
+        assert rc == 0
+        in_process.assert_called_once()
+        local_shell.assert_called_once()
+
+    def test_a_value_only_exported_is_what_the_launcher_uses_too(
+        self, multi_agent_env, monkeypatch
+    ):
+        """With no .env entry the launcher inherits the export, so there is
+        nothing to disagree about."""
+        monkeypatch.setenv(
+            "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH", "/secure/exported.json"
+        )
+
+        rc, _, in_process, local_shell = self._shell(multi_agent_env)
+
+        assert rc == 0
+        in_process.assert_called_once()
+        local_shell.assert_called_once()
+
+    def test_a_running_server_is_used_without_a_local_audit(
+        self, multi_agent_env, monkeypatch
+    ):
+        """Routed to a running agent, the shell builds no agent and audits
+        nothing, so the operator's shell environment cannot misgovern it."""
+        variable = "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH"
+        home = self._home(multi_agent_env, **{variable: "/secure/from-the-file.json"})
+        monkeypatch.setenv(variable, "/secure/from-the-shell.json")
+
+        rc, http_shell, in_process, local_shell = self._shell(
+            home, server=("http://localhost:18801", "test-key")
+        )
+
+        assert rc == 0
+        http_shell.assert_called_once()
+        in_process.assert_not_called()
+        local_shell.assert_not_called()
+
+
 # -----------------------------------------------------------------------
 # _detect_running_agent_server tests (#654)
 # -----------------------------------------------------------------------

@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace as _replace_dataclass
 from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
 from kestrel_sovereign.storage.privacy_wrapper import (
+    DurablePersistenceGate,
     ReentrantTransitionLock,
     EphemeralPurgeReport,
     StorePurgeResult,
@@ -25,7 +26,10 @@ from kestrel_sovereign.security.assertion_tenant_resolver import (
 )
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse
-from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+from kestrel_sovereign.llm.invocation_context import (
+    LLMInvocationContext,
+    turn_invocation_scope,
+)
 from kestrel_sovereign.config import (
     SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
     SEMANTIC_CAPABILITIES_CONFIG_ENV,
@@ -711,6 +715,7 @@ class KestrelAgent(
         isolated_runtime_idle_timeouts: Optional[Mapping[str, Optional[float]]] = None,
         isolated_runtime_telemetry_observer: Optional[Callable[[Any], Any]] = None,
         sovereign_trust_root_path: Optional[str] = None,
+        constitution_source_descriptor_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
         semantic_inference_profile: Optional["InferenceProfile"] = None,
         semantic_inference_limits: Optional["InferenceLimits"] = None,
@@ -805,6 +810,12 @@ class KestrelAgent(
                        When omitted, the shared resolver reads
                        ``KESTREL_SOVEREIGN_TRUST_ROOT_PATH``. The graph database
                        is never a trust-root source.
+            constitution_source_descriptor_path: Optional operator-owned,
+                       Sovereign-signed governing-constitution source
+                       descriptor (#2553). When omitted, the shared resolver
+                       reads ``KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH``;
+                       when neither is set the packaged constitution governs.
+                       The graph database never selects the governing source.
             identity_export_dir: Optional per-agent local identity export
                        directory. Multi-agent hosts resolve this before agent
                        construction so it never depends on process CWD.
@@ -958,6 +969,9 @@ class KestrelAgent(
             else None
         )
         self._sovereign_trust_root_path = sovereign_trust_root_path
+        self._constitution_source_descriptor_path = (
+            constitution_source_descriptor_path
+        )
         self.identity_export_dir = identity_export_dir
 
         # Per-agent constitution overlay (#898). When ``<agent_dir>/CONSTITUTION.md``
@@ -1635,6 +1649,9 @@ class KestrelAgent(
         # — which already holds this lock across the whole turn — re-enters
         # instead of self-deadlocking on its own task's lock (#2672 review P1).
         self._privacy_transition_lock = ReentrantTransitionLock()
+        # Serializes durable signal persistence against a privacy transition
+        # without the privacy-transition lock every turn holds (#3316).
+        self._durable_persistence_gate = DurablePersistenceGate()
         # A data-destructive privacy transition (e.g. PUBLIC → EPHEMERAL) staged
         # awaiting explicit confirmation via confirm_privacy_transition. None when
         # no transition is pending. Guarded by _privacy_transition_lock.
@@ -2710,6 +2727,8 @@ class KestrelAgent(
         #   stripe.deposit       — Stripe deposit webhook (UNTRUSTED COGNITION)
         #   a2a.question_answered— send_a2a_question resumption rail (#1444)
         #   wait.complete        — generic wait reconciler rail (#1860)
+        #   wait.replay          — a wait wake whose event predates the
+        #                          handle's last delivered wake (#3390)
         #   workflow rescue      — the six generic sources named by the
         #                          Workflows built-in stalled_work_rescue
         from kestrel_sovereign.signals import RegistrationPolicy
@@ -2731,6 +2750,9 @@ class KestrelAgent(
         from kestrel_sovereign.signals.sources.wait import (
             build_wait_complete_registration,
         )
+        from kestrel_sovereign.signals.sources.wait_replay import (
+            build_wait_replay_registration,
+        )
         from kestrel_sovereign.signals.sources.workflow_rescue import (
             build_workflow_rescue_registrations,
         )
@@ -2742,6 +2764,7 @@ class KestrelAgent(
             build_stripe_deposit_registration(),
             build_a2a_question_answered_registration(),
             build_wait_complete_registration(),
+            build_wait_replay_registration(),
             # Core hosts these provider-neutral registrations because the
             # Workflows built-in names them.  The sweep is deliberately the
             # echo-only implementation: an installed domain feature may feed
@@ -3735,6 +3758,11 @@ class KestrelAgent(
                 self._persist_route_embedding_models
             )
 
+        # Record the embedding profile the loaded config resolves, so offline
+        # tools (`kestrel embeddings reindex` / `verify`) can compare their own
+        # resolution against it (#3420).
+        await self.record_active_embedding_profile()
+
         # Cache the features prompt (built once at session start)
         self._cached_features_prompt = self._build_features_prompt_section()
 
@@ -4194,6 +4222,19 @@ class KestrelAgent(
             lock = ReentrantTransitionLock()
             self._privacy_transition_lock = lock
         return lock
+
+    def _get_durable_persistence_gate(self) -> DurablePersistenceGate:
+        """Return the gate between durable signal persistence and a privacy flip.
+
+        ``SignalDispatcher`` holds it shared around a signal's privacy
+        projection and durable commit; ``privacy_transition()`` holds it
+        exclusive after CONVERSATION and the privacy-transition lock (#3316).
+        """
+        gate = getattr(self, "_durable_persistence_gate", None)
+        if gate is None:
+            gate = DurablePersistenceGate()
+            self._durable_persistence_gate = gate
+        return gate
 
     @staticmethod
     def _evaluate_pre_turn_guard(guard) -> None:
@@ -6403,7 +6444,13 @@ Expected Duration: {expected_duration}
             # turn stays absent rather than carrying an empty attribute.
             KESTREL_SESSION_ID: session_id or None,
             "agent.input_length": len(user_input),
-        }) as _otel_span:
+        }) as _otel_span, turn_invocation_scope(
+            # #3426: chat receives this turn's identity as an argument; the
+            # embeddings the turn makes (retrieval, persistence, tools) cannot.
+            getattr(self, "llm_service", None),
+            invocation_context,
+            session_id=session_id,
+        ):
             try:
                 async with self._turn_lifecycle():
                     # Correlation is optional evidence, never cancellation

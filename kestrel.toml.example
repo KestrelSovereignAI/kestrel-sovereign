@@ -283,6 +283,17 @@ banned = []
 # memory_answerability_gate = true  # global kill switch for the LLM evidence stage
 # memory_answerability_timeout_seconds = 12.0  # hard per-recall latency bound
 # memory_answerability_model = "gemma4:31b"  # optional qualified judge; defaults to active chat model
+# memory_answerability_backend = "chat"  # "chat" (generate, above) or "decision" (decide; #3424)
+# memory_answerability_decision_model = "ollama:local/<model>"  # decision backend only; <vendor>[:<route>][/<model>]
+#
+# The decision backend asks one noul question per candidate; all share the
+# threshold key "answers" (default 0.5 until calibrated). Measure first:
+#   kestrel decisions eval --caller memory_answerability --baseline chat
+# then paste the proposed blocks, e.g.:
+# [decisions.thresholds."memory_answerability"]
+# uncalibrated = "refuse"    # or "default": uncalibrated models use the 0.5 default
+# [decisions.thresholds."memory_answerability".models."ollama:local/<model>"]
+# "answers" = 0.42
 
 # =============================================================================
 # Backup Retention

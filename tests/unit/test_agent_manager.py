@@ -76,6 +76,7 @@ from kestrel_sovereign.spawn.lifecycle import (
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.stop import AuthoritativeStopDescendant
 from tests.utils.aiosqlite_workers import aiosqlite_worker
+from tests.utils.scheduler_ticks import tick_and_settle
 
 
 def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC"):
@@ -7541,7 +7542,7 @@ class TestAgentManagerBasics:
 
             # This is the former race: a scope publication here let the host
             # claim the row, clear its nonce, and make rollback retain it.
-            await host_runner._tick()
+            await tick_and_settle(host_runner)
             assert await db.fetchone(
                 "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
                 ("pending-owned-schedule",),
@@ -12693,6 +12694,41 @@ class TestLoadFromConfig:
         assert mock_agent_cls.call_args.kwargs["identity_export_dir"] == (
             tmp_path / "agent_data" / "claw" / "continuity"
         ).resolve()
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_in_process_agent_receives_its_constitution_source_descriptor(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        """The per-agent descriptor reaches the agent that audits against it.
+
+        Dropping it would audit a custom-governed agent against the package and
+        Safe-Mode it at its first audit (#2553).
+        """
+        mock_get_did.return_value = "did:claw"
+        mock_agent_cls.return_value = _make_mock_agent("did:claw")
+        manager = AgentManager(base_data_dir=tmp_path)
+        config = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            constitution_source_descriptor="/secure/claw-source.signed.json",
+            port=8801,
+        )
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent("claw", config)
+
+        assert mock_agent_cls.call_args.kwargs[
+            "constitution_source_descriptor_path"
+        ] == Path("/secure/claw-source.signed.json")
 
     @pytest.mark.asyncio
     @patch(

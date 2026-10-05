@@ -30,6 +30,7 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     invocation_was_self_fenced,
     prime_durable_stop_fence,
+    reject_reserved_session_id,
     request_invocation_provenance,
     resolve_request_invocation_id,
     self_fenced_invocation_http_error,
@@ -446,6 +447,7 @@ async def invoke_agent(request: Request, http_response: Response):
                 code="input_required",
                 message="Input not provided.",
             )
+        reject_reserved_session_id(session_id)
 
         # Combine provider and model for proper routing
         if provider_override and model_override:
@@ -847,6 +849,7 @@ async def stream_agent_response(request: Request):
                 code="input_required",
                 message="Input not provided.",
             )
+        reject_reserved_session_id(session_id)
 
         agent = get_agent(request)
         caller = getattr(request.state, "caller", None)

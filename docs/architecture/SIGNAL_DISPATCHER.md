@@ -552,6 +552,17 @@ to `0` because the wake is the only thing that resumes the parked work. A
 delivery is a wake, not a verdict: poll the provider for the handle's state on
 every delivery, then deactivate the consumer when the parked work finishes.
 
+Registering again after the handle's wake was delivered re-arms the watch
+(#3399). It records that delivered (or still in-flight) wake as its baseline
+and wakes once more, on the first terminal event other than it. A provider
+that names its terminal events (`TERMINAL_EVENT_KEY` in
+`kestrel_sovereign/waits/engine.py`) makes "other" mean a new execution — a CI
+re-run that fails again, or a new head commit — rather than a new outcome; the
+same execution read through a different view (GitHub's Checks API or its
+Actions fallback) re-baselines the watch without a wake. A watch re-armed over
+an event its provider marks final (a merged PR) can never fire, so the
+reconciler retires it instead of polling it.
+
 The dispatcher permits durable registrations only for its own `agent.did`.
 Every claim, acknowledgement, retry, and observation query is selected by
 that scope in storage; scope is therefore an authorization boundary for a
@@ -678,17 +689,30 @@ The dispatcher pipeline:
 7. **Route**:
    - ACTION → `await registration.handler(payload)`
    - ARTIFACT → `await registration.artifact_handler(signal)`
-   - COGNITION → select the registration `prompt_template`, or the signal's `prompt_template_override` only when the registration has `allow_prompt_override=True`; render with the signal envelope → `await agent.process_input_or_streaming(prompt, ...)`. The entry point itself acquires `CONVERSATION` at the shared turn lifecycle (Concern #1) — the dispatcher does not pre-acquire it. Streaming vs non-streaming is selected by the calling context; both share the same lifecycle boundary.
+   - COGNITION → select the registration `prompt_template`, or the signal's `prompt_template_override` only when the registration has `allow_prompt_override=True`; render with the signal envelope → `await agent.process_input_or_streaming(prompt, ...)` with `session_id` set to the signal's session, or to a session minted for this turn when the signal has none (#3429), so the turn's session is fixed before it starts rather than chosen per row by the store's time-gap heuristic. The entry point itself acquires `CONVERSATION` at the shared turn lifecycle (Concern #1) — the dispatcher does not pre-acquire it. Streaming vs non-streaming is selected by the calling context; both share the same lifecycle boundary.
 8. **Release locks** in reverse acquisition order.
 9. **Log** the routed outcome per the source's redaction policy.
 
+Step 3 serializes against a privacy transition through the agent's
+**durable persistence gate**, not the privacy-transition lock (#3316). The
+gate guards exactly one race: a NORMAL projection computed, the mode changed
+to EPHEMERAL while the commit is blocked, and the stale plaintext projection
+committed after the transition. The dispatcher holds it shared around
+projection and commit, so concurrent dispatches do not serialize on each
+other; `privacy_transition()` holds it exclusive, acquired after CONVERSATION
+and the privacy-transition lock, so a mode change waits for in-flight persists
+and no persist straddles it. Every turn holds the privacy-transition lock for
+its whole body (#3310), so persisting under that lock queued inbound ACK
+ingress and cron dispatches behind any in-flight turn. The global order is
+CONVERSATION → privacy transition → persistence gate; nothing is acquired
+while the gate is held.
+
 An `InFlightControlActionRegistration` (today only `a2a.peer_stop`, #3169)
 is an ACTION that acts on work already running. Step 3 persists only a fixed
-marker for it (no payload, caller, or chain) without taking the privacy
-transition lock every running turn holds, and Hold's begin-work disposition
-does not apply to it. Validation, cycle/TTL, durable deduplication, and rate
-limiting are unchanged. See the peer Stop section of
-[`SIGNAL_SOURCES_GUIDE.md`](./SIGNAL_SOURCES_GUIDE.md).
+marker for it (no payload, caller, or chain), and Hold's begin-work
+disposition does not apply to it. Validation, cycle/TTL, durable
+deduplication, rate limiting, and the persistence gate are unchanged. See the
+peer Stop section of [`SIGNAL_SOURCES_GUIDE.md`](./SIGNAL_SOURCES_GUIDE.md).
 
 The dispatcher lives as a sibling component the agent holds a reference to. Easier to test than another mixin.
 

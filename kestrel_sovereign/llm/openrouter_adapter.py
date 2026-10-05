@@ -29,10 +29,17 @@ if TYPE_CHECKING:
 
 from pydantic import BaseModel
 
-from .adapter import LLMResponse
+from .adapter import LLMResponse, ReportedUsage
 from kestrel_sdk.llm import ProviderCapabilities
+from kestrel_sdk.llm.decisions import (
+    DecisionModelInfo,
+    DecisionTransportError,
+    ValidatedDecisionRequest,
+)
+from .decisions.http import post_systemone, systemone_body
 from .openai_adapter import OpenAIAdapter
 from .model_metadata import ModelInfo, ModelCategory
+from .output_ceiling import reported_token_limit
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 from kestrel_sovereign.kestrel_config.defaults import get_openrouter_api_base
 
@@ -91,6 +98,9 @@ class OpenRouterAdapter(OpenAIAdapter):
             # Truthful, ROUTE-scoped embedding advertisement (#2288): only when
             # an embedding model is actually configured for this route.
             supports_embeddings=self._supports_embeddings,
+            # Decision models are served on their own systemone surface; which
+            # ones exist is discovery state, not this static flag (#3424).
+            supports_decisions=True,
             embedding_model=self._embedding_model,
             embedding_dim=self._embedding_dim,
             model_dependent=("tools", "vision", "structured_output"),
@@ -126,6 +136,7 @@ class OpenRouterAdapter(OpenAIAdapter):
         *,
         model: Optional[str] = None,
         dimensions: Optional[int] = None,
+        usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
         """Embed one text via OpenRouter's OpenAI-compatible ``/v1/embeddings``.
@@ -145,7 +156,12 @@ class OpenRouterAdapter(OpenAIAdapter):
         if dimensions is None:
             dimensions = self._embedding_dim
         return await super().aembed(
-            client, text, model=model, dimensions=dimensions, **kwargs
+            client,
+            text,
+            model=model,
+            dimensions=dimensions,
+            usage_sink=usage_sink,
+            **kwargs,
         )
 
     async def aembed_batch(
@@ -155,6 +171,7 @@ class OpenRouterAdapter(OpenAIAdapter):
         *,
         model: Optional[str] = None,
         dimensions: Optional[int] = None,
+        usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
         model = model or self._embedding_model
@@ -168,7 +185,12 @@ class OpenRouterAdapter(OpenAIAdapter):
         if dimensions is None:
             dimensions = self._embedding_dim
         return await super().aembed_batch(
-            client, texts, model=model, dimensions=dimensions, **kwargs
+            client,
+            texts,
+            model=model,
+            dimensions=dimensions,
+            usage_sink=usage_sink,
+            **kwargs,
         )
 
     def _get_client(self) -> openai.AsyncOpenAI:
@@ -293,7 +315,9 @@ class OpenRouterAdapter(OpenAIAdapter):
         - Model ID (e.g., "anthropic/claude-3-opus")
         - Display name
         - Description
-        - Context length
+        - Context length (``context_length``) and output ceiling
+          (``top_provider.max_completion_tokens``); a limit the catalog does
+          not report stays ``None`` rather than becoming a guessed number
         - Pricing (per token)
         - Supported features (vision, tools, etc.)
 
@@ -360,7 +384,15 @@ class OpenRouterAdapter(OpenAIAdapter):
                     category=category,
                     is_featured=False,  # Will be enriched from catalog
                     is_hidden=False,
-                    context_limit=m.get("context_length", 4096),
+                    # #3355: a record without ``context_length`` has an
+                    # unknown window, not a 4,096-token one. ``None`` lets
+                    # the catalog override apply and the token counter name
+                    # the model as unknown; a number here would be persisted
+                    # to the discovered-limits cache as if reported.
+                    context_limit=reported_token_limit(m.get("context_length")),
+                    output_limit=reported_token_limit(
+                        (m.get("top_provider") or {}).get("max_completion_tokens")
+                    ),
                     supports_vision=supports_vision,
                     supports_tools=supports_tools,
                     supports_streaming=True,  # OpenRouter streams every chat route
@@ -443,6 +475,68 @@ class OpenRouterAdapter(OpenAIAdapter):
             ))
 
         logger.info(f"OpenRouter: discovered {len(results)} embedding models")
+        return results
+
+    async def adecide(
+        self,
+        client: Any,
+        model: str,
+        request: ValidatedDecisionRequest,
+        *,
+        timeout: float,
+    ) -> Dict[str, Any]:
+        """Answer a decision request via OpenRouter's ``/systemone`` passthrough (#3424).
+
+        OpenRouter serves decision models only on this typed surface; they are
+        not chat-completions models. The canonical systemone request is sent
+        as-is with the model id; the raw response (including OpenRouter's
+        ``usage.cost``) is returned for the framework to normalise.
+        """
+        if not self.api_key:
+            raise DecisionTransportError("openrouter: OPENROUTER_API_KEY is not set")
+        return await post_systemone(
+            f"{self.base_url}/systemone",
+            systemone_body(model, request),
+            timeout=timeout,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            route="openrouter",
+        )
+
+    async def list_decision_models(self, client: Any = None) -> List[DecisionModelInfo]:
+        """Discover decision models from the catalog's ``decisions`` output modality.
+
+        ``GET /models?output_modalities=decisions`` returns exactly the
+        ``text->decisions`` models (verified live 2026-10-02). The plain
+        ``/models`` listing omits them, so they never appear as chat models.
+        Failures propagate so discovery can mark the route stale.
+        """
+        if not self.api_key:
+            return []
+        async with httpx.AsyncClient() as http_client:
+            response = await http_client.get(
+                f"{self.base_url}/models",
+                params={"output_modalities": "decisions"},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=HTTP_TIMEOUT_DEFAULT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+
+        results: List[DecisionModelInfo] = []
+        for entry in payload.get("data", []):
+            model_id = entry.get("id")
+            modality = (entry.get("architecture") or {}).get("modality") or ""
+            if not model_id or not str(modality).endswith("decisions"):
+                continue
+            created = entry.get("created")
+            results.append(DecisionModelInfo(
+                id=str(model_id),
+                vendor="openrouter",
+                route="",
+                context_limit=reported_token_limit(entry.get("context_length")),
+                created_at=str(created) if created is not None else None,
+            ))
+        logger.info(f"OpenRouter: discovered {len(results)} decision models")
         return results
 
     @staticmethod

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional
 import aiohttp
 import httpx
 import asyncio
+import inspect
 import os
 import re
 import time
@@ -3287,6 +3288,12 @@ async def verify_embedding_space(request: Request):
         results = await agent.llm_service.verify_embedding_space_parity(
             pin_name, record_to=db
         )
+        # A pin that passes (or fails) changes the profile the agent resolves.
+        record_active_profile = getattr(
+            agent, "record_active_embedding_profile", None
+        )
+        if inspect.iscoroutinefunction(record_active_profile):
+            await record_active_profile()
         return {
             "success": True,
             "results": {name: r.to_dict() for name, r in results.items()},

@@ -903,6 +903,10 @@ async def test_content_edge_rejected(tmp_path, mode):
             await wrapper.graph.add_edge(AGENT_ID, "fact-1", "knows")
         with pytest.raises(PrivacyViolationError):
             await wrapper.graph_store.add_edge(AGENT_ID, "fact-1", "records_action")
+        with pytest.raises(PrivacyViolationError):
+            await wrapper.graph.add_external_reference_edge(
+                AGENT_ID, "github_issue:owner/repo#1", "linked_to"
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

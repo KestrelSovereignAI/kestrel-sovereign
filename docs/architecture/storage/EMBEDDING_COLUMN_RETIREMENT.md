@@ -12,7 +12,7 @@ tags:
 - architecture
 - architecture-spec
 - storage
-timestamp: '2026-09-29T00:00:00Z'
+timestamp: '2026-09-30T00:00:00Z'
 status: active
 owner: architecture
 canonical: true
@@ -509,6 +509,62 @@ Inception still indexes its constitution through a bare `LLMService()`. A
 newborn agent has no persisted embedding config to apply, so on a host whose
 first chat route cannot embed its constitution chunks are stored without
 vectors the same way; `reindex` embeds them once a route is set.
+
+## Reindexing onto the profile the agent searches
+
+Vector search filters by `embedding_profile_id`, so `reindex` is safe only
+when its target is the profile the running agent resolves. On 2026-09-30 it
+was not
+([#3420](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3420)).
+The agent's `ollama:local` route is a member of the shared space
+`qwen3-embedding-8b@768`, whose parity probe passed and is recorded in
+`embedding_profiles.parity_cosine`. The agent rehydrates that at boot
+(`hydrate_verified_space_pins`) and stamps and searches profile
+`7685e6844167`. The CLI never rehydrated it, so the route kept the space id
+its Ollama adapter declares, `qwen3-embedding:8b@768` (profile
+`bea8bae1ec47`). `reindex --yes` counted all 2494 rows as stale and rewrote
+them, and vector search then found none. `verify` still reported the gate met,
+because it did not look at profile ids.
+
+Three changes close this:
+
+- **The CLI resolves what the agent resolves.**
+  `_apply_persisted_embedding_config` now replays the three boot steps it
+  skipped, before it applies the persisted pins and route: it rehydrates the
+  verified shared spaces; it applies the agent's persisted chat-model
+  preference, which an auto `embedding_route` follows; and it registers the
+  corpus's dominant profile so an unpinned route's auto model keeps the
+  corpus's space (#2366). The preference goes through the agent's own loader,
+  `apply_persisted_model_preference`, so the two cannot drift. A preference
+  that loader cannot apply leaves the CLI unpinned, as it leaves the agent,
+  and the CLI prints a warning saying so. The constitution reanchor resolves
+  through the same helper.
+- **The agent records its active profile.** It writes the profile it resolves
+  to `agent_metadata` under `active_embedding_profile`: at boot once its
+  embedding config is loaded, whenever the embedding route, a route's model
+  pin, or the chat model preference is persisted, and after a parity
+  verification. It records nothing while a local-only privacy mode forces the
+  resolution, because that mode writes no durable rows. An agent that
+  resolves no profile leaves the previous record in place.
+- **`reindex` refuses any other target**, in a dry-run as well as with
+  `--yes`, and writes nothing (exit `2`). Its report prints `target_profile`
+  and `active_profile` side by side. With no record (the agent has not started
+  since this change), it refuses while any stored vector is on another
+  profile, since nothing then shows which profile the agent searches; rows
+  with no vector at all are still embedded. When agents sharing one database
+  record different profiles, it requires `--agent-id`.
+
+`verify` now also reports `active_embedding_profile`: the recorded profile
+and, per embedded table (`conversation_history` included when `--table` is
+`all`), the stored vectors on and off it. A vector stamped with a NULL profile
+counts as off, since vector search cannot find it either. A non-zero count
+prints a warning naming `reindex --yes`. It does not affect the exit code:
+this is search visibility, not the phase-2 gate. With no record, or several
+different ones, nothing is counted and the report says so.
+
+Recovery for the affected agent needs no file restore: once the fixed release
+is running, the agent records `7685e6844167` at boot, and `reindex --yes`
+re-embeds every row back onto it.
 
 ## What remains
 

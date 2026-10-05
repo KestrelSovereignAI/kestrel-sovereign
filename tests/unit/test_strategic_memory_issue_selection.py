@@ -1,5 +1,6 @@
 """Tests for provider-neutral strategic-memory issue selection."""
 
+import re
 from unittest.mock import AsyncMock
 
 import pytest
@@ -51,7 +52,9 @@ async def test_pick_top_issue_does_not_fetch_unused_morning_projection(monkeypat
         AsyncMock(return_value=[{
             "number": 17,
             "title": "Targeted issue",
-            "labels": [],
+            "state": "open",
+            "repository_url": "https://api.github.com/repos/owner/repo",
+            "labels": [{"name": "agent-ready"}],
             "assignees": [],
             "comments": 0,
         }]),
@@ -106,8 +109,10 @@ class TestReferencePrefixMustLookLikeARepository:
             pick_top_issue,
         )
 
+        # Two scanned repositories: the prose row is then a bare number that
+        # names no project, and the valid row's repository is one of them.
         data = {
-            "morning_signal_config": {"scan_repos": []},
+            "morning_signal_config": {"scan_repos": ["owner/repo", "owner/other"]},
             "blockers": [
                 {"severity": "critical", "issue": "Issue #123", "title": "prose"},
                 {"severity": "high", "issue": "owner/repo#7", "title": "valid"},
@@ -133,27 +138,52 @@ class TestReferencePrefixMustLookLikeARepository:
 
 
 def _open(number, title="t"):
-    return {"number": number, "title": title, "state": "open", "labels": []}
+    """An open issue the orchestrator has labelled ``agent-ready``.
+
+    Only such an issue is on the allow-list (#3464), so every test here that
+    expects a pick uses one. ``_labelled`` gives an open issue exactly the
+    labels a test names, and no others.
+    """
+    return {
+        "number": number, "title": title, "state": "open",
+        "labels": [{"name": "agent-ready"}],
+    }
 
 
 def _closed(number, title="t"):
     return {"number": number, "title": title, "state": "closed", "labels": []}
 
 
-def _stub_github(monkeypatch, responses, calls=None, linked_prs=None):
+def _stub_github(
+    monkeypatch, responses, calls=None, linked_prs=None, retry_evidence=None
+):
     """Answer github_api_get from ``responses``; anything else is a 404.
 
     The PR-linkage GraphQL read answers from ``linked_prs`` keyed by
     ``(repo, number)``: a list of PR nodes, ``None`` for an unreadable read,
     or an exception to raise. Absent means no PR links the issue.
+
+    The post-run activity read (#3398) answers from ``retry_evidence`` keyed
+    the same way: an ``issue`` node (see ``_activity``), ``None`` for an
+    unreadable read, or an exception to raise. Absent means no activity.
     """
     monkeypatch.setattr(issue_selection, "get_github_token", lambda: "token")
     linked_prs = linked_prs or {}
+    retry_evidence = retry_evidence or {}
 
     async def fake_post(path, token, body):
         assert path == "/graphql", path
         variables = body["variables"]
         key = (f"{variables['owner']}/{variables['name']}", variables["number"])
+        if "timelineItems" in body["query"]:
+            if calls is not None:
+                calls.append(("activity",) + key)
+            value = retry_evidence.get(key, _activity())
+            if isinstance(value, Exception):
+                raise value
+            if value is None:
+                return None
+            return {"data": {"repository": {"issue": value}}}
         if calls is not None:
             calls.append(("graphql",) + key)
         value = linked_prs.get(key, [])
@@ -174,7 +204,7 @@ def _stub_github(monkeypatch, responses, calls=None, linked_prs=None):
             value = responses[path]
             if isinstance(value, Exception):
                 raise value
-            return value
+            return _as_github_serves(path, value)
         # The backlog scan's list endpoints: nothing open, so a test observes
         # the blocker path's decision rather than a fallback's.
         if "/issues?" in path:
@@ -184,7 +214,35 @@ def _stub_github(monkeypatch, responses, calls=None, linked_prs=None):
     monkeypatch.setattr(issue_selection, "github_api_get", fake)
 
 
+_ISSUES_PATH = re.compile(r"/repos/([^/?]+/[^/?]+)/issues")
+
+
+def _as_github_serves(path, value):
+    """Every issue GitHub returns names the repository serving it.
+
+    A fixture that sets ``repository_url`` itself (a transferred issue, or
+    ``None``) keeps its own value.
+    """
+    match = _ISSUES_PATH.match(path)
+    if match is None:
+        return value
+    served = {"repository_url": f"https://api.github.com/repos/{match.group(1)}"}
+    if isinstance(value, dict):
+        return {**served, **value}
+    if isinstance(value, list):
+        return [{**served, **item} if isinstance(item, dict) else item for item in value]
+    return value
+
+
 FOURTEEN = [f"org/repo{i}" for i in range(14)]
+
+#: The listing reads the milestone and backlog passes make. GitHub filters
+#: both by ``agent-ready``, so a page holds candidates (#3464).
+_BACKLOG = "/repos/o/r/issues?state=open&labels=agent-ready&per_page=5&sort=updated"
+_MILESTONES = "/repos/o/r/milestones?state=open&per_page=20"
+_MILESTONE_ISSUES = (
+    "/repos/o/r/issues?milestone=4&state=open&labels=agent-ready&per_page=10&sort=updated"
+)
 
 
 @pytest.mark.asyncio
@@ -387,7 +445,12 @@ async def test_diagnostics_say_when_nothing_could_be_confirmed(monkeypatch):
         "blockers_talon_owned": 0,
         "candidates_checked": 0,
         "candidates_unreadable": 0,
+        "eligibility_exclusions": [
+            {"repo": "o/r", "issue_number": 1, "reason": "issue_unreadable"},
+            {"repo": "o/r", "issue_number": 2, "reason": "issue_unreadable"},
+        ],
         "open_pr_exclusions": [],
+        "run_exclusions": [],
     }
 
 
@@ -410,7 +473,11 @@ async def test_a_closed_blocker_is_checked_but_not_unreadable(monkeypatch):
         "blockers_talon_owned": 0,
         "candidates_checked": 0,
         "candidates_unreadable": 0,
+        "eligibility_exclusions": [
+            {"repo": "o/r", "issue_number": 1, "reason": "closed", "state": "closed"},
+        ],
         "open_pr_exclusions": [],
+        "run_exclusions": [],
     }
 
 
@@ -488,8 +555,12 @@ async def test_an_instruction_or_a_finished_run_does_not_withhold(monkeypatch, l
     """``agent-ready`` tells Talon to skip clarification; it must still dispatch.
 
     ``agent-complete`` with no open PR (one closed unmerged, say) is not in
-    flight. An open PR withholds the issue by itself -- see the #3317 tests."""
-    _stub_github(monkeypatch, {"/repos/o/r/issues/1": _labelled(1, label)})
+    flight. An open PR withholds the issue by itself -- see the #3317 tests.
+    Every one of these sits beside ``agent-ready``: without it nothing is
+    dispatched (#3464)."""
+    _stub_github(
+        monkeypatch, {"/repos/o/r/issues/1": _labelled(1, "agent-ready", label)}
+    )
     data = {
         "morning_signal_config": {"scan_repos": ["o/r"]},
         "blockers": [{"severity": "critical", "issue": "o/r#1", "title": "t"}],
@@ -500,13 +571,24 @@ async def test_an_instruction_or_a_finished_run_does_not_withhold(monkeypatch, l
     assert picked is not None and picked["issue_number"] == 1
 
 
-def test_backlog_scan_skips_talon_owned_issues_too():
-    issues = [
-        _labelled(1, "agent-failed"),
-        _labelled(2, "agent-claimed"),
-        _open(3),
-    ]
-    assert [i["number"] for i in issue_selection._ranked_candidates(issues)] == [3]
+@pytest.mark.asyncio
+async def test_backlog_scan_skips_talon_owned_issues_too(monkeypatch):
+    _stub_github(monkeypatch, {_BACKLOG: [
+        _labelled(1, "agent-ready", "agent-failed"),
+        _labelled(2, "agent-ready", "agent-claimed"),
+        {**_open(3), "comments": 9},
+    ]})
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}}, diagnostics
+    )
+
+    assert picked is not None and picked["issue_number"] == 3
+    assert [
+        (e["issue_number"], e["reason"], e["labels"])
+        for e in diagnostics["eligibility_exclusions"]
+    ] == [(1, "talon_owned", ["agent-failed"]), (2, "talon_owned", ["agent-claimed"])]
 
 
 def test_talon_state_labels_match_talons_vocabulary():
@@ -589,7 +671,7 @@ async def test_the_backlog_scan_skips_an_issue_with_an_open_pr(monkeypatch):
     _stub_github(
         monkeypatch,
         {
-            "/repos/o/r/issues?state=open&per_page=5&sort=updated": [
+            _BACKLOG: [
                 {**_open(1), "comments": 0, "assignees": []},
                 {**_open(2), "comments": 3, "assignees": []},
             ],
@@ -611,10 +693,10 @@ async def test_the_milestone_scan_skips_an_issue_with_an_open_pr(monkeypatch):
     _stub_github(
         monkeypatch,
         {
-            "/repos/o/r/milestones?state=open&per_page=20": [
+            _MILESTONES: [
                 {"number": 4, "title": "Extraction"},
             ],
-            "/repos/o/r/issues?milestone=4&state=open&per_page=10&sort=updated": [
+            _MILESTONE_ISSUES: [
                 _open(11), _open(12),
             ],
         },
@@ -659,7 +741,7 @@ async def test_linkage_is_read_once_per_issue_across_passes(monkeypatch):
         monkeypatch,
         {
             "/repos/o/r/issues/5": _open(5),
-            "/repos/o/r/issues?state=open&per_page=5&sort=updated": [_open(5)],
+            _BACKLOG: [_open(5)],
         },
         calls,
         linked_prs={("o/r", 5): [_pr(6, updated_at=_fresh_now())]},
@@ -837,9 +919,6 @@ async def test_the_stalled_threshold_is_configurable(monkeypatch, configured, ex
 # #3367: unreadable linkage in the milestone/backlog passes is counted too
 # ---------------------------------------------------------------------------
 
-_BACKLOG = "/repos/o/r/issues?state=open&per_page=5&sort=updated"
-_MILESTONES = "/repos/o/r/milestones?state=open&per_page=20"
-_MILESTONE_ISSUES = "/repos/o/r/issues?milestone=4&state=open&per_page=10&sort=updated"
 
 
 @pytest.mark.asyncio
@@ -933,3 +1012,1318 @@ async def test_one_unreadable_candidate_among_in_flight_ones_is_counted(monkeypa
     ) is None
     assert diagnostics["candidates_checked"] == 3
     assert diagnostics["candidates_unreadable"] == 1
+
+
+# ---------------------------------------------------------------------------
+# #3398: an issue whose last Talon run asked a question is not dispatched
+# again until something newer than that run authorizes a retry
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from kestrel_sovereign.features.strategic_memory import run_history  # noqa: E402
+
+#: When #3093's last run (clarifying) finished on the live host.
+_RUN_ENDED = datetime(2026, 9, 24, 8, 41, tzinfo=timezone.utc)
+
+
+def _at(minutes):
+    """An ISO instant ``minutes`` after (negative: before) the run ended."""
+    return (_RUN_ENDED + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+
+
+def _run(issue, disposition="clarifying", *, repo="o/r", ended=_RUN_ENDED, job_id=None):
+    return run_history.TalonRun(
+        job_id=job_id or f"job-{issue}-{disposition}",
+        repo=repo,
+        issue_number=issue,
+        disposition=disposition,
+        completed_at=ended,
+    )
+
+
+def _history(*runs):
+    return run_history.RunHistory.from_runs(runs)
+
+
+def _activity(*nodes, last_edited_at=None):
+    """An ``issue`` node as the post-run activity query returns it."""
+    return {"lastEditedAt": last_edited_at, "timelineItems": {"nodes": list(nodes)}}
+
+
+def _comment(minutes, body="Please split this", association="OWNER"):
+    return {
+        "__typename": "IssueComment",
+        "createdAt": _at(minutes),
+        "authorAssociation": association,
+        "body": body,
+    }
+
+
+def _labeled(minutes, name):
+    return {"__typename": "LabeledEvent", "createdAt": _at(minutes), "label": {"name": name}}
+
+
+def _renamed(minutes):
+    return {"__typename": "RenamedTitleEvent", "createdAt": _at(minutes)}
+
+
+def _blockers(*issues):
+    return {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [
+            {"severity": "high", "issue": f"o/r#{n}", "title": f"row {n}"} for n in issues
+        ],
+    }
+
+
+#: What Talon itself leaves on an issue around the end of a run: its question,
+#: and the claim release posted on exit. Both under the operator's account.
+_TALON_OWN_COMMENTS = (
+    _comment(-1, "**Kestrel Talon Analyzing** | Session: `s`\n\n## Clarification Needed"),
+    _comment(1, "<!-- kestrel-talon:claim-released -->\n**Kestrel Talon claim released**"),
+)
+
+
+@pytest.mark.asyncio
+async def test_the_live_shape_an_answered_by_nobody_run_is_not_dispatched_again(monkeypatch):
+    """#3093 on 09-16, 09-23 and 09-24: open, a high blocker, no open PR, and
+    the Talon label cleared to mean "acknowledged". Every run ended with the
+    same question and no diff. Nothing since the last one changed its input,
+    so dispatching it again is the same run again."""
+    _stub_github(
+        monkeypatch,
+        {
+            "/repos/o/r/issues/3093": _open(3093, "Talon live progress"),
+            "/repos/o/r/issues/3094": _open(3094, "next"),
+        },
+        retry_evidence={("o/r", 3093): _activity(*_TALON_OWN_COMMENTS)},
+    )
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        _blockers(3093, 3094), diagnostics, run_history=_history(_run(3093, job_id="9a63c66b2b71"))
+    )
+
+    assert picked is not None and picked["issue_number"] == 3094
+    [exclusion] = diagnostics["run_exclusions"]
+    assert exclusion == {
+        "repo": "o/r",
+        "issue_number": 3093,
+        "reason": issue_selection.EXCLUDED_RUN_HISTORY,
+        "job_id": "9a63c66b2b71",
+        "disposition": "clarifying",
+        "completed_at": _RUN_ENDED.isoformat(),
+    }
+    assert issue_selection.describe_exclusion(exclusion) == (
+        "skipped o/r#3093 -- Talon job 9a63c66b ended clarifying at "
+        "2026-09-24 08:41 UTC without a PR, and nothing since authorizes a "
+        "retry (a maintainer or orchestrator comment, an issue edit, or agent-ready)"
+    )
+    # A real answer from GitHub, not an outage.
+    assert diagnostics["blockers_unreadable"] == 0
+    assert diagnostics["open_pr_exclusions"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["blocked", "clarifying"])
+async def test_a_board_whose_only_candidate_awaits_an_answer_selects_nothing(
+    monkeypatch, disposition
+):
+    _stub_github(monkeypatch, {"/repos/o/r/issues/3093": _open(3093)})
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(3093), diagnostics, run_history=_history(_run(3093, disposition))
+    ) is None
+    [exclusion] = diagnostics["run_exclusions"]
+    assert exclusion["disposition"] == disposition
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "activity",
+    [
+        pytest.param(_activity(_comment(5)), id="owner-comment"),
+        pytest.param(_activity(_comment(5, association="MEMBER")), id="member-comment"),
+        pytest.param(_activity(_comment(5, association="COLLABORATOR")), id="orchestrator-comment"),
+        pytest.param(_activity(last_edited_at=_at(5)), id="body-edit"),
+        pytest.param(_activity(_renamed(5)), id="title-change"),
+        pytest.param(_activity(_labeled(5, "agent-ready")), id="readiness-label"),
+        pytest.param(_activity(_labeled(5, "Agent-Ready")), id="readiness-label-case"),
+        pytest.param(
+            _activity(_comment(5), *_TALON_OWN_COMMENTS), id="answer-among-talon-comments"
+        ),
+    ],
+)
+async def test_something_newer_than_the_run_authorizes_a_retry(monkeypatch, activity):
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/3093": _open(3093)},
+        retry_evidence={("o/r", 3093): activity},
+    )
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        _blockers(3093), diagnostics, run_history=_history(_run(3093))
+    )
+
+    assert picked is not None and picked["issue_number"] == 3093
+    assert diagnostics["run_exclusions"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "activity",
+    [
+        pytest.param(_activity(), id="nothing"),
+        pytest.param(_activity(_comment(-5)), id="comment-before-the-run-ended"),
+        pytest.param(_activity(_comment(0)), id="comment-at-the-same-instant"),
+        pytest.param(_activity(_comment(5, association="NONE")), id="stranger-comment"),
+        pytest.param(
+            _activity(_comment(5, association="CONTRIBUTOR")), id="contributor-comment"
+        ),
+        pytest.param(
+            _activity(_comment(5, association="FIRST_TIME_CONTRIBUTOR")),
+            id="first-time-contributor-comment",
+        ),
+        pytest.param(_activity(*_TALON_OWN_COMMENTS), id="talon-own-comments"),
+        pytest.param(
+            _activity(_comment(5, "  **Kestrel Talon Blocked** | Session: `s`")),
+            id="talon-blocked-comment-after",
+        ),
+        pytest.param(_activity(_labeled(5, "agent-blocked")), id="talon-label"),
+        pytest.param(_activity(_labeled(5, "bug")), id="unrelated-label"),
+        pytest.param(_activity(_labeled(-5, "agent-ready")), id="readiness-label-before"),
+        pytest.param(_activity(last_edited_at=_at(-5)), id="edit-before-the-run-ended"),
+        pytest.param(_activity(_renamed(-5)), id="title-change-before"),
+        pytest.param(
+            _activity({"__typename": "IssueComment", "authorAssociation": "OWNER", "body": "x"}),
+            id="comment-without-a-timestamp",
+        ),
+    ],
+)
+async def test_nothing_newer_from_the_repository_withholds(monkeypatch, activity):
+    """Removing ``agent-blocked`` is deliberately absent from the authorizers:
+    it has meant both "retry" and "stop" (#3398). The query does not even ask
+    for unlabel events."""
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/3093": _open(3093)},
+        retry_evidence={("o/r", 3093): activity},
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(3093), diagnostics, run_history=_history(_run(3093))
+    ) is None
+    [exclusion] = diagnostics["run_exclusions"]
+    assert exclusion["reason"] == issue_selection.EXCLUDED_RUN_HISTORY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["completed", "failed", "unknown"])
+async def test_a_run_that_did_not_stop_on_a_question_does_not_withhold(
+    monkeypatch, disposition
+):
+    """``failed`` keeps its own gate -- Talon's ``agent-failed`` label (#3294) --
+    and ``unknown`` is not evidence that the run asked anything."""
+    calls = []
+    _stub_github(monkeypatch, {"/repos/o/r/issues/3093": _open(3093)}, calls)
+
+    picked = await issue_selection.pick_top_issue(
+        _blockers(3093), run_history=_history(_run(3093, disposition))
+    )
+
+    assert picked is not None and picked["issue_number"] == 3093
+    assert ("activity", "o/r", 3093) not in calls
+
+
+@pytest.mark.asyncio
+async def test_an_issue_with_no_talon_run_is_never_asked_about(monkeypatch):
+    calls = []
+    _stub_github(monkeypatch, {"/repos/o/r/issues/7": _open(7)}, calls)
+
+    picked = await issue_selection.pick_top_issue(
+        _blockers(7), run_history=_history(_run(3093, "blocked"))
+    )
+
+    assert picked is not None and picked["issue_number"] == 7
+    assert not any(call[0] == "activity" for call in calls if isinstance(call, tuple))
+
+
+@pytest.mark.asyncio
+async def test_without_a_run_history_there_is_no_last_run(monkeypatch):
+    _stub_github(monkeypatch, {"/repos/o/r/issues/3093": _open(3093)})
+
+    picked = await issue_selection.pick_top_issue(_blockers(3093))
+
+    assert picked is not None and picked["issue_number"] == 3093
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runs, withheld",
+    [
+        pytest.param(
+            [_run(1, "blocked", ended=_RUN_ENDED - timedelta(days=2)), _run(1, "completed")],
+            False,
+            id="a-later-completed-run-supersedes-a-blocked-one",
+        ),
+        pytest.param(
+            [_run(1, "completed", ended=_RUN_ENDED - timedelta(days=2)), _run(1, "blocked")],
+            True,
+            id="a-later-blocked-run-supersedes-a-completed-one",
+        ),
+    ],
+)
+async def test_the_most_recent_run_decides(monkeypatch, runs, withheld):
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": _open(1)})
+
+    picked = await issue_selection.pick_top_issue(_blockers(1), run_history=_history(*runs))
+
+    assert (picked is None) is withheld
+
+
+@pytest.mark.asyncio
+async def test_the_retry_window_starts_at_the_most_recent_run(monkeypatch):
+    """A comment that authorized the 09-23 run does not authorize another
+    after the 09-24 run asked again: the earlier answer was already read."""
+    first = _run(1, "blocked", ended=_RUN_ENDED - timedelta(days=1))
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/1": _open(1)},
+        retry_evidence={("o/r", 1): _activity(_comment(-60 * 12))},
+    )
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(1), run_history=_history(first)
+    ) is not None
+    assert await issue_selection.pick_top_issue(
+        _blockers(1), run_history=_history(first, _run(1, "clarifying"))
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_the_registry_and_the_ledger_need_not_agree_on_case(monkeypatch):
+    _stub_github(monkeypatch, {"/repos/O/R/issues/5": _open(5)})
+    data = {
+        "morning_signal_config": {"scan_repos": ["O/R"]},
+        "blockers": [{"severity": "high", "issue": "O/R#5", "title": "x"}],
+    }
+
+    assert await issue_selection.pick_top_issue(
+        data, run_history=_history(_run(5, "blocked", repo="o/r"))
+    ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        RuntimeError("502"),
+    ],
+)
+async def test_unreadable_post_run_activity_withholds_and_counts_as_unreadable(
+    monkeypatch, failure
+):
+    """"Could not tell whether anyone answered" is not "someone answered", and
+    an outage must still render as one rather than as nothing to do."""
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/3093": _open(3093)},
+        retry_evidence={("o/r", 3093): failure},
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(3093), diagnostics, run_history=_history(_run(3093, "blocked"))
+    ) is None
+    assert diagnostics["blockers_checked"] == 1
+    assert diagnostics["blockers_unreadable"] == 1
+    [exclusion] = diagnostics["run_exclusions"]
+    assert exclusion["reason"] == issue_selection.EXCLUDED_RUN_HISTORY_UNCONFIRMED
+    assert issue_selection.describe_exclusion(exclusion).endswith(
+        "and GitHub could not say whether anything since authorizes a retry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_open_pr_is_reported_instead_of_the_run(monkeypatch):
+    """One reason per skip: a PR already working the issue is the stronger
+    fact, and the post-run read is not spent on it."""
+    calls = []
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/1": _open(1)},
+        calls,
+        linked_prs={("o/r", 1): [_pr(2, updated_at=_fresh_now())]},
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(1), diagnostics, run_history=_history(_run(1, "blocked"))
+    ) is None
+    assert len(diagnostics["open_pr_exclusions"]) == 1
+    assert diagnostics["run_exclusions"] == []
+    assert ("activity", "o/r", 1) not in calls
+
+
+@pytest.mark.asyncio
+async def test_a_talon_state_label_still_withholds_first(monkeypatch):
+    calls = []
+    _stub_github(
+        monkeypatch, {"/repos/o/r/issues/1": _labelled(1, "agent-clarifying")}, calls
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(1), diagnostics, run_history=_history(_run(1))
+    ) is None
+    assert diagnostics["blockers_talon_owned"] == 1
+    assert diagnostics["run_exclusions"] == []
+    assert ("activity", "o/r", 1) not in calls
+
+
+@pytest.mark.asyncio
+async def test_the_backlog_scan_skips_an_issue_awaiting_an_answer(monkeypatch):
+    _stub_github(monkeypatch, {_BACKLOG: [_open(1), {**_open(2), "comments": 3}]})
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}},
+        diagnostics,
+        run_history=_history(_run(1, "blocked")),
+    )
+
+    assert picked is not None and picked["issue_number"] == 2
+    assert [e["issue_number"] for e in diagnostics["run_exclusions"]] == [1]
+    assert diagnostics["candidates_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_milestone_scan_skips_an_issue_awaiting_an_answer(monkeypatch):
+    _stub_github(
+        monkeypatch,
+        {
+            _MILESTONES: [{"number": 4, "title": "Extraction"}],
+            _MILESTONE_ISSUES: [_open(11), _open(12)],
+        },
+    )
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "milestones": [{"name": "Extraction", "status": "at_risk", "repos": ["o/r"]}],
+    }
+
+    picked = await issue_selection.pick_top_issue(
+        data, run_history=_history(_run(11, "clarifying"))
+    )
+
+    assert picked is not None and picked["issue_number"] == 12
+
+
+@pytest.mark.asyncio
+async def test_unreadable_post_run_activity_in_the_backlog_is_counted(monkeypatch):
+    _stub_github(
+        monkeypatch, {_BACKLOG: [_open(1)]}, retry_evidence={("o/r", 1): None}
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}},
+        diagnostics,
+        run_history=_history(_run(1, "blocked")),
+    ) is None
+    assert diagnostics["candidates_checked"] == 1
+    assert diagnostics["candidates_unreadable"] == 1
+
+
+@pytest.mark.asyncio
+async def test_post_run_activity_is_read_once_per_issue_across_passes(monkeypatch):
+    calls = []
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/5": _open(5), _BACKLOG: [_open(5)]},
+        calls,
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(5), diagnostics, run_history=_history(_run(5, "blocked"))
+    ) is None
+    assert calls.count(("activity", "o/r", 5)) == 1, calls
+    assert len(diagnostics["run_exclusions"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"errors": [{"message": "Could not resolve to a Repository"}]},
+        {
+            "data": {"repository": {"issue": _activity()}},
+            "errors": [{"message": "Resource not accessible by integration"}],
+        },
+        {"data": {"repository": None}},
+        {"data": {"repository": {"issue": None}}},
+        {"data": {"repository": {"issue": {"lastEditedAt": None}}}},
+        {"data": {"repository": {"issue": {"timelineItems": {"nodes": None}}}}},
+        [],
+        None,
+    ],
+)
+async def test_a_graphql_answer_without_activity_is_unreadable_not_empty(
+    monkeypatch, response
+):
+    """An empty timeline is "nobody answered"; a missing one is no answer."""
+    monkeypatch.setattr(
+        issue_selection, "github_api_post", AsyncMock(return_value=response)
+    )
+
+    assert await issue_selection._fetch_retry_evidence("o/r", 1, "t") is None
+
+
+@pytest.mark.asyncio
+async def test_the_activity_query_names_the_issue_it_is_asked_about(monkeypatch):
+    post = AsyncMock(return_value={"data": {"repository": {"issue": _activity(
+        _comment(1), last_edited_at=_at(2),
+    )}}})
+    monkeypatch.setattr(issue_selection, "github_api_post", post)
+
+    evidence = await issue_selection._fetch_retry_evidence("Kestrel.AI/kestrel-x", 3093, "t")
+
+    assert evidence == {"last_edited_at": _at(2), "timeline": [_comment(1)]}
+    path, token, body = post.await_args.args
+    assert (path, token) == ("/graphql", "t")
+    assert body["variables"] == {"owner": "Kestrel.AI", "name": "kestrel-x", "number": 3093}
+    for field in ("lastEditedAt", "ISSUE_COMMENT", "LABELED_EVENT", "RENAMED_TITLE_EVENT",
+                  "authorAssociation"):
+        assert field in body["query"], field
+
+
+def test_the_retry_vocabulary_matches_talons():
+    """Copies of kestrel-feature-talon / kestrel-talon vocabulary, pinned here
+    because core cannot import either package. Change both or neither."""
+    # kestrel_feature_talon/run_disposition.py BLOCKED, CLARIFYING
+    assert run_history.QUESTION_DISPOSITIONS == frozenset({"blocked", "clarifying"})
+    # kestrel_feature_talon/wait_provider.py TalonWaitable.kind
+    assert run_history.TALON_WAIT_KIND == "talon"
+    # kestreltalon/models.py TALON_COMMENT_MARKER; claim_record.py markers
+    assert issue_selection.TALON_COMMENT_PREFIXES == (
+        "**Kestrel Talon",
+        "<!-- kestrel-talon:",
+    )
+    # kestreltalon/processor.py: "agent-ready" in context.labels skips clarification
+    assert issue_selection.RETRY_READINESS_LABELS == frozenset({"agent-ready"})
+
+
+# ---------------------------------------------------------------------------
+# #3464: an allow-list -- open, agent-ready, in the scanned repository that is
+# the dispatch target -- decided before any candidate is ranked
+# ---------------------------------------------------------------------------
+
+
+def _reasons(diagnostics):
+    return [
+        (e["repo"], e["issue_number"], e["reason"])
+        for e in diagnostics["eligibility_exclusions"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_live_shape_a_blocker_on_an_issue_not_agent_ready_is_skipped(monkeypatch):
+    """10-03: ``mode='suggest'`` picked #3319, a ``bug``-only issue whose fix
+    belonged to kestrel-talon, on the strength of a high ledger row. The row
+    is a note about the issue; it does not authorize work on it."""
+    calls = []
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/3319": _labelled(3319, "bug", title="resume burns iterations")},
+        calls,
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(_blockers(3319), diagnostics) is None
+    assert _reasons(diagnostics) == [("o/r", 3319, "not_agent_ready")]
+    [exclusion] = diagnostics["eligibility_exclusions"]
+    assert issue_selection.describe_exclusion(exclusion) == (
+        "skipped o/r#3319 -- not labelled agent-ready"
+    )
+    # Refused before ranking, so nothing downstream spends a read on it.
+    assert not [c for c in calls if isinstance(c, tuple)], calls
+    # GitHub answered; this is not an outage.
+    assert diagnostics["blockers_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_agent_ready_issue_in_an_unscanned_repository_is_wrong_repo(monkeypatch):
+    """A row naming its own repository used to be dispatched without the scan
+    list. That is the row that sends work to a repository this agent was never
+    asked to work in -- and it is never even read."""
+    calls = []
+    _stub_github(
+        monkeypatch, {"/repos/o/talon/issues/35": _open(35, "the real fix")}, calls
+    )
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/core"]},
+        "blockers": [{"severity": "critical", "issue": "o/talon#35", "title": "x"}],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert _reasons(diagnostics) == [("o/talon", 35, "wrong_repo")]
+    assert issue_selection.describe_exclusion(diagnostics["eligibility_exclusions"][0]) == (
+        "skipped o/talon#35 -- o/talon is not in morning_signal_config.scan_repos"
+    )
+    assert "/repos/o/talon/issues/35" not in calls
+    assert diagnostics["blockers_checked"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_number_from_a_reference_to_another_repository_is_not_dispatched_here(
+    monkeypatch,
+):
+    """``repo: o/core`` with ``issue: o/talon#35`` used to dispatch o/core#35:
+    an unrelated issue that happens to share the number. Both repositories are
+    scanned, both issues are agent-ready, and neither is dispatched by this
+    row."""
+    calls = []
+    _stub_github(
+        monkeypatch,
+        {
+            "/repos/o/core/issues/35": _open(35, "unrelated"),
+            "/repos/o/talon/issues/35": _open(35, "the real fix"),
+        },
+        calls,
+    )
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/core", "o/talon"]},
+        "blockers": [
+            {"severity": "high", "repo": "o/core", "issue": "o/talon#35", "title": "x"},
+        ],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert _reasons(diagnostics) == [("o/core", 35, "wrong_repo")]
+    assert "in another repository" in issue_selection.describe_exclusion(
+        diagnostics["eligibility_exclusions"][0]
+    )
+    assert not any("/issues/35" in c for c in calls if isinstance(c, str)), calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("moved_to", [35, 3093], ids=["renumbered", "same-number"])
+async def test_an_issue_github_serves_from_another_repository_is_wrong_repo(
+    monkeypatch, moved_to
+):
+    """GitHub follows a transferred issue's redirect: asking o/core for #3093
+    answers with the issue it moved to. That issue is open and agent-ready --
+    and it is not the dispatch target, whose repository does not own it, even
+    when the number happens to match."""
+    moved = {
+        **_open(moved_to, "Talon live progress"),
+        "repository_url": "https://api.github.com/repos/o/talon",
+    }
+    _stub_github(monkeypatch, {"/repos/o/core/issues/3093": moved})
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/core", "o/talon"]},
+        "blockers": [{"severity": "high", "issue": "o/core#3093", "title": "x"}],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert _reasons(diagnostics) == [("o/core", 3093, "wrong_repo")]
+    assert issue_selection.describe_exclusion(diagnostics["eligibility_exclusions"][0]) == (
+        f"skipped o/core#3093 -- GitHub serves it as o/talon#{moved_to}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "row",
+    [
+        pytest.param({"issue": "talon#5"}, id="lone-scanned-repo"),
+        # ``strategy_add_blocker`` binds the lone scanned repo into ``repo``
+        # when the reference is not ``owner/repo``, so the stored row names
+        # this repository and still means Talon's issue 5.
+        pytest.param({"issue": "talon#5", "repo": "o/core"}, id="bound-at-write"),
+    ],
+)
+async def test_a_short_reference_to_another_repository_is_wrong_repo(monkeypatch, row):
+    """``talon#5`` is Talon's issue 5. With one scanned repository it read as
+    a bare ``#5`` there, so an unrelated agent-ready o/core#5 took the row's
+    number and its critical severity."""
+    calls = []
+    _stub_github(monkeypatch, {"/repos/o/core/issues/5": _open(5, "unrelated")}, calls)
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/core"]},
+        "blockers": [{"severity": "critical", "title": "Talon's 5", **row}],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert _reasons(diagnostics) == [("o/core", 5, "wrong_repo")]
+    assert issue_selection.describe_exclusion(diagnostics["eligibility_exclusions"][0]) == (
+        "skipped o/core#5 -- the ledger row's issue reference names talon, not o/core"
+    )
+    assert "/repos/o/core/issues/5" not in calls
+
+
+@pytest.mark.asyncio
+async def test_another_owners_repository_inside_prose_is_wrong_repo(monkeypatch):
+    """``parse_issue_ref`` reads ``blocked by other/core#5`` as prose with a
+    number, and the repository's name alone matches o/core's. Its owner does
+    not."""
+    _stub_github(monkeypatch, {"/repos/o/core/issues/5": _open(5)})
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/core"]},
+        "blockers": [
+            {"severity": "high", "issue": "blocked by other/core#5", "title": "x"},
+        ],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert issue_selection.describe_exclusion(diagnostics["eligibility_exclusions"][0]) == (
+        "skipped o/core#5 -- the ledger row's issue reference names other/core, "
+        "not o/core"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "issue_ref",
+    ["core#5", "Core#5", "#5", "5", "Issue #5", "o/core#5", "blocked by O/Core#5"],
+)
+async def test_a_reference_naming_this_repository_or_none_is_not_refused(
+    monkeypatch, issue_ref
+):
+    _stub_github(monkeypatch, {"/repos/o/core/issues/5": _open(5)})
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/core"]},
+        "blockers": [{"severity": "high", "issue": issue_ref, "title": "x"}],
+    }
+
+    picked = await issue_selection.pick_top_issue(data)
+
+    assert picked is not None and picked["issue_number"] == 5
+
+
+@pytest.mark.asyncio
+async def test_a_qualified_reference_is_judged_by_its_repository_not_its_name(
+    monkeypatch,
+):
+    """``other/core#5`` names its repository in full: it is refused because
+    other/core is not scanned, not waved through because its short name
+    matches o/core's."""
+    _stub_github(monkeypatch, {"/repos/o/core/issues/5": _open(5)})
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/core"]},
+        "blockers": [
+            {"severity": "high", "issue": "other/core#5", "repo": "o/core", "title": "x"},
+        ],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert _reasons(diagnostics) == [("o/core", 5, "wrong_repo")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("severity", [["high"], {"level": "high"}, None, 3, "medium"])
+async def test_a_row_without_a_blocker_severity_is_not_a_blocker(monkeypatch, severity):
+    """Hand-edited YAML: a list or mapping where a severity belongs skipped the
+    row before the allow-list, and must not now crash the dispatch."""
+    calls = []
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": _open(1)}, calls)
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [{"severity": severity, "issue": "o/r#1", "title": "x"}],
+    }
+
+    assert await issue_selection.pick_top_issue(data) is None
+    assert "/repos/o/r/issues/1" not in calls
+
+
+@pytest.mark.asyncio
+async def test_string_labels_are_read_by_eligibility_and_ranking_alike(monkeypatch):
+    """One label reader: a shape the allow-list accepts must not crash the
+    ranking that follows it."""
+    _stub_github(monkeypatch, {_BACKLOG: [
+        {**_open(1), "labels": ["agent-ready", "wontfix"]},
+        {**_open(2), "labels": ["agent-ready", {"color": "ededed"}]},
+    ]})
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}}
+    )
+
+    assert picked is not None and picked["issue_number"] == 2
+
+
+@pytest.mark.asyncio
+async def test_an_answer_about_a_different_number_is_wrong_repo(monkeypatch):
+    """The answer must be the issue asked about, number included: a dispatch
+    of o/r#1 works from whatever this read returned."""
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": _open(36)})
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(_blockers(1), diagnostics) is None
+    assert issue_selection.describe_exclusion(diagnostics["eligibility_exclusions"][0]) == (
+        "skipped o/r#1 -- GitHub serves it as o/r#36"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_issue_github_does_not_place_in_a_repository_is_wrong_repo(monkeypatch):
+    """What GitHub did not state is refused, for the action that writes code."""
+    _stub_github(
+        monkeypatch, {"/repos/o/r/issues/1": {**_open(1), "repository_url": None}}
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(_blockers(1), diagnostics) is None
+    assert _reasons(diagnostics) == [("o/r", 1, "wrong_repo")]
+    assert issue_selection.describe_exclusion(diagnostics["eligibility_exclusions"][0]) == (
+        "skipped o/r#1 -- GitHub did not say which repository serves it"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "issue, reason, text",
+    [
+        pytest.param(
+            {**_open(1), "state": "closed"}, "closed", "skipped o/r#1 -- closed",
+            id="closed",
+        ),
+        pytest.param(
+            {**_open(1), "state": "unknown"}, "closed",
+            "skipped o/r#1 -- GitHub does not report it open (state 'unknown')",
+            id="state-not-open",
+        ),
+        pytest.param(
+            {**_open(1), "pull_request": {"url": "..."}}, "not_an_issue",
+            "skipped o/r#1 -- a pull request, not an issue",
+            id="pull-request",
+        ),
+        pytest.param(
+            None, "issue_unreadable", "skipped o/r#1 -- GitHub could not return the issue",
+            id="unreadable",
+        ),
+        pytest.param(
+            _labelled(1, "agent-ready", "agent-blocked"), "talon_owned",
+            "skipped o/r#1 -- Talon labels agent-blocked; the decision belongs to "
+            "whoever reads Talon's comment",
+            id="talon-owned",
+        ),
+    ],
+)
+async def test_each_refusal_is_named(monkeypatch, issue, reason, text):
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": issue})
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(_blockers(1), diagnostics) is None
+    [exclusion] = diagnostics["eligibility_exclusions"]
+    assert exclusion["reason"] == reason
+    assert issue_selection.describe_exclusion(exclusion) == text
+
+
+@pytest.mark.asyncio
+async def test_a_bare_number_among_several_repositories_is_named_wrong_repo(monkeypatch):
+    calls = []
+    _stub_github(monkeypatch, {}, calls)
+    data = {
+        "morning_signal_config": {"scan_repos": FOURTEEN},
+        "blockers": [{"severity": "high", "issue": "#2665", "title": "x"}],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    [exclusion] = diagnostics["eligibility_exclusions"]
+    assert (exclusion["repo"], exclusion["reason"]) == (None, "wrong_repo")
+    assert issue_selection.describe_exclusion(exclusion) == (
+        "skipped #2665 -- the ledger row names no repository, and 14 are scanned"
+    )
+    assert not any("/issues/2665" in c for c in calls), calls
+
+
+@pytest.mark.asyncio
+async def test_a_higher_severity_ineligible_row_does_not_outrank_a_lower_eligible_one(
+    monkeypatch,
+):
+    """Severity orders; it never authorizes. The critical row is ranked first
+    in the ledger and refused all the same, and the high row behind it is the
+    pick."""
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _labelled(1, "bug"),
+        "/repos/o/r/issues/2": _open(2, "authorized"),
+    })
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [
+            {"severity": "critical", "issue": "o/r#1", "title": "loud"},
+            {"severity": "high", "issue": "o/r#2", "title": "quiet"},
+        ],
+    }
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(data, diagnostics)
+
+    assert picked is not None and picked["issue_number"] == 2
+    assert "severity: high" in picked["context"]
+    assert _reasons(diagnostics) == [("o/r", 1, "not_agent_ready")]
+
+
+@pytest.mark.asyncio
+async def test_severity_orders_the_eligible_blockers(monkeypatch):
+    """Among eligible issues the most severe row wins, wherever it sits in the
+    ledger -- and an issue takes the most severe of the rows that name it."""
+    calls = []
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _open(1, "high only"),
+        "/repos/o/r/issues/2": _open(2, "named twice"),
+    }, calls)
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [
+            {"severity": "high", "issue": "o/r#1", "title": "first row"},
+            {"severity": "high", "issue": "o/r#2", "title": "high row"},
+            {"severity": "critical", "issue": "o/r#2", "title": "critical row"},
+        ],
+    }
+
+    picked = await issue_selection.pick_top_issue(data)
+
+    assert picked["issue_number"] == 2
+    assert picked["context"].startswith("Blocker (severity: critical): critical row.")
+    assert calls.count("/repos/o/r/issues/2") == 1, calls
+
+
+@pytest.mark.asyncio
+async def test_every_blocker_is_allow_listed_before_any_is_ranked(monkeypatch):
+    """A suggest run reports every refusal, not only those ranked above the
+    pick: the allow-list is decided for all candidates first."""
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _open(1, "pick"),
+        "/repos/o/r/issues/2": _labelled(2, "bug"),
+        "/repos/o/r/issues/3": _closed(3),
+    })
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(_blockers(1, 2, 3), diagnostics)
+
+    assert picked["issue_number"] == 1
+    assert _reasons(diagnostics) == [
+        ("o/r", 2, "not_agent_ready"),
+        ("o/r", 3, "closed"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_no_eligible_candidate_selects_nothing_and_falls_back_to_no_row(monkeypatch):
+    """When nothing passes the answer is no dispatch -- not the top ledger row,
+    and not a read spent asking whether a refused issue is in flight."""
+    calls = []
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _labelled(1, "bug"),
+        "/repos/o/r/issues/2": _closed(2),
+        _BACKLOG: [],
+    }, calls)
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [
+            {"severity": "critical", "issue": "o/r#1", "title": "top row"},
+            {"severity": "high", "issue": "o/r#2", "title": "next row"},
+            {"severity": "high", "issue": "o/elsewhere#3", "title": "far row"},
+        ],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert sorted(_reasons(diagnostics)) == [
+        ("o/elsewhere", 3, "wrong_repo"),
+        ("o/r", 1, "not_agent_ready"),
+        ("o/r", 2, "closed"),
+    ]
+    assert not [c for c in calls if isinstance(c, tuple)], calls
+    assert diagnostics["open_pr_exclusions"] == diagnostics["run_exclusions"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_issue_is_reported_once(monkeypatch):
+    """The ledger only grows: on the live host twelve rows named one target.
+    A refusal is one line per issue and reason, across rows and passes."""
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _labelled(1, "agent-ready", "agent-claimed"),
+        _BACKLOG: [_labelled(1, "agent-ready", "agent-claimed")],
+    })
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": (
+            [{"severity": "high", "issue": "o/r#1", "title": f"row {i}"} for i in range(3)]
+            + [{"severity": "high", "issue": "o/x#2", "title": f"far {i}"} for i in range(3)]
+        ),
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert _reasons(diagnostics) == [("o/x", 2, "wrong_repo"), ("o/r", 1, "talon_owned")]
+
+
+@pytest.mark.asyncio
+async def test_the_allow_list_runs_before_the_run_history_gate(monkeypatch):
+    """#3398's gate is the second filter: an issue the allow-list refuses is
+    never asked about its Talon runs, and one it admits still is."""
+    calls = []
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _labelled(1, "bug"),
+        "/repos/o/r/issues/2": _open(2),
+    }, calls)
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(1, 2),
+        diagnostics,
+        run_history=_history(_run(1, "blocked"), _run(2, "clarifying")),
+    ) is None
+    assert _reasons(diagnostics) == [("o/r", 1, "not_agent_ready")]
+    assert [(e["issue_number"], e["reason"]) for e in diagnostics["run_exclusions"]] == [
+        (2, "run_history"),
+    ]
+    assert ("activity", "o/r", 1) not in calls
+    assert ("activity", "o/r", 2) in calls
+
+
+@pytest.mark.asyncio
+async def test_the_listing_passes_read_only_agent_ready_issues(monkeypatch):
+    """The backlog and milestone reads ask GitHub for agent-ready issues, and
+    selection still checks what comes back: a page is not an authorization."""
+    calls = []
+    _stub_github(monkeypatch, {
+        _MILESTONES: [{"number": 4, "title": "Extraction"}],
+        _MILESTONE_ISSUES: [_labelled(11, "bug")],
+        _BACKLOG: [_labelled(12, "bug"), {**_open(13), "comments": 7}],
+    }, calls)
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "milestones": [{"name": "Extraction", "status": "at_risk", "repos": ["o/r"]}],
+    }
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(data, diagnostics)
+
+    assert picked is not None and picked["issue_number"] == 13
+    assert _reasons(diagnostics) == [
+        ("o/r", 11, "not_agent_ready"),
+        ("o/r", 12, "not_agent_ready"),
+    ]
+    assert _MILESTONE_ISSUES in calls and _BACKLOG in calls
+    assert ("graphql", "o/r", 11) not in calls
+    assert ("graphql", "o/r", 12) not in calls
+
+
+@pytest.mark.asyncio
+async def test_a_milestone_repository_outside_the_scan_list_is_not_read(monkeypatch):
+    calls = []
+    _stub_github(monkeypatch, {}, calls)
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "milestones": [{"name": "X", "status": "at_risk", "repos": ["o/elsewhere"]}],
+    }
+
+    assert await issue_selection.pick_top_issue(data) is None
+    assert not any(c.startswith("/repos/o/elsewhere") for c in calls if isinstance(c, str))
+
+
+@pytest.mark.asyncio
+async def test_a_scanned_repository_is_matched_whatever_its_case(monkeypatch):
+    """GitHub names are case-insensitive. The pick uses scan_repos' spelling,
+    which is the one every other read in the run uses."""
+    _stub_github(monkeypatch, {"/repos/Org/Core/issues/5": _open(5)})
+    data = {
+        "morning_signal_config": {"scan_repos": ["Org/Core"]},
+        "blockers": [{"severity": "high", "issue": "org/core#5", "title": "x"}],
+    }
+
+    picked = await issue_selection.pick_top_issue(data)
+
+    assert picked is not None
+    assert (picked["repo"], picked["issue_number"]) == ("Org/Core", 5)
+
+
+def test_agent_ready_is_the_label_talon_reads():
+    """kestreltalon/processor.py: ``agent-ready`` in context.labels. Change
+    both or neither."""
+    assert issue_selection.AGENT_READY_LABEL == "agent-ready"
+
+
+# ---------------------------------------------------------------------------
+# #3468: epics and the Sovereign's issues are refused before ranking
+# ---------------------------------------------------------------------------
+
+
+def _assigned(issue, *logins):
+    return {**issue, "assignees": [{"login": login} for login in logins]}
+
+
+def _sovereign_config(login="UncleSaurus", **extra):
+    config = {"scan_repos": ["o/r"], **extra}
+    if login is not None:
+        config["sovereign_login"] = login
+    return config
+
+
+@pytest.mark.asyncio
+async def test_the_live_shape_an_agent_ready_epic_is_skipped(monkeypatch):
+    """10-03, the first suggest run after #3464: #375, open and agent-ready,
+    was the top issue -- an epic, which no single claim can finish. The
+    unassigned agent-ready issue behind it is the pick."""
+    calls = []
+    _stub_github(monkeypatch, {_BACKLOG: [
+        _assigned(
+            _labelled(375, "agent-ready", "epic", title="Epic: Incubator"),
+            "UncleSaurus",
+        ),
+        {**_open(400, "bounded"), "assignees": [], "comments": 2},
+    ]}, calls)
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": _sovereign_config()}, diagnostics
+    )
+
+    assert picked is not None and picked["issue_number"] == 400
+    assert _reasons(diagnostics) == [("o/r", 375, "epic")]
+    assert issue_selection.describe_exclusion(
+        diagnostics["eligibility_exclusions"][0]
+    ) == (
+        "skipped o/r#375 -- labelled epic; an epic is not a unit of work one "
+        "claim can finish"
+    )
+    # Refused before ranking: no read is spent asking whether it is in flight.
+    assert ("graphql", "o/r", 375) not in calls
+    assert diagnostics["candidates_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_epic_blocker_does_not_outrank_a_bounded_one(monkeypatch):
+    """The critical row names an unassigned, agent-ready epic. Severity orders
+    eligible blockers; it cannot make an epic one."""
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _labelled(1, "agent-ready", "Epic"),
+        "/repos/o/r/issues/2": _open(2, "bounded"),
+    })
+    data = {
+        "morning_signal_config": _sovereign_config(),
+        "blockers": [
+            {"severity": "critical", "issue": "o/r#1", "title": "epic row"},
+            {"severity": "high", "issue": "o/r#2", "title": "bounded row"},
+        ],
+    }
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(data, diagnostics)
+
+    assert picked is not None and picked["issue_number"] == 2
+    assert _reasons(diagnostics) == [("o/r", 1, "epic")]
+    assert diagnostics["blockers_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured", ["UncleSaurus", "unclesaurus", "@UncleSaurus"])
+async def test_an_issue_assigned_to_the_sovereign_is_skipped(monkeypatch, configured):
+    """An issue assigned to the Sovereign is the Sovereign's work. The login
+    comes from config, matched as GitHub matches logins: case-insensitively."""
+    calls = []
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _assigned(_open(1, "theirs"), "UncleSaurus"),
+        "/repos/o/r/issues/2": _open(2, "ours"),
+    }, calls)
+    data = {
+        "morning_signal_config": _sovereign_config(configured),
+        "blockers": [
+            {"severity": "critical", "issue": "o/r#1", "title": "top row"},
+            {"severity": "high", "issue": "o/r#2", "title": "next row"},
+        ],
+    }
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(data, diagnostics)
+
+    assert picked is not None and picked["issue_number"] == 2
+    assert _reasons(diagnostics) == [("o/r", 1, "sovereign_assigned")]
+    [exclusion] = diagnostics["eligibility_exclusions"]
+    assert exclusion["assignees"] == ["UncleSaurus"]
+    assert issue_selection.describe_exclusion(exclusion) == (
+        f"skipped o/r#1 -- assigned to UncleSaurus; {configured.lstrip('@')} is "
+        "the Sovereign"
+    )
+    assert ("graphql", "o/r", 1) not in calls
+
+
+@pytest.mark.asyncio
+async def test_an_issue_assigned_to_someone_else_stays_eligible(monkeypatch):
+    """With the Sovereign's login configured, only their assignment withholds
+    an issue; ranking still prefers the unassigned one."""
+    _stub_github(monkeypatch, {_BACKLOG: [
+        _assigned({**_open(1), "comments": 0}, "UncleSaurus", "helper"),
+        _assigned({**_open(2), "comments": 0}, "helper"),
+        {**_open(3), "assignees": [], "comments": 5},
+    ]})
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": _sovereign_config()}, diagnostics
+    )
+
+    assert picked is not None and picked["issue_number"] == 3
+    assert _reasons(diagnostics) == [("o/r", 1, "sovereign_assigned")]
+
+    _stub_github(monkeypatch, {_BACKLOG: [
+        _assigned({**_open(2), "comments": 0}, "helper"),
+    ]})
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": _sovereign_config()}
+    )
+    assert picked is not None and picked["issue_number"] == 2
+
+
+@pytest.mark.asyncio
+async def test_without_a_configured_login_every_assigned_issue_is_skipped(monkeypatch):
+    """Nothing can say an assignee is not the Sovereign, so no assigned issue
+    is dispatched. An unassigned agent-ready issue still is."""
+    _stub_github(monkeypatch, {_BACKLOG: [
+        _assigned({**_open(1), "comments": 0}, "helper"),
+        {**_open(2), "assignees": [], "comments": 9},
+    ]})
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": _sovereign_config(None)}, diagnostics
+    )
+
+    assert picked is not None and picked["issue_number"] == 2
+    assert _reasons(diagnostics) == [("o/r", 1, "assigned")]
+    assert issue_selection.describe_exclusion(
+        diagnostics["eligibility_exclusions"][0]
+    ) == (
+        "skipped o/r#1 -- assigned to helper, and no "
+        "morning_signal_config.sovereign_login says that is not the Sovereign"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", ["   ", "@", ["UncleSaurus"], 7, {"login": "x"}])
+async def test_a_malformed_login_withholds_every_assigned_issue(
+    monkeypatch, caplog, malformed
+):
+    """Hand-edited YAML: a value that is not a login is not guessed at. It
+    fails closed, as an unset login does, and says so."""
+    _stub_github(monkeypatch, {_BACKLOG: [
+        _assigned(_open(1), "helper"),
+        _assigned(_open(2), "UncleSaurus"),
+    ]})
+    diagnostics = {}
+
+    with caplog.at_level("WARNING", logger=issue_selection.logger.name):
+        picked = await issue_selection.pick_top_issue(
+            {"morning_signal_config": _sovereign_config(malformed)}, diagnostics
+        )
+
+    assert picked is None
+    assert _reasons(diagnostics) == [("o/r", 1, "assigned"), ("o/r", 2, "assigned")]
+    assert "sovereign_login" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "assignees",
+    [[{"login": "helper"}, {"id": 7}], [None], "UncleSaurus", [{"login": ""}]],
+    ids=["unnamed-entry", "null-entry", "not-a-list", "blank-login"],
+)
+async def test_an_assignee_github_did_not_name_may_be_the_sovereign(
+    monkeypatch, assignees
+):
+    """What GitHub did not state is refused: an assignee without a login
+    cannot be ruled out as the Sovereign."""
+    _stub_github(monkeypatch, {_BACKLOG: [{**_open(1), "assignees": assignees}]})
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        {"morning_signal_config": _sovereign_config()}, diagnostics
+    ) is None
+    [exclusion] = diagnostics["eligibility_exclusions"]
+    assert exclusion["reason"] == "assigned"
+    assert exclusion["unnamed_assignee"] is True
+    assert issue_selection.describe_exclusion(exclusion).endswith(
+        "an assignee GitHub did not name, who may be the Sovereign"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_single_assignee_field_is_read_too(monkeypatch):
+    """GitHub's legacy ``assignee`` names the Sovereign as surely as the
+    ``assignees`` list does."""
+    _stub_github(monkeypatch, {_BACKLOG: [
+        {**_open(1), "assignee": {"login": "UncleSaurus"}},
+    ]})
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        {"morning_signal_config": _sovereign_config()}, diagnostics
+    ) is None
+    assert _reasons(diagnostics) == [("o/r", 1, "sovereign_assigned")]
+
+
+@pytest.mark.asyncio
+async def test_when_only_epics_and_the_sovereigns_issues_remain_nothing_is_picked(
+    monkeypatch,
+):
+    """No fallback to the top ledger row, and no read spent asking whether a
+    refused issue is in flight."""
+    calls = []
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _labelled(1, "agent-ready", "epic"),
+        "/repos/o/r/issues/2": _assigned(_open(2), "UncleSaurus"),
+        _BACKLOG: [_labelled(1, "agent-ready", "epic"), _assigned(_open(2), "UncleSaurus")],
+    }, calls)
+    diagnostics = {}
+
+    data = {**_blockers(1, 2), "morning_signal_config": _sovereign_config()}
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert _reasons(diagnostics) == [
+        ("o/r", 1, "epic"),
+        ("o/r", 2, "sovereign_assigned"),
+    ]
+    assert not [c for c in calls if isinstance(c, tuple)], calls
+    assert diagnostics["open_pr_exclusions"] == diagnostics["run_exclusions"] == []
+
+
+@pytest.mark.asyncio
+async def test_agent_ready_is_still_the_first_reason_for_an_unauthorized_epic(
+    monkeypatch,
+):
+    """The allow-list reports the authorization it lacks before anything else:
+    an epic nobody labelled agent-ready is not agent-ready."""
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": _assigned(
+        _labelled(1, "epic"), "UncleSaurus"
+    )})
+    diagnostics = {}
+
+    data = {**_blockers(1), "morning_signal_config": _sovereign_config()}
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert _reasons(diagnostics) == [("o/r", 1, "not_agent_ready")]
+
+
+@pytest.mark.asyncio
+async def test_a_non_mapping_config_does_not_crash_selection(monkeypatch):
+    """``configured_repos`` already tolerates hand-edited YAML that is not a
+    mapping; the selector's own reads of the same block must too."""
+    _stub_github(monkeypatch, {})
+
+    assert await issue_selection.pick_top_issue(
+        {"morning_signal_config": ["o/r"]}
+    ) is None

@@ -179,8 +179,10 @@ def hides_persisted_user_content(agent: Any) -> bool:
 
     Covers every volatile privacy mode whose policy forbids durable persistence:
     EPHEMERAL (``is_ephemeral``), ISOLATED (``uses_temp_storage``), AND
-    DEIDENTIFIED (``requires_deidentification`` — fail-closed until the Safe
-    Harbor pipeline lands). Omitting the DEIDENTIFIED check let the Save feature
+    DEIDENTIFIED (``requires_deidentification`` — raw user content never
+    persists; only pipeline output with its evidence artifact does, through
+    ``PrivacyEnforcingStorage.store_deidentified_records``). Omitting the
+    DEIDENTIFIED check let the Save feature
     write user content to ``saved_items`` while volatile, inconsistent with the
     graph wrapper and consolidator gates that do cover it (#2672 live-path
     bypass).

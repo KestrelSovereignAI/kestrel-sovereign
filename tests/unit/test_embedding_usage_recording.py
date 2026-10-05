@@ -1,0 +1,773 @@
+"""Embedding calls record usage through the shared modality recorder (#3426).
+
+Every dispatched embedding call, successful or not, reaches the same sinks as
+chat: ``model_usage``, the ``llm_calls`` row, Prometheus and the metering
+callback. Records carry ``modality="embedding"``, the tokens and cost the route
+reports, and no content: neither the embedded text nor a vector.
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import math
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from openai.types import CreateEmbeddingResponse
+
+import kestrel_sovereign
+from kestrel_sovereign.llm.adapter import ReportedUsage
+from kestrel_sovereign.llm.embedding_service import ProviderEmbeddingService
+from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
+from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+from kestrel_sovereign.llm.openrouter_adapter import OpenRouterAdapter
+from tests.utils.process_local_llm_service import process_local_service
+
+SECRET = "the patient said something private"
+ROUTE = "openai:api"
+MODEL = "text-embedding-3-small"
+
+
+class UsageReportingAdapter:
+    """An embedding adapter that reports provider usage, like the OpenAI one."""
+
+    def __init__(
+        self,
+        *,
+        vector: Optional[List[float]] = None,
+        batch: Optional[List[Optional[List[float]]]] = None,
+        error: Optional[BaseException] = None,
+        delay: float = 0.0,
+        tokens: Optional[int] = 7,
+        cost: Optional[float] = 0.0003,
+    ):
+        self.vector = [0.1, 0.2, 0.3] if vector is None else vector
+        self.batch = batch
+        self.error = error
+        self.delay = delay
+        self.tokens = tokens
+        self.cost = cost
+        self.started = asyncio.Event()
+        self.sinks: List[Any] = []
+        self.texts: List[Any] = []
+        self.during_call = None
+
+    async def _respond(self, payload: Any, usage_sink: Optional[ReportedUsage]) -> None:
+        self.texts.append(payload)
+        self.sinks.append(usage_sink)
+        self.started.set()
+        if self.during_call is not None:
+            self.during_call()
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        if usage_sink is not None:
+            usage_sink.add(input_tokens=self.tokens, cost=self.cost)
+
+    async def aembed(self, client, text, *, model=None, dimensions=None,
+                     usage_sink: Optional[ReportedUsage] = None, **kwargs):
+        await self._respond(text, usage_sink)
+        return self.vector
+
+    async def aembed_batch(self, client, texts, *, model=None, dimensions=None,
+                           usage_sink: Optional[ReportedUsage] = None, **kwargs):
+        await self._respond(texts, usage_sink)
+        if self.batch is not None:
+            return self.batch
+        return [list(self.vector) for _ in texts]
+
+
+class SinklessAdapter:
+    """A third-party adapter written against the bare SDK embed contract."""
+
+    def __init__(self):
+        self.kwargs: List[Dict[str, Any]] = []
+
+    async def aembed(self, client, text, *, model=None, **kwargs):
+        self.kwargs.append(kwargs)
+        return [0.5, 0.5]
+
+    async def aembed_batch(self, client, texts, *, model=None, **kwargs):
+        self.kwargs.append(kwargs)
+        return [[0.5, 0.5] for _ in texts]
+
+
+def _provider(adapter: Any, *, name: str = ROUTE, model: str = MODEL) -> Dict[str, Any]:
+    vendor, _, route = name.partition(":")
+    return {
+        "name": name,
+        "vendor": vendor,
+        "route": route,
+        "adapter": adapter,
+        "client": object(),
+        "model": "auto",
+        "is_local": False,
+        "is_cloud": True,
+        "capabilities": {
+            "supports_embeddings": True,
+            "embedding_model": model,
+            "embedding_dim": 3,
+        },
+    }
+
+
+def _llm_service(*providers: Dict[str, Any]):
+    service = process_local_service(list(providers))
+    service._observability_store = MagicMock()
+    service._observability_store.log_llm_call = AsyncMock()
+    service._owner_agent_did = "did:example:agent"
+    service._track_model_usage = AsyncMock()
+    return service
+
+
+def _embedding_service(adapter: Any, **provider_kwargs: Any):
+    llm = _llm_service(_provider(adapter, **provider_kwargs))
+    embed = llm.get_embedding_service()
+    assert isinstance(embed, ProviderEmbeddingService)
+    return llm, embed
+
+
+def _logged(service) -> List[Dict[str, Any]]:
+    return [call.kwargs for call in service._observability_store.log_llm_call.await_args_list]
+
+
+def _bill_as(service, *, session_id: str = "s") -> None:
+    service._resolve_invocation_context = lambda *a, **k: LLMInvocationContext(
+        session_id=session_id, companion_id="comp", user_id="user"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wiring: the services LLMService builds carry its recorder
+# ---------------------------------------------------------------------------
+
+
+def test_every_llm_service_embedding_builder_attaches_the_recorder() -> None:
+    adapter = UsageReportingAdapter()
+    llm = _llm_service(_provider(adapter))
+    assert llm.get_embedding_service()._recorder is llm
+    assert llm.get_embedding_service_for_route(ROUTE)._recorder is llm
+    assert llm._new_embedding_service(_provider(adapter))._recorder is llm
+
+
+def test_production_code_builds_embedding_services_only_through_the_factory() -> None:
+    """A service built anywhere else would dispatch calls nothing records."""
+    package = Path(kestrel_sovereign.__file__).parent
+    constructions = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {
+            child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name != "ProviderEmbeddingService":
+                continue
+            owner: ast.AST = node
+            while owner in parents and not isinstance(
+                owner, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                owner = parents[owner]
+            constructions.append(
+                (path.relative_to(package).as_posix(), getattr(owner, "name", "<module>"))
+            )
+    assert constructions == [("llm/service.py", "_new_embedding_service")]
+
+
+# ---------------------------------------------------------------------------
+# What a record carries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_successful_embedding_records_usage_without_content() -> None:
+    adapter = UsageReportingAdapter(tokens=7, cost=0.0003)
+    llm, embed = _embedding_service(adapter)
+
+    vector = await embed.aembed(SECRET)
+
+    assert vector == [0.1, 0.2, 0.3]
+    [row] = _logged(llm)
+    assert row["provider"] == ROUTE and row["model"] == MODEL and row["success"] is True
+    assert row["metadata"]["modality"] == "embedding"
+    assert row["metadata"]["operation"] == "document"
+    assert row["metadata"]["input_count"] == 1
+    assert row["metadata"]["usage_available"] is True
+    assert row["metadata"]["provider_reported_cost_usd"] == pytest.approx(0.0003)
+    assert row["input_tokens"] == 7 and row["output_tokens"] is None
+    assert row["user_prompt"] is None and row["response"] is None
+    assert row["system_prompt"] is None and row["error_message"] is None
+    assert SECRET not in repr(row) and "0.1" not in repr(row["metadata"])
+    llm._track_model_usage.assert_awaited_once_with(MODEL, ROUTE, tokens=7)
+
+
+@pytest.mark.asyncio
+async def test_query_and_batch_operations_are_recorded() -> None:
+    adapter = UsageReportingAdapter(tokens=3, cost=None)
+    llm, embed = _embedding_service(adapter)
+
+    await embed.aembed_query("what did I say?")
+    await embed.aembed_batch(["a", "b", "c"])
+
+    query, batch = _logged(llm)
+    assert query["metadata"]["operation"] == "query"
+    assert query["metadata"]["input_count"] == 1
+    assert "provider_reported_cost_usd" not in query["metadata"]
+    assert batch["metadata"]["operation"] == "batch"
+    assert batch["metadata"]["input_count"] == 3
+    assert batch["success"] is True and batch["input_tokens"] == 3
+
+
+@pytest.mark.asyncio
+async def test_an_adapter_that_reports_nothing_records_unknown_usage() -> None:
+    adapter = SinklessAdapter()
+    llm, embed = _embedding_service(adapter)
+
+    assert await embed.aembed("text") == [0.5, 0.5]
+
+    # The sink is never forwarded to an adapter that did not name it: it could
+    # pass the unknown keyword on into its own HTTP request.
+    assert adapter.kwargs == [{"dimensions": 3}]
+    [row] = _logged(llm)
+    assert row["success"] is True and row["input_tokens"] is None
+    assert row["metadata"]["usage_available"] is False
+    llm._track_model_usage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_embedding_is_recorded_and_reraised_without_its_message() -> None:
+    adapter = UsageReportingAdapter(error=RuntimeError(f"HTTP 400: input was {SECRET}"))
+    llm, embed = _embedding_service(adapter)
+
+    with pytest.raises(RuntimeError):
+        await embed.aembed(SECRET)
+
+    [row] = _logged(llm)
+    assert row["success"] is False and row["error_message"] == "RuntimeError"
+    assert row["metadata"]["missing_vectors"] == 1
+    assert row["metadata"]["usage_available"] is False
+    assert SECRET not in repr(row)
+    llm._track_model_usage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_adapter_that_swallows_its_failure_is_recorded_as_failed() -> None:
+    adapter = UsageReportingAdapter()
+    adapter.vector = None  # what the Ollama adapter returns after a logged failure
+    llm, embed = _embedding_service(adapter)
+
+    assert await embed.aembed("text") is None
+
+    [row] = _logged(llm)
+    assert row["success"] is False and row["error_message"] is None
+    assert row["metadata"]["missing_vectors"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_partial_batch_is_recorded_as_failed_with_its_usage() -> None:
+    adapter = UsageReportingAdapter(batch=[[0.1], None, [0.3]], tokens=9)
+    llm, embed = _embedding_service(adapter)
+
+    assert await embed.aembed_batch(["a", "b", "c"]) == [[0.1], None, [0.3]]
+
+    [row] = _logged(llm)
+    assert row["success"] is False and row["metadata"]["missing_vectors"] == 1
+    # The provider still reported (and billed) the tokens it consumed.
+    llm._track_model_usage.assert_awaited_once_with(MODEL, ROUTE, tokens=9)
+
+
+@pytest.mark.asyncio
+async def test_array_vectors_do_not_break_the_record() -> None:
+    np = pytest.importorskip("numpy")
+    adapter = UsageReportingAdapter(batch=[np.array([0.1, 0.2]), np.array([0.3, 0.4])])
+    llm, embed = _embedding_service(adapter)
+
+    result = await embed.aembed_batch(["a", "b"])
+
+    assert len(result) == 2
+    [row] = _logged(llm)
+    assert row["success"] is True and "missing_vectors" not in row["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_batch_dispatches_and_records_nothing() -> None:
+    adapter = UsageReportingAdapter()
+    llm, embed = _embedding_service(adapter)
+
+    assert await embed.aembed_batch([]) == []
+    assert _logged(llm) == []
+    assert adapter.sinks == [None]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_propagates_and_the_record_survives() -> None:
+    adapter = UsageReportingAdapter(delay=30)
+    llm, embed = _embedding_service(adapter)
+
+    task = asyncio.create_task(embed.aembed("text"))
+    await asyncio.wait_for(adapter.started.wait(), 30)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await llm.drain_modality_records()
+
+    [row] = _logged(llm)
+    assert row["success"] is False and row["error_message"] == "CancelledError"
+
+
+@pytest.mark.asyncio
+async def test_the_invocation_context_is_frozen_before_the_call() -> None:
+    adapter = UsageReportingAdapter()
+    llm, embed = _embedding_service(adapter)
+    llm.set_observability_context(session_id="before", companion_id="c", user_id="u")
+    adapter.during_call = lambda: llm.set_observability_context(
+        session_id="after", companion_id="c2", user_id="u2"
+    )
+
+    await embed.aembed("text")
+
+    [row] = _logged(llm)
+    assert row["session_id"] == "before" and row["companion_id"] == "c"
+
+
+@pytest.mark.asyncio
+async def test_a_service_without_a_recorder_records_nothing() -> None:
+    adapter = UsageReportingAdapter()
+    embed = ProviderEmbeddingService(_provider(adapter))
+
+    assert await embed.aembed("text") == [0.1, 0.2, 0.3]
+    assert adapter.sinks == [None]
+
+
+# ---------------------------------------------------------------------------
+# Sinks shared with chat: Prometheus and metering
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_embeddings_count_in_the_llm_series_not_the_decision_series() -> None:
+    from kestrel_sdk import metrics
+
+    if not metrics.PROMETHEUS_AVAILABLE:
+        pytest.skip("prometheus-client not installed")
+    model = "embed-metrics-3426"
+    llm, embed = _embedding_service(UsageReportingAdapter(tokens=11), model=model)
+
+    def sample(name: str, labels: Dict[str, str]) -> float:
+        return metrics.REGISTRY.get_sample_value(name, labels) or 0.0
+
+    calls = {"provider": ROUTE, "model": model, "success": "True"}
+    tokens = {"model": model, "direction": "input"}
+    decisions = {"model": model}
+    before = (
+        sample("kestrel_llm_calls_total", calls),
+        sample("kestrel_llm_tokens_total", tokens),
+        sample("kestrel_llm_decision_tokens_total", decisions),
+    )
+    await embed.aembed("text")
+    assert sample("kestrel_llm_calls_total", calls) == before[0] + 1
+    assert sample("kestrel_llm_tokens_total", tokens) == before[1] + 11
+    assert sample("kestrel_llm_decision_tokens_total", decisions) == before[2]
+
+
+@pytest.mark.asyncio
+async def test_original_signature_metering_callback_bills_embeddings() -> None:
+    llm, embed = _embedding_service(UsageReportingAdapter(tokens=7))
+    billed: List[Dict[str, Any]] = []
+
+    async def original(*, companion_id, user_id, provider, model, prompt_tokens,
+                       completion_tokens):
+        billed.append(dict(provider=provider, model=model, prompt_tokens=prompt_tokens,
+                           completion_tokens=completion_tokens))
+
+    llm.set_metering_callback(original)
+    _bill_as(llm)
+    await embed.aembed("text")
+    assert billed == [dict(provider=ROUTE, model=MODEL, prompt_tokens=7, completion_tokens=0)]
+
+
+@pytest.mark.asyncio
+async def test_metering_callback_that_names_modality_and_cost_receives_them() -> None:
+    llm, embed = _embedding_service(UsageReportingAdapter(tokens=7, cost=0.0003))
+    seen: List[Any] = []
+
+    async def aware(*, companion_id, user_id, provider, model, prompt_tokens,
+                    completion_tokens, modality, cost):
+        seen.append((modality, cost))
+
+    llm.set_metering_callback(aware)
+    _bill_as(llm)
+    await embed.aembed("text")
+    assert seen == [("embedding", pytest.approx(0.0003))]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_embedding_is_not_billed() -> None:
+    llm, embed = _embedding_service(UsageReportingAdapter(error=RuntimeError("503")))
+    meter = AsyncMock()
+    llm.set_metering_callback(meter)
+    _bill_as(llm)
+    with pytest.raises(RuntimeError):
+        await embed.aembed("text")
+    meter.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# One recording path: a usage-DB outage suppresses no other sink
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_usage_db_failure_does_not_suppress_the_llm_calls_row() -> None:
+    llm, embed = _embedding_service(UsageReportingAdapter(tokens=7))
+    llm._track_model_usage = AsyncMock(side_effect=RuntimeError("usage db down"))
+
+    assert await embed.aembed("text") == [0.1, 0.2, 0.3]
+    [row] = _logged(llm)
+    assert row["input_tokens"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Adapters fill the sink from the provider response
+# ---------------------------------------------------------------------------
+
+
+def _openai_response(*, n: int = 1, cost: Optional[float] = None) -> CreateEmbeddingResponse:
+    usage: Dict[str, Any] = {"prompt_tokens": 5, "total_tokens": 5}
+    if cost is not None:
+        usage["cost"] = cost
+    return CreateEmbeddingResponse.model_validate({
+        "object": "list",
+        "model": "qwen/qwen3-embedding-0.6b",
+        "data": [
+            {"object": "embedding", "index": i, "embedding": [0.1, 0.2]} for i in range(n)
+        ],
+        "usage": usage,
+    })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["aembed", "aembed_batch"])
+async def test_openrouter_reports_tokens_and_cost(method: str) -> None:
+    adapter = OpenRouterAdapter(embedding_model="qwen/qwen3-embedding-0.6b", embedding_dim=2)
+    client = SimpleNamespace(embeddings=SimpleNamespace(
+        create=AsyncMock(return_value=_openai_response(n=2, cost=0.00004))
+    ))
+    sink = ReportedUsage()
+    payload = "text" if method == "aembed" else ["a", "b"]
+
+    await getattr(adapter, method)(client, payload, usage_sink=sink)
+
+    assert (sink.input_tokens, sink.cost) == (5, pytest.approx(0.00004))
+    assert sink.model == "qwen/qwen3-embedding-0.6b"
+    # The sink is consumed by the adapter, never sent to the provider.
+    assert "usage_sink" not in client.embeddings.create.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_openai_reports_tokens_without_a_cost() -> None:
+    adapter = OpenAIAdapter()
+    client = SimpleNamespace(embeddings=SimpleNamespace(
+        create=AsyncMock(return_value=_openai_response())
+    ))
+    sink = ReportedUsage()
+    await adapter.aembed(client, "text", usage_sink=sink)
+    assert (sink.input_tokens, sink.cost) == (5, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["dict", "object"])
+@pytest.mark.parametrize("method", ["aembed", "aembed_batch"])
+async def test_ollama_reports_prompt_eval_count(shape: str, method: str) -> None:
+    import ollama
+
+    body = {"model": "nomic-embed-text", "embeddings": [[0.1, 0.2]], "prompt_eval_count": 4}
+    response = body if shape == "dict" else ollama.EmbedResponse(**body)
+    client = SimpleNamespace(embed=AsyncMock(return_value=response))
+    sink = ReportedUsage()
+    payload = "text" if method == "aembed" else ["text"]
+
+    await getattr(OllamaAdapter(), method)(client, payload, usage_sink=sink)
+
+    assert (sink.input_tokens, sink.cost, sink.model) == (4, None, "nomic-embed-text")
+    assert "usage_sink" not in client.embed.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_real_adapters_receive_the_sink_from_the_service() -> None:
+    adapter = OpenRouterAdapter(embedding_model="qwen/qwen3-embedding-0.6b", embedding_dim=2)
+    client = SimpleNamespace(embeddings=SimpleNamespace(
+        create=AsyncMock(return_value=_openai_response(cost=0.00004))
+    ))
+    provider = _provider(adapter, name="openrouter:api", model="qwen/qwen3-embedding-0.6b")
+    provider["client"] = client
+    llm = _llm_service(provider)
+
+    await llm.get_embedding_service().aembed("text")
+
+    [row] = _logged(llm)
+    assert row["input_tokens"] == 5
+    assert row["metadata"]["provider_reported_cost_usd"] == pytest.approx(0.00004)
+
+
+def test_reported_usage_accumulates_and_ignores_implausible_values() -> None:
+    usage = ReportedUsage()
+    usage.add(input_tokens=True, cost=True, model="")
+    usage.add(input_tokens=-1, cost=math.nan)
+    usage.add(input_tokens="5", cost=-0.1)
+    assert (usage.input_tokens, usage.cost, usage.model) == (None, None, None)
+    usage.add(input_tokens=3, cost=0.25, model="m")
+    usage.add(input_tokens=4, cost=0.5)
+    assert (usage.input_tokens, usage.cost, usage.model) == (7, 0.75, "m")
+
+
+# ---------------------------------------------------------------------------
+# A turn's identity reaches its embeddings, however the caller supplied it
+# ---------------------------------------------------------------------------
+
+TURN_SESSION = "3426-turn-session"
+# The caller's identity carries no session: the turn's own ``session_id``
+# argument fills it, for embeddings as for chat.
+TURN_IDENTITY = dict(companion_id="companion-3426", user_id="user-3426")
+TURN_ATTRIBUTION = (TURN_SESSION, "companion-3426", "user-3426")
+UNATTRIBUTED = (None, None, None)
+TOOL_TEXT = "a note the inline tool embeds"
+
+
+def _attribution(row: Dict[str, Any]) -> tuple:
+    return (row["session_id"], row["companion_id"], row["user_id"])
+
+
+@pytest.mark.asyncio
+async def test_a_turns_identity_reaches_only_its_own_service_during_the_turn() -> None:
+    from kestrel_sovereign.llm.invocation_context import turn_invocation_scope
+
+    llm, embed = _embedding_service(UsageReportingAdapter())
+    other, other_embed = _embedding_service(UsageReportingAdapter())
+
+    with turn_invocation_scope(
+        llm, LLMInvocationContext(**TURN_IDENTITY), session_id=TURN_SESSION
+    ):
+        await embed.aembed("inside the turn")
+        await other_embed.aembed("another agent's service, same task")
+    await embed.aembed("after the turn")
+
+    inside, after = _logged(llm)
+    [foreign] = _logged(other)
+    assert _attribution(inside) == TURN_ATTRIBUTION
+    assert _attribution(foreign) == UNATTRIBUTED
+    assert _attribution(after) == UNATTRIBUTED
+
+
+class _TurnSinks:
+    """A booted agent's ``llm_calls`` store and metering callback."""
+
+    def __init__(self) -> None:
+        self.store = SimpleNamespace(log_llm_call=AsyncMock())
+        self.bills: List[Dict[str, Any]] = []
+
+    async def meter(self, *, companion_id, user_id, provider, model, prompt_tokens,
+                    completion_tokens, modality):
+        self.bills.append(dict(companion_id=companion_id, user_id=user_id,
+                               model=model, prompt_tokens=prompt_tokens,
+                               modality=modality))
+
+    def embedding_rows(self) -> List[Dict[str, Any]]:
+        return [
+            call.kwargs
+            for call in self.store.log_llm_call.await_args_list
+            if (call.kwargs.get("metadata") or {}).get("modality") == "embedding"
+        ]
+
+    def embedding_bills(self) -> List[Dict[str, Any]]:
+        return [bill for bill in self.bills if bill["modality"] == "embedding"]
+
+
+@asynccontextmanager
+async def _booted_agent(tmp_path, monkeypatch, adapter: Any, sinks: _TurnSinks,
+                        generate=None):
+    """A real agent on real storage, with an embedding route that reports usage.
+
+    Only the chat provider calls are scripted. Every embedding the turn makes
+    (retrieval queries, conversation persistence, tools) goes through the
+    agent's own ``LLMService`` recorder to the sinks in ``sinks``.
+    """
+    from kestrel_sovereign.bootstrap import BootstrapState
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.llm.adapter import LLMResponse
+    from kestrel_sovereign.llm.service import LLMService
+    from tests.shared.genesis_audit import complete_deterministic_genesis_audit
+
+    credentials = await create_kestrel_identity_async(
+        output_dir=str(tmp_path), is_test_instance=True, agent_name="EmbedMeter"
+    )
+    llm_service = LLMService()
+    agent = KestrelAgent(
+        did=credentials.agent_did,
+        storage_path=os.path.join(str(tmp_path), "kestrel_prime.db"),
+        llm_service=llm_service,
+    )
+    try:
+        await agent.initialize()
+        await complete_deterministic_genesis_audit(
+            agent, provenance="test:embedding_turn_metering"
+        )
+        await agent.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
+
+        embedding = llm_service._new_embedding_service(_provider(adapter))
+        monkeypatch.setattr(
+            llm_service, "get_embedding_service", lambda *_a, **_k: embedding
+        )
+        llm_service.set_observability_store(sinks.store)
+        llm_service.set_metering_callback(sinks.meter)
+
+        async def generate_with_messages(*_args, **kwargs):
+            if generate is not None:
+                await generate(**kwargs)
+            return LLMResponse(content="Noted.")
+
+        async def stream_with_tool_detection(*_args, **_kwargs):
+            yield "Noted."
+
+        monkeypatch.setattr(llm_service, "generate_with_messages", generate_with_messages)
+        monkeypatch.setattr(
+            llm_service, "stream_with_tool_detection", stream_with_tool_detection
+        )
+        yield agent
+        await llm_service.drain_modality_records()
+    finally:
+        await agent.shutdown()
+        await llm_service.close()
+
+
+TURN_MESSAGE = "Please remember that the heron came back to the mill pond today."
+
+
+async def _run_turn(agent, entry_point: str, identity: str,
+                    message: str = TURN_MESSAGE) -> str:
+    """Run one turn, its identity supplied ``explicit``-ly or as ``ambient`` state."""
+    kwargs: Dict[str, Any] = {}
+    if identity == "explicit":
+        kwargs["invocation_context"] = LLMInvocationContext(**TURN_IDENTITY)
+    else:
+        agent.llm_service.set_observability_context(
+            session_id=TURN_SESSION, **TURN_IDENTITY
+        )
+    if entry_point == "process_input":
+        return await agent.process_input(message, session_id=TURN_SESSION, **kwargs)
+    return "".join(
+        [
+            chunk
+            async for chunk in agent.process_input_streaming(
+                message, session_id=TURN_SESSION, **kwargs
+            )
+        ]
+    )
+
+
+def _assert_every_embedding_is_the_turns(adapter, sinks: _TurnSinks) -> None:
+    rows = sinks.embedding_rows()
+    # One record per dispatched call: the adapter saw every embedding.
+    assert len(rows) == len(adapter.texts)
+    assert [_attribution(row) for row in rows] == [TURN_ATTRIBUTION] * len(rows)
+    assert sinks.embedding_bills() == [
+        dict(companion_id="companion-3426", user_id="user-3426", model=MODEL,
+             prompt_tokens=7, modality="embedding")
+    ] * len(rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity", ["explicit", "ambient"])
+@pytest.mark.parametrize("entry_point", ["process_input", "process_input_streaming"])
+async def test_a_turn_attributes_and_meters_its_embeddings(
+    tmp_path, monkeypatch, entry_point, identity
+) -> None:
+    """``invocation_context`` reaches the turn's embeddings, not only its chat.
+
+    ``explicit`` sets no ambient ``set_observability_context`` at all: the
+    identity exists only as the argument the caller passed to the turn. It must
+    be recorded and billed exactly as the ``ambient`` turn is.
+    """
+    adapter = UsageReportingAdapter(tokens=7, cost=0.0003)
+    sinks = _TurnSinks()
+    async with _booted_agent(tmp_path, monkeypatch, adapter, sinks) as agent:
+        assert await _run_turn(agent, entry_point, identity) == "Noted."
+
+    # The turn really made the embeddings #3426 is about: retrieval queries and
+    # conversation-persistence writes. Without them the identity assertions
+    # below would hold vacuously.
+    operations = {row["metadata"]["operation"] for row in sinks.embedding_rows()}
+    assert {"query", "document"} <= operations
+    _assert_every_embedding_is_the_turns(adapter, sinks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry_point", ["process_input", "process_input_streaming"])
+async def test_a_command_turn_attributes_its_embeddings(
+    tmp_path, monkeypatch, entry_point
+) -> None:
+    """A ``!`` command runs before the turn's LLM body, and a streamed one is
+    delegated to ``process_input``. Its embeddings are still the turn's."""
+    adapter = UsageReportingAdapter(tokens=7, cost=0.0003)
+    sinks = _TurnSinks()
+    async with _booted_agent(tmp_path, monkeypatch, adapter, sinks) as agent:
+        await _run_turn(agent, entry_point, "explicit", message="!recall heron")
+
+    assert adapter.texts, "the command made no embedding call"
+    _assert_every_embedding_is_the_turns(adapter, sinks)
+
+
+@pytest.mark.asyncio
+async def test_an_inline_tool_on_a_task_older_than_the_turn_carries_its_identity(
+    tmp_path, monkeypatch
+) -> None:
+    """The codex app-server runs each tool on a reader task spawned before the
+    turn, so the turn's identity reaches it only as declared turn-scoped state.
+    """
+    adapter = UsageReportingAdapter(tokens=7, cost=0.0003)
+    sinks = _TurnSinks()
+    requests: asyncio.Queue = asyncio.Queue()
+
+    async def reader() -> None:
+        while (request := await requests.get()) is not None:
+            executor, done = request
+            try:
+                done.set_result(await executor("embed_note", {}))
+            except Exception as exc:  # noqa: BLE001 - re-raised via the future
+                done.set_exception(exc)
+
+    async def generate(*, tool_executor, **_kwargs) -> None:
+        done = asyncio.get_running_loop().create_future()
+        await requests.put((tool_executor, done))
+        await done
+
+    async with _booted_agent(
+        tmp_path, monkeypatch, adapter, sinks, generate=generate
+    ) as agent:
+        async def execute_named_tool(name, args, *, session_id, source, _capture):
+            _capture["effective_args"] = args
+            return await agent.llm_service.get_embedding_service().aembed(TOOL_TEXT)
+
+        monkeypatch.setattr(agent, "execute_named_tool", execute_named_tool)
+        reader_task = asyncio.create_task(reader())
+        await asyncio.sleep(0)  # the reader is running before the turn starts
+        try:
+            assert await _run_turn(agent, "process_input", "explicit") == "Noted."
+        finally:
+            await requests.put(None)
+            await reader_task
+
+    assert TOOL_TEXT in adapter.texts
+    _assert_every_embedding_is_the_turns(adapter, sinks)

@@ -9,6 +9,7 @@ Adapter for Google's Gemini API with support for:
 """
 import logging
 import os
+from enum import Enum
 from typing import Any, Dict, List, Optional, Union, AsyncIterator
 
 from .adapter import LLMAdapter, LLMResponse, ToolCall
@@ -20,8 +21,37 @@ from kestrel_sdk.llm import (
 )
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
+from .output_ceiling import (
+    OutputCeilingUnknownError,
+    OutputCeilings,
+    attach_stop_reason,
+    join_output_ceiling_notice,
+    output_ceiling_notice_chunk,
+    output_limit_cut_notice,
+    reported_token_limit,
+)
 
 logger = logging.getLogger(__name__)
+
+#: Gemini's ``finish_reason`` for a response cut at ``max_output_tokens``.
+_MAX_TOKENS_FINISH_REASON = "MAX_TOKENS"
+
+
+def _gemini_model_id(model: str) -> str:
+    """``model`` without the ``models/`` resource prefix discovery strips."""
+    return model[len("models/"):] if model.startswith("models/") else model
+
+
+def _finish_reason(candidate: Any) -> Optional[str]:
+    """A Gemini candidate's finish reason by name (``"MAX_TOKENS"``), if any.
+
+    google-genai reports it as a ``FinishReason`` member; the name is the
+    provider's own wire value, and what telemetry records.
+    """
+    reason = getattr(candidate, "finish_reason", None)
+    if isinstance(reason, Enum):
+        reason = reason.name
+    return reason if isinstance(reason, str) and reason else None
 
 
 def _normalized_google_genai_usage(
@@ -76,6 +106,80 @@ class GoogleAdapter(LLMAdapter):
     Note: Gemini uses a different message format than OpenAI.
     Uses 'contents' with 'role' and 'parts'.
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Output ceilings Gemini reported (``outputTokenLimit``), keyed by
+        # model id (#3355). Filled by model discovery and, for a model
+        # discovery has not described, by one ``models.get`` on first use.
+        self._output_ceilings = OutputCeilings()
+
+    # ---- Output ceiling (#3355) --------------------------------------------
+
+    async def _model_output_ceiling(self, client: Any, model: str) -> int:
+        """The largest ``max_output_tokens`` Gemini accepts for ``model``.
+
+        The model's own ``outputTokenLimit``, never a framework number: a
+        literal 8,192 silently cut every Gemini turn (#3355). Raises
+        :class:`OutputCeilingUnknownError` when Gemini does not report one —
+        a guess is never sent.
+        """
+        model_id = _gemini_model_id(model)
+        known = self._output_ceilings.get(model_id)
+        if known is not None:
+            return known
+        record = await client.aio.models.get(model=model)
+        limit = reported_token_limit(getattr(record, "output_token_limit", None))
+        if limit is None:
+            raise OutputCeilingUnknownError(model_id, provider="Google Gemini")
+        self._output_ceilings.remember(model_id, limit)
+        return limit
+
+    async def _generation_config(
+        self,
+        client: Any,
+        model: str,
+        tools: Optional[List[Dict[str, Any]]],
+        call_kwargs: Dict[str, Any],
+    ) -> tuple[Dict[str, Any], Optional[int]]:
+        """The ``generate_content`` config, and the model ceiling if it was used.
+
+        A ``max_tokens`` the caller chose is sent as given and no ceiling is
+        returned: a cut at that budget is the caller's to read from the
+        finish reason. Otherwise the model's own ceiling is sent and returned,
+        so a response that exhausted the model's whole output can be told from
+        one that stopped at a smaller, deliberate budget.
+        """
+        requested = call_kwargs.get("max_tokens")
+        model_ceiling = None
+        if requested is None:
+            model_ceiling = await self._model_output_ceiling(client, model)
+        config: Dict[str, Any] = {
+            "max_output_tokens": requested if requested is not None else model_ceiling,
+        }
+        if "temperature" in call_kwargs:
+            config["temperature"] = call_kwargs["temperature"]
+        if tools:
+            config["tools"] = [{
+                "function_declarations": self._convert_tools_to_gemini_format(tools)
+            }]
+        return config, model_ceiling
+
+    @staticmethod
+    def _output_ceiling_notice(
+        model: str,
+        finish_reason: Optional[str],
+        model_ceiling: Optional[int],
+    ) -> Optional[str]:
+        """The notice for a response cut at the model's own ceiling, else None."""
+        return output_limit_cut_notice(
+            provider="Google Gemini",
+            model=model,
+            stop_reason=finish_reason,
+            cut_reason=_MAX_TOKENS_FINISH_REASON,
+            caller_budget=model_ceiling is None,
+            model_ceiling=model_ceiling,
+        )
 
     def provider_capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
@@ -253,18 +357,9 @@ class GoogleAdapter(LLMAdapter):
             LLMResponse with content and/or tool calls
         """
         try:
-            config: Dict[str, Any] = {
-                "max_output_tokens": kwargs.get("max_tokens", 8192),
-            }
-
-            if "temperature" in kwargs:
-                config["temperature"] = kwargs["temperature"]
-
-            # Prepare tool config
-            if tools:
-                config["tools"] = [{
-                    "function_declarations": self._convert_tools_to_gemini_format(tools)
-                }]
+            config, model_ceiling = await self._generation_config(
+                client, model, tools, kwargs,
+            )
 
             # Generate content via the maintained google-genai async client,
             # honoring the routed model (mirrors VertexAIAdapter).
@@ -287,7 +382,29 @@ class GoogleAdapter(LLMAdapter):
             parts = None
             if candidate is not None and getattr(candidate, "content", None) is not None:
                 parts = getattr(candidate.content, "parts", None)
-            for part in parts or []:
+            parts = list(parts or [])
+
+            # #3355: Gemini's own verdict on whether the response is finished.
+            # A MAX_TOKENS stop cuts generation inside its LAST part; when
+            # that part is a function call it was cut mid-generation, and it
+            # must not be handed on as a call to execute.
+            finish_reason = _finish_reason(candidate)
+            cut_part = (
+                parts[-1]
+                if finish_reason == _MAX_TOKENS_FINISH_REASON and parts
+                and getattr(parts[-1], "function_call", None) is not None
+                else None
+            )
+            if cut_part is not None:
+                logger.warning(
+                    "Dropping function call %s from a Gemini response cut by "
+                    "%s: it is incomplete",
+                    getattr(cut_part.function_call, "name", None), finish_reason,
+                )
+
+            for part in parts:
+                if part is cut_part:
+                    continue
                 if getattr(part, "text", None):
                     content = part.text
                 # google-genai Part ALWAYS carries a `function_call` attribute
@@ -317,7 +434,11 @@ class GoogleAdapter(LLMAdapter):
                     cache_read_input_tokens,
                 ) = _normalized_google_genai_usage(usage_metadata)
 
-            return LLMResponse(
+            notice = self._output_ceiling_notice(model, finish_reason, model_ceiling)
+            if notice is not None:
+                content = join_output_ceiling_notice(content, notice)
+
+            return attach_stop_reason(LLMResponse(
                 content=content,
                 tool_calls=parsed_tool_calls,
                 raw=response,
@@ -325,7 +446,7 @@ class GoogleAdapter(LLMAdapter):
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            )
+            ), finish_reason)
 
         except Exception as e:
             logger.error(f"Google Gemini API error: {e}", exc_info=True)
@@ -345,17 +466,9 @@ class GoogleAdapter(LLMAdapter):
             Text chunks as they arrive, then a usage-bearing response.
         """
         try:
-            config: Dict[str, Any] = {
-                "max_output_tokens": kwargs.get("max_tokens", 8192),
-            }
-
-            if "temperature" in kwargs:
-                config["temperature"] = kwargs["temperature"]
-
-            if tools:
-                config["tools"] = [{
-                    "function_declarations": self._convert_tools_to_gemini_format(tools)
-                }]
+            config, model_ceiling = await self._generation_config(
+                client, model, tools, kwargs,
+            )
 
             # Stream via the maintained google-genai async client, honoring the
             # routed model (mirrors VertexAIAdapter).
@@ -367,13 +480,29 @@ class GoogleAdapter(LLMAdapter):
 
             text_content = ""
             usage_metadata = None
+            finish_reason = None
             async for chunk in stream:
                 if getattr(chunk, "usage_metadata", None) is not None:
                     usage_metadata = chunk.usage_metadata
+                # #3355: the finish reason rides on the last chunk's candidate.
+                candidates = getattr(chunk, "candidates", None)
+                if candidates:
+                    finish_reason = _finish_reason(candidates[0]) or finish_reason
                 text = getattr(chunk, "text", None)
                 if text:
                     text_content += text
                     yield text
+
+            # #3355: the streamed text is already on screen, so a cut at the
+            # model's ceiling is marked by a final chunk — and carried on the
+            # terminal response's content, which mirrors what was shown.
+            notice = self._output_ceiling_notice(model, finish_reason, model_ceiling)
+            if notice is not None:
+                notice_chunk = output_ceiling_notice_chunk(
+                    notice, follows_text=bool(text_content),
+                )
+                text_content += notice_chunk
+                yield notice_chunk
 
             input_tokens = output_tokens = total_tokens = None
             cache_read_input_tokens = None
@@ -384,14 +513,14 @@ class GoogleAdapter(LLMAdapter):
                     total_tokens,
                     cache_read_input_tokens,
                 ) = _normalized_google_genai_usage(usage_metadata)
-            yield LLMResponse(
+            yield attach_stop_reason(LLMResponse(
                 content=text_content or None,
                 tool_calls=None,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            )
+            ), finish_reason)
 
         except Exception as e:
             logger.error(f"Google Gemini streaming error: {e}", exc_info=True)
@@ -546,12 +675,19 @@ class GoogleAdapter(LLMAdapter):
                     display_name=display_name,
                     category=category,
                     description=description,
-                    context_limit=getattr(model, 'input_token_limit', None),
+                    context_limit=reported_token_limit(
+                        getattr(model, 'input_token_limit', None)
+                    ),
+                    # #3355: the ceiling requests send for this model.
+                    output_limit=reported_token_limit(
+                        getattr(model, 'output_token_limit', None)
+                    ),
                     supports_vision=supports_vision,
                     supports_tools="gemini" in lower_id,  # Only Gemini models support tools
                     supports_streaming=True,
                 ))
 
+            self._output_ceilings.learn(models)
             logger.info(f"Google returned {len(models)} models")
             return models
 

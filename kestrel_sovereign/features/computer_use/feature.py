@@ -35,7 +35,7 @@ import os
 import shlex
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 from kestrel_sovereign.constitution.hierarchy import (
@@ -224,6 +224,23 @@ _DEFAULT_AUTO_APPROVED_BINS = ["ls", "cat", "rg"]
 _DEFAULT_DENIED_BINS = ["dd", "mkfs", "shutdown", "sudo", "ssh"]
 _APPROVAL_TIMEOUT = 300.0
 
+# Both resolve against the agent's storage dir (``agent_data/<Agent>/``) when
+# relative, so two agents on one host never share a file (#3279). An absolute
+# path, or one starting with ``~``, is used as written.
+_DEFAULT_AUDIT_LOG_PATH = ".kestrel/computer_use_audit.jsonl"
+_DEFAULT_CAPTURE_DIR = ".kestrel/computer_use_captures"
+# A review artifact is worth keeping for a while and not forever. ``0``
+# disables pruning.
+_DEFAULT_CAPTURE_RETENTION_DAYS = 14
+_SECONDS_PER_DAY = 24 * 60 * 60
+# Retention runs at initialize, then at most this often, checked whenever a
+# run is captured -- the only thing that adds to the directory.
+_CAPTURE_PRUNE_INTERVAL_SECONDS = _SECONDS_PER_DAY
+
+
+class _RuntimePathError(ValueError):
+    """A configured runtime path this agent has no location for."""
+
 
 @dataclass
 class _GateOutcome:
@@ -265,12 +282,25 @@ class ComputerUseFeature(Feature):
     def __init__(self, agent=None):
         super().__init__(agent)
         self._cfg: Dict[str, Any] = {}
+        self._clear_runtime_state()
+
+    def _clear_runtime_state(self) -> None:
+        """Forget everything an initialize built from configuration.
+
+        Every initialize starts here, so what the feature does afterwards
+        depends only on the configuration it was given, never on what an
+        earlier initialize built (#3476).
+        """
         self._backend: Optional[SandboxBackend] = None
         self._path_policy: Optional[PathPolicy] = None
         self._binary_policy: Optional[BinaryPolicy] = None
         self._audit: Optional[AuditLog] = None
         self._max_read_bytes: int = 5_000_000
-        self._capture_dir: Path = Path(".kestrel/computer_use_captures")
+        self._capture_dir: Optional[Path] = None
+        self._capture_retention_days: int = _DEFAULT_CAPTURE_RETENTION_DAYS
+        self._last_capture_prune: Optional[float] = None
+        # Why the last initialize built no backend, for the readiness refusal.
+        self._init_refusal: Optional[str] = None
 
     @property
     def tool_description(self) -> str:
@@ -291,13 +321,54 @@ class ComputerUseFeature(Feature):
         await self._setup_from_config()
 
     async def _setup_from_config(self) -> None:
-        if not self._cfg.get("enabled", False):
-            logger.info("ComputerUseFeature: disabled in kestrel.toml")
-            # Audit log still opens so disabled-call refusals can be recorded.
-            audit_path = self._cfg.get(
-                "audit_log_path", ".kestrel/computer_use_audit.jsonl"
+        # A re-initialisation that refuses must not leave the previous
+        # backend live: it would keep running calls on a host-touching
+        # capability whose refusal the operator has just read in the log.
+        # Cleared before the old backend is shut down, so a call arriving
+        # mid-initialize is refused rather than run on half-built state.
+        previous = self._backend
+        self._clear_runtime_state()
+        if previous is not None:
+            await previous.shutdown()
+
+        enabled = bool(self._cfg.get("enabled", False))
+        try:
+            audit_path = self._resolve_runtime_path(
+                "audit_log_path", _DEFAULT_AUDIT_LOG_PATH
             )
+            # Opened before anything else can refuse, and even when disabled,
+            # so refusals are recorded.
             self._audit = AuditLog(audit_path, agent=self.agent)
+            self._note_legacy_audit_log(audit_path)
+            # Runtime-owned, deliberately not agent-nameable. See capture.py
+            # for why the path is allocated rather than accepted as a
+            # parameter.
+            self._capture_dir = self._resolve_runtime_path(
+                "capture_dir", _DEFAULT_CAPTURE_DIR
+            )
+        except _RuntimePathError as exc:
+            # No backend is built, so every call is refused at readiness.
+            # Whatever did resolve stays: an audit log that could be placed
+            # still records those refusals.
+            self._init_refusal = str(exc)
+            logger.log(
+                logging.ERROR if enabled else logging.WARNING,
+                "ComputerUseFeature: %s. No computer-use call will run.",
+                exc,
+            )
+            return
+        self._capture_retention_days = _config_int(
+            self._cfg.get("capture_retention_days"),
+            default=_DEFAULT_CAPTURE_RETENTION_DAYS,
+            name="features.computer_use.capture_retention_days",
+            minimum=0,
+        )
+        # Disabled or not: artifacts written while it was enabled still age
+        # out rather than staying forever.
+        await self._prune_captures(force=True)
+
+        if not enabled:
+            logger.info("ComputerUseFeature: disabled in kestrel.toml")
             return
 
         allowed = [str(Path(p).expanduser()) for p in self._cfg.get("allowed_paths", [])]
@@ -340,14 +411,6 @@ class ComputerUseFeature(Feature):
             deny=list(self._cfg.get("denied_binaries", _DEFAULT_DENIED_BINS)),
         )
 
-        audit_path = self._cfg.get("audit_log_path", ".kestrel/computer_use_audit.jsonl")
-        self._audit = AuditLog(audit_path, agent=self.agent)
-        # Runtime-owned, deliberately not agent-nameable. See capture.py for
-        # why the path is allocated rather than accepted as a parameter.
-        self._capture_dir = Path(
-            self._cfg.get("capture_dir", ".kestrel/computer_use_captures")
-        ).expanduser()
-
         granted = self._granted_capabilities()
         backend_name = self._cfg.get("backend", "docker")
         try:
@@ -377,6 +440,7 @@ class ComputerUseFeature(Feature):
         except CapabilityBlocked as exc:
             logger.warning("ComputerUseFeature: backend refused init: %s", exc)
             self._backend = None
+            self._init_refusal = f"backend refused init: {exc}"
             return
 
         logger.info(
@@ -389,8 +453,11 @@ class ComputerUseFeature(Feature):
         )
 
     async def shutdown(self) -> None:
-        if self._backend is not None:
-            await self._backend.shutdown()
+        # Cleared first: a shut-down backend must not run another call, and a
+        # later initialize must not shut it down a second time.
+        backend, self._backend = self._backend, None
+        if backend is not None:
+            await backend.shutdown()
 
     def _load_config(self) -> Dict[str, Any]:
         """Read [features.computer_use] from kestrel.toml. Best-effort."""
@@ -425,6 +492,129 @@ class ComputerUseFeature(Feature):
                     logger.warning("failed to read %s: %s", candidate, exc)
                     return {}
         return {}
+
+    def _agent_storage_dir(self) -> Optional[Path]:
+        """The agent's storage dir: the directory holding its database.
+
+        ``storage_path`` is the database file (``agent_data/<Agent>/
+        kestrel_prime.db``). Only a real path counts -- a ``MagicMock``
+        agent answers every attribute, and is a ``PathLike`` too.
+        """
+        storage_path = getattr(self.agent, "storage_path", None) if self.agent else None
+        if isinstance(storage_path, (str, PurePath)) and str(storage_path):
+            return Path(storage_path).expanduser().absolute().parent
+        return None
+
+    def _resolve_runtime_path(self, key: str, default: str) -> Path:
+        """Where a configured runtime path lives, for ``audit_log_path`` and ``capture_dir``.
+
+        A relative value resolves against the agent's storage dir, which is
+        what the shipped config comment promises. Resolving it against the
+        host process's cwd instead put every agent's audit rows into one
+        file in the source checkout (#3279). An absolute value, or one
+        starting with ``~``, is used as written.
+
+        There is no cwd fallback: a relative value with no storage dir to
+        anchor it is refused, since "somewhere shared" is the defect.
+        """
+        raw = self._cfg.get(key, default)
+        if not isinstance(raw, (str, PurePath)) or not str(raw) or "\x00" in str(raw):
+            # A NUL byte is legal in a TOML string and refused by every
+            # filesystem call, which would raise out of initialize.
+            raise _RuntimePathError(
+                f"features.computer_use.{key} must be a non-empty path with no "
+                f"NUL character, got {raw!r}"
+            )
+        try:
+            path = Path(raw).expanduser()
+        except RuntimeError as exc:
+            raise _RuntimePathError(
+                f"features.computer_use.{key} = {str(raw)!r} names a home "
+                f"directory that cannot be determined: {exc}"
+            ) from exc
+        if path.is_absolute():
+            return path
+        try:
+            storage_dir = self._agent_storage_dir()
+        except (OSError, RuntimeError) as exc:
+            raise _RuntimePathError(
+                f"features.computer_use.{key} = {str(raw)!r} is relative to the "
+                f"agent's storage dir, which cannot be determined: {exc}"
+            ) from exc
+        if storage_dir is None:
+            raise _RuntimePathError(
+                f"features.computer_use.{key} = {str(raw)!r} is relative to the "
+                f"agent's storage dir, and this agent has none; configure an "
+                f"absolute path"
+            )
+        resolved = storage_dir / path
+        if "\x00" in str(resolved):
+            raise _RuntimePathError(
+                f"features.computer_use.{key} resolves to {str(resolved)!r}, "
+                f"which contains a NUL character"
+            )
+        return resolved
+
+    def _note_legacy_audit_log(self, audit_path: Path) -> None:
+        """Say where a pre-#3279 audit log is, without touching it.
+
+        The old code resolved ``audit_log_path`` against the host's cwd, so
+        that file can hold several agents' rows interleaved. Splitting it is
+        an operator's decision, so it is named here and left in place.
+        """
+        raw = self._cfg.get("audit_log_path", _DEFAULT_AUDIT_LOG_PATH)
+        try:
+            legacy = Path.cwd() / Path(raw).expanduser()
+            if not legacy.is_file() or legacy.resolve() == audit_path.resolve():
+                return
+        except (OSError, RuntimeError):
+            return
+        logger.info(
+            "ComputerUseFeature: this agent's audit log is %s. A legacy "
+            "cwd-relative audit log exists at %s and is left untouched; it may "
+            "hold several agents' rows.",
+            audit_path,
+            legacy,
+        )
+
+    async def _prune_captures(self, *, force: bool = False) -> None:
+        """Retire capture artifact sets older than ``capture_retention_days``.
+
+        Runs at initialize (``force``) and then at most once per
+        ``_CAPTURE_PRUNE_INTERVAL_SECONDS``. Only inside the resolved
+        ``capture_dir``, and never the audit log, wherever it is.
+        """
+        if self._capture_retention_days == 0 or self._capture_dir is None:
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and self._last_capture_prune is not None
+            and now - self._last_capture_prune < _CAPTURE_PRUNE_INTERVAL_SECONDS
+        ):
+            return
+        # Stamped before the prune runs, so concurrent captures do not each
+        # start one.
+        self._last_capture_prune = now
+        wall = time.time()
+        max_age = self._capture_retention_days * _SECONDS_PER_DAY
+        if max_age >= wall:
+            # Longer than the epoch: nothing is old enough, and subtracting
+            # an int this large from a float would overflow.
+            return
+        cutoff = wall - max_age
+        protected = (self._audit.path,) if self._audit is not None else ()
+        removed = await asyncio.to_thread(
+            capture.prune, self._capture_dir, cutoff=cutoff, protected=protected
+        )
+        if removed:
+            logger.info(
+                "ComputerUseFeature: pruned %d capture artifact set(s) older "
+                "than %d day(s) from %s",
+                removed,
+                self._capture_retention_days,
+                self._capture_dir,
+            )
 
     def _granted_capabilities(self) -> frozenset[str]:
         """Read Amendment IX grants. Empty set means deny-everything default."""
@@ -560,8 +750,17 @@ class ComputerUseFeature(Feature):
             await self._audit_denied(tool_name, payload, ["denied:readiness:disabled"])
             return _GateOutcome(False, allowed_by, "readiness:feature not enabled")
         if self._backend is None:
-            await self._audit_denied(tool_name, payload, ["denied:readiness:backend"])
-            return _GateOutcome(False, allowed_by, "readiness:backend not initialized")
+            await self._audit_denied(
+                tool_name,
+                payload,
+                ["denied:readiness:backend"],
+                error=self._init_refusal,
+            )
+            reason = "readiness:backend not initialized"
+            if self._init_refusal:
+                reason = f"{reason}: {self._init_refusal}"
+            return _GateOutcome(False, allowed_by, reason)
+        gated_backend = self._backend
 
         # 1. Privacy
         if not self._privacy_allows():
@@ -754,6 +953,26 @@ class ComputerUseFeature(Feature):
                 )
                 return _GateOutcome(False, allowed_by, f"approval:{scope}")
             allowed_by.append(f"approval:{scope}")
+
+        # 6. Still the feature these gates ran against. The approval wait can
+        # last minutes, and an initialize in that time either refused, leaving
+        # no backend, or built a new one from configuration these gates never
+        # evaluated -- possibly a different backend than the capability that
+        # was checked. Either way the authorisation no longer applies (#3476).
+        if self._backend is not gated_backend:
+            await self._audit_denied(
+                tool_name,
+                payload,
+                allowed_by + ["denied:readiness:reinitialized"],
+                error=self._init_refusal,
+            )
+            reason = (
+                "readiness:feature was re-initialised while this call was "
+                "being authorised"
+            )
+            if self._init_refusal:
+                reason = f"{reason}: {self._init_refusal}"
+            return _GateOutcome(False, allowed_by, reason)
 
         # Stash the resolved values on the outcome via the payload so
         # callers don't have to re-resolve.
@@ -1332,6 +1551,8 @@ class ComputerUseFeature(Feature):
             # and can fail on a read-only or full disk, and a call that has
             # passed every gate must leave an audit row whatever happens
             # after. Outside, that failure escaped unaudited.
+            if capture_output:
+                await self._prune_captures()
             bundle = capture.allocate(self._capture_dir) if capture_output else None
             # HEAD is only meaningful for a directory on this host. The
             # docker backend with no cwd runs at ``/`` inside a container,
@@ -1674,26 +1895,35 @@ class ComputerUseFeature(Feature):
 def _positive_int(value: Any, *, default: int, name: str) -> int:
     """A configured byte ceiling, or the default when it is not usable.
 
+    Zero and negatives are rejected: a ceiling of 0 would clip every capture
+    to nothing while every flag still reported the run complete.
+    """
+    return _config_int(value, default=default, name=name, minimum=1)
+
+
+def _config_int(value: Any, *, default: int, name: str, minimum: int) -> int:
+    """A configured integer of at least ``minimum``, or the default.
+
     ``int()`` straight onto an operator-supplied value is the wrong boundary
     discipline for this file: ``timeout`` and ``capture_output`` a few hundred
     lines up both refuse a value they cannot read rather than guessing. Config
     differs from a tool argument in one way that matters -- there is no caller
     to hand the refusal to, and raising here happens inside ``initialize`` and
     takes the whole feature down over a typo. So it warns and falls back,
-    which is what an unreadable ceiling should cost.
-
-    Zero and negatives are rejected too: a ceiling of 0 would clip every
-    capture to nothing while every flag still reported the run complete.
+    which is what an unreadable setting should cost.
     """
     if value is None:
         return default
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: TOML admits ``inf``, and ``int(inf)`` raises it.
         logger.warning("%s is not an integer (%r); using %d", name, value, default)
         return default
-    if parsed <= 0:
-        logger.warning("%s must be positive (got %d); using %d", name, parsed, default)
+    if parsed < minimum:
+        logger.warning(
+            "%s must be at least %d (got %d); using %d", name, minimum, parsed, default
+        )
         return default
     return parsed
 

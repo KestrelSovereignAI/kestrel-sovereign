@@ -547,9 +547,10 @@ Authorization and protocol decisions are final and never retried.
 The registration is an `InFlightControlActionRegistration`. It acts only on
 work already running, so the dispatcher:
 
-- persists only a fixed durable marker (no payload, caller, or chain) and
-  therefore does not wait on the privacy-transition lock that every running
-  turn holds;
+- persists only a fixed durable marker (no payload, caller, or chain). Like
+  every source it persists under the agent's durable persistence gate, which
+  only a privacy transition holds exclusively; turns do not hold it, so a Stop
+  never queues behind the turn it is meant to stop (#3316);
 - does not apply Hold's begin-work disposition, so a held agent still receives
   Stop for work in flight.
 
@@ -586,6 +587,15 @@ restarts, and #2922 is why that status can no longer read `ok` for a
 wake nobody saw — see rule 5). Set `session_id` to the session that
 REGISTERED the work and the dispatcher resumes it.
 
+The fresh session is minted by the dispatcher before the turn starts
+and passed as the turn's `session_id` (#3429). The turn writes every
+row under it, and work dispatched from the turn records it as origin,
+so that work's own wake returns there: one session per autonomous
+chain. Before #3429 the turn ran with no session at all, the store's
+30-minute time-gap heuristic chose a session for each row at write
+time, and dispatches from the turn recorded an empty origin, so every
+hop of a chain was unbound again.
+
 Five rules:
 
 1. **Bind AND surface.** `session_id` alone puts the turn in the right
@@ -593,9 +603,10 @@ Five rules:
    `signal_completed` and the open chat stays blank until a manual
    refresh. A bound wake must also be `USER_VISIBLE` *and* register a
    `result_summary` callback — the frontend requires both to paint it.
-   An unattended (session-less) wake stays `INTERNAL`: the
-   notifications stream is pinned to the agent, not to a session, so
-   emitting would paint a turn into whichever pane happens to be open.
+   An unattended wake (no `Signal.session_id`) stays `INTERNAL`, even
+   though its turn runs in a minted session: the notifications stream
+   is pinned to the agent, not to a session, so emitting would paint a
+   turn into whichever pane happens to be open.
 
 2. **Never take the session from caller-influenceable data.** The wait
    reconciler resolves it through the provider's `origin_session_id(handle)`

@@ -5,12 +5,10 @@ Tests both regex-based and NER-based detection (when spaCy is available).
 """
 
 import pytest
-from decimal import Decimal
 
 from kestrel_sovereign.features.privacy.pii_detector import (
     PIIDetector,
     PIIType,
-    PIIMatch,
     get_pii_detector,
     anonymize_text,
 )
@@ -281,3 +279,44 @@ class TestEdgeCases:
         # Should have exactly one redaction, not multiple
         redaction_count = result.count("[")
         assert redaction_count >= 1
+
+
+class _StubEntity:
+    def __init__(self, text, label, start):
+        self.text = text
+        self.label_ = label
+        self.start_char = start
+        self.end_char = start + len(text)
+
+
+def _detector_with_entities(text, *entities):
+    """A detector whose NER model reports ``entities`` (text, label) in ``text``."""
+    stub = PIIDetector.__new__(PIIDetector)
+    ents = [_StubEntity(t, label, text.index(t)) for t, label in entities]
+    stub.nlp = lambda _text: type("Doc", (), {"ents": ents})()
+    return stub
+
+
+class TestEntityOnlyDetection:
+    """``detect_entities`` reports NER spans that ``detect`` lets regexes shadow."""
+
+    TEXT = "Seen 2 days ago with son Tom Lee and Dr Patel."
+
+    def test_detect_lets_a_greedy_regex_shadow_a_name(self):
+        detector = _detector_with_entities(self.TEXT, ("Tom Lee", "PERSON"))
+        types = {m.pii_type for m in detector.detect(self.TEXT)}
+        assert PIIType.ADDRESS in types
+        assert PIIType.PERSON not in types
+
+    def test_detect_entities_keeps_the_name(self):
+        text = self.TEXT + " Seen today, code 1111."
+        detector = _detector_with_entities(
+            text, ("Tom Lee", "PERSON"), ("today", "DATE"), ("1111", "DATE")
+        )
+        [entity] = detector.detect_entities(text)
+        assert (entity.pii_type, entity.text) == (PIIType.PERSON, "Tom Lee")
+
+    def test_detect_entities_is_empty_without_a_model(self):
+        detector = PIIDetector.__new__(PIIDetector)
+        detector.nlp = None
+        assert detector.detect_entities(self.TEXT) == []

@@ -30,6 +30,30 @@ The runner:
 7. Tears the server down on exit (``finally``-block trap), unless
    ``--keep-server`` was passed.
 
+``kestrel demo smoke`` (#2682) drives the same isolated-server lifecycle for
+the Sovereign Console Playwright smoke — the subset pull-request CI runs. It
+differs from a demo wherever a demo would let host state in:
+
+* The instance lives in a fresh home (``--home``, which must be absent or
+  empty, or a new temp dir). That home is the server's ``KESTREL_HOME`` and
+  working directory. The server also reads no ``.env`` file at all
+  (``KESTREL_SKIP_DOTENV=1``): not its project home's, not its launch
+  directory's, and not a legacy one next to the package source, any of which
+  would refill the variables the smoke removed. It gets a throwaway
+  ``KESTREL_DATA_KEY``.
+* No ``KESTREL_*`` setting, provider key, or credential-shaped variable is
+  inherited, and the agent is configured with only the local Ollama route, so
+  no paid LLM can be selected. The smoke sends only ``!status``, a
+  non-cognitive command.
+* Before Playwright runs, it proves the instance's origin: the server
+  resolves ``kestrel_sovereign`` from this runner's package, and the one agent
+  it serves carries the DID minted by this run's inception. Those facts go to
+  the spec as ``console-smoke-instance.json``; the spec re-proves them through
+  the browser.
+* The server PID is written to ``<home>/server.pid`` while it runs, so a
+  supervisor (the CI job's ``always()`` step) can tear it down even when this
+  process is killed before its own ``finally`` runs.
+
 Cross-platform: ``npx`` works on Windows; ``uvicorn`` boots the same
 way; ``subprocess.Popen(..., start_new_session=True)`` /
 ``CREATE_NEW_PROCESS_GROUP`` are wrapped by
@@ -42,20 +66,27 @@ Usage::
     kestrel demo run technical
     kestrel demo run spawn --port 9001
     kestrel demo run voice --keep-server   # leave the demo server up
+    kestrel demo smoke                     # Console smoke in a fresh temp home
+    kestrel demo smoke --home "$RUNNER_TEMP/console-smoke" --port 8910
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import re
+import signal
 import socket
+import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Callable, Iterator, List, Optional, Tuple
 
 from kestrel_sovereign._subprocess_helpers import (
     run_streaming,
@@ -63,6 +94,7 @@ from kestrel_sovereign._subprocess_helpers import (
     stop_process,
     wait_for_health,
 )
+from kestrel_sovereign.paths import SKIP_DOTENV_ENV
 
 
 # Ports the runner refuses to use. ``8888`` is the live server in the
@@ -74,6 +106,29 @@ _FORBIDDEN_PORTS = frozenset({8888})
 # Default demo port — must not collide with the live server's 8888.
 # Matches the bash predecessor.
 _DEFAULT_DEMO_PORT = 8900
+
+# Default Console-smoke port: off 8888, and off 8900 so a smoke can run
+# beside a demo.
+_DEFAULT_SMOKE_PORT = 8910
+
+# Seconds to wait for /health. A cold CI runner boots the server slower than
+# a workstation, so the smoke allows more than a demo.
+_DEMO_HEALTH_TIMEOUT = 60.0
+_SMOKE_HEALTH_TIMEOUT = 120.0
+
+# Files the smoke writes in its home. The manifest and PID file are the
+# runner's contract with the Playwright spec and the CI teardown step.
+SMOKE_MANIFEST_NAME = "console-smoke-instance.json"
+SMOKE_PID_NAME = "server.pid"
+SMOKE_LOG_NAME = "server.log"
+_SMOKE_INCEPTION_NAME = "inception.json"
+
+# The Playwright project that is the CI smoke subset.
+_SMOKE_PLAYWRIGHT_CMD = (
+    "npx", "playwright", "test",
+    "--config", "tests/e2e/playwright.config.cjs",
+    "--project", "console-smoke",
+)
 
 # Provider-key env vars preserved through to the demo's ``npx playwright``
 # subprocess. ``KESTREL_API_KEY`` is deliberately NOT in this list — it's
@@ -90,6 +145,28 @@ _PROVIDER_KEY_ENV = (
     "RUNPOD_API_KEY",
     "OLLAMA_HOST",
 )
+
+# Variable names that look like a credential. The smoke strips every one of
+# them, not only the providers listed above: an instance that must never
+# use a production key is safer refusing all keys than enumerating them.
+_CREDENTIAL_ENV_NAME = re.compile(r"(?:_KEY|_TOKEN|_SECRET|_PASSWORD)$")
+
+# Variable prefixes the smoke never inherits. ``KESTREL_*`` configures another
+# Kestrel install; ``OTEL_*`` is OpenTelemetry configuration, including the
+# operator's collector endpoint and the credential in its headers.
+_SMOKE_STRIPPED_ENV_PREFIXES = ("KESTREL_", "OTEL_")
+
+# Resolves ``kestrel_sovereign`` without importing it, as the
+# LIVE_AGENT_DOGFOODING runbook's origin check does.
+_MODULE_ORIGIN_PROBE = (
+    "import importlib.util, pathlib; "
+    "print(pathlib.Path(importlib.util.find_spec('kestrel_sovereign').origin)"
+    ".resolve().parent)"
+)
+
+
+class _SmokeSetupError(Exception):
+    """A precondition the Console smoke refuses to run without."""
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +215,21 @@ def _port_is_busy(port: int, host: str = "127.0.0.1") -> bool:
         return False
     finally:
         s.close()
+
+
+def _port_refusal(port: int) -> Optional[str]:
+    """Why ``port`` cannot host an isolated server, or None if it can."""
+    if port in _FORBIDDEN_PORTS:
+        return (
+            f"refusing DEMO_PORT={port} — that's the live server. "
+            "Pick another port."
+        )
+    if _port_is_busy(port):
+        return (
+            f"port {port} already in use; free it or pass "
+            "--port <free-port>"
+        )
+    return None
 
 
 def _load_dotenv_for_demo(repo: Path) -> dict:
@@ -242,6 +334,123 @@ def _build_playwright_env(parent_env: dict, demo_url: str, repo: Path, demo_db: 
     return env
 
 
+def _build_smoke_env(
+    parent_env: dict, home: Path, data_dir: Path, data_key: str,
+) -> dict:
+    """Build the env shared by every Console-smoke subprocess.
+
+    Nothing that configures another Kestrel install crosses over: every
+    ``KESTREL_*`` variable is dropped and only the instance's own settings
+    are set. Provider keys and every credential-shaped variable are dropped
+    too, so the instance cannot reach a paid LLM or a production service.
+    Every ``OTEL_*`` variable is dropped as well: the SDK's LLM-span tracer
+    exports whenever an OTLP endpoint is set, and the lifecycle tracer does too
+    unless tracing is switched off, so an inherited endpoint and its auth
+    headers would ship smoke traffic to the operator's collector.
+    ``KESTREL_TRACING_ENABLED=0`` switches the lifecycle tracer off, whatever
+    the operator exported.
+
+    ``KESTREL_HOME`` is the fresh home, so the project resolver stays inside
+    the instance. Removing a variable here is not enough on its own: the
+    server loads its ``.env`` files with ``override=False``, which fills in
+    exactly the variables that are absent, and one of those files sits next to
+    the package source rather than in the home. ``KESTREL_SKIP_DOTENV`` tells
+    the server to read none of them, so this mapping is the instance's whole
+    environment.
+    ``KESTREL_DATA_KEY`` is a throwaway key minted for this run, and the
+    born-hybrid identity's did:web domain is ``localhost``, the same default
+    ``kestrel setup --quickstart`` uses.
+    ``KESTREL_SKIP_REACHABILITY_PROBE`` lets the local-only agent boot with no
+    Ollama daemon, as the clean-install job does, and Phoenix is disabled so
+    the instance neither starts a trace store nor binds its ports.
+    """
+    env = {
+        name: value
+        for name, value in parent_env.items()
+        if not name.startswith(_SMOKE_STRIPPED_ENV_PREFIXES)
+        and name not in _PROVIDER_KEY_ENV
+        and not _CREDENTIAL_ENV_NAME.search(name)
+    }
+    _pin_demo_database_env(env, data_dir)
+    env["KESTREL_HOME"] = str(home)
+    env[SKIP_DOTENV_ENV] = "1"
+    env["KESTREL_DATA_KEY"] = data_key
+    env["KESTREL_DID_WEB_DOMAIN"] = "localhost"
+    env["KESTREL_MULTI_AGENT_CONFIG"] = str(home / "multi_agent-disabled.toml")
+    env["KESTREL_DEMO_SERVER"] = "1"
+    env["KESTREL_SKIP_REACHABILITY_PROBE"] = "1"
+    env["KESTREL_PHOENIX_ENABLED"] = "0"
+    env["KESTREL_TRACING_ENABLED"] = "0"
+    return env
+
+
+def _ephemeral_data_key() -> str:
+    """A fresh ``KESTREL_DATA_KEY`` that encrypts only this run's identity."""
+    from kestrel_sdk.security.aead import AEADCipher
+
+    return AEADCipher.generate_key().decode("ascii")
+
+
+def _prepare_smoke_home(home: Optional[str]) -> Path:
+    """Return a fresh, private instance home.
+
+    With no ``home`` a new temp dir is created. A supplied path must be
+    absent or empty: the smoke proves it is serving a *freshly created*
+    instance, and it never deletes an operator's directory to make one.
+    """
+    if home is None:
+        return Path(tempfile.mkdtemp(prefix="kestrel-console-smoke-")).resolve()
+    path = Path(home).expanduser().resolve()
+    if path.exists() and (not path.is_dir() or any(path.iterdir())):
+        raise _SmokeSetupError(
+            f"--home {path} already exists and is not empty; the smoke only "
+            "runs in a freshly created home."
+        )
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+def _load_inception_manifest(path: Path, data_dir: Path) -> dict:
+    """Read the setup script's manifest and check it describes ``data_dir``."""
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise _SmokeSetupError(f"cannot read inception manifest {path}: {e}")
+    did = manifest.get("agent_did")
+    if not isinstance(did, str) or not did.startswith("did:"):
+        raise _SmokeSetupError(f"inception manifest {path} has no agent DID")
+    db_path = Path(str(manifest.get("db_path", ""))).resolve()
+    if data_dir.resolve() not in db_path.parents:
+        raise _SmokeSetupError(
+            f"inception wrote its database to {db_path}, outside the smoke "
+            f"data dir {data_dir}"
+        )
+    return manifest
+
+
+def _server_module_origin(cwd: Path, env: dict) -> Path:
+    """Where the server will import ``kestrel_sovereign`` from.
+
+    Resolved by the same interpreter, working directory, and environment the
+    server is launched with, so module search resolves identically.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _MODULE_ORIGIN_PROBE],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise _SmokeSetupError(
+            "cannot resolve the server's kestrel_sovereign origin: "
+            f"{result.stderr.strip() or 'no output'}"
+        )
+    return Path(result.stdout.strip().splitlines()[-1])
+
+
 def _fetch_demo_api_key(demo_url: str) -> Optional[str]:
     """Mint/return the demo server's API key via the public ``/api/auth/key``
     endpoint (in ``server.py``'s ``public_paths``). ``/api/agents`` requires it."""
@@ -250,6 +459,29 @@ def _fetch_demo_api_key(demo_url: str) -> Optional[str]:
             return json.loads(resp.read()).get("key")
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
         return None
+
+
+def _fetch_agents(demo_url: str) -> Tuple[Optional[list], Optional[str]]:
+    """Return ``(agents, None)`` from ``/api/agents``, or ``(None, error)``.
+
+    ``/api/agents`` is authenticated, so mint the demo key first
+    (``X-API-Key``); without it the server returns 401 and no check
+    built on this could ever pass.
+    """
+    api_key = _fetch_demo_api_key(demo_url)
+    request = urllib.request.Request(f"{demo_url}/api/agents")
+    if api_key:
+        request.add_header("X-API-Key", api_key)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as resp:
+            body = resp.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        return None, f"!!fetch-error: {e}"
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as e:
+        return None, f"!!parse-error: {e}; body[:400]={body[:400]!r}"
+    return data.get("agents") or [], None
 
 
 def _verify_only_demo_agents(demo_url: str) -> Optional[str]:
@@ -261,25 +493,10 @@ def _verify_only_demo_agents(demo_url: str) -> Optional[str]:
     defences (``KESTREL_MULTI_AGENT_CONFIG`` override + the demo flag)
     should make this unreachable in practice, but the cost of a false
     negative is wiping a live agent — re-check at the boundary.
-
-    ``/api/agents`` is authenticated, so mint the demo key first
-    (``X-API-Key``); without it the server returns 401 and the runner
-    can never pass the check.
     """
-    api_key = _fetch_demo_api_key(demo_url)
-    request = urllib.request.Request(f"{demo_url}/api/agents")
-    if api_key:
-        request.add_header("X-API-Key", api_key)
-    try:
-        with urllib.request.urlopen(request, timeout=5) as resp:
-            body = resp.read()
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
-        return f"!!fetch-error: {e}"
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError as e:
-        return f"!!parse-error: {e}; body[:400]={body[:400]!r}"
-    agents = data.get("agents") or []
+    agents, error = _fetch_agents(demo_url)
+    if error is not None:
+        return error
     live = [
         a.get("name") or a.get("id") or "<unnamed>"
         for a in agents
@@ -288,6 +505,157 @@ def _verify_only_demo_agents(demo_url: str) -> Optional[str]:
     if not live:
         return None
     return ",".join(live)
+
+
+def _verify_served_identity(demo_url: str, expected_did: str) -> Optional[str]:
+    """Check the server serves exactly the agent this run created.
+
+    A DID is minted per inception, so a match proves the server is reading
+    the freshly created database rather than any other. Returns None on
+    success, else a description of what it serves instead.
+    """
+    agents, error = _fetch_agents(demo_url)
+    if error is not None:
+        return error
+    served = [a.get("id") for a in agents]
+    if served != [expected_did]:
+        return (
+            f"expected exactly the freshly created agent {expected_did}; "
+            f"server reports {served}"
+        )
+    return None
+
+
+@contextlib.contextmanager
+def _sigterm_raises_exit() -> Iterator[None]:
+    """Turn SIGTERM into ``SystemExit`` so ``finally`` teardown runs.
+
+    SIGTERM (CI cancellation, ``kill``) otherwise ends the process without
+    unwinding, leaving the isolated server running. Only the main thread
+    may install a handler; anywhere else this is a no-op.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _exit(signum: int, _frame: Any) -> None:
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, _exit)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _run_isolated_playwright(
+    *,
+    prefix: str,
+    port: int,
+    data_dir: Path,
+    server_cwd: Path,
+    server_env: dict,
+    server_log: Path,
+    health_timeout: float,
+    playwright_cmd: List[str],
+    playwright_cwd: Path,
+    playwright_env: dict,
+    keep_server: bool,
+    pid_file: Optional[Path] = None,
+    verify_instance: Optional[Callable[[str, Any], Optional[str]]] = None,
+) -> int:
+    """Start an isolated server, prove it, run Playwright, tear it down.
+
+    The lifecycle ``kestrel demo run`` and ``kestrel demo smoke`` share:
+    start uvicorn on ``port``, wait for ``/health``, refuse any non-demo
+    agent (#868), run the caller's ``verify_instance`` (an error string
+    refuses), then run Playwright. The server is stopped on every exit —
+    success, failure, an exception, or SIGTERM — unless ``keep_server``.
+    """
+    demo_url = f"http://127.0.0.1:{port}"
+    # Use sys.executable -m uvicorn so we don't depend on whether the
+    # operator has ``uvicorn`` on PATH — matches the in-process startup
+    # idiom in cli.py:_start_inprocess_mode.
+    server_cmd = [
+        sys.executable, "-m", "uvicorn", "kestrel_sovereign.server:app",
+        "--host", "127.0.0.1", "--port", str(port),
+    ]
+    with _sigterm_raises_exit():
+        log_fd = open(server_log, "wb")
+        print(
+            f"[{prefix}] Starting isolated server on {demo_url} "
+            f"(DB={data_dir}) ..."
+        )
+        proc = start_background_process(
+            server_cmd,
+            cwd=server_cwd,
+            env=server_env,
+            stdout=log_fd,
+            stderr=log_fd,
+        )
+        exit_code = 1
+        try:
+            if pid_file is not None:
+                pid_file.write_text(f"{proc.pid}\n", encoding="utf-8")
+
+            print(f"[{prefix}] Waiting for {demo_url}/health ...", flush=True)
+            if not wait_for_health(port, timeout=health_timeout, proc=proc):
+                print(
+                    "error: server did not become healthy within "
+                    f"{health_timeout:.0f}s. Log: {server_log}",
+                    file=sys.stderr,
+                )
+                return exit_code
+
+            # Routing precondition (#868 AC#3).
+            print(f"[{prefix}] Verifying every loaded agent is is_demo=true ...")
+            bad = _verify_only_demo_agents(demo_url)
+            if bad is not None:
+                print(
+                    "error: refusing to run — server reports non-demo "
+                    f"agent(s): {bad}\n"
+                    "       This is the routing precondition that wiped "
+                    "Meridian (#867/#868).",
+                    file=sys.stderr,
+                )
+                return exit_code
+
+            if verify_instance is not None:
+                problem = verify_instance(demo_url, proc)
+                if problem is not None:
+                    print(f"error: refusing to run — {problem}", file=sys.stderr)
+                    return exit_code
+
+            print(f"[{prefix}] Running {' '.join(playwright_cmd)} ...")
+            exit_code = run_streaming(
+                playwright_cmd,
+                cwd=playwright_cwd,
+                env=playwright_env,
+            )
+            print(f"[{prefix}] Done (exit={exit_code}).")
+            return exit_code
+        finally:
+            log_fd.close()
+            if not keep_server:
+                print(
+                    f"[{prefix}] Stopping server (PID {proc.pid}) ...",
+                    flush=True,
+                )
+                stop_process(proc)
+                if pid_file is not None:
+                    pid_file.unlink(missing_ok=True)
+                if exit_code != 0:
+                    print(
+                        f"[{prefix}] Server log: {server_log}",
+                        file=sys.stderr,
+                    )
+            else:
+                print(
+                    f"[{prefix}] --keep-server set; leaving uvicorn at "
+                    f"PID {proc.pid} ({demo_url}). Stop it manually when "
+                    "done.",
+                    file=sys.stderr,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -321,20 +689,9 @@ def _cmd_demo_run(args) -> int:
         )
         return 2
 
-    if port in _FORBIDDEN_PORTS:
-        print(
-            f"error: refusing DEMO_PORT={port} — that's the live "
-            "server. Pick another port.",
-            file=sys.stderr,
-        )
-        return 2
-
-    if _port_is_busy(port):
-        print(
-            f"error: port {port} already in use; free it or pass "
-            f"--port <free-port>",
-            file=sys.stderr,
-        )
+    refusal = _port_refusal(port)
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
         return 2
 
     demo_url = f"http://127.0.0.1:{port}"
@@ -353,94 +710,132 @@ def _cmd_demo_run(args) -> int:
         )
         return 1
 
-    # 2. Spawn isolated uvicorn against demo DB; logs go to a tempfile
-    # we can ``tail``-print on health-check failure.
-    server_log = Path(tempfile.gettempdir()) / f"kestrel-demo-server-{port}.log"
-    log_fd = open(server_log, "wb")
-    server_env = _build_demo_env(os.environ.copy(), demo_db, repo)
-    # Use sys.executable -m uvicorn so we don't depend on whether the
-    # operator has ``uvicorn`` on PATH — matches the in-process startup
-    # idiom in cli.py:_start_inprocess_mode.
-    server_cmd = [
-        sys.executable, "-m", "uvicorn", "kestrel_sovereign.server:app",
-        "--host", "127.0.0.1", "--port", str(port),
-    ]
-    print(
-        f"[demo-runner] Starting isolated server on {demo_url} "
-        f"(DB={demo_db}) ..."
+    # 2-5. Isolated server → health → isolation check → demo → teardown.
+    rc = _run_isolated_playwright(
+        prefix="demo-runner",
+        port=port,
+        data_dir=demo_db,
+        server_cwd=repo,
+        server_env=_build_demo_env(os.environ.copy(), demo_db, repo),
+        server_log=Path(tempfile.gettempdir()) / f"kestrel-demo-server-{port}.log",
+        health_timeout=_DEMO_HEALTH_TIMEOUT,
+        playwright_cmd=["npx", "playwright", "test", "--config=config.cjs"],
+        playwright_cwd=demo_dir,
+        playwright_env=_build_playwright_env(os.environ.copy(), demo_url, repo, demo_db),
+        keep_server=keep_server,
     )
-    proc = start_background_process(
-        server_cmd,
-        cwd=repo,
-        env=server_env,
-        stdout=log_fd,
-        stderr=log_fd,
-    )
+    print(f"[demo-runner] Artifacts in demos/{name}/demo-output/")
+    return rc
 
-    exit_code = 0
+
+def _cmd_demo_smoke(args) -> int:
+    """``kestrel demo smoke`` — the Sovereign Console Playwright smoke."""
+    repo = _repo_root()
+    port: int = int(args.port) if args.port is not None else _DEFAULT_SMOKE_PORT
+    keep_server: bool = bool(getattr(args, "keep_server", False))
+
+    refusal = _port_refusal(port)
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 2
     try:
-        # 3. Wait for /health.
-        print(
-            f"[demo-runner] Waiting for {demo_url}/health ...",
-            flush=True,
-        )
-        if not wait_for_health(port, timeout=60.0, proc=proc):
-            print(
-                "error: server did not become healthy within 60s. "
-                f"Log: {server_log}",
-                file=sys.stderr,
-            )
-            return 1
+        home = _prepare_smoke_home(getattr(args, "home", None))
+    except _SmokeSetupError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
 
-        # 4. Verify routing precondition (#868 AC#3).
-        print(
-            "[demo-runner] Verifying every loaded agent is is_demo=true ..."
-        )
-        bad = _verify_only_demo_agents(demo_url)
-        if bad is not None:
-            print(
-                "error: refusing to run — server reports non-demo "
-                f"agent(s): {bad}\n"
-                "       This is the routing precondition that wiped "
-                "Meridian (#867/#868).",
-                file=sys.stderr,
-            )
-            return 1
+    data_dir = home / "agent_data" / "console-smoke"
+    inception_path = home / _SMOKE_INCEPTION_NAME
+    manifest_path = home / SMOKE_MANIFEST_NAME
+    demo_url = f"http://127.0.0.1:{port}"
+    env = _build_smoke_env(os.environ.copy(), home, data_dir, _ephemeral_data_key())
 
-        # 5. Run the demo via npx.
-        print(f"[demo-runner] Running demos/{name} ...")
-        playwright_env = _build_playwright_env(os.environ.copy(), demo_url, repo, demo_db)
-        rc = run_streaming(
-            ["npx", "playwright", "test", "--config=config.cjs"],
-            cwd=demo_dir,
-            env=playwright_env,
-        )
-        exit_code = rc
+    # 1. A fresh demo agent, configured with the local LLM route only.
+    print(f"[console-smoke] Creating a fresh smoke agent in {home} ...")
+    rc = run_streaming(
+        [
+            sys.executable, str(repo / "scripts" / "setup_demo_agent.py"),
+            "--data-dir", str(data_dir),
+            "--manifest", str(inception_path),
+            "--local-llm-only",
+        ],
+        cwd=home,
+        env=env,
+    )
+    if rc != 0:
         print(
-            f"[demo-runner] Done (exit={rc}). Artifacts in "
-            f"demos/{name}/demo-output/"
+            "error: scripts/setup_demo_agent.py failed; aborting.",
+            file=sys.stderr,
         )
-        return rc
-    finally:
-        log_fd.close()
-        if not keep_server:
-            print(
-                f"[demo-runner] Stopping server (PID {proc.pid}) ...",
-                flush=True,
-            )
-            stop_process(proc)
-            if exit_code != 0:
-                print(
-                    f"[demo-runner] Server log: {server_log}",
-                    file=sys.stderr,
-                )
-        else:
-            print(
-                f"[demo-runner] --keep-server set; leaving uvicorn at "
-                f"PID {proc.pid} ({demo_url}). Stop it manually when "
-                "done.",
-                file=sys.stderr,
-            )
+        return 1
+
+    # 2. Prove the server will run this checkout's code.
+    try:
+        inception = _load_inception_manifest(inception_path, data_dir)
+        module_origin = _server_module_origin(home, env)
+    except _SmokeSetupError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    expected_origin = Path(__file__).resolve().parent
+    if module_origin != expected_origin:
+        print(
+            "error: refusing to run — the server would import "
+            f"kestrel_sovereign from {module_origin}, not from this "
+            f"runner's {expected_origin}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"[console-smoke] Server module origin: {module_origin}")
+
+    def _record_instance(url: str, proc: Any) -> Optional[str]:
+        # 3. Prove the server serves this run's database, then hand the
+        # proven facts to the spec.
+        problem = _verify_served_identity(url, inception["agent_did"])
+        if problem is not None:
+            return problem
+        manifest = {
+            "base_url": url,
+            "port": port,
+            "home": str(home),
+            "data_dir": str(data_dir),
+            "db_path": inception["db_path"],
+            "agent_did": inception["agent_did"],
+            "agent_name": inception.get("agent_name"),
+            "module_origin": str(module_origin),
+            "server_pid": proc.pid,
+        }
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        print(
+            f"[console-smoke] Serving {inception['agent_did']} from "
+            f"{inception['db_path']}"
+        )
+        return None
+
+    playwright_env = {
+        name: value for name, value in env.items() if name != "KESTREL_DATA_KEY"
+    }
+    playwright_env["KESTREL_URL"] = demo_url
+    playwright_env["KESTREL_CONSOLE_SMOKE_MANIFEST"] = str(manifest_path)
+
+    rc = _run_isolated_playwright(
+        prefix="console-smoke",
+        port=port,
+        data_dir=data_dir,
+        server_cwd=home,
+        server_env=env,
+        server_log=home / SMOKE_LOG_NAME,
+        health_timeout=_SMOKE_HEALTH_TIMEOUT,
+        playwright_cmd=list(_SMOKE_PLAYWRIGHT_CMD),
+        playwright_cwd=repo,
+        playwright_env=playwright_env,
+        keep_server=keep_server,
+        pid_file=home / SMOKE_PID_NAME,
+        verify_instance=_record_instance,
+    )
+    print(f"[console-smoke] Instance home: {home}")
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +845,7 @@ def _cmd_demo_run(args) -> int:
 def add_demo_subcommand(
     subparsers: "argparse._SubParsersAction",
 ) -> None:
-    """Register ``kestrel demo {run}`` under the parent subparsers.
+    """Register ``kestrel demo {run,smoke}`` under the parent subparsers.
 
     Called from :func:`kestrel_sovereign.cli.build_parser`. Mirrors the
     ``cli_release`` / ``cli_deploy`` locality pattern so an operator
@@ -487,6 +882,31 @@ def add_demo_subcommand(
              "on exit.",
     )
 
+    smoke_p = demo_sub.add_parser(
+        "smoke",
+        help="Run the Sovereign Console Playwright smoke (the CI subset) "
+             "against a freshly created isolated instance",
+    )
+    smoke_p.add_argument(
+        "--home",
+        default=None,
+        help="Instance home; must be absent or empty (default: a new temp "
+             "dir). Holds the database, server.log, and the instance "
+             "manifest.",
+    )
+    smoke_p.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"Port for the isolated server (default: "
+             f"{_DEFAULT_SMOKE_PORT}; refuses 8888)",
+    )
+    smoke_p.add_argument(
+        "--keep-server",
+        action="store_true",
+        help="Leave the server running after the smoke. Default: stop it.",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Top-level handler
@@ -496,22 +916,29 @@ def cmd_demo(args) -> int:
     """Dispatch ``kestrel demo ...``.
 
     Exit codes:
-        0 — demo passed
-        1 — demo failed (server unhealthy, sanity-check failed,
-            playwright reported failure)
-        2 — argument error (unknown demo, forbidden port, port busy)
+        0 — demo/smoke passed
+        1 — demo/smoke failed (setup failed, server unhealthy, isolation or
+            origin check failed, playwright reported failure)
+        2 — argument error (unknown demo, forbidden port, port busy,
+            non-empty smoke home)
     """
     sub = getattr(args, "demo_command", None)
     if sub == "run":
         return _cmd_demo_run(args)
+    if sub == "smoke":
+        return _cmd_demo_smoke(args)
     print(
-        "Usage: kestrel demo run <name> [--port PORT] [--keep-server]",
+        "Usage: kestrel demo run <name> [--port PORT] [--keep-server]\n"
+        "       kestrel demo smoke [--home DIR] [--port PORT] [--keep-server]",
         file=sys.stderr,
     )
     return 1
 
 
 __all__ = [
+    "SMOKE_LOG_NAME",
+    "SMOKE_MANIFEST_NAME",
+    "SMOKE_PID_NAME",
     "add_demo_subcommand",
     "cmd_demo",
 ]

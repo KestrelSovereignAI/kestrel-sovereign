@@ -5,12 +5,20 @@ Provides text embeddings using Ollama's embedding models.
 This replaces the need for local sentence-transformers installation.
 """
 import hashlib
+import inspect
 import logging
+import time
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional
 import numpy as np
 
 from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
+
+from .adapter import ReportedUsage
+from .modality_recording import ModalityCall
+
+if TYPE_CHECKING:
+    from .modality_recording import ModalityRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -493,6 +501,29 @@ class EmbeddingService:
         return "local"
 
 
+def _names_usage_sink(method: Any) -> bool:
+    """Whether an adapter embed method explicitly declares ``usage_sink``.
+
+    The SDK embed contract returns bare vectors and forwards ``**kwargs``, so
+    an adapter that never heard of the sink could pass it on into its HTTP
+    request. Only an adapter that names the parameter receives it.
+    """
+    try:
+        return "usage_sink" in inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_vector(value: Any) -> bool:
+    """Whether an adapter returned an embedding (lists or arrays alike)."""
+    if value is None:
+        return False
+    try:
+        return len(value) > 0
+    except TypeError:
+        return True
+
+
 class ProviderEmbeddingService:
     """Embedding service backed by an initialized LLM provider route.
 
@@ -502,6 +533,11 @@ class ProviderEmbeddingService:
     capability metadata records the embedding model and dimension that produced
     those vectors; vectors from different providers/models are not semantically
     interchangeable and should be re-embedded before mixing in one index.
+
+    With a ``recorder`` (the owning ``LLMService``), every dispatched embedding
+    call, successful or not, is recorded through the same sinks as chat
+    (#3426): content-free, tagged ``modality="embedding"``, with the tokens and
+    cost the route reports.
     """
 
     def __init__(
@@ -510,8 +546,10 @@ class ProviderEmbeddingService:
         *,
         space_id_override: Optional[str] = None,
         normalized_override: Optional[bool] = None,
+        recorder: Optional["ModalityRecorder"] = None,
     ):
         self.provider = provider
+        self._recorder = recorder
         self.adapter = provider["adapter"]
         self.client = provider["client"]
         # Capture the registry's route classification at construction.  Both
@@ -597,14 +635,98 @@ class ProviderEmbeddingService:
             return {"dimensions": int(self.embedding_dim)}
         return {}
 
+    async def _dispatch(
+        self,
+        operation: str,
+        method: Callable[..., Awaitable[Any]],
+        payload: Any,
+        input_count: int,
+    ) -> Any:
+        """Call one adapter embed method and record the dispatch.
+
+        The invocation context is frozen before the first await. The record is
+        written whether the call returns, raises or is cancelled, and never
+        replaces the caller's outcome.
+        """
+        kwargs: dict[str, Any] = {"model": self.model, **self._embed_kwargs()}
+        recorder = self._recorder
+        if recorder is None:
+            return await method(self.client, payload, **kwargs)
+
+        context = recorder.snapshot_invocation_context()
+        usage = ReportedUsage()
+        if _names_usage_sink(method):
+            kwargs["usage_sink"] = usage
+        started = time.monotonic()
+        result: Any = None
+        error: Optional[BaseException] = None
+        try:
+            result = await method(self.client, payload, **kwargs)
+            return result
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            await recorder.record_modality_call(
+                self._embedding_call(
+                    operation,
+                    input_count,
+                    result=result,
+                    error=error,
+                    usage=usage,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    context=context,
+                )
+            )
+
+    def _embedding_call(
+        self,
+        operation: str,
+        input_count: int,
+        *,
+        result: Any,
+        error: Optional[BaseException],
+        usage: ReportedUsage,
+        duration_ms: int,
+        context: Any,
+    ) -> ModalityCall:
+        """Describe one embedding dispatch without its text or vectors."""
+        if error is not None:
+            missing = input_count
+        elif operation == "batch":
+            vectors = result if isinstance(result, (list, tuple)) else ()
+            missing = input_count - sum(
+                1 for vector in vectors[:input_count] if _is_vector(vector)
+            )
+        else:
+            missing = 0 if _is_vector(result) else 1
+        metadata: dict[str, Any] = {
+            "operation": operation,
+            "input_count": input_count,
+        }
+        if missing:
+            metadata["missing_vectors"] = missing
+        return ModalityCall(
+            modality="embedding",
+            provider=str(self.provider.get("name") or "unknown"),
+            model=str(self.model or usage.model or "unknown"),
+            duration_ms=duration_ms,
+            success=error is None and not missing,
+            context=context,
+            error_class=type(error).__name__ if error is not None else None,
+            input_tokens=usage.input_tokens,
+            cost=usage.cost,
+            metadata=metadata,
+        )
+
     async def aembed(self, text: str) -> Optional[List[float]]:
-        return await self.adapter.aembed(
-            self.client,
+        return await self._dispatch(
+            "document",
+            self.adapter.aembed,
             _prepare_retrieval_document(
                 text, self.model, self._document_format
             ),
-            model=self.model,
-            **self._embed_kwargs(),
+            1,
         )
 
     async def aembed_query(
@@ -614,13 +736,13 @@ class ProviderEmbeddingService:
         instruction: str = MEMORY_RETRIEVAL_INSTRUCTION,
     ) -> Optional[List[float]]:
         """Embed a retrieval query using the model's query-side contract."""
-        return await self.adapter.aembed(
-            self.client,
+        return await self._dispatch(
+            "query",
+            self.adapter.aembed,
             _prepare_retrieval_query(
                 text, self.model, instruction, self._query_format
             ),
-            model=self.model,
-            **self._embed_kwargs(),
+            1,
         )
 
     def retrieval_similarity_floor(self) -> float:
@@ -632,16 +754,17 @@ class ProviderEmbeddingService:
         return _requires_answerability_gate(self.model, self._answerability_gate)
 
     async def aembed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
-        return await self.adapter.aembed_batch(
-            self.client,
-            [
-                _prepare_retrieval_document(
-                    text, self.model, self._document_format
-                )
-                for text in texts
-            ],
-            model=self.model,
-            **self._embed_kwargs(),
+        prepared = [
+            _prepare_retrieval_document(text, self.model, self._document_format)
+            for text in texts
+        ]
+        if not prepared:
+            # Nothing is dispatched for an empty batch, so nothing is recorded.
+            return await self.adapter.aembed_batch(
+                self.client, prepared, model=self.model, **self._embed_kwargs()
+            )
+        return await self._dispatch(
+            "batch", self.adapter.aembed_batch, prepared, len(prepared)
         )
 
     def describe(self) -> Optional[EmbeddingProfile]:

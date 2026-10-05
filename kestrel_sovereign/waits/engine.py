@@ -39,6 +39,85 @@ logger = logging.getLogger(__name__)
 MAX_HANDLE_WAIT_SECONDS = 3600
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 
+# The ``WaitStatus.data`` key through which a provider names the terminal
+# EVENT a terminal poll describes (#3399). The reconciler dedups wakes on it
+# when present, so a provider that sets it gets one wake per distinct terminal
+# event rather than one per outcome class: a CI re-run that fails again is a
+# new event even though its outcome is the same ``failed``.
+#
+# The value is a non-empty string, and it must be:
+#
+# * stable — the same event polled again, at any later time, yields the same
+#   string. Anything that varies between polls of one event (a fetch time, an
+#   ``updated_at`` touched by an unrelated edit) re-fires the wake.
+# * read from the provider's raw record, never from its classification. The
+#   reconciler compares identities without the outcome, so a classifier change
+#   that re-labels an old event does not make it news and replay it (#3390).
+# * distinct for distinct events, including ones with the same outcome — a
+#   re-run, a new head commit, a corrected terminal record.
+# * the same through every read path the provider has. A provider that can
+#   read one event through several paths that name its records differently
+#   puts only what every path names alike here (for CI, the head SHA), and
+#   the rest in ``TERMINAL_EVENT_DETAIL_KEY``.
+# * written by the provider itself. A provider that spreads third-party data
+#   into ``WaitStatus.data`` must drop this key, and the four below, from
+#   that data, or the third party decides when the agent is woken.
+#
+# A provider that does not set it keeps the legacy ``"<outcome>"`` /
+# ``"<outcome>:<native status>"`` token unchanged.
+TERMINAL_EVENT_KEY = "terminal_event"
+
+# Optional, and always set as a pair: the part of the event's identity that
+# only one read path can see (the DETAIL — for CI, the execution set), and
+# that path's name (the VIEW). GitHub CI is the case (#3399): the Checks API
+# names a re-run by its new check-run ids, the Actions API fallback by its
+# workflow run's ``run_attempt``, and nothing maps one onto the other. A watch
+# fires on a new execution, never on a change of view, so with the event
+# unchanged:
+#
+# * same view: a new event if and only if the details differ.
+# * different view: NOT a new event, whatever the outcome — one execution can
+#   be DONE through one view and PARTIAL through a narrower one. The
+#   reconciler does not wake; it re-baselines the delivered token, and any
+#   watch armed over it, to the new view's identity and logs the switch, so a
+#   genuine re-run seen later through that view still fires.
+#
+# Accepted limit: a new execution whose first terminal read is also the read
+# where the view switches is absorbed into that re-baseline. A view switch is
+# rare (for CI, a credential gaining or losing the Checks API), and the next
+# distinct execution still fires.
+#
+# A provider whose read path never changes does not need these keys: put the
+# whole identity in ``TERMINAL_EVENT_KEY``.
+TERMINAL_EVENT_DETAIL_KEY = "terminal_event_detail"
+TERMINAL_EVENT_VIEW_KEY = "terminal_event_view"
+
+# Optional: ``True`` when the handle can produce no later terminal event — a
+# merged PR, a finished local task, an A2A task whose terminal state this
+# agent has stamped. A re-registered watch waits for an event other than the one
+# already delivered, so over a final event it can never fire; the reconciler
+# disarms it when it polls that event again rather than polling it every tick
+# forever. Leave it unset for anything that can still change (a closed PR can
+# be reopened). Like the keys above, only the provider may write it.
+TERMINAL_EVENT_FINAL_KEY = "terminal_event_final"
+
+# Optional: when the terminal event happened, read from the provider's raw
+# record (a job's exit time, not the time it was polled or classified), as an
+# ISO 8601 string (a ``datetime`` is accepted too, and re-written as one). A
+# value without a timezone is read as UTC.
+#
+# The reconciler compares it with the handle's last delivered wake (#3390).
+# A wake whose event is older than that delivery is a REPLAY: the event
+# happened before the agent was last woken for this handle, so whatever the
+# provider's own wake would tell the agent to do in that turn may already be
+# done or superseded. The reconciler announces a replay on the generic
+# ``wait.replay`` source, which states that it is a replay and carries none of
+# the provider's act-now instructions, instead of on the provider's signal.
+# A provider that does not set it never has a wake labelled a replay. Like the
+# keys above, only the provider may write it: a forged earlier time would
+# strip a fresh wake of its instructions.
+TERMINAL_EVENT_AT_KEY = "terminal_event_at"
+
 
 def parse_ref(ref: str) -> Tuple[str, str]:
     """Split a ``"<kind>:<handle>"`` wait reference into its parts.

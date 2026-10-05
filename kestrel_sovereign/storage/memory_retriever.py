@@ -52,7 +52,7 @@ from .async_conversation_store import (
 from .associative_linker import AssociativeLinker
 from .memory_answerability import (
     AnswerabilityCandidate,
-    LLMAnswerabilityGate,
+    AnswerabilityGate,
     has_exact_lexical_evidence,
 )
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
@@ -201,7 +201,7 @@ class MemoryRetriever:
         self,
         conversation_store: AsyncConversationStore,
         linker: Optional[AssociativeLinker] = None,
-        answerability_gate: Optional[LLMAnswerabilityGate] = None,
+        answerability_gate: Optional[AnswerabilityGate] = None,
         answerability_enabled: bool = True,
     ):
         """

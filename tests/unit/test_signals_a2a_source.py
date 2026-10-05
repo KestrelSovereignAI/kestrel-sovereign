@@ -746,3 +746,64 @@ async def test_durable_consumer_guard_reads_registration_not_drainer_state(tmp_p
         ) is True, "a registered consumer must count before its drainer starts"
     finally:
         await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_an_ask_tool_in_a_woken_turn_is_denied_not_queued(
+    components, tmp_path
+):
+    """#3439 wiring. The dispatcher must bind the causation chain around the
+    turn it routes, so the security hook running inside that turn sees a
+    signal-driven turn and denies an ASK tool at once instead of queuing an
+    approval nobody in the conversation can answer. Outside the turn the
+    chain is unbound again."""
+    from kestrel_sdk.hooks.base import HookInput, PermissionDecision
+    from kestrel_sovereign.agent.turn_lifecycle import (
+        current_turn_is_signal_driven,
+    )
+    from kestrel_sovereign.features.security.approval_queue import (
+        ApprovalQueue,
+    )
+    from kestrel_sovereign.features.security.hooks import SecurityHook
+    from kestrel_sovereign.features.security.permissions import (
+        PermissionLevel,
+        PermissionStore,
+    )
+
+    c = components
+    store = PermissionStore(str(tmp_path / "perms.db"))
+    await store.initialize()
+    await store.register_tool("MemoryFeature", "memory_status", PermissionLevel.ASK)
+    queue = ApprovalQueue(permission_store=store)
+    hook = SecurityHook(store, queue)
+    outputs = []
+
+    async def turn_calls_ask_tool(prompt):
+        outputs.append(
+            await asyncio.wait_for(
+                hook.execute(
+                    HookInput(
+                        session_id="a2a-session",
+                        hook_event_name="PreToolUse",
+                        tool_name="memory_status",
+                        feature_name="MemoryFeature",
+                        tool_input={},
+                    )
+                ),
+                timeout=1.0,
+            )
+        )
+        return "needs operator approval"
+
+    c.agent.process_input = turn_calls_ask_tool
+    sig = build_signal_for_completed_task(
+        _fake_task(task_id="t-ask"), target_agent=c.agent.did
+    )
+    result = await c.dispatcher.dispatch_signal(sig)
+
+    assert result.status == Status.OK
+    assert len(outputs) == 1
+    assert outputs[0].permission_decision == PermissionDecision.DENY
+    assert "MemoryFeature.memory_status" in outputs[0].permission_reason
+    assert queue.pending_requests == []
+    assert current_turn_is_signal_driven() is False

@@ -16,7 +16,10 @@ wrong for a provider that has named its own retry time. These tests pin:
     re-emits it afterwards, and labels the late wake as late;
   * a dispatcher-side failure with no advice still spends the cap exactly as
     before (the loop guard is not weakened);
-  * locked and parked wakes are listed by ``wait_status``.
+  * locked and parked wakes are listed by ``wait_status``;
+  * a lock fires only at the row's recorded attempts and reports the count it
+    fired at, and a wake dispatched after a lock is not listed as locked
+    (#3391).
 
 The dispatcher, source registration, reconciler and store are production code;
 only the agent body and the wait provider are doubles.
@@ -25,6 +28,7 @@ only the agent body and the wait provider are doubles.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -84,8 +88,12 @@ class _Agent:
         self.turns = 0
         # None -> the turn succeeds; an exception -> the turn raises it.
         self.failure: BaseException | None = None
+        # When set, a turn waits for it before running: a wake still in flight.
+        self.gate: asyncio.Event | None = None
 
     async def process_input(self, prompt: str, **kwargs):
+        if self.gate is not None:
+            await self.gate.wait()
         self.turns += 1
         if self.failure is not None:
             raise self.failure
@@ -167,6 +175,8 @@ async def rig(tmp_path, sqlite_database_factory):
         job=job,
     )
 
+    if agent.gate is not None:
+        agent.gate.set()  # never leave a held turn behind
     pending = [t for t in agent.background_tasks if not t.done()]
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
@@ -441,10 +451,9 @@ async def test_wait_status_lists_locked_and_parked_wakes(rig):
         "talon", "4f08bfc5", delivery_status="failed",
         delivery_error="LLMAllProvidersFailedError: 429", attempt_at=now,
     )
-    await store.record_delivery(
-        "talon", "4f08bfc5", delivery_status=MAX_ATTEMPTS_EXCEEDED,
-        delivery_error="LLMAllProvidersFailedError: 429",
-        signaled_outcome="failed:failed", attempt_at=now,
+    assert await store.lock_at_max_attempts(
+        "talon", "4f08bfc5", target="failed:failed",
+        max_attempts=MAX_DELIVERY_ATTEMPTS, attempt_at=now,
     )
     # Parked until the provider's reset.
     reset = now + timedelta(hours=2)
@@ -475,6 +484,8 @@ async def test_wait_status_lists_locked_and_parked_wakes(rig):
     deferred = result.data["deferred"]
     assert [e["ref"] for e in locked] == ["talon:4f08bfc5"]
     assert locked[0]["delivery_attempts"] == MAX_DELIVERY_ATTEMPTS
+    assert locked[0]["locked_at_attempts"] == MAX_DELIVERY_ATTEMPTS
+    assert locked[0]["attempt_count_mismatch"] is False
     assert "429" in locked[0]["last_error"]
     assert [e["ref"] for e in deferred] == ["talon:bd2583ac"]
     assert deferred[0]["deferred_until"]
@@ -606,6 +617,9 @@ async def test_deferral_columns_migrate_onto_a_legacy_table(
 
     assert row.delivery_deferred_until is None
     assert row.delivery_deferrals == 0
+    assert row.delivery_locked_attempts is None, (
+        "the count a legacy lock fired at was never recorded (#3391)"
+    )
     assert [r.handle for r in await store.list_undelivered()] == ["h-old"], (
         "a wake locked before this fix is listed too — that is the backlog "
         "an agent most needs to find"
@@ -621,3 +635,236 @@ def test_wait_status_description_names_the_real_lock_status():
         if t.name == "wait_status"
     )
     assert f"`{MAX_ATTEMPTS_EXCEEDED}`" in tool.schema.description
+
+
+# ---------------------------------------------------------------------------
+# #3391: the lock fires at the recorded attempts and says how many
+# ---------------------------------------------------------------------------
+#
+# wait_status listed the Talon wakes for bb80a9d5 and f5162cae as LOCKED with
+# one attempt. A provider that corrects a job's terminal state after its wake
+# was locked starts a new transition, and that wake is dispatched as attempt 1.
+# Until it was harvested the row kept the lock's status beside the new wake's
+# counter, and wait_status reported a wake being sent as one locked after a
+# single attempt.
+
+
+async def _lock_finished_unknown(r) -> None:
+    """Lock transition A (``finished_unknown``) at the cap with a failure no
+    amount of waiting fixes."""
+    r.job.native_status = "finished_unknown"
+    r.agent.failure = RuntimeError("table has no column named request_generation")
+    for _ in range(MAX_DELIVERY_ATTEMPTS + 2):
+        await _tick(r)
+    row = await _row(r)
+    assert row.last_delivery_status == MAX_ATTEMPTS_EXCEEDED
+    assert row.last_signaled_outcome == "failed:finished_unknown"
+
+
+async def _wait_status(r):
+    feature = WaitFeature(agent=None)
+    feature.agent = r.host
+    return await feature.wait_status()
+
+
+@pytest.mark.asyncio
+async def test_the_lock_records_the_attempt_count_it_fired_at(rig):
+    await _lock_finished_unknown(rig)
+
+    row = await _row(rig)
+    assert rig.agent.turns == MAX_DELIVERY_ATTEMPTS
+    assert row.last_delivery_attempts == MAX_DELIVERY_ATTEMPTS
+    assert row.delivery_locked_attempts == MAX_DELIVERY_ATTEMPTS
+
+    result = await _wait_status(rig)
+    [entry] = result.data["locked"]
+    assert entry["locked_at_attempts"] == MAX_DELIVERY_ATTEMPTS
+    assert entry["delivery_max_attempts"] == MAX_DELIVERY_ATTEMPTS
+    assert entry["attempt_count_mismatch"] is False
+    assert (
+        f"locked at {MAX_DELIVERY_ATTEMPTS} of {MAX_DELIVERY_ATTEMPTS} attempt(s)"
+        in result.confirmation
+    )
+    assert "MISMATCH" not in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_a_wake_dispatched_after_a_lock_is_not_reported_locked(rig):
+    """The corrected transition's wake is in flight: it is neither locked nor
+    deferred, and the counter beside it is its own."""
+    await _lock_finished_unknown(rig)
+
+    rig.job.native_status = "failed"
+    rig.agent.failure = None
+    rig.agent.gate = asyncio.Event()
+    tick = await rig.reconciler.reconcile()  # dispatched; its turn is held
+    assert tick.data["signals_enqueued"] == 1
+
+    row = await _row(rig)
+    assert row.pending_signal_id is not None
+    assert row.attempts_signaled_target == "failed:failed"
+    assert row.last_delivery_attempts == 1, "attempt 1 of the NEW transition"
+    assert row.delivery_locked_attempts is None, "the dispatch ended the lock"
+    assert (await _wait_status(rig)).data == {"locked": [], "deferred": []}, (
+        "a wake being sent is not a wake locked after one attempt"
+    )
+    corrected = rig.emitted[-1]
+    assert corrected.payload["delivery_attempt"] == 1
+    assert corrected.payload["delivery_previous_status"] == MAX_ATTEMPTS_EXCEEDED
+    assert corrected.payload["delivery_previous_attempts"] == MAX_DELIVERY_ATTEMPTS
+
+    rig.agent.gate.set()
+    await asyncio.gather(*rig.agent.background_tasks, return_exceptions=True)
+    await _tick(rig)  # harvest
+    row = await _row(rig)
+    assert row.last_signaled_outcome == "failed:failed", "B was delivered"
+    assert row.last_delivery_status.startswith("ok_")
+    assert (await _wait_status(rig)).data["locked"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_stale_read_at_the_cap_does_not_lock(rig, monkeypatch):
+    """The lock checks the row, not the reconciler's read of it. A read that
+    shows the cap over a row recording one attempt — a concurrent writer, a
+    stale state — locks nothing and reports no lock."""
+    store = rig.reconciler._store
+    now = datetime.now(timezone.utc)
+    await store.record_pending(
+        "example", "job-1", signal_id="s1", target="failed:failed",
+        attempts=1, attempt_at=now,
+    )
+    await store.record_delivery(
+        "example", "job-1", delivery_status="failed", delivery_error="boom",
+        attempt_at=now,
+    )
+    real_get = store.get
+
+    async def stale_get(kind, handle):
+        row = await real_get(kind, handle)
+        return dataclasses.replace(row, last_delivery_attempts=MAX_DELIVERY_ATTEMPTS)
+
+    monkeypatch.setattr(store, "get", stale_get)
+    tick = await _tick(rig)
+
+    assert tick.data["signals_hard_failed"] == 0
+    assert tick.data["transitions"] == []
+    row = await real_get("example", "job-1")
+    assert row.last_delivery_status == "failed"
+    assert row.last_signaled_outcome is None
+    assert row.last_delivery_attempts == 1
+    assert row.delivery_locked_attempts is None
+
+
+@pytest.mark.asyncio
+async def test_the_store_locks_only_at_the_recorded_attempts_of_that_transition(
+    tmp_path, sqlite_database_factory,
+):
+    db = await sqlite_database_factory(tmp_path / "wait_store.db")
+    store = WaitSignalStore(db, agent_id="did:test:agent")
+    now = datetime.now(timezone.utc)
+
+    async def lock(target: str) -> bool:
+        return await store.lock_at_max_attempts(
+            "talon", "job-1", target=target,
+            max_attempts=MAX_DELIVERY_ATTEMPTS, attempt_at=now,
+        )
+
+    await store.record_pending(
+        "talon", "job-1", signal_id="s1", target="failed:failed",
+        attempts=1, attempt_at=now,
+    )
+    await store.record_delivery(
+        "talon", "job-1", delivery_status="failed", delivery_error="boom",
+        attempt_at=now,
+    )
+    assert not await lock("failed:failed"), "one recorded attempt is not the cap"
+
+    await store.record_pending(
+        "talon", "job-1", signal_id="s2", target="failed:failed",
+        attempts=MAX_DELIVERY_ATTEMPTS, attempt_at=now,
+    )
+    assert not await lock("failed:failed"), "a wake in flight is not locked"
+
+    await store.record_delivery(
+        "talon", "job-1", delivery_status="failed", delivery_error="boom",
+        attempt_at=now,
+    )
+    assert not await lock("failed:finished_unknown"), (
+        "the counter belongs to another transition"
+    )
+    row = await store.get("talon", "job-1")
+    assert row.last_delivery_status == "failed"
+    assert row.last_signaled_outcome is None
+    assert row.delivery_locked_attempts is None
+
+    assert await lock("failed:failed")
+    row = await store.get("talon", "job-1")
+    assert row.last_delivery_status == MAX_ATTEMPTS_EXCEEDED
+    assert row.last_signaled_outcome == "failed:failed"
+    assert row.delivery_locked_attempts == MAX_DELIVERY_ATTEMPTS
+    assert row.last_delivery_error == "boom", "the last real failure is kept"
+    assert [r.handle for r in await store.list_undelivered()] == ["job-1"]
+
+    with pytest.raises(ValueError, match="lock_at_max_attempts"):
+        await store.record_delivery(
+            "talon", "job-1", delivery_status=MAX_ATTEMPTS_EXCEEDED,
+            signaled_outcome="failed:failed", attempt_at=now,
+        )
+
+    # A later dispatch is a new transition's, and it ends the lock. The lock's
+    # status stays the previous status until that wake is harvested.
+    await store.record_pending(
+        "talon", "job-1", signal_id="s3", target="done:complete",
+        attempts=1, attempt_at=now,
+    )
+    row = await store.get("talon", "job-1")
+    assert row.delivery_locked_attempts is None
+    assert row.last_delivery_status == MAX_ATTEMPTS_EXCEEDED
+    assert await store.list_undelivered() == []
+
+
+@pytest.mark.asyncio
+async def test_wait_status_shows_a_lock_whose_count_does_not_match_the_cap(rig):
+    """The rows #3391 reported read as locked after one attempt. However such
+    a row arose — a lock written before its count was recorded, or a counter
+    changed under a lock — wait_status puts the numbers side by side and flags
+    the mismatch."""
+    for handle, attempts, locked_at in (
+        ("bb80a9d5", 1, None),
+        ("f5162cae", 1, MAX_DELIVERY_ATTEMPTS),
+        ("legacy-at-cap", MAX_DELIVERY_ATTEMPTS, None),
+    ):
+        await rig.db.execute(
+            """
+            INSERT INTO wait_signal_state
+                (agent_id, kind, handle, last_signaled_outcome,
+                 last_delivery_status, last_delivery_attempts,
+                 attempts_signaled_target, delivery_locked_attempts)
+            VALUES (?, 'talon', ?, 'failed:failed', ?, ?, 'failed:failed', ?)
+            """,
+            (rig.agent.did, handle, MAX_ATTEMPTS_EXCEEDED, attempts, locked_at),
+        )
+
+    result = await _wait_status(rig)
+    locked = {e["ref"]: e for e in result.data["locked"]}
+
+    unrecorded = locked["talon:bb80a9d5"]
+    assert unrecorded["locked_at_attempts"] is None
+    assert unrecorded["delivery_attempts"] == 1
+    assert unrecorded["attempt_count_mismatch"] is True
+    changed = locked["talon:f5162cae"]
+    assert changed["locked_at_attempts"] == MAX_DELIVERY_ATTEMPTS
+    assert changed["attempt_count_mismatch"] is True
+    assert locked["talon:legacy-at-cap"]["attempt_count_mismatch"] is False
+
+    text = result.confirmation
+    assert (
+        f"talon:bb80a9d5 (failed:failed), locked at an unrecorded attempt count "
+        f"(counter reads 1 of {MAX_DELIVERY_ATTEMPTS}) — ATTEMPT COUNT MISMATCH"
+    ) in text
+    assert (
+        f"talon:f5162cae (failed:failed), locked at {MAX_DELIVERY_ATTEMPTS} of "
+        f"{MAX_DELIVERY_ATTEMPTS} attempt(s), counter now reads 1 — "
+        "ATTEMPT COUNT MISMATCH"
+    ) in text
+    assert text.count("MISMATCH") == 2

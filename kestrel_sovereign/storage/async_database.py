@@ -26,7 +26,6 @@ from .conversation_created_at import (
     UNDATED_DDL,
     UNDATED_TABLE,
     canonical_created_at,
-    canonical_sql,
     conversation_history_ddl,
     created_at_bind,
     created_at_check,
@@ -130,6 +129,46 @@ _MODEL_USAGE_PERIODS_INDEX = (
     "idx_model_usage_periods_start",
     "model_usage_periods",
     "period_start",
+)
+
+#: ``wait_signal_rekeys`` — append-only audit of every change the wait
+#: reconciler makes to a delivered ``wait_signal_state`` row WITHOUT waking the
+#: agent (#3390). One row per re-key of ``last_signaled_outcome`` to the token
+#: the same terminal event is now polled under. ``reason`` is one of:
+#:
+#: * ``reclassified`` — the provider labels the delivered event differently
+#:   (its outcome class changed; its native status or event did not);
+#: * ``view_switched`` — the provider reads the event through another view
+#:   (#3399);
+#: * ``identity_adopted`` — the provider began naming terminal events after
+#:   the row was delivered (#3399);
+#: * ``identity_dropped`` — the provider stopped naming them.
+#:
+#: A classifier change used to read every delivered row as a new transition
+#: and replay its whole history as first deliveries. That re-key is now
+#: silent, so this table is the only place it is visible.
+#:
+#: Kept out of ``CORE_SCHEMA`` for the reason given above
+#: ``_MODEL_USAGE_PERIODS_DDL``: ``_ensure_wait_signal_rekeys`` creates it
+#: through probe -> migration lock -> re-probe, and its index through
+#: ``ensure_index``.
+_WAIT_SIGNAL_REKEYS_DDL = """
+CREATE TABLE IF NOT EXISTS wait_signal_rekeys (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL,
+    handle TEXT NOT NULL,
+    previous_token TEXT NOT NULL,
+    token TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    recorded_at TIMESTAMP NOT NULL
+)
+"""
+
+_WAIT_SIGNAL_REKEYS_INDEX = (
+    "idx_wait_signal_rekeys_handle",
+    "wait_signal_rekeys",
+    "agent_id, kind, handle",
 )
 
 #: ``(name, table, columns)`` of the index that makes the #2959 staleness probe
@@ -764,6 +803,20 @@ CREATE INDEX IF NOT EXISTS idx_pending_a2a_questions_sweep
 --                            is poll-only (not MonitorableWaitable), so EVERY
 --                            async waitable is wakeable without auto-waking all
 --                            tasks (which would self-wake on inbound work)
+--                            (cleared again when the watch fires, #3399)
+--   - watch_baseline         the terminal-event token a watch was (re)armed
+--                            over (#3399): the wake in flight, else the one
+--                            last delivered, when the agent registered it.
+--                            Delivering any other token disarms the watch, so
+--                            re-registering a watch that has fired re-arms it
+--                            instead of leaving it inert
+--   - last_delivered_at      the time of the last delivered wake for this
+--                            handle: when the poll that built it began, never
+--                            the later harvest. Unlike
+--                            last_delivery_attempt_at, a later transition's
+--                            attempts never overwrite it, so a re-emitted
+--                            wake can say when the handle was last woken and
+--                            whether its event is older than that (#3390)
 --
 -- ``agent_id`` scopes rows to the OWNING agent for shared-backend isolation,
 -- exactly like pending_a2a_questions above.
@@ -792,10 +845,16 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     delivery_deferred_until TIMESTAMP,
     -- How many times this transition's wake was parked that way.
     delivery_deferrals INTEGER NOT NULL DEFAULT 0,
+    -- The recorded attempt count a wake was locked at when it reached the
+    -- retry cap (#3391), copied from last_delivery_attempts by the lock
+    -- itself. NULL on every row that is not currently locked.
+    delivery_locked_attempts INTEGER,
     pending_signal_id TEXT,
     pending_signaled_target TEXT,
     pending_signal_enqueued_at TIMESTAMP,
     watching INTEGER NOT NULL DEFAULT 0,
+    watch_baseline TEXT,
+    last_delivered_at TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (agent_id, kind, handle)
 );
@@ -1228,7 +1287,18 @@ class AsyncDatabase:
         """
         strategy = getattr(self._backend, "nested_transaction_strategy", None)
         return strategy if strategy in {"savepoint", "joined"} else None
-    
+
+    @property
+    def owns_open_transaction(self) -> bool | None:
+        """Whether the current task has a transaction open on this database.
+
+        When it does, a ``transaction()`` entered now joins it, and its writes
+        commit only when the outer one does. Unknown backends return ``None``
+        so callers that must commit before acting fail closed.
+        """
+        owns = getattr(self._backend, "owns_open_transaction", None)
+        return owns if isinstance(owns, bool) else None
+
     async def _init_schema(self) -> None:
         """Create database tables if they don't exist."""
         # Through the accessor, not CORE_SCHEMA directly: conversation_history
@@ -1476,6 +1546,49 @@ class AsyncDatabase:
             "wait_signal_state", "delivery_deferrals",
             "INTEGER NOT NULL DEFAULT 0",
         )
+        # The attempt count a lock fired at (#3391). No backfill: a legacy
+        # lock's counter may have been rewritten by a later dispatch, so NULL
+        # ("not recorded") is the honest answer, and ``wait_status`` reports
+        # the live counter beside it.
+        await self._migrate_add_column(
+            "wait_signal_state", "delivery_locked_attempts", "INTEGER"
+        )
+        # Watch re-arm baseline (#3399), same reasoning again. A legacy row
+        # reads NULL: a watch that already fired stays retired exactly as it
+        # was until the agent registers it again, so the upgrade replays
+        # nothing.
+        await self._migrate_add_column(
+            "wait_signal_state", "watch_baseline", "TEXT"
+        )
+        # Last delivered wake (#3390). Unlike the columns above, this one has
+        # an honest legacy answer to backfill for some rows. Where the locked
+        # token was delivered (a persisted ``ok``/``coalesced`` status) and
+        # nothing has been dispatched since (no wake pending), the delivered
+        # attempt is the row's last dispatch, and ``last_attempt_started_at``
+        # (#3105) dates it.
+        #
+        # Never ``last_delivery_attempt_at``: that is the harvest, a tick after
+        # the wake, and an event that finished in between would read as older
+        # than the wake and be announced as a replay. A row with no dispatch
+        # time (delivered before #3105), mid-retry, pending, hard-failed, or
+        # never delivered stays NULL, which never labels a wake a replay.
+        await self.migrate_columns_once(
+            "wait_signal_state",
+            (("last_delivered_at", "TIMESTAMP"),),
+            backfills={
+                "last_delivered_at": (
+                    "UPDATE wait_signal_state "
+                    "SET last_delivered_at = last_attempt_started_at "
+                    "WHERE last_signaled_outcome IS NOT NULL "
+                    "AND pending_signal_id IS NULL "
+                    "AND last_attempt_started_at IS NOT NULL "
+                    "AND (last_delivery_status LIKE 'ok%' "
+                    "OR last_delivery_status LIKE 'coalesced%')",
+                    (),
+                ),
+            },
+        )
+        await self._ensure_wait_signal_rekeys()
         # Both indexes go through ``ensure_index`` rather than a bare
         # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
         # sequence but not safe in parallel, and ``_init_schema`` runs on every
@@ -2260,6 +2373,29 @@ class AsyncDatabase:
             ),
         )
         await self.ensure_index(*_MODEL_USAGE_PERIODS_INDEX)
+
+    async def _ensure_wait_signal_rekeys(self) -> None:
+        """Create the #3390 re-key audit table safely under concurrent boot.
+
+        New in an upgrade, so the first post-upgrade PostgreSQL boot is
+        exactly the request burst ``_ensure_model_usage_periods`` describes:
+        a bare ``CREATE TABLE IF NOT EXISTS`` lets two initializers pass the
+        catalogue probe together and one fails its whole ``from_pool()`` on
+        ``pg_class``'s unique index. Same probe -> migration lock -> re-probe,
+        and the index through ``ensure_index``.
+        """
+        table = "wait_signal_rekeys"
+        if not await self.table_exists(table):
+            async with self.migration_lock(f"create_{table}"):
+                if not await self.table_exists(table):
+                    await self.execute(_WAIT_SIGNAL_REKEYS_DDL)
+
+        if not await self.table_exists(table):
+            raise RuntimeError(
+                "wait_signal_rekeys was not created; delivered wait wakes "
+                "cannot be re-keyed without an audit record"
+            )
+        await self.ensure_index(*_WAIT_SIGNAL_REKEYS_INDEX)
 
     async def ensure_index(
         self, name: str, table: str, columns: str, *, lock_name: str = "",

@@ -22,6 +22,24 @@ from datetime import date, datetime, timezone
 from typing import Any, Dict, Optional
 
 
+def parse_instant(value: Any) -> Optional[datetime]:
+    """An ISO-8601 timestamp string as an aware UTC ``datetime``, or ``None``.
+
+    ``Z`` is accepted and a naive timestamp is taken as UTC -- GitHub writes
+    the first, ``datetime.now(timezone.utc).isoformat()`` the second's aware
+    form. Anything else (a non-string, empty or unparseable text) is ``None``.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        moment = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
 def contract_created_at(value: Any) -> Optional[str]:
     """Return ``value`` in the graph ``created_at`` contract, or ``None``.
 
@@ -39,16 +57,16 @@ def contract_created_at(value: Any) -> Optional[str]:
         moment = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
     elif isinstance(value, str):
         text = value.strip()
-        if not text:
-            return None
-        try:
-            if len(text) == 10:
+        if len(text) == 10:
+            try:
                 parsed = date.fromisoformat(text)
-                moment = datetime(parsed.year, parsed.month, parsed.day, tzinfo=timezone.utc)
-            else:
-                moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
-            return None
+            except ValueError:
+                return None
+            moment = datetime(parsed.year, parsed.month, parsed.day, tzinfo=timezone.utc)
+        else:
+            moment = parse_instant(text)
+            if moment is None:
+                return None
     else:
         return None
     if moment.tzinfo is None:

@@ -379,7 +379,8 @@ class SchedulerFeature(Feature):
         """Read ``[scheduler] max_concurrent_tasks`` from kestrel.toml.
 
         Defaults to ``DEFAULT_MAX_CONCURRENT_TASKS`` (#1675). Operators set 1
-        to restore the legacy strictly-serial tick behaviour."""
+        to run occurrences strictly serially; polling continues either way
+        (#3465)."""
         from kestrel_sovereign.config import load_section
         from kestrel_sovereign.features.scheduler.runner import (
             DEFAULT_MAX_CONCURRENT_TASKS,

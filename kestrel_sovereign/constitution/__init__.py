@@ -40,9 +40,17 @@ from .genesis_audit import (
     validate_completed_genesis_audit,
 )
 from .resolver import (
+    GoverningSource,
     governing_constitution_path,
     is_authoritative_governing_source,
     resolve_governing_constitution_bytes,
+    resolve_governing_source,
+)
+from .source_descriptor import (
+    CONSTITUTION_SOURCE_DESCRIPTOR_ENV,
+    SOURCE_KIND_EXTERNAL,
+    SOURCE_KIND_PACKAGE,
+    ConstitutionSourceError,
 )
 
 __all__ = [
@@ -69,7 +77,13 @@ __all__ = [
     "contract_to_json",
     "parse_emancipation_block",
     "render_amendment_viii",
+    "GoverningSource",
     "governing_constitution_path",
     "is_authoritative_governing_source",
     "resolve_governing_constitution_bytes",
+    "resolve_governing_source",
+    "CONSTITUTION_SOURCE_DESCRIPTOR_ENV",
+    "SOURCE_KIND_EXTERNAL",
+    "SOURCE_KIND_PACKAGE",
+    "ConstitutionSourceError",
 ]

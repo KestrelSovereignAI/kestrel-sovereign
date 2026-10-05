@@ -2,10 +2,14 @@
 Tests for the ContextBuilder module.
 """
 
+import logging
+
 import pytest
 from unittest.mock import Mock, AsyncMock, patch
 from kestrel_sovereign.agent.context_builder import ContextBuilder
 from kestrel_sovereign.agent.context_manager import ContextManager
+from kestrel_sovereign.logging_config import content_log_summary
+from tests.utils.log_records import records_containing
 
 
 class TestContextBuilder:
@@ -48,6 +52,27 @@ class TestContextBuilder:
 
         assert result == "No relevant documents or knowledge found in memory."
         async_mock_storage.search_chunks.assert_called_once_with("test query")
+
+    @pytest.mark.asyncio
+    async def test_retrieve_context_logs_facts_about_the_query_never_its_text(
+        self, async_context_builder, caplog
+    ):
+        """#3318: the query is the turn's user message, encrypted in the store."""
+        query = "my sister's diagnosis came back today"
+        caplog.set_level(logging.INFO, logger="kestrel_sovereign.agent.context_builder")
+
+        await async_context_builder.retrieve_context(query, session_id="session-3318")
+
+        lines = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "kestrel_sovereign.agent.context_builder"
+        ]
+        assert any(
+            content_log_summary(query) in line and "session-3318" in line
+            for line in lines
+        ), lines
+        assert not records_containing(caplog.records, "diagnosis")
 
     @pytest.mark.asyncio
     async def test_retrieve_context_with_results(self, async_context_builder, async_mock_storage):
@@ -122,28 +147,6 @@ class TestContextBuilder:
             "status": "unavailable", "reason": "semantic_recall_capability_unavailable"
         }
 
-
-@pytest.mark.asyncio
-async def test_context_manager_passes_live_rag_budget_and_keeps_semantic_metadata_content_free():
-    """The plan receives typed trace metadata, never retrieved claim/source bytes."""
-    builder = Mock()
-    builder.retrieve_context = AsyncMock(return_value="Source: note\nContent: fitting legacy RAG")
-    builder.last_semantic_recall_metadata = {
-        "status": "used",
-        "assertions": ({"assertion_id": "opaque-id", "score": 0.9},),
-    }
-    manager = ContextManager(Mock(), context_builder=builder)
-    manager.counter = Mock(count=lambda value: len(value))
-
-    result = await manager._produce_rag(
-        Mock(rag=37), "question", {"rag_min_score": 0.2}, include_rag=True, trivial_turn=False
-    )
-
-    builder.retrieve_context.assert_awaited_once_with("question", min_score=0.2, max_tokens=37)
-    assert result is not None
-    assert "Source: note\nContent: fitting legacy RAG" in result.dynamic_block
-    assert result.metadata == {"semantic_recall": builder.last_semantic_recall_metadata}
-    assert "fitting legacy RAG" not in repr(result.metadata)
 
     @pytest.mark.asyncio
     async def test_retrieve_context_handles_error(self, async_context_builder, async_mock_storage):
@@ -444,6 +447,29 @@ async def test_context_manager_passes_live_rag_budget_and_keeps_semantic_metadat
         result = await context_builder.build_rag_context("test query")
 
         assert result is None
+
+
+@pytest.mark.asyncio
+async def test_context_manager_passes_live_rag_budget_and_keeps_semantic_metadata_content_free():
+    """The plan receives typed trace metadata, never retrieved claim/source bytes."""
+    builder = Mock()
+    builder.retrieve_context = AsyncMock(return_value="Source: note\nContent: fitting legacy RAG")
+    builder.last_semantic_recall_metadata = {
+        "status": "used",
+        "assertions": ({"assertion_id": "opaque-id", "score": 0.9},),
+    }
+    manager = ContextManager(Mock(), context_builder=builder)
+    manager.counter = Mock(count=lambda value: len(value))
+
+    result = await manager._produce_rag(
+        Mock(rag=37), "question", {"rag_min_score": 0.2}, include_rag=True, trivial_turn=False
+    )
+
+    builder.retrieve_context.assert_awaited_once_with("question", min_score=0.2, max_tokens=37)
+    assert result is not None
+    assert "Source: note\nContent: fitting legacy RAG" in result.dynamic_block
+    assert result.metadata == {"semantic_recall": builder.last_semantic_recall_metadata}
+    assert "fitting legacy RAG" not in repr(result.metadata)
 
 
 class TestContextBuilderIntegration:

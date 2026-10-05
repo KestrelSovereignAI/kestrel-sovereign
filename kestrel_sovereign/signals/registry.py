@@ -720,7 +720,7 @@ class SourceRegistry:
         # Pre-turn admission — kestrel-sovereign#3310.
         SourceRegistry._validate_pre_turn_guard(reg)
 
-        # In-flight control ACTIONs skip the privacy transition lock and Hold
+        # In-flight control ACTIONs skip Hold and persist only a fixed marker
         # (#3169); keep that exemption to trusted, payload-free ACTIONs.
         if isinstance(reg, InFlightControlActionRegistration):
             if reg.allowed_modes != frozenset({SignalMode.ACTION}):

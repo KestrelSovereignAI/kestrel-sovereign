@@ -246,7 +246,7 @@ class TestRegisteredToolDispatch:
         messages = []
 
         result = await dispatch_agent._dispatch_tool_call(
-            _tool_call("create_github_issue", {"title": "t"}),
+            _tool_call("create_github_issue", {"query": "t"}),
             {},  # nothing visible this turn
             {"create_github_issue"},
             messages,
@@ -255,7 +255,7 @@ class TestRegisteredToolDispatch:
         )
 
         assert result == {"success": True, "tool": "create_github_issue"}
-        tool.execute.assert_awaited_once_with(title="t")
+        tool.execute.assert_awaited_once_with(query="t")
         # The permission lookup names the OWNING feature, not the tool.
         pre_call = dispatch_agent.hooks_manager.execute_hooks.await_args_list[0]
         assert pre_call.args[1].feature_name == "GitHubFeature"

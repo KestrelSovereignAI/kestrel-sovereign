@@ -551,6 +551,11 @@ async def test_clean_boot_reaches_ready(tmp_path):
         # domain feature: core hosts its six provider-neutral source contracts.
         assert all(name in agent.signal_registry for name in SOURCE_NAMES)
         assert "a2a.peer_stop" in agent.signal_registry
+        # Every wait wake the reconciler can build has a registered source:
+        # without ``wait.replay`` a replay would be dropped as unknown and
+        # locked away undelivered (#3390).
+        assert "wait.complete" in agent.signal_registry
+        assert "wait.replay" in agent.signal_registry
         from kestrel_sovereign.signals.sources.a2a import (
             DURABLE_COGNITION_CONSUMER_ID as A2A_COMPLETE_CONSUMER,
         )
@@ -564,6 +569,41 @@ async def test_clean_boot_reaches_ready(tmp_path):
         } <= agent.dispatcher._started_durable_cognition_consumers
         agent.reconcile_a2a_cognition_wakes.assert_awaited_once_with()
         assert started_when_reconciled == set()
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_boot_records_its_embedding_profile_after_loading_the_config(tmp_path):
+    """Offline tools compare their resolution with the recorded profile (#3420).
+
+    Recorded before the persisted embedding config is applied, it would name a
+    profile the agent does not search.
+    """
+    agent = _make_agent(tmp_path)
+    calls = []
+
+    def spy(name):
+        original = getattr(agent, name)
+
+        async def recorded(*args, **kwargs):
+            calls.append(name)
+            return await original(*args, **kwargs)
+
+        return recorded
+
+    order = [
+        "_load_embedding_route",
+        "_load_route_embedding_models",
+        "record_active_embedding_profile",
+    ]
+    for name in order:
+        setattr(agent, name, spy(name))
+    try:
+        with _boot_mocks():
+            await agent.initialize()
+        assert agent._boot_state is BootPhaseState.READY
+        assert calls == order
     finally:
         await _cleanup(agent)
 

@@ -234,6 +234,7 @@ def _assert_owning_turn_observed(seen: dict, turn: dict) -> None:
 def test_every_turn_scoped_value_is_declared_at_its_definition_site():
     from kestrel_sovereign import auth, telemetry
     from kestrel_sovereign.agent import parts, turn_lifecycle
+    from kestrel_sovereign.llm import invocation_context
     from kestrel_sovereign.signals import context
     from kestrel_sovereign.storage import privacy_wrapper
 
@@ -251,6 +252,7 @@ def test_every_turn_scoped_value_is_declared_at_its_definition_site():
         "current_signal": {context._current_signal.name},
         "turn_id": {telemetry._CURRENT_TURN_ID.name},
         "causation_chain": {turn_lifecycle._CURRENT_CHAIN.name},
+        "llm_turn_invocation": {invocation_context._TURN_INVOCATION.name},
     }
     for name, var_names in expected.items():
         assert declared.get(name) == var_names, name
@@ -715,6 +717,7 @@ def test_no_closure_re_presents_turn_scoped_state_by_hand():
             "current_signal",
             "turn_id",
             "causation_chain",
+            "llm_turn_invocation",
         }
     }
     assert "<lambda>" not in bind_owners, (

@@ -59,6 +59,7 @@ from .ledger_index import (
     search_rows,
 )
 from .morning_signal import generate_morning_signal
+from .run_history import RunHistoryUnreadable, read_run_history
 from .session_log import collect_session_log
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,10 @@ SIGNAL_DISPATCH_REASON_CODES = frozenset(
         # candidate was withheld only because GitHub could not say whether an
         # open PR already works it; not "the backlog is empty" (#3367).
         "CANDIDATES_UNCONFIRMED",
+        # Talon's job registry was not read completely (or its provider has
+        # no read that says whether it was), so whether the pick's last run
+        # already ended with an unanswered question is unknown (#3398).
+        "RUN_HISTORY_UNCONFIRMED",
     }
 )
 # Prefixes that the github-backed sub-modules (backlog_hygiene,
@@ -1732,13 +1737,52 @@ class StrategicMemoryFeature(Feature):
                 },
             )
 
-        selection: Dict[str, Any] = {}
-        issue = await pick_top_issue(self._strategy_data_view(), selection)
         workflow_name = self._dispatch_workflow_name()
-        # Candidates passed over because a pull request already works them
-        # (#3317). Every outcome carries them: "skipped #3310 -- PR #3311
-        # open" is what an orchestrator reading the run needs, not a silence.
-        skipped = list(selection.get("open_pr_exclusions") or [])
+        try:
+            run_history = await read_run_history(self.agent)
+        except RunHistoryUnreadable as exc:
+            # The registry is how selection knows an issue's last run asked a
+            # question nobody has answered (#3398). Selecting without all of
+            # it could dispatch that same run again.
+            return ToolResult.partial(
+                confirmation=(
+                    "## Signal Dispatch"
+                    + (" (suggest)" if mode == "suggest" else "")
+                    + f"\nCould not confirm Talon's run history: {exc}. Nothing "
+                    "was dispatched -- without it, re-dispatching an issue "
+                    "whose last run is still waiting on an answer cannot be "
+                    "ruled out. This is not the same as having nothing to do."
+                ),
+                error=f"Talon's run history is unconfirmed: {exc}",
+                data={
+                    "mode": mode,
+                    "issue": None,
+                    "workflow": workflow_name,
+                    "dispatched": False,
+                    "skipped": [],
+                    "reason_code": "RUN_HISTORY_UNCONFIRMED",
+                    # Set when the provider predates the read (#3446): an
+                    # upgrade fixes it, where a retry does not.
+                    "requirement": exc.requirement,
+                },
+            )
+        selection: Dict[str, Any] = {}
+        issue = await pick_top_issue(
+            self._strategy_data_view(), selection, run_history=run_history
+        )
+        # Candidates passed over because they are not on the allow-list --
+        # closed, not agent-ready, in the wrong repository (#3464), an epic or
+        # the Sovereign's (#3468) -- because a pull request already works
+        # them (#3317), or because their last Talon run asked a question
+        # nothing since has answered (#3398). Every outcome carries them:
+        # "skipped #3310 -- PR #3311 open" is what an orchestrator reading the
+        # run needs, not a silence, and a suggest run that names each refusal
+        # is evidence the gates hold.
+        skipped = (
+            list(selection.get("eligibility_exclusions") or [])
+            + list(selection.get("open_pr_exclusions") or [])
+            + list(selection.get("run_exclusions") or [])
+        )
         skipped_text = (
             "\n**Skipped:**\n"
             + "\n".join(f"- {describe_exclusion(entry)}" for entry in skipped)
@@ -1765,17 +1809,19 @@ class StrategicMemoryFeature(Feature):
             }
         elif not issue and candidates_unreadable:
             # Milestone/backlog candidates withheld because GitHub could not
-            # say whether an open PR already works them. Withholding is right;
-            # reporting the result as an empty backlog is not (#3367). Any one
-            # of them may have been the pick.
+            # say whether an open PR already works them, or whether anything
+            # since their last Talon run authorizes a retry. Withholding is
+            # right; reporting the result as an empty backlog is not (#3367).
+            # Any one of them may have been the pick.
             unconfirmed = {
                 "reason_code": "CANDIDATES_UNCONFIRMED",
                 "finding": f"Could not confirm {candidates_unreadable} of "
                 f"{candidates_checked} milestone/backlog candidate issue(s) "
-                "with GitHub -- their pull-request linkage was unreadable, so "
-                "they were withheld.",
-                "error": "GitHub could not confirm pull-request linkage for "
-                f"{candidates_unreadable} candidate issue(s)",
+                "with GitHub -- their pull-request linkage or post-run "
+                "activity was unreadable, so they were withheld.",
+                "error": "GitHub could not confirm pull-request linkage or "
+                f"post-run activity for {candidates_unreadable} candidate "
+                "issue(s)",
             }
         if unconfirmed is not None:
             return ToolResult.partial(

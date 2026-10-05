@@ -25,6 +25,10 @@ from tests.utils.aiosqlite_workers import (
 )
 
 
+async def _read_owns_open_transaction(database):
+    return database.owns_open_transaction
+
+
 class TestPlaceholderConversion:
     """Test SQL placeholder conversion utilities."""
     
@@ -121,7 +125,20 @@ class TestSQLiteBackend:
     @pytest.mark.asyncio
     async def test_nested_transaction_strategy_is_joined(self, backend):
         assert backend.nested_transaction_strategy == "joined"
-    
+
+    @pytest.mark.asyncio
+    async def test_owns_open_transaction_only_in_the_opening_task(self, backend):
+        """True exactly where a ``transaction()`` would join an open one; a
+        task spawned inside it opens its own instead."""
+        assert backend.owns_open_transaction is False
+        async with backend.transaction():
+            assert backend.owns_open_transaction is True
+            child = asyncio.get_running_loop().create_task(
+                _read_owns_open_transaction(backend)
+            )
+            assert await child is False
+        assert backend.owns_open_transaction is False
+
     @pytest.mark.asyncio
     async def test_is_connected(self, backend):
         assert backend.is_connected is True
@@ -1860,6 +1877,41 @@ class TestAsyncDatabase:
         assert PostgresBackend(
             "postgresql://test:test@127.0.0.1/test"
         ).nested_transaction_strategy == "savepoint"
+
+    @pytest.mark.asyncio
+    async def test_owns_open_transaction_contracts(self, tmp_path):
+        """Unknown backends answer ``None`` so callers fail closed; SQLite and
+        PostgreSQL answer for the current task only."""
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+        unknown_backend = MagicMock()
+        unknown_backend.owns_open_transaction = MagicMock()
+        assert AsyncDatabase(unknown_backend).owns_open_transaction is None
+        assert AsyncDatabase(object()).owns_open_transaction is None
+
+        database = await AsyncDatabase.sqlite(str(tmp_path / "owns.db"))
+        try:
+            assert database.owns_open_transaction is False
+            async with database.transaction():
+                assert database.owns_open_transaction is True
+            assert database.owns_open_transaction is False
+        finally:
+            await database.close()
+
+        # PostgreSQL keys its open transaction to the task that opened it.
+        postgres = PostgresBackend("postgresql://test:test@127.0.0.1/test")
+        assert postgres.owns_open_transaction is False
+        token = postgres._txn_conn_var.set((asyncio.current_task(), object()))
+        try:
+            assert postgres.owns_open_transaction is True
+            child = asyncio.get_running_loop().create_task(
+                _read_owns_open_transaction(postgres)
+            )
+            assert await child is False
+        finally:
+            postgres._txn_conn_var.reset(token)
+        assert postgres.owns_open_transaction is False
 
     @pytest.mark.asyncio
     async def test_column_shape_helpers_define_missing_column_semantics(self):

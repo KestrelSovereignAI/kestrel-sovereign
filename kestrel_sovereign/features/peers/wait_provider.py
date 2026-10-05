@@ -29,11 +29,23 @@ from typing import ClassVar, Optional
 from kestrel_sdk.tools import Outcome, WaitStatus
 from kestrel_sdk.tools.result import ToolResultStatus
 
+from kestrel_sovereign.waits.engine import (
+    TERMINAL_EVENT_AT_KEY,
+    TERMINAL_EVENT_DETAIL_KEY,
+    TERMINAL_EVENT_FINAL_KEY,
+    TERMINAL_EVENT_KEY,
+    TERMINAL_EVENT_VIEW_KEY,
+)
+
 # Peer/audit lifecycle tokens that end the wait.
 _TERMINAL_DONE = frozenset({"completed"})
 _TERMINAL_FAIL = frozenset(
     {"failed", "canceled", "cancelled", "dispatch_failed"}
 )
+# Terminal states the outbound audit row never overwrites once stamped
+# (``update_outbound_terminal_state`` replaces only ``expired`` and
+# ``dispatch_failed``): no later terminal event can follow them (#3399).
+_FINAL_STAMPED = frozenset({"completed", "failed", "canceled", "cancelled"})
 
 
 class A2AWaitable:
@@ -161,7 +173,10 @@ class A2AWaitable:
         # authoritative — no need to round-trip the peer again.
         if row is not None and row.terminal_state:
             return self._classify(
-                row.terminal_state, handle, recipient=row.recipient
+                row.terminal_state, handle, recipient=row.recipient,
+                final=(
+                    str(row.terminal_state).strip().lower() in _FINAL_STAMPED
+                ),
             )
 
         recipient = row.recipient if row is not None else None
@@ -204,10 +219,24 @@ class A2AWaitable:
         *,
         recipient: Optional[str] = None,
         extra: Optional[dict] = None,
+        final: bool = False,
     ) -> WaitStatus:
         norm = str(state or "").strip().lower()
         data = dict(extra or {})
+        # ``extra`` is the peer's own task result. This provider names no
+        # terminal event, and a peer must not name one for it: the reconciler
+        # dedups wakes on these keys, so a forged value would let the peer
+        # choose when this agent is woken (#3399), or date a fresh completion
+        # early enough to have it announced as a replay (#3390).
+        for key in (
+            TERMINAL_EVENT_KEY, TERMINAL_EVENT_DETAIL_KEY, TERMINAL_EVENT_VIEW_KEY,
+            TERMINAL_EVENT_FINAL_KEY, TERMINAL_EVENT_AT_KEY,
+        ):
+            data.pop(key, None)
         data.update({"task_id": handle, "state": norm})
+        if final:
+            # Only from this agent's own stamped audit row, never the peer.
+            data[TERMINAL_EVENT_FINAL_KEY] = True
         if recipient:
             data.setdefault("recipient", recipient)
         label = handle[:8]

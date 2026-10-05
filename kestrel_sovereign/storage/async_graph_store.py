@@ -833,6 +833,20 @@ class NodeDeleteResult(str, Enum):
     NOT_FOUND = "not_found"
 
 
+class _EdgeAdmission(Enum):
+    """Which endpoint-ownership rule a bound edge write is held to."""
+
+    #: Both endpoints are graph nodes the writer owns.
+    ORDINARY = "ordinary"
+    #: The writer owns the source; the target may be absent or belong to
+    #: another tenant (lineage to a parent outside this tenant's graph).
+    TRUSTED_CROSS_AGENT = "trusted_cross_agent"
+    #: The writer owns the source; the target names something outside the
+    #: graph (a GitHub issue, a URL), so it has no node and no owner. A target
+    #: that is in the graph is held to the ordinary rule (#3091).
+    EXTERNAL_REFERENCE = "external_reference"
+
+
 @dataclass
 class GraphNode:
     """Represents a node in the knowledge graph."""
@@ -1979,14 +1993,42 @@ class AsyncGraphStore:
         Upserts by (source_id, target_id, label) — calling add_edge twice
         with the same triple updates the properties, not duplicates the edge.
         A tenant-bound writer must own both endpoints; intentional lineage
-        edges to an external parent use :meth:`add_trusted_cross_agent_edge`.
+        edges to an external parent use :meth:`add_trusted_cross_agent_edge`,
+        and edges to something outside the graph use
+        :meth:`add_external_reference_edge`.
         """
         await self._add_edge(
             source_id,
             target_id,
             label,
             properties,
-            trusted_cross_agent=False,
+            admission=_EdgeAdmission.ORDINARY,
+        )
+
+    async def add_external_reference_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        label: str,
+        properties: Optional[Dict] = None,
+    ) -> None:
+        """Add an edge from an owned node to a reference outside the graph.
+
+        ``target_id`` names something no agent owns — a GitHub issue, a URL,
+        an external job — so it has no graph node and no ownership witness.
+        Only the source is checked against the bound agent. A target that is
+        in the graph (a node, or another tenant's ownership reservation) is
+        not an external reference and gets the ordinary rule: the bound agent
+        must own it, so this never connects two tenants' nodes.
+        """
+        if not self.agent_id:
+            raise ValueError("External reference edges require a bound graph store")
+        await self._add_edge(
+            source_id,
+            target_id,
+            label,
+            properties,
+            admission=_EdgeAdmission.EXTERNAL_REFERENCE,
         )
 
     async def add_trusted_cross_agent_edge(
@@ -2011,7 +2053,36 @@ class AsyncGraphStore:
             target_id,
             label,
             properties,
-            trusted_cross_agent=True,
+            admission=_EdgeAdmission.TRUSTED_CROSS_AGENT,
+        )
+
+    @staticmethod
+    def _require_edge_endpoint_ownership(
+        admission: _EdgeAdmission,
+        *,
+        owns_source: bool,
+        owns_target: bool,
+        target_exists: bool,
+        target_has_owner: bool,
+    ) -> None:
+        """Refuse an edge whose endpoints the admission rule does not allow."""
+        if admission is _EdgeAdmission.TRUSTED_CROSS_AGENT:
+            if not owns_source:
+                raise ValueError(
+                    "Trusted cross-agent edge source is not owned by the bound agent"
+                )
+            return
+        if owns_source and owns_target and target_exists:
+            return
+        if (
+            admission is _EdgeAdmission.EXTERNAL_REFERENCE
+            and owns_source
+            and not target_exists
+            and not target_has_owner
+        ):
+            return
+        raise ValueError(
+            "Graph edge endpoints are not both owned by the bound agent"
         )
 
     async def _add_edge(
@@ -2021,9 +2092,9 @@ class AsyncGraphStore:
         label: str,
         properties: Optional[Dict],
         *,
-        trusted_cross_agent: bool,
+        admission: _EdgeAdmission,
     ) -> None:
-        """Implement ordinary and explicitly trusted edge writes atomically."""
+        """Implement every edge admission rule atomically."""
         declared = properties.get("agent_id") if properties else None
         if declared is not None and not isinstance(declared, str):
             raise ValueError("Graph edge properties.agent_id must be a string")
@@ -2043,37 +2114,26 @@ class AsyncGraphStore:
                     "       WHERE node_id = ? AND agent_id = ?), "
                     "EXISTS(SELECT 1 FROM graph_node_owners "
                     "       WHERE node_id = ? AND agent_id = ?), "
-                    "EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?)",
+                    "EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?), "
+                    "EXISTS(SELECT 1 FROM graph_node_owners WHERE node_id = ?)",
                     (
                         source_id,
                         requested_owner,
                         target_id,
                         requested_owner,
                         target_id,
+                        target_id,
                     ),
                 )
-                preflight_owns_source = bool(
-                    preflight_owners and preflight_owners[0]
+                self._require_edge_endpoint_ownership(
+                    admission,
+                    owns_source=bool(preflight_owners and preflight_owners[0]),
+                    owns_target=bool(preflight_owners and preflight_owners[1]),
+                    target_exists=bool(preflight_owners and preflight_owners[2]),
+                    target_has_owner=bool(
+                        preflight_owners and preflight_owners[3]
+                    ),
                 )
-                preflight_owns_target = bool(
-                    preflight_owners and preflight_owners[1]
-                )
-                preflight_target_exists = bool(
-                    preflight_owners and preflight_owners[2]
-                )
-                if trusted_cross_agent:
-                    if not preflight_owns_source:
-                        raise ValueError(
-                            "Trusted cross-agent edge source is not owned by the bound agent"
-                        )
-                elif not (
-                    preflight_owns_source
-                    and preflight_owns_target
-                    and preflight_target_exists
-                ):
-                    raise ValueError(
-                        "Graph edge endpoints are not both owned by the bound agent"
-                    )
 
             # Node deletion and ownership release take graph rows before any
             # edge ledger row. Ordinary edge admission must use the same order
@@ -2082,9 +2142,13 @@ class AsyncGraphStore:
             # through MVCC and commit a dangling edge after node cleanup has
             # passed it. Trusted cross-agent edges deliberately permit an
             # absent/foreign target, so only their owned source participates.
+            # An external reference locks its target too: the reservation
+            # serializes against a writer creating a node with that id, so
+            # the "not in the graph" check below cannot go stale.
             lock_ids = (
                 [source_id]
-                if self.db.backend_type == "postgres" and trusted_cross_agent
+                if self.db.backend_type == "postgres"
+                and admission is _EdgeAdmission.TRUSTED_CROSS_AGENT
                 else [source_id, target_id]
             )
             await lock_graph_nodes_for_update(
@@ -2113,20 +2177,23 @@ class AsyncGraphStore:
                     "EXISTS(SELECT 1 FROM graph_node_owners "
                     "       WHERE node_id = ? AND agent_id = ?), "
                     "EXISTS(SELECT 1 FROM graph_node_owners "
-                    "       WHERE node_id = ? AND agent_id = ?)",
-                    (source_id, requested_owner, target_id, requested_owner),
+                    "       WHERE node_id = ? AND agent_id = ?), "
+                    "EXISTS(SELECT 1 FROM graph_node_owners WHERE node_id = ?)",
+                    (
+                        source_id,
+                        requested_owner,
+                        target_id,
+                        requested_owner,
+                        target_id,
+                    ),
                 )
-                owns_source = bool(endpoint_owners and endpoint_owners[0])
-                owns_target = bool(endpoint_owners and endpoint_owners[1])
-                if trusted_cross_agent:
-                    if not owns_source:
-                        raise ValueError(
-                            "Trusted cross-agent edge source is not owned by the bound agent"
-                        )
-                elif not (owns_source and owns_target and target_exists):
-                    raise ValueError(
-                        "Graph edge endpoints are not both owned by the bound agent"
-                    )
+                self._require_edge_endpoint_ownership(
+                    admission,
+                    owns_source=bool(endpoint_owners and endpoint_owners[0]),
+                    owns_target=bool(endpoint_owners and endpoint_owners[1]),
+                    target_exists=target_exists,
+                    target_has_owner=bool(endpoint_owners and endpoint_owners[2]),
+                )
 
             existing = await self.db.fetchone(
                 "SELECT properties FROM graph_edges "

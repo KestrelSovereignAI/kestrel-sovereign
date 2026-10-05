@@ -50,37 +50,62 @@ from kestrel_sovereign.a2a.transport_auth import (
     is_a2a_transport_only_process,
 )
 from kestrel_sovereign.auth import normalize_api_key
+from kestrel_sovereign.paths import SKIP_DOTENV_ENV
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from kestrel_sovereign.telemetry import setup_tracing
 
-# Load environment variables from .env file.
-# override=False: Don't clobber env vars already set by ProcessManager
-# (e.g., KESTREL_DB_PATH is set per-agent in multi_agent mode). With
-# override=False the FIRST source to define a key wins, so order is
-# custody-critical: the resolved project home must be consulted BEFORE the
-# current directory (#2468). A stray source-checkout ``.env`` in CWD must never
-# shadow the KESTREL_DATA_KEY the agent's identity was encrypted under, or the
-# server would boot with a key that cannot decrypt its own memory.
-#
-# Resolution order (first defined wins):
-#   1. <project_dir>/.env — the resolved project home (KESTREL_HOME, marker
-#      walk-up, or ~/.kestrel for pip-installed users). This is the home whose
-#      persisted KESTREL_DATA_KEY the identity was encrypted under; authoritative.
-#   2. CWD/.env — the directory the operator happened to launch from; only fills
-#      in keys the home did not define.
-#   3. <package-dir>/.env — legacy: source clones where someone dropped a .env
-#      next to the package source.
-# python-dotenv silently no-ops on missing files, so all three calls are safe.
-try:
-    from kestrel_sovereign.paths import project_dir as _resolve_project_dir
-    load_dotenv(_resolve_project_dir() / ".env", override=False)
-except Exception:
-    # Resolver should never raise, but a .env load is best-effort: if
-    # this somehow blows up we want the server to keep booting.
-    pass
-load_dotenv(Path.cwd() / ".env", override=False)
-load_dotenv(Path(__file__).parent / ".env", override=False)
+
+def load_server_dotenv(package_dir: Path = Path(__file__).parent) -> None:
+    """Load environment variables from the server's ``.env`` files.
+
+    override=False: Don't clobber env vars already set by ProcessManager
+    (e.g., KESTREL_DB_PATH is set per-agent in multi_agent mode). With
+    override=False the FIRST source to define a key wins, so order is
+    custody-critical: the resolved project home must be consulted BEFORE the
+    current directory (#2468). A stray source-checkout ``.env`` in CWD must
+    never shadow the KESTREL_DATA_KEY the agent's identity was encrypted under,
+    or the server would boot with a key that cannot decrypt its own memory.
+
+    Resolution order (first defined wins):
+      1. <project_dir>/.env — the resolved project home (KESTREL_HOME, marker
+         walk-up, or ~/.kestrel for pip-installed users). This is the home
+         whose persisted KESTREL_DATA_KEY the identity was encrypted under;
+         authoritative.
+      2. CWD/.env — the directory the operator happened to launch from; only
+         fills in keys the home did not define.
+      3. <package_dir>/.env — legacy: source clones where someone dropped a
+         .env next to the package source.
+    python-dotenv silently no-ops on missing files, so all three calls are
+    safe.
+
+    ``KESTREL_SKIP_DOTENV=1`` reads none of them. A launcher that hands the
+    server its complete environment sets it (``kestrel demo smoke``, #2682):
+    because a missing key is not an exported one, ``override=False`` would
+    otherwise refill every variable that launcher deliberately removed, from
+    whichever of these files exists. Any other value is refused rather than
+    read as "load", so a misspelled opt-out cannot silently load the files.
+    """
+    skip = os.environ.get(SKIP_DOTENV_ENV, "")
+    if skip == "1":
+        return
+    if skip not in ("", "0"):
+        raise ValueError(
+            f"{SKIP_DOTENV_ENV}={skip!r}: expected '1' (load no .env file) "
+            "or '0'/unset (load them)"
+        )
+    try:
+        from kestrel_sovereign.paths import project_dir as _resolve_project_dir
+        load_dotenv(_resolve_project_dir() / ".env", override=False)
+    except Exception:
+        # Resolver should never raise, but a .env load is best-effort: if
+        # this somehow blows up we want the server to keep booting.
+        pass
+    load_dotenv(Path.cwd() / ".env", override=False)
+    load_dotenv(package_dir / ".env", override=False)
+
+
+load_server_dotenv()
 
 from kestrel_sovereign.logging_config import (
     setup_logging,

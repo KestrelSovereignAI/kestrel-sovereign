@@ -43,6 +43,7 @@ from .session_id_column import (
     SESSION_ID_KEY,
     column_session_id,
     merged_column_assignment,
+    new_session_id,
 )
 from .destructive_audit import DestructiveAuditEvent, DestructiveAuditLog, hash_rows
 from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
@@ -88,10 +89,11 @@ _PAGE_ATTEMPTS = 3
 # Current key version for new encryptions
 CURRENT_KEY_VERSION = 1
 
-# Keep exact-id purge statements below the oldest supported SQLite bind
-# ceiling (999).  PostgreSQL permits much larger statements, but sharing one
-# conservative batch size keeps the destructive path backend-neutral.
-_EXACT_PURGE_BATCH_SIZE = 500
+# Keep exact-id statements (purge locks, session row reads) below the oldest
+# supported SQLite bind ceiling (999).  PostgreSQL permits much larger
+# statements, but sharing one conservative batch size keeps both paths
+# backend-neutral.
+_EXACT_ID_BATCH_SIZE = 500
 _PURGE_SELECT_PLACEHOLDER = "__KESTREL_PURGE_SELECT_COLUMNS__"
 _PURGE_BASE_SELECT_COLUMNS = (
     "id, role, content, metadata, created_at, deleted_at"
@@ -737,8 +739,8 @@ class AsyncConversationStore:
         """Build bounded, globally-ascending selectors for exact IDs."""
         ordered_ids = sorted({int(message_id) for message_id in message_ids})
         queries: list[Tuple[str, tuple[Any, ...]]] = []
-        for start in range(0, len(ordered_ids), _EXACT_PURGE_BATCH_SIZE):
-            batch = ordered_ids[start : start + _EXACT_PURGE_BATCH_SIZE]
+        for start in range(0, len(ordered_ids), _EXACT_ID_BATCH_SIZE):
+            batch = ordered_ids[start : start + _EXACT_ID_BATCH_SIZE]
             placeholders = ",".join("?" for _ in batch)
             queries.append(
                 (
@@ -917,8 +919,8 @@ class AsyncConversationStore:
             else:
                 message_ids = []
                 lexical_index_ids = []
-            for start in range(0, len(message_ids), _EXACT_PURGE_BATCH_SIZE):
-                batch = message_ids[start : start + _EXACT_PURGE_BATCH_SIZE]
+            for start in range(0, len(message_ids), _EXACT_ID_BATCH_SIZE):
+                batch = message_ids[start : start + _EXACT_ID_BATCH_SIZE]
                 placeholders = ",".join("?" for _ in batch)
                 affected = await self.db.execute(
                     "DELETE FROM conversation_history "
@@ -950,10 +952,10 @@ class AsyncConversationStore:
                     lexical_index_ids
                 ) as cleanup_keys:
                     for start in range(
-                        0, len(cleanup_keys), _EXACT_PURGE_BATCH_SIZE
+                        0, len(cleanup_keys), _EXACT_ID_BATCH_SIZE
                     ):
                         batch = cleanup_keys[
-                            start : start + _EXACT_PURGE_BATCH_SIZE
+                            start : start + _EXACT_ID_BATCH_SIZE
                         ]
                         placeholders = ",".join("?" for _ in batch)
                         await self.db.execute(
@@ -1104,8 +1106,7 @@ class AsyncConversationStore:
     @staticmethod
     def _new_session_id() -> str:
         """Mint a new implicit session_id (UUID4)."""
-        import uuid
-        return str(uuid.uuid4())
+        return new_session_id()
 
     async def _canonicalize_session_id(
         self, session_id: Optional[str]
@@ -2040,7 +2041,9 @@ class AsyncConversationStore:
         """Get recent conversation history with automatic decryption and migration.
 
         Args:
-            limit: Maximum number of messages to return
+            limit: Maximum number of messages to return; the most recent
+                ``limit`` are returned, in chronological order, whether or not
+                the read is session-scoped.
             session_id: If provided, get messages from this session only (using time-based grouping)
         """
         if session_id:
@@ -2163,10 +2166,12 @@ class AsyncConversationStore:
         """Apply the canonical time-gap/resumption rules to candidate rows.
 
         Display reads and exact lifecycle snapshots deliberately share this
-        one filter.  The exact-ID path selects only ``id``/``metadata``/
-        ``created_at`` and supplies the corresponding indexes so unbounded
-        privacy purges do not materialize encrypted message bodies merely to
-        resolve membership.
+        one filter.  Both select only ``id``/``metadata``/``created_at`` and
+        supply the corresponding indexes, so resolving membership never
+        materializes encrypted message bodies.
+
+        ``limit`` keeps the newest ``limit`` members; the candidates must
+        therefore cover the whole session, not a window from its start.
         """
         from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 
@@ -2223,7 +2228,6 @@ class AsyncConversationStore:
 
         session_rows = []
         last_timestamp: Optional[datetime] = None
-        is_first = True
         # The row a session's run STARTS at, when its key names one. A legacy
         # key IS a row id (#2012), so the session begins there and at no other
         # row; a canonical key begins wherever the first row naming it is.
@@ -2352,15 +2356,19 @@ class AsyncConversationStore:
 
             if not include_markers and meta.get("type") == "session_marker":
                 last_timestamp = timestamp
-                is_first = False
                 continue
 
             session_rows.append(row)
             last_timestamp = timestamp
-            is_first = False
 
-            if limit is not None and len(session_rows) >= limit:
-                break
+        # A limit keeps the session's NEWEST rows, the window the unscoped
+        # history read returns (#3431). Cutting the walk at the head instead
+        # froze a session-bound turn's history at its first ``limit`` messages,
+        # so a long conversation never showed the agent what was said since.
+        # Membership is decided over the whole walk above, never by the cut:
+        # the run's state at a late row depends on every row before it.
+        if limit is not None:
+            session_rows = session_rows[-limit:] if limit > 0 else []
 
         # Match the historical newest-first raw-row contract.
         return list(reversed(session_rows))
@@ -2383,14 +2391,17 @@ class AsyncConversationStore:
 
         Args:
             session_id: The message ID that marks the session start
-            limit: Maximum messages to return
+            limit: Maximum messages to return. A longer session yields its
+                most recent ``limit`` messages, never its first (#3431).
             deleted_filter: ``live`` (default — for reads),
                 ``deleted`` (for restore / Trash view), or
                 ``all`` (for purge — finds rows in any state).
             include_markers: When True, include the session's ``new_session``
                 marker row(s) in the result. Reads/display keep the default
                 (markers are structural, not displayable), but session
-                LIFECYCLE ops (delete/restore/purge) pass True so the marker —
+                LIFECYCLE ops (delete/archive/restore, through
+                :meth:`_resolve_session_member_ids`; purge, through
+                :meth:`_get_complete_session_message_ids`) pass True so the marker —
                 the session's live anchor — is acted on too. Otherwise deleting
                 a session's content leaves a live orphan marker that keeps the
                 session in the active list yet unresolvable by a later delete
@@ -2400,23 +2411,66 @@ class AsyncConversationStore:
                 unarchived/purged; normal conversation replay passes False.
 
         Returns:
-            List of raw rows
+            List of raw rows, newest first
             (id, role, content, metadata, created_at, rendered_content,
             model, provider) — rendered_content/model/provider are appended
             so existing positional accesses below don't shift.
         """
+        member_ids = await self._resolve_session_member_ids(
+            session_id,
+            limit=limit,
+            deleted_filter=deleted_filter,
+            include_markers=include_markers,
+            include_archived=include_archived,
+        )
         del_clause = self._deleted_filter_clause(deleted_filter)
         archive_clause = "" if include_archived else " AND archived_at IS NULL"
-        # Canonicalize the timestamp prefilter/order: SQLite history mixes
+
+        # rendered_content (#1402) is appended at row[5] so existing positional
+        # accesses on metadata/created_at don't shift. The deletion and archive
+        # filters are re-applied so a row that changed state since the
+        # membership read is not returned under the universe it just left.
+        full_rows: dict[int, tuple] = {}
+        for start in range(0, len(member_ids), _EXACT_ID_BATCH_SIZE):
+            batch = member_ids[start : start + _EXACT_ID_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            for row in await self.db.fetchall(
+                f"""SELECT id, role, content, metadata, created_at,
+                          rendered_content, model, provider
+                   FROM conversation_history
+                   WHERE agent_id = ? AND id IN ({placeholders}){del_clause}{archive_clause}""",
+                (self.agent_id, *batch),
+            ):
+                full_rows[int(row[0])] = row
+        return [full_rows[mid] for mid in member_ids if mid in full_rows]
+
+    async def _resolve_session_member_ids(
+        self,
+        session_id: str,
+        *,
+        limit: Optional[int],
+        deleted_filter: str = "live",
+        include_markers: bool = False,
+        include_archived: bool = True,
+    ) -> list[int]:
+        """Resolve a session's member ids, newest first, without message bodies.
+
+        The membership half of :meth:`_get_session_messages`, under the same
+        rules. ``limit=None`` resolves the WHOLE session: the session
+        lifecycle operations (delete, archive, unarchive, restore) act on every
+        member, and a limit — which keeps the newest rows (#3431) — would
+        leave the session's head, its anchor marker included, untouched.
+        """
+        del_clause = self._deleted_filter_clause(deleted_filter)
+        archive_clause = "" if include_archived else " AND archived_at IS NULL"
+        # Canonicalize the timestamp prefilter: SQLite history mixes
         # ``YYYY-MM-DD HH:MM:SS`` and ISO-8601 ``T`` forms, and raw TEXT
         # comparison drops later rows whose stored form sorts below the
         # anchor's.  The exact purge/count resolver already compares via
         # julianday; display must see the same membership or hard purge could
         # destroy rows this path never returned.
-        # ``(created_at, id) >= (cursor)``, spelled as the disjunction both
-        # dialects can index. A stamp-only cursor cannot step past a second
-        # that holds more rows than one window: the same page comes back for
-        # ever, and the loop consumed the resumption key it was paging TO.
+        # ``(created_at, id) >= (anchor)``, spelled as the disjunction both
+        # dialects can index.
         created_at_predicate = (
             "("
             + self._timestamp_predicate("created_at", ">")
@@ -2424,7 +2478,6 @@ class AsyncConversationStore:
             + self._timestamp_predicate("created_at", ">=")
             + " AND id >= ?))"
         )
-        created_at_order = self._canonical_timestamp_sql("created_at")
         # Escape LIKE wildcards so a `%`/`_` in session_id can't broaden the
         # match to EVERY row (#1729); ESCAPE '\' makes the backslash the escape
         # char. For an ordinary UUID this is a no-op.
@@ -2480,63 +2533,53 @@ class AsyncConversationStore:
             else None
         )
 
-        # The rows that NAME this session, whatever the distance — a resumption
-        # past a time gap, or past the window below.
-        resumed_rows = await self.db.fetchall(
-            f"""SELECT id, role, content, metadata, created_at, rendered_content,
-                      model, provider
-               FROM conversation_history
-               WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
-               ORDER BY {created_at_order} ASC, id ASC
-               LIMIT ?""",
-            (self.agent_id, spaced_pattern, limit)
-        )
-
-        resumed_rows_alt = await self.db.fetchall(
-            f"""SELECT id, role, content, metadata, created_at, rendered_content,
-                      model, provider
-               FROM conversation_history
-               WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
-               ORDER BY {created_at_order} ASC, id ASC
-               LIMIT ?""",
-            (self.agent_id, compact_pattern, limit)
-        )
-
-        # One window forward from the anchor, ordered by ``(created_at, id)``
-        # and cut by ``(created_at, id) >= anchor`` — the order the walk itself
-        # sorts candidates into. ``created_at`` is stored to the second, so a
-        # bound on the stamp alone admits the row BEFORE the anchor and a LIMIT
-        # over it truncates a tie group wherever the engine felt like it:
-        # measured on sqlite 3.50, a LIMIT of eight over ten rows returned the
-        # last row of the tie and dropped the two before it.
+        # Membership is resolved over the WHOLE session before any limit is
+        # applied, because the limit keeps the session's newest rows (#3431)
+        # and whether a late row is a member depends on every row before it.
+        # A candidate window capped from the session's start can only ever
+        # answer with its head. So the candidates carry only what the walk
+        # reads — id, metadata, created_at — and no message body is
+        # materialized until the window is known.
         #
-        # rendered_content (#1402) is appended at row[5] so existing positional
-        # accesses on metadata/created_at don't shift.
+        # The rows that NAME this session, whatever the distance — a
+        # resumption past a time gap, or past the forward walk below.
+        resumed_rows = await self.db.fetchall(
+            f"""SELECT id, metadata, created_at
+               FROM conversation_history
+               WHERE agent_id = ?
+                 AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\')
+                 {del_clause}{archive_clause}""",
+            (self.agent_id, spaced_pattern, compact_pattern),
+        )
+
+        # Forward from the anchor, cut by ``(created_at, id) >= anchor`` — the
+        # order the walk itself sorts candidates into. ``created_at`` is stored
+        # to the second, so a bound on the stamp alone admits the row BEFORE
+        # the anchor in the same second.
         if start_row is not None:
             all_rows = await self.db.fetchall(
-                f"""SELECT id, role, content, metadata, created_at,
-                          rendered_content, model, provider
+                f"""SELECT id, metadata, created_at
                    FROM conversation_history
-                   WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
-                   ORDER BY {created_at_order} ASC, id ASC
-                   LIMIT ?""",
+                   WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}""",
                 (
                     self.agent_id,
                     self._timestamp_query_param(start_row[0]),
                     self._timestamp_query_param(start_row[0]),
                     int(start_row[1]),
-                    limit * 2,  # Fetch extra in case of filtering
                 ),
             )
 
-        return self._filter_session_rows(
-            [*all_rows, *resumed_rows, *resumed_rows_alt],
+        member_rows = self._filter_session_rows(
+            [*all_rows, *resumed_rows],
             session_id,
             limit=limit,
             include_markers=include_markers,
+            metadata_index=1,
+            created_at_index=2,
             anchor_missing=anchor_missing,
             anchor_key=anchor_key,
         )
+        return [int(row[0]) for row in member_rows]
 
     async def _get_complete_session_message_ids(
         self,
@@ -3427,6 +3470,42 @@ class AsyncConversationStore:
         )
         return _rows_affected(affected) > 0
 
+    async def _update_session_members(
+        self,
+        member_ids: Sequence[int],
+        *,
+        assignment: str,
+        state_predicate: str,
+    ) -> int:
+        """Apply one lifecycle stamp to a resolved session's members.
+
+        A session has no size bound, so its ids are written in bounded
+        batches — below the oldest supported SQLite bind ceiling — inside ONE
+        transaction: a failure part-way leaves the session as it was rather
+        than half deleted or half archived.
+
+        Returns:
+            Rows the stamp changed; ``state_predicate`` excludes members
+            already in the target state.
+        """
+        ordered_ids = sorted({int(message_id) for message_id in member_ids})
+        if not ordered_ids:
+            return 0
+        affected = 0
+        async with self.db.transaction():
+            for start in range(0, len(ordered_ids), _EXACT_ID_BATCH_SIZE):
+                batch = ordered_ids[start : start + _EXACT_ID_BATCH_SIZE]
+                placeholders = ",".join("?" for _ in batch)
+                affected += _rows_affected(
+                    await self.db.execute(
+                        f"UPDATE conversation_history SET {assignment} "
+                        f"WHERE agent_id = ? AND id IN ({placeholders}) "
+                        f"AND {state_predicate}",
+                        (self.agent_id, *batch),
+                    )
+                )
+        return affected
+
     async def delete_conversation_session(self, session_id: str) -> int:
         """Soft-delete every live message in the given session (#763).
 
@@ -3461,26 +3540,14 @@ class AsyncConversationStore:
         # include_markers=True so soft-deleting a session also trashes its
         # new_session marker — otherwise the live orphan marker keeps the
         # session in the active list yet unresolvable by a later delete (#2027).
-        rows = await self._get_session_messages(
-            session_id, limit=10_000, include_markers=True
+        ids = await self._resolve_session_member_ids(
+            session_id, limit=None, include_markers=True
         )
-        if not rows:
-            return 0
-
-        ids = [row[0] for row in rows]
-        if not ids:
-            return 0
-
-        placeholders = ",".join("?" for _ in ids)
-        params = [*ids, self.agent_id]
-        affected = await self.db.execute_commit(
-            f"UPDATE conversation_history "
-            f"SET deleted_at = {self._now_sql()} "
-            f"WHERE id IN ({placeholders}) AND agent_id = ? "
-            f"AND deleted_at IS NULL",
-            tuple(params),
+        return await self._update_session_members(
+            ids,
+            assignment=f"deleted_at = {self._now_sql()}",
+            state_predicate="deleted_at IS NULL",
         )
-        return _rows_affected(affected)
 
     async def archive_conversation_session(self, session_id: str) -> int:
         """Archive every live message in the given session (#2149).
@@ -3500,26 +3567,14 @@ class AsyncConversationStore:
         # include_markers=True so archiving a session also stamps its
         # new_session marker, keeping the marker in lock-step with content
         # (mirrors the delete path, #2027).
-        rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter="live", include_markers=True
+        ids = await self._resolve_session_member_ids(
+            session_id, limit=None, deleted_filter="live", include_markers=True
         )
-        if not rows:
-            return 0
-
-        ids = [row[0] for row in rows]
-        if not ids:
-            return 0
-
-        placeholders = ",".join("?" for _ in ids)
-        params = [*ids, self.agent_id]
-        affected = await self.db.execute_commit(
-            f"UPDATE conversation_history "
-            f"SET archived_at = {self._now_sql()} "
-            f"WHERE id IN ({placeholders}) AND agent_id = ? "
-            f"AND deleted_at IS NULL AND archived_at IS NULL",
-            tuple(params),
+        return await self._update_session_members(
+            ids,
+            assignment=f"archived_at = {self._now_sql()}",
+            state_predicate="deleted_at IS NULL AND archived_at IS NULL",
         )
-        return _rows_affected(affected)
 
     async def unarchive_conversation_session(self, session_id: str) -> int:
         """Clear archived_at on every archived message in a session (#2149).
@@ -3533,25 +3588,14 @@ class AsyncConversationStore:
             Number of rows unarchived. Zero if the session has no archived
             rows or doesn't exist.
         """
-        rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter="live", include_markers=True
+        ids = await self._resolve_session_member_ids(
+            session_id, limit=None, deleted_filter="live", include_markers=True
         )
-        if not rows:
-            return 0
-
-        ids = [row[0] for row in rows]
-        if not ids:
-            return 0
-
-        placeholders = ",".join("?" for _ in ids)
-        params = [*ids, self.agent_id]
-        affected = await self.db.execute_commit(
-            f"UPDATE conversation_history SET archived_at = NULL "
-            f"WHERE id IN ({placeholders}) AND agent_id = ? "
-            f"AND archived_at IS NOT NULL",
-            tuple(params),
+        return await self._update_session_members(
+            ids,
+            assignment="archived_at = NULL",
+            state_predicate="archived_at IS NOT NULL",
         )
-        return _rows_affected(affected)
 
     # ------------------------------------------------------------------
     # Restore primitives (#763 / #765)
@@ -3589,25 +3633,17 @@ class AsyncConversationStore:
         """
         # include_markers=True so a marker trashed alongside its session
         # (#2027) is restored too, keeping delete/restore symmetric.
-        rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter="deleted", include_markers=True
+        ids = await self._resolve_session_member_ids(
+            session_id,
+            limit=None,
+            deleted_filter="deleted",
+            include_markers=True,
         )
-        if not rows:
-            return 0
-
-        ids = [row[0] for row in rows]
-        if not ids:
-            return 0
-
-        placeholders = ",".join("?" for _ in ids)
-        params = [*ids, self.agent_id]
-        affected = await self.db.execute_commit(
-            f"UPDATE conversation_history SET deleted_at = NULL "
-            f"WHERE id IN ({placeholders}) AND agent_id = ? "
-            f"AND deleted_at IS NOT NULL",
-            tuple(params),
+        return await self._update_session_members(
+            ids,
+            assignment="deleted_at = NULL",
+            state_predicate="deleted_at IS NOT NULL",
         )
-        return _rows_affected(affected)
 
     # ------------------------------------------------------------------
     # Purge primitives (#763)
@@ -4274,8 +4310,9 @@ class AsyncConversationStore:
         # session-resolution logic the soft-delete primitives use.
         allowed_ids: Optional[set] = None
         if session_id is not None:
-            rows = await self._get_session_messages(session_id, limit=10_000)
-            allowed_ids = {row[0] for row in rows}
+            allowed_ids = set(
+                await self._resolve_session_member_ids(session_id, limit=None)
+            )
 
         pattern_lower = content_pattern.lower()
         matches = []

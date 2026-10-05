@@ -509,6 +509,17 @@ class AsyncStorage:
         async with self.db.transaction(immediate=immediate):
             yield
 
+    @property
+    def owns_open_transaction(self) -> bool | None:
+        """Whether the current task is inside a :meth:`transaction` here.
+
+        ``None`` when the backend cannot say; see
+        :attr:`AsyncDatabase.owns_open_transaction`.
+        """
+        if self.db is None:
+            return False  # never initialized, so no transaction was opened
+        return self.db.owns_open_transaction
+
     # --- File Operations ---
     
     async def store_file(self, content: bytes, original_name: str, 

@@ -67,6 +67,9 @@ from kestrel_sovereign.agent.streaming import (
     _build_tool_sentinel,
     STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
 )
+from kestrel_sovereign.agent.direct_tool_arguments import (
+    normalize_direct_tool_arguments,
+)
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.security.tool_audit import (
     ACTION_TOOL_RESOLUTION,
@@ -279,7 +282,7 @@ class ContextStats:
         """Reset stats if session has changed."""
         if session_id and session_id != self._last_session_id:
             if self._last_session_id is not None:
-                logging.debug(f"[CONTEXT_STATS] Session changed, resetting stats")
+                logging.debug("[CONTEXT_STATS] Session changed, resetting stats")
             self._last_session_id = session_id
             self.reset()
 
@@ -1046,6 +1049,25 @@ class OrchestratorEngineMixin:
                 source, tool_name, validation_error,
             )
             return {"success": False, "error": f"Invalid tool arguments: {validation_error}"}
+
+        # #3396: the same direct-tool argument rules as the chat path's
+        # ``_dispatch_direct_tool``, applied before PRE_TOOL_USE.
+        args, argument_error = normalize_direct_tool_arguments(
+            tool_name, found_tool, args
+        )
+        if argument_error is not None:
+            logging.warning(
+                "[GOVERNED-DISPATCH] argument check failed source=%s tool=%s err=%s",
+                source, tool_name, argument_error,
+            )
+            await record_tool_rejection(
+                self,
+                tool_name=tool_name,
+                reason=argument_error,
+                action=ACTION_TOOL_VALIDATION,
+                args=args,
+            )
+            return {"success": False, "error": f"Invalid tool arguments: {argument_error}"}
 
         logging.info(
             "[GOVERNED-DISPATCH] source=%s session=%s tool=%s feature=%s",
@@ -2141,6 +2163,38 @@ class OrchestratorEngineMixin:
             feature_name or self._security_feature_name_for_tool(tool_name)
         )
 
+        async def _failed(error_message, *, error_class, status="error"):
+            if dispatch_meta is not None:
+                dispatch_meta.update({
+                    "status": status,
+                    "error_class": error_class,
+                    "error_message": error_message,
+                })
+            dispatch_duration = int((time.time() - dispatch_start) * 1000)
+            await self.observability_store.log_tool_response(
+                event_id=dispatch_event_id,
+                success=False,
+                duration_ms=dispatch_duration,
+                error_message=error_message,
+            )
+            if streaming and tool_events is not None:
+                tool_events.append({'type': 'error', 'tool': tool_name, 'error': error_message[:200]})
+            return {"success": False, "error": error_message}
+
+        # #3396: before PRE_TOOL_USE, so hooks, approvals, and the audit see
+        # exactly the arguments the tool will run with.
+        args, argument_error = normalize_direct_tool_arguments(tool_name, tool, args)
+        if argument_error is not None:
+            logging.warning(f"[DIRECT-TOOL] {tool_name} refused: {argument_error}")
+            await record_tool_rejection(
+                self,
+                tool_name=tool_name,
+                reason=argument_error,
+                action=ACTION_TOOL_VALIDATION,
+                args=args,
+            )
+            return await _failed(argument_error, error_class="ToolArgumentError")
+
         async def _exec_direct(effective_args, t=tool):
             return await t.execute(**effective_args)
 
@@ -2172,25 +2226,11 @@ class OrchestratorEngineMixin:
             return result
         except Exception as e:
             logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
-            result = {"success": False, "error": str(e)}
-            if dispatch_meta is not None:
-                status = "timeout" if isinstance(e, TimeoutError) else "error"
-                dispatch_meta.update({
-                    "status": status,
-                    "error_class": type(e).__name__,
-                    "error_message": str(e),
-                })
-
-            dispatch_duration = int((time.time() - dispatch_start) * 1000)
-            await self.observability_store.log_tool_response(
-                event_id=dispatch_event_id,
-                success=False,
-                duration_ms=dispatch_duration,
-                error_message=str(e),
+            return await _failed(
+                str(e),
+                error_class=type(e).__name__,
+                status="timeout" if isinstance(e, TimeoutError) else "error",
             )
-            if streaming and tool_events is not None:
-                tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(e)[:200]})
-            return result
 
     # ------------------------------------------------------------------
     # Tool concurrency batching
@@ -2483,7 +2523,9 @@ class OrchestratorEngineMixin:
         if user_message:
             messages.append({"role": "user", "content": user_message})
             logging.debug(
-                f"[{log_prefix}] Added user message to context: {user_message[:100]}..."
+                "[%s] Added user message to context: chars=%d",
+                log_prefix,
+                len(user_message),
             )
         else:
             logging.warning(

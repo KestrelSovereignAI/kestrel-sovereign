@@ -6,8 +6,11 @@ Enriches results with manual overrides from model_catalog.toml.
 Provides in-memory caching and disk-based cache for fast startup.
 """
 import asyncio
+import dataclasses
 import logging
 from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
+
+from kestrel_sdk.llm import ModelInfo as SDKModelInfo
 
 from .model_metadata import ModelInfo, ModelCategory
 from .model_catalog import get_catalog_service
@@ -17,6 +20,52 @@ if TYPE_CHECKING:
     from .embedding_discovery import EmbeddingModelInfo
 
 logger = logging.getLogger(__name__)
+
+#: Every field the framework ``ModelInfo`` constructor accepts (#3270).
+_FRAMEWORK_MODEL_FIELDS = tuple(
+    field.name for field in dataclasses.fields(ModelInfo) if field.init
+)
+
+
+def _as_framework_models(vendor: str, models: Any) -> List[ModelInfo]:
+    """Return an adapter's ``list_models`` result as framework ``ModelInfo`` (#3270).
+
+    The catalog is a list of the framework ``ModelInfo``, which extends the SDK
+    dataclass with ``underlying_provider`` and ``output_limit``. External LLM
+    plugins depend only on the SDK and build its base ``ModelInfo``, so their
+    records used to enter the catalog without those fields: a fresh discovery
+    returned two types, while the same catalog reloaded from the disk cache
+    returned one. Each SDK record is lifted into the framework type with every
+    field it carries; the fields it lacks take their defaults.
+
+    An item that is not a ``ModelInfo`` at all breaks the adapter contract. It
+    is dropped with a warning naming the vendor, never passed through. A result
+    that is not a list means the call itself produced no catalog, so it raises
+    for the caller to record as that vendor's discovery failure.
+    """
+    if not isinstance(models, (list, tuple)):
+        raise TypeError(
+            f"list_models returned {type(models).__name__}, not a list of ModelInfo"
+        )
+    lifted: List[ModelInfo] = []
+    rejected: List[str] = []
+    for model in models:
+        if isinstance(model, ModelInfo):
+            lifted.append(model)
+        elif isinstance(model, SDKModelInfo):
+            lifted.append(ModelInfo(**{
+                name: getattr(model, name)
+                for name in _FRAMEWORK_MODEL_FIELDS
+                if hasattr(model, name)
+            }))
+        else:
+            rejected.append(type(model).__name__)
+    if rejected:
+        logger.warning(
+            "%s: model discovery dropped %d item(s) that are not ModelInfo: %s",
+            vendor, len(rejected), ", ".join(sorted(set(rejected))),
+        )
+    return lifted
 
 
 def _model_offers_dim(model: "EmbeddingModelInfo", dim: int) -> bool:
@@ -145,6 +194,9 @@ class ModelDiscoveryMixin:
                 # embedding route's ``supports_embeddings`` unset on this
                 # instance even though its embedding catalog is discoverable.
                 await self.reconcile_embedding_capabilities(use_cache=True)
+                # Decision models (#3424): reuse cached decision state; only
+                # never-discovered routes are contacted on a cache hit.
+                await self.reconcile_decision_capabilities(use_cache=True)
                 return self._filter_models(
                     cached_models,
                     featured_only=featured_only,
@@ -311,6 +363,9 @@ class ModelDiscoveryMixin:
         # (they use ``_resolve_local_auto_routes``), so cloud embedding
         # endpoints are not contacted under a privacy-gated turn.
         await self.reconcile_embedding_capabilities(use_cache=True)
+        # Decision models (#3424) on the same non-local warm-up path; a cache
+        # miss refreshes every decision route and re-runs pin canaries.
+        await self.reconcile_decision_capabilities(use_cache=False)
 
         # Cache results in shared memory cache and on disk
         shared_cache.set(all_models)
@@ -904,6 +959,15 @@ class ModelDiscoveryMixin:
                     if parity is not None and getattr(parity, "passed", False):
                         return m
         return None
+
+    async def reconcile_decision_capabilities(self, use_cache: bool = True) -> None:
+        """Hook for the decisions modality (#3424), called beside embedding reconciliation.
+
+        :class:`~kestrel_sovereign.llm.decision_service.DecisionServiceMixin`
+        implements it and precedes this mixin in ``LLMService``'s MRO; a bare
+        discovery mixin (catalog-only tooling and tests) has no decision state
+        to reconcile.
+        """
 
     async def reconcile_embedding_capabilities(self, *, use_cache: bool = True) -> None:
         """Fold live embedding discovery into each route's static capabilities (#2338).
@@ -1614,10 +1678,16 @@ class ModelDiscoveryMixin:
         client; the SDK 0.5.0 contract requires it be passed to
         discovery so authenticated /models endpoints reach the right
         endpoint for routes with custom ``base_url``.
+
+        This is where any adapter's records, including an external plugin's,
+        enter the catalog, so they are normalized here
+        (:func:`_as_framework_models`).
         """
         try:
             if hasattr(adapter, 'list_models'):
-                models = await adapter.list_models(client)
+                models = _as_framework_models(
+                    vendor, await adapter.list_models(client)
+                )
                 logger.debug("%s: discovered %d models", vendor, len(models))
                 self._note_discovery_outcome(vendor, None)
                 return models

@@ -1335,10 +1335,13 @@ side door around `PrivacyEnforcingStorage`:
   fresh sources and provenance.
 - `ANONYMOUS` stores only the policy-approved redacted form; raw source text,
   raw identifiers, and unredacted vectors are prohibited.
-- `DEIDENTIFIED` is currently **fail-closed**, despite its target preset of
-  `storage=deidentified`, `assurance=safe_harbor`, and `audit=required`.
-  `PrivacyPolicy.for_mode()` denies persistent writes until an evidence-backed
-  Safe Harbor or Expert Determination pipeline exists. A semantic write attempt
+- `DEIDENTIFIED` is currently **fail-closed** for semantic writes, despite its
+  preset of `storage=deidentified`, `assurance=safe_harbor`, and
+  `audit=required`. `PrivacyPolicy.for_mode()` denies generic persistent
+  writes. The record-level de-identification pipeline
+  (`kestrel_sovereign.deidentification`) and its evidence-gated
+  `store_deidentified_records` save persist de-identified records with their
+  evidence artifact; they do not extend to the semantic layer. A semantic write attempt
   in this mode must return `deidentification_evidence_unavailable` before a
   write capability or writer call exists, and persist no canonical assertion,
   source occurrence, pre-publication quarantine artifact, vector/index,

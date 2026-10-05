@@ -9,6 +9,7 @@ import logging
 from typing import Optional
 
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sovereign.agent.turn_lifecycle import current_turn_is_signal_driven
 from kestrel_sovereign.features.security.permissions import (
     SUBAGENT_DISPATCH_ACTION,
     PermissionLevel,
@@ -44,6 +45,26 @@ logger = logging.getLogger(__name__)
 # ``execute_named_tool`` from a lifecycle hook passes this session id.
 FEATURE_LIFECYCLE_SESSION_ID = "feature-lifecycle"
 NON_INTERACTIVE_SESSION_IDS = frozenset({"scheduler", FEATURE_LIFECYCLE_SESSION_ID})
+
+
+def reserved_session_id(session_id: object) -> Optional[str]:
+    """The reserved non-interactive id ``session_id`` names, or ``None``.
+
+    Membership in :data:`NON_INTERACTIVE_SESSION_IDS` asserts that no human is
+    attached, so only the code paths that own those ids may present one. A
+    request door asks this before it adopts a caller's ``session_id``: a chat
+    caller who sent ``"scheduler"`` had every ASK-gated tool in the turn
+    refused with "no interactive approver" and the turn's history filed under
+    the reserved label (#3284).
+
+    Surrounding whitespace is ignored because the turn lifecycle strips it
+    from the session it binds (``turn_lifecycle._normalize_session_id``), so a
+    padded value reaches the turn's features as the bare reserved id.
+    """
+    if not isinstance(session_id, str):
+        return None
+    candidate = session_id.strip()
+    return candidate if candidate in NON_INTERACTIVE_SESSION_IDS else None
 
 
 class SecurityHook(Hook):
@@ -185,7 +206,16 @@ class SecurityHook(Hook):
             # A non-interactive caller (e.g. a scheduler tick) has no human to
             # answer the queue; ask the queue not to block-and-wait forever but
             # to return a non-blocking no_approver denial instead (#2111).
-            allow_blocking = input.session_id not in NON_INTERACTIVE_SESSION_IDS
+            #
+            # A signal-driven turn (an A2A task, a wake) is just as unattended,
+            # and it waits while holding the agent's conversation lock, so one
+            # unanswered approval stopped every later turn the agent had: user
+            # chat, wakes and peer questions alike (#3439).
+            signal_driven = current_turn_is_signal_driven()
+            allow_blocking = (
+                input.session_id not in NON_INTERACTIVE_SESSION_IDS
+                and not signal_driven
+            )
             approved, scope = await self.approval_queue.request_approval(
                 feature_name=feature_name,
                 tool_name=tool_name,
@@ -220,13 +250,30 @@ class SecurityHook(Hook):
                         feature_name,
                         tool_name,
                     )
+                    if signal_driven:
+                        reason = (
+                            "this turn was started by a signal (an A2A task "
+                            "or a wake), so no operator is in its "
+                            "conversation to grant it"
+                        )
+                    elif not allow_blocking:
+                        reason = (
+                            f"this is a non-interactive call (session "
+                            f"'{input.session_id}'), so no operator is "
+                            "attached to grant it"
+                        )
+                    else:
+                        reason = (
+                            "this is a headless/test instance with no "
+                            "interactive approver; enable non-interactive "
+                            "approval (KESTREL_TEST_AUTO_APPROVE=1) or run "
+                            "with an attached approver"
+                        )
                     return HookOutput.deny(
-                        f"{feature_name}.{tool_name} requires approval, but no "
-                        "interactive approver is available (headless/test "
-                        "instance). Not queuing to avoid an indefinite block. "
-                        "Enable non-interactive approval "
-                        "(KESTREL_TEST_AUTO_APPROVE=1) or run with an attached "
-                        "approver."
+                        f"{feature_name}.{tool_name} requires operator "
+                        f"approval and was not run: {reason}. The request was "
+                        "not queued. Tell whoever asked that operator approval "
+                        f"is required for {feature_name}.{tool_name}."
                     )
                 if denial.is_user_denial:
                     logger.info(f"User denied: {feature_name}.{tool_name}")

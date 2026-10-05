@@ -5,9 +5,10 @@ This is the generic successor to the per-job ``last_signaled_status`` +
 ``pending_signal_*`` fields talon_monitor used to stash inside ``jobs.json``:
 one row per ``(agent_id, kind, handle)`` the reconciler has observed, tracking
 
-  - ``last_signaled_outcome`` — application-level dedup: the terminal
-    :class:`~kestrel_sdk.tools.Outcome` value we already delivered a signal
-    for, so the next tick does not re-fire the same transition.
+  - ``last_signaled_outcome`` — application-level dedup: the token of the
+    terminal event we already delivered a signal for, so the next tick does
+    not re-fire it. The provider's terminal-event identity when it exposes
+    one, else the :class:`~kestrel_sdk.tools.Outcome` value (#3399).
   - ``last_delivery_*`` — diagnostics + retry accounting; ``attempts`` caps
     the soft-fail retry loop. ``last_delivery_status`` composes the dispatch
     result with a VISIBILITY verdict (``ok_queued`` / ``ok_unsurfaced`` /
@@ -24,6 +25,25 @@ one row per ``(agent_id, kind, handle)`` the reconciler has observed, tracking
     time is PARKED until then, and that attempt is refunded (#3302). The
     retry cap guards against a signal the dispatcher will always reject; it
     must not be spent waiting out a rate limit the provider has dated.
+  - ``delivery_locked_attempts`` — the recorded attempt count a wake was
+    locked at when it reached the retry cap (#3391), copied from the row's own
+    counter by the only method that writes the lock. ``NULL`` on every row
+    that is not currently locked, and on locks written before the column.
+  - ``watching`` / ``watch_baseline`` — an explicit ``wait(mode="signal")``
+    watch, and the terminal-event token it was armed over: the one in flight
+    or last delivered when the agent registered it (#3399). Delivering any
+    other token disarms the watch, so registering it again after it fired
+    re-arms it for the next event.
+  - ``last_delivered_at`` — the time of the last wake for this handle that
+    was delivered: when the reconciler began the poll that built it, not when
+    a later tick harvested its result. A later transition's attempts rewrite
+    every ``last_delivery_*`` column, so without it a re-emitted wake could
+    not say the handle had been woken before, nor whether its event predates
+    that wake (#3390).
+
+Every change to a delivered row that does NOT wake the agent — a re-key of
+``last_signaled_outcome`` to the token the same event is now polled under —
+is also appended to ``wait_signal_rekeys`` in the same transaction (#3390).
 
 Like :class:`PendingA2AQuestionStore`, every query is filtered by
 ``agent_id`` so a shared backend (e.g. Postgres) cannot leak rows between
@@ -38,6 +58,7 @@ connection but may not durably commit, resurrecting state across a restart.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional, Union
@@ -56,6 +77,17 @@ MAX_ATTEMPTS_EXCEEDED = "max_attempts_exceeded"
 # (#3302). Not a failure of the wake: its attempt was refunded.
 DEFERRED_RATE_LIMITED = "deferred_rate_limited"
 
+# Why a delivered row was re-keyed without a wake (``wait_signal_rekeys``,
+# #3390). The provider re-labelled the delivered event: its outcome class, or
+# its native status under an unchanged event identity, changed.
+REKEY_RECLASSIFIED = "reclassified"
+# The provider read the delivered event through another view (#3399).
+REKEY_VIEW_SWITCHED = "view_switched"
+# The provider began naming terminal events after the row was delivered.
+REKEY_IDENTITY_ADOPTED = "identity_adopted"
+# The provider stopped naming terminal events after the row was delivered.
+REKEY_IDENTITY_DROPPED = "identity_dropped"
+
 # The one column list every read selects, in ``_row_to_dc`` order.
 _STATE_COLUMNS = """
     kind, handle, last_signaled_outcome, last_delivery_status,
@@ -64,8 +96,32 @@ _STATE_COLUMNS = """
     pending_signaled_target, pending_signal_enqueued_at,
     watching, last_surface_status,
     attempts_signaled_target, last_attempt_started_at,
-    delivery_deferred_until, delivery_deferrals
+    delivery_deferred_until, delivery_deferrals,
+    watch_baseline, last_delivered_at, delivery_locked_attempts
 """
+
+
+def _parse_utc(
+    raw: Optional[str], *, kind: str, handle: str, column: str,
+) -> Optional[datetime]:
+    """A stored naive-UTC timestamp as an aware UTC datetime, or ``None``.
+
+    The columns hold naive UTC (see :func:`_coerce_ts`). A value that does
+    not parse is logged and treated as absent.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        logger.warning(
+            "wait_signal_state %s:%s has an unparseable %s %r; ignoring it",
+            kind, handle, column, raw,
+        )
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _coerce_ts(value: TimeArg) -> Optional[datetime]:
@@ -123,29 +179,53 @@ class WaitSignalState:
     delivery_deferred_until: Optional[str] = None
     # How many times this transition's wake has been parked that way.
     delivery_deferrals: int = 0
+    # The terminal-event token the explicit watch was (re)armed over (#3399):
+    # the wake in flight, else the one delivered, when the agent registered
+    # it. ``None`` for a watch armed before any wake, and on rows predating
+    # the column.
+    watch_baseline: Optional[str] = None
+    # The time of the last delivered wake for this handle (#3390): when the
+    # poll that built it began. ``None`` when none was delivered, and on
+    # legacy rows whose delivered wake could not be dated.
+    last_delivered_at: Optional[str] = None
+    # The recorded attempt count this row's wake was locked at (#3391), or
+    # ``None`` when it is not locked, or was locked before the column existed.
+    delivery_locked_attempts: Optional[int] = None
 
     def deferred_until_utc(self) -> Optional[datetime]:
         """``delivery_deferred_until`` as an aware UTC datetime, or ``None``.
 
-        The column holds naive UTC (see :func:`_coerce_ts`). A value that does
-        not parse is treated as no deferral: failing open delivers the wake,
-        which is the safe direction.
+        A value that does not parse is treated as no deferral: failing open
+        delivers the wake, which is the safe direction.
         """
-        raw = self.delivery_deferred_until
-        if not raw:
-            return None
-        try:
-            parsed = datetime.fromisoformat(raw)
-        except ValueError:
-            logger.warning(
-                "wait_signal_state %s:%s has an unparseable "
-                "delivery_deferred_until %r; ignoring it",
-                self.kind, self.handle, raw,
-            )
-            return None
-        if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
+        return _parse_utc(
+            self.delivery_deferred_until,
+            kind=self.kind, handle=self.handle, column="delivery_deferred_until",
+        )
+
+    def delivered_at_utc(self) -> Optional[datetime]:
+        """``last_delivered_at`` as an aware UTC datetime, or ``None``.
+
+        A value that does not parse is treated as no recorded delivery, so no
+        wake is labelled a replay on its account.
+        """
+        return _parse_utc(
+            self.last_delivered_at,
+            kind=self.kind, handle=self.handle, column="last_delivered_at",
+        )
+
+
+@dataclass(frozen=True)
+class WaitSignalRekey:
+    """One ``wait_signal_rekeys`` audit row (#3390): a delivered row
+    re-keyed to the token its event is now polled under, without a wake."""
+
+    kind: str
+    handle: str
+    previous_token: str
+    token: str
+    reason: str
+    recorded_at: str
 
 
 class WaitSignalStore:
@@ -251,6 +331,14 @@ class WaitSignalStore:
         record, not a confirmed delivery). Upsert via try-UPDATE / fallback
         INSERT so an existing row keeps its prior ``last_signaled_outcome``
         instead of an ``INSERT OR REPLACE`` blowing it away.
+
+        A dispatch also ends any lock on the row (#3391): a locked transition
+        is never re-sent, so a wake dispatched after one is a new transition,
+        and the counter this sets belongs to it. ``last_delivery_status``
+        keeps the lock's status until this wake is harvested, so it is still
+        the "previous status" the wake reports. The pending fields set here
+        are what keep :meth:`list_undelivered` from reporting a wake in flight
+        as locked.
         """
         attempt_dt = _coerce_ts(attempt_at) or datetime.now(timezone.utc).replace(
             tzinfo=None
@@ -270,6 +358,7 @@ class WaitSignalStore:
                 attempts_signaled_target = ?,
                 last_attempt_started_at = ?,
                 delivery_deferred_until = NULL,
+                delivery_locked_attempts = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
@@ -322,6 +411,7 @@ class WaitSignalStore:
         signaled_outcome: Optional[str] = None,
         attempt_at: TimeArg = None,
         surface_status: Optional[str] = None,
+        delivered_at: TimeArg = None,
     ) -> None:
         """Record the outcome of a harvested delivery.
 
@@ -331,14 +421,41 @@ class WaitSignalStore:
         ``signaled_outcome`` is not None it also locks
         ``last_signaled_outcome`` — callers pass it for delivered + hard-fail
         states (stop the loop) and OMIT it for soft-fails (so the next tick
-        re-detects and retries).
+        re-detects and retries). Locking a token other than an explicit
+        watch's ``watch_baseline`` also disarms that watch: it has fired
+        (#3399).
 
         ``surface_status`` is the dispatcher's raw account of what the
         ``signal_completed`` emit did (#2922) — provenance for the visibility
         verdict already composed into ``delivery_status``. It is written even
         when ``None`` so a later, less-observable attempt cannot inherit an
         earlier attempt's verdict and read as better than it was.
+
+        ``delivered_at`` marks a successful delivery — the wake was accepted
+        and its turn ran — as opposed to a hard-fail or retry-cap lock, which
+        also lock ``signaled_outcome``. Only a successful delivery stamps
+        ``last_delivered_at`` (#3390), so it requires ``signaled_outcome``.
+        Its value is the WAKE's time, the instant the poll that built it
+        began, and deliberately not ``attempt_at``: the harvest runs a tick
+        later, and an event that finished in between — after the wake, before
+        its harvest — would otherwise read as older than the wake and be
+        announced as a replay.
+
+        It never writes the retry-cap lock: ``MAX_ATTEMPTS_EXCEEDED`` is
+        refused, because only :meth:`lock_at_max_attempts` checks the row's
+        recorded attempts before locking (#3391). Any status written here
+        replaces a lock, so it also clears ``delivery_locked_attempts``.
         """
+        if delivery_status == MAX_ATTEMPTS_EXCEEDED:
+            raise ValueError(
+                "the retry-cap lock checks the recorded attempts: use "
+                "lock_at_max_attempts"
+            )
+        delivered_dt = _coerce_ts(delivered_at)
+        if delivered_dt is not None and signaled_outcome is None:
+            raise ValueError(
+                "a successful delivery locks its token: pass signaled_outcome"
+            )
         attempt_dt = _coerce_ts(attempt_at) or datetime.now(timezone.utc).replace(
             tzinfo=None
         )
@@ -355,9 +472,16 @@ class WaitSignalStore:
                     last_delivery_error = ?,
                     last_delivery_attempt_at = ?,
                     last_signaled_outcome = ?,
+                    last_delivered_at = COALESCE(?, last_delivered_at),
+                    watching = CASE
+                        WHEN watch_baseline IS NULL OR watch_baseline <> ?
+                        THEN 0
+                        ELSE watching
+                    END,
                     pending_signal_id = NULL,
                     pending_signaled_target = NULL,
                     pending_signal_enqueued_at = NULL,
+                    delivery_locked_attempts = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE agent_id = ? AND kind = ? AND handle = ?
                 """,
@@ -366,6 +490,8 @@ class WaitSignalStore:
                     surface_status,
                     delivery_error,
                     attempt_dt,
+                    signaled_outcome,
+                    delivered_dt,
                     signaled_outcome,
                     self._agent_id,
                     kind,
@@ -383,6 +509,7 @@ class WaitSignalStore:
                     pending_signal_id = NULL,
                     pending_signaled_target = NULL,
                     pending_signal_enqueued_at = NULL,
+                    delivery_locked_attempts = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE agent_id = ? AND kind = ? AND handle = ?
                 """,
@@ -402,8 +529,9 @@ class WaitSignalStore:
                 INSERT INTO wait_signal_state
                     (agent_id, kind, handle, last_signaled_outcome,
                      last_delivery_status, last_surface_status,
-                     last_delivery_error, last_delivery_attempt_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                     last_delivery_error, last_delivery_attempt_at,
+                     last_delivered_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 (
                     self._agent_id,
@@ -414,6 +542,7 @@ class WaitSignalStore:
                     surface_status,
                     delivery_error,
                     attempt_dt,
+                    delivered_dt,
                 ),
             )
 
@@ -458,6 +587,7 @@ class WaitSignalStore:
                 pending_signal_id = NULL,
                 pending_signaled_target = NULL,
                 pending_signal_enqueued_at = NULL,
+                delivery_locked_attempts = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
@@ -494,6 +624,69 @@ class WaitSignalStore:
                 ),
             )
 
+    async def lock_at_max_attempts(
+        self,
+        kind: str,
+        handle: str,
+        *,
+        target: str,
+        max_attempts: int,
+        attempt_at: TimeArg = None,
+    ) -> bool:
+        """Lock ``target``'s undelivered wake once its recorded attempts reach
+        ``max_attempts`` (#3391).
+
+        The only writer of ``MAX_ATTEMPTS_EXCEEDED``. It is a compare-and-set
+        on the row itself, not on what the caller read: the row must still be
+        counting ``target``'s transition (``attempts_signaled_target``), its
+        recorded ``last_delivery_attempts`` must have reached the cap, and no
+        wake may be in flight. Whatever the caller believed, a lock below the
+        cap, on another transition's counter, or over a wake being dispatched
+        is refused.
+
+        The lock copies the row's own counter into
+        ``delivery_locked_attempts``, so the locked row reports the attempt
+        count it was locked at. It locks ``target`` like a hard fail, disarms
+        an explicit watch armed over another token, and keeps the row's
+        ``last_delivery_error``: the last real failure is the only account of
+        why the wake never landed. Returns whether it locked.
+        """
+        attempt_dt = _coerce_ts(attempt_at) or datetime.now(timezone.utc).replace(
+            tzinfo=None
+        )
+        rowcount = await self._db.execute(
+            """
+            UPDATE wait_signal_state
+            SET last_delivery_status = ?,
+                last_surface_status = NULL,
+                last_delivery_attempt_at = ?,
+                last_signaled_outcome = ?,
+                delivery_locked_attempts = last_delivery_attempts,
+                watching = CASE
+                    WHEN watch_baseline IS NULL OR watch_baseline <> ?
+                    THEN 0
+                    ELSE watching
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE agent_id = ? AND kind = ? AND handle = ?
+                  AND attempts_signaled_target = ?
+                  AND last_delivery_attempts >= ?
+                  AND pending_signal_id IS NULL
+            """,
+            (
+                MAX_ATTEMPTS_EXCEEDED,
+                attempt_dt,
+                target,
+                target,
+                self._agent_id,
+                kind,
+                handle,
+                target,
+                int(max_attempts),
+            ),
+        )
+        return rowcount > 0
+
     async def list_undelivered(self, limit: int = 50) -> List[WaitSignalState]:
         """Wakes for THIS agent that have not reached it and will not soon.
 
@@ -502,6 +695,11 @@ class WaitSignalStore:
           * locked — the retry cap was reached and the transition was locked
             as ``max_attempts_exceeded`` without ever being delivered;
           * parked — the wake is deferred until a provider-advised retry time.
+
+        A row whose lock is followed by a wake still in flight is neither
+        (#3391). That wake is for a new transition: until its harvest the row
+        keeps the lock's status beside the new wake's attempt counter, and
+        reporting it read as a wake locked after one attempt.
 
         The read surface behind ``wait_status`` (#3302): before it, the only
         way to learn that a job's completion wake had been locked away was to
@@ -512,7 +710,8 @@ class WaitSignalStore:
             SELECT {_STATE_COLUMNS}
             FROM wait_signal_state
             WHERE agent_id = ?
-                  AND (last_delivery_status = ?
+                  AND ((last_delivery_status = ?
+                        AND pending_signal_id IS NULL)
                        OR delivery_deferred_until IS NOT NULL)
             ORDER BY updated_at DESC
             LIMIT ?
@@ -542,18 +741,33 @@ class WaitSignalStore:
     # ------------------------------------------------------------------
 
     async def start_watch(self, kind: str, handle: str) -> None:
-        """Register an explicit watch on ``(kind, handle)`` (set watching=1).
+        """Arm an explicit watch on ``(kind, handle)`` (set watching=1).
 
         Upsert that PRESERVES any existing delivery/signaled/pending fields:
         a row may already exist from a prior delivery cycle. Try-UPDATE first;
         if no row, INSERT a fresh one with watching=1 and zeroed counters.
         This is the durable half of ``wait(target, mode="signal")`` — the
         reconciler polls watched rows so even a poll-only provider is wakeable.
+
+        Registering RE-ARMS (#3399). Before this, a watch that had fired once
+        stayed retired while still acknowledging ``watching: true``, so the
+        second wake of a watch → fail → re-run → watch-again loop could never
+        arrive. The watch's ``watch_baseline`` becomes the terminal event this
+        handle's wake was already given for: the one in flight if a wake is
+        pending, else the one last delivered. The in-flight case is the common
+        one, not an edge — an agent re-runs a job and re-registers from inside
+        the very wake that announced the failure, before the reconciler has
+        harvested it. :meth:`record_delivery` disarms the watch only on a
+        delivery other than its baseline, and the reconciler's dedup against
+        ``last_signaled_outcome`` keeps it quiet on the delivered event.
         """
         rowcount = await self._db.execute(
             """
             UPDATE wait_signal_state
             SET watching = 1,
+                watch_baseline = COALESCE(
+                    pending_signaled_target, last_signaled_outcome
+                ),
                 updated_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
@@ -582,22 +796,160 @@ class WaitSignalStore:
         )
 
     async def list_watched(self) -> List[WaitSignalState]:
-        """Active explicit watches — watching=1 AND not yet signaled.
+        """Armed explicit watches — the reconciler's watched-poll set.
 
-        Once a watch's transition is delivered (``last_signaled_outcome`` is
-        set) it drops out of the reconciler's watched-poll set, mirroring the
-        application-level dedup the active_handles loop applies.
+        A watch fires once per registration: :meth:`record_delivery` disarms
+        it (``watching = 0``) when a terminal event other than its
+        ``watch_baseline`` is delivered, and registering again re-arms it
+        (#3399). Disarming is explicit rather than inferred from
+        ``last_signaled_outcome`` moving, because a soft-failed wake leaves
+        that column where it was and must still be retried.
+
+        A row armed with no baseline and a delivered outcome cannot arise from
+        this code: such a watch is disarmed by the delivery itself. It is a
+        watch that fired before #3399 added the baseline, and it stays retired
+        until the agent registers it again, so the upgrade replays nothing.
         """
         rows = await self._db.fetchall(
             f"""
             SELECT {_STATE_COLUMNS}
             FROM wait_signal_state
             WHERE agent_id = ? AND watching = 1
-                  AND last_signaled_outcome IS NULL
+                  AND (watch_baseline IS NOT NULL
+                       OR last_signaled_outcome IS NULL)
             """,
             (self._agent_id,),
         )
         return [self._row_to_dc(r) for r in rows]
+
+    async def adopt_signaled_token(
+        self,
+        kind: str,
+        handle: str,
+        *,
+        previous: str,
+        token: str,
+        reason: str,
+        recorded_at: TimeArg = None,
+    ) -> bool:
+        """Re-key a delivered transition from ``previous`` to ``token``.
+
+        The reconciler has judged that the event it now polls is the one
+        ``previous`` delivered, under a different string: the provider
+        re-labelled it (#3390), started naming terminal events after it was
+        delivered, or read it through another view (#3399). Re-keying in
+        place records that without emitting, so none of those replays the
+        wake, and later polls compare against the current string, so the next
+        genuine event still wakes. A watch armed over ``previous`` moves with
+        it and stays live, and so does the attempt accounting of the delivered
+        transition (``attempts_signaled_target``): left on the old string, it
+        would read a later, different event as a retry of the delivered one.
+        ``last_delivered_at`` is untouched: the delivery it dates is the one
+        being re-keyed.
+
+        A re-key is a change to delivered state that wakes nobody, so it is
+        audited: a ``wait_signal_rekeys`` row naming both tokens and
+        ``reason`` (one of the ``REKEY_*`` constants) is written in the same
+        transaction, and only when the row was re-keyed.
+
+        Compare-and-set on ``previous``: a delivery recorded since the
+        reconciler read the row is left alone. Returns whether it re-keyed.
+        """
+        recorded_dt = _coerce_ts(recorded_at) or datetime.now(
+            timezone.utc
+        ).replace(tzinfo=None)
+        async with self._db.transaction():
+            rowcount = await self._db.execute(
+                """
+                UPDATE wait_signal_state
+                SET last_signaled_outcome = ?,
+                    watch_baseline = CASE
+                        WHEN watch_baseline = ? THEN ?
+                        ELSE watch_baseline
+                    END,
+                    attempts_signaled_target = CASE
+                        WHEN attempts_signaled_target = ? THEN ?
+                        ELSE attempts_signaled_target
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE agent_id = ? AND kind = ? AND handle = ?
+                      AND last_signaled_outcome = ?
+                """,
+                (
+                    token,
+                    previous,
+                    token,
+                    previous,
+                    token,
+                    self._agent_id,
+                    kind,
+                    handle,
+                    previous,
+                ),
+            )
+            if rowcount == 0:
+                return False
+            await self._db.execute(
+                """
+                INSERT INTO wait_signal_rekeys
+                    (id, agent_id, kind, handle, previous_token, token,
+                     reason, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    self._agent_id,
+                    kind,
+                    handle,
+                    previous,
+                    token,
+                    reason,
+                    recorded_dt,
+                ),
+            )
+        return True
+
+    async def list_rekeys(
+        self,
+        kind: Optional[str] = None,
+        handle: Optional[str] = None,
+        *,
+        limit: int = 50,
+    ) -> List[WaitSignalRekey]:
+        """THIS agent's re-key audit rows (#3390), newest first.
+
+        Optionally narrowed to one ``kind``, or one ``(kind, handle)``.
+        """
+        clauses = ["agent_id = ?"]
+        params: list = [self._agent_id]
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if handle is not None:
+            clauses.append("handle = ?")
+            params.append(handle)
+        params.append(int(limit))
+        rows = await self._db.fetchall(
+            f"""
+            SELECT kind, handle, previous_token, token, reason, recorded_at
+            FROM wait_signal_rekeys
+            WHERE {" AND ".join(clauses)}
+            ORDER BY recorded_at DESC, id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        return [
+            WaitSignalRekey(
+                kind=r[0],
+                handle=r[1],
+                previous_token=r[2],
+                token=r[3],
+                reason=r[4],
+                recorded_at=str(r[5]),
+            )
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -622,4 +974,7 @@ class WaitSignalStore:
             last_attempt_started_at=str(r[13]) if r[13] is not None else None,
             delivery_deferred_until=str(r[14]) if r[14] is not None else None,
             delivery_deferrals=int(r[15]) if r[15] is not None else 0,
+            watch_baseline=str(r[16]) if r[16] is not None else None,
+            last_delivered_at=str(r[17]) if r[17] is not None else None,
+            delivery_locked_attempts=int(r[18]) if r[18] is not None else None,
         )

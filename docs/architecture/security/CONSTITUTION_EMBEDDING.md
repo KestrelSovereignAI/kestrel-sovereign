@@ -57,22 +57,23 @@ This DID serves as the agent's permanent identifier and becomes the `node_id` fo
 ### 4. Constitution Storage (CRITICAL)
 The constitution is stored as the **FIRST file** in the agent's storage. The
 bytes come from the single governing-constitution resolver
-(`kestrel_sovereign.constitution.resolver.resolve_governing_constitution_bytes`),
-which reads the packaged canonical source at `config.CONSTITUTION_PATH` —
-the same source the periodic integrity audit recomputes from:
+(`kestrel_sovereign.constitution.resolver`). It first decides which source
+governs — the packaged canonical source at `config.CONSTITUTION_PATH`, unless
+operator configuration names a Sovereign-signed source descriptor — and then
+reads that source, the same one the periodic integrity audit recomputes from:
 ```python
-constitution_content = resolve_governing_constitution_bytes(contract)
+source = resolve_governing_source(agent_dids={agent_did})
+constitution_content = resolve_governing_constitution_bytes(contract, source=source)
 constitution_hash = storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
 ```
 
-> **Deprecation (#2463):** inception and offline reanchor now REFUSE a
-> `constitution_path` override that is not the packaged governing source.
-> Anchoring bytes from any other path manufactured agents guaranteed to
-> fail their next periodic audit and enter Safe Mode. A legitimate custom
-> governing source is expressed by pointing `config.CONSTITUTION_PATH` at
-> it (the one seam every path — inception, audit, reanchor, doctor — reads).
-> Restoring first-class custom sources via a tamper-bound, Sovereign-signed
-> source descriptor is tracked as a follow-up issue.
+> **Custom sources (#2463, #2553):** inception and offline reanchor REFUSE a
+> bare `constitution_path` override that is not the governing source, because
+> anchoring bytes from any other path manufactured agents guaranteed to fail
+> their next periodic audit and enter Safe Mode. A custom governing source is
+> configured with a Sovereign-signed source descriptor verified against the
+> operator-pinned trust root; see
+> [Sovereign Constitution Trust Root](SOVEREIGN_TRUST_ROOT.md#custom-governing-constitution-sources).
 
 > **Reanchor authority (#2499):** the public key authorizing a constitution
 > reanchor is pinned outside the graph database. Live and offline reanchor use
@@ -344,7 +345,8 @@ All tests run as async with `pytest-anyio` and verify the complete constitution 
 
 Inception owns the durable state transition:
 
-1. Resolve governing bytes through
+1. Resolve the governing source and its bytes through
+   `constitution.resolver.resolve_governing_source` and
    `constitution.resolver.resolve_governing_constitution_bytes`.
 2. If setup supplied a usable configured auditor, evaluate those exact bytes
    before storing the constitution. Only risk levels 1–2 may continue. Any

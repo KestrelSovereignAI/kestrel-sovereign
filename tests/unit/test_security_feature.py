@@ -917,6 +917,152 @@ class TestSecurityHook:
         )
         assert "scheduler" in NON_INTERACTIVE_SESSION_IDS
 
+    @staticmethod
+    def _signal_chain():
+        from kestrel_sdk.signals import CausationFrame
+
+        return [
+            CausationFrame(
+                agent_id="did:test:nellie",
+                source="a2a.task_submitted",
+                signal_id="sig-question",
+                turn_id=None,
+                depth=1,
+                emitted_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_signal_driven_turn_is_denied_not_queued(
+        self, hook, permission_store, approval_queue
+    ):
+        """#3439. An A2A-task or wake turn has nobody in its conversation to
+        answer an approval, and it waits holding the agent's conversation lock,
+        so one unanswered ASK stopped every later turn the agent had. It must
+        resolve as no_approver at once, with nothing left queued, and tell the
+        model which tool needs operator approval."""
+        from kestrel_sovereign.agent.turn_lifecycle import bind_current_chain
+
+        await permission_store.register_tool(
+            "MemoryFeature", "memory_status", PermissionLevel.ASK
+        )
+        input = HookInput(
+            session_id="a2a-session-23823405",
+            hook_event_name="PreToolUse",
+            tool_name="memory_status",
+            feature_name="MemoryFeature",
+            tool_input={},
+        )
+
+        with bind_current_chain(self._signal_chain()):
+            output = await asyncio.wait_for(hook.execute(input), timeout=1.0)
+
+        assert output.continue_execution is False
+        assert output.permission_decision == PermissionDecision.DENY
+        assert approval_queue.pending_requests == []
+        assert "MemoryFeature.memory_status" in output.permission_reason
+        assert "requires operator approval" in output.permission_reason
+        assert "signal" in output.permission_reason
+        assert "KESTREL_TEST_AUTO_APPROVE" not in output.permission_reason
+        logs = await permission_store.get_audit_log(limit=10)
+        assert [row["decision"] for row in logs] == ["no_approver"]
+
+    @pytest.mark.asyncio
+    async def test_a_direct_user_turn_still_queues_and_waits(
+        self, hook, permission_store, approval_queue
+    ):
+        """The Sovereign answers a direct user turn's approval through the
+        approval panel, so with no causation chain bound the hook still queues
+        and waits for that decision (#3439 leaves this path alone)."""
+        from kestrel_sovereign.agent.turn_lifecycle import (
+            current_turn_is_signal_driven,
+        )
+
+        await permission_store.register_tool(
+            "MemoryFeature", "memory_status", PermissionLevel.ASK
+        )
+        input = HookInput(
+            session_id="chat-session",
+            hook_event_name="PreToolUse",
+            tool_name="memory_status",
+            feature_name="MemoryFeature",
+            tool_input={},
+        )
+
+        assert current_turn_is_signal_driven() is False
+        pending = asyncio.create_task(hook.execute(input))
+        for _ in range(100):
+            if approval_queue.pending_requests:
+                break
+            await asyncio.sleep(0.01)
+        assert len(approval_queue.pending_requests) == 1
+        assert not pending.done()
+
+        request = approval_queue.pending_requests[0]
+        await approval_queue.submit_decision(request.id, approved=True)
+        output = await asyncio.wait_for(pending, timeout=1.0)
+
+        assert output.permission_decision == PermissionDecision.ALLOW
+        assert approval_queue.pending_requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_scheduler_denial_names_the_tool_and_operator_approval(
+        self, hook, permission_store, approval_queue
+    ):
+        """The non-interactive session ids keep their non-blocking deny, and
+        the text the model sees says which tool needs operator approval
+        without blaming a test instance that is not one (#3439)."""
+        await permission_store.register_tool(
+            "SpawnFeature", "spawn_agent", PermissionLevel.ASK
+        )
+        input = HookInput(
+            session_id="scheduler",
+            hook_event_name="PreToolUse",
+            tool_name="spawn_agent",
+            feature_name="SpawnFeature",
+            tool_input={"name": "child"},
+        )
+
+        output = await asyncio.wait_for(hook.execute(input), timeout=1.0)
+
+        assert output.permission_decision == PermissionDecision.DENY
+        assert approval_queue.pending_requests == []
+        assert "SpawnFeature.spawn_agent" in output.permission_reason
+        assert "requires operator approval" in output.permission_reason
+        assert "'scheduler'" in output.permission_reason
+        assert "KESTREL_TEST_AUTO_APPROVE" not in output.permission_reason
+
+    @pytest.mark.asyncio
+    async def test_a_headless_test_instance_keeps_its_auto_approve_hint(
+        self, permission_store
+    ):
+        """A direct turn on a headless test instance is short-circuited by the
+        queue, not by the hook, and the hint about KESTREL_TEST_AUTO_APPROVE
+        still applies to it (#2029)."""
+        queue = ApprovalQueue(
+            permission_store=permission_store,
+            agent=MagicMock(is_test_instance=True),
+        )
+        hook = SecurityHook(permission_store, queue)
+        await permission_store.register_tool(
+            "SpawnFeature", "spawn_agent", PermissionLevel.ASK
+        )
+        input = HookInput(
+            session_id="chat-session",
+            hook_event_name="PreToolUse",
+            tool_name="spawn_agent",
+            feature_name="SpawnFeature",
+            tool_input={"name": "child"},
+        )
+
+        output = await asyncio.wait_for(hook.execute(input), timeout=1.0)
+
+        assert output.permission_decision == PermissionDecision.DENY
+        assert queue.pending_requests == []
+        assert "SpawnFeature.spawn_agent" in output.permission_reason
+        assert "requires operator approval" in output.permission_reason
+        assert "KESTREL_TEST_AUTO_APPROVE=1" in output.permission_reason
+
     @pytest.mark.asyncio
     async def test_auto_allow(self, hook, permission_store):
         await permission_store.register_tool(

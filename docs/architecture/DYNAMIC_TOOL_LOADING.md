@@ -332,6 +332,20 @@ In practice, current tools already use descriptive names (`list_models`, `memory
 
 Regression coverage: `tests/unit/test_tool_allowlist_registry.py`.
 
+### Dispatcher arguments carried to direct tools (#3396)
+
+**Risk**: A feature dispatcher takes `task` and `context`, and callers keep passing them after a feature's tools become direct. A `@tool` method that does not declare them raised `TypeError` before running, losing the rest of the call (a `shell` call's `capture_output=true`, for one). A misspelt argument is the opposite risk: dropping it would run the tool with a default.
+
+**Mitigation**: Both direct-tool paths, `_dispatch_direct_tool` and `execute_named_tool`, pass the arguments through `kestrel_sovereign.agent.direct_tool_arguments.normalize_direct_tool_arguments` before `PRE_TOOL_USE`:
+
+- An argument the tool's schema accepts passes through unchanged, `task` and `context` included.
+- `task` and `context` are dropped when the schema does not accept them.
+- Any other argument the schema does not accept refuses the call. The error lists the tool's parameters and suggests the closest one (`pr_number` → `pull_number`). The refusal writes a `tool_validation` audit row.
+- What a schema accepts is the schema's own answer, not membership of `properties`, and the tool's original schema answers wherever there is one. A JSON-Schema object accepts its `properties` and every name a `patternProperties` pattern matches (unanchored, as JSON Schema defines). Unless `additionalProperties` is `false`, it accepts every other name as well, and validating those is left to the server.
+- An isolated feature's tool is judged by the `input_schema` its service advertised (`IsolatedFeatureTool.input_schema`; any proxy may carry one as `input_schema` or `inputSchema`), never by the `ToolSchema` parameter list derived from it, which drops `additionalProperties` and `patternProperties`. A proxy whose service advertised no schema object leaves the arguments unchanged. An MCP tool's JSON Schema is its `schema.parameters`.
+- Only a tool with no original schema, a native `@tool` method, is judged by its `ToolSchema` parameter list, which accepts exactly its parameters. A tool with no schema of either shape leaves the arguments unchanged.
+- A server's pattern is never run as a regular expression: `(?:x?){4000000000}` exhausts memory matching even `task`, and `^(a+)+$` backtracks for minutes on a long model-chosen name, all on the event loop. Patterns are compared with `task` and `context` only, and only a literal one, optionally anchored with `^`/`$` (`^x-`, `^context$`), is evaluated, by string comparison. A generic name that any other pattern might match passes through, as does any other name a closed schema leaves to its patterns; the server validates them.
+
 ### Session persistence
 
 **Risk**: If explored tools persist across sessions, the tool list could be stale after feature code changes or restarts.

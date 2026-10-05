@@ -615,10 +615,14 @@ def test_google_text_stream_emits_terminal_cache_usage():
     async def generate_content_stream(**kwargs):
         return _FakeAsyncIter(chunks)
 
+    async def get(*, model):
+        return SimpleNamespace(output_token_limit=65_536)
+
     fake_client = SimpleNamespace(
         aio=SimpleNamespace(
             models=SimpleNamespace(
                 generate_content_stream=generate_content_stream,
+                get=get,
             )
         )
     )

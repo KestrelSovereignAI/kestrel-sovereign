@@ -12,6 +12,7 @@ from kestrel_sovereign.agent.invocation import (
     validate_invocation_id,
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
+from kestrel_sovereign.features.security.hooks import reserved_session_id
 
 
 def require_sovereign_host_lifecycle(request: Request):
@@ -127,6 +128,29 @@ def validate_request_invocation_id(value: object) -> str:
         return validate_invocation_id(value)
     except ValueError as error:
         raise _invalid_request_id(error) from error
+
+
+def reject_reserved_session_id(session_id: object) -> None:
+    """Refuse a caller-supplied ``session_id`` that names a reserved id.
+
+    The non-interactive ids tell the security hook that no human is attached,
+    so a request that could set one would have its own approvals refused and
+    its history filed under a label owned by internal callers (#3284). Called
+    before the turn is registered, so a refusal leaves no request state.
+    """
+    reserved = reserved_session_id(session_id)
+    if reserved is None:
+        return
+    raise ApiHTTPException(
+        status_code=400,
+        code="reserved_session_id",
+        message=(
+            f"session_id '{reserved}' is reserved for the agent's "
+            "non-interactive callers and cannot be set by a request. Omit "
+            "session_id, or start a conversation with "
+            "POST /api/conversations/new and use the id it returns."
+        ),
+    )
 
 
 def _invalid_request_id(error: ValueError) -> ApiHTTPException:

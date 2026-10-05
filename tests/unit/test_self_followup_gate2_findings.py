@@ -43,6 +43,7 @@ from tests.unit.test_inline_executor_contextvar_invariant import (
     _CodexReaderHarness,
 )
 from tests.unit.test_self_followup_schedule import SOURCE, _drain, _schedule
+from tests.utils.scheduler_ticks import tick_and_settle
 
 SENTINEL = "gate2-intent-XYZZY"
 
@@ -161,7 +162,7 @@ async def test_a2a_sent_inline_from_a_follow_up_keeps_the_single_hop_bound(
         assert created.status is ToolResultStatus.OK, created.error
 
         agent.process_input = follow_up_turn
-        await runner._tick()
+        await tick_and_settle(runner)
         await _drain(agent)
 
         assert len(outbound) == 1, "the follow-up turn did not send its A2A task"
@@ -255,10 +256,10 @@ async def _persist_read_tool_outputs(agent, feature, runner):
     agent.features = {"SchedulerFeature": feature}
     for name in READ_TOOLS:
         await _schedule_due(feature, name)
-    await runner._tick()
+    await tick_and_settle(runner)
     await _drain(agent)
     await _schedule_due(feature, "schedule_history")
-    await runner._tick()
+    await tick_and_settle(runner)
     await _drain(agent)
 
 
