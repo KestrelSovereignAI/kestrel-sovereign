@@ -147,6 +147,9 @@ def test_allowlist_denies_write_edit_and_mutation_tools():
         # WorkflowsFeature package is absent, so CI enforces it.
         "workflow_await_signal_deadline",
         "workflow_await_signal_delivery",
+        # #3394 — Workflows 0.7's cron-trigger target starts runs of any
+        # registered workflow, a lane around workflow_run's argument scope.
+        "workflow_trigger_cron",
     ):
         assert fo.is_tool_denied(tool)
 
@@ -173,6 +176,10 @@ def test_allowed_dispatch_and_read_tools_are_not_denied():
     # workflow_run is the ONLY dispatch surface — it must be allowed.
     assert fo.is_tool_allowed("workflow_run")
     assert not fo.is_tool_denied("workflow_run")
+    # #3394 — Workflows 0.7's owner-scoped definition/retention reads.
+    for tool in ("workflow_inspect_definition", "workflow_inspect_retention"):
+        assert fo.is_tool_allowed(tool), f"{tool} must be allowed"
+        assert not fo.is_tool_denied(tool)
     # Read tools across the surfaces are allowed (real feature @tool names).
     for tool in (
         "ask_agent",
