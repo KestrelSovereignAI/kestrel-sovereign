@@ -137,7 +137,12 @@ class MemoryFeature(Feature):
         """
         hooks = getattr(agent, "sleep_hooks", None) or []
         if not any(isinstance(hook, ReflectionSleepHook) for hook in hooks):
-            self._register_sleep_hook(agent, ReflectionSleepHook())
+            from kestrel_sovereign.storage.memory_system import _attestation_settings
+
+            settings = _attestation_settings()
+            self._register_sleep_hook(agent, ReflectionSleepHook(
+                backend=settings.backend, decision_model=settings.decision_model,
+            ))
 
     @property
     def memory_system(self):

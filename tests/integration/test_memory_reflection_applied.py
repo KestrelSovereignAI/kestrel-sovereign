@@ -103,6 +103,78 @@ async def test_pre_sleep_marks_only_llm_attested_retrieved_memories(
         assert "reason=It changed the assistant's recommendation." in caplog.text
 
 
+class _FakeDecisionLLM:
+    """``decide`` over the hook's per-memory request."""
+
+    def __init__(self):
+        self.calls = []
+
+    def _current_force_local_only(self):
+        return False
+
+    async def decide(self, request, **kwargs):
+        from types import MappingProxyType
+
+        from kestrel_sdk.llm.decisions import DecisionResult, NoulAnswer
+
+        self.calls.append((request, kwargs))
+        p_true = 0.92 if "load-bearing" in request.state["memory"] else 0.08
+        return DecisionResult(
+            answers=MappingProxyType({"applied": NoulAnswer(p_true=p_true)}),
+            vendor="ollama", route="ollama:local", model="tev1:0.8b",
+            thresholds=MappingProxyType({"applied": 0.5}),
+            calibrated=False, input_tokens=1, duration_ms=3,
+        )
+
+
+@pytest.mark.asyncio
+async def test_decision_backend_attests_each_candidate_on_its_own(tmp_path, caplog):
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        memory_system = MemorySystem(storage, AGENT_ID)
+        await memory_system.initialize()
+
+        await storage.conversation.add_conversation(
+            "assistant",
+            "Remember the user's load-bearing preference for concise plans.",
+        )
+        await storage.conversation.add_conversation(
+            "assistant",
+            "Decorative context that did not steer this session.",
+        )
+        history = await storage.conversation.get_full_history_with_ids()
+        applied_id = history[0]["id"]
+        unused_id = history[1]["id"]
+        retrieved_at = datetime.now(timezone.utc).isoformat()
+        for msg_id in (applied_id, unused_id):
+            await storage.conversation.update_message_metadata(
+                msg_id,
+                {"importance": 0.5, "access_count": 1, "last_accessed": retrieved_at},
+            )
+
+        agent = _Agent(storage, memory_system)
+        agent.llm_service = _FakeDecisionLLM()
+        hook = ReflectionSleepHook(backend="decision")
+
+        caplog.set_level(logging.INFO)
+        result = await hook.on_pre_sleep(agent)
+
+        assert result["success"] is True
+        assert result["candidates"] == 2
+        assert result["attested_message_ids"] == [applied_id]
+        assert len(agent.llm_service.calls) == 2
+        assert {kwargs["caller"] for _, kwargs in agent.llm_service.calls} == {
+            "memory_attestation"}
+
+        history = await storage.conversation.get_full_history_with_ids()
+        applied_meta = _metadata(next(row for row in history if row["id"] == applied_id))
+        unused_meta = _metadata(next(row for row in history if row["id"] == unused_id))
+        assert applied_meta["applied_count"] == 1
+        assert unused_meta.get("applied_count", 0) == 0
+        assert "Decision attestation (ollama:local/tev1:0.8b): p(applied)=0.92." in caplog.text
+        assert "concise plans" not in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_applied_count_changes_archive_set_on_consolidation(tmp_path):
     db_path = tmp_path / "kestrel.db"

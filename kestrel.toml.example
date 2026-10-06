@@ -294,6 +294,20 @@ banned = []
 # uncalibrated = "refuse"    # or "default": uncalibrated models use the 0.5 default
 # [decisions.thresholds."memory_answerability".models."ollama:local/<model>"]
 # "answers" = 0.42
+#
+# Sleep memory attestation (pre-sleep: which retrieved memories actually
+# changed a response; applied memories resist decay archival):
+# memory_attestation_backend = "chat"  # "chat" (generate) or "decision" (decide; #3495), one call per memory
+# memory_attestation_decision_model = "openrouter:api/<model>"  # decision backend only; <vendor>[:<route>][/<model>]
+#
+# The decision backend asks one noul, "applied", per memory over
+# {session, memory} (default threshold 0.5). A false "applied" keeps junk
+# from archiving, so calibrate the models you allow and refuse the rest:
+#   kestrel decisions eval --caller memory_attestation --baseline chat
+# [decisions.thresholds."memory_attestation"]
+# uncalibrated = "refuse"    # with no calibrated local model, a privacy mode fails the stage instead of guessing
+# [decisions.thresholds."memory_attestation".models."openrouter:api/<model>"]
+# "applied" = 0.5
 
 # =============================================================================
 # Backup Retention
