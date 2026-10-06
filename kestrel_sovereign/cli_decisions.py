@@ -189,6 +189,12 @@ async def _eval(service: Any, args: argparse.Namespace) -> int:
             print(f"ERROR: caller {args.caller!r} has no baseline {name!r}", file=sys.stderr)
             return 2
 
+    if args.baseline and not local_only:
+        # Chat baselines go through the service's chat paths, some of which
+        # (the response audit) do not warm model discovery themselves; a fresh
+        # CLI service would otherwise skip every ``model = "auto"`` route.
+        await service.discover_all_models()
+
     reports = []
     for name in args.baseline or ():
         print(f"evaluating baseline {name} on {len(samples)} samples...", file=sys.stderr)

@@ -433,3 +433,33 @@ def test_unavailable_errors_carry_their_rejection_reason() -> None:
                                    "context limit unknown")])
     assert ev._error_label(error) == "DecisionUnavailable(no_fit: context limit unknown)"
     assert ev._error_label(DecisionTransportError("x")) == "DecisionTransportError"
+
+
+@pytest.mark.asyncio
+async def test_cloud_baselines_warm_model_discovery_first(monkeypatch) -> None:
+    calls: List[str] = []
+
+    class _Service(_CliService):
+        async def discover_all_models(self, *a, **k):
+            calls.append("discover")
+            return []
+
+    async def fake_eval(service, selector, samples, **kwargs):
+        return ev.ModelReport(selector, *selector.split("/", 1))
+
+    async def fake_baseline(service, caller, name, samples, **kwargs):
+        calls.append(f"baseline:{name}")
+        return ev.ModelReport(f"baseline:{name}", "baseline", name, baseline=True)
+
+    monkeypatch.setattr(cli_decisions, "evaluate_model", fake_eval)
+    monkeypatch.setattr(cli_decisions, "evaluate_baseline", fake_baseline)
+    args = argparse.Namespace(caller="memory_answerability", samples=None, route=None, model=None,
+                              local_only=False, allow_cloud=False, timeout=5.0, concurrency=1,
+                              target_accuracy=0.9, json=None, baseline=["chat"])
+    assert await cli_decisions._eval(_Service(), args) == 0
+    assert calls[:2] == ["discover", "baseline:chat"]
+
+    calls.clear()
+    args.local_only = True
+    assert await cli_decisions._eval(_Service(), args) == 0
+    assert "discover" not in calls
