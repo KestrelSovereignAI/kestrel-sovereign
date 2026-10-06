@@ -1540,7 +1540,10 @@ class AnthropicAdapter(LLMAdapter):
                 api_params["temperature"] = kwargs["temperature"]
 
             # Native structured output streams the JSON as ordinary text deltas.
-            if response_format is not None and issubclass(response_format, BaseModel):
+            structured = (
+                response_format is not None and issubclass(response_format, BaseModel)
+            )
+            if structured:
                 api_params["output_config"] = _native_structured_output_config(
                     response_format
                 )
@@ -1578,7 +1581,14 @@ class AnthropicAdapter(LLMAdapter):
             last_block_index: Optional[int] = None
             last_block_type: Optional[str] = None
             pending_tool_marker: Optional[ToolCallStarted] = None
-            splitter = ThinkingContentSplitter(provider="anthropic")
+            # #3492: structured text is the JSON document itself, and a string
+            # field in it may quote a literal ``<think>``. The model's own
+            # reasoning arrives as thinking deltas, so that text is passed
+            # through verbatim rather than split on tags.
+            splitter = (
+                None if structured
+                else ThinkingContentSplitter(provider="anthropic")
+            )
 
             async with _anthropic_stream_with_retry(client, api_params) as stream:
                 stream_iter = stream.__aiter__()
@@ -1693,7 +1703,11 @@ class AnthropicAdapter(LLMAdapter):
                                 text = getattr(delta, 'text', '')
                                 if text:
                                     chunk_count += 1
-                                    for item in splitter.feed(text):
+                                    items = (
+                                        [text] if splitter is None
+                                        else splitter.feed(text)
+                                    )
+                                    for item in items:
                                         if isinstance(item, str):
                                             text_content += item
                                         yield item
@@ -1718,7 +1732,7 @@ class AnthropicAdapter(LLMAdapter):
                         current_tool_block_index = None
 
             logger.info(f"Stream completed. Text chunks: {chunk_count}, Tool calls: {len(tool_calls_accumulator)}")
-            for item in splitter.flush():
+            for item in (splitter.flush() if splitter is not None else ()):
                 if isinstance(item, str):
                     text_content += item
                 yield item

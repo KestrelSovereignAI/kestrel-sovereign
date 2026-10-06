@@ -21,7 +21,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from kestrel_sdk.llm import StructuredOutputMode
-from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.claude_max_adapter import ClaudeMaxAdapter
 from tests.utils.anthropic_client import (
@@ -148,24 +148,9 @@ def _event(event_type: str, **fields: Any) -> SimpleNamespace:
     return SimpleNamespace(type=event_type, **fields)
 
 
-def test_streaming_structured_output_streams_the_json_exactly_once():
-    """Native output streams the JSON as ordinary text deltas. The old
-    forced-tool path re-yielded the assembled tool arguments at the end; that
-    must not happen now or the JSON would be shown twice."""
-    events = [
-        _event("message_start", message=SimpleNamespace(
-            usage=SimpleNamespace(input_tokens=7),
-        )),
-        _event("content_block_start", index=0,
-               content_block=SimpleNamespace(type="text")),
-        _event("content_block_delta", index=0,
-               delta=SimpleNamespace(type="text_delta", text='{"risk_level": 1, ')),
-        _event("content_block_delta", index=0,
-               delta=SimpleNamespace(type="text_delta", text='"reasoning": "ok"}')),
-        _event("content_block_stop", index=0),
-        _event("message_delta", usage=SimpleNamespace(output_tokens=9),
-               delta=SimpleNamespace(stop_reason="end_turn")),
-    ]
+def _stream_items(events: List[Any], **request: Any) -> tuple[List[Any], dict]:
+    """Run ``get_streaming_response_with_tools`` over ``events``; return what
+    it yielded and the request it sent."""
     messages = MagicMock()
     messages.stream = MagicMock(return_value=_EventStream(events))
     client = SimpleNamespace(messages=messages, models=models_api())
@@ -178,13 +163,47 @@ def test_streaming_structured_output_streams_the_json_exactly_once():
                 model="claude-opus-5-5",
                 messages=USER,
                 tools=TOOLS,
-                response_format=Verdict,
+                **request,
             )
         ]
 
     items = asyncio.run(_run())
+    return items, messages.stream.call_args.kwargs
 
-    sent = messages.stream.call_args.kwargs
+
+def _text_stream(*deltas: Any) -> List[Any]:
+    """A one-text-block message: ``str`` deltas are text, ``ThinkingDelta``
+    deltas are the model's own thinking."""
+    events: List[Any] = [
+        _event("message_start", message=SimpleNamespace(
+            usage=SimpleNamespace(input_tokens=7),
+        )),
+        _event("content_block_start", index=0,
+               content_block=SimpleNamespace(type="text")),
+    ]
+    for delta in deltas:
+        if isinstance(delta, ThinkingDelta):
+            fields = SimpleNamespace(type="thinking_delta", thinking=delta.content)
+        else:
+            fields = SimpleNamespace(type="text_delta", text=delta)
+        events.append(_event("content_block_delta", index=0, delta=fields))
+    events += [
+        _event("content_block_stop", index=0),
+        _event("message_delta", usage=SimpleNamespace(output_tokens=9),
+               delta=SimpleNamespace(stop_reason="end_turn")),
+    ]
+    return events
+
+
+def test_streaming_structured_output_streams_the_json_exactly_once():
+    """Native output streams the JSON as ordinary text deltas. The old
+    forced-tool path re-yielded the assembled tool arguments at the end; that
+    must not happen now or the JSON would be shown twice."""
+    items, sent = _stream_items(
+        _text_stream('{"risk_level": 1, ', '"reasoning": "ok"}'),
+        response_format=Verdict,
+    )
+
     assert "tool_choice" not in sent
     assert "tools" not in sent
     assert sent["output_config"]["format"]["type"] == "json_schema"
@@ -194,3 +213,84 @@ def test_streaming_structured_output_streams_the_json_exactly_once():
     assert len(finals) == 1
     assert finals[0].content == expected
     assert finals[0].tool_calls is None
+
+
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        pytest.param(
+            ('{"risk_level": 1, "reasoning": "', "<thi",
+             'nk>literal documentation', '"}'),
+            id="unpaired-tag-split-across-deltas",
+        ),
+        pytest.param(
+            ('{"risk_level": 1, "reasoning": "quotes <think>a', ' plan</think> ',
+             'verbatim"}'),
+            id="paired-tags",
+        ),
+    ],
+)
+def test_streaming_structured_output_keeps_think_tags_inside_the_json(deltas):
+    """A verdict's string field may quote a response containing ``<think>``.
+    Structured text is the JSON document, not prose with inline reasoning, so
+    the tags must not be split out of it: an unpaired tag would cut the
+    document short, a paired one would silently erase part of the field."""
+    items, _ = _stream_items(_text_stream(*deltas), response_format=Verdict)
+
+    expected = "".join(deltas)
+    assert not [i for i in items if isinstance(i, ThinkingDelta)]
+    assert "".join(i for i in items if isinstance(i, str)) == expected
+    finals = [i for i in items if isinstance(i, LLMResponse)]
+    assert finals[0].content == expected
+    verdict = Verdict.model_validate_json(finals[0].content)
+    assert "<think>" in verdict.reasoning
+
+
+def test_streaming_structured_output_still_surfaces_native_thinking():
+    """The model's reasoning arrives as thinking deltas, so passing structured
+    text through verbatim loses none of it."""
+    items, _ = _stream_items(
+        _text_stream(
+            ThinkingDelta("weighing the claim"),
+            '{"risk_level": 1, "reasoning": "ok"}',
+        ),
+        response_format=Verdict,
+    )
+
+    thinking = [i for i in items if isinstance(i, ThinkingDelta)]
+    assert [t.content for t in thinking] == ["weighing the claim"]
+    assert "".join(i for i in items if isinstance(i, str)) == (
+        '{"risk_level": 1, "reasoning": "ok"}'
+    )
+
+
+def test_unstructured_tool_stream_still_splits_think_tags():
+    """Only structured output is passed through verbatim; an ordinary stream
+    keeps splitting inline ``<think>`` reasoning out of the visible text."""
+    items, sent = _stream_items(
+        _text_stream("<think>private</think>", "visible"),
+    )
+
+    assert "output_config" not in sent
+    thinking = [i for i in items if isinstance(i, ThinkingDelta)]
+    assert [t.content for t in thinking] == ["private"]
+    assert "".join(i for i in items if isinstance(i, str)) == "visible"
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_structured_output_keeps_think_tags_inside_the_json():
+    payload = {"risk_level": 1, "reasoning": "quotes <think>a plan</think> and <think>"}
+    client = anthropic_client(_message([
+        SimpleNamespace(type="thinking", thinking="weighing the claim"),
+        _text(json.dumps(payload)),
+    ]))
+
+    response = await AnthropicAdapter().get_response(
+        client=client,
+        model="claude-sonnet-5-5",
+        messages=USER,
+        response_format=Verdict,
+    )
+
+    assert response.content == json.dumps(payload)
+    assert Verdict.model_validate_json(response.content).model_dump() == payload
