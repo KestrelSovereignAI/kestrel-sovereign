@@ -224,6 +224,11 @@ WORKFLOW_TOOLS = frozenset(
         "workflow_list_definitions",
         "workflow_list_builtin",
         "workflow_load_builtin",
+        # kestrel-feature-workflows 0.7 (#3394): owner-scoped reads of one
+        # definition (with its trigger health) and of the runs retained
+        # because their exact definition is absent.
+        "workflow_inspect_definition",
+        "workflow_inspect_retention",
     }
 )
 
@@ -356,6 +361,14 @@ WORKFLOW_MUTATION_TOOLS = frozenset(
         # still completes — on the recovery cadence.
         "workflow_await_signal_deadline",
         "workflow_await_signal_delivery",
+        # kestrel-feature-workflows 0.7 (#3394): the Scheduler's target for a
+        # cron-triggered definition. It STARTS a run of whichever workflow the
+        # registration names, so it is a second dispatch lane around
+        # workflow_run's fleet_coding_pipeline-only argument restriction
+        # (a cron-triggered builtin is one workflow_load_builtin away). Denied
+        # for the reason send_a2a_task is; a cron registration on this agent
+        # then fails at fire time rather than launching unscoped work.
+        "workflow_trigger_cron",
     }
 )
 
