@@ -62,6 +62,9 @@ SAMPLE_ADAPTERS: Mapping[str, str] = {
     "memory_answerability": (
         "kestrel_sovereign.storage.memory_answerability:answerability_eval_sample"
     ),
+    "memory_attestation": (
+        "kestrel_sovereign.features.memory.reflection_hook:attestation_eval_sample"
+    ),
     "response_audit": (
         "kestrel_sovereign.features.response_audit.decision_audit:response_audit_eval_sample"
     ),
@@ -73,6 +76,9 @@ SAMPLE_ADAPTERS: Mapping[str, str] = {
 BASELINES: Mapping[str, Mapping[str, str]] = {
     "memory_answerability": {
         "chat": "kestrel_sovereign.storage.memory_answerability:answerability_chat_baseline",
+    },
+    "memory_attestation": {
+        "chat": "kestrel_sovereign.features.memory.reflection_hook:attestation_chat_baseline",
     },
     "response_audit": {
         "chat": (

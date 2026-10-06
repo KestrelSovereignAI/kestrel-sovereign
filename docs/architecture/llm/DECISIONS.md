@@ -481,6 +481,12 @@ Slices are tracked on #3424. Each one lands with tests that fail without it.
    - **Failure.** Any `DecisionError` is an un-run audit (`audited=False`), which strict mode already denies. `decide` applies the live privacy provider; the chat audit does not (#3491).
    - **Eval.** `kestrel decisions eval --caller response_audit --baseline chat`. The chat baseline refuses local-only runs, because the chat audit cannot be confined to local routes.
 6. Reflection capture pre-gate, and batched sleep attestation.
+   - **6a: sleep attestation (#3495).** An opt-in backend, `[retrieval] memory_attestation_backend = "chat" | "decision"`, default `"chat"`. The pre-sleep reflection hook decides which retrieved memories materially changed a response, and `mark_applied` protects those memories from decay archival.
+     - **Request.** The chat backend makes one `generate` call per memory. The decision backend makes one `decide` call per sleep, with one `noul` per memory over a state of `{session, memories}`. Every question shares the threshold key `applied`, with the caller default 0.5. `attestation_decision_request` builds the request for both the hook and its eval adapter.
+     - **Failure costs.** Errors are asymmetric. A false "applied" keeps a junk memory alive, while a false "not applied" only lets normal decay run. Operators should calibrate and set `uncalibrated = "refuse"`. A privacy mode with no calibrated local model then fails the stage instead of guessing. On the shipped synthetic set, `tev1:0.8b` marks nearly every memory applied (accuracy 0.37), which is exactly the failure that `refuse` prevents.
+     - **Privacy.** The decision backend passes the live privacy state as `local_only`; `decide` also ORs it in itself (§6). The chat backend previously sent memories to whichever chat route ranked first, even in a privacy mode. It now passes `force_local_only` from the same live state (#3497).
+     - **Failure.** Any `DecisionError` fails the stage (`attestation_failed`, with the error type) and marks nothing, the same as a chat-call failure.
+   - **6b: reflection capture pre-gate.** This lives in `kestrel-feature-reflection`. Core must not import features, so the feature registers its eval adapter through an entry point.
 7. Per-heuristic migrations, each with labelled samples: tagger, schema router, continuation intent, turn classifier, injection scoring, and GitHub-app should-respond.
 8. Images in state.
 9. Decision-driven model routing, after the per-turn routing freeze.

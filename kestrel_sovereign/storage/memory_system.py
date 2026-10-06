@@ -115,6 +115,47 @@ class AnswerabilitySettings:
 
 
 ANSWERABILITY_BACKENDS = ("chat", "decision")
+DECISION_BACKENDS = ANSWERABILITY_BACKENDS
+
+
+def _decision_backend_setting(
+    config: Dict[str, Any],
+    *,
+    backend_key: str,
+    decision_model_key: str,
+    chat_model_key: Optional[str] = None,
+) -> tuple[str, Optional[str]]:
+    """Validate one ``<x>_backend`` / ``<x>_decision_model`` pair in ``[retrieval]``.
+
+    Shared by every retrieval caller that can run on ``chat`` or ``decision``
+    (#3424). A decision model only means something to the decision backend,
+    and a chat model only to the chat backend: setting the other backend's key
+    is an error naming the right key, never a value read under the wrong
+    selector grammar.
+    """
+    backend = config.get(backend_key, "chat")
+    decision_model = config.get(decision_model_key)
+    if backend not in DECISION_BACKENDS:
+        raise ValueError(f'retrieval.{backend_key} must be "chat" or "decision"')
+    if decision_model is not None:
+        if not isinstance(decision_model, str) or not decision_model.strip():
+            raise ValueError(f"retrieval.{decision_model_key} must be a selector string")
+        try:
+            parse_decision_selector(decision_model)
+        except ValueError as error:
+            raise ValueError(f"retrieval.{decision_model_key}: {error}") from error
+    if backend == "chat" and decision_model is not None:
+        raise ValueError(
+            f"retrieval.{decision_model_key} applies only when "
+            f'{backend_key} = "decision"'
+        )
+    if backend == "decision" and chat_model_key and config.get(chat_model_key) is not None:
+        raise ValueError(
+            f"retrieval.{chat_model_key} is the chat backend's model; "
+            f"with the decision backend use {decision_model_key} "
+            "(<vendor>[:<route>][/<model>])"
+        )
+    return backend, decision_model.strip() if decision_model else None
 
 
 def _answerability_settings() -> AnswerabilitySettings:
@@ -123,8 +164,6 @@ def _answerability_settings() -> AnswerabilitySettings:
     enabled = config.get("memory_answerability_gate", True)
     timeout = config.get("memory_answerability_timeout_seconds", 12.0)
     model = config.get("memory_answerability_model")
-    backend = config.get("memory_answerability_backend", "chat")
-    decision_model = config.get("memory_answerability_decision_model")
     if not isinstance(enabled, bool):
         raise ValueError("retrieval.memory_answerability_gate must be boolean")
     if (
@@ -137,41 +176,38 @@ def _answerability_settings() -> AnswerabilitySettings:
         )
     if model is not None and (not isinstance(model, str) or not model.strip()):
         raise ValueError("retrieval.memory_answerability_model must be a model string")
-    if backend not in ANSWERABILITY_BACKENDS:
-        raise ValueError(
-            'retrieval.memory_answerability_backend must be "chat" or "decision"'
-        )
-    if decision_model is not None:
-        if not isinstance(decision_model, str) or not decision_model.strip():
-            raise ValueError(
-                "retrieval.memory_answerability_decision_model must be a selector string"
-            )
-        try:
-            parse_decision_selector(decision_model)
-        except ValueError as error:
-            raise ValueError(
-                f"retrieval.memory_answerability_decision_model: {error}"
-            ) from error
-    # One model key per backend: a value written for one judge is never read
-    # by the other under a different selector grammar.
-    if backend == "chat" and decision_model is not None:
-        raise ValueError(
-            "retrieval.memory_answerability_decision_model applies only when "
-            'memory_answerability_backend = "decision"'
-        )
-    if backend == "decision" and model is not None:
-        raise ValueError(
-            "retrieval.memory_answerability_model is the chat backend's model; "
-            "with the decision backend use memory_answerability_decision_model "
-            "(<vendor>[:<route>][/<model>])"
-        )
+    backend, decision_model = _decision_backend_setting(
+        config,
+        backend_key="memory_answerability_backend",
+        decision_model_key="memory_answerability_decision_model",
+        chat_model_key="memory_answerability_model",
+    )
     return AnswerabilitySettings(
         enabled=enabled,
         timeout_seconds=float(timeout),
         model=model.strip() if model else None,
         backend=backend,
-        decision_model=decision_model.strip() if decision_model else None,
+        decision_model=decision_model,
     )
+
+
+@dataclass(frozen=True)
+class AttestationSettings:
+    """``[retrieval] memory_attestation_*`` for the pre-sleep application check."""
+
+    backend: str = "chat"
+    decision_model: Optional[str] = None
+
+
+def _attestation_settings() -> AttestationSettings:
+    """Load and validate the sleep-time memory attestation backend (#3495)."""
+    config = load_section("retrieval") or {}
+    backend, decision_model = _decision_backend_setting(
+        config,
+        backend_key="memory_attestation_backend",
+        decision_model_key="memory_attestation_decision_model",
+    )
+    return AttestationSettings(backend=backend, decision_model=decision_model)
 
 
 def _build_answerability_gate(
