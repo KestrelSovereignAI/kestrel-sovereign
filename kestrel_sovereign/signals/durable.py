@@ -5180,8 +5180,16 @@ class DurableSignalStore(UnifiedStoreBase):
         consumer_id: Optional[str] = None,
         statuses: Optional[Iterable[str]] = None,
         limit: int = 100,
+        rebuildable_sources: Optional[Iterable[str]] = None,
     ) -> list[DurableDelivery]:
-        """List observable delivery state within one agent/tenant only."""
+        """List observable delivery state within one agent/tenant only.
+
+        With ``rebuildable_sources``, list only rows whose executable envelope
+        can be rebuilt without the live signal: the row stores its caller, or
+        its source is one an authoritative store rebuilds. A privacy-elided
+        row of any other source stores no caller and can run only from its
+        provider's redelivery (#3392).
+        """
         self._require_nonempty("agent_id", agent_id)
         if limit < 1 or limit > 1000:
             raise ValueError("limit must be between 1 and 1000")
@@ -5190,6 +5198,17 @@ class DurableSignalStore(UnifiedStoreBase):
         if consumer_id is not None:
             where.append("d.consumer_id = ?")
             params.append(consumer_id)
+        if rebuildable_sources is not None:
+            sources = tuple(sorted(set(rebuildable_sources)))
+            if sources:
+                where.append(
+                    "(e.caller_identity IS NOT NULL OR e.source IN ("
+                    + ", ".join("?" for _ in sources)
+                    + "))"
+                )
+                params.extend(sources)
+            else:
+                where.append("e.caller_identity IS NOT NULL")
         if statuses is not None:
             wanted = tuple(statuses)
             valid = (
