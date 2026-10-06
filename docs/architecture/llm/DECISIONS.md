@@ -475,7 +475,11 @@ Slices are tracked on #3424. Each one lands with tests that fail without it.
    - **Privacy.** The gate's injected `force_local_only_provider` becomes `local_only=self._force_local_only()`. Under §6, `decide` ORs that value with the live provider. Today the injected provider *replaces* the live one, so the only possible behaviour change is that the gate becomes stricter.
    - **Model selection.** `memory_answerability_model` keeps its meaning for the chat backend (`generate`'s grammar). `memory_answerability_decision_model` is the decision backend's selector (§5.3). Each key is valid for one backend only: setting the other backend's key is a configuration error naming the right key, so a value is never read under the wrong grammar.
    - **Failure.** Any `DecisionError` becomes `completed=False`, exactly like a chat-judge failure, and the retriever falls back to lexical evidence.
-5. Response audit, as a `score` question.
+5. **Response audit**, as an opt-in backend: `KESTREL_RESPONSE_AUDIT_BACKEND=chat|decision` (default `chat`), with `KESTREL_RESPONSE_AUDIT_DECISION_MODEL` as the decision backend's selector. The variables follow the feature's existing env-var configuration.
+   - **Questions.** Two `noul` questions over `{response}`, not one `score`: `block` (should not be shown) and `concern` (raises some integrity concern). Code composes them into the hook's 1–3 contract: 3 when `block` clears its threshold, else 2 when `concern` does, else 1. Two yes/no questions calibrate directly with the eval harness (Youden's J per key) and map one-to-one onto the two cut-offs the hook actually acts on. A three-level score would need a derived cut-off the harness cannot calibrate.
+   - **Reasoning** is content-free: route, model and the two probabilities. The strict-mode redaction of telemetry and of the audit anchor therefore holds without special cases.
+   - **Failure.** Any `DecisionError` is an un-run audit (`audited=False`), which strict mode already denies. `decide` applies the live privacy provider; the chat audit does not (#3491).
+   - **Eval.** `kestrel decisions eval --caller response_audit --baseline chat`. The chat baseline refuses local-only runs, because the chat audit cannot be confined to local routes.
 6. Reflection capture pre-gate, and batched sleep attestation.
 7. Per-heuristic migrations, each with labelled samples: tagger, schema router, continuation intent, turn classifier, injection scoring, and GitHub-app should-respond.
 8. Images in state.
