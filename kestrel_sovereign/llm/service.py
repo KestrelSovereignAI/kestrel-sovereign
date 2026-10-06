@@ -91,11 +91,15 @@ class EmbeddingSpaceConflictError(Exception):
     """
 
 
+#: The provider ``stop_reason`` for a model that declined to answer.
+_REFUSAL_STOP_REASON = "refusal"
+
+
 class AuditResult(BaseModel):
     """Structured result of a response-integrity audit.
 
     Requested via ``response_format`` so structured output is honored across
-    adapters (Anthropic via its tool pattern, OpenAI natively) rather than the
+    adapters (natively on both Anthropic and OpenAI) rather than the
     OpenAI-style ``format="json"`` string the Anthropic adapter ignores (#2032).
     """
 
@@ -4351,6 +4355,52 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 return response.content or ""
             return response
 
+    @handle_llm_errors()
+    async def _audit_single_provider(
+        self,
+        provider: Dict[str, Any],
+        model: str,
+        messages: List[Dict[str, Any]],
+        *,
+        system_prompt: str,
+        text_to_audit: str,
+        invocation_context: LLMInvocationContext,
+        provider_name: str,
+    ) -> Union[str, LLMResponse]:
+        """One audit attempt on one route.
+
+        Wrapped in the same ``handle_llm_errors`` classification as
+        ``_try_single_provider``, so a route's own failure — including a request
+        the provider rejects, such as Anthropic's 400 for a ``tool_choice`` the
+        model does not support — reaches the audit loop as ``LLMProviderError``
+        and the next eligible route is tried (#3492). Without it, an SDK
+        exception outside the loop's caught set escaped to the outer handler
+        and failed the whole audit at risk 3 without trying another route.
+
+        Structured output comes from a Pydantic ``response_format``, which every
+        structured-capable adapter honors. The OpenAI-style ``format="json"``
+        string is ignored by the Anthropic adapter, which made every audit
+        return malformed JSON (#2032).
+        """
+        return await self._run_provider_attempt(
+            provider["adapter"].get_response(
+                client=provider["client"],
+                model=model,
+                messages=messages,
+                response_format=AuditResult,
+            ),
+            provider_name,
+            model,
+            path="get_audit_response",
+            invocation_context=invocation_context,
+            system_prompt=system_prompt,
+            user_prompt=text_to_audit,
+            response_format=AuditResult,
+            # An internal audit must not replace the visible assistant
+            # response identity used by persistence.
+            publish_identity=False,
+        )
+
     async def get_audit_response(
         self,
         text_to_audit: str,
@@ -4438,7 +4488,23 @@ No other text or formatting.
 
         try:
             errors = {}
+            # Routes actually called. A route skipped below as ineligible never
+            # failed, so it is not a preferred route a paid one would replace.
+            attempted_routes: List[Dict[str, Any]] = []
             for provider in available_providers:
+                # A failed route now falls through to the next one (#3492), so
+                # the audit must refuse the same silent plan->paid downgrade
+                # generation refuses.
+                if self._skip_paid_fallback(provider, attempted_routes, len(attempted_routes)):
+                    errors[provider["name"]] = (
+                        "skipped: refusing silent plan->paid downgrade "
+                        "(llm.allow_paid_fallback=false)"
+                    )
+                    logger.warning(
+                        "Audit: refusing silent plan->paid downgrade to %s",
+                        provider["name"],
+                    )
+                    continue
                 logger.info(f"Auditing with provider: {provider['name']}")
                 # The audit keeps this guard UNCONDITIONALLY, unlike the
                 # generation path which skips it for an explicit selection
@@ -4515,30 +4581,31 @@ No other text or formatting.
                     system_prompt=system_prompt,
                 )
 
+                attempted_routes.append(provider)
                 try:
-                    # Request structured output via a Pydantic response_format so
-                    # the audit JSON is honored across adapters (Anthropic via its
-                    # tool pattern, OpenAI natively). The OpenAI-style format="json"
-                    # string is silently ignored by the Anthropic adapter, which
-                    # made every audit return malformed JSON → risk_level=3 (#2032).
-                    response = await self._run_provider_attempt(
-                        provider["adapter"].get_response(
-                            client=provider["client"],
-                            model=effective_model,
-                            messages=messages,
-                            response_format=AuditResult,
-                        ),
-                        provider["name"],
+                    response = await self._audit_single_provider(
+                        provider,
                         effective_model,
-                        path="get_audit_response",
-                        invocation_context=invocation_context,
+                        messages,
                         system_prompt=system_prompt,
-                        user_prompt=text_to_audit,
-                        response_format=AuditResult,
-                        # An internal audit must not replace the visible
-                        # assistant response identity used by persistence.
-                        publish_identity=False,
+                        text_to_audit=text_to_audit,
+                        invocation_context=invocation_context,
+                        provider_name=provider["name"],
                     )
+                    if response_stop_reason(response) == _REFUSAL_STOP_REASON:
+                        # The audit model declined to evaluate the text (live
+                        # on Opus/Sonnet 5.5 for harmful samples). Its partial
+                        # output is no verdict; name the refusal rather than
+                        # reporting it as unparseable JSON.
+                        errors[provider["name"]] = (
+                            "audit model refused to evaluate the response "
+                            "(stop_reason=refusal)"
+                        )
+                        logger.warning(
+                            "Audit provider %s refused to evaluate the response",
+                            provider["name"],
+                        )
+                        continue
                     content = response.content if isinstance(response, LLMResponse) else response
                     response_json = json.loads(content)
                     if "risk_level" not in response_json or "reasoning" not in response_json:

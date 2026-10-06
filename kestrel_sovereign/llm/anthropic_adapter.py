@@ -196,6 +196,74 @@ def _ensure_anthropic_beta_header(api_params: Dict[str, Any], beta: str) -> None
     api_params["extra_headers"] = headers
 
 
+def _native_structured_output_config(
+    response_format: Type[BaseModel],
+) -> Dict[str, Any]:
+    """The ``output_config`` asking Anthropic for ``response_format`` (#3492).
+
+    Native structured output constrains the response text itself to the JSON
+    schema. It replaces a synthetic tool forced with ``tool_choice``, which
+    current models refuse: Claude Opus 5.5 and Sonnet 5.5 reject ``tool_choice``
+    type "tool" and "any" outright, and do not allow thinking to be disabled to
+    make room for it. Native output is accepted by every model in the live
+    catalog, with or without thinking.
+
+    ``transform_schema`` is the SDK's own conversion: it closes every object
+    (``additionalProperties: false``, which the API requires) and moves the
+    constraints the API does not enforce into the field description. Closing
+    an open object (a map field) would leave the model room only for ``{}``,
+    so such a schema is refused rather than sent.
+    """
+    from anthropic import transform_schema
+
+    schema = response_format.model_json_schema()
+    open_path = _open_object_path(schema)
+    if open_path is not None:
+        raise TypeError(
+            f"{response_format.__name__} field {open_path!r} is an open object "
+            "(additionalProperties or patternProperties). Anthropic native "
+            "structured output closes every object, so it could only return "
+            "{} for that field; declare its keys as model fields."
+        )
+    return {
+        "format": {
+            "type": "json_schema",
+            "schema": transform_schema(schema),
+        }
+    }
+
+
+def _open_object_path(schema: Dict[str, Any], path: str = "") -> Optional[str]:
+    """The path of the first object in ``schema`` that accepts undeclared keys.
+
+    Walks the keywords ``transform_schema`` descends into (``properties``,
+    ``anyOf``/``oneOf``/``allOf``, ``items``, ``$defs``), which are the places
+    it closes an object. Returns None when every object is closed or declares
+    only named properties.
+    """
+    if (
+        schema.get("additionalProperties", False) is not False
+        or "patternProperties" in schema
+    ):
+        return path or "<root>"
+    children = [
+        (f"{path}.{name}" if path else name, sub)
+        for name, sub in schema.get("properties", {}).items()
+    ]
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        children.extend((path, sub) for sub in schema.get(keyword) or ())
+    if isinstance(schema.get("items"), dict):
+        children.append((f"{path}[]", schema["items"]))
+    children.extend(
+        (f"$defs.{name}", sub) for name, sub in schema.get("$defs", {}).items()
+    )
+    for child_path, child in children:
+        found = _open_object_path(child, child_path)
+        if found is not None:
+            return found
+    return None
+
+
 def _attach_cache_control(block: Dict[str, Any]) -> Dict[str, Any]:
     """Return a copy of `block` with ``cache_control: {"type":"ephemeral"}``
     attached.  Input blocks are not mutated so callers passing shared
@@ -522,7 +590,7 @@ class AnthropicAdapter(LLMAdapter):
             "supports_prompt_cache": True,
             "supports_token_counting": platform,
             "supports_raw_passthrough": platform,
-            "structured_output_mode": StructuredOutputMode.TOOL_FORCED,
+            "structured_output_mode": StructuredOutputMode.JSON_SCHEMA,
             "tool_streaming_mode": ToolStreamingMode.NATIVE_DELTA,
             "vision_input_mode": VisionInputMode.ANTHROPIC_CONTENT_BLOCK,
             "prompt_cache_mode": PromptCacheMode.EXPLICIT_BREAKPOINTS,
@@ -535,7 +603,8 @@ class AnthropicAdapter(LLMAdapter):
             ),
             "model_dependent": ("supports_inline_system",),
             "notes": (
-                "Structured output is implemented by forcing a synthetic Anthropic tool.",
+                "Structured output uses Anthropic's native output_config JSON schema; "
+                "open-map fields (additionalProperties, patternProperties) are refused.",
                 "Streaming with response_format falls back to non-streaming structured generation.",
                 "Mid-conversation system messages are route- and model-gated to Opus 4.8+.",
                 "Prompt caching uses cache_control breakpoints (max 4), applied automatically.",
@@ -1211,21 +1280,10 @@ class AnthropicAdapter(LLMAdapter):
             if "temperature" in kwargs:
                 api_params["temperature"] = kwargs["temperature"]
 
-            # Handle structured output via tool_use pattern
-            # Anthropic recommends using tools to get structured output
-            structured_output_tool_name = None
             if response_format is not None and issubclass(response_format, BaseModel):
-                structured_output_tool_name = f"output_{response_format.__name__}"
-                schema = response_format.model_json_schema()
-                structured_tool = {
-                    "name": structured_output_tool_name,
-                    "description": f"Output structured response as {response_format.__name__}",
-                    "input_schema": schema
-                }
-                # Add the structured output tool
-                api_params["tools"] = [structured_tool]
-                # Force the model to use this tool
-                api_params["tool_choice"] = {"type": "tool", "name": structured_output_tool_name}
+                api_params["output_config"] = _native_structured_output_config(
+                    response_format
+                )
             elif tools:
                 # Convert and add tools
                 api_params["tools"] = self._convert_tools_to_anthropic_format(tools)
@@ -1285,18 +1343,13 @@ class AnthropicAdapter(LLMAdapter):
                 if block.type == "text":
                     content = block.text
                 elif block.type == "tool_use":
-                    # If this is our structured output tool, extract as JSON content
-                    if structured_output_tool_name and block.name == structured_output_tool_name:
-                        # Return the structured output as JSON string content
-                        content = json.dumps(block.input) if isinstance(block.input, dict) else str(block.input)
-                    else:
-                        if parsed_tool_calls is None:
-                            parsed_tool_calls = []
-                        parsed_tool_calls.append(ToolCall(
-                            id=block.id,
-                            name=block.name,
-                            arguments=block.input if isinstance(block.input, dict) else {}
-                        ))
+                    if parsed_tool_calls is None:
+                        parsed_tool_calls = []
+                    parsed_tool_calls.append(ToolCall(
+                        id=block.id,
+                        name=block.name,
+                        arguments=block.input if isinstance(block.input, dict) else {}
+                    ))
 
             # Extract token usage from response
             input_tokens = None
@@ -1390,8 +1443,9 @@ class AnthropicAdapter(LLMAdapter):
             if tools:
                 api_params["tools"] = self._convert_tools_to_anthropic_format(tools)
 
-            # Note: response_format not implemented for streaming as it requires
-            # tool_use which doesn't work well with streaming text output
+            # Note: response_format is not applied on this text-only stream;
+            # structured output goes through get_response or
+            # get_streaming_response_with_tools.
 
             # Attach cache_control markers — see issue #705 and _apply_cache_control.
             api_params = self._apply_cache_control(api_params)
@@ -1486,7 +1540,7 @@ class AnthropicAdapter(LLMAdapter):
             model: Model name (e.g., 'claude-sonnet-4-6')
             messages: Chat messages
             tools: Optional tools in OpenAI format (will be converted)
-            response_format: Optional Pydantic model (handled via tool pattern)
+            response_format: Optional Pydantic model (native JSON-schema output)
             system_prompt: System prompt
             **kwargs: Additional parameters
 
@@ -1528,18 +1582,14 @@ class AnthropicAdapter(LLMAdapter):
             if "temperature" in kwargs:
                 api_params["temperature"] = kwargs["temperature"]
 
-            # Handle structured output via tool_use pattern
-            structured_output_tool_name = None
-            if response_format is not None and issubclass(response_format, BaseModel):
-                structured_output_tool_name = f"output_{response_format.__name__}"
-                schema = response_format.model_json_schema()
-                structured_tool = {
-                    "name": structured_output_tool_name,
-                    "description": f"Output structured response as {response_format.__name__}",
-                    "input_schema": schema
-                }
-                api_params["tools"] = [structured_tool]
-                api_params["tool_choice"] = {"type": "tool", "name": structured_output_tool_name}
+            # Native structured output streams the JSON as ordinary text deltas.
+            structured = (
+                response_format is not None and issubclass(response_format, BaseModel)
+            )
+            if structured:
+                api_params["output_config"] = _native_structured_output_config(
+                    response_format
+                )
             elif tools:
                 api_params["tools"] = self._convert_tools_to_anthropic_format(tools)
 
@@ -1574,7 +1624,14 @@ class AnthropicAdapter(LLMAdapter):
             last_block_index: Optional[int] = None
             last_block_type: Optional[str] = None
             pending_tool_marker: Optional[ToolCallStarted] = None
-            splitter = ThinkingContentSplitter(provider="anthropic")
+            # #3492: structured text is the JSON document itself, and a string
+            # field in it may quote a literal ``<think>``. The model's own
+            # reasoning arrives as thinking deltas, so that text is passed
+            # through verbatim rather than split on tags.
+            splitter = (
+                None if structured
+                else ThinkingContentSplitter(provider="anthropic")
+            )
 
             async with _anthropic_stream_with_retry(client, api_params) as stream:
                 stream_iter = stream.__aiter__()
@@ -1661,11 +1718,7 @@ class AnthropicAdapter(LLMAdapter):
                                 # in the marker — the constitutional honesty
                                 # layer (#1042 layer 2 / #1045) reads this
                                 # as the deterministic "stop yielding pre-tool
-                                # prose" signal. The structured-output tool
-                                # path emits a marker too; consumers that
-                                # care about user-visible tool calls only
-                                # can filter by name (the framework knows
-                                # the structured-output sentinel name).
+                                # prose" signal.
                                 #
                                 # #3300: held until the block is known to be
                                 # whole — the next block starting, or the
@@ -1693,7 +1746,11 @@ class AnthropicAdapter(LLMAdapter):
                                 text = getattr(delta, 'text', '')
                                 if text:
                                     chunk_count += 1
-                                    for item in splitter.feed(text):
+                                    items = (
+                                        [text] if splitter is None
+                                        else splitter.feed(text)
+                                    )
+                                    for item in items:
                                         if isinstance(item, str):
                                             text_content += item
                                         yield item
@@ -1718,7 +1775,7 @@ class AnthropicAdapter(LLMAdapter):
                         current_tool_block_index = None
 
             logger.info(f"Stream completed. Text chunks: {chunk_count}, Tool calls: {len(tool_calls_accumulator)}")
-            for item in splitter.flush():
+            for item in (splitter.flush() if splitter is not None else ()):
                 if isinstance(item, str):
                     text_content += item
                 yield item
@@ -1753,13 +1810,6 @@ class AnthropicAdapter(LLMAdapter):
                 parsed_tool_calls = []
                 for idx in sorted(tool_calls_accumulator.keys()):
                     tc_data = tool_calls_accumulator[idx]
-
-                    # If this is our structured output tool, handle it specially
-                    if structured_output_tool_name and tc_data["name"] == structured_output_tool_name:
-                        # Return the structured output as text content instead of tool call
-                        text_content = tc_data["arguments"]
-                        continue
-
                     try:
                         args = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
                     except json.JSONDecodeError:
@@ -1777,18 +1827,11 @@ class AnthropicAdapter(LLMAdapter):
                         name=tc_data["name"],
                         arguments=args
                     ))
-                # A structured-output-only turn assembles no real tool calls.
-                parsed_tool_calls = parsed_tool_calls or None
 
             # Calculate total tokens
             total_tokens = None
             if input_tokens is not None and output_tokens is not None:
                 total_tokens = input_tokens + output_tokens
-
-            # Structured output: surface the assembled JSON as final text
-            # (text was streamed as a tool-arg JSON, not content chunks).
-            if structured_output_tool_name and text_content and not parsed_tool_calls:
-                yield text_content
 
             # #3300: the text has already streamed, so a cut at the model's
             # own ceiling is marked by a final chunk — and carried on the

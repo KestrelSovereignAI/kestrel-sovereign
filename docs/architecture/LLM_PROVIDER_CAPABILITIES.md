@@ -56,7 +56,7 @@ Current high-level matrix:
 | --- | --- | --- | --- | --- | --- |
 | OpenAI | yes | yes | model-dependent | `json_schema` | Native OpenAI request shapes. |
 | OpenRouter | model-dependent | yes | model-dependent | model-dependent `json_schema` | Upstream model support is authoritative. |
-| Anthropic / Claude Max | yes | yes | yes | `tool_forced` | Structured output uses a synthetic forced tool. |
+| Anthropic / Claude Max | yes | yes | yes | `json_schema` | Native `output_config` structured output; Opus/Sonnet 5.5 refuse a forced `tool_choice` (#3492). |
 | Google Gemini direct | yes | yes | yes | no | `response_format` is not wired into this adapter yet. |
 | Vertex AI | model-dependent | yes | model-dependent | model-dependent `provider_native` | Uses Gemini/Vertex `response_schema`. |
 | Ollama | model-dependent | yes | model-dependent | model-dependent `schema_format` | Depends on local model capabilities. |

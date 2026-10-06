@@ -1259,7 +1259,7 @@ def test_in_tree_adapter_capability_matrix():
             False,
             None,
             None,
-            StructuredOutputMode.TOOL_FORCED,
+            StructuredOutputMode.JSON_SCHEMA,
             ToolStreamingMode.NATIVE_DELTA,
             VisionInputMode.ANTHROPIC_CONTENT_BLOCK,
         ),

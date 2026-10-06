@@ -227,7 +227,9 @@ dependencies = [
     # >=5.9.0 fixes an uncontrolled-recursion DoS on malformed input.
     "cbor2>=5.9.0",
     # LLM provider SDKs (used at runtime via dynamic import)
-    "anthropic>=0.75.0",
+    # >=0.77: GA structured outputs (`output_config`), which the Anthropic
+    # adapter uses for every response_format request (#3492).
+    "anthropic>=0.77.0",
     "google-generativeai>=0.8.6",
     "google-cloud-storage>=3.4.1",
     # Floor at 1.0: 0.x used ml_dsa_65.generate_keypair() and a verify()

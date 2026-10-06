@@ -75,7 +75,7 @@ _FEATURE_STREAMING_STRUCTURED_OUTPUT = "streaming_structured_output"
 _FEATURE_TOOL_STREAM_SYSTEM_PROMPT = "tool_stream_system_prompt"
 
 # Structured-output modes that can be produced while streaming. ``TOOL_FORCED``
-# (Anthropic) cannot — it assembles the object from a buffered tool call — and
+# cannot — it assembles the object from a buffered tool call — and
 # ``NONE``/``UNKNOWN`` carry no streamable guarantee.
 _STREAMABLE_STRUCTURED_MODES = frozenset(
     {
@@ -1234,9 +1234,8 @@ class StreamingMixin:
 
                 # For structured output, only routes whose typed capabilities
                 # advertise a streamable structured-output mode (and opt in via
-                # contract_features) can stream a response_format. Anthropic's
-                # TOOL_FORCED mode buffers a tool call, so it stays on the
-                # non-streaming fallback below.
+                # contract_features) can stream a response_format. Every other
+                # route stays on the non-streaming fallback below.
                 supports_streaming_structured = _route_supports_streaming_structured(provider)
 
                 # Use streaming if supported (or no structured output requested)
