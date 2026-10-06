@@ -62,6 +62,9 @@ SAMPLE_ADAPTERS: Mapping[str, str] = {
     "memory_answerability": (
         "kestrel_sovereign.storage.memory_answerability:answerability_eval_sample"
     ),
+    "response_audit": (
+        "kestrel_sovereign.features.response_audit.decision_audit:response_audit_eval_sample"
+    ),
 }
 
 #: Caller-owned baselines: caller -> {name: "module:function"}. A baseline is
@@ -70,6 +73,11 @@ SAMPLE_ADAPTERS: Mapping[str, str] = {
 BASELINES: Mapping[str, Mapping[str, str]] = {
     "memory_answerability": {
         "chat": "kestrel_sovereign.storage.memory_answerability:answerability_chat_baseline",
+    },
+    "response_audit": {
+        "chat": (
+            "kestrel_sovereign.features.response_audit.decision_audit:response_audit_chat_baseline"
+        ),
     },
 }
 

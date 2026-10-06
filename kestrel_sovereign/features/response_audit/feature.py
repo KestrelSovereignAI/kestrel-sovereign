@@ -10,6 +10,34 @@ from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
+AUDIT_BACKENDS = ("chat", "decision")
+
+
+def _validate_backend(backend: str, decision_model) -> None:
+    """Refuse an unknown backend or a decision model the selector grammar rejects.
+
+    A decision model only means something to the decision backend; setting it
+    with the chat backend is refused rather than ignored.
+    """
+    if backend not in AUDIT_BACKENDS:
+        raise ValueError(
+            'KESTREL_RESPONSE_AUDIT_BACKEND must be "chat" or "decision" '
+            f"(got {backend!r})"
+        )
+    if decision_model is None:
+        return
+    if backend != "decision":
+        raise ValueError(
+            "KESTREL_RESPONSE_AUDIT_DECISION_MODEL applies only when "
+            'KESTREL_RESPONSE_AUDIT_BACKEND="decision"'
+        )
+    from kestrel_sovereign.llm.decisions.config import parse_decision_selector
+
+    try:
+        parse_decision_selector(decision_model)
+    except ValueError as error:
+        raise ValueError(f"KESTREL_RESPONSE_AUDIT_DECISION_MODEL: {error}") from error
+
 
 class ResponseAuditFeature(Feature):
     """Per-response LLM audit. Disabled by default (mode=skip)."""
@@ -20,6 +48,11 @@ class ResponseAuditFeature(Feature):
         self._mode = os.environ.get("KESTREL_RESPONSE_AUDIT_MODE", "skip")
         self._strategy = os.environ.get("KESTREL_RESPONSE_AUDIT_STRATEGY", "post")
         self._risk_threshold = int(os.environ.get("KESTREL_RESPONSE_AUDIT_RISK_THRESHOLD", "3"))
+        # #3424 slice 5: "chat" (get_audit_response, the default) or
+        # "decision" (one decide call; see decision_audit.py).
+        self._backend = os.environ.get("KESTREL_RESPONSE_AUDIT_BACKEND", "chat")
+        self._decision_model = os.environ.get("KESTREL_RESPONSE_AUDIT_DECISION_MODEL") or None
+        _validate_backend(self._backend, self._decision_model)
 
     @property
     def tool_description(self) -> str:
@@ -40,9 +73,25 @@ class ResponseAuditFeature(Feature):
             mode=mode,
             strategy=self._strategy,
             risk_threshold=self._risk_threshold,
+            auditor=self._decision_auditor() if self._backend == "decision" else None,
         )
         self._mode = mode
-        logger.info(f"ResponseAuditHook created: mode={mode}, strategy={self._strategy}")
+        logger.info(
+            f"ResponseAuditHook created: mode={mode}, strategy={self._strategy}, "
+            f"backend={self._backend}"
+        )
+
+    def _decision_auditor(self):
+        from kestrel_sovereign.features.response_audit.decision_audit import decision_audit
+
+        async def audit(text: str, redact_content: bool) -> dict:
+            # Decision telemetry never records content, so redact_content has
+            # nothing further to withhold on this backend.
+            return await decision_audit(
+                self.agent.llm_service, text, model_override=self._decision_model,
+            )
+
+        return audit
 
     def get_hooks(self) -> List[Hook]:
         """Return the audit hook for auto-registration (if active)."""
@@ -128,6 +177,7 @@ class ResponseAuditFeature(Feature):
         )
         data = {
             "mode": self._mode,
+            "backend": self._backend,
             "strategy": self._strategy,
             "risk_threshold": self._risk_threshold,
             "hook_registered": hook_registered,
@@ -143,6 +193,7 @@ class ResponseAuditFeature(Feature):
         confirmation = (
             "Response Audit Status:\n"
             f"  mode: {self._mode}\n"
+            f"  backend: {self._backend}\n"
             f"  strategy: {self._strategy}\n"
             f"  risk_threshold: {self._risk_threshold}\n"
             f"  hook_registered: {hook_registered}\n"

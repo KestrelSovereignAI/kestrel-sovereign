@@ -1,5 +1,7 @@
 """Response audit hook - evaluates LLM responses for integrity."""
 import logging
+from typing import Any, Awaitable, Callable, Dict, Optional
+
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 from kestrel_sovereign.security.narration_check import (
     analyze_narration,
@@ -21,15 +23,24 @@ class ResponseAuditHook(Hook):
        ToolCallStarted marker boundary by ``agent/streaming.py``).
        Same inputs always yield the same verdict; suitable for
        compliance-gated deployments.
-    2. **LLM audit call** — ``llm_service.get_audit_response`` runs a
-       separate model judgment over the assembled ``response_text``.
+    2. **Model audit call** — the configured auditor judges the assembled
+       ``response_text``: ``llm_service.get_audit_response`` (chat backend,
+       the default) or a ``decide`` call (decision backend, #3424). Both
+       return ``{"risk_level", "reasoning", "audited"}``.
 
     The two signals are additive: a narration violation elevates risk
     even when the LLM audit is unavailable, so the deterministic check
     keeps firing under partial-outage conditions.
     """
 
-    def __init__(self, agent, mode: str = "warn", strategy: str = "post", risk_threshold: int = 3):
+    def __init__(
+        self,
+        agent,
+        mode: str = "warn",
+        strategy: str = "post",
+        risk_threshold: int = 3,
+        auditor: Optional[Callable[[str, bool], Awaitable[Dict[str, Any]]]] = None,
+    ):
         super().__init__(
             name="response_audit",
             events=[HookEvent.POST_RESPONSE],
@@ -43,6 +54,8 @@ class ResponseAuditHook(Hook):
         self.audit_count = 0
         self.last_risk_level = None
         self.last_narration_verdict = None
+        # ``auditor(text, redact_content)``; None means the chat backend.
+        self._auditor = auditor
 
     @property
     def fail_closed(self) -> bool:
@@ -135,9 +148,7 @@ class ResponseAuditHook(Hook):
             # audit provider call — whose ``user_prompt`` IS the withheld prose —
             # must redact its own durable telemetry. ``fail_closed`` is True iff
             # ``mode == "strict"``, so advisory (warn) audits keep full telemetry.
-            audit_result = await self.agent.llm_service.get_audit_response(
-                response_text, redact_content=self.fail_closed,
-            )
+            audit_result = await self._audit(response_text)
         except Exception as e:
             logger.warning(f"Response audit failed: {e}")
             # Even with the LLM audit unavailable, a clean-cut
@@ -210,6 +221,13 @@ class ResponseAuditHook(Hook):
             response_text=response_text,
             risk_level=risk_level,
             reasoning=reasoning,
+        )
+
+    async def _audit(self, response_text: str) -> Dict[str, Any]:
+        if self._auditor is not None:
+            return await self._auditor(response_text, self.fail_closed)
+        return await self.agent.llm_service.get_audit_response(
+            response_text, redact_content=self.fail_closed,
         )
 
     def _apply_audit_decision(
