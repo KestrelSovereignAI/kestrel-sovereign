@@ -1477,11 +1477,7 @@ class SignalDispatcher:
         """Claim and route all currently-due work for one durable consumer."""
 
         while not self._durable_shutdown:
-            candidates = await self.list_durable_deliveries(
-                consumer_id=consumer_id,
-                statuses=[PENDING, RETRY],
-                limit=100,
-            )
+            candidates = await self._drainable_durable_deliveries(consumer_id)
             if candidates and await self._agent_is_held():
                 # Observe Hold before transferring any lease. One bounded
                 # timer per consumer discovers a cross-process Release; the
@@ -1535,13 +1531,7 @@ class SignalDispatcher:
                 )
                 await self._schedule_next_durable_cognition_drain(consumer_id)
                 return
-            seed = Signal(
-                source=delivery.event.source,
-                kind=delivery.event.kind,
-                mode=SignalMode(delivery.event.mode),
-                payload={},
-                target_agent=delivery.event.target_agent,
-            )
+            seed = self._durable_retry_seed(delivery.event)
             # The drainer owns a batch, not any one attempt's Stop lifecycle.
             # Give each recovered delivery its own task so the settlement guard
             # callback runs at that delivery's ACK/NACK boundary before the
@@ -1563,12 +1553,40 @@ class SignalDispatcher:
             )
             await delivery_task
 
-    async def _schedule_next_durable_cognition_drain(self, consumer_id: str) -> None:
-        pending = await self.list_durable_deliveries(
+    async def _drainable_durable_deliveries(
+        self, consumer_id: str, *, limit: int = 100
+    ) -> List[DurableDelivery]:
+        """The oldest PENDING/RETRY rows a drain could execute, up to ``limit``.
+
+        A privacy-elided row stores no caller. Unless the agent declares that
+        its rehydrate hook rebuilds the row's source from an authoritative
+        store, only the provider's redelivery of the live envelope can run it.
+        Claiming it here could only spend an attempt on a caller-recovery
+        failure, once per retry delay, for as long as no redelivery came
+        (#3392). The ledger query leaves such rows out, so they neither crowd
+        executable rows out of the window nor re-arm the drain.
+        """
+
+        return await self.list_durable_deliveries(
             consumer_id=consumer_id,
             statuses=[PENDING, RETRY],
-            limit=1,
+            limit=limit,
+            rebuildable_sources=self._durable_rebuildable_sources(),
         )
+
+    def _durable_rebuildable_sources(self) -> frozenset[str]:
+        """Sources whose caller-less rows the agent's rehydrate hook rebuilds."""
+
+        if not callable(
+            getattr(self._agent, "rehydrate_durable_cognition_signal", None)
+        ):
+            return frozenset()
+        return frozenset(
+            getattr(self._agent, "durable_rehydratable_sources", None) or ()
+        )
+
+    async def _schedule_next_durable_cognition_drain(self, consumer_id: str) -> None:
+        pending = await self._drainable_durable_deliveries(consumer_id, limit=1)
         if not pending:
             return
         next_attempt = pending[0].next_attempt_at
@@ -2386,6 +2404,7 @@ class SignalDispatcher:
         consumer_id: Optional[str] = None,
         statuses: Optional[List[str]] = None,
         limit: int = 100,
+        rebuildable_sources: Optional[frozenset[str]] = None,
     ) -> List[DurableDelivery]:
         """Observe durable delivery state for this agent only."""
         async with self._admit_durable_operation():
@@ -2395,6 +2414,7 @@ class SignalDispatcher:
                 consumer_id=consumer_id,
                 statuses=statuses,
                 limit=limit,
+                rebuildable_sources=rebuildable_sources,
             )
 
     async def purge_expired_durable_deliveries(self) -> int:
@@ -3421,34 +3441,53 @@ class SignalDispatcher:
     ) -> Signal:
         """Recover the executable envelope for one durable retry.
 
-        Privacy-elided rows intentionally contain only a marker. Sources with
-        a separate authoritative store (currently A2A tasks) may rehydrate the
-        envelope through the agent hook; other volatile sources still require
-        provider redelivery and therefore fall through to the normal protected
-        caller recovery failure.
+        Privacy-elided rows intentionally contain only a marker and no caller.
+        Sources with a separate authoritative store (currently A2A tasks) may
+        rehydrate the envelope through the agent hook; other volatile sources
+        still require provider redelivery and therefore fall through to the
+        normal protected caller recovery failure.
         """
 
         if use_live_signal:
             return dispatch_signal
         event = delivery.event
-        if (
-            isinstance(event.payload, dict)
-            and _DURABLE_PRIVACY_GATED_MARKER in event.payload
-        ):
-            rehydrate = getattr(
-                self._agent,
-                "rehydrate_durable_cognition_signal",
-                None,
+        if event.caller_identity is None:
+            # Decide on the stored fact, not the payload: a claim re-attaches
+            # a live payload sidecar, which removes the marker while the row
+            # still holds no caller (#3392).
+            recovered = await self._rehydrate_durable_signal(
+                event, dispatch_signal=dispatch_signal
             )
-            if callable(rehydrate):
-                recovered = rehydrate(event, dispatch_signal=dispatch_signal)
-                if inspect.isawaitable(recovered):
-                    recovered = await recovered
-                if recovered is not None:
-                    return recovered
+            if recovered is not None:
+                return recovered
         return self._signal_from_durable_event(
             event,
             dispatch_signal=dispatch_signal,
+        )
+
+    async def _rehydrate_durable_signal(
+        self, event, *, dispatch_signal: Signal
+    ) -> Optional[Signal]:
+        """Rebuild an envelope the ledger cannot supply from its source's store."""
+
+        rehydrate = getattr(self._agent, "rehydrate_durable_cognition_signal", None)
+        if not callable(rehydrate):
+            return None
+        recovered = rehydrate(event, dispatch_signal=dispatch_signal)
+        if inspect.isawaitable(recovered):
+            recovered = await recovered
+        return recovered
+
+    @staticmethod
+    def _durable_retry_seed(event) -> Signal:
+        """A fresh dispatch identity for one recovered durable retry."""
+
+        return Signal(
+            source=event.source,
+            kind=event.kind,
+            mode=SignalMode(event.mode),
+            payload={},
+            target_agent=event.target_agent,
         )
 
     @asynccontextmanager

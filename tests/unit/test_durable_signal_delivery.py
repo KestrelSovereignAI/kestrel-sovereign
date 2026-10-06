@@ -2450,6 +2450,9 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
         EventManagerMixin.rehydrate_durable_cognition_signal,
         agent_b,
     )
+    agent_b.durable_rehydratable_sources = (
+        EventManagerMixin.durable_rehydratable_sources
+    )
     try:
         await dispatcher_b.register_durable_consumer(consumer)
         await dispatcher_b.start_durable_cognition_consumer(A2A_CONSUMER)
@@ -9576,6 +9579,7 @@ async def test_release_of_expired_first_lease_wakes_an_idle_drainer(
         agent.rehydrate_durable_cognition_signal = (
             lambda event, *, dispatch_signal: live
         )
+        agent.durable_rehydratable_sources = frozenset({"channel.message"})
         result = await dispatcher.dispatch_signal(
             live, source_event_id="telegram:update:heartbeat-release"
         )
@@ -9654,6 +9658,7 @@ async def test_committed_then_raised_release_still_wakes_the_idle_drainer(
         agent.rehydrate_durable_cognition_signal = (
             lambda event, *, dispatch_signal: live
         )
+        agent.durable_rehydratable_sources = frozenset({"channel.message"})
         result = await dispatcher.dispatch_signal(
             live, source_event_id="telegram:update:committed-then-raised"
         )
@@ -9741,6 +9746,7 @@ async def test_concurrent_release_miss_before_commit_then_raise_still_wakes_drai
         agent.rehydrate_durable_cognition_signal = (
             lambda event, *, dispatch_signal: live
         )
+        agent.durable_rehydratable_sources = frozenset({"channel.message"})
         result = await dispatcher.dispatch_signal(
             live, source_event_id="telegram:update:concurrent-release"
         )

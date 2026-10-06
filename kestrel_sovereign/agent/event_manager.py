@@ -180,6 +180,15 @@ class EventManagerMixin:
     # buffered events drop first once the cap is exceeded.
     _MAX_PENDING_EVENTS = 100
 
+    # The durable sources whose privacy-elided rows
+    # ``rehydrate_durable_cognition_signal`` can rebuild from an authoritative
+    # store. The signal dispatcher's drain claims a row that holds no caller
+    # only when its source is listed here; any other such row waits for its
+    # provider to redeliver it with the live envelope (#3392).
+    durable_rehydratable_sources: frozenset[str] = frozenset(
+        {"a2a.task_submitted", "a2a.task_complete"}
+    )
+
     async def emit_event(
         self, event_type: str, data: Dict[str, Any]
     ) -> EventDeliveryReceipt:
@@ -627,7 +636,7 @@ class EventManagerMixin:
         """Rebuild a privacy-elided A2A wake from its authoritative task row."""
 
         source = getattr(event, "source", None)
-        if source not in {"a2a.task_submitted", "a2a.task_complete"}:
+        if source not in self.durable_rehydratable_sources:
             return None
         # WORKING recovery deliberately uses a revision-specific source event
         # identity so it cannot deduplicate against the original SUBMITTED

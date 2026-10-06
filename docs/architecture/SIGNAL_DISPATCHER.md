@@ -657,6 +657,23 @@ that event's reservation exactly as a Hold deferral would, then raises, as
 the post-claim fence already does. Terminal ingress deferred by Hold
 reports `HELD` admission, as cognition ingress does.
 
+A payload-elided row stores no caller (`caller_identity` is NULL); the
+caller is bound to the live envelope. The durable cognition drain claims
+such a row only when its source is in the agent's
+`durable_rehydratable_sources`, the sources its
+`rehydrate_durable_cognition_signal` hook rebuilds from an authoritative
+store (today, A2A tasks). The hook reads the same set. Every other elided
+row waits for its provider to redeliver the update, which runs it through
+the exact-event claim with the live envelope. Before #3392 the drain claimed
+those rows anyway and failed caller recovery. It then spent an attempt once
+per retry delay until a redelivery came, and a bounded consumer lost the
+message. The drain's ledger query leaves waiting rows out, so they neither
+crowd executable work out of its window nor re-arm its timer. The same
+NULL-caller fact, not the payload marker, decides when the route asks the
+hook. A claim re-attaches a live payload sidecar, which removes the marker,
+so a Hold-deferred A2A wake used to fail caller recovery for as long as its
+sidecar lived.
+
 Registration and persistence also serialize their handoff at the
 `(agent_id, source)` scope.  Thus an event racing a new workflow subscription
 is either committed first and backfilled by that registration, or sees the
