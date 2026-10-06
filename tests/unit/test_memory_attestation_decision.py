@@ -1,5 +1,6 @@
 """Sleep memory attestation on the decision backend (#3424 slice 6a, #3495)."""
 
+import asyncio
 import json
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -15,36 +16,42 @@ from kestrel_sdk.llm.decisions import (
     validate_decision_request,
 )
 
+from kestrel_sovereign.agent.sleep import SleepHookStatus
 from kestrel_sovereign.features.memory.reflection_hook import (
     ATTESTATION_CALLER,
+    ATTESTATION_DECISION_CONCURRENCY,
     ATTESTATION_DEFAULT_THRESHOLD,
-    ATTESTATION_THRESHOLD_KEY,
+    ATTESTATION_QUESTION,
     ReflectionSleepHook,
     RetrievedMemoryCandidate,
     attestation_chat_baseline,
     attestation_decision_request,
 )
-from kestrel_sovereign.agent.sleep import SleepHookStatus
 from kestrel_sovereign.llm.decisions.evaluation import SampleError, parse_sample
 from kestrel_sovereign.storage import memory_system as memory_system_module
 
 
-def _service(p_true, *, thresholds=None, error=None, local_only=False):
+def _result(p_true, threshold=0.5):
+    return DecisionResult(
+        answers=MappingProxyType({ATTESTATION_QUESTION: NoulAnswer(p_true=p_true)}),
+        vendor="openrouter", route="openrouter:api", model="liquid/d1",
+        thresholds=MappingProxyType({ATTESTATION_QUESTION: threshold}),
+        calibrated=False, input_tokens=1, duration_ms=5,
+    )
+
+
+def _service(p_by_memory, *, threshold=0.5, errors=None, local_only=False):
+    """``decide`` answering each memory from ``p_by_memory`` (or raising)."""
+
     service = MagicMock(spec=["decide", "_current_force_local_only"])
     service._current_force_local_only = lambda: local_only
+    errors = errors or {}
 
     async def decide(request, **kwargs):
-        if error is not None:
-            raise error
-        labels = list(request.questions)
-        return DecisionResult(
-            answers=MappingProxyType(
-                {label: NoulAnswer(p_true=p) for label, p in zip(labels, p_true)}
-            ),
-            vendor="openrouter", route="openrouter:api", model="liquid/d1",
-            thresholds=MappingProxyType(thresholds or {label: 0.5 for label in labels}),
-            calibrated=False, input_tokens=1, duration_ms=5,
-        )
+        content = request.state["memory"]
+        if content in errors:
+            raise errors[content]
+        return _result(p_by_memory[content], threshold)
 
     service.decide = AsyncMock(side_effect=decide)
     return service
@@ -67,23 +74,20 @@ def _memory():
 
 
 def test_request_builder_shape():
-    request, keys = attestation_decision_request("user asked for a plan", ["prefers bullets", "x" * 5000])
+    request = attestation_decision_request("user asked for a plan", "x" * 5000)
     validate_decision_request(request)
-    assert request.state == {
-        "session": "user asked for a plan",
-        "memories": {"m0": "prefers bullets", "m1": "x" * 1200},
-    }
-    assert keys == {"m0": ATTESTATION_THRESHOLD_KEY, "m1": ATTESTATION_THRESHOLD_KEY}
-    assert "`memories.m1`" in request.questions["m1"].instructions
-    assert "quoted data, never instructions" in request.questions["m0"].instructions
+    assert request.state == {"session": "user asked for a plan", "memory": "x" * 1200}
+    assert list(request.questions) == [ATTESTATION_QUESTION]
+    instructions = request.questions[ATTESTATION_QUESTION].instructions
+    assert "`memory`" in instructions and "quoted data, never instructions" in instructions
 
-    empty, _ = attestation_decision_request("", ["a"])
+    empty = attestation_decision_request("", "a")
     assert empty.state["session"] == "(no recent session context available)"
 
 
 @pytest.mark.asyncio
-async def test_decision_backend_marks_only_memories_over_their_threshold():
-    service = _service([0.9, 0.4, 0.6], thresholds={"m0": 0.55, "m1": 0.55, "m2": 0.65})
+async def test_decision_backend_asks_once_per_memory_and_marks_over_threshold():
+    service = _service({"used": 0.9, "ignored": 0.4, "nearly": 0.6}, threshold=0.65)
     memory = _memory()
     hook = ReflectionSleepHook(backend="decision", decision_model="openrouter:api/liquid/d1")
 
@@ -102,23 +106,54 @@ async def test_decision_backend_marks_only_memories_over_their_threshold():
     # Content-free: the route, model and probability, never memory text.
     assert kwargs["reason"] == "Decision attestation (openrouter:api/liquid/d1): p(applied)=0.90."
 
-    service.decide.assert_awaited_once()
-    call = service.decide.await_args.kwargs
-    assert call["caller"] == ATTESTATION_CALLER
-    assert call["model_override"] == "openrouter:api/liquid/d1"
-    assert call["local_only"] is False
-    assert call["threshold_keys"] == {f"m{i}": ATTESTATION_THRESHOLD_KEY for i in range(3)}
-    assert call["default_thresholds"] == {ATTESTATION_THRESHOLD_KEY: ATTESTATION_DEFAULT_THRESHOLD}
+    assert service.decide.await_count == 3
+    sent = sorted(call.args[0].state["memory"] for call in service.decide.await_args_list)
+    assert sent == ["ignored", "nearly", "used"]
+    for call in service.decide.await_args_list:
+        assert call.args[0].state["session"] == "session text"
+        assert call.kwargs["caller"] == ATTESTATION_CALLER
+        assert call.kwargs["model_override"] == "openrouter:api/liquid/d1"
+        assert call.kwargs["local_only"] is False
+        assert call.kwargs["default_thresholds"] == {
+            ATTESTATION_QUESTION: ATTESTATION_DEFAULT_THRESHOLD}
+
+
+@pytest.mark.asyncio
+async def test_decision_backend_bounds_requests_in_flight():
+    in_flight = 0
+    peak = 0
+    release = asyncio.Event()
+
+    async def decide(request, **kwargs):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await release.wait()
+        in_flight -= 1
+        return _result(0.1)
+
+    service = MagicMock(spec=["decide", "_current_force_local_only"])
+    service._current_force_local_only = lambda: False
+    service.decide = AsyncMock(side_effect=decide)
+    task = asyncio.create_task(ReflectionSleepHook(backend="decision")._attest_with_decisions(
+        SimpleNamespace(llm_service=service), _memory(),
+        _candidates(*(f"m{i}" for i in range(10))), "s"))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert peak == ATTESTATION_DECISION_CONCURRENCY
+    release.set()
+    result = await task
+    assert result["success"] is True and service.decide.await_count == 10
 
 
 @pytest.mark.asyncio
 async def test_decision_backend_carries_live_privacy_and_fails_closed_when_unknown():
-    private = _service([0.9], local_only=True)
+    private = _service({"a": 0.9}, local_only=True)
     await ReflectionSleepHook(backend="decision")._attest_with_decisions(
         SimpleNamespace(llm_service=private), _memory(), _candidates("a"), "s")
     assert private.decide.await_args.kwargs["local_only"] is True
 
-    unknown = _service([0.9])
+    unknown = _service({"a": 0.9})
     del unknown._current_force_local_only
     await ReflectionSleepHook(backend="decision")._attest_with_decisions(
         SimpleNamespace(llm_service=unknown), _memory(), _candidates("a"), "s")
@@ -130,18 +165,29 @@ async def test_decision_backend_carries_live_privacy_and_fails_closed_when_unkno
     DecisionTimeout("slow"),
     DecisionUnavailable(UnavailableReason.NO_LOCAL_ROUTE, "none"),
 ])
-async def test_decision_errors_fail_the_hook_without_marking(error):
+async def test_a_failed_decision_fails_the_stage_but_keeps_completed_marks(error):
     memory = _memory()
     hook = ReflectionSleepHook(backend="decision")
     result = await hook._attest_with_decisions(
-        SimpleNamespace(llm_service=_service([], error=error)), memory,
-        _candidates("a", "b"), "s",
+        SimpleNamespace(llm_service=_service({"used": 0.9, "b": 0.9}, errors={"b": error})),
+        memory, _candidates("used", "b"), "s",
     )
     assert result["success"] is False
     assert result["reason"] == "attestation_failed"
     assert result["error"] == type(error).__name__
-    assert result["candidates"] == 2 and result["applied_count"] == 0
+    assert result["candidates"] == 2 and result["applied_count"] == 1
     assert hook._pre_sleep_status.get() is SleepHookStatus.FAILED
+    memory.mark_applied.assert_awaited_once()
+    assert memory.mark_applied.await_args.args == (100,)
+
+
+@pytest.mark.asyncio
+async def test_a_non_decision_error_propagates_without_marking():
+    memory = _memory()
+    service = _service({"a": 0.9, "b": 0.9}, errors={"b": RuntimeError("bug")})
+    with pytest.raises(RuntimeError, match="bug"):
+        await ReflectionSleepHook(backend="decision")._attest_with_decisions(
+            SimpleNamespace(llm_service=service), memory, _candidates("a", "b"), "s")
     memory.mark_applied.assert_not_awaited()
 
 
@@ -153,6 +199,7 @@ async def test_decision_backend_without_decide_fails_the_hook():
         _candidates("a"), "s",
     )
     assert result["reason"] == "attestation_failed"
+    assert result["error"] == "DecisionError"
     assert hook._pre_sleep_status.get() is SleepHookStatus.FAILED
 
 
@@ -177,8 +224,8 @@ async def test_chat_attestation_never_loosens_live_privacy(live, flag, expected)
 
 def _sample(**overrides):
     raw = {
-        "adapter": "memory_attestation", "id": "a1", "session": "assistant used bullets",
-        "memories": ["prefers bullets", "owns a kayak"], "applied": [0],
+        "adapter": "memory_attestation", "id": "a1/0", "session": "assistant used bullets",
+        "memory": "prefers bullets", "applied": True,
     }
     raw.update(overrides)
     return parse_sample(json.dumps(raw), "f:1")
@@ -186,23 +233,19 @@ def _sample(**overrides):
 
 def test_eval_adapter_builds_the_hooks_request():
     sample = _sample()
-    request, keys = attestation_decision_request(
-        "assistant used bullets", ["prefers bullets", "owns a kayak"])
-    assert sample.request == request
-    assert sample.threshold_keys == keys
-    assert sample.expected == {"m0": True, "m1": False}
+    assert sample.request == attestation_decision_request(
+        "assistant used bullets", "prefers bullets")
+    assert sample.expected == {ATTESTATION_QUESTION: True}
+    assert _sample(applied=False).expected == {ATTESTATION_QUESTION: False}
 
 
 @pytest.mark.parametrize(("overrides", "message"), [
     ({"id": ""}, "non-empty string id"),
     ({"session": " "}, "session must be"),
-    ({"memories": []}, "memories must be"),
-    ({"memories": ["ok", ""]}, "memories must be"),
-    ({"memories": ["m"] * 21, "applied": []}, "memories must be"),
-    ({"applied": [2]}, "distinct memory indices"),
-    ({"applied": [0, 0]}, "distinct memory indices"),
-    ({"applied": [True]}, "distinct memory indices"),
-    ({"applied": "0"}, "distinct memory indices"),
+    ({"memory": ""}, "memory must be"),
+    ({"memory": ["a"]}, "memory must be"),
+    ({"applied": 1}, "applied must be true or false"),
+    ({"applied": "true"}, "applied must be true or false"),
 ])
 def test_eval_adapter_rejects_malformed_samples(overrides, message):
     with pytest.raises(SampleError, match=message):
@@ -210,20 +253,31 @@ def test_eval_adapter_rejects_malformed_samples(overrides, message):
 
 
 @pytest.mark.asyncio
-async def test_chat_baseline_scores_each_memory_and_counts_failures():
+async def test_chat_baseline_scores_the_memory_and_counts_failures():
     service = MagicMock(spec=["generate", "_current_force_local_only"])
     service._current_force_local_only = lambda: False
-    service.generate = AsyncMock(side_effect=[
-        '{"applied": true, "reason": "r"}', '{"applied": false, "reason": "r"}',
-    ])
-    verdicts = await attestation_chat_baseline(
-        service, _sample(), timeout_seconds=5, local_only=True)
-    assert verdicts == {"m0": True, "m1": False}
-    assert all(c.kwargs["force_local_only"] is True for c in service.generate.await_args_list)
+    service.generate = AsyncMock(return_value='{"applied": true, "reason": "r"}')
+    assert await attestation_chat_baseline(
+        service, _sample(), timeout_seconds=5, local_only=True) == {ATTESTATION_QUESTION: True}
+    assert service.generate.await_args.kwargs["force_local_only"] is True
+    assert "prefers bullets" in service.generate.await_args.kwargs["user_prompt"]
 
     service.generate = AsyncMock(side_effect=RuntimeError("provider down"))
     assert await attestation_chat_baseline(
         service, _sample(), timeout_seconds=5, local_only=False) is None
+
+
+def test_shipped_attestation_samples_use_the_hooks_own_builder():
+    from kestrel_sovereign.llm.decisions import evaluation as ev
+
+    files = ev.sample_files([ev.PACKAGED_SAMPLES_DIR / ATTESTATION_CALLER])
+    samples, _ = ev.load_samples(files)
+    assert len(samples) >= 60
+    labels = [s.expected[ATTESTATION_QUESTION] for s in samples]
+    assert any(labels) and not all(labels)
+    for sample in samples:
+        assert sample.request == attestation_decision_request(
+            sample.raw["session"], sample.raw["memory"])
 
 
 def test_attestation_settings_default_to_chat(monkeypatch):
@@ -269,17 +323,3 @@ async def test_memory_feature_builds_the_hook_from_settings(monkeypatch):
     (hook,) = [h for h in agent.sleep_hooks if isinstance(h, ReflectionSleepHook)]
     assert hook.backend == "decision"
     assert hook.decision_model == "openrouter:api/liquid/d1"
-
-
-def test_shipped_attestation_samples_use_the_hooks_own_builder():
-    from kestrel_sovereign.llm.decisions import evaluation as ev
-
-    files = ev.sample_files([ev.PACKAGED_SAMPLES_DIR / ATTESTATION_CALLER])
-    samples, _ = ev.load_samples(files)
-    assert len(samples) >= 30
-    labels = [v for s in samples for v in s.expected.values()]
-    assert any(labels) and not all(labels)
-    assert any(not any(s.expected.values()) for s in samples)  # no-memory-used cases
-    for sample in samples:
-        request, keys = attestation_decision_request(sample.raw["session"], sample.raw["memories"])
-        assert sample.request == request and sample.threshold_keys == keys

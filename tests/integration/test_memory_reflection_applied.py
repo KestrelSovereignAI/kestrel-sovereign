@@ -104,7 +104,7 @@ async def test_pre_sleep_marks_only_llm_attested_retrieved_memories(
 
 
 class _FakeDecisionLLM:
-    """``decide`` over the hook's batched request: one ``noul`` per memory."""
+    """``decide`` over the hook's per-memory request."""
 
     def __init__(self):
         self.calls = []
@@ -118,20 +118,17 @@ class _FakeDecisionLLM:
         from kestrel_sdk.llm.decisions import DecisionResult, NoulAnswer
 
         self.calls.append((request, kwargs))
-        memories = request.state["memories"]
+        p_true = 0.92 if "load-bearing" in request.state["memory"] else 0.08
         return DecisionResult(
-            answers=MappingProxyType({
-                label: NoulAnswer(p_true=0.92 if "load-bearing" in text else 0.08)
-                for label, text in memories.items()
-            }),
+            answers=MappingProxyType({"applied": NoulAnswer(p_true=p_true)}),
             vendor="ollama", route="ollama:local", model="tev1:0.8b",
-            thresholds=MappingProxyType({label: 0.5 for label in memories}),
+            thresholds=MappingProxyType({"applied": 0.5}),
             calibrated=False, input_tokens=1, duration_ms=3,
         )
 
 
 @pytest.mark.asyncio
-async def test_decision_backend_attests_every_candidate_in_one_call(tmp_path, caplog):
+async def test_decision_backend_attests_each_candidate_on_its_own(tmp_path, caplog):
     db_path = tmp_path / "kestrel.db"
     async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
         memory_system = MemorySystem(storage, AGENT_ID)
@@ -165,10 +162,9 @@ async def test_decision_backend_attests_every_candidate_in_one_call(tmp_path, ca
         assert result["success"] is True
         assert result["candidates"] == 2
         assert result["attested_message_ids"] == [applied_id]
-        assert len(agent.llm_service.calls) == 1
-        request, kwargs = agent.llm_service.calls[0]
-        assert len(request.questions) == 2
-        assert kwargs["caller"] == "memory_attestation"
+        assert len(agent.llm_service.calls) == 2
+        assert {kwargs["caller"] for _, kwargs in agent.llm_service.calls} == {
+            "memory_attestation"}
 
         history = await storage.conversation.get_full_history_with_ids()
         applied_meta = _metadata(next(row for row in history if row["id"] == applied_id))
