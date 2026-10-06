@@ -210,16 +210,58 @@ def _native_structured_output_config(
 
     ``transform_schema`` is the SDK's own conversion: it closes every object
     (``additionalProperties: false``, which the API requires) and moves the
-    constraints the API does not enforce into the field description.
+    constraints the API does not enforce into the field description. Closing
+    an open object (a map field) would leave the model room only for ``{}``,
+    so such a schema is refused rather than sent.
     """
     from anthropic import transform_schema
 
+    schema = response_format.model_json_schema()
+    open_path = _open_object_path(schema)
+    if open_path is not None:
+        raise TypeError(
+            f"{response_format.__name__} field {open_path!r} is an open object "
+            "(additionalProperties or patternProperties). Anthropic native "
+            "structured output closes every object, so it could only return "
+            "{} for that field; declare its keys as model fields."
+        )
     return {
         "format": {
             "type": "json_schema",
-            "schema": transform_schema(response_format),
+            "schema": transform_schema(schema),
         }
     }
+
+
+def _open_object_path(schema: Dict[str, Any], path: str = "") -> Optional[str]:
+    """The path of the first object in ``schema`` that accepts undeclared keys.
+
+    Walks the keywords ``transform_schema`` descends into (``properties``,
+    ``anyOf``/``oneOf``/``allOf``, ``items``, ``$defs``), which are the places
+    it closes an object. Returns None when every object is closed or declares
+    only named properties.
+    """
+    if (
+        schema.get("additionalProperties", False) is not False
+        or "patternProperties" in schema
+    ):
+        return path or "<root>"
+    children = [
+        (f"{path}.{name}" if path else name, sub)
+        for name, sub in schema.get("properties", {}).items()
+    ]
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        children.extend((path, sub) for sub in schema.get(keyword) or ())
+    if isinstance(schema.get("items"), dict):
+        children.append((f"{path}[]", schema["items"]))
+    children.extend(
+        (f"$defs.{name}", sub) for name, sub in schema.get("$defs", {}).items()
+    )
+    for child_path, child in children:
+        found = _open_object_path(child, child_path)
+        if found is not None:
+            return found
+    return None
 
 
 def _attach_cache_control(block: Dict[str, Any]) -> Dict[str, Any]:
@@ -561,7 +603,8 @@ class AnthropicAdapter(LLMAdapter):
             ),
             "model_dependent": ("supports_inline_system",),
             "notes": (
-                "Structured output uses Anthropic's native output_config JSON schema.",
+                "Structured output uses Anthropic's native output_config JSON schema; "
+                "open-map fields (additionalProperties, patternProperties) are refused.",
                 "Streaming with response_format falls back to non-streaming structured generation.",
                 "Mid-conversation system messages are route- and model-gated to Opus 4.8+.",
                 "Prompt caching uses cache_control breakpoints (max 4), applied automatically.",

@@ -22,8 +22,12 @@ from pydantic import BaseModel, Field
 
 from kestrel_sdk.llm import StructuredOutputMode
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
-from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
+from kestrel_sovereign.llm.anthropic_adapter import (
+    AnthropicAdapter,
+    _native_structured_output_config,
+)
 from kestrel_sovereign.llm.claude_max_adapter import ClaudeMaxAdapter
+from kestrel_sovereign.llm.service import AuditResult
 from tests.utils.anthropic_client import (
     FORCED_TOOL_CHOICE_REFUSAL,
     anthropic_client,
@@ -294,3 +298,31 @@ async def test_non_streaming_structured_output_keeps_think_tags_inside_the_json(
 
     assert response.content == json.dumps(payload)
     assert Verdict.model_validate_json(response.content).model_dump() == payload
+
+
+class Tally(BaseModel):
+    counts: dict[str, int]
+
+
+@pytest.mark.asyncio
+async def test_open_map_response_format_is_refused_before_any_request():
+    """``transform_schema`` closes every object, so a map field could only
+    ever come back as ``{}``. The adapter refuses the schema instead of
+    sending a rewritten one."""
+    client = anthropic_client(_message([_text("{}")]))
+
+    with pytest.raises(TypeError, match=r"Tally field 'counts' is an open object"):
+        await AnthropicAdapter().get_response(
+            client=client,
+            model="claude-sonnet-5-5",
+            messages=USER,
+            response_format=Tally,
+        )
+
+    client.messages.stream.assert_not_called()
+
+
+def test_audit_result_schema_passes_through_unchanged():
+    config = _native_structured_output_config(AuditResult)
+
+    assert config["format"]["schema"] == anthropic.transform_schema(AuditResult)
