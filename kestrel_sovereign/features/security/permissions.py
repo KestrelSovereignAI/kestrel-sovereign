@@ -263,11 +263,13 @@ def assert_sdk_permission_level_parity() -> None:
     enforcement = set(_LEVEL_RANK)
     composition = set(_CONTRIBUTED_TIGHTENING)
     hardening = set(_HARDENED_PRESERVED_LEVELS)
+    auto_mode = set(_GLOBAL_AUTO_MODE_RESOLUTION)
     if (
         sdk != sovereign
         or enforcement != set(PermissionLevel)
         or composition != set(PermissionLevel)
         or hardening != set(PermissionLevel)
+        or auto_mode != set(PermissionLevel)
     ):
         raise RuntimeError(
             "SDK/Sovereign permission vocabulary mismatch; refusing feature "
@@ -275,7 +277,8 @@ def assert_sdk_permission_level_parity() -> None:
             f"(sdk={sdk!r}, sovereign={sovereign!r}, "
             f"enforced={sorted(level.value for level in enforcement)!r}, "
             f"composed={sorted(level.value for level in composition)!r}, "
-            f"hardened={sorted(level.value for level in hardening)!r})"
+            f"hardened={sorted(level.value for level in hardening)!r}, "
+            f"auto_mode={sorted(level.value for level in auto_mode)!r})"
         )
 
 
@@ -377,7 +380,7 @@ _LEVEL_RANK = {
 
 # Static-rail composition is a separate concern from the legacy-row winner
 # policy above. ALLOW/AUTO/SESSION/ASK are operational modes, not a general
-# restrictiveness order: global auto mode can promote three of them, while
+# restrictiveness order: global auto mode promotes ASK and SESSION, while
 # static ALLOW entries intentionally migrate selected unattended tools. Only
 # ALWAYS_ASK and DENY are hard rails with a strict ordering. Listing every
 # declaration keeps the vocabulary closed when the SDK enum grows.
@@ -455,9 +458,20 @@ _HARDENED_PRESERVED_LEVELS = {
     PermissionLevel.DENY: frozenset({PermissionLevel.DENY}),
 }
 
-_AUTO_MODE_EXEMPT_LEVELS = {
-    PermissionLevel.DENY,
-    PermissionLevel.ALWAYS_ASK,
+# Global auto mode stands in for the human approver, so it rewrites only the
+# levels that would otherwise wait for one: ASK, SESSION, and the no-row
+# default (ASK). ALLOW and AUTO already run without an approver; an explicit
+# operator ALLOW must still read as ALLOW, because consumers ask whether a tool
+# is *explicitly* allowed and auto mode is not that grant (#3503). DENY and
+# ALWAYS_ASK are hard rails auto mode never crosses. Listing every level keeps
+# the vocabulary closed when the SDK enum grows.
+_GLOBAL_AUTO_MODE_RESOLUTION = {
+    PermissionLevel.ALLOW: PermissionLevel.ALLOW,
+    PermissionLevel.AUTO: PermissionLevel.AUTO,
+    PermissionLevel.SESSION: PermissionLevel.AUTO,
+    PermissionLevel.ASK: PermissionLevel.AUTO,
+    PermissionLevel.ALWAYS_ASK: PermissionLevel.ALWAYS_ASK,
+    PermissionLevel.DENY: PermissionLevel.DENY,
 }
 
 
@@ -793,14 +807,9 @@ class PermissionStore:
         """
         key = f"{feature_name}.{tool_name}"
 
-        # Session override takes priority. In global Auto mode, explicit
-        # DENY and ALWAYS_ASK remain hard policy rails; everything else can
-        # flow through Auto.
+        # Session override takes priority.
         if key in self._session_overrides:
-            level = self._session_overrides[key]
-            if self._global_auto_mode and level not in _AUTO_MODE_EXEMPT_LEVELS:
-                return PermissionLevel.AUTO
-            return level
+            return self._apply_global_auto_mode(self._session_overrides[key])
 
         # Check persistent storage.
         #
@@ -820,10 +829,7 @@ class PermissionStore:
         # already-running agents (#1427 sibling).
         rows = await self._lookup_rows(feature_name, tool_name)
         if rows:
-            best = _most_permissive(rows)
-            if self._global_auto_mode and best not in _AUTO_MODE_EXEMPT_LEVELS:
-                return PermissionLevel.AUTO
-            return best
+            return self._apply_global_auto_mode(_most_permissive(rows))
 
         # Default for unregistered tools.
         # Demo servers (KESTREL_DEMO_SERVER=1) auto-allow — _register_all_tools
@@ -835,9 +841,17 @@ class PermissionStore:
         import os as _os
         if _os.environ.get("KESTREL_DEMO_SERVER", "").lower() in ("1", "true", "yes"):
             return PermissionLevel.ALLOW
-        if self._global_auto_mode:
-            return PermissionLevel.AUTO
-        return PermissionLevel.ASK
+        return self._apply_global_auto_mode(PermissionLevel.ASK)
+
+    def _apply_global_auto_mode(self, level: PermissionLevel) -> PermissionLevel:
+        """Resolve ``level`` under global auto mode, when it is enabled.
+
+        The single place the promotion rule lives: see
+        ``_GLOBAL_AUTO_MODE_RESOLUTION``.
+        """
+        if not self._global_auto_mode:
+            return level
+        return _GLOBAL_AUTO_MODE_RESOLUTION[level]
 
     async def _lookup_rows(
         self,

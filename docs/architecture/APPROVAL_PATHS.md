@@ -80,7 +80,7 @@ When an audit agent is attached, the `mcpServer/elicitation/request` decline IS 
 
 1. `ComputerUseFeature.shell(argv=...)` runs `BinaryPolicy.evaluate(argv)` directly.
 2. `REQUIRE_APPROVAL` → `ApprovalQueue.request_approval(feature_name="computer_use", tool_name="shell", tool_args={"argv": [...]})`.
-3. Inside `request_approval`, the order is: **(a)** explicit DENY in the permission store → hard stop; **(b)** global auto-mode + non-DENY permission level → `(True, "auto")` immediately, logged as `decision="auto_mode_allowed"` in `security_audit_log` ([`approval_queue.py:217-234`](../../kestrel_sovereign/features/security/approval_queue.py)); **(c)** scoped `[[security.auto_approve.shell]]` allowlist match → `(True, f"auto_approve:{audit_id}")` with the full row in `auto_approve_audit` ([`approval_queue.py:242-321`](../../kestrel_sovereign/features/security/approval_queue.py)). The scoped allowlist matches ONLY on the `argv` shape — the internal-gate signature — because the LLM tool path (#3) passes `{"command": ...}` instead.
+3. Inside `request_approval`, the order is: **(a)** explicit DENY in the permission store → hard stop; **(b)** global auto-mode + an `AUTO` or explicit `ALLOW` level → `(True, "auto")` immediately, logged in `security_audit_log` as `decision="auto_mode_allowed"` (`AUTO`) or `decision="auto_allowed"` (explicit `ALLOW`) ([`approval_queue.py:217-234`](../../kestrel_sovereign/features/security/approval_queue.py)); **(c)** scoped `[[security.auto_approve.shell]]` allowlist match → `(True, f"auto_approve:{audit_id}")` with the full row in `auto_approve_audit` ([`approval_queue.py:242-321`](../../kestrel_sovereign/features/security/approval_queue.py)). The scoped allowlist matches ONLY on the `argv` shape — the internal-gate signature — because the LLM tool path (#3) passes `{"command": ...}` instead.
 4. The audit id from the scoped path rides the `allowed_by` chain so `computer_use._audit_run` finalizes the exit code.
 5. No path matched → human approval. Permission policy DENY → silent denial (logged).
 
@@ -98,12 +98,12 @@ When an audit agent is attached, the `mcpServer/elicitation/request` decline IS 
 
 1. PRE_TOOL_USE hooks fire. `SecurityHook.execute` ([`kestrel_sovereign/features/security/hooks.py`](../../kestrel_sovereign/features/security/hooks.py)) looks up `PermissionLevel`.
 2. `PermissionLevel.ALLOW` → silent allow (audit row written, no modal).
-3. `PermissionLevel.AUTO` (the auto-mode promotion of any non-DENY stored level) → silent allow with `decision="auto_mode_allowed"`.
+3. `PermissionLevel.AUTO` (a stored `AUTO`, or the auto-mode promotion of `ASK` / `SESSION` / no row) → silent allow with `decision="auto_mode_allowed"`.
 4. `PermissionLevel.DENY` → silent deny with `decision="auto_denied"`.
 5. `PermissionLevel.ASK` / `SESSION` → queue and wait for the modal.
 6. The downstream `ComputerUseFeature.shell` then runs the same `BinaryPolicy` / `PathPolicy` check internally — failure-modes there mirror Path 2's gates.
 
-**Auto-mode covers** this path via the `_global_auto_mode and level != PermissionLevel.DENY → PermissionLevel.AUTO` promotion in [`features/security/permissions.py:432-437`](../../kestrel_sovereign/features/security/permissions.py).
+**Auto-mode covers** this path via the `_GLOBAL_AUTO_MODE_RESOLUTION` table in [`features/security/permissions.py`](../../kestrel_sovereign/features/security/permissions.py): `ASK`, `SESSION`, and the no-row default resolve to `AUTO`; an explicit `ALLOW` stays `ALLOW` so consumers can still tell the operator granted it (#3503); `DENY` and `ALWAYS_ASK` are unchanged.
 
 The LLM-tool path is what an agent should prefer when an equivalent kestrel-side tool exists. For `gh` specifically, `kestrel-feature-github`'s `create_issue` (over `httpx`) is the supported alternative; it goes through Path 3 (the feature pipeline) and bypasses `BinaryPolicy` entirely. See #1579.
 
