@@ -325,18 +325,30 @@ class ApprovalQueue:
                         tool_name,
                     )
                     return (False, "denied")
-                if (
-                    self._permission_store.get_global_auto_mode()
-                    and level == PermissionLevel.AUTO
+                # Global auto mode resolves ASK/SESSION to AUTO but leaves an
+                # explicit ALLOW as ALLOW (#3503); both skip the human here,
+                # and the audit row says which grant allowed the call.
+                if self._permission_store.get_global_auto_mode() and level in (
+                    PermissionLevel.AUTO,
+                    PermissionLevel.ALLOW,
                 ):
-                    await self._permission_store.log_decision(
-                        feature_name=feature_name,
-                        tool_name=tool_name,
-                        action=audit_action,
-                        decision="auto_mode_allowed",
-                        user_choice="constitutional_honesty_unflagged",
-                        args_summary=summarize_args(tool_args),
-                    )
+                    if level == PermissionLevel.ALLOW:
+                        await self._permission_store.log_decision(
+                            feature_name=feature_name,
+                            tool_name=tool_name,
+                            action=audit_action,
+                            decision="auto_allowed",
+                            args_summary=summarize_args(tool_args),
+                        )
+                    else:
+                        await self._permission_store.log_decision(
+                            feature_name=feature_name,
+                            tool_name=tool_name,
+                            action=audit_action,
+                            decision="auto_mode_allowed",
+                            user_choice="constitutional_honesty_unflagged",
+                            args_summary=summarize_args(tool_args),
+                        )
                     logger.info(
                         "ApprovalQueue auto-mode approved %s.%s without prompting",
                         feature_name,

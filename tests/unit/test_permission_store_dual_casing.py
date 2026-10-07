@@ -250,3 +250,29 @@ async def test_get_permission_returns_ask_default_when_neither_row_present(tmp_p
         await store.get_permission("TaskFeature", "respond_to_a2a_task")
         == PermissionLevel.ASK
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pascal_level", "snake_level"),
+    [
+        (PermissionLevel.ALLOW, PermissionLevel.ASK),
+        (PermissionLevel.ASK, PermissionLevel.ALLOW),
+    ],
+)
+async def test_global_auto_mode_keeps_mixed_casing_allow(
+    tmp_path, pascal_level, snake_level
+):
+    """ALLOW under one casing and ASK under the other resolves to the
+    operator's ALLOW, and global auto mode must not relabel it AUTO (#3503)."""
+    store = PermissionStore(str(tmp_path / "perms.db"))
+    await store.initialize()
+    await store.set_permission("TaskFeature", "respond_to_a2a_task", pascal_level)
+    await store.set_permission("task_feature", "respond_to_a2a_task", snake_level)
+    store.set_global_auto_mode(True)
+
+    for feature_name in ("TaskFeature", "task_feature"):
+        assert (
+            await store.get_permission(feature_name, "respond_to_a2a_task")
+            is PermissionLevel.ALLOW
+        )

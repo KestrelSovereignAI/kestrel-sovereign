@@ -176,10 +176,89 @@ class TestPermissionStore:
         store.set_global_auto_mode(True)
 
         assert await store.get_permission("WalletAgent", "get_balance") == PermissionLevel.AUTO
-        assert await store.get_permission("SearchFeature", "web_search") == PermissionLevel.AUTO
+        assert await store.get_permission("SearchFeature", "web_search") == PermissionLevel.ALLOW
         assert await store.get_permission("NewFeature", "new_tool") == PermissionLevel.AUTO
         assert await store.get_permission("WalletAgent", "delete_everything") == PermissionLevel.DENY
         assert await store.get_permission("ShellFeature", "rm") == PermissionLevel.ALWAYS_ASK
+
+    # Global auto mode stands in for a missing human approver, so it rewrites
+    # only the levels that would wait for one. An explicit operator ALLOW stays
+    # ALLOW: a consumer that needs an *explicit* grant (the Workflows deadline
+    # gate) could not see one when ALLOW came back as AUTO (#3503).
+    _AUTO_MODE_RESOLUTION = [
+        (PermissionLevel.ALLOW, PermissionLevel.ALLOW),
+        (PermissionLevel.AUTO, PermissionLevel.AUTO),
+        (PermissionLevel.ASK, PermissionLevel.AUTO),
+        (PermissionLevel.SESSION, PermissionLevel.AUTO),
+        (PermissionLevel.DENY, PermissionLevel.DENY),
+        (PermissionLevel.ALWAYS_ASK, PermissionLevel.ALWAYS_ASK),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("stored", "expected"), _AUTO_MODE_RESOLUTION)
+    async def test_global_auto_mode_resolves_persisted_row(
+        self, store, stored, expected
+    ):
+        await store.set_permission("WorkflowsFeature", "deadline", stored)
+        store.set_global_auto_mode(True)
+
+        assert await store.get_permission("WorkflowsFeature", "deadline") is expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("stored", "expected"), _AUTO_MODE_RESOLUTION)
+    async def test_global_auto_mode_resolves_session_override(
+        self, store, stored, expected
+    ):
+        await store.set_permission(
+            "WorkflowsFeature", "deadline", PermissionLevel.ASK
+        )
+        await store.set_permission(
+            "WorkflowsFeature", "deadline", stored, scope="session"
+        )
+        store.set_global_auto_mode(True)
+
+        assert await store.get_permission("WorkflowsFeature", "deadline") is expected
+
+    @pytest.mark.asyncio
+    async def test_global_auto_mode_resolves_missing_row_to_auto(self, store):
+        store.set_global_auto_mode(True)
+
+        assert (
+            await store.get_permission("WorkflowsFeature", "never_registered")
+            is PermissionLevel.AUTO
+        )
+
+    @pytest.mark.asyncio
+    async def test_always_scope_auto_mode_keeps_explicit_allow(self, store):
+        """The persisted ``always`` tier is the one prod runs in."""
+        await store.set_permission(
+            "WorkflowsFeature", "deadline", PermissionLevel.ALLOW
+        )
+        await store.set_global_auto_mode_scope("always")
+
+        assert (
+            await store.get_permission("WorkflowsFeature", "deadline")
+            is PermissionLevel.ALLOW
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stored", [level for level, _ in _AUTO_MODE_RESOLUTION])
+    async def test_without_global_auto_mode_levels_are_returned_unchanged(
+        self, store, stored
+    ):
+        await store.set_permission("WorkflowsFeature", "deadline", stored)
+        await store.set_permission(
+            "WorkflowsFeature", "session_tool", stored, scope="session"
+        )
+
+        assert await store.get_permission("WorkflowsFeature", "deadline") is stored
+        assert (
+            await store.get_permission("WorkflowsFeature", "session_tool") is stored
+        )
+        assert (
+            await store.get_permission("WorkflowsFeature", "never_registered")
+            is PermissionLevel.ASK
+        )
 
     @pytest.mark.asyncio
     async def test_clear_session_overrides_disables_global_auto(self, store):
@@ -1108,6 +1187,36 @@ class TestSecurityHook:
         assert logs[0]["user_choice"] == "constitutional_honesty_unflagged"
 
     @pytest.mark.asyncio
+    async def test_explicit_allow_under_global_auto_mode_is_audited_as_allow(
+        self, hook, permission_store, approval_queue
+    ):
+        """#3503: auto mode no longer relabels the operator's explicit grant."""
+        await permission_store.set_permission(
+            "WorkflowsFeature",
+            "workflow_await_signal_deadline",
+            PermissionLevel.ALLOW,
+        )
+        permission_store.set_global_auto_mode(True)
+
+        output = await hook.execute(
+            HookInput(
+                session_id="test",
+                hook_event_name="PreToolUse",
+                tool_name="workflow_await_signal_deadline",
+                feature_name="WorkflowsFeature",
+                tool_input={},
+            )
+        )
+
+        assert output.continue_execution is True
+        assert output.permission_decision == PermissionDecision.ALLOW
+        assert approval_queue.pending_requests == []
+
+        logs = await permission_store.get_audit_log(limit=1)
+        assert logs[0]["decision"] == "auto_allowed"
+        assert logs[0]["user_choice"] is None
+
+    @pytest.mark.asyncio
     async def test_always_ask_prompts_under_global_auto_mode(
         self, hook, permission_store, approval_queue
     ):
@@ -1449,6 +1558,47 @@ class TestApprovalQueueScopePersistence:
         logs = await store.get_audit_log(limit=1)
         assert logs[0]["decision"] == "auto_mode_allowed"
         assert logs[0]["user_choice"] == "constitutional_honesty_unflagged"
+
+    @pytest.mark.asyncio
+    async def test_global_auto_mode_direct_request_approval_allows_explicit_allow(
+        self, store
+    ):
+        """An explicit ALLOW reads as ALLOW under auto mode (#3503), and must
+        still skip the human queue exactly as it did when it read as AUTO."""
+        request_added = False
+
+        async def on_request_added(_request):
+            nonlocal request_added
+            request_added = True
+
+        auto_policy = MagicMock()
+        auto_policy.evaluate = AsyncMock(
+            side_effect=AssertionError("auto mode must resolve before the allowlist")
+        )
+        queue = ApprovalQueue(
+            on_request_added=on_request_added,
+            permission_store=store,
+            auto_approve_policy=auto_policy,
+        )
+        await store.set_permission("ComputeFeature", "run_script", PermissionLevel.ALLOW)
+        store.set_global_auto_mode(True)
+
+        approved, scope = await queue.request_approval(
+            feature_name="ComputeFeature",
+            tool_name="run_script",
+            tool_args={"script_id": "s-allow"},
+            timeout=0.01,
+        )
+
+        assert approved is True
+        assert scope == "auto"
+        assert request_added is False
+        assert queue.pending_requests == []
+        auto_policy.evaluate.assert_not_awaited()
+
+        logs = await store.get_audit_log(limit=1)
+        assert logs[0]["decision"] == "auto_allowed"
+        assert logs[0]["user_choice"] is None
 
     @pytest.mark.asyncio
     async def test_global_auto_mode_direct_request_approval_respects_deny(
