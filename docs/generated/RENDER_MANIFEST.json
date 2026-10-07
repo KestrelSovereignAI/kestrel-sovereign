@@ -829,6 +829,7 @@
     {
       "existing_code_refs": [
         "endpoints/__init__.py",
+        "kestrel_sovereign/host_features/runtime.py",
         "server.py"
       ],
       "findings": [],
