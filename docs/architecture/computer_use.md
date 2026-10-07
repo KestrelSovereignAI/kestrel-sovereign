@@ -154,9 +154,11 @@ Reading those rows back is the canonical way to reconstruct what happened.
 
 ## Capture retention
 
-`shell(capture_output=true)` writes `<run_id>.stdout`, `<run_id>.stderr` and the `<run_id>.json` manifest into `capture_dir`. The local backend puts no cap on their size, so the feature prunes them: on initialize, and then at most once a day when a run is captured, it deletes every artifact set whose manifest was last written more than `capture_retention_days` ago (default 14; `0` disables pruning).
+`shell(capture_output=true)` writes `<run_id>.stdout`, `<run_id>.stderr` and the `<run_id>.json` manifest into `capture_dir`. Neither backend puts a cap on their size (#3277), so the feature prunes them: on initialize, and then at most once a day when a run is captured, it deletes every artifact set whose manifest was last written more than `capture_retention_days` ago (default 14; `0` disables pruning).
 
 Pruning only considers direct children of the resolved `capture_dir` that carry the runtime's run-id naming (32 lowercase hex characters). It does not recurse, does not follow a linked manifest, keeps a run whose manifest has not been written yet, and never deletes the audit log, wherever it is configured.
+
+Because pruning keys a set by its manifest, a run that ends without one is cleaned up when it ends instead. If the call is cancelled, or fails before its manifest is written, its stream files, and any partial manifest, are removed before the cancellation or error reaches the caller (#3512).
 
 ## Threat model
 

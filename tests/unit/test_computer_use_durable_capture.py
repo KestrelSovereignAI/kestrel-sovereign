@@ -23,8 +23,12 @@ cannot show that a 2 MiB review survives, which is the entire claim.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
+import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +39,7 @@ from kestrel_sovereign.features.computer_use import capture
 from kestrel_sovereign.features.computer_use.backends.base import (
     CaptureTarget,
     CompletedRun,
+    open_capture_owned,
 )
 from kestrel_sovereign.features.computer_use.backends.local import LocalSandboxBackend
 from kestrel_sovereign.features.computer_use.feature import (
@@ -3472,3 +3477,318 @@ async def test_a_cancelled_stderr_write_is_lost_on_its_own_side(
     # false claim the per-stream split exists to prevent.
     assert result.truncated_stdout is False
     assert result.writers_remaining is False
+
+
+# ---------------------------------------------------------------------------
+# #3512: a run that is never published leaves nothing behind
+# ---------------------------------------------------------------------------
+#
+# Pruning retires an artifact set by its manifest, and only a run that returns
+# a result gets one. Every way a captured run can end without one -- cancelled,
+# a spawn error that raises, a failure after the backend returned -- used to
+# leave stream files that no prune would ever remove, and since #3277 those
+# files are as large as everything the command printed.
+
+
+def _left_in(directory: Path) -> list[str]:
+    return sorted(p.name for p in directory.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_local_capture_leaves_nothing_pruning_cannot_retire(
+    tmp_path: Path,
+):
+    """The ticket's defect on the local backend, which had it too: the
+    cancellation handler tore the process down and closed the files, and
+    nothing removed them."""
+    bundle = capture.allocate(tmp_path / "captures")
+    running = tmp_path / "running"
+    script = tmp_path / "long.py"
+    script.write_text(
+        "import time\n"
+        "print('the first half of a long review', flush=True)\n"
+        f"open({str(running)!r}, 'w').close()\n"
+        "time.sleep(60)\n"
+    )
+    task = asyncio.create_task(
+        LocalSandboxBackend(GRANTS).exec(
+            ["python3", str(script)],
+            cwd=None,
+            env=None,
+            timeout=120,
+            capture=CaptureTarget(
+                stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+            ),
+        )
+    )
+    deadline = time.monotonic() + 10
+    while not running.exists():
+        assert time.monotonic() < deadline, "the command never started"
+        await asyncio.sleep(0.05)
+    assert bundle.stdout_path.exists() and bundle.stderr_path.exists()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    captures = bundle.stdout_path.parent
+    assert _left_in(captures) == []
+    capture.prune(captures, cutoff=time.time() + 3600)
+    assert _left_in(captures) == []
+
+
+@pytest.mark.asyncio
+async def test_a_spawn_that_raises_leaves_no_capture_files(tmp_path: Path):
+    """A permission denial on spawn propagates rather than becoming an
+    rc=127 result (review round 11), so nothing will ever write a manifest
+    for the files opened before it."""
+    not_executable = tmp_path / "not_executable.sh"
+    not_executable.write_text("#!/bin/sh\necho hi\n")
+    not_executable.chmod(0o644)
+    bundle = capture.allocate(tmp_path / "captures")
+
+    with pytest.raises(PermissionError):
+        await LocalSandboxBackend(GRANTS).exec(
+            [str(not_executable)],
+            cwd=None,
+            env=None,
+            timeout=30,
+            capture=CaptureTarget(
+                stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+            ),
+        )
+
+    assert _left_in(tmp_path / "captures") == []
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_local_open_does_not_orphan_what_it_opens(
+    tmp_path: Path, monkeypatch
+):
+    """The open runs in a worker thread, which a cancellation does not stop:
+    it created both files after the caller had gone, and nothing closed or
+    removed them."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    opened: list = []
+    real_open = local_mod._open_capture
+
+    def slow_open(cap):
+        entered.set()
+        release.wait(5)
+        try:
+            handles = real_open(cap)
+            opened.extend(handles)
+            return handles
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(local_mod, "_open_capture", slow_open)
+    bundle = capture.allocate(tmp_path / "captures")
+    ran = tmp_path / "ran"
+
+    task = asyncio.create_task(
+        LocalSandboxBackend(GRANTS).exec(
+            ["python3", "-c", f"open({str(ran)!r}, 'w').close()"],
+            cwd=None,
+            env=None,
+            timeout=30,
+            capture=CaptureTarget(
+                stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+            ),
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Whatever the thread was doing has finished, so nothing below can be
+    # read before the files it creates exist.
+    assert await asyncio.to_thread(finished.wait, 5)
+
+    assert not ran.exists(), "a cancelled call went on to run the command"
+    assert len(opened) == 2 and all(fh.closed for fh in opened)
+    assert _left_in(tmp_path / "captures") == []
+
+
+@pytest.mark.asyncio
+async def test_an_open_that_fails_after_a_cancel_still_removes_its_first_file(
+    tmp_path: Path,
+):
+    """When the second file fails to open, the opener closes the first and
+    raises -- leaving it on disk. Without a cancellation the run still
+    returns, and its manifest names that file; with one, nothing does."""
+    target = CaptureTarget(
+        stdout_path=tmp_path / "run.stdout", stderr_path=tmp_path / "run.stderr"
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def half_open(cap):
+        capture.open_stream(cap.stdout_path).close()
+        entered.set()
+        release.wait(5)
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    task = asyncio.create_task(open_capture_owned(half_open, target))
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert _left_in(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_a_run_cancelled_after_the_backend_returned_leaves_nothing(
+    workspace: Path, queue, monkeypatch
+):
+    """The window between the backend returning and the manifest landing.
+    Reading HEAD after the run is an await of its own -- up to five seconds on
+    a slow repository -- and a cancellation there left the backend's
+    finished files with no manifest to name them."""
+    f = await _feature(workspace, queue)
+    reading_head_after = asyncio.Event()
+    real_git_head = capture.git_head
+    heads_read = 0
+
+    async def git_head(cwd):
+        nonlocal heads_read
+        heads_read += 1
+        if heads_read == 1:
+            return await real_git_head(cwd)
+        reading_head_after.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(capture, "git_head", git_head)
+    captures = workspace / "captures"
+
+    task = asyncio.create_task(f.shell(command="echo hello", capture_output=True))
+    await asyncio.wait_for(reading_head_after.wait(), timeout=10)
+    assert [Path(n).suffix for n in _left_in(captures)] == [".stderr", ".stdout"]
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert _left_in(captures) == []
+    capture.prune(captures, cutoff=time.time() + 3600)
+    assert _left_in(captures) == []
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_that_could_not_be_written_takes_its_set_with_it(
+    workspace: Path, queue, monkeypatch
+):
+    """The run fails and says why, and leaves neither its streams nor the
+    half-written manifest: nothing could find the streams, and the fragment
+    would be read as the record of a run."""
+
+    async def failing_write(bundle, body):
+        bundle.manifest_path.write_text('{"run_id": ')
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(capture, "write_manifest", failing_write)
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(command="echo hello", capture_output=True)
+
+    assert env.status is ToolResultStatus.ERROR
+    assert "No space left on device" in env.error
+    assert _left_in(workspace / "captures") == []
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_write_finishes_before_a_cancellation_goes_on(
+    tmp_path: Path, monkeypatch
+):
+    """The write runs in a thread a cancellation cannot stop. Had the
+    cancellation gone on without it, the caller would remove the set as
+    unpublished and the manifest would land afterwards, naming files that no
+    longer exist."""
+    bundle = capture.allocate(tmp_path / "captures")
+    entered = threading.Event()
+    release = threading.Event()
+    real_open = os.open
+
+    def gated_open(path, flags, mode=0o777, *args, **kwargs):
+        if Path(path) == bundle.manifest_path:
+            entered.set()
+            release.wait(5)
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(capture.os, "open", gated_open)
+
+    task = asyncio.create_task(capture.write_manifest(bundle, {"run_id": "x"}))
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=0.2)
+    assert not done, "the cancellation went on while the manifest was being written"
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert json.loads(bundle.manifest_path.read_text()) == {"run_id": "x"}
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_final_local_close_still_leaves_nothing(
+    tmp_path: Path, monkeypatch
+):
+    """Found by review, the docker case's twin. The command had finished, and
+    a cancellation landing while the files closed ended the call with no
+    result -- and, because the close ran after the run was marked done, with
+    both files kept."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    closing = threading.Event()
+    release = threading.Event()
+    handles: list = []
+    real_open = local_mod._open_capture
+
+    class _ClosingSlowly:
+        def __init__(self, fh) -> None:
+            self.fh = fh
+
+        def write(self, data: bytes) -> int:
+            return self.fh.write(data)
+
+        def close(self) -> None:
+            closing.set()
+            release.wait(5)
+            self.fh.close()
+
+    def open_slow_close(cap):
+        out_fh, err_fh = real_open(cap)
+        handles.extend((out_fh, err_fh))
+        return out_fh, _ClosingSlowly(err_fh)
+
+    monkeypatch.setattr(local_mod, "_open_capture", open_slow_close)
+    bundle = capture.allocate(tmp_path / "captures")
+
+    task = asyncio.create_task(
+        LocalSandboxBackend(GRANTS).exec(
+            ["python3", "-c", "print('VERDICT: clean')"],
+            cwd=None,
+            env=None,
+            timeout=30,
+            capture=CaptureTarget(
+                stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+            ),
+        )
+    )
+    try:
+        assert await asyncio.to_thread(closing.wait, 10), "the close was never reached"
+        task.cancel()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert all(fh.closed for fh in handles)
+    assert _left_in(tmp_path / "captures") == []

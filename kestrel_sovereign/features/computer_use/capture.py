@@ -36,7 +36,9 @@ tell that a verdict was about a tree that no longer exists.
 A review artifact is worth keeping for a while and not forever, and no
 backend puts a cap on its size -- both stream each pipe to its file as the
 command writes it (#3277) -- so :func:`prune` retires whole artifact sets
-once their manifest passes the retention cutoff (#3279).
+once their manifest passes the retention cutoff (#3279). A run that ends
+before its manifest is written has nothing for that cutoff to read, so its
+files are removed with :func:`discard` when it ends (#3512).
 """
 
 from __future__ import annotations
@@ -52,6 +54,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
+
+from kestrel_sovereign._async_ownership import run_blocking_operation
 
 logger = logging.getLogger(__name__)
 
@@ -232,7 +236,13 @@ def open_stream(path: Path):
 
 
 async def write_manifest(bundle: CaptureBundle, body: dict[str, Any]) -> None:
-    """Write the manifest with ``fsync``, matching the audit log's durability."""
+    """Write the manifest with ``fsync``, matching the audit log's durability.
+
+    Finished before a cancellation of the caller propagates. A thread cannot
+    be stopped, so a manifest the caller stopped waiting for would land after
+    the caller had already decided the run was never published and removed
+    its streams -- a manifest naming files that no longer exist.
+    """
 
     def _write() -> None:
         line = json.dumps(body, indent=2, sort_keys=True) + "\n"
@@ -243,7 +253,26 @@ async def write_manifest(bundle: CaptureBundle, body: dict[str, Any]) -> None:
         finally:
             os.close(fd)
 
-    await asyncio.to_thread(_write)
+    await run_blocking_operation(_write)
+
+
+def discard(paths: Iterable[Path]) -> None:
+    """Remove the files of an artifact set that will never be published.
+
+    :func:`prune` retires a set by its manifest, so files whose run ended
+    before writing one -- it raised, or was cancelled -- are invisible to
+    retention and would stay forever (#3512). Whoever ends such a run
+    removes them instead.
+
+    Synchronous. Best effort: a file that cannot be removed is logged, never
+    raised, so the error or cancellation that ended the run is the one the
+    caller sees.
+    """
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("could not remove unpublished capture file %s: %s", path, exc)
 
 
 def prune(

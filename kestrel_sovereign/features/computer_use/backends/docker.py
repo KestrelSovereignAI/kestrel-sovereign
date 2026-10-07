@@ -27,11 +27,12 @@ than a program of their own — the same defect one layer down.
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 import uuid
 from pathlib import Path
 from typing import BinaryIO, Optional
+
+from kestrel_sovereign._async_ownership import run_blocking_operation
 
 from .base import (
     CaptureTarget,
@@ -39,13 +40,13 @@ from .base import (
     DirEntry,
     SandboxBackend,
     close_capture,
+    discard_capture,
     host_list,
     host_read,
     host_write,
     open_capture,
+    open_capture_owned,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class DockerSandboxBackend(SandboxBackend):
@@ -144,6 +145,11 @@ class DockerSandboxBackend(SandboxBackend):
         so by handing the sink a final ``b""``; nothing else — not the exit
         code, not the record's flags — is evidence that the pipe was read to
         its end.
+
+        The files outlive this call only when it returns a result naming
+        them. A call that raises — no ``docker`` to run, a cancellation, an
+        executor error — removes them first, because only a returned result
+        gets the manifest that pruning retires a set by (#3512).
         """
         if not argv:
             raise ValueError("empty argv")
@@ -151,7 +157,6 @@ class DockerSandboxBackend(SandboxBackend):
         from kestrel_sovereign.features.compute.models import ComputeCommand
         from kestrel_sovereign.features.compute.executors.base import (
             _OUTPUT_TRUNCATED_SUFFIX,
-            ExecutionEnvironmentError,
             ExecutionTimeoutError,
             OutputSinks,
         )
@@ -170,7 +175,7 @@ class DockerSandboxBackend(SandboxBackend):
         out_fh = err_fh = None
         if capture is not None:
             try:
-                out_fh, err_fh = await asyncio.to_thread(open_capture, capture)
+                out_fh, err_fh = await open_capture_owned(open_capture, capture)
             except OSError as exc:
                 # Defaults here would have said "nothing truncated, no
                 # writers" — and the feature would then write a manifest
@@ -192,7 +197,10 @@ class DockerSandboxBackend(SandboxBackend):
 
         record = None
         timed_out = False
-        never_ran = False
+        # Whether the run reached an outcome to return, its files closed.
+        # Without one the files are removed below, not left for a manifest
+        # that will never be written.
+        has_outcome = False
         try:
             try:
                 record = await self._executor.execute_command(
@@ -206,14 +214,6 @@ class DockerSandboxBackend(SandboxBackend):
                 )
             except ExecutionTimeoutError:
                 timed_out = True
-            except ExecutionEnvironmentError:
-                # No ``docker`` to run: nothing ran, so there is no output and
-                # no artifact, and the caller gets the error instead of
-                # paths. The files opened for one would be stream files no
-                # manifest names, and pruning retires a set by its manifest —
-                # on a host without Docker, two more per call, forever.
-                never_ran = True
-                raise
             if record is not None and err_sink is not None and not err_sink.ended:
                 # The executor returned without reading stderr to its end,
                 # which it does only when the run failed under it — a
@@ -228,15 +228,19 @@ class DockerSandboxBackend(SandboxBackend):
                     await err_sink.annotate(
                         (record.stderr + "\n").encode("utf-8", errors="replace")
                     )
-        finally:
             # Retired before closing, so a drain the executor abandoned
             # cannot write into a file whose completeness is being decided.
-            for sink in (out_sink, err_sink):
-                if sink is not None:
-                    sink.retire()
+            _retire(out_sink, err_sink)
+            # Inside the ``try``: a cancellation that lands during the close
+            # also leaves the run with no result to name the files.
             close_errors = await close_capture(out_fh, err_fh)
-            if never_ran and capture is not None:
-                await asyncio.to_thread(_discard_capture, capture)
+            has_outcome = True
+        finally:
+            if capture is not None and not has_outcome:
+                # Retired first here too: a drain still running must not
+                # write into a file that is being removed.
+                _retire(out_sink, err_sink)
+                await run_blocking_operation(discard_capture, capture, out_fh, err_fh)
         duration_ms = int((time.monotonic() - started) * 1000)
 
         stdout_path = str(capture.stdout_path) if capture else None
@@ -368,17 +372,11 @@ class _StreamCapture:
         return not self.ended or self.error is not None
 
 
-def _discard_capture(capture: CaptureTarget) -> None:
-    """Remove the stream files of a run that never started.
-
-    Best effort: a file that cannot be removed is logged, never raised, so
-    the error that explains why nothing ran is the one the caller sees.
-    """
-    for path in (capture.stdout_path, capture.stderr_path):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as exc:
-            logger.warning("could not remove unused capture file %s: %s", path, exc)
+def _retire(*sinks: Optional[_StreamCapture]) -> None:
+    """Have each sink accept nothing more: its file is about to be closed."""
+    for sink in sinks:
+        if sink is not None:
+            sink.retire()
 
 
 def _split_truncation_marker(

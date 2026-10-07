@@ -16,12 +16,21 @@ matched against the allow/deny lists.
 from __future__ import annotations
 
 import asyncio
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
-from ..capture import open_stream
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    raise_owned_outcome,
+    run_blocking_operation,
+)
+
+from ..capture import discard, open_stream
+
+logger = logging.getLogger(__name__)
 
 
 class CapabilityBlocked(Exception):
@@ -218,6 +227,60 @@ def open_capture(capture: CaptureTarget) -> tuple[BinaryIO, BinaryIO]:
         out_fh.close()
         raise
     return out_fh, err_fh
+
+
+async def open_capture_owned(
+    opener: Callable[[CaptureTarget], tuple[BinaryIO, BinaryIO]],
+    capture: CaptureTarget,
+) -> tuple[BinaryIO, BinaryIO]:
+    """Run ``opener`` in a worker without orphaning what it opens.
+
+    Cancelling the caller does not stop the thread. An open the caller
+    stopped waiting for still creates both files, and then nothing closes
+    them or removes them: the run never reaches the manifest that would let
+    pruning retire them (#3512). So the open is awaited to its end whatever
+    happens to the caller, and a caller cancelled meanwhile has the files
+    closed and removed before the cancellation goes on. Any other outcome is
+    the opener's own, returned or raised.
+    """
+    outcome = await await_owned_task(
+        asyncio.create_task(asyncio.to_thread(opener, capture))
+    )
+    if outcome.cancellation is not None:
+        # Also when the open failed: a first file opened before the second
+        # failed is closed by the opener and still on disk.
+        await run_blocking_operation(
+            discard_capture, capture, *(outcome.result or ())
+        )
+    return raise_owned_outcome(outcome, operation="opening a capture")
+
+
+def discard_capture(capture: CaptureTarget, *handles: BinaryIO | None) -> None:
+    """Close ``handles`` and remove the capture's files.
+
+    For a run that ends without a result to name them: no ``docker`` to run,
+    a cancellation, anything else ``exec`` raises. Pruning retires an
+    artifact set by its manifest, and only a returned result gets one, so
+    these files would otherwise be retired by nothing. On a host without
+    Docker that was two more per call, forever; and since the output is
+    streamed to disk (#3277), a cancelled long run left files as large as
+    everything it printed (#3512).
+
+    Synchronous; a caller on the event loop runs it in a worker, under
+    :func:`~kestrel_sovereign._async_ownership.run_blocking_operation` so a
+    second cancellation cannot stop it halfway. Closed before removal,
+    because Windows refuses to unlink an open file. Best effort: a failure is
+    logged, never raised, so the error or cancellation that ended the run is
+    the one the caller sees.
+    """
+    for fh in handles:
+        if fh is None:
+            continue
+        try:
+            fh.close()
+        except OSError as exc:
+            logger.warning("could not close an unpublished capture file: %s", exc)
+    discard((capture.stdout_path, capture.stderr_path))
 
 
 async def close_capture(

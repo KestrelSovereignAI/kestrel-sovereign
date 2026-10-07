@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -707,3 +708,239 @@ async def test_a_stream_annotated_with_a_diagnostic_stays_lost(
 
     assert result.truncated_stderr is True
     assert target.stderr_path.read_bytes() == b"early\n" + note
+
+
+# --- #3512: a run that returns no result leaves no files behind -------------
+
+
+class _BlockingExecutor:
+    """A container that has written some output and is still running.
+
+    It never returns on its own: the call ends only when it is cancelled, or
+    with ``error`` once ``fail`` is set.
+    """
+
+    def __init__(self, error: Optional[BaseException] = None) -> None:
+        self.running = asyncio.Event()
+        self.fail = asyncio.Event()
+        self._error = error
+
+    async def execute_command(self, command, working_dir=None, *, output_sinks=None):
+        await output_sinks.stdout(b"the first half of a long review\n")
+        await output_sinks.stderr(b"progress\n")
+        self.running.set()
+        await self.fail.wait()
+        raise self._error
+
+
+def _left_in(directory: Path) -> list[str]:
+    return sorted(p.name for p in directory.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_capture_leaves_nothing_pruning_cannot_retire(
+    tmp_path: Path,
+) -> None:
+    """The defect. Since #3277 the container's output streams to the files
+    while it runs, so a cancelled run has already written them. Only a
+    returned result gets the manifest that pruning retires a set by, and the
+    files used to be discarded only when there was no ``docker`` at all: a
+    cancelled long run left files as large as everything it printed, that no
+    prune would ever remove."""
+    executor = _BlockingExecutor()
+    backend = DockerSandboxBackend(granted_capabilities={"shell_execution_sandboxed"})
+    backend._executor = executor  # type: ignore[assignment]
+    target = _target(tmp_path)
+    captures = target.stdout_path.parent
+
+    task = asyncio.create_task(
+        backend.exec(
+            ["claude", "-p", "review"], cwd=None, env=None, timeout=3600, capture=target
+        )
+    )
+    await asyncio.wait_for(executor.running.wait(), timeout=5)
+    assert target.stdout_path.exists() and target.stderr_path.exists()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert _left_in(captures) == []
+    capture.prune(captures, cutoff=time.time() + 3600)
+    assert _left_in(captures) == []
+
+
+@pytest.mark.asyncio
+async def test_an_executor_error_mid_run_leaves_no_files_either(
+    tmp_path: Path,
+) -> None:
+    """The rule is "no result, no files", not a list of the ways to get no
+    result: the no-``docker`` case was handled and a cancellation was not."""
+    executor = _BlockingExecutor(error=RuntimeError("docker daemon went away"))
+    backend = DockerSandboxBackend(granted_capabilities={"shell_execution_sandboxed"})
+    backend._executor = executor  # type: ignore[assignment]
+    target = _target(tmp_path)
+
+    task = asyncio.create_task(
+        backend.exec(["echo", "hi"], cwd=None, env=None, timeout=30, capture=target)
+    )
+    await asyncio.wait_for(executor.running.wait(), timeout=5)
+    executor.fail.set()
+    with pytest.raises(RuntimeError, match="daemon went away"):
+        await task
+
+    assert _left_in(target.stdout_path.parent) == []
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_open_does_not_orphan_what_it_opens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same leak one await earlier. The files are opened in a worker
+    thread, and cancelling the caller does not stop the thread: it went on to
+    create both files after the caller had gone, leaving two open handles
+    nothing would close and two files no manifest would ever name."""
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    opened: list = []
+    real_open = docker_backend.open_capture
+
+    def slow_open(target):
+        entered.set()
+        release.wait(5)
+        try:
+            handles = real_open(target)
+            opened.extend(handles)
+            return handles
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(docker_backend, "open_capture", slow_open)
+    backend = _real_backend()
+    calls = _fake_docker(monkeypatch, backend, _ContainerRun(b"x", b""))
+    target = _target(tmp_path)
+
+    task = asyncio.create_task(
+        backend.exec(["echo", "hi"], cwd=None, env=None, timeout=30, capture=target)
+    )
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Whatever the thread was doing has finished, so nothing below can be
+    # read before the files it creates exist.
+    assert await asyncio.to_thread(finished.wait, 5)
+
+    assert calls == []
+    assert len(opened) == 2 and all(fh.closed for fh in opened)
+    assert _left_in(target.stdout_path.parent) == []
+
+
+class _ClosingSlowly:
+    """A capture handle whose close waits until the test lets it finish."""
+
+    def __init__(self, fh, closing: threading.Event, release: threading.Event) -> None:
+        self.fh = fh
+        self._closing = closing
+        self._release = release
+
+    def write(self, data: bytes) -> int:
+        return self.fh.write(data)
+
+    def close(self) -> None:
+        self._closing.set()
+        self._release.wait(5)
+        self.fh.close()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_final_close_still_leaves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found by review. The run had finished, but the files are only final
+    once closed, and a cancellation landing in that close still ends the
+    call without a result: closing in the ``finally`` and marking the run
+    done before it let that cancellation through with both files kept."""
+    closing = threading.Event()
+    release = threading.Event()
+    handles: list = []
+    real_open = docker_backend.open_capture
+
+    def open_slow_close(target):
+        out_fh, err_fh = real_open(target)
+        handles.extend((out_fh, err_fh))
+        return out_fh, _ClosingSlowly(err_fh, closing, release)
+
+    monkeypatch.setattr(docker_backend, "open_capture", open_slow_close)
+
+    class _Executor:
+        async def execute_command(self, command, working_dir=None, *, output_sinks=None):
+            await output_sinks.stdout(b"VERDICT: clean\n")
+            await output_sinks.stdout(b"")
+            await output_sinks.stderr(b"")
+            return ExecutionRecord(
+                id="exec-1", script_id=command.id, exit_code=0, executor="docker"
+            )
+
+    backend = DockerSandboxBackend(granted_capabilities={"shell_execution_sandboxed"})
+    backend._executor = _Executor()  # type: ignore[assignment]
+    target = _target(tmp_path)
+
+    task = asyncio.create_task(
+        backend.exec(["echo", "hi"], cwd=None, env=None, timeout=30, capture=target)
+    )
+    try:
+        assert await asyncio.to_thread(closing.wait, 5), "the close was never reached"
+        task.cancel()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert all(fh.closed for fh in handles)
+    assert _left_in(target.stdout_path.parent) == []
+
+
+@pytest.mark.asyncio
+async def test_a_drain_left_running_by_a_cancel_is_refused_not_failed(
+    tmp_path: Path,
+) -> None:
+    """The executor keeps no promise to stop its drain when the call is
+    cancelled. Output it delivers after the files were closed and removed
+    must be refused by the sink, as on the success path -- not written to a
+    closed file, which raises into the executor's own task."""
+    running = asyncio.Event()
+    removed = asyncio.Event()
+    late: list[asyncio.Task] = []
+
+    class _Executor:
+        async def execute_command(self, command, working_dir=None, *, output_sinks=None):
+            async def abandoned_drain() -> None:
+                await removed.wait()
+                await output_sinks.stdout(b"late\n")
+                await output_sinks.stdout(b"")
+
+            late.append(asyncio.create_task(abandoned_drain()))
+            running.set()
+            await asyncio.Event().wait()
+
+    backend = DockerSandboxBackend(granted_capabilities={"shell_execution_sandboxed"})
+    backend._executor = _Executor()  # type: ignore[assignment]
+    target = _target(tmp_path)
+
+    task = asyncio.create_task(
+        backend.exec(["echo", "hi"], cwd=None, env=None, timeout=30, capture=target)
+    )
+    await asyncio.wait_for(running.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    removed.set()
+    try:
+        await asyncio.wait_for(late[0], timeout=5)
+    finally:
+        late[0].cancel()
+
+    assert _left_in(target.stdout_path.parent) == []
