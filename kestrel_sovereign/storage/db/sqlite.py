@@ -7,7 +7,9 @@ Implementation of DatabaseBackend using aiosqlite.
 import asyncio
 import logging
 import os
+import sqlite3
 import time
+import weakref
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +50,11 @@ _AIOSQLITE_WORKER_SHUTDOWN_POLL_S = 0.01
 _SQLITE_BUSY_TIMEOUT_S = 30.0
 _CANCELLED_OPERATION_DRAIN_TIMEOUT_S = _SQLITE_BUSY_TIMEOUT_S
 
+# Backoff between attempts of a cancellation-drain rollback that the drain's
+# own interrupt aborted. Attempts stop at the drain deadline above.
+_CANCELLED_WRITE_ROLLBACK_RETRY_INITIAL_S = 0.01
+_CANCELLED_WRITE_ROLLBACK_RETRY_MAX_S = 0.25
+
 
 class ColdReadUnavailable(RuntimeError):
     """A cold read was requested for a database that is not quiescent.
@@ -61,6 +68,14 @@ class ColdReadUnavailable(RuntimeError):
 
 class _CancelledWriteDrainDeadlineExceeded(RuntimeError):
     """A retained rollback is still running after a later writer's budget."""
+
+
+def _is_sqlite_interrupt(exc: Exception) -> bool:
+    """Whether ``exc`` is SQLite's ``SQLITE_INTERRUPT`` result, nothing broader."""
+    return (
+        isinstance(exc, sqlite3.OperationalError)
+        and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT
+    )
 
 
 @dataclass
@@ -395,6 +410,13 @@ class SQLiteBackend(DatabaseBackend):
         self._cancelled_write_drain: Optional[asyncio.Task[None]] = None
         self._cancelled_write_drain_started_at: Optional[float] = None
         self._cancelled_write_drain_error: Optional[Exception] = None
+        # A cancelled shared-connection read skips its inline cursor close, so
+        # its statement can stay active. The drain closes the ones still alive
+        # when that statement aborts its rollback. Weak, so recording a cursor
+        # never extends its statement's life.
+        self._abandoned_read_cursors: weakref.WeakSet[aiosqlite.Cursor] = (
+            weakref.WeakSet()
+        )
         self._retired_connection_closes: _RetainedAiosqliteCloses = {}
         self._closing = False
     
@@ -447,8 +469,7 @@ class SQLiteBackend(DatabaseBackend):
             drain is not None
             and not drain.done()
             and started_at is not None
-            and time.monotonic() - started_at
-            >= _CANCELLED_OPERATION_DRAIN_TIMEOUT_S
+            and self._cancelled_write_drain_remaining(started_at) <= 0
         )
 
     @property
@@ -662,6 +683,7 @@ class SQLiteBackend(DatabaseBackend):
             self._cancelled_write_drain = None
             self._cancelled_write_drain_started_at = None
             self._cancelled_write_drain_error = None
+            self._abandoned_read_cursors.clear()
             self._closing = False
             
             logger.debug(f"Connected to SQLite: {self.db_path}")
@@ -761,6 +783,7 @@ class SQLiteBackend(DatabaseBackend):
             self._cancelled_write_drain = None
             self._cancelled_write_drain_started_at = None
             self._cancelled_write_drain_error = None
+            self._abandoned_read_cursors.clear()
             self._closing = False
 
         if pending_cancellation is not None:
@@ -934,8 +957,7 @@ class SQLiteBackend(DatabaseBackend):
             remaining = _CANCELLED_OPERATION_DRAIN_TIMEOUT_S
             if started_at is not None:
                 remaining = max(
-                    0.0,
-                    remaining - (time.monotonic() - started_at),
+                    0.0, self._cancelled_write_drain_remaining(started_at)
                 )
             try:
                 async with asyncio.timeout(remaining):
@@ -1012,15 +1034,16 @@ class SQLiteBackend(DatabaseBackend):
             logger.error("Overlapping SQLite cancellation drains detected")
             return
 
+        started_at = time.monotonic()
         self._cancelled_write_drain_error = None
-        self._cancelled_write_drain_started_at = time.monotonic()
+        self._cancelled_write_drain_started_at = started_at
         self._cancelled_write_drain = asyncio.create_task(
-            self._drain_cancelled_write(conn),
+            self._drain_cancelled_write(conn, started_at=started_at),
             name=f"sqlite-cancelled-write-drain:{self.db_path}",
         )
 
     async def _drain_cancelled_write(
-        self, conn: aiosqlite.Connection
+        self, conn: aiosqlite.Connection, *, started_at: float
     ) -> None:
         """Interrupt and roll back one cancelled operation, then retire its fence."""
         this_task = asyncio.current_task()
@@ -1043,7 +1066,7 @@ class SQLiteBackend(DatabaseBackend):
                     self.db_path,
                     exc_info=True,
                 )
-            await conn.rollback()
+            await self._rollback_cancelled_write(conn, started_at=started_at)
         except Exception as exc:
             self._cancelled_write_drain_error = exc
             logger.exception(
@@ -1063,6 +1086,72 @@ class SQLiteBackend(DatabaseBackend):
             if self._cancelled_write_drain is this_task:
                 self._cancelled_write_drain = None
                 self._cancelled_write_drain_started_at = None
+
+    async def _rollback_cancelled_write(
+        self, conn: aiosqlite.Connection, *, started_at: float
+    ) -> None:
+        """Roll back for the drain, retrying a rollback its interrupt aborted.
+
+        ``sqlite3_interrupt()`` also interrupts every statement started before
+        the connection's active-statement count reaches zero, so a ROLLBACK
+        queued while the cancelled operation left a statement active fails
+        ``interrupted``. That is the drain's own interrupt, not a cleanup
+        failure: release the abandoned statements and retry within the drain
+        deadline. Any other failure, an interrupt while ``close`` owns the
+        connection, or a rollback still interrupted at the deadline raises.
+        """
+        retry_delay = _CANCELLED_WRITE_ROLLBACK_RETRY_INITIAL_S
+        while True:
+            try:
+                await conn.rollback()
+                return
+            except sqlite3.OperationalError as exc:
+                if (
+                    not _is_sqlite_interrupt(exc)
+                    or self._closing
+                    or self._cancelled_write_drain_remaining(started_at) <= 0
+                ):
+                    raise
+            logger.debug(
+                "SQLite cancellation rollback for %s was interrupted by its "
+                "drain; retrying after releasing abandoned statements",
+                self.db_path,
+            )
+            await self._release_abandoned_statements(conn)
+            await asyncio.sleep(
+                min(
+                    retry_delay,
+                    max(0.0, self._cancelled_write_drain_remaining(started_at)),
+                )
+            )
+            retry_delay = min(
+                2 * retry_delay, _CANCELLED_WRITE_ROLLBACK_RETRY_MAX_S
+            )
+
+    @staticmethod
+    def _cancelled_write_drain_remaining(started_at: float) -> float:
+        """Seconds left of the drain deadline that began at ``started_at``."""
+        return _CANCELLED_OPERATION_DRAIN_TIMEOUT_S - (
+            time.monotonic() - started_at
+        )
+
+    async def _release_abandoned_statements(
+        self, conn: aiosqlite.Connection
+    ) -> None:
+        """Reset the statements cancelled reads left active on ``conn``.
+
+        Closes the abandoned read cursors still alive. A read cancelled while
+        its ``execute`` was in flight never received its cursor, and
+        aiosqlite's worker keeps the last result it produced (that cursor)
+        until it completes another operation. Opening and closing a cursor
+        completes one, which releases it.
+        """
+        abandoned = list(self._abandoned_read_cursors)
+        self._abandoned_read_cursors.clear()
+        for cursor in abandoned:
+            await cursor.close()
+        released = await conn.cursor()
+        await released.close()
 
     async def _rollback_after_failure(
         self, conn: aiosqlite.Connection
@@ -1174,9 +1263,12 @@ class SQLiteBackend(DatabaseBackend):
             return [tuple(row) for row in result]
         except asyncio.CancelledError:
             cancelled = True
-            if conn is self._connection and not self._in_transaction:
-                self._handoff_cancelled_write(conn)
-            elif conn is not self._connection:
+            if conn is self._connection:
+                if cursor is not None:
+                    self._abandoned_read_cursors.add(cursor)
+                if not self._in_transaction:
+                    self._handoff_cancelled_write(conn)
+            else:
                 # A snapshot is private to this read, so it needs no shared
                 # transaction fence. Interrupt its current SQLite operation so
                 # _read_connection can close the owned worker without waiting

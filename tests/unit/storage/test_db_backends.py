@@ -2,7 +2,9 @@
 Tests for database backend abstraction layer.
 """
 import asyncio
+import sqlite3
 import threading
+import time
 from contextlib import suppress
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,8 +27,29 @@ from tests.utils.aiosqlite_workers import (
 )
 
 
+# Bound for awaits that must finish promptly. Generous, so a GC pause on a
+# loaded xdist worker cannot fail a passing test.
+_HANG_GUARD_SECONDS = 30.0
+
+
 async def _read_owns_open_transaction(database):
     return database.owns_open_transaction
+
+
+def _sqlite_operational_error(
+    code: int, name: str, message: str
+) -> sqlite3.OperationalError:
+    """An OperationalError carrying the result code sqlite3 attaches."""
+    exc = sqlite3.OperationalError(message)
+    exc.sqlite_errorcode = code
+    exc.sqlite_errorname = name
+    return exc
+
+
+def _sqlite_interrupted() -> sqlite3.OperationalError:
+    return _sqlite_operational_error(
+        sqlite3.SQLITE_INTERRUPT, "SQLITE_INTERRUPT", "interrupted"
+    )
 
 
 class TestPlaceholderConversion:
@@ -1300,6 +1323,294 @@ class TestSQLiteBackend:
                 assert backend.write_connection_unavailable is False
                 await backend.execute("CREATE TABLE later (id INTEGER)")
                 await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_drain_retries_rollback_its_own_interrupt_aborted(
+        self, backend
+    ):
+        """An interrupted drain rollback converges instead of latching (#3496)."""
+        await backend.execute("CREATE TABLE durable (value INTEGER NOT NULL)")
+        conn = backend._ensure_connected()
+        real_rollback = conn.rollback
+        attempts = 0
+
+        async def rollback_interrupted_once():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise _sqlite_interrupted()
+            await real_rollback()
+
+        with patch.object(conn, "rollback", new=rollback_interrupted_once):
+            backend._handoff_cancelled_write(conn)
+            drain = backend._cancelled_write_drain
+            assert drain is not None
+            async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                await drain
+
+        assert attempts == 2
+        assert backend._cancelled_write_drain_error is None
+        assert backend.write_connection_unavailable is False
+        await backend.execute("INSERT INTO durable (value) VALUES (1)")
+        assert await backend.fetch_val("SELECT value FROM durable") == 1
+
+    @pytest.mark.asyncio
+    async def test_drain_rollback_failing_otherwise_still_latches(
+        self, backend
+    ):
+        """Only SQLITE_INTERRUPT is retried; any other failure latches."""
+        conn = backend._ensure_connected()
+        failure = _sqlite_operational_error(
+            sqlite3.SQLITE_IOERR, "SQLITE_IOERR", "disk I/O error"
+        )
+        attempts = 0
+
+        async def failing_rollback():
+            nonlocal attempts
+            attempts += 1
+            raise failure
+
+        with patch.object(conn, "rollback", new=failing_rollback):
+            backend._handoff_cancelled_write(conn)
+            drain = backend._cancelled_write_drain
+            assert drain is not None
+            async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                await drain
+
+        assert attempts == 1
+        assert backend._cancelled_write_drain_error is failure
+        assert backend.write_connection_requires_reconnect is True
+        with pytest.raises(ConnectionError, match="cancellation cleanup failed"):
+            await backend.execute("CREATE TABLE later (id INTEGER)")
+
+    @pytest.mark.asyncio
+    async def test_drain_rollback_still_interrupted_at_deadline_latches(
+        self, backend, monkeypatch
+    ):
+        """The retry stays inside the drain deadline, then latches."""
+        drain_timeout = 0.2
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "_CANCELLED_OPERATION_DRAIN_TIMEOUT_S",
+            drain_timeout,
+        )
+        conn = backend._ensure_connected()
+
+        async def always_interrupted():
+            raise _sqlite_interrupted()
+
+        with patch.object(conn, "rollback", new=always_interrupted):
+            backend._handoff_cancelled_write(conn)
+            drain = backend._cancelled_write_drain
+            started_at = backend._cancelled_write_drain_started_at
+            assert drain is not None and started_at is not None
+            async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                await drain
+            latched_after = time.monotonic() - started_at
+
+        assert latched_after >= drain_timeout
+        assert sqlite_backend_module._is_sqlite_interrupt(
+            backend._cancelled_write_drain_error
+        )
+        assert backend.write_connection_requires_reconnect is True
+        with pytest.raises(ConnectionError, match="cancellation cleanup failed"):
+            await backend.execute("CREATE TABLE later (id INTEGER)")
+
+    @pytest.mark.asyncio
+    async def test_drain_does_not_retry_rollback_interrupted_during_close(
+        self, tmp_path
+    ):
+        """Close's interrupt is close's: the drain stops instead of retrying."""
+        backend = SQLiteBackend(str(tmp_path / "close-interrupts-drain.db"))
+        await backend.connect()
+        conn = backend._ensure_connected()
+        rollback_started = asyncio.Event()
+        release_rollback = asyncio.Event()
+        attempts = 0
+
+        async def rollback_interrupted_by_close():
+            nonlocal attempts
+            attempts += 1
+            rollback_started.set()
+            await release_rollback.wait()
+            raise _sqlite_interrupted()
+
+        close_task = None
+        drain = None
+        try:
+            with patch.object(
+                conn, "rollback", new=rollback_interrupted_by_close
+            ):
+                backend._handoff_cancelled_write(conn)
+                drain = backend._cancelled_write_drain
+                assert drain is not None
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    await rollback_started.wait()
+                close_task = asyncio.create_task(backend.close())
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    while not backend._closing:
+                        await asyncio.sleep(0)
+                release_rollback.set()
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    await close_task
+
+            assert attempts == 1
+            assert drain.done() and not drain.cancelled()
+            assert not backend.is_connected
+        finally:
+            release_rollback.set()
+            for task in (drain, close_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (drain, close_task) if task is not None),
+                return_exceptions=True,
+            )
+            if backend.is_connected:
+                await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_drain_releases_read_cursor_held_by_aiosqlite_worker(
+        self, backend, monkeypatch
+    ):
+        """A transaction read cancelled mid-execute leaves a genuinely
+        interrupted ROLLBACK, and the drain still converges (#3496).
+
+        The worker finished the SELECT's first step, so its statement is
+        active and only aiosqlite's worker still references its cursor.
+        """
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "_CANCELLED_OPERATION_DRAIN_TIMEOUT_S",
+            5.0,
+        )
+        await backend.execute("CREATE TABLE t (value INTEGER NOT NULL)")
+        await backend.execute_many(
+            "INSERT INTO t (value) VALUES (?)", [(1,), (2,), (3,)]
+        )
+        conn = backend._ensure_connected()
+        real_execute = conn.execute
+        real_rollback = conn.rollback
+        executed = asyncio.Event()
+        rollbacks: list[str] = []
+
+        async def execute_then_hang(sql, parameters=None):
+            if not sql.startswith("SELECT value FROM t"):
+                return await real_execute(sql, parameters)
+            await real_execute(sql, parameters)
+            executed.set()
+            await asyncio.Event().wait()
+
+        async def observed_rollback():
+            try:
+                await real_rollback()
+            except sqlite3.OperationalError as exc:
+                rollbacks.append(exc.sqlite_errorname)
+                raise
+            rollbacks.append("ok")
+
+        async def cancelled_transaction():
+            async with backend.transaction():
+                await backend.execute("INSERT INTO t (value) VALUES (4)")
+                await backend.fetch_all("SELECT value FROM t ORDER BY value")
+
+        with (
+            patch.object(conn, "execute", new=execute_then_hang),
+            patch.object(conn, "rollback", new=observed_rollback),
+        ):
+            transaction = asyncio.create_task(cancelled_transaction())
+            async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                await executed.wait()
+            transaction.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await transaction
+            drain = backend._cancelled_write_drain
+            assert drain is not None
+            async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                await drain
+
+        assert rollbacks == ["SQLITE_INTERRUPT", "ok"]
+        assert backend._cancelled_write_drain_error is None
+        await backend.execute("INSERT INTO t (value) VALUES (5)")
+        assert await backend.fetch_all("SELECT value FROM t ORDER BY value") == [
+            (1,),
+            (2,),
+            (3,),
+            (5,),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_drain_closes_cancelled_read_cursor_before_retrying(
+        self, backend, monkeypatch
+    ):
+        """A cancelled read's cursor kept alive by its task's exception is
+        closed by the drain, so the interrupted ROLLBACK converges (#3496)."""
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "_CANCELLED_OPERATION_DRAIN_TIMEOUT_S",
+            5.0,
+        )
+        await backend.execute("CREATE TABLE t (value INTEGER NOT NULL)")
+        await backend.execute_many(
+            "INSERT INTO t (value) VALUES (?)", [(1,), (2,), (3,)]
+        )
+        conn = backend._ensure_connected()
+        real_rollback = conn.rollback
+        fetch_entered = asyncio.Event()
+        rollbacks: list[str] = []
+
+        async def hanging_fetchall(cursor):
+            fetch_entered.set()
+            await asyncio.Event().wait()
+
+        async def observed_rollback():
+            try:
+                await real_rollback()
+            except sqlite3.OperationalError as exc:
+                rollbacks.append(exc.sqlite_errorname)
+                raise
+            rollbacks.append("ok")
+
+        async def cancelled_transaction():
+            async with backend.transaction():
+                await backend.execute("INSERT INTO t (value) VALUES (4)")
+                await backend.fetch_all("SELECT value FROM t ORDER BY value")
+
+        transaction = asyncio.create_task(cancelled_transaction())
+        try:
+            with (
+                patch.object(aiosqlite.Cursor, "fetchall", new=hanging_fetchall),
+                patch.object(conn, "rollback", new=observed_rollback),
+            ):
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    await fetch_entered.wait()
+                transaction.cancel()
+                drain = None
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    while drain is None:
+                        await asyncio.sleep(0)
+                        drain = backend._cancelled_write_drain
+                # The cancelled transaction is deliberately not awaited yet:
+                # its exception keeps the abandoned cursor alive.
+                assert transaction.done()
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    await drain
+            with pytest.raises(asyncio.CancelledError):
+                await transaction
+        finally:
+            if not transaction.done():
+                transaction.cancel()
+            await asyncio.gather(transaction, return_exceptions=True)
+
+        assert rollbacks == ["SQLITE_INTERRUPT", "ok"]
+        assert backend._cancelled_write_drain_error is None
+        await backend.execute("INSERT INTO t (value) VALUES (5)")
+        assert await backend.fetch_all("SELECT value FROM t ORDER BY value") == [
+            (1,),
+            (2,),
+            (3,),
+            (5,),
+        ]
 
     @pytest.mark.asyncio
     async def test_close_fences_late_cancellation_handoff(self, tmp_path):
