@@ -309,11 +309,8 @@ class OperatorRuntimeRegistry:
         with self._lock:
             candidates = [
                 registration
-                for reference, registration in self._services.items()
-                if reference.name == requirement.name
-                and reference.scope is requirement.scope
-                and reference.agent_id == requirement.agent_id
-                and requirement.accepts(registration.descriptor)
+                for registration in self._services.values()
+                if service_registration_satisfies(registration, requirement)
             ]
             if not candidates:
                 return None
@@ -512,6 +509,21 @@ class OperatorRuntimeRegistry:
         return (int(major), int(minor), int(patch))
 
 
+def service_registration_satisfies(
+    registration: ServiceRegistration, requirement: ServiceRequirement
+) -> bool:
+    """Whether ``registration`` is a stable compatible candidate for ``requirement``.
+
+    The single compatibility rule: the registry resolves services by it, and
+    host-feature start order (#3501) puts a consumer after exactly the
+    providers it would resolve. Host and agent namespaces never cross.
+    """
+
+    return registration.agent_id == requirement.agent_id and requirement.accepts(
+        registration.descriptor
+    )
+
+
 def _validate_owner(owner: object) -> None:
     """Reuse the SDK's canonical lifecycle-owner token validation."""
 
@@ -526,4 +538,5 @@ __all__ = [
     "OperatorRegistrationIdentityError",
     "OperatorRegistrationSet",
     "OperatorRuntimeRegistry",
+    "service_registration_satisfies",
 ]

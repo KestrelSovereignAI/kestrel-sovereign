@@ -176,6 +176,26 @@ Feature-specific startup branches are a boundary smell. A feature that needs
 special startup behavior should express it through lifecycle methods, hooks,
 signals, provider registries, or an explicit descriptor in future work.
 
+### Host-feature start order
+
+Host features start one at a time, provider before consumer (#3501). A host
+feature provides a service through `get_service_registrations()` and consumes
+one by holding a `ServiceRequirement` that it resolves through the host
+operator registry. `start_host_features` in
+`kestrel_sovereign/host_features/runtime.py` reads those requirements from each
+feature's state as constructed: the feature itself, objects whose class comes
+from the feature's own package, and built-in containers among them. A
+requirement that is only created inside `on_host_start`, or only held at module
+level, is not seen and does not order the feature.
+
+A provider's `on_host_start` finishes before any of its consumers is activated
+or started, and `stop_host_features` stops them in reverse, so consumers stop
+before their providers. Features with no dependency between them keep their
+discovery order. A dependency cycle is logged at ERROR, naming its members and
+the services involved, and those members start in discovery order. A
+requirement that no host feature provides is logged at WARNING. Neither case
+drops a feature.
+
 ## Router Contribution
 
 Modules that expose HTTP endpoints should return an `APIRouter` from

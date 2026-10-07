@@ -28,6 +28,7 @@ from kestrel_sovereign.operator import OperatorRuntimeRegistry
 from kestrel_sovereign.signals import SourceRegistry
 from kestrel_sovereign.waits import WaitRegistry
 
+from .start_order import order_host_features_for_start
 from .ui import compute_host_ui_manifest, host_feature_static_mounts
 
 logger = logging.getLogger(__name__)
@@ -173,6 +174,13 @@ async def start_host_features(
 ) -> List[HostFeature]:
     """Start features after validating the complete contribution transition.
 
+    Features start provider-before-consumer, by the ``ServiceRequirement``
+    values each one holds (see :mod:`.start_order`): a provider's
+    ``on_host_start`` has finished before any consumer is activated or started.
+    That start order is recorded in ``ctx.started_host_features``, which
+    :func:`stop_host_features` reverses. The returned list keeps the order of
+    ``features``, so routers and console panels mount in discovery order.
+
     An ordinary feature start failure remains isolated, but its declarative
     registrations are exactly reversed before a later feature is started.
     Contribution contract and owner conflicts raise before any mutation.
@@ -207,7 +215,9 @@ async def start_host_features(
     ) + tuple(transition.rejected)
     previously_started = tuple(getattr(ctx, "started_host_features", ()))
     started: List[HostFeature] = []
-    for feature, prepared_item in transition.activatable(features):
+    for feature, prepared_item in order_host_features_for_start(
+        transition.activatable(features), runtime.operator_registry
+    ):
         try:
             runtime.activate(prepared_item)
         except Exception as exc:
@@ -267,7 +277,8 @@ async def start_host_features(
         ctx.started_host_features = previously_started
         raise
     ctx.started_host_features = (*previously_started, *started)
-    return started
+    started_ids = {id(feature) for feature in started}
+    return [feature for feature in features if id(feature) in started_ids]
 
 
 def _host_feature_name(feature: Any) -> str:
@@ -323,10 +334,25 @@ async def _rollback_started_host_features(
 
 
 async def stop_host_features(features: List[HostFeature], ctx: Any) -> None:
-    """Stop active host features and remove their exact contribution objects."""
+    """Stop active host features and remove their exact contribution objects.
+
+    They stop in the reverse of the order they started
+    (``ctx.started_host_features``), whatever order ``features`` lists them in,
+    so a consumer stops before the provider it depends on.
+    """
     runtime = getattr(ctx, "feature_contribution_runtime", None)
     requested = tuple(features)
-    for feature in reversed(requested):
+    started_at = {
+        id(feature): position
+        for position, feature in enumerate(getattr(ctx, "started_host_features", ()))
+    }
+    # Latest start first; a feature with no recorded start keeps the reverse of
+    # the order it was requested in.
+    for _, feature in sorted(
+        enumerate(requested),
+        key=lambda item: (started_at.get(id(item[1]), -1), item[0]),
+        reverse=True,
+    ):
         if runtime is not None and not runtime.is_active(feature):
             continue
         try:

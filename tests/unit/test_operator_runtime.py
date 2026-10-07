@@ -182,6 +182,22 @@ def test_service_host_and_agent_namespaces_never_fall_back() -> None:
         )
         is None
     )
+    assert (
+        registry.resolve_compatible_service(
+            ServiceRequirement(
+                "operator.shell", "1.0.0", ServiceScope.AGENT, "agent-2"
+            )
+        )
+        is second_agent
+    )
+    assert (
+        registry.resolve_compatible_service(
+            ServiceRequirement(
+                "operator.shell", "1.0.0", ServiceScope.AGENT, "agent-3"
+            )
+        )
+        is None
+    )
 
 
 def test_conflicting_batch_rolls_back_every_registry_kind() -> None:
