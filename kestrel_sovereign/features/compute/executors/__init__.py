@@ -12,6 +12,8 @@ from .base import (
     CommandExecutionUnsupported,
     ExecutionError,
     ExecutionTimeoutError,
+    OutputSink,
+    OutputSinks,
 )
 from .uv_executor import UvExecutor
 from .docker_executor import DockerExecutor
@@ -22,6 +24,8 @@ __all__ = [
     "ExecutionError",
     "ExecutionTimeoutError",
     "CommandExecutionUnsupported",
+    "OutputSink",
+    "OutputSinks",
     "UvExecutor",
     "DockerExecutor",
     "LocalExecutor",

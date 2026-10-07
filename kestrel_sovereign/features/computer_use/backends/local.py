@@ -31,9 +31,11 @@ from .base import (
     CompletedRun,
     DirEntry,
     SandboxBackend,
+    close_capture,
     host_list,
     host_read,
     host_write,
+    open_capture,
 )
 
 logger = logging.getLogger(__name__)
@@ -147,7 +149,6 @@ class LocalSandboxBackend(SandboxBackend):
         full_argv = [binary, *argv[1:]]
         started = time.monotonic()
 
-        close_errors: dict[str, OSError] = {}
         out_error = err_error = None
         spawn_failed = False
         spawn_error = ""
@@ -328,20 +329,10 @@ class LocalSandboxBackend(SandboxBackend):
                     err_error = pumps[1].exception() if pumps[1] in done else None
                     stdout_bytes = stderr_bytes = b""
         finally:
-            # A close flushes, and a flush can fail — a full disk surfaces
-            # here rather than at any write. Swallowing it discarded the
-            # buffered tail of a capture and called the file complete, the
-            # same shape as the unread pump exception.
-            # Off the loop for the same reason the writes are: a close
-            # flushes, and a flush on a slow or full filesystem blocks
-            # everything else in the process — including the timeout that is
-            # supposed to bound this very call.
-            for slot, fh in (("out", out_fh), ("err", err_fh)):
-                if fh is not None:
-                    try:
-                        await asyncio.to_thread(fh.close)
-                    except OSError as exc:  # pragma: no cover - disk-full path
-                        close_errors[slot] = exc
+            # A failed close is the same shape as the unread pump exception:
+            # the buffered tail of a capture discarded, the file called
+            # complete. See :func:`close_capture`.
+            close_errors = await close_capture(out_fh, err_fh)
 
         duration_ms = int((time.monotonic() - started) * 1000)
         effective_cwd = str(cwd) if cwd else os.getcwd()
@@ -540,21 +531,12 @@ async def _kill_tree(pid: int) -> None:
 
 
 def _open_capture(capture: CaptureTarget):
-    """Open both capture files for writing, creating parents.
+    """Open both capture files: :func:`open_capture`, behind a seam of its own.
 
-    Opened ``wb`` rather than appended: a capture path names one run's
-    output, and a stale body under a fresh run's manifest would read as that
-    run's output.
+    The seam is this module's, so a test can fail or slow the open for this
+    backend without reaching into the shared helper.
     """
-    from ..capture import open_stream
-
-    out_fh = open_stream(capture.stdout_path)
-    try:
-        err_fh = open_stream(capture.stderr_path)
-    except OSError:
-        out_fh.close()
-        raise
-    return out_fh, err_fh
+    return open_capture(capture)
 
 
 def _truncate(data: bytes) -> tuple[str, bool]:

@@ -28,6 +28,7 @@ from .base import (
     ExecutionEnvironmentError,
     ExecutionError,
     ExecutionTimeoutError,
+    OutputSinks,
     _ExecutionContext,
     _ExecutionResult,
 )
@@ -881,6 +882,8 @@ class DockerExecutor(BaseExecutor):
         self,
         command: ComputeCommand,
         working_dir: Optional[str] = None,
+        *,
+        output_sinks: Optional[OutputSinks] = None,
     ) -> ExecutionRecord:
         """Execute an argv vector in a container. No script, no shell.
 
@@ -904,10 +907,17 @@ class DockerExecutor(BaseExecutor):
         nothing asks it of a one-shot vector, and an unused parameter is
         an untested way to widen a container.
 
+        ``output_sinks`` widens what the caller can *see*, not what the
+        container can reach: they are fed from the ``docker run`` pipes on
+        this side, and the container is built exactly as without them.
+
         Args:
             command: The :class:`ComputeCommand` to execute
             working_dir: Optional host directory copied into a private,
                 read-only container snapshot.
+            output_sinks: Optional sinks receiving every byte of the
+                container's stdout and stderr, unclipped (see
+                :class:`OutputSinks`).
 
         Returns:
             ExecutionRecord with execution results
@@ -937,6 +947,7 @@ class DockerExecutor(BaseExecutor):
                 docker_path=docker_path,
                 container_name=container_name,
                 deadline=deadline,
+                output_sinks=output_sinks,
             )
 
         async def cleanup(context: _ExecutionContext) -> None:
@@ -960,6 +971,7 @@ class DockerExecutor(BaseExecutor):
         docker_path: str,
         container_name: str,
         deadline: float,
+        output_sinks: Optional[OutputSinks] = None,
     ) -> _ExecutionResult:
         cmd, log_safe_cmd = self._container_invocation(
             docker_path=docker_path,
@@ -1009,6 +1021,7 @@ class DockerExecutor(BaseExecutor):
                     docker_path,
                     container_name,
                 ),
+                sinks=output_sinks,
             )
         except TimeoutError:
             raise ExecutionTimeoutError(

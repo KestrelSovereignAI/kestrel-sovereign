@@ -49,6 +49,33 @@ class _CapturedOutput:
     truncated: bool = False
 
 
+# Receives one output stream's raw bytes, chunk by chunk and in order, as they
+# are read from the pipe -- before any of them is clipped to
+# ``max_output_bytes`` or decoded -- and then exactly one ``b""`` once the
+# stream has reached EOF. That last call is how a caller learns the stream was
+# read to its end: a sink that never saw it was given part of the output at
+# most, whatever the record says.
+#
+# The drain awaits each call before it reads again, so a slow sink slows the
+# pipe instead of buffering the output in memory. An exception raised by a
+# sink ends the drain as a failed read would; a sink that can fail in an
+# expected way (a full disk) records that itself and returns.
+OutputSink = Callable[[bytes], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class OutputSinks:
+    """Where :meth:`BaseExecutor.execute_command` streams each pipe's bytes.
+
+    For a caller that needs the whole output rather than the bounded copy in
+    the :class:`ExecutionRecord` -- computer-use writes a capture artifact the
+    record's ceiling must not clip (#3277).
+    """
+
+    stdout: OutputSink
+    stderr: OutputSink
+
+
 @dataclass(frozen=True, slots=True)
 class _ExecutionContext:
     """State shared by one concrete executor run and its lifecycle."""
@@ -186,6 +213,8 @@ class BaseExecutor(ABC):
         self,
         command: ComputeCommand,
         working_dir: Optional[str] = None,
+        *,
+        output_sinks: Optional[OutputSinks] = None,
     ) -> ExecutionRecord:
         """Execute an argv vector directly — no shell, no script file.
 
@@ -199,6 +228,9 @@ class BaseExecutor(ABC):
         Args:
             command: The :class:`ComputeCommand` to execute
             working_dir: Optional working directory for execution
+            output_sinks: Optional :class:`OutputSinks` that receive every
+                byte of each stream as it is read. The record's copy is
+                still bounded by ``max_output_bytes``; the sinks are not.
 
         Returns:
             ExecutionRecord with stdout, stderr, exit_code, etc.
@@ -357,15 +389,18 @@ class BaseExecutor(ABC):
         *,
         timeout_seconds: int,
         terminate: _ProcessTerminator,
+        sinks: Optional[OutputSinks] = None,
     ) -> tuple[_CapturedOutput, _CapturedOutput]:
         """Drain both pipes concurrently, bounding retained bytes per stream.
 
         Timeout and cancellation both invoke the concrete executor's
         termination strategy, then drain and reap the child before propagating.
+        What is drained after that point is discarded, not given to ``sinks``:
+        their streams never reach EOF, which is what tells the caller so.
         """
         try:
             return await asyncio.wait_for(
-                self._drain_process(process),
+                self._drain_process(process, sinks),
                 timeout=timeout_seconds,
             )
         except (TimeoutError, asyncio.CancelledError):
@@ -400,10 +435,11 @@ class BaseExecutor(ABC):
     async def _drain_process(
         self,
         process: asyncio.subprocess.Process,
+        sinks: Optional[OutputSinks] = None,
     ) -> tuple[_CapturedOutput, _CapturedOutput]:
         stdout, stderr, _ = await asyncio.gather(
-            self._drain_stream(process.stdout),
-            self._drain_stream(process.stderr),
+            self._drain_stream(process.stdout, sinks.stdout if sinks else None),
+            self._drain_stream(process.stderr, sinks.stderr if sinks else None),
             process.wait(),
         )
         return stdout, stderr
@@ -411,19 +447,24 @@ class BaseExecutor(ABC):
     async def _drain_stream(
         self,
         stream: Optional[asyncio.StreamReader],
+        sink: Optional[OutputSink] = None,
     ) -> _CapturedOutput:
-        if stream is None:
-            return _CapturedOutput(b"")
-
         retained = bytearray()
         truncated = False
-        while chunk := await stream.read(_OUTPUT_CHUNK_BYTES):
-            remaining = max(0, self._max_output_bytes - len(retained))
-            if remaining:
-                retained.extend(chunk[:remaining])
-            if len(chunk) > remaining:
-                truncated = True
+        if stream is not None:
+            while chunk := await stream.read(_OUTPUT_CHUNK_BYTES):
+                # Before the clip: the sink is the whole stream, the record
+                # only its first ``max_output_bytes``.
+                if sink is not None:
+                    await sink(chunk)
+                remaining = max(0, self._max_output_bytes - len(retained))
+                if remaining:
+                    retained.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    truncated = True
 
+        if sink is not None:
+            await sink(b"")
         return _CapturedOutput(bytes(retained), truncated)
 
     async def _terminate_and_reap(

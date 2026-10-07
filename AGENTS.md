@@ -165,13 +165,12 @@ runtime rather than by a shell it does not have. Two parameters:
   text becomes a bounded preview showing the head *and the tail*, so a verdict
   at the end of a long review is visible without opening the file. On the
   **local** backend the child writes to the file directly and there is no cap
-  on it. On the **docker** backend — which is the DEFAULT — there is: the
-  capture is written from a string the executor already clipped at
-  `max_output_bytes` (1 MiB unless
-  `[features.computer_use.docker].max_output_bytes` says otherwise), so a
-  review past that ceiling still comes back clipped and PARTIAL. Streaming it
-  is #3277. Check `complete`, as below, rather than assuming the file is
-  whole.
+  on it. On the **docker** backend — which is the DEFAULT — each stream is
+  likewise written to its file as the container produces it, as raw bytes,
+  with no cap on the file (#3277); `max_output_bytes` (1 MiB unless
+  `[features.computer_use.docker].max_output_bytes` says otherwise) bounds
+  only the copy kept in memory. Check `complete`, as below, rather than
+  assuming the file is whole.
 
 The manifest records what ran, where, how it ended, which backend ran it
 (`backend` — the result itself does not carry it), and the git `HEAD` before
@@ -212,10 +211,19 @@ this section was present in the result with that spelling.
 
 What that run did NOT cover: it called `shell` directly rather than through
 the tool executor, so the approval queue and the LLM-facing schema are still
-unexercised; and it ran on the local backend, so it says nothing about the
-docker ceiling above. Review round 12 caught that generalisation — one
-backend's measurement written up as an unqualified promise — which is the same
-defect this section warns about two paragraphs down.
+unexercised; and it ran on the local backend, so it said nothing about docker.
+Review round 12 caught that generalisation — one backend's measurement written
+up as an unqualified promise — which is the same defect this section warns
+about two paragraphs down.
+
+**Measured 2026-10-07 on the DOCKER backend (#3277)**, against a live daemon
+and `alpine:3.19`, with 3,348,905 bytes of `/dev/urandom` (not valid UTF-8).
+Through `shell` the run came back `complete: true` with an artifact of exactly
+that size; through the backend directly, a second run's artifact had the
+SHA-256 the container's own `sha256sum` printed. On the code before #3277 the
+same two runs wrote 1,900,500- and 1,899,855-byte files — the first 1 MiB,
+decoded with replacement and re-encoded — and `shell` came back PARTIAL. Like
+the local run, this called `shell` directly, not through the tool executor.
 
 Note when you first use this that `capture_output` is advertised to the model
 as a *string* (its annotation is `bool | str`, which no JSON schema type

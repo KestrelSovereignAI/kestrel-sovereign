@@ -33,9 +33,10 @@ verdict is about a specific tree, and during the 2026-08-31 run the head
 moved three times in eight hours. ``head_moved`` is how a later reader can
 tell that a verdict was about a tree that no longer exists.
 
-A review artifact is worth keeping for a while and not forever, and the
-local backend puts no cap on its size, so :func:`prune` retires whole
-artifact sets once their manifest passes the retention cutoff (#3279).
+A review artifact is worth keeping for a while and not forever, and no
+backend puts a cap on its size -- both stream each pipe to its file as the
+command writes it (#3277) -- so :func:`prune` retires whole artifact sets
+once their manifest passes the retention cutoff (#3279).
 """
 
 from __future__ import annotations
@@ -228,20 +229,6 @@ def open_stream(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
     return os.fdopen(fd, "wb")
-
-
-async def write_stream(path: Path, data: bytes) -> None:
-    """Write a capture stream in one shot, owner-only.
-
-    For a backend that has already buffered the output and cannot hand the
-    child a descriptor.
-    """
-
-    def _write() -> None:
-        with open_stream(path) as fh:
-            fh.write(data)
-
-    await asyncio.to_thread(_write)
 
 
 async def write_manifest(bundle: CaptureBundle, body: dict[str, Any]) -> None:

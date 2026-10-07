@@ -19,6 +19,9 @@ import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
+
+from ..capture import open_stream
 
 
 class CapabilityBlocked(Exception):
@@ -74,7 +77,11 @@ class CompletedRun:
     the entire failure mode #3243 exists to close.
 
     ``stdout_path``/``stderr_path`` are set when a :class:`CaptureTarget` was
-    given, and name files holding the run's complete output.
+    given, and name files holding the run's complete output. With a capture
+    the files are the output of record and ``truncated_*`` speak for them;
+    ``stdout``/``stderr`` are then at most a bounded copy (empty on the local
+    backend, the executor's clipped copy on the docker one) and are never
+    what a caller should read as the run's output.
     """
 
     argv: list[str]
@@ -191,3 +198,48 @@ def os_scandir(path):
     import os as _os
 
     return _os.scandir(path)
+
+
+# === Shared capture-file handling ============================================
+
+
+def open_capture(capture: CaptureTarget) -> tuple[BinaryIO, BinaryIO]:
+    """Open both capture files for writing, owner-only, creating parents.
+
+    Opened ``wb`` rather than appended: a capture path names one run's
+    output, and a stale body under a fresh run's manifest would read as that
+    run's output. If the second open fails the first handle is closed, so a
+    failure leaves nothing open.
+    """
+    out_fh = open_stream(capture.stdout_path)
+    try:
+        err_fh = open_stream(capture.stderr_path)
+    except OSError:
+        out_fh.close()
+        raise
+    return out_fh, err_fh
+
+
+async def close_capture(
+    out_fh: BinaryIO | None, err_fh: BinaryIO | None
+) -> dict[str, OSError]:
+    """Close a capture's streams, returning each failed close by slot.
+
+    A close flushes, and a flush can fail — a full disk surfaces here rather
+    than at any write. Swallowing it would discard the buffered tail of a
+    capture and call the file complete, so a failure is returned under
+    ``"out"`` or ``"err"`` for the caller to report as lost output on that
+    stream alone.
+
+    Off the loop for the same reason the writes are: a close flushes, and a
+    flush on a slow or full filesystem blocks everything else in the process —
+    including the timeout that is supposed to bound the run.
+    """
+    errors: dict[str, OSError] = {}
+    for slot, fh in (("out", out_fh), ("err", err_fh)):
+        if fh is not None:
+            try:
+                await asyncio.to_thread(fh.close)
+            except OSError as exc:  # pragma: no cover - disk-full path
+                errors[slot] = exc
+    return errors

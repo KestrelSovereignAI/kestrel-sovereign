@@ -32,11 +32,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from kestrel_sovereign.constitution.hierarchy import (
     DANGEROUS_CAPABILITIES,
@@ -417,16 +416,12 @@ class ComputerUseFeature(Feature):
             if backend_name == "local":
                 self._backend = LocalSandboxBackend(granted)
             else:
-                # ``max_output_bytes`` is the docker backend's capture
-                # ceiling, and it was not reachable from configuration at
-                # all: the capture is written from strings the executor has
-                # already clipped, so on this backend a review longer than
-                # the ceiling comes back clipped and PARTIAL — the 1 MiB cap
-                # #3243 was filed against, still in force on the DEFAULT
-                # backend. Passing it through does not make the capture a
-                # stream; it makes the ceiling an operator's decision instead
-                # of a constant. Streaming it to the file, as the local
-                # backend does, is #3277.
+                # ``max_output_bytes`` bounds the copy of each stream the
+                # executor keeps in memory, and with it the inline text of an
+                # uncaptured run. It does not bound a capture: the backend
+                # streams each pipe to its file as the container writes it
+                # (#3277), so raising the ceiling buys memory-resident output,
+                # never a longer artifact.
                 docker_cfg = self._cfg.get("docker", {})
                 self._backend = DockerSandboxBackend(
                     granted_capabilities=granted,
@@ -1732,10 +1727,19 @@ class ComputerUseFeature(Feature):
                     reasons.append(f"exited rc={result.returncode}")
                 if result.timed_out:
                     reasons.append(f"timed out after {timeout}s and was killed")
-                if result.truncated_stdout:
-                    reasons.append("stdout was clipped at the output cap")
-                if result.truncated_stderr:
-                    reasons.append("stderr was clipped at the output cap")
+                # A capture is never clipped at a cap; its flags mean bytes
+                # the file does not hold — a failed write, a kill before the
+                # pipe was read to its end.
+                for stream, lost in (
+                    ("stdout", result.truncated_stdout),
+                    ("stderr", result.truncated_stderr),
+                ):
+                    if lost:
+                        reasons.append(
+                            f"wrote {stream} its capture does not hold"
+                            if bundle
+                            else f"{stream} was clipped at the output cap"
+                        )
                 if clipped_here:
                     reasons.append(
                         "produced more output than one tool result can carry "
