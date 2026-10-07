@@ -24,6 +24,7 @@ from kestrel_sovereign.features.compute.executors import (
     DockerExecutor,
     ExecutionTimeoutError,
     LocalExecutor,
+    OutputSinks,
     UvExecutor,
 )
 from kestrel_sovereign.features.compute.executors import (
@@ -1809,6 +1810,56 @@ async def test_docker_command_mode_execs_the_vector_and_writes_no_script(
     # mount exists for only rewrites script text.
     binds = [captured[i + 1] for i, arg in enumerate(captured) if arg == "-v"]
     assert binds == [], binds
+
+
+@pytest.mark.asyncio
+async def test_docker_command_mode_streams_every_byte_to_its_sinks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """#3277: the record's copy is bounded; the sinks are not.
+
+    Each sink is handed every byte its pipe carried, raw — the invalid
+    UTF-8 byte included — and then one ``b""`` when the pipe reached EOF.
+    That last call is the only way a caller can tell a stream read to its
+    end from one the drain abandoned. The record keeps its ceiling.
+    """
+    executor = _make_executor(monkeypatch, "docker", max_bytes=4)
+    _track_temp_dirs(monkeypatch, tmp_path)
+    stdout = b"A" * 70_000 + b"\xff" + b"TAIL"
+    stderr = b"E" * 5
+    process = _SuccessfulProcess(stdout, stderr)
+
+    async def create_subprocess(*command: object, **_kwargs: object):
+        if _is_docker_command(command, "rm"):
+            return _CompletedProcess()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    heard: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+
+    def sink(stream: str):
+        async def receive(chunk: bytes) -> None:
+            heard[stream].append(chunk)
+
+        return receive
+
+    record = await asyncio.wait_for(
+        executor.execute_command(
+            _command(),
+            output_sinks=OutputSinks(stdout=sink("stdout"), stderr=sink("stderr")),
+        ),
+        timeout=2,
+    )
+
+    for stream, emitted in (("stdout", stdout), ("stderr", stderr)):
+        assert b"".join(heard[stream]) == emitted
+        assert heard[stream][-1] == b""
+        assert b"" not in heard[stream][:-1], "EOF is announced once, last"
+    assert len(heard["stdout"]) > 2, "streamed in chunks, not buffered whole"
+    assert record.stdout == f"AAAA{TRUNCATED_SUFFIX}"
+    assert record.stdout_truncated is True
+    assert record.stderr == f"EEEE{TRUNCATED_SUFFIX}"
 
 
 @pytest.mark.asyncio

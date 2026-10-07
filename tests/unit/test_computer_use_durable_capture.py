@@ -251,6 +251,30 @@ async def test_a_clipped_run_is_partial_even_at_rc_zero(workspace: Path, queue):
     assert "INCOMPLETE" in (env.error or "")
 
 
+@pytest.mark.parametrize("captured", [False, True])
+@pytest.mark.asyncio
+async def test_the_caveat_names_how_the_output_was_lost(
+    workspace: Path, queue, captured: bool
+):
+    """#3277. A capture is never clipped at a cap: its ``truncated_*`` mean
+    bytes the file does not hold — a failed write, a container killed before
+    its pipe was read to the end. Telling the reader it hit "the output cap"
+    sends them to raise a ceiling that has nothing to do with it."""
+    f = await _feature(workspace, queue)
+    f._backend = _StubBackend(_run(truncated_stderr=True))
+
+    env = await f.shell(command="echo hi", capture_output=captured)
+
+    caveat = env.error or ""
+    assert env.data["complete"] is False
+    if captured:
+        assert "command wrote stderr its capture does not hold" in caveat
+        assert "output cap" not in caveat
+    else:
+        assert "stderr was clipped at the output cap" in caveat
+    assert "stdout" not in caveat.split(" — ")[0]
+
+
 @pytest.mark.asyncio
 async def test_a_clipped_stderr_also_refuses_success(workspace: Path, queue):
     f = await _feature(workspace, queue)
@@ -413,7 +437,7 @@ async def test_the_docker_backend_reports_a_timeout_instead_of_raising():
     backend = DockerSandboxBackend.__new__(DockerSandboxBackend)
 
     class _Executor:
-        async def execute_command(self, command, working_dir=None):
+        async def execute_command(self, command, working_dir=None, *, output_sinks=None):
             raise ExecutionTimeoutError("cmd", 5)
 
     backend._executor = _Executor()
@@ -440,7 +464,7 @@ async def test_the_docker_backend_reads_truncation_off_the_record():
     backend = DockerSandboxBackend.__new__(DockerSandboxBackend)
 
     class _Executor:
-        async def execute_command(self, command, working_dir=None):
+        async def execute_command(self, command, working_dir=None, *, output_sinks=None):
             class _Rec:
                 exit_code = 0
                 stdout = "a review" + _OUTPUT_TRUNCATED_SUFFIX
@@ -477,7 +501,7 @@ async def test_output_that_merely_looks_truncated_is_not(monkeypatch):
     backend = DockerSandboxBackend.__new__(DockerSandboxBackend)
 
     class _Executor:
-        async def execute_command(self, command, working_dir=None):
+        async def execute_command(self, command, working_dir=None, *, output_sinks=None):
             class _Rec:
                 exit_code = 0
                 stdout = "here is a log I am quoting" + _OUTPUT_TRUNCATED_SUFFIX
@@ -818,7 +842,12 @@ async def test_a_capture_without_a_cwd_still_records_where_it_ran(
 async def test_a_docker_timeout_still_produces_the_files_it_promised():
     """The manifest named bundle paths that were never created, so the
     previews read ``[capture unreadable]`` — a missing artifact reported as
-    a broken one."""
+    a broken one.
+
+    #3277: the files are opened before the container starts and fed as it
+    writes, so what it wrote before the deadline is in them rather than
+    replaced by an empty file. The kill discards what was still in the pipe,
+    so neither stream reached EOF and both are reported lost."""
     from kestrel_sovereign.features.compute.executors.base import ExecutionTimeoutError
     from kestrel_sovereign.features.computer_use.backends.docker import (
         DockerSandboxBackend,
@@ -828,7 +857,8 @@ async def test_a_docker_timeout_still_produces_the_files_it_promised():
     backend = DockerSandboxBackend.__new__(DockerSandboxBackend)
 
     class _Executor:
-        async def execute_command(self, command, working_dir=None):
+        async def execute_command(self, command, working_dir=None, *, output_sinks=None):
+            await output_sinks.stdout(b"written before the deadline\n")
             raise ExecutionTimeoutError("cmd", 5)
 
     backend._executor = _Executor()
@@ -848,7 +878,9 @@ async def test_a_docker_timeout_still_produces_the_files_it_promised():
     assert bundle.stdout_path.exists()
     assert bundle.stderr_path.exists()
     assert result.stdout_path == str(bundle.stdout_path)
-    assert "timeout" in bundle.stderr_path.read_text()
+    assert bundle.stdout_path.read_bytes() == b"written before the deadline\n"
+    assert (result.truncated_stdout, result.truncated_stderr) == (True, True)
+    assert "timeout" in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -1266,7 +1298,6 @@ async def test_the_fallback_covers_a_capture_that_holds_nothing(
 ):
     """The other half of that pair. If the diagnostic could not be written
     into the capture, the empty file must not silently replace it."""
-    bundle_dir = workspace / "captures"
     f = await _feature(workspace, queue)
 
     class _EmptyCaptureBackend:
@@ -1491,7 +1522,6 @@ def test_the_executor_populates_the_truncation_field():
 
     from kestrel_sovereign.features.compute.executors.base import (
         BaseExecutor,
-        _CapturedOutput,
         _ExecutionContext,
     )
 
@@ -1537,8 +1567,6 @@ def test_the_executor_populates_the_truncation_field():
 async def test_the_run_path_carries_truncation_into_the_record():
     """The wiring the mutant actually sat on: the caller must read the
     capture's own ``truncated`` flag rather than pass a constant."""
-    from datetime import datetime
-
     from kestrel_sovereign.features.compute.executors import base as exec_base
 
     class _Subject:
@@ -2567,12 +2595,16 @@ async def test_a_slow_final_write_is_flushed_not_discarded(
 
 
 @pytest.mark.asyncio
-async def test_a_docker_capture_says_so_when_the_bytes_were_replaced():
-    """Review round 9. The executor decodes with ``errors='replace'`` before
-    this backend sees anything, so non-UTF-8 output has already become
-    U+FFFD and a capture written from those strings is not what the command
-    emitted. The bytes are gone by then; what can still be honest is the
-    claim about them."""
+async def test_a_docker_capture_keeps_the_bytes_the_strings_replaced():
+    """Review round 9. The executor decodes with ``errors='replace'``, so a
+    capture written from its strings was not what the command emitted, and
+    the backend called it incomplete rather than file a transcription as the
+    output.
+
+    #3277 removed the transcription: the capture is written from the bytes
+    the executor reads off the pipe. So the file holds the byte the strings
+    lost, and the caveat that existed only because of the strings is gone.
+    The returned string is still the decoded copy."""
     from kestrel_sovereign.features.computer_use.backends.docker import (
         DockerSandboxBackend,
     )
@@ -2581,10 +2613,14 @@ async def test_a_docker_capture_says_so_when_the_bytes_were_replaced():
     backend = DockerSandboxBackend.__new__(DockerSandboxBackend)
 
     class _Executor:
-        async def execute_command(self, command, working_dir=None):
+        async def execute_command(self, command, working_dir=None, *, output_sinks=None):
+            await output_sinks.stdout(b"before\xffafter")
+            await output_sinks.stdout(b"")
+            await output_sinks.stderr(b"")
+
             class _Rec:
                 exit_code = 0
-                stdout = "before�after"
+                stdout = "before\ufffdafter"
                 stderr = ""
                 stdout_truncated = False
                 stderr_truncated = False
@@ -2604,14 +2640,19 @@ async def test_a_docker_capture_says_so_when_the_bytes_were_replaced():
         ),
     )
 
-    assert result.truncated_stdout is True
+    assert bundle.stdout_path.read_bytes() == b"before\xffafter"
+    assert result.truncated_stdout is False
     assert result.truncated_stderr is False
+    assert result.stdout == "before\ufffdafter"
 
 
 @pytest.mark.asyncio
-async def test_clean_docker_output_is_not_called_lossy():
-    """Control: the marker must be the replacement character, not every
-    capture."""
+async def test_a_docker_capture_the_executor_did_not_drain_is_not_whole():
+    """Control for the one fact that now decides a docker capture: the
+    executor's final ``b""``. A record handed back without it — the shape of
+    a run that failed under the executor — must not be filed as a whole
+    artifact however clean its flags look. Its stderr is the runtime's
+    diagnostic, and it goes into the file the caller will read."""
     from kestrel_sovereign.features.computer_use.backends.docker import (
         DockerSandboxBackend,
     )
@@ -2620,11 +2661,11 @@ async def test_clean_docker_output_is_not_called_lossy():
     backend = DockerSandboxBackend.__new__(DockerSandboxBackend)
 
     class _Executor:
-        async def execute_command(self, command, working_dir=None):
+        async def execute_command(self, command, working_dir=None, *, output_sinks=None):
             class _Rec:
-                exit_code = 0
-                stdout = "ordinary output"
-                stderr = ""
+                exit_code = -1
+                stdout = ""
+                stderr = "Docker working directory snapshot failed"
                 stdout_truncated = False
                 stderr_truncated = False
 
@@ -2643,7 +2684,11 @@ async def test_clean_docker_output_is_not_called_lossy():
         ),
     )
 
-    assert result.truncated_stdout is False
+    assert (result.truncated_stdout, result.truncated_stderr) == (True, True)
+    assert result.returncode == -1
+    assert bundle.stderr_path.read_text() == (
+        "Docker working directory snapshot failed\n"
+    )
 
 
 @pytest.mark.asyncio
@@ -2801,7 +2846,6 @@ async def test_the_windows_kill_is_bounded_and_off_the_loop(monkeypatch):
     """Review round 10. ``taskkill`` ran synchronously with no timeout on
     every timeout and every cancellation, so a wedged terminator blocked the
     server indefinitely — defeating the very timeout that called it."""
-    import asyncio as _a
     import time as _t
 
     import kestrel_sovereign.features.computer_use.backends.local as local_mod
@@ -2838,8 +2882,6 @@ async def test_abandoning_a_pump_does_not_leak_the_pipe(tmp_path: Path):
         try:
             return len(_os.listdir(f"/dev/fd/{_os.getpid()}"))
         except OSError:
-            import resource
-
             return len(_os.listdir("/dev/fd"))
 
     script = tmp_path / "daemon.py"
