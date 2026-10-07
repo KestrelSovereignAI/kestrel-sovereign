@@ -1361,6 +1361,11 @@ async def _settle_feature_transition(
     task.add_done_callback(mark_terminal_before_admission)
     pending_cancellation = None
     try:
+        # The child sets ``admitted`` and carries on in the same event-loop
+        # step, so this frame resumes only when the child first suspends —
+        # possibly after the whole transition has run. A cancellation raised
+        # here does not mean the child is still queued; ``admitted`` says
+        # whether it is (#3506).
         await asyncio.shield(admitted)
     except asyncio.CancelledError as cancellation:
         pending_cancellation = cancellation

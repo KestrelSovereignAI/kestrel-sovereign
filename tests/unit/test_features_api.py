@@ -3,6 +3,7 @@
 import asyncio
 import shlex
 import sys
+import traceback
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from types import SimpleNamespace
@@ -153,6 +154,61 @@ async def _propagate_cancelled_child(*_args):
     child = asyncio.create_task(asyncio.sleep(0))
     child.cancel()
     await child
+
+
+class _DeadlineAfterAdmission:
+    """Expire a caller's deadline inside its admitted feature transition.
+
+    Both CI failures in #3506 had this shape. The transition child acquires the
+    turn boundary, sets ``admitted`` and carries on in the same event-loop
+    step, so the caller stays parked on ``asyncio.shield(admitted)`` until the
+    child first suspends. A cyclic GC pass stalled the loaded xdist worker for
+    over a second inside that step, the test's 1s guard expired, and the
+    cancellation landed on the admission wait of a transition that had already
+    been admitted.
+
+    Expiring the deadline from inside the child, then holding the child until
+    the caller has taken the cancellation, reproduces that ordering without a
+    clock, and in its strictest form: the caller handles the cancellation
+    while the transition is still running.
+    """
+
+    def __init__(self):
+        self.deadline = None
+        self.caller_cancelled = asyncio.Event()
+        self._await_owned_task = features_endpoint.await_owned_task
+
+    async def expire_inside_transition(self):
+        self.deadline.reschedule(asyncio.get_running_loop().time())
+        await asyncio.wait_for(
+            self.caller_cancelled.wait(), timeout=_HANG_GUARD_SECONDS
+        )
+
+    async def run(self, operation):
+        """Await ``operation``; its deadline must surface at the admission wait."""
+
+        async def observed_await_owned_task(task, pending_cancellation=None):
+            if pending_cancellation is not None:
+                self.caller_cancelled.set()
+            return await self._await_owned_task(
+                task, pending_cancellation=pending_cancellation
+            )
+
+        with patch.object(
+            features_endpoint, "await_owned_task", observed_await_owned_task
+        ), pytest.raises(TimeoutError) as raised:
+            async with asyncio.timeout(None) as deadline:
+                self.deadline = deadline
+                await operation
+        cancellation = raised.value.__cause__
+        assert isinstance(cancellation, asyncio.CancelledError)
+        # The same frame both CI tracebacks named.
+        frames = traceback.extract_tb(cancellation.__traceback__)
+        assert any(
+            frame.name == "_settle_feature_transition"
+            and "asyncio.shield(admitted)" in (frame.line or "")
+            for frame in frames
+        ), frames
 
 
 FAKE_REGISTRY = {
@@ -490,7 +546,9 @@ class TestEnableFeature:
         enable = asyncio.create_task(
             features_endpoint.enable_feature(request, feature.name)
         )
-        await asyncio.wait_for(feature.activation_started.wait(), timeout=1)
+        await asyncio.wait_for(
+            feature.activation_started.wait(), timeout=_HANG_GUARD_SECONDS
+        )
         update = asyncio.create_task(
             features_endpoint.update_feature_config(
                 request,
@@ -502,7 +560,9 @@ class TestEnableFeature:
         await asyncio.sleep(0.05)
         feature.release_activation.set()
 
-        _done, pending = await asyncio.wait({enable, update}, timeout=0.5)
+        _done, pending = await asyncio.wait(
+            {enable, update}, timeout=_HANG_GUARD_SECONDS
+        )
         deadlocked = bool(pending)
         if deadlocked:
             # A queued PATCH owns ingress while enable owns CONVERSATION. Cancel
@@ -540,12 +600,12 @@ class TestEnableFeature:
 
         async with real_turn_lifecycle():
             turn = asyncio.create_task(agent.process_input("queued cognition"))
-            await asyncio.wait_for(lock_attempted.wait(), timeout=1)
+            await asyncio.wait_for(lock_attempted.wait(), timeout=_HANG_GUARD_SECONDS)
             assert not turn.done()
             agent._safe_mode = True
             agent._safe_mode_reason = "feature contribution quarantine failed"
 
-        response = await asyncio.wait_for(turn, timeout=1)
+        response = await asyncio.wait_for(turn, timeout=_HANG_GUARD_SECONDS)
 
         assert "SAFE MODE ACTIVE" in response
         agent._process_input_traced_locked.assert_not_awaited()
@@ -587,12 +647,12 @@ class TestEnableFeature:
 
         async with real_turn_lifecycle():
             turn = asyncio.create_task(collect())
-            await asyncio.wait_for(lock_attempted.wait(), timeout=1)
+            await asyncio.wait_for(lock_attempted.wait(), timeout=_HANG_GUARD_SECONDS)
             assert not turn.done()
             agent._safe_mode = True
             agent._safe_mode_reason = "feature contribution quarantine failed"
 
-        chunks = await asyncio.wait_for(turn, timeout=1)
+        chunks = await asyncio.wait_for(turn, timeout=_HANG_GUARD_SECONDS)
 
         assert len(chunks) == 1
         assert "SAFE MODE ACTIVE" in chunks[0]
@@ -623,7 +683,7 @@ class TestEnableFeature:
 
         response = await asyncio.wait_for(
             features_endpoint.enable_feature(request, "TestFeature"),
-            timeout=1,
+            timeout=_HANG_GUARD_SECONDS,
         )
 
         assert response["status"] == "enabled"
@@ -653,7 +713,7 @@ class TestEnableFeature:
         ):
             await asyncio.wait_for(
                 features_endpoint.enable_feature(request, "TestFeature"),
-                timeout=1,
+                timeout=_HANG_GUARD_SECONDS,
             )
 
         assert observed == []
@@ -688,12 +748,14 @@ class TestEnableFeature:
         )
 
         try:
-            await asyncio.wait_for(child_started.wait(), timeout=1)
+            await asyncio.wait_for(child_started.wait(), timeout=_HANG_GUARD_SECONDS)
             with pytest.raises(
                 RuntimeError,
                 match="feature transition generation is fully committed",
             ):
-                await asyncio.wait_for(asyncio.shield(operation), timeout=0.2)
+                await asyncio.wait_for(
+                    asyncio.shield(operation), timeout=_HANG_GUARD_SECONDS
+                )
         finally:
             if cognition_task is not None and not cognition_task.done():
                 cognition_task.cancel()
@@ -739,7 +801,7 @@ class TestEnableFeature:
 
         release_child.set()
         with pytest.raises(RuntimeError, match="expired feature transition"):
-            await asyncio.wait_for(detached_task, timeout=1)
+            await asyncio.wait_for(detached_task, timeout=_HANG_GUARD_SECONDS)
 
         assert cognition_entered is False
 
@@ -763,11 +825,81 @@ class TestEnableFeature:
 
         response = await asyncio.wait_for(
             features_endpoint.enable_feature(request, "TestFeature"),
-            timeout=1,
+            timeout=_HANG_GUARD_SECONDS,
         )
 
         assert response["status"] == "enabled"
         assert observed == [True]
+
+    @pytest.mark.asyncio
+    async def test_deadline_at_admission_wait_settles_reentrant_privacy_hook(self):
+        """A deadline that lands after admission waits for the commit (#3506).
+
+        The CI failure of ``test_enable_hook_can_reenter_privacy_transition``,
+        forced: the caller's cancellation arrives at ``shield(admitted)`` while
+        the hook is inside its re-entered privacy transition. The admitted
+        child must not be cancelled or abandoned; the caller re-raises only
+        after the feature is enabled and every boundary is released.
+        """
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        ordering = _DeadlineAfterAdmission()
+        entered = asyncio.Event()
+
+        async def enable_with_privacy_transition():
+            async with agent.privacy_transition():
+                await ordering.expire_inside_transition()
+                entered.set()
+
+        feature.on_enable.side_effect = enable_with_privacy_transition
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        await ordering.run(features_endpoint.enable_feature(request, "TestFeature"))
+
+        assert entered.is_set()
+        assert feature.enabled is True
+        assert agent._get_lock_manager().active_hold_diagnostics() == []
+        assert not agent._get_privacy_transition_lock().locked()
+        assert not agent._get_durable_persistence_gate().locked()
+        assert not features_endpoint._feature_config_update_lock(agent).locked()
+
+    @pytest.mark.asyncio
+    async def test_deadline_at_admission_wait_settles_committed_ready_cognition(
+        self,
+    ):
+        """The ready-hook variant of the same forced ordering (#3506).
+
+        The CI failure of ``test_committed_enable_ready_hook_can_await_cognition``:
+        the caller's cancellation arrives at ``shield(admitted)`` while the
+        post-commit ready hook is inside its cognition turn.
+        """
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        ordering = _DeadlineAfterAdmission()
+        observed = []
+
+        async def ready_with_cognition(_agent):
+            async with agent._turn_lifecycle():
+                await ordering.expire_inside_transition()
+                observed.append(feature.enabled)
+
+        feature.on_agent_ready = AsyncMock(side_effect=ready_with_cognition)
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        await ordering.run(features_endpoint.enable_feature(request, "TestFeature"))
+
+        assert observed == [True]
+        assert feature.enabled is True
+        assert agent._get_lock_manager().active_hold_diagnostics() == []
+        assert not features_endpoint._feature_config_update_lock(agent).locked()
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.endpoints.features.get_registry")
@@ -820,7 +952,7 @@ class TestEnableFeature:
 
         response = await asyncio.wait_for(
             features_endpoint.enable_feature(request, info.name),
-            timeout=1,
+            timeout=_HANG_GUARD_SECONDS,
         )
 
         assert response["status"] == "enabled"
@@ -845,7 +977,7 @@ class TestEnableFeature:
             feature.initialize.assert_not_awaited()
             assert feature.enabled is False
 
-        response = await asyncio.wait_for(enable, timeout=1)
+        response = await asyncio.wait_for(enable, timeout=_HANG_GUARD_SECONDS)
         assert response["status"] == "enabled"
         feature.initialize.assert_awaited_once()
         assert feature.enabled is True
@@ -876,7 +1008,7 @@ class TestEnableFeature:
         enable = asyncio.create_task(
             features_endpoint.enable_feature(request, feature.name)
         )
-        await asyncio.wait_for(entered.wait(), timeout=1)
+        await asyncio.wait_for(entered.wait(), timeout=_HANG_GUARD_SECONDS)
         assert feature.enabled is False
         assert agent.feature_contribution_runtime.active_context_clauses()
 
@@ -886,7 +1018,7 @@ class TestEnableFeature:
 
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(enable, timeout=1)
+            await asyncio.wait_for(enable, timeout=_HANG_GUARD_SECONDS)
 
         assert feature.enabled is True
         assert agent.features[feature.name] is feature
@@ -1254,7 +1386,7 @@ class TestDisableFeature:
             feature.on_disable.assert_not_awaited()
             assert feature.enabled is True
 
-        response = await asyncio.wait_for(disable, timeout=1)
+        response = await asyncio.wait_for(disable, timeout=_HANG_GUARD_SECONDS)
         assert response["status"] == "disabled"
         feature.on_disable.assert_awaited_once()
         assert feature.enabled is False
@@ -1286,7 +1418,7 @@ class TestDisableFeature:
         disable = asyncio.create_task(
             features_endpoint.disable_feature(request, feature.name)
         )
-        await asyncio.wait_for(entered.wait(), timeout=1)
+        await asyncio.wait_for(entered.wait(), timeout=_HANG_GUARD_SECONDS)
         assert feature.enabled is True
         assert not agent.feature_contribution_runtime.active_context_clauses()
 
@@ -1296,7 +1428,7 @@ class TestDisableFeature:
 
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(disable, timeout=1)
+            await asyncio.wait_for(disable, timeout=_HANG_GUARD_SECONDS)
 
         assert feature.enabled is False
         assert agent.features[feature.name] is feature
@@ -2151,7 +2283,7 @@ class TestRemoveFeature:
             await asyncio.sleep(0)
             removal.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(removal, timeout=1)
+                await asyncio.wait_for(removal, timeout=_HANG_GUARD_SECONDS)
 
         # There is no orphaned owned task waiting to mutate after the old turn
         # releases its lock.
@@ -2207,7 +2339,7 @@ class TestRemoveFeature:
             assert agent.feature_contribution_runtime.active_context_clauses()
             assert not feature.disabled
 
-        response = await asyncio.wait_for(removal, timeout=1)
+        response = await asyncio.wait_for(removal, timeout=_HANG_GUARD_SECONDS)
         assert response["status"] == "removed"
         assert feature.name not in agent.features
         assert not agent.feature_contribution_runtime.active_context_clauses()
@@ -2257,7 +2389,7 @@ class TestRemoveFeature:
         removal = asyncio.create_task(
             features_endpoint.remove_feature(request, feature.name)
         )
-        await asyncio.wait_for(entered.wait(), timeout=1)
+        await asyncio.wait_for(entered.wait(), timeout=_HANG_GUARD_SECONDS)
         removal.cancel()
         await asyncio.sleep(0)
         assert not removal.done()
@@ -2268,8 +2400,8 @@ class TestRemoveFeature:
 
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(removal, timeout=1)
-        await asyncio.wait_for(contender, timeout=1)
+            await asyncio.wait_for(removal, timeout=_HANG_GUARD_SECONDS)
+        await asyncio.wait_for(contender, timeout=_HANG_GUARD_SECONDS)
 
         assert feature.name not in agent.features
         assert not agent.feature_contribution_runtime.active_context_clauses()
@@ -2617,7 +2749,7 @@ class TestUpdateFeatureConfig:
 
                 async def release_deadlock() -> None:
                     nonlocal blocked
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(_HANG_GUARD_SECONDS)
                     if not tool_called.is_set():
                         blocked = True
                         # Cancel the queued config child so the gate reopens and
@@ -2642,13 +2774,13 @@ class TestUpdateFeatureConfig:
                     await rescue
 
             if not blocked:
-                response = await asyncio.wait_for(update, timeout=1)
+                response = await asyncio.wait_for(update, timeout=_HANG_GUARD_SECONDS)
                 assert response["config"] == {"enabled": True}
                 assert feature._traffic_gate.closed is False
                 assert feature._config_ingress_live_turn_bypass_active is False
             else:
                 with pytest.raises(asyncio.CancelledError):
-                    await asyncio.wait_for(update, timeout=1)
+                    await asyncio.wait_for(update, timeout=_HANG_GUARD_SECONDS)
         finally:
             if update is not None and not update.done():
                 update.cancel()
@@ -2691,7 +2823,9 @@ class TestUpdateFeatureConfig:
                 nonlocal fence_entered
                 fence_entered = True
                 release_cognition.set()
-                await asyncio.wait_for(cognition_done.wait(), timeout=1)
+                await asyncio.wait_for(
+                    cognition_done.wait(), timeout=_HANG_GUARD_SECONDS
+                )
                 yield
 
         feature = AdmittedIngressFeature()
@@ -2717,11 +2851,11 @@ class TestUpdateFeatureConfig:
                         config={"mode": "new"}
                     ),
                 ),
-                timeout=1,
+                timeout=_HANG_GUARD_SECONDS,
             )
         finally:
             release_cognition.set()
-            await asyncio.wait_for(cognition, timeout=1)
+            await asyncio.wait_for(cognition, timeout=_HANG_GUARD_SECONDS)
 
         assert fence_entered is True
         assert state == {"mode": "new"}
@@ -2778,11 +2912,11 @@ class TestUpdateFeatureConfig:
                     ),
                 )
             )
-            await asyncio.wait_for(fence_entered.wait(), timeout=1)
+            await asyncio.wait_for(fence_entered.wait(), timeout=_HANG_GUARD_SECONDS)
             feature.generation += 1
 
         with pytest.raises(HTTPException) as error:
-            await asyncio.wait_for(update, timeout=1)
+            await asyncio.wait_for(update, timeout=_HANG_GUARD_SECONDS)
 
         assert error.value.status_code == 409
         assert "changed while configuration was queued" in error.value.detail
@@ -2895,7 +3029,7 @@ class TestUpdateFeatureConfig:
             await asyncio.sleep(0)
             assert not applied.is_set()
 
-        response = await asyncio.wait_for(update, timeout=1)
+        response = await asyncio.wait_for(update, timeout=_HANG_GUARD_SECONDS)
         assert response["config"] == {"mode": "old"}
         assert applied.is_set()
 
@@ -2926,7 +3060,7 @@ class TestUpdateFeatureConfig:
             assert agent.features.pop("TestFeature") is stale
 
         with pytest.raises(HTTPException) as exc_info:
-            await asyncio.wait_for(update, timeout=1)
+            await asyncio.wait_for(update, timeout=_HANG_GUARD_SECONDS)
 
         assert exc_info.value.status_code == 404
         stale.set_config.assert_not_awaited()
@@ -2957,7 +3091,7 @@ class TestUpdateFeatureConfig:
                 "TestFeature",
                 features_endpoint.ConfigUpdateRequest(config={"mode": "new"}),
             ),
-            timeout=1,
+            timeout=_HANG_GUARD_SECONDS,
         )
 
         assert entered.is_set()
@@ -2997,7 +3131,7 @@ class TestUpdateFeatureConfig:
                         config={"mode": "new"}
                     ),
                 ),
-                timeout=1,
+                timeout=_HANG_GUARD_SECONDS,
             )
 
         assert observed == []
@@ -3036,7 +3170,7 @@ class TestUpdateFeatureConfig:
                 features_endpoint.ConfigUpdateRequest(config={"mode": "first"}),
             )
         )
-        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await asyncio.wait_for(first_started.wait(), timeout=_HANG_GUARD_SECONDS)
         second_update = asyncio.create_task(
             features_endpoint.update_feature_config(
                 request_for(second_agent),
@@ -3045,7 +3179,9 @@ class TestUpdateFeatureConfig:
             )
         )
         try:
-            done, _pending = await asyncio.wait({second_update}, timeout=0.5)
+            done, _pending = await asyncio.wait(
+                {second_update}, timeout=_HANG_GUARD_SECONDS
+            )
             assert second_update in done
             assert second_update.result()["config"] == {"mode": "old"}
         finally:
@@ -3090,7 +3226,7 @@ class TestUpdateFeatureConfig:
                 features_endpoint.ConfigUpdateRequest(config={"mode": "new"}),
             )
         )
-        await asyncio.wait_for(committed.wait(), timeout=1)
+        await asyncio.wait_for(committed.wait(), timeout=_HANG_GUARD_SECONDS)
         update.cancel()
         await asyncio.sleep(0)
         assert not update.done()
@@ -3101,7 +3237,7 @@ class TestUpdateFeatureConfig:
 
         release_setter.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(update, timeout=1)
+            await asyncio.wait_for(update, timeout=_HANG_GUARD_SECONDS)
 
         assert state == {"mode": "new"}
         assert refreshed.is_set()
@@ -3907,11 +4043,15 @@ class TestConcurrentInstallSerialization:
         from kestrel_sovereign.endpoints import features as features_ep
 
         installed: list = []
+        first_running = _asyncio.Event()
+        release_first = _asyncio.Event()
 
         async def _txn(tag):
             try:
                 installed.append(tag)
-                await _asyncio.sleep(0.05)
+                if tag == "first":
+                    first_running.set()
+                    await release_first.wait()
             finally:
                 features_ep._INSTALL_LOCK.release()
 
@@ -3923,14 +4063,17 @@ class TestConcurrentInstallSerialization:
         async def _drive():
             features_ep._INSTALL_LOCK = _asyncio.Lock()
             first = _asyncio.create_task(_request("first"))
-            await _asyncio.sleep(0.01)          # first holds the lock
+            await first_running.wait()          # first holds the lock
             second = _asyncio.create_task(_request("second"))
-            await _asyncio.sleep(0.01)          # second is queued on acquire()
+            await _asyncio.sleep(0)             # second is queued on acquire()
             second.cancel()                     # client hangs up while WAITING
             try:
                 await second
             except _asyncio.CancelledError:
                 pass
+            # First holds the lock until here, so a worker stall cannot let it
+            # finish and hand the lock to second before the cancellation.
+            release_first.set()
             await first
             await _asyncio.sleep(0.1)           # give a phantom install time to land
             return list(installed)
