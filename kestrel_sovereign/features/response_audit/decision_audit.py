@@ -168,25 +168,18 @@ async def response_audit_chat_baseline(
 ) -> Optional[Dict[str, bool]]:
     """Eval baseline: the chat auditor's verdict for one sample.
 
-    ``LLMService.get_audit_response`` takes no local-only restriction and
-    routes over the whole provider chain, so it cannot honour a local-only
-    eval: the baseline refuses rather than send private samples to a cloud
-    route. Returns ``None`` when the chat audit did not run (``audited=False``).
+    ``local_only`` reaches ``get_audit_response`` as ``force_local_only``,
+    which the service ORs with its live privacy state, so it never loosens
+    either (#3491). Returns ``None`` when the chat audit did not run
+    (``audited=False``), including when no local route can audit.
     """
 
     import asyncio
 
-    from kestrel_sovereign.llm.decisions.evaluation import SampleError
-
-    if local_only:
-        raise SampleError(
-            "the chat audit baseline cannot be confined to local routes; "
-            "rerun with --allow-cloud (synthetic samples only) or drop --baseline"
-        )
     text = str((sample.raw or {}).get("response", ""))
     try:
         async with asyncio.timeout(timeout_seconds):
-            verdict = await llm_service.get_audit_response(text)
+            verdict = await llm_service.get_audit_response(text, force_local_only=local_only)
     except TimeoutError:
         return None
     if verdict.get("audited", True) is False:

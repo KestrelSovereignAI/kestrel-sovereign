@@ -94,6 +94,10 @@ class EmbeddingSpaceConflictError(Exception):
 #: The provider ``stop_reason`` for a model that declined to answer.
 _REFUSAL_STOP_REASON = "refusal"
 
+#: ``reason`` of an audit that did not run because a local-only privacy mode
+#: left it no local route (#3491).
+NO_LOCAL_AUDIT_ROUTE = "no_local_audit_route"
+
 
 class AuditResult(BaseModel):
     """Structured result of a response-integrity audit.
@@ -4407,6 +4411,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         invocation_context: Optional[LLMInvocationContext] = None,
         *,
         redact_content: bool = False,
+        force_local_only: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Get a structured audit response from the normal provider chain.
 
@@ -4418,11 +4423,22 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         strict path redacts and the advisory path is unchanged. Threaded on the
         frozen per-call context — never global state — so a concurrent call is
         unaffected.
+
+        ``force_local_only`` (#3491): the audit sends ``text_to_audit`` to a
+        route, so it follows the privacy rule of the turn that produced it.
+        ``None`` reads the live restriction (``_current_force_local_only``);
+        ``True`` tightens it. Nothing loosens it: an explicit ``False`` still
+        leaves the live restriction in force, as in ``decide``. Under
+        local-only, only ``is_local`` routes are candidates and the mandate
+        narrows within them, so it can never add a cloud route back. With no
+        local route the audit does not run: ``audited=False`` with
+        ``reason=NO_LOCAL_AUDIT_ROUTE``.
         """
         self._check_policy()
         invocation_context = self._resolve_invocation_context(invocation_context)
         if redact_content and not invocation_context.redact_content:
             invocation_context = replace(invocation_context, redact_content=True)
+        local_only = bool(force_local_only) or self._current_force_local_only()
         if not self.providers:
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
@@ -4456,6 +4472,16 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                     target_selector = pref_model
 
         available_providers = self._available_providers()
+        if local_only:
+            available_providers = [p for p in available_providers if p.get("is_local")]
+            if not available_providers:
+                logger.warning("Audit skipped: local-only privacy and no local route")
+                return {
+                    "risk_level": 1,
+                    "reasoning": "Audit skipped - local-only privacy mode and no local route available.",
+                    "audited": False,
+                    "reason": NO_LOCAL_AUDIT_ROUTE,
+                }
         target_model = None
         if target_selector:
             resolved = self._resolve_model_selector(target_selector, providers=available_providers)
@@ -4466,6 +4492,14 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 available_providers = self._filter_providers_by_selector(
                     available_providers, target_provider
                 ) or available_providers
+        if local_only and target_model and not any(
+            target_model == p.get("model") for p in available_providers
+        ):
+            # Generation under local-only ignores a non-local mandated model
+            # and runs each local route's configured model
+            # (``resolve_provider_routing``); the audit judges on the same one.
+            logger.info("Audit LOCAL_ONLY: ignoring non-local model '%s'", target_model)
+            target_model = None
 
         system_prompt = """
 You are an AI Integrity Auditor for a Kestrel agent's responses.

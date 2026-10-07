@@ -444,6 +444,9 @@ async def test_cloud_baselines_warm_model_discovery_first(monkeypatch) -> None:
             calls.append("discover")
             return []
 
+        async def _ensure_models_discovered(self, *, force_local_only=False):
+            calls.append(f"discover_local_only={force_local_only}")
+
     async def fake_eval(service, selector, samples, **kwargs):
         return ev.ModelReport(selector, *selector.split("/", 1))
 
@@ -459,7 +462,10 @@ async def test_cloud_baselines_warm_model_discovery_first(monkeypatch) -> None:
     assert await cli_decisions._eval(_Service(), args) == 0
     assert calls[:2] == ["discover", "baseline:chat"]
 
+    # #3491: a local-only chat-audit baseline now runs on local routes, so
+    # they are warmed without contacting a cloud vendor.
     calls.clear()
     args.local_only = True
     assert await cli_decisions._eval(_Service(), args) == 0
     assert "discover" not in calls
+    assert calls[:2] == ["discover_local_only=True", "baseline:chat"]
