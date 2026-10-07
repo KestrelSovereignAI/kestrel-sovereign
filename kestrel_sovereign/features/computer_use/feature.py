@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from kestrel_sovereign._async_ownership import run_blocking_operation
 from kestrel_sovereign.constitution.hierarchy import (
     DANGEROUS_CAPABILITIES,
     parse_amendment_ix_grants,
@@ -1541,6 +1542,8 @@ class ComputerUseFeature(Feature):
         resolved_cwd = Path(payload["cwd"]) if payload.get("cwd") else None
         started_at = capture.utcnow()
         started = time.monotonic()
+        bundle: Optional[capture.CaptureBundle] = None
+        manifest_path: Optional[str] = None
         try:
             # Inside the try: allocating the capture touches the filesystem
             # and can fail on a read-only or full disk, and a call that has
@@ -1584,7 +1587,6 @@ class ComputerUseFeature(Feature):
             unverified_writers = bundle is not None and result.writers_remaining is not False
             incomplete = bool(result.timed_out or clipped or unverified_writers)
 
-            manifest_path = None
             if bundle is not None:
                 # The directory the backend actually used, which is where
                 # HEAD has to be read: a run with no ``cwd`` still ran
@@ -1894,6 +1896,16 @@ class ComputerUseFeature(Feature):
                 error=str(exc),
             )
             return ToolResult.failed(error=str(exc))
+        finally:
+            if bundle is not None and manifest_path is None:
+                # The run ended before it was published -- an error or a
+                # cancellation, after the backend returned or while it ran --
+                # so nothing names this set and pruning, which keys a set by
+                # its manifest, would never retire it (#3512).
+                await run_blocking_operation(
+                    capture.discard,
+                    (bundle.stdout_path, bundle.stderr_path, bundle.manifest_path),
+                )
 
 
 def _positive_int(value: Any, *, default: int, name: str) -> int:

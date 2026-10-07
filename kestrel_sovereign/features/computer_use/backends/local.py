@@ -19,6 +19,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from kestrel_sovereign._async_ownership import run_blocking_operation
 from kestrel_sovereign._subprocess_helpers import (
     is_windows,
     new_process_group_kwargs,
@@ -32,10 +33,12 @@ from .base import (
     DirEntry,
     SandboxBackend,
     close_capture,
+    discard_capture,
     host_list,
     host_read,
     host_write,
     open_capture,
+    open_capture_owned,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,6 +144,11 @@ class LocalSandboxBackend(SandboxBackend):
         doctrine spells ``</dev/null`` and which this surface cannot express,
         since the redirect is shell grammar. The reviewer this feature exists
         to run is the exact program that hangs.
+
+        The capture files outlive this call only when it returns a result
+        naming them. A call that raises — a cancellation, a spawn error other
+        than a missing binary — removes them first, because only a returned
+        result gets the manifest that pruning retires a set by (#3512).
         """
         if not argv:
             raise ValueError("empty argv")
@@ -155,7 +163,7 @@ class LocalSandboxBackend(SandboxBackend):
         out_fh = err_fh = None
         if capture is not None:
             try:
-                out_fh, err_fh = await asyncio.to_thread(_open_capture, capture)
+                out_fh, err_fh = await open_capture_owned(_open_capture, capture)
             except OSError as exc:
                 duration_ms = int((time.monotonic() - started) * 1000)
                 # Defaults here would have said "nothing truncated, no
@@ -175,6 +183,10 @@ class LocalSandboxBackend(SandboxBackend):
                     cwd=str(cwd) if cwd else os.getcwd(),
                 )
 
+        # Whether the run reached an outcome to return, its capture files
+        # closed. Without one they are removed below, not left for a
+        # manifest that will never be written.
+        has_outcome = False
         try:
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -202,11 +214,11 @@ class LocalSandboxBackend(SandboxBackend):
                     # reads the artifact when there is one and would
                     # otherwise get rc=127 beside an empty file.
                     err_fh.write((message + "\n").encode("utf-8"))
-                # Deliberately NOT returned here. The handles close in the
-                # ``finally`` below, and a close that fails under disk
-                # pressure would have had nowhere to go in a result already
-                # constructed — the diagnostic would be filed as fully
-                # persisted when it was not.
+                # Deliberately NOT returned here. The handles close below,
+                # and a close that fails under disk pressure would have had
+                # nowhere to go in a result already constructed — the
+                # diagnostic would be filed as fully persisted when it was
+                # not.
                 spawn_error = message
 
             # Only when there is a process to wait for. The spawn-failure
@@ -328,11 +340,16 @@ class LocalSandboxBackend(SandboxBackend):
                     out_error = pumps[0].exception() if pumps[0] in done else None
                     err_error = pumps[1].exception() if pumps[1] in done else None
                     stdout_bytes = stderr_bytes = b""
-        finally:
             # A failed close is the same shape as the unread pump exception:
             # the buffered tail of a capture discarded, the file called
-            # complete. See :func:`close_capture`.
+            # complete. See :func:`close_capture`. Inside the ``try``: a
+            # cancellation that lands during the close also leaves the run
+            # with no result to name the files.
             close_errors = await close_capture(out_fh, err_fh)
+            has_outcome = True
+        finally:
+            if capture is not None and not has_outcome:
+                await run_blocking_operation(discard_capture, capture, out_fh, err_fh)
 
         duration_ms = int((time.monotonic() - started) * 1000)
         effective_cwd = str(cwd) if cwd else os.getcwd()
