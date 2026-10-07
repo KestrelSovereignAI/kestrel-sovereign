@@ -227,8 +227,21 @@ class ResponseAuditHook(Hook):
         if self._auditor is not None:
             return await self._auditor(response_text, self.fail_closed)
         return await self.agent.llm_service.get_audit_response(
-            response_text, redact_content=self.fail_closed,
+            response_text,
+            redact_content=self.fail_closed,
+            force_local_only=self._turn_local_only(),
         )
+
+    def _turn_local_only(self) -> bool:
+        """Whether the audited turn was confined to local routes (#3491).
+
+        The audit sends that turn's response to a route, so it follows the
+        same privacy rule. The service also applies its live restriction, so
+        either can only tighten the other. A privacy state that cannot be read
+        raises into ``execute``'s audit-error path, which makes no audit call
+        and, under strict, denies.
+        """
+        return not self.agent.privacy_agent.privacy_config.allows_cloud_llm()
 
     def _apply_audit_decision(
         self, response_text: str, risk_level: int, reasoning: str,

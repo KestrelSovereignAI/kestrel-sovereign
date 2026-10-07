@@ -7989,7 +7989,8 @@ Expected Duration: {expected_duration}
 
 
     async def get_audit_response(self, text_to_audit: str) -> Dict[str, Any]:
-        # This function is now just a pass-through to the LLM service
+        """Audit through the LLM service under this agent's live privacy rule:
+        a local-only mode confines it to local routes (#3491)."""
         return await self.llm_service.get_audit_response(text_to_audit)
         
     async def create_trusted_agent(self, agent_name: str) -> str:

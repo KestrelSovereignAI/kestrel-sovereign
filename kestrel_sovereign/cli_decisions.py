@@ -189,11 +189,15 @@ async def _eval(service: Any, args: argparse.Namespace) -> int:
             print(f"ERROR: caller {args.caller!r} has no baseline {name!r}", file=sys.stderr)
             return 2
 
-    if args.baseline and not local_only:
+    if args.baseline:
         # Chat baselines go through the service's chat paths, some of which
         # (the response audit) do not warm model discovery themselves; a fresh
-        # CLI service would otherwise skip every ``model = "auto"`` route.
-        await service.discover_all_models()
+        # CLI service would otherwise skip every ``model = "auto"`` route. A
+        # local-only run warms local routes only, contacting no cloud vendor.
+        if local_only:
+            await service._ensure_models_discovered(force_local_only=True)
+        else:
+            await service.discover_all_models()
 
     reports = []
     for name in args.baseline or ():

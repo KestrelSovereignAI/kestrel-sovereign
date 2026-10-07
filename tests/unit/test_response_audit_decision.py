@@ -132,14 +132,18 @@ async def test_warn_hook_annotates_concern_without_leaking_response() -> None:
 async def test_chat_backend_is_the_default_and_unchanged() -> None:
     service = MagicMock()
     service.get_audit_response = AsyncMock(return_value={"risk_level": 1, "reasoning": "ok"})
+    agent = _agent(service)
+    agent.privacy_agent.privacy_config.allows_cloud_llm.return_value = True
     with patch.dict("os.environ", {"KESTREL_RESPONSE_AUDIT_MODE": "warn"}, clear=False):
         import os
         os.environ.pop("KESTREL_RESPONSE_AUDIT_BACKEND", None)
-        feature = ResponseAuditFeature(_agent(service))
+        feature = ResponseAuditFeature(agent)
         await feature.initialize()
     await feature.get_hooks()[0].execute(_hook_input("An ordinary helpful answer here."))
     service.get_audit_response.assert_awaited_once()
-    assert service.get_audit_response.await_args.kwargs == {"redact_content": False}
+    assert service.get_audit_response.await_args.kwargs == {
+        "redact_content": False, "force_local_only": False,
+    }
     status = await feature.audit_status()
     assert status.data["backend"] == "chat"
 
@@ -206,18 +210,21 @@ def test_adapter_validation(raw, message) -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_baseline_maps_risk_and_refuses_local_only() -> None:
+async def test_chat_baseline_maps_risk_and_honours_local_only() -> None:
     sample = ev.parse_sample(json.dumps(
         {"adapter": "response_audit", "id": "x", "response": "hi there", "risk": 2}), "f:1")
     service = MagicMock()
     service.get_audit_response = AsyncMock(return_value={"risk_level": 2, "reasoning": "r"})
     assert await da.response_audit_chat_baseline(
         service, sample, timeout_seconds=5, local_only=False) == {"block": False, "concern": True}
+    assert service.get_audit_response.await_args.kwargs == {"force_local_only": False}
+
+    # #3491: a local-only eval confines the chat audit to local routes.
+    assert await da.response_audit_chat_baseline(
+        service, sample, timeout_seconds=5, local_only=True) == {"block": False, "concern": True}
+    assert service.get_audit_response.await_args.kwargs == {"force_local_only": True}
 
     service.get_audit_response = AsyncMock(return_value={"risk_level": 3, "reasoning": "r",
                                                          "audited": False})
     assert await da.response_audit_chat_baseline(
-        service, sample, timeout_seconds=5, local_only=False) is None
-
-    with pytest.raises(ev.SampleError, match="cannot be confined to local routes"):
-        await da.response_audit_chat_baseline(service, sample, timeout_seconds=5, local_only=True)
+        service, sample, timeout_seconds=5, local_only=True) is None
