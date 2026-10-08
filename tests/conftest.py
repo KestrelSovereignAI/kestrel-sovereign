@@ -53,7 +53,7 @@ from tests.shared.postgres_requirement import (
 )
 from tests.shared.postgres_worker_isolation import (
     isolate_xdist_worker as _isolate_xdist_worker,
-    release_worker_schema as _release_worker_schema,
+    release_worker_database as _release_worker_database,
 )
 from tests.utils.postgres_schema import postgres_test_url
 
@@ -64,7 +64,7 @@ from tests.utils.feedback_bridge import (
 )
 
 FORCED_EXIT_GRACE_SECONDS = 10.0
-_WORKER_SCHEMA_KEY = pytest.StashKey()
+_WORKER_DATABASE_KEY = pytest.StashKey()
 
 
 @pytest.fixture
@@ -166,7 +166,7 @@ def pytest_configure(config):
     # After .env: a local .env may supply TEST_POSTGRES_URL.
     _check_postgres_requirement()
     # After the check: it must see the URL the job supplied (#3383).
-    config.stash[_WORKER_SCHEMA_KEY] = _isolate_xdist_worker()
+    config.stash[_WORKER_DATABASE_KEY] = _isolate_xdist_worker()
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -180,11 +180,11 @@ def pytest_unconfigure(config):
     """Release this process's per-session test resources.
 
     One hook: pytest keeps only the last module-level definition, so the
-    PostgreSQL worker schema (#3383) and the host-isolation root (#3286) must
-    be released here together.
+    PostgreSQL worker database (#3383) and the host-isolation root (#3286)
+    must be released here together.
     """
     try:
-        _release_worker_schema(config.stash.get(_WORKER_SCHEMA_KEY, None))
+        _release_worker_database(config.stash.get(_WORKER_DATABASE_KEY, None))
     finally:
         if _SESSION_ISOLATION_ROOT is not None:
             shutil.rmtree(_SESSION_ISOLATION_ROOT, ignore_errors=True)

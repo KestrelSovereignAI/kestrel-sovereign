@@ -1,6 +1,6 @@
-"""Give each xdist worker its own PostgreSQL schema (#3383).
+"""Give each xdist worker its own PostgreSQL database (#3383).
 
-The unit tier runs ``pytest -n auto`` against one PostgreSQL database. Many
+The unit tier runs ``pytest -n auto`` against one PostgreSQL server. Many
 PostgreSQL cases boot the core schema (``AsyncDatabase._init_schema()``),
 whose ``CREATE TABLE/INDEX IF NOT EXISTS`` loop is idempotent in sequence but
 not in parallel: PostgreSQL tests for existence before it takes the lock that
@@ -9,36 +9,43 @@ proceed and one dies on a catalog unique index (``pg_type_typname_nsp_index``).
 Tests that drop and rebuild core tables reopen the same window mid-run, so
 initializing the schema once up front would not close it.
 
-Instead, each worker creates a schema of its own when it configures and
-rewrites ``TEST_POSTGRES_URL`` to select it through ``search_path``. Every
-reader of that variable — the ``db_backend`` fixture, a test opening a second
-connection to "the same database", a child process — then agrees on the
-worker's schema, and within a worker tests run one at a time. The schema is
-dropped when the worker unconfigures.
+Instead, each worker creates a database of its own when it configures and
+rewrites ``TEST_POSTGRES_URL`` to name it. Every reader of that variable — the
+``db_backend`` fixture, a test opening a second connection to "the same
+database", a child process — then agrees on the worker's database, and within
+a worker tests run one at a time. The database is dropped when the worker
+unconfigures.
 
-pgvector is the exception (#3401). An extension is installed once per
-database, into the first schema on the installing connection's
-``search_path``, and the core schema's migrations install it with ``CREATE
-EXTENSION IF NOT EXISTS vector``. Left to them, the first worker would put it
-in its own schema: no other worker could resolve ``vector(N)``, and that
-worker's drop would take every other worker's vector columns with it. So
-each worker first installs pgvector where a serial run would (``public``,
-normally), holding an advisory lock because ``CREATE EXTENSION IF NOT
-EXISTS`` races like ``CREATE TABLE IF NOT EXISTS``, and puts that schema
-after its own on the ``search_path``. Tables are created in, and resolve
-first to, the worker's schema; only a name the worker's schema lacks falls
-through to that shared one, so a test whose own table is gone (dropped and
-not yet rebuilt) reaches whatever a serial run left there. Where pgvector is
-absent and cannot be installed (the server lacks it, or the role is not a
-superuser: it is not a trusted extension), the worker gets its own schema
-alone.
+A database, not a schema (#3401, #3515). A schema isolates only the names it
+holds; a worker in one still shares the rest of the database. pgvector, which
+the core schema's migrations install, exists once per database, in one
+schema, and a worker resolves ``vector`` only with that schema on its
+``search_path``, where it also resolves everything else the schema holds. A
+serial run installs pgvector into ``public`` together with the core tables it
+boots there, so a worker's unqualified ``DROP TABLE IF EXISTS`` removed a
+table every run shares, and ``to_regclass`` reported it as the worker's own.
+Moving pgvector to a schema of its own would break the next serial run, whose
+migrations name ``vector`` unqualified, and the migrations' catalog probes
+that no schema qualifies saw every other worker's tables regardless. A worker
+in a database of its own shares none of this: it meets what a serial run meets
+on a fresh database, and its migrations install pgvector into its own
+``public`` exactly as a serial run's do, where the server provides it and the
+role may install it.
 
-Only xdist workers are isolated: a serial run has no peer to race, and its
-``search_path`` is left as it was.
+The worker's URL keeps every option of the job's URL except ``search_path``,
+which names schemas of the job's database that the worker's does not have:
+the worker runs on the server's default ``search_path``, as a serial run on a
+fresh database does.
 
-This does not relax #3381. A required run whose worker cannot set up its
-schema stops with a usage error; an unrequired one leaves the URL alone, so
-its PostgreSQL cases skip on the same connection failure they always did.
+Only xdist workers are isolated: a serial run has no peer to race, and its URL
+is left as it was.
+
+This does not relax #3381. A required run whose worker cannot create its
+database (the server is unreachable, or the role may not create databases)
+stops with a usage error. An unrequired one leaves the URL alone: its
+PostgreSQL cases skip on a connection failure as they always did, and on a
+server they can reach but whose role may not create a database they run
+unisolated, in the job's own database.
 """
 
 from __future__ import annotations
@@ -57,21 +64,14 @@ import asyncpg
 import pytest
 
 from tests.shared.postgres_requirement import REQUIRE_ENV, URL_ENV, postgres_required
-from tests.utils.postgres_schema import (
-    postgres_test_url,
-    quoted_search_path,
-    with_search_path,
-)
+from tests.utils.postgres_schema import database_url, postgres_test_url
 
 WORKER_ENV = "PYTEST_XDIST_WORKER"
 CONNECT_TIMEOUT_SECONDS = 10.0
-# A worker that leaked a connection holding a lock must not hang the
-# session's end on the drop.
+# ``FORCE`` ends a connection a test leaked into the worker's database, and
+# the lock timeout bounds a wait on any other lock held on it, so neither
+# hangs the session's end.
 DROP_LOCK_TIMEOUT = "10s"
-# The extension the core schema's migrations create, which every worker of
-# the database must resolve from one shared schema.
-SHARED_EXTENSION = "vector"
-EXTENSION_LOCK = "kestrel.tests.postgres_worker_isolation.shared_extension"
 
 _T = TypeVar("_T")
 
@@ -79,15 +79,15 @@ _CONNECTION_ERRORS = (OSError, TimeoutError, asyncpg.PostgresError, asyncpg.Inte
 
 
 @dataclass(frozen=True)
-class WorkerSchema:
-    """A schema one worker owns, and the URL it was created through."""
+class WorkerDatabase:
+    """A database one worker owns, and the URL it was created through."""
 
     admin_url: str
-    schema: str
+    database: str
 
 
-def worker_schema_name(worker_id: str) -> str:
-    """A fresh schema name for *worker_id*, unique to this run."""
+def worker_database_name(worker_id: str) -> str:
+    """A fresh database name for *worker_id*, unique to this run."""
 
     worker = re.sub(r"[^a-z0-9_]", "_", worker_id.lower())
     return f"pytest_{worker}_{uuid4().hex[:12]}"
@@ -109,55 +109,14 @@ async def _execute(url: str, *statements: str) -> None:
         await conn.close()
 
 
-async def _shared_extension_schema(conn: asyncpg.Connection) -> str | None:
-    """Install :data:`SHARED_EXTENSION` if absent; the schema it lives in.
-
-    ``None`` when the server does not provide the extension, or this role may
-    not install it: the migrations, running as the same role, cannot either.
-    """
-
-    available = await conn.fetchval(
-        "SELECT 1 FROM pg_available_extensions WHERE name = $1", SHARED_EXTENSION
-    )
-    if not available:
-        return None
-    try:
-        async with conn.transaction():
-            await conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtext($1))", EXTENSION_LOCK
-            )
-            await conn.execute(f'CREATE EXTENSION IF NOT EXISTS "{SHARED_EXTENSION}"')
-    except asyncpg.InsufficientPrivilegeError:
-        # pgvector is not a trusted extension, so only a superuser installs it.
-        return None
-    return await conn.fetchval(
-        "SELECT n.nspname FROM pg_extension e "
-        "JOIN pg_namespace n ON n.oid = e.extnamespace "
-        "WHERE e.extname = $1",
-        SHARED_EXTENSION,
-    )
-
-
-async def _create_worker_schema(url: str, schema: str) -> str | None:
-    """Create *schema*; return the shared extension's schema, if any."""
-
-    conn = await asyncpg.connect(url, timeout=CONNECT_TIMEOUT_SECONDS)
-    try:
-        # Before the worker's schema exists, so a failure leaves nothing.
-        extension_schema = await _shared_extension_schema(conn)
-        await conn.execute(f'CREATE SCHEMA "{schema}"')
-    finally:
-        await conn.close()
-    return extension_schema
-
-
 def isolate_xdist_worker(
     environ: MutableMapping[str, str] | None = None,
-) -> WorkerSchema | None:
-    """Point this worker's ``TEST_POSTGRES_URL`` at a schema of its own.
+) -> WorkerDatabase | None:
+    """Point this worker's ``TEST_POSTGRES_URL`` at a database of its own.
 
-    Returns the created schema, or ``None`` when this is not an xdist worker,
-    no PostgreSQL URL is configured, or an unrequired run cannot reach it.
+    Returns the created database, or ``None`` when this is not an xdist
+    worker, no PostgreSQL URL is configured, or an unrequired run cannot
+    create the database.
     """
 
     env = os.environ if environ is None else environ
@@ -165,23 +124,22 @@ def isolate_xdist_worker(
     base_url = postgres_test_url(env)
     if not worker_id or not base_url:
         return None
-    schema = worker_schema_name(worker_id)
+    database = worker_database_name(worker_id)
     try:
-        extension_schema = _run(_create_worker_schema(base_url, schema))
+        _run(_execute(base_url, f'CREATE DATABASE "{database}"'))
     except _CONNECTION_ERRORS as exc:
         if postgres_required(env):
             raise pytest.UsageError(
-                f"{REQUIRE_ENV}=1 but xdist worker {worker_id} could not set up "
-                f"its PostgreSQL schema: {exc!r}"
+                f"{REQUIRE_ENV}=1 but xdist worker {worker_id} could not create "
+                f"its PostgreSQL database: {exc!r}"
             ) from exc
         return None
-    search_path = (schema,) if extension_schema is None else (schema, extension_schema)
-    env[URL_ENV] = with_search_path(base_url, quoted_search_path(*search_path))
-    return WorkerSchema(admin_url=base_url, schema=schema)
+    env[URL_ENV] = database_url(base_url, database)
+    return WorkerDatabase(admin_url=base_url, database=database)
 
 
-def release_worker_schema(owned: WorkerSchema | None) -> None:
-    """Drop the schema :func:`isolate_xdist_worker` created, if any."""
+def release_worker_database(owned: WorkerDatabase | None) -> None:
+    """Drop the database :func:`isolate_xdist_worker` created, if any."""
 
     if owned is None:
         return
@@ -190,13 +148,13 @@ def release_worker_schema(owned: WorkerSchema | None) -> None:
             _execute(
                 owned.admin_url,
                 f"SET lock_timeout = '{DROP_LOCK_TIMEOUT}'",
-                f'DROP SCHEMA IF EXISTS "{owned.schema}" CASCADE',
+                f'DROP DATABASE IF EXISTS "{owned.database}" WITH (FORCE)',
             )
         )
     except _CONNECTION_ERRORS as exc:
-        # The tests have already reported; a leftover schema is litter in a
-        # test database, not a verdict on the run.
+        # The tests have already reported; a leftover database is litter on
+        # a test server, not a verdict on the run.
         warnings.warn(
-            f"could not drop xdist worker schema {owned.schema}: {exc!r}",
+            f"could not drop xdist worker database {owned.database}: {exc!r}",
             stacklevel=2,
         )
