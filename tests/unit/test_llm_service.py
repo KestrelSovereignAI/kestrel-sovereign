@@ -3269,3 +3269,78 @@ class TestStreamingMandatePreference:
         assert call_args is not None
         model_used = call_args.kwargs.get("model") or (call_args.args[1] if len(call_args.args) > 1 else None)
         assert model_used in ("gpt-5-mini", "openai/gpt-5-mini")
+
+
+# =============================================================================
+# #3525 — chat entry points follow the live privacy state
+# =============================================================================
+
+
+class TestLivePrivacySeam:
+    """A secondary caller that omits ``force_local_only`` (or passes ``False``)
+    must not reach a cloud route while the agent is in a local-only mode."""
+
+    @staticmethod
+    def _add_local_route(llm_service):
+        adapter = Mock()
+        adapter.create_messages = Mock(return_value=[])
+        adapter.get_response = AsyncMock(
+            return_value=LLMResponse(content="local", input_tokens=1, output_tokens=1)
+        )
+        llm_service.providers.append({
+            "name": "ollama:local", "vendor": "ollama", "route": "local",
+            "client": AsyncMock(), "adapter": adapter, "model": "llama3.2:3b",
+            "is_cloud": False, "is_local": True, "base_url": None,
+            "selection_hints": [],
+        })
+        return adapter
+
+    @staticmethod
+    def _cloud_adapters(llm_service):
+        return [p["adapter"] for p in llm_service.providers if not p.get("is_local")]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entry", ["get_response", "generate", "generate_with_messages"])
+    async def test_live_local_only_confines_a_flagless_call(self, llm_service, entry):
+        local = self._add_local_route(llm_service)
+        llm_service.set_force_local_only_provider(lambda: True)
+
+        if entry == "generate_with_messages":
+            await llm_service.generate_with_messages(
+                messages=[{"role": "user", "content": "private"}], force_local_only=False)
+        elif entry == "generate":
+            await llm_service.generate(system_prompt="s", user_prompt="private")
+        else:
+            await llm_service.get_response(system_prompt="s", user_prompt="private")
+
+        assert local.get_response.await_count == 1
+        for cloud in self._cloud_adapters(llm_service):
+            cloud.get_response.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_without_a_live_restriction_routing_is_unchanged(self, llm_service):
+        local = self._add_local_route(llm_service)
+        llm_service.set_force_local_only_provider(lambda: False)
+        await llm_service.get_response(system_prompt="s", user_prompt="hi")
+        local.get_response.assert_not_called()
+        assert any(c.get_response.await_count for c in self._cloud_adapters(llm_service))
+
+    def test_routing_resolution_reads_the_live_state(self, llm_service):
+        self._add_local_route(llm_service)
+        llm_service.set_force_local_only_provider(lambda: True)
+        providers, _ = llm_service.resolve_provider_routing()
+        assert providers and all(p["is_local"] for p in providers)
+
+        llm_service.set_force_local_only_provider(None)
+        providers, _ = llm_service.resolve_provider_routing()
+        assert any(not p.get("is_local") for p in providers)
+
+    def test_a_raising_provider_fails_closed(self, llm_service):
+        def broken():
+            raise RuntimeError("privacy provider down")
+
+        llm_service.set_force_local_only_provider(broken)
+        assert llm_service._effective_force_local_only(False) is True
+        llm_service.set_force_local_only_provider(None)
+        assert llm_service._effective_force_local_only(False) is False
+        assert llm_service._effective_force_local_only(True) is True
