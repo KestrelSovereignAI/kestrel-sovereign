@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-07
-**Scope:** 2614 tracked files (1827 `.py`, 351 `.md`, 436 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-08
+**Scope:** 2617 tracked files (1830 `.py`, 351 `.md`, 436 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -444,7 +444,7 @@ Repo entry points and standard project files.
   - `class AgentDataProtectionError`; `class DestructiveOperationPolicy`; `def rewrite_script_for_safety(content, language, workdir)`
 - **kestrel_sovereign/features/compute/executors/__init__.py** — Kestrel Compute Feature - Executors Package.
 - **kestrel_sovereign/features/compute/executors/base.py** — Kestrel Compute Feature - Base Executor.
-  - `class ExecutionError`; `class ExecutionTimeoutError`; `class ExecutionEnvironmentError`; `class CommandExecutionUnsupported`; `class BaseExecutor`
+  - `class OutputSinks`; `class ExecutionError`; `class ExecutionTimeoutError`; `class ExecutionEnvironmentError`; `class CommandExecutionUnsupported`; `class BaseExecutor`
 - **kestrel_sovereign/features/compute/executors/docker_executor.py** — Kestrel Compute Feature - Docker Executor.
   - `class DockerExecutor`
 - **kestrel_sovereign/features/compute/executors/docker_snapshot_worker.py** — Killable subprocess boundary for Docker working-directory snapshots.
@@ -484,7 +484,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/computer_use/backends/local.py** — Local sandbox backend — direct host execution.
   - `class LocalSandboxBackend`
 - **kestrel_sovereign/features/computer_use/capture.py** — Durable artifacts for shell runs whose output must outlive the result.
-  - `class CaptureBundle`; `def allocate(capture_dir)`; `async def git_head(cwd)`; `def build_manifest()`; `def open_stream(path)`; `async def write_stream(path, data)`; `async def write_manifest(bundle, body)`; `def prune(capture_dir)`; `…`
+  - `class CaptureBundle`; `def allocate(capture_dir)`; `async def git_head(cwd)`; `def build_manifest()`; `def open_stream(path)`; `async def write_manifest(bundle, body)`; `def discard(paths)`; `def prune(capture_dir)`; `…`
 - **kestrel_sovereign/features/computer_use/feature.py** — ComputerUseFeature: bounded host access wrapped in three gates + policy.
   - `def shell_syntax_refusal(command, argv)`; `class ComputerUseFeature`
 - **kestrel_sovereign/features/computer_use/path_safety.py** — Path-safety guards for the computer-use feature.
@@ -790,6 +790,8 @@ Repo entry points and standard project files.
   - `def discover_host_feature_classes()`; `class HostScopedManifest`; `def read_host_scoped_manifest(manifest_path)`; `def instantiate_host_features(classes)`
 - **kestrel_sovereign/host_features/runtime.py** — Mount host-feature routers/UI and drive their host-scoped lifecycle.
   - `def host_feature_path_prefixes(app)`; `def is_host_feature_path(app, path)`; `def mount_host_feature_routers(app, features)`; `def mount_host_feature_ui(app, features)`; `def unmount_host_features(app)`; `async def start_host_features(features, ctx)`; `async def stop_host_features(features, ctx)`
+- **kestrel_sovereign/host_features/start_order.py** — Start host features provider-before-consumer (issue #3501).
+  - `class RequirementScan`; `def scan_service_requirements(feature)`; `def order_host_features_for_start(pairs, active_services)`
 - **kestrel_sovereign/host_features/storage.py** — Private path resolution and migration for fleet/host feature SQLite state.
   - `class HostDatabaseLaunchContext`; `def host_database_path(db_path)`; `def resolve_host_database_launch_context()`; `def pin_host_database_launch_context(env)`; `def legacy_host_database_path()`; `def sqlite_family(path)`; `def validate_sqlite_family_private(path)`; `def validate_host_database_parent_readiness(database)`; `…`
 - **kestrel_sovereign/host_features/ui.py** — Aggregate host-feature UI contributions into a host-scoped console surface.
@@ -1041,7 +1043,7 @@ Repo entry points and standard project files.
   - `def encode_agent_route_name(agent_name)`; `def decode_agent_route_name(segment)`
 - **kestrel_sovereign/operator/__init__.py** — Generic runtime support for SDK operator contracts.
 - **kestrel_sovereign/operator/runtime.py** — Lifecycle-owned registries for generic SDK operator contracts.
-  - `class OperatorRegistrationError`; `class OperatorRegistrationConflictError`; `class OperatorRegistrationIdentityError`; `class ExecutionTargetUnavailableError`; `class ExecutionTargetRegistration`; `class OperatorRegistrationSet`; `class OperatorRuntimeRegistry`
+  - `class OperatorRegistrationError`; `class OperatorRegistrationConflictError`; `class OperatorRegistrationIdentityError`; `class ExecutionTargetUnavailableError`; `class ExecutionTargetRegistration`; `class OperatorRegistrationSet`; `class OperatorRuntimeRegistry`; `def service_registration_satisfies(registration, requirement)`
 - **kestrel_sovereign/paths.py** — Project-root and package-root resolution.
   - `def package_dir()`; `def project_dir()`; `def load_project_env(home)`; `def spawned_agent_env(project_dir)`; `def spawned_agent_data_key(env, agent_name)`; `class StoragePathOutsideTestRootsError`; `def guard_storage_path(path)`; `def runtime_path_env(name, default)`; `…`
 - **kestrel_sovereign/phoenix_supervisor.py** — Host-supervised Arize Phoenix subprocess + same-origin embed helpers (#2570).
@@ -2972,7 +2974,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_computer_use_audit.py** — Tests for the JSONL audit log (#836).
   - `async def test_writes_one_record(tmp_path)`; `async def test_records_in_order(tmp_path)`; `async def test_concurrent_writes_serialized(tmp_path)`; `async def test_creates_parent_dir(tmp_path)`; `async def test_forwards_to_feedback_hook(tmp_path)`; `async def test_record_includes_outcome_and_error(tmp_path)`
 - **tests/unit/test_computer_use_docker_backend.py** — What the Docker sandbox backend hands to the compute executor (#3187).
-  - `async def test_exec_hands_the_vector_to_the_argv_mode_unchanged()`; `async def test_exec_passes_the_timeout_environment_and_cwd_through()`; `async def test_exec_reports_a_missing_exit_code_as_a_failure()`; `async def test_exec_refuses_an_empty_vector()`; `def test_the_backend_still_requires_the_sandboxed_grant()`
+  - `async def test_exec_hands_the_vector_to_the_argv_mode_unchanged()`; `async def test_exec_passes_the_timeout_environment_and_cwd_through()`; `async def test_exec_reports_a_missing_exit_code_as_a_failure()`; `async def test_exec_refuses_an_empty_vector()`; `def test_the_backend_still_requires_the_sandboxed_grant()`; `async def test_a_capture_past_the_ceiling_holds_all_of_it_and_is_complete(tmp_path, monkeypatch)`; `async def test_the_returned_strings_stay_clipped_at_the_ceiling(tmp_path, monkeypatch)`; `async def test_non_utf8_bytes_survive_the_capture_byte_for_byte(tmp_path, monkeypatch)`; `…`
 - **tests/unit/test_computer_use_durable_capture.py** — A long review must leave an artifact, and a clipped one must not read as a verdict (#3243).
   - `class FakeApprovalQueue`; `class FakeSecurityFeature`; `class FakeAgent`; `def workspace(tmp_path)`; `def queue()`; `async def test_a_capture_survives_output_far_larger_than_the_inline_cap(tmp_path)`; `async def test_without_a_capture_the_same_output_is_clipped_and_says_so(tmp_path)`; `async def test_the_capture_path_is_allocated_by_the_runtime(workspace, queue)`; `…`
 - **tests/unit/test_computer_use_feature.py** — Tests for ComputerUseFeature gate ordering and lifecycle (#838).
@@ -3355,6 +3357,8 @@ Repo entry points and standard project files.
   - `class TalonCoordinatorFeature`; `def test_declared_config_is_addressed_by_package_name(tmp_path)`; `def test_class_name_spelling_is_not_read_but_is_reported(tmp_path, caplog)`; `def test_absent_file_and_absent_block_are_not_errors(tmp_path)`; `def test_unknown_feature_class_resolves_to_no_package(tmp_path)`; `async def test_declared_config_is_applied_to_the_feature(tmp_path)`; `async def test_feature_without_a_schema_is_left_alone(tmp_path)`; `async def test_a_rejected_config_propagates_rather_than_being_swallowed(tmp_path)`; `…`
 - **tests/unit/test_host_feature_contribution_runtime.py** — —
   - `async def test_host_start_stop_wires_all_exact_sdk_contributions_once()`; `async def test_host_context_clauses_reach_existing_agent_prompts_and_teardown()`; `async def test_later_host_context_collision_is_rejected_before_rendering(tmp_path)`; `async def test_later_host_context_respects_bound_agent_bootstrap_names(tmp_path)`; `async def test_host_renderer_failure_does_not_leak_feature_repr_or_cause()`; `async def test_host_renderer_cancelled_error_is_sanitized_without_cause()`; `async def test_host_stop_removes_only_requested_owner()`; `async def test_host_start_failure_removes_only_failed_feature_contributions()`; `…`
+- **tests/unit/test_host_feature_start_order.py** — Host features start provider-before-consumer (#3501).
+  - `async def test_a_provider_finishes_starting_before_a_consumer_listed_first()`; `async def test_consumers_stop_before_their_providers()`; `async def test_the_started_set_is_returned_in_discovery_order_for_mounting()`; `async def test_independent_features_keep_discovery_order(caplog)`; `async def test_only_a_provider_moves_and_only_to_just_before_its_first_consumer()`; `async def test_a_transitive_provider_starts_before_the_provider_that_needs_it()`; `async def test_a_dependency_cycle_is_logged_by_name_and_every_feature_starts(caplog)`; `async def test_a_requirement_no_host_feature_provides_is_logged_and_still_starts(caplog)`; `…`
 - **tests/unit/test_host_feature_storage.py** — Private custody tests for the fleet/host feature SQLite database (#2610).
   - `async def test_default_host_database_is_private_at_creation_under_umask_zero(tmp_path, monkeypatch)`; `async def test_custom_env_path_is_supported_hardened_and_reopened(tmp_path, monkeypatch)`; `def test_custom_path_refuses_shared_parent_without_chmod(tmp_path)`; `async def test_context_disables_store_when_custom_parent_is_not_private(tmp_path, monkeypatch)`; `def test_custom_path_creates_missing_dedicated_parent_privately(tmp_path)`; `def test_custom_path_rejects_symbolic_link_parent(tmp_path)`; `def test_custom_path_rejects_symbolic_links(tmp_path, link_target)`; `def test_custom_path_rejects_multiply_linked_database(tmp_path)`; `…`
 - **tests/unit/test_host_features.py** — Unit tests for the host-scoped feature runtime (issue #2293, Phase 1).
@@ -3797,6 +3801,8 @@ Repo entry points and standard project files.
   - `class TestResponseAuditHook`; `class TestResponseAuditHookNarrationFolding`; `class TestResponseAuditFeature`; `async def test_post_response_hook_flags_user_denial_without_audit()`; `async def test_post_response_hook_allows_audit_backed_user_denial()`; `async def test_post_response_hook_missing_security_feature_does_not_break()`
 - **tests/unit/test_response_audit_decision.py** — Response audit on decide (#3490, #3424 slice 5): request builder, risk composition, failure semantics, hook/feature wiring, and the eval adapter.
   - `def test_request_builder_shape()`; `def test_compose_risk(p_block, p_concern, risk)`; `async def test_decision_audit_uses_resolved_thresholds_and_content_free_reasoning()`; `async def test_decision_failure_is_an_unrun_audit(error)`; `async def test_strict_hook_with_decision_backend_blocks_and_fails_closed()`; `async def test_warn_hook_annotates_concern_without_leaking_response()`; `async def test_chat_backend_is_the_default_and_unchanged()`; `def test_backend_config_validation(env, message)`; `…`
+- **tests/unit/test_response_audit_privacy.py** — #3491: the response audit follows the privacy rule of the turn it audits.
+  - `async def test_live_local_only_mode_audits_on_the_local_route_only(mode)`; `async def test_isolated_hook_passes_the_turn_privacy_state_explicitly()`; `async def test_explicit_false_cannot_loosen_the_live_restriction()`; `async def test_unreadable_live_restriction_fails_closed_to_local()`; `async def test_no_local_route_returns_typed_unaudited_result()`; `async def test_strict_hook_blocks_the_turn_when_no_local_route_can_audit()`; `async def test_warn_hook_does_not_send_or_block_when_no_local_route_can_audit()`; `async def test_hook_that_cannot_read_the_turn_privacy_state_makes_no_audit_call()`; `…`
 - **tests/unit/test_restart_coordinator.py** — Tests for the durable restart coordinator (#1512).
   - `async def test_fleet_idle_defers_when_a_sibling_is_busy(tmp_path)`; `async def test_fleet_idle_true_when_all_agents_idle(tmp_path)`; `async def test_fleet_idle_falls_back_to_self_without_provider(tmp_path)`; `async def test_fleet_idle_resolves_via_manager_backref_when_no_provider(tmp_path)`; `async def test_fleet_idle_excludes_only_requesters_own_marker(tmp_path)`; `async def test_fleet_blocker_names_sibling_task_kind_and_age_not_its_tail(tmp_path)`; `async def test_fleet_blocker_labels_a_sibling_by_display_name_and_did(tmp_path)`; `async def test_fleet_blocker_does_not_disclose_sibling_dispatcher_load(tmp_path)`; `…`
 - **tests/unit/test_restart_events_endpoint.py** — Tests for the restart status-event API endpoint (#1816).
