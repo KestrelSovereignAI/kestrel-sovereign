@@ -158,8 +158,18 @@ jobs:
         # release-signing secrets NOR the GH_PAT-backed git auth are
         # available, so a malicious tag cannot steal either.
         run: |
-          uv build --wheel --sdist --out-dir ../dist/
-          ls -la ../dist/
+          uv build --wheel --sdist --out-dir ../build-dist/
+          ls -la ../build-dist/
+
+      # Stage before introducing signing keys: uv's auxiliary .gitignore
+      # must not enter a manifest whose consumers receive only packages.
+      - name: Stage exact distribution inventory
+        working-directory: signing-tools
+        run: |
+          uv run python scripts/release/stage_distribution_artifacts.py \
+            --source ../build-dist \
+            --destination ../dist \
+            --release-tag "${{ steps.release_tag.outputs.tag }}"
 
       - name: Load signing key into SecureKeyStorage (using main's loader)
         working-directory: signing-tools
