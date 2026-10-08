@@ -281,3 +281,35 @@ def test_shipped_samples_are_the_population_the_decision_sees():
         message = sample.raw["message"]
         assert OrchestratorEngineMixin._signals_unfinished_tool_work(message), sample.id
         assert sample.requests == (tc.continuation_decision_request(message),)
+
+
+# --- streaming: a skipped repair never repeats a streamed answer (codex r1) ---
+
+
+async def _stream_with_decision(stream_items, p_unfinished):
+    from tests.unit.test_turn_completion_guard import _drain_streaming, _streaming_agent
+
+    agent = _streaming_agent(stream_items, "[answer complete]")
+    decided = _service(p_unfinished)
+    agent.llm_service.decide = decided.decide
+    return agent, await _drain_streaming(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_complete_answer_is_not_repeated_when_the_repair_is_skipped(
+    decision_check,
+):
+    agent, text = await _stream_with_decision(
+        [_PLAN, LLMResponse(content=_PLAN, tool_calls=None)], 0.02)
+    agent.llm_service.generate_with_messages.assert_not_awaited()
+    assert text.count(_PLAN) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unstreamed_complete_answer_is_delivered_when_the_repair_is_skipped(
+    decision_check,
+):
+    agent, text = await _stream_with_decision(
+        [LLMResponse(content=_PLAN, tool_calls=None)], 0.02)
+    agent.llm_service.generate_with_messages.assert_not_awaited()
+    assert text.count(_PLAN) == 1

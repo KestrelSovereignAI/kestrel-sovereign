@@ -548,6 +548,12 @@ class OrchestratorEngineMixin:
                 local_only=force_local_only, session_id=session_id,
             )
         ):
+            # The message is the answer, as written. One already streamed to
+            # the client has nothing left to deliver: like a confirmed repair
+            # (``_settle_repaired_turn``), only an addition would follow it,
+            # and there is none.
+            if original_delivered:
+                response.content = ""
             return response
 
         logging.warning(
