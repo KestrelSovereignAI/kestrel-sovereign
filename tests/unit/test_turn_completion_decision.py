@@ -62,8 +62,14 @@ def _service(p_unfinished=None, *, error=None, threshold=0.5):
 
 @pytest.fixture
 def decision_check(monkeypatch):
-    monkeypatch.setattr(tc, "CONTINUATION_CHECK", "decision")
-    monkeypatch.setattr(tc, "CONTINUATION_CHECK_DECISION_MODEL", "openrouter:api/liquid/d1")
+    monkeypatch.setenv(tc.CONTINUATION_CHECK_ENV, "decision")
+    monkeypatch.setenv(tc.CONTINUATION_CHECK_MODEL_ENV, "openrouter:api/liquid/d1")
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_check(monkeypatch):
+    monkeypatch.delenv(tc.CONTINUATION_CHECK_ENV, raising=False)
+    monkeypatch.delenv(tc.CONTINUATION_CHECK_MODEL_ENV, raising=False)
 
 
 # --- settings -----------------------------------------------------------------
@@ -116,6 +122,24 @@ async def test_the_pattern_check_never_asks():
     service = _service(0.0)
     assert await tc.confirm_unfinished(service, _PLAN) is True
     service.decide.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_setting_is_read_when_the_check_runs(monkeypatch):
+    """The server imports this module before it loads ``.env``, so a value
+    that arrives after import must still take effect."""
+    service = _service(0.02)
+    assert await tc.confirm_unfinished(service, _PLAN) is True
+    monkeypatch.setenv(tc.CONTINUATION_CHECK_ENV, "decision")
+    assert await tc.confirm_unfinished(service, _PLAN) is False
+    assert service.decide.await_args.kwargs["model_override"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_setting_raises_rather_than_falling_back(monkeypatch):
+    monkeypatch.setenv(tc.CONTINUATION_CHECK_ENV, "sometimes")
+    with pytest.raises(ValueError, match="must be"):
+        await tc.confirm_unfinished(_service(0.5), _PLAN)
 
 
 @pytest.mark.asyncio

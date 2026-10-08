@@ -2537,6 +2537,13 @@ class KestrelAgent(
                 )
             )
 
+        # The continuation check reads its env when it runs (the server
+        # imports it before loading .env); a malformed value fails the boot
+        # here rather than a turn later (#3527).
+        from kestrel_sovereign.turn_completion import continuation_check_settings
+
+        continuation_check_settings()
+
         # Async completion pass for routes the sync registry build couldn't
         # bring up (e.g. an OpenRouter route with only a management key, now
         # completed via a bootstrap child key). Guard on iscoroutinefunction

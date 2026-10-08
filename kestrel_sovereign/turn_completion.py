@@ -96,8 +96,9 @@ def settle_repaired_content(original: Optional[str], repaired: Optional[str]) ->
 # ---------------------------------------------------------------------------
 
 #: ``regex`` (the pattern alone decides) or ``decision`` (the pattern
-#: prefilters and a decision confirms). Module constants, like the
-#: orchestrator's other env knobs: an invalid value fails at import, so at boot.
+#: prefilters and a decision confirms). Read when the check runs, never at
+#: import: the server imports this module before it loads ``.env``. The agent
+#: validates them at construction so a bad value still fails at boot.
 CONTINUATION_CHECK_ENV = "KESTREL_CONTINUATION_CHECK"
 CONTINUATION_CHECK_MODEL_ENV = "KESTREL_CONTINUATION_CHECK_DECISION_MODEL"
 CONTINUATION_CHECKS = ("regex", "decision")
@@ -145,8 +146,6 @@ def continuation_check_settings(
     return check, model
 
 
-CONTINUATION_CHECK, CONTINUATION_CHECK_DECISION_MODEL = continuation_check_settings()
-
 
 def continuation_decision_request(content: str) -> DecisionRequest:
     """The decision a pattern-flagged message gets. The single builder for
@@ -182,7 +181,8 @@ async def confirm_unfinished(
     repairs.
     """
 
-    if CONTINUATION_CHECK != "decision":
+    check, decision_model = continuation_check_settings()
+    if check != "decision":
         return True
     decide = getattr(llm_service, "decide", None)
     if not callable(decide):
@@ -193,7 +193,7 @@ async def confirm_unfinished(
             continuation_decision_request(content),
             caller=CONTINUATION_CALLER,
             timeout_seconds=CONTINUATION_DECISION_TIMEOUT_SECONDS,
-            model_override=CONTINUATION_CHECK_DECISION_MODEL,
+            model_override=decision_model,
             local_only=local_only,
             session_id=session_id,
             default_thresholds={CONTINUATION_QUESTION: CONTINUATION_DEFAULT_THRESHOLD},

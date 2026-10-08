@@ -1634,3 +1634,23 @@ async def test_post_all_features_loaded_barrier_flag(tmp_path, fail_after_post_l
             assert agent._post_all_features_loaded_complete is True
     finally:
         await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_storage_phase_fails_boot_on_a_malformed_continuation_check(tmp_path, monkeypatch):
+    """#3527: the continuation check reads its env when it runs, because the
+    server imports it before loading .env; a malformed value must still fail
+    the boot rather than a turn."""
+    monkeypatch.setenv("KESTREL_CONTINUATION_CHECK", "sometimes")
+    agent = _make_agent(tmp_path)
+    ctx = BootContext()
+    with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage:
+        storage = AsyncMock()
+        storage.initialize = AsyncMock()
+        storage.get_node = AsyncMock(return_value=None)
+        storage.db = MagicMock()
+        storage.close = AsyncMock()
+        MockStorage.return_value = storage
+
+        with pytest.raises(ValueError, match="KESTREL_CONTINUATION_CHECK"):
+            await agent._boot_phase_storage_privacy(ctx)
