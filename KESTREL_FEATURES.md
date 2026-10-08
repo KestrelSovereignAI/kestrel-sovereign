@@ -631,7 +631,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `backlog_hygiene` | `!hygiene` | `system` | `fix` | 88 | `enabled` |
-| `morning_signal` | `!morning` | `system` |  | 48 | `enabled` |
+| `morning_signal` | `!morning` | `system` |  | 67 | `enabled` |
 | `recall_blockers` | `!blockers` | `memory` | `limit`, `include_resolved` | 120 | `enabled` |
 | `recall_patterns` | `!patterns` | `memory` | `limit`, `include_superseded` | 123 | `enabled` |
 | `session_log` | `!sessionlog` | `system` | `session_id`, `focus` | 125 | `enabled` |
@@ -1115,7 +1115,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!blockers` | `strategic_memory` | `[limit] [include_resolved]` | Recall blockers from the strategy index (graph nodes of type 'strategy_blocker'). Resolved blockers are excluded by default; pass include_resolved=True to see them. |
 | `!dispatch` | `strategic_memory` | `[mode]` | Pick the highest-priority issue from strategic memory and start it through a live feature-contributed dispatch workflow. Preview with mode='suggest'; execute fails closed when no compatible workflow capability and governed runner are enabled. |
 | `!hygiene` | `strategic_memory` | `[fix]` | Scan all repos for backlog hygiene issues: missing assignees, milestones, status labels. Reports gaps and flags items needing human review. |
-| `!morning` | `strategic_memory` |  | Generate a morning strategic briefing -- milestone status, blockers, recommended work items. Pulls live data from GitHub when GITHUB_TOKEN is available. |
+| `!morning` | `strategic_memory` |  | Generate a morning strategic briefing -- milestone status, blockers, the last 24h of workflow runs (failures and persistently failing workflows), recommended work items. Pulls live data from GitHub when GITHUB_TOKEN is available. |
 | `!patterns` | `strategic_memory` | `[limit] [include_superseded]` | Recall learned patterns from the strategy index (graph nodes of type 'strategy_pattern'). Superseded patterns are excluded by default; pass include_superseded=True to see them. |
 | `!sessionlog` | `strategic_memory` | `[session_id] [focus]` | End-of-day session log collector. Scans all repos for today's activity (issues closed, PRs merged, comments, commits) and generates a structured session summary with outcomes and metrics. |
 | `!strategy` | `strategic_memory` | `[section]` | View the current strategic context: vision, milestones, stakeholders, decisions, blockers, and patterns. |
