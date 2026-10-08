@@ -309,6 +309,14 @@ banned = []
 # uncalibrated = "refuse"    # with no calibrated local model, a privacy mode fails the stage instead of guessing
 # [decisions.thresholds."memory_attestation".models."openrouter:api/<model>"]
 # "applied" = 0.5
+#
+# Continuation check (#3527): with KESTREL_CONTINUATION_CHECK=decision (env,
+# like the orchestrator's other knobs), a message the continuation pattern
+# flags gets one "unfinished" decision before a repair turn is spent; optional
+# KESTREL_CONTINUATION_CHECK_DECISION_MODEL selects the model. Calibrate with
+#   kestrel decisions eval --caller turn_completion --baseline regex
+# [decisions.thresholds."turn_completion".models."openrouter:api/<model>"]
+# "unfinished" = 0.5
 
 # =============================================================================
 # Backup Retention

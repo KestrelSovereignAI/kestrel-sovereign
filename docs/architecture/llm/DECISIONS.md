@@ -492,7 +492,12 @@ Slices are tracked on #3424. Each one lands with tests that fail without it.
      - **Privacy.** The decision backend passes the live privacy state as `local_only`; `decide` also ORs it in itself (§6). The chat backend previously sent memories to whichever chat route ranked first, even in a privacy mode. It now passes `force_local_only` from the same live state (#3497).
      - **Failure.** A `DecisionError` on any memory fails the stage (`attestation_failed`, with the error types). Memories whose calls completed are still marked, the same as a chat-call failure midway.
    - **6b: reflection capture pre-gate.** This lives in `kestrel-feature-reflection`. Core must not import features, so the feature registers its eval adapter through an entry point.
-7. Per-heuristic migrations, each with labelled samples: tagger, schema router, continuation intent, turn classifier, injection scoring, and GitHub-app should-respond.
+7. Per-heuristic migrations, each with labelled samples: tagger, schema router, continuation intent, turn classifier, injection scoring, and GitHub-app should-respond. Each one starts by measuring what the heuristic costs today. Slice 6b was dropped when its premise did not hold.
+   - **7a: continuation intent (#3527).** `CONTINUATION_INTENT_RE` searches the whole assistant message, and any plan sentence triggers a premature-yield repair turn (#1237) that carries the whole conversation.
+     - **Measured on the reference host** (09-30 to 10-08): 247 repair turns, with a median of 169k context tokens each on the orchestrator's model (36.9M in total). Only 21 (8.5%) made a tool call; 124 (50%) replied only `[answer complete]`.
+     - **Change.** With `KESTREL_CONTINUATION_CHECK=decision` the pattern becomes a prefilter. A flagged message gets one `noul`, `unfinished`, over the tail of the message (caller `turn_completion`, default 0.5), and the repair runs only on yes. `KESTREL_CONTINUATION_CHECK_DECISION_MODEL` is the selector. Both are read when the check runs, not at import, because the server imports the module before it loads `.env`. The agent validates them at boot. Tool-call markup written as text skips the decision and is always repaired.
+     - **Failure.** Any `DecisionError` repairs, as the pattern alone would, so the check only ever removes repairs. Privacy follows the turn's `force_local_only` and the live state.
+     - **Live eval** (40 shipped messages, all pattern-flagged, 16 unfinished): the pattern alone has precision 0.40 by construction; d1 scores 1.000 (p50 376 ms); tev1:0.8b scores 0.850 when calibrated to 0.65.
 8. Images in state.
 9. Decision-driven model routing, after the per-turn routing freeze.
 

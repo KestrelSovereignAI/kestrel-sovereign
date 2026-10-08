@@ -74,6 +74,7 @@ SAMPLE_ADAPTERS: Mapping[str, str] = {
     "response_audit": (
         "kestrel_sovereign.features.response_audit.decision_audit:response_audit_eval_sample"
     ),
+    "turn_completion": "kestrel_sovereign.turn_completion:turn_completion_eval_sample",
 }
 
 #: Caller-owned baselines: caller -> {name: "module:function"}. A baseline is
@@ -90,6 +91,10 @@ BASELINES: Mapping[str, Mapping[str, str]] = {
         "chat": (
             "kestrel_sovereign.features.response_audit.decision_audit:response_audit_chat_baseline"
         ),
+    },
+    "turn_completion": {
+        "regex": "kestrel_sovereign.turn_completion:orchestrator_pattern_baseline",
+        "regex_subagent": "kestrel_sovereign.turn_completion:subagent_pattern_baseline",
     },
 }
 

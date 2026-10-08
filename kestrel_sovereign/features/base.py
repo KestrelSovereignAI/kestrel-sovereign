@@ -40,6 +40,7 @@ from kestrel_sdk.features.ui import UIContributions
 # these across every feature docstring in the tree before removal.
 from kestrel_sdk.features.base import tool, parse_docstring_params
 from kestrel_sovereign.turn_completion import (
+    confirm_unfinished,
     settle_repaired_content,
     turn_completion_repair_prompt,
 )
@@ -402,6 +403,12 @@ class Feature(_SdkFeature):
         """
         content = getattr(response, "content", "") or ""
         if not tools or not self._signals_unfinished_tool_work(content):
+            return response
+        # The pattern is usually a finished answer's plan; confirm it first
+        # when the decision check is on (#3527).
+        if not await confirm_unfinished(
+            self.agent.llm_service, content, session_id=session_id,
+        ):
             return response
 
         logger.warning(

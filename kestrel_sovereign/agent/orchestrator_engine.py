@@ -34,6 +34,7 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.turn_completion import (
+    confirm_unfinished,
     confirms_complete,
     repair_addition,
     settle_repaired_content,
@@ -537,6 +538,22 @@ class OrchestratorEngineMixin:
         """
         content = response.content or ""
         if not tools or not OrchestratorEngineMixin._signals_unfinished_tool_work(content):
+            return response
+        # Markup written as text executed nothing and is never an answer; a
+        # narrated continuation is usually a finished answer's plan, so it is
+        # confirmed first when the decision check is on (#3527).
+        if not OrchestratorEngineMixin._tool_call_emitted_as_text(content) and not (
+            await confirm_unfinished(
+                self.llm_service, content,
+                local_only=force_local_only, session_id=session_id,
+            )
+        ):
+            # The message is the answer, as written. One already streamed to
+            # the client has nothing left to deliver: like a confirmed repair
+            # (``_settle_repaired_turn``), only an addition would follow it,
+            # and there is none.
+            if original_delivered:
+                response.content = ""
             return response
 
         logging.warning(
