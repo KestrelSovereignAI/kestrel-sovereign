@@ -152,3 +152,24 @@ def test_completed_receipt_preserves_valid_integer_and_pending_states(risk):
     }
     assert validate_completed_genesis_audit(record, "exact") == record["status"]
     assert validate_completed_genesis_audit({"status": "pending"}, "exact") is None
+
+
+@pytest.mark.parametrize("status,risk", [("passed", 1), ("failed", 3)])
+@pytest.mark.parametrize("field", ["completed_at", "timestamp"])
+@pytest.mark.parametrize(
+    "value", [True, False, 1, 1.5, [], ["time"], {}, {"time": "now"}, "", "  "]
+)
+def test_completed_receipt_rejects_malformed_completion_shape(
+    status, risk, field, value
+):
+    record = {
+        "status": status,
+        "risk_level": risk,
+        "constitution_hash": "exact",
+        "audited": True,
+        field: value,
+    }
+    original = deepcopy(record)
+    with pytest.raises(GenesisAuditError, match="completion time"):
+        validate_completed_genesis_audit(record, "exact")
+    assert record == original
