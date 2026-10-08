@@ -14,6 +14,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -7924,3 +7925,345 @@ async def test_sovereign_update_is_not_subject_to_agent_tag_bound(
     row = await get_request(backend, request_id)
     assert row.status == "executing"
     assert row.update_repo_path == default_repo
+
+
+# ---------------------------------------------------------------------------
+# Constitution adoption gate (#3517): a restart that would boot agents into
+# constitution Safe Mode is refused terminally, with the agents and hashes
+# named, before anything restarts. The coordinator judges the installed code
+# in a fresh interpreter, which imports the linked package these tests put on
+# its PYTHONPATH (``link_installed_package``).
+# ---------------------------------------------------------------------------
+
+_ANCHORED_TEXT = b"# Kestrel Constitution\nthe text the fleet is anchored to\n"
+_AMENDED_TEXT = b"# Kestrel Constitution\nthe text a merged PR introduced\n"
+#: What an update whose resolver renders differently appends to the text.
+_RENDERED = b"\n<!-- rendered by the merged release -->\n"
+
+
+@pytest.fixture
+def adoption_project(tmp_path, monkeypatch):
+    """The project the coordinator's ``kestrel restart`` child would boot."""
+    from tests.utils.constitution_anchor import sha256
+
+    for name in (
+        "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH",
+        "KESTREL_SOVEREIGN_TRUST_ROOT_PATH",
+        "KESTREL_DB_BACKEND",
+        "KESTREL_DATABASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr("kestrel_sovereign.paths.project_dir", lambda: project)
+    return project, sha256
+
+
+def _link_installed(tmp_path, monkeypatch, constitution):
+    """Install a package whose packaged constitution is ``constitution``."""
+    from tests.utils.constitution_anchor import link_installed_package
+
+    if sys.platform == "win32":
+        pytest.skip("the linked installed package needs POSIX symlinks")
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH", str(constitution)
+    )
+    package = link_installed_package(tmp_path / "site", constitution)
+    monkeypatch.setenv("PYTHONPATH", str(package.root))
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+    return package
+
+
+def _install_constitution(tmp_path, monkeypatch, content: bytes):
+    constitution = tmp_path / "pkg" / "KESTREL_CONSTITUTION.md"
+    constitution.parent.mkdir(parents=True, exist_ok=True)
+    constitution.write_bytes(content)
+    return _link_installed(tmp_path, monkeypatch, constitution)
+
+
+@pytest.mark.asyncio
+async def test_restart_onto_an_unadopted_constitution_is_refused_terminally(
+    tmp_path, monkeypatch, adoption_project,
+):
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    installed = _install_constitution(tmp_path, monkeypatch, _AMENDED_TEXT)
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="ship the merged constitution PR")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        result = await feat.restart_coordinator()
+        again = await feat.restart_coordinator()
+
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    assert row.completed_at
+    for text in (
+        "Emma",
+        sha256(_ANCHORED_TEXT),
+        sha256(_AMENDED_TEXT),
+        "constitution Safe Mode",
+        "docs/architecture/security/SOVEREIGN_TRUST_ROOT.md",
+    ):
+        assert text in row.status_reason
+    assert result.data["refused"] == [
+        {"request_id": request_id, "reason": row.status_reason}
+    ]
+    assert result.data["executed"] == []
+    # Terminal: the next tick has nothing to run, and the row stays refused.
+    assert again.data["pending"] == 0
+    assert (await get_request(backend, request_id)).status == "refused"
+    events = await list_events_for_request(backend, request_id)
+    assert [event.state for event in events][-1] == "refused"
+    # A refused request cannot be canceled back into the queue.
+    canceled = await feat.cancel_restart_request(request_id)
+    assert canceled.data["canceled"] is False
+
+    # Refusal is terminal for its authority too: rewriting the row back to
+    # pending, even after the fleet adopts the constitution, is a replay.
+    installed.constitution.write_bytes(_ANCHORED_TEXT)
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'pending' WHERE id = ?",
+        (request_id,),
+    )
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+    spawn.assert_not_called()
+    replayed = await get_request(backend, request_id)
+    assert replayed.status == "rejected"
+    assert "consumed" in replayed.status_reason
+
+
+@pytest.mark.asyncio
+async def test_restart_onto_the_anchored_constitution_proceeds(
+    tmp_path, monkeypatch, adoption_project,
+):
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    _install_constitution(tmp_path, monkeypatch, _ANCHORED_TEXT)
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="routine restart")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        result = await feat.restart_coordinator()
+
+    spawn.assert_called_once()
+    assert result.data["refused"] == []
+    assert (await get_request(backend, request_id)).status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_update_onto_an_unadopted_constitution_is_refused_before_checkout(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """The fetched revision is judged before the update checks it out."""
+    from tests.utils.constitution_anchor import (
+        PACKAGED_CONSTITUTION_RELPATH,
+        commit_constitution,
+        git,
+        origin_and_clone,
+        seed_anchored_agents,
+    )
+
+    project, sha256 = adoption_project
+    origin, checkout = origin_and_clone(tmp_path, _ANCHORED_TEXT)
+    commit_constitution(origin, _AMENDED_TEXT, "merge the constitution PR")
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(checkout / PACKAGED_CONSTITUTION_RELPATH),
+    )
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    head = git(checkout, "rev-parse", "HEAD").strip()
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="ship the merged constitution PR",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=str(checkout),
+    )
+    assert created.status is ToolResultStatus.OK, created.error
+    request_id = created.data["request"]["id"]
+
+    ran = []
+    real_step = RestartCoordinatorFeature._run_update_step
+
+    async def _step(self, step):
+        ran.append(step.name)
+        if step.name == "fetch":
+            return await real_step(self, step)
+        return {
+            "step": step.name, "argv": list(step.argv), "returncode": 0,
+            "ok": True, "stdout_tail": "", "stderr_tail": "",
+        }
+
+    with patch.object(RestartCoordinatorFeature, "_run_update_step", _step), \
+            patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+        result = await feat.restart_coordinator()
+
+    assert ran == ["fetch"]
+    spawn.assert_not_called()
+    assert git(checkout, "rev-parse", "HEAD").strip() == head
+    assert (checkout / PACKAGED_CONSTITUTION_RELPATH).read_bytes() == _ANCHORED_TEXT
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    for text in ("Emma", sha256(_ANCHORED_TEXT), sha256(_AMENDED_TEXT)):
+        assert text in row.status_reason
+    assert row.update_log_dict()["failed_step"] == "constitution_adoption"
+    assert result.data["refused"] == [
+        {"request_id": request_id, "reason": row.status_reason}
+    ]
+    events = await list_events_for_request(backend, request_id)
+    assert [event.state for event in events][-1] == "refused"
+
+
+async def _update_onto_unchanged_text(
+    tmp_path, monkeypatch, adoption_project, *, install,
+):
+    """Run an update_then_restart whose release leaves the text alone.
+
+    The fetch is real; the other steps are recorded, and ``install`` runs on
+    the installed package when the profile's install step would. Returns
+    ``(result, row, steps_run, spawn, events)``.
+    """
+    from tests.utils.constitution_anchor import (
+        PACKAGED_CONSTITUTION_RELPATH,
+        git,
+        origin_and_clone,
+        seed_anchored_agents,
+    )
+
+    project, sha256 = adoption_project
+    origin, checkout = origin_and_clone(tmp_path, _ANCHORED_TEXT)
+    (origin / "README.md").write_text("a release\n")
+    git(origin, "add", "README.md")
+    git(origin, "commit", "-q", "-m", "a release that leaves the text alone")
+    package = _link_installed(
+        tmp_path, monkeypatch, checkout / PACKAGED_CONSTITUTION_RELPATH
+    )
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="ship the merged release",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=str(checkout),
+    )
+    assert created.status is ToolResultStatus.OK, created.error
+    request_id = created.data["request"]["id"]
+
+    ran = []
+    real_step = RestartCoordinatorFeature._run_update_step
+
+    async def _step(self, step):
+        ran.append(step.name)
+        if step.name == "fetch":
+            return await real_step(self, step)
+        if step.name == "install":
+            install(package)
+        return {
+            "step": step.name, "argv": list(step.argv), "returncode": 0,
+            "ok": True, "stdout_tail": "", "stderr_tail": "",
+        }
+
+    with patch.object(RestartCoordinatorFeature, "_run_update_step", _step), \
+            patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+        result = await feat.restart_coordinator()
+    row = await get_request(backend, request_id)
+    events = await list_events_for_request(backend, request_id)
+    return result, row, ran, spawn, events
+
+
+@pytest.mark.asyncio
+async def test_update_whose_install_renders_the_text_differently_is_refused(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """The fetched text matches; the code the update installed does not.
+
+    The check after the fetch runs this host's own resolver, which an update
+    replaces on disk but not in this process. The installed code is judged in
+    a fresh interpreter before anything restarts.
+    """
+    _, sha256 = adoption_project
+
+    result, row, ran, spawn, events = await _update_onto_unchanged_text(
+        tmp_path, monkeypatch, adoption_project,
+        install=lambda package: package.change_rendering(_RENDERED),
+    )
+
+    assert "install" in ran and ran[-1] == "resolve_ref"
+    spawn.assert_not_called()
+    assert row.status == "refused"
+    assert row.completed_at
+    for text in (
+        "Emma",
+        sha256(_ANCHORED_TEXT),
+        sha256(_ANCHORED_TEXT + _RENDERED),
+        "the installed code",
+        "The update itself is installed",
+    ):
+        assert text in row.status_reason
+    assert row.update_log_dict()["failed_step"] == "constitution_adoption"
+    assert result.data["refused"] == [
+        {"request_id": row.id, "reason": row.status_reason}
+    ]
+    assert result.data["executed"] == []
+    assert [event.state for event in events][-1] == "refused"
+
+
+@pytest.mark.asyncio
+async def test_update_whose_install_keeps_the_anchored_hash_restarts(
+    tmp_path, monkeypatch, adoption_project,
+):
+    result, row, ran, spawn, _ = await _update_onto_unchanged_text(
+        tmp_path, monkeypatch, adoption_project, install=lambda package: None,
+    )
+
+    assert ran[-1] == "resolve_ref"
+    spawn.assert_called_once()
+    assert row.status == "executing"
+    assert result.data["refused"] == []
+
+
+@pytest.mark.asyncio
+async def test_restart_onto_installed_code_that_renders_differently_is_refused(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """Code installed after this host booted is judged as installed."""
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    installed = _install_constitution(tmp_path, monkeypatch, _ANCHORED_TEXT)
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    installed.change_rendering(_RENDERED)
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="pick up the installed release")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    assert sha256(_ANCHORED_TEXT + _RENDERED) in row.status_reason

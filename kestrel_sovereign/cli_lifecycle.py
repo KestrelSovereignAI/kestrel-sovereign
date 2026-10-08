@@ -14,10 +14,25 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
 
+from kestrel_sovereign.constitution_adoption import (
+    ADOPTION_RUNBOOK,
+    CONSTITUTION_ADOPTION_REQUIRED,
+    INSTALLED_CODE,
+    OVERRIDE_FLAG,
+    ConstitutionAdoptionCheck,
+    ConstitutionAdoptionError,
+    check_constitution_adoption,
+    check_installed_constitution_adoption,
+    local_agents,
+    packaged_constitution_at,
+    refusal_lines,
+    unverified_lines,
+)
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
 from kestrel_sovereign.multi_agent.process_manager import (
     DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
@@ -54,7 +69,7 @@ def _format_seconds(seconds: float) -> str:
 
 # Reanchor runbook surfaced when a readiness timeout traces back to
 # constitution safe mode (#2616/#2618).
-_REANCHOR_RUNBOOK = "docs/architecture/security/SOVEREIGN_TRUST_ROOT.md"
+_REANCHOR_RUNBOOK = ADOPTION_RUNBOOK
 
 
 def _probe_health_status(port: int) -> Optional[int]:
@@ -175,6 +190,20 @@ def _add_startup_timeout_argument(parser: argparse.ArgumentParser) -> None:
         help=(
             "Seconds to wait for /health after start/restart "
             f"(default: {DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS:g})"
+        ),
+    )
+
+
+def _add_constitution_override_argument(parser: argparse.ArgumentParser) -> None:
+    """Register the deliberate override of the constitution adoption gate."""
+    parser.add_argument(
+        OVERRIDE_FLAG,
+        action="store_true",
+        help=(
+            "Restart even though an agent is not anchored to the governing "
+            "constitution the code would run, so it boots into constitution "
+            "Safe Mode. For an operator about to run the reanchor ceremony "
+            f"({_REANCHOR_RUNBOOK})."
         ),
     )
 
@@ -623,8 +652,189 @@ def cmd_terminate(args) -> int:
     return 0
 
 
+def _constitution_adoption_gate(
+    run_check: Callable[[], ConstitutionAdoptionCheck],
+    *,
+    code_label: str,
+    allow_safe_mode: bool,
+    refuse: bool = True,
+    running: Optional[Callable[[Optional[list[str]]], dict[str, str]]] = None,
+    command: str = "restart",
+    untouched: str = "nothing was changed",
+) -> int:
+    """Refuse a restart that would boot agents into constitution Safe Mode.
+
+    ``run_check`` produces the check; ``code_label`` names what it judges.
+    Returns 0 to proceed, or ``CONSTITUTION_ADOPTION_REQUIRED`` after printing
+    the agents, both hashes and the adoption procedure (#3517). With
+    ``allow_safe_mode`` the same findings are printed and the restart proceeds
+    deliberately. ``untouched`` says what a refusal left as it was.
+
+    ``refuse=False`` installs without restarting. That still refuses while a
+    blocking agent is served by a live process: its periodic integrity audit
+    reads the constitution from disk, so the install alone would put it in
+    Safe Mode. ``running`` reports those agents (see
+    :func:`_report_running`). Otherwise the findings only warn about the next
+    restart.
+
+    A gate that cannot work out what the code about to run produces refuses as
+    well: it has learned nothing about any agent. Installing without a restart
+    then proceeds only when no agent is running.
+    """
+    try:
+        check = run_check()
+    except ConstitutionAdoptionError as exc:
+        print(
+            f"• constitution: cannot verify what {code_label} would govern "
+            f"agents by: {exc}",
+            file=sys.stderr,
+        )
+        if allow_safe_mode:
+            return 0
+        if not refuse:
+            if not _report_running(running, None):
+                return 0
+            print(
+                "  Installing without a restart could put them in Safe Mode "
+                "at their next periodic integrity audit.",
+                file=sys.stderr,
+            )
+        print(
+            f"❌ constitution: {command} REFUSED — {untouched}. Fix the cause "
+            f"and retry, or pass {OVERRIDE_FLAG} to proceed without the check.",
+            file=sys.stderr,
+        )
+        return CONSTITUTION_ADOPTION_REQUIRED
+
+    for line in unverified_lines(check):
+        print(f"  {line}", file=sys.stderr)
+    if check.safe:
+        if check.verdicts and not check.unverified:
+            print(
+                f"• constitution: {len(check.verdicts)} agent(s) anchored to "
+                f"what {check.code_label} governs by"
+            )
+        return 0
+
+    for line in refusal_lines(check):
+        print(f"  {line}", file=sys.stderr)
+    if refuse:
+        if allow_safe_mode:
+            print(
+                f"• constitution: proceeding into Safe Mode deliberately "
+                f"({OVERRIDE_FLAG}).",
+                file=sys.stderr,
+            )
+            return 0
+        print(
+            f"❌ constitution: {command} REFUSED — {untouched}. Pass "
+            f"{OVERRIDE_FLAG} to restart into Safe Mode deliberately.",
+            file=sys.stderr,
+        )
+        return CONSTITUTION_ADOPTION_REQUIRED
+
+    if not _report_running(running, [v.agent for v in check.blocking]):
+        print(
+            "• constitution: none of these agents is running; the next "
+            "restart will be refused until they are reanchored.",
+            file=sys.stderr,
+        )
+        return 0
+    print(
+        "  A running agent's periodic integrity audit reads the constitution "
+        "from disk, so installing without a restart puts it in Safe Mode.",
+        file=sys.stderr,
+    )
+    if allow_safe_mode:
+        print(
+            f"• constitution: installing under running agents deliberately "
+            f"({OVERRIDE_FLAG}).",
+            file=sys.stderr,
+        )
+        return 0
+    print(
+        f"❌ constitution: {command} REFUSED — {untouched}. Terminate them "
+        f"first (the offline adoption ceremony), or pass {OVERRIDE_FLAG} to "
+        f"install anyway.",
+        file=sys.stderr,
+    )
+    return CONSTITUTION_ADOPTION_REQUIRED
+
+
+def _report_running(
+    running: Optional[Callable[[Optional[list[str]]], dict[str, str]]],
+    agent_names: Optional[list[str]],
+) -> bool:
+    """Whether a live process serves any of these agents, printing each one.
+
+    ``running`` maps agent names (None: every local agent) to the command that
+    stops each served one. A registry it cannot read counts as running: an
+    install must not guess that nothing would read what it changes.
+    """
+    if running is None:
+        return False
+    try:
+        holders = running(agent_names)
+    except ConstitutionAdoptionError as exc:
+        print(f"  cannot tell which agents are running: {exc}", file=sys.stderr)
+        return True
+    for agent, remedy in holders.items():
+        print(f"  {agent} is running (`{remedy}` stops it).", file=sys.stderr)
+    return bool(holders)
+
+
+def _running_agents(
+    project_dir: Path, agent_names: Optional[list[str]]
+) -> dict[str, str]:
+    """Which of these agents a live process serves, with the command that stops it.
+
+    ``agent_names`` None means every local agent. The registry is the one the
+    adoption check judged; liveness is ``cli._agent_holder``, the same read
+    the reanchor guard and ``kestrel terminate`` use.
+
+    Raises:
+        ConstitutionAdoptionError: The registry cannot be loaded.
+    """
+    local = local_agents(project_dir)
+    holders = {}
+    for name in local if agent_names is None else agent_names:
+        if name in local:
+            remedy = cli._agent_holder(project_dir, name, local[name])
+            if remedy:
+                holders[name] = remedy
+    return holders
+
+
 def cmd_restart(args) -> int:
-    """Restart host and/or agents (terminate then start)."""
+    """Restart host and/or agents (terminate then start).
+
+    Refuses before terminating anything when the installed code would boot an
+    agent into constitution Safe Mode (#3517), unless
+    ``--allow-constitution-safe-mode``. The installed code is judged in a fresh
+    interpreter, because this one may have imported ``kestrel_sovereign``
+    before ``kestrel update`` installed a new one.
+
+    A named restart judges that agent only, unless ``kestrel update`` sets
+    ``constitution_check_all_agents``: the package it changed governs every
+    local agent, restarted now or not.
+    """
+    name = getattr(args, "name", None)
+    judged = (
+        None
+        if getattr(args, "constitution_check_all_agents", False) or not name
+        else [name]
+    )
+    project_dir = cli._get_project_dir()
+    rc = _constitution_adoption_gate(
+        lambda: check_installed_constitution_adoption(
+            project_dir, agent_names=judged
+        ),
+        code_label=INSTALLED_CODE,
+        allow_safe_mode=bool(getattr(args, "allow_constitution_safe_mode", False)),
+        untouched="no agent was stopped",
+    )
+    if rc != 0:
+        return rc
     # Through ``cli.`` so test patches of cli.cmd_terminate / cli.cmd_start apply.
     rc = cli.cmd_terminate(args)
     if rc != 0:
@@ -785,14 +995,7 @@ def _git_reattach_if_safely_detached(project_dir: Path) -> Optional[str]:
         if _git("symbolic-ref", "-q", "HEAD").returncode == 0:
             return None  # already on a branch — nothing to do
 
-        # Resolve the remote's default branch (origin/HEAD → e.g. "main");
-        # fall back to "main" if the symbolic ref isn't configured.
-        head_ref = _git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
-        if head_ref.returncode == 0 and head_ref.stdout.strip():
-            ref = head_ref.stdout.strip()
-            branch = ref.split("/", 1)[1] if "/" in ref else ref
-        else:
-            branch = "main"
+        branch = _reattach_branch(_git)
 
         # Reattach ONLY if the detached commit is already contained in
         # origin/<branch> — i.e. a no-loss fast-forward.
@@ -804,6 +1007,107 @@ def _git_reattach_if_safely_detached(project_dir: Path) -> Optional[str]:
         return branch
     except (FileNotFoundError, OSError):
         return None
+
+
+def _reattach_branch(git) -> str:
+    """The branch a detached checkout is reattached to: origin's default.
+
+    ``origin/HEAD`` names it (e.g. ``main``); ``main`` when that symbolic ref
+    is not configured. ``git`` runs one git command in the checkout.
+    """
+    head_ref = git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    if head_ref.returncode == 0 and head_ref.stdout.strip():
+        ref = head_ref.stdout.strip()
+        return ref.split("/", 1)[1] if "/" in ref else ref
+    return "main"
+
+
+def _run_git_fetch(project_dir: Path) -> Tuple[int, str]:
+    """Run ``git fetch`` in ``project_dir`` — the fetch half of the pull.
+
+    Updates remote-tracking refs only; the checkout is untouched. Returns
+    ``(returncode, combined_output)``.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "fetch"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        return 1, f"git not available: {exc}"
+    return result.returncode, (result.stdout or "") + (result.stderr or "")
+
+
+def _pull_target_revision(project_dir: Path) -> Optional[str]:
+    """The commit ``kestrel update``'s pull will land on, after a fetch.
+
+    None when the pull will not move HEAD: already up to date, ahead of the
+    upstream, or refused (no upstream, or not a fast-forward — the update
+    aborts on those before it restarts). A detached checkout is judged as
+    the update recovers it: reattached to origin's default branch, but only
+    when that loses no commits (``_git_reattach_if_safely_detached``).
+
+    Raises :class:`_GitFailedError` when git cannot name HEAD.
+    """
+    def _git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args], cwd=str(project_dir),
+            capture_output=True, text=True, check=False,
+        )
+
+    try:
+        head = _git("rev-parse", "--verify", "HEAD^{commit}")
+        if head.returncode != 0:
+            raise _GitFailedError(
+                (head.stderr or head.stdout).strip() or "git rev-parse HEAD failed"
+            )
+        if _git("symbolic-ref", "-q", "HEAD").returncode == 0:
+            upstream = "@{upstream}"
+        else:
+            upstream = f"refs/remotes/origin/{_reattach_branch(_git)}"
+        target = _git("rev-parse", "--verify", "--quiet", f"{upstream}^{{commit}}")
+        if target.returncode != 0:
+            return None
+        revision = target.stdout.strip()
+        if revision == head.stdout.strip():
+            return None
+        if _git("merge-base", "--is-ancestor", "HEAD", revision).returncode != 0:
+            return None
+        return revision
+    except (FileNotFoundError, OSError) as exc:
+        raise _GitFailedError(f"git not available: {exc}") from exc
+
+
+def _incoming_packaged_constitution(checkout: Path, *, fetch: bool):
+    """A loader for the packaged constitution the update's pull will install.
+
+    Fetches first (unless ``fetch`` is False, for a dry run that mutates
+    nothing and so reads the remote-tracking refs as last fetched), then asks
+    git for the constitution at the revision the pull lands on. Only called
+    when an agent is actually compared, so a host with no agents does no git
+    work for this.
+    """
+    def load() -> Optional[bytes]:
+        if fetch:
+            rc, out = cli._run_git_fetch(checkout)
+            if rc != 0:
+                raise ConstitutionAdoptionError(
+                    f"git fetch failed in {checkout}: {out.strip()}"
+                )
+        try:
+            revision = cli._pull_target_revision(checkout)
+        except _GitFailedError as exc:
+            raise ConstitutionAdoptionError(str(exc)) from exc
+        if revision is None:
+            print("• constitution: the pull brings no new revision")
+            return None
+        print(f"• constitution: checking incoming revision {revision[:12]}")
+        return packaged_constitution_at(checkout, revision)
+
+    return load
 
 
 def _run_uv_sync(project_dir: Path) -> Tuple[int, str]:
@@ -1240,6 +1544,14 @@ def cmd_update(args) -> int:
         unrepaired core drift: that returns ``CORE_UNSAFE`` and always
         aborts before the restart, because continuing would bring the
         agents up on a core the manifest does not declare (#2949).
+      - Before any step runs, a revision whose governing constitution an
+        agent is not anchored to refuses the whole update (#3517), unless
+        ``--allow-constitution-safe-mode``; with ``--no-restart`` only while
+        such an agent is running. Every local agent is judged, as
+        the package is shared; a named target narrows only the restart. The
+        restart checks again, in a fresh interpreter, against what was
+        installed, because a revision can change how the constitution is
+        rendered as well as its text.
     """
     from kestrel_sovereign.cli_features import core_state_refusal
 
@@ -1258,6 +1570,7 @@ def cmd_update(args) -> int:
     allow_dirty = bool(getattr(args, "allow_dirty", False))
     no_deps = bool(getattr(args, "no_deps", False))
     continue_on_error = bool(getattr(args, "continue_on_error", False))
+    allow_safe_mode = bool(getattr(args, "allow_constitution_safe_mode", False))
     # --prefer-source / --prefer-pypi bulk-override the per-feature reconcile
     # update mode (issue #1788). Mutually exclusive at the parser level.
     prefer = None
@@ -1282,6 +1595,57 @@ def cmd_update(args) -> int:
     )
     print(f"  target: {target_label}{' [DRY-RUN]' if dry_run else ''}")
     print()
+
+    # Step 0: constitution adoption gate (#3517), before anything changes.
+    # The pull is about to install a revision whose packaged constitution may
+    # differ from the one every agent is anchored to; restarting onto it would
+    # boot the fleet into constitution Safe Mode. Judge the incoming revision
+    # now, while refusing still leaves the host exactly as it was. Without a
+    # pull the code about to run is the code on disk. With --no-restart nothing
+    # restarts, so the finding only warns about the next restart, unless a
+    # blocking agent is running: its periodic integrity audit would read the
+    # new constitution from disk. The offline adoption ceremony terminates,
+    # installs, and reanchors before starting.
+    #
+    # What the pull, install or feature steps change is the shared package
+    # every local agent runs, restarted now or not: an agent left running
+    # still reads the new constitution at its next periodic integrity audit.
+    # So any of them judges every local agent, and a named target narrows only
+    # the restart.
+    pulling = (
+        pull
+        and source_checkout is not None
+        and cli._project_dir_is_git(source_checkout)
+    )
+    package_changing = pull or install or features
+    judged = None if package_changing or not target else [target]
+    incoming = (
+        _incoming_packaged_constitution(source_checkout, fetch=not dry_run)
+        if pulling
+        else None
+    )
+    code_label = (
+        "the revision `git pull --ff-only` will land on"
+        + (" (as last fetched)" if dry_run else "")
+        if pulling
+        else INSTALLED_CODE
+    )
+    rc = _constitution_adoption_gate(
+        lambda: check_constitution_adoption(
+            project_dir,
+            agent_names=judged,
+            packaged_constitution=incoming,
+            code_label=code_label,
+        ),
+        code_label=code_label,
+        allow_safe_mode=allow_safe_mode,
+        refuse=restart,
+        running=lambda names: _running_agents(project_dir, names),
+        command="update",
+        untouched="nothing was pulled, installed or restarted",
+    )
+    if rc != 0:
+        return rc
 
     # Step 1: git pull --ff-only against the source checkout (NOT the
     # data root, which may be a non-git KESTREL_HOME).
@@ -1564,8 +1928,23 @@ def cmd_update(args) -> int:
                 name=target,
                 force=bool(getattr(args, "force", False)),
                 startup_timeout=_startup_timeout(args),
+                allow_constitution_safe_mode=allow_safe_mode,
+                # The restart judges what was just installed, in a fresh
+                # interpreter, for every agent the package change reaches.
+                constitution_check_all_agents=package_changing,
             )
             rc = cli.cmd_restart(restart_args)
+            if rc == CONSTITUTION_ADOPTION_REQUIRED:
+                print(
+                    "• restart: REFUSED by the constitution check above; no "
+                    "agent was stopped"
+                    + (
+                        ", but the update itself is installed."
+                        if package_changing
+                        else "."
+                    ),
+                    file=sys.stderr,
+                )
             if rc != 0:
                 return rc
     else:
@@ -1721,6 +2100,7 @@ def add_lifecycle_subparsers(subparsers) -> None:
         "--force", action="store_true",
         help="Force-kill existing processes during the termination phase",
     )
+    _add_constitution_override_argument(restart_p)
     _add_startup_timeout_argument(restart_p)
 
     # kestrel update [agent]
@@ -1818,6 +2198,7 @@ def add_lifecycle_subparsers(subparsers) -> None:
         "--force", action="store_true",
         help="Forwarded to `kestrel restart` (force-kill stale processes)",
     )
+    _add_constitution_override_argument(update_p)
     _add_startup_timeout_argument(update_p)
 
     # kestrel status

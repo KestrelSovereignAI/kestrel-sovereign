@@ -49,6 +49,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -2221,7 +2222,10 @@ def _row_physically_exists(source: _GovernanceSource) -> bool:
 
 
 def _read_agent_governance(
-    multi_agent: MultiAgentConfig, project_dir: Path, env: dict
+    multi_agent: MultiAgentConfig,
+    project_dir: Path,
+    env: dict,
+    agent_names: frozenset[str] | None = None,
 ) -> list[_AgentGovernance]:
     """Resolve and read every registered local agent's governance, once each.
 
@@ -2234,10 +2238,15 @@ def _read_agent_governance(
     black-holed endpoint cost the connection timeout once per agent — a
     ten-agent fleet waiting fifty seconds under a five-second bound. The
     schema question is a property of the database, not of the tenant asking.
+
+    ``agent_names`` limits the reading to those agents — a restart of one
+    agent asks only about that one (#3517). None reads every local agent.
     """
     ledger_by_dsn: dict = {}
     readings: list[_AgentGovernance] = []
     for name, cfg in multi_agent.get_local_agents().items():
+        if agent_names is not None and name not in agent_names:
+            continue
         agent_dir = (project_dir / cfg.data_dir).resolve()
         db_path = agent_dir / "kestrel_prime.db"
         if not db_path.exists():
@@ -2311,10 +2320,80 @@ def _read_agent_governance(
     return readings
 
 
+@dataclass(frozen=True)
+class ConstitutionAnchorVerdict:
+    """What the drift check concluded about one agent's constitution anchor.
+
+    The structured twin of the report lines, for callers that act on the
+    answer rather than print it — the deploy gate in
+    :mod:`kestrel_sovereign.constitution_adoption` (#3517). ``status`` is one
+    of:
+
+    - ``match`` — the anchored hash is the governing hash.
+    - ``mismatch`` — it is not; the integrity audit Safe-Modes the agent.
+    - ``audit_failure`` — the governing constitution cannot be produced at all
+      (an untrusted descriptor, an unreadable or blank source, a pinned digest
+      the bytes no longer meet, a corrupted emancipation contract). The audit
+      fails closed on every one of these, so the agent Safe-Modes too.
+    - ``unverified`` — the anchor could not be read, so nothing was compared.
+    """
+
+    agent: str
+    status: str
+    anchored_hash: str | None = None
+    governing_hash: str | None = None
+    governing_path: str | None = None
+    detail: str = ""
+
+
+#: Supplies the packaged constitution's raw bytes as they will be after a
+#: deploy, or None when the deploy leaves the file on disk as it is. Called
+#: only when an agent governed by the package is actually compared.
+PackagedConstitution = Callable[[], "bytes | None"]
+
+
+def _deployed_content(
+    governing_source, packaged_constitution: PackagedConstitution | None
+) -> bytes | None:
+    """The bytes a deploy will put at this source, when it changes them.
+
+    A deploy replaces the *package*. A descriptor-selected external file is
+    operator configuration the deploy does not touch, so it is read from disk.
+    """
+    from kestrel_sovereign.constitution.source_descriptor import (
+        SOURCE_KIND_PACKAGE,
+    )
+
+    if packaged_constitution is None or governing_source.kind != SOURCE_KIND_PACKAGE:
+        return None
+    return packaged_constitution()
+
+
+def _record_verdict(
+    verdicts: dict[str, ConstitutionAnchorVerdict] | None,
+    name: str,
+    status: str,
+    **fields,
+) -> None:
+    """Record ``name``'s verdict, unless it already has one.
+
+    The first verdict is the agent's: a governing source that cannot be
+    produced fails the audit whatever the anchor says, so nothing learned
+    about the database afterwards replaces it.
+    """
+    if verdicts is not None:
+        verdicts.setdefault(
+            name, ConstitutionAnchorVerdict(agent=name, status=status, **fields)
+        )
+
+
 def _check_constitution_drift(
     readings: list[_AgentGovernance],
     report: DoctorReport,
     env: dict | None = None,
+    *,
+    packaged_constitution: PackagedConstitution | None = None,
+    verdicts: dict[str, ConstitutionAnchorVerdict] | None = None,
 ) -> None:
     """Compare each agent's anchored constitution_hash against the on-disk file.
 
@@ -2348,6 +2427,12 @@ def _check_constitution_drift(
     signature. Only the unpinned packaged default, which no descriptor chose,
     is reported as a skipped check when it cannot be read.
 
+    ``packaged_constitution`` judges the agents against the packaged
+    constitution a deploy is about to install instead of the one on disk
+    (#3517). ``verdicts``, when given, receives one
+    :class:`ConstitutionAnchorVerdict` per agent. The report lines are the same
+    either way.
+
     Per-agent overlay (``<agent_dir>/CONSTITUTION.md``) and the
     ``governed_by`` governance edge are NOT compared here — overlays ARE
     anchored since #1722, and the edge is integrity proof 2. Both are
@@ -2367,21 +2452,30 @@ def _check_constitution_drift(
     for reading in readings:
         name = reading.name
         source = reading.source
+
         # Readability is a property of the source that governs this agent, so
         # it is checked on that source (#3451), and before any database state,
         # so an empty or unreadable database cannot hide an unreadable source
         # (#2463). Reading the package first and stopping when it failed let an
         # unreadable package hide every descriptor-governed agent's own
         # verification and drift findings, about files the package is not.
-        governing_source = _readable_governing_source(reading, report, env)
+        governing_source, source_problem = _readable_governing_source(
+            reading, report, env, packaged_constitution
+        )
+        if governing_source is None:
+            _record_verdict(
+                verdicts, name, "audit_failure", detail=source_problem
+            )
 
         if isinstance(source, _UnreadableDB):
             _report_unexamined(name, source.reason, source, report)
+            _record_verdict(verdicts, name, "unverified", detail=source.reason)
             continue
 
         node = reading.node
         if isinstance(node, _UnreadableDB):
             _report_unexamined(name, node.reason, node, report)
+            _record_verdict(verdicts, name, "unverified", detail=node.reason)
             continue
         if isinstance(node, _NoAgentNode):
             # The same verdict on either backend: the row is there, #2649 is
@@ -2409,10 +2503,22 @@ def _check_constitution_drift(
                     f"ledger problem, not constitution drift; reanchoring will "
                     f"not clear it."
                 )
+                _record_verdict(
+                    verdicts,
+                    name,
+                    "unverified",
+                    detail=f"agent row is not owned by {source.agent_did}",
+                )
                 continue
             report.warn.append(
                 f"{name}: constitution drift check skipped — no agent node "
                 f"owned by {source.agent_did} in {source.describe()}"
+            )
+            _record_verdict(
+                verdicts,
+                name,
+                "unverified",
+                detail=f"no agent node owned by {source.agent_did}",
             )
             continue
         _, _, properties = node
@@ -2423,6 +2529,10 @@ def _check_constitution_drift(
                 f"{name}: constitution drift check skipped — agent node missing "
                 f"constitution_hash property (older agent? re-incept to anchor)"
             )
+            _record_verdict(
+                verdicts, name, "unverified",
+                detail="agent node has no constitution_hash",
+            )
             continue
 
         try:
@@ -2431,6 +2541,13 @@ def _check_constitution_drift(
             report.fail.append(
                 f"{name}: anchored emancipation contract is corrupted ({exc}); "
                 f"the agent will fail its integrity audit. Re-anchor it."
+            )
+            _record_verdict(
+                verdicts,
+                name,
+                "audit_failure",
+                anchored_hash=stored_hash,
+                detail=f"anchored emancipation contract is corrupted ({exc})",
             )
             continue
         if governing_source is None:
@@ -2446,7 +2563,11 @@ def _check_constitution_drift(
         try:
             on_disk_hash = hashlib.sha256(
                 resolve_governing_constitution_bytes(
-                    contract, source=governing_source
+                    contract,
+                    source=governing_source,
+                    content=_deployed_content(
+                        governing_source, packaged_constitution
+                    ),
                 )
             ).hexdigest()
         except (OSError, ValueError) as exc:
@@ -2457,6 +2578,13 @@ def _check_constitution_drift(
                     f"{name}: constitution drift check skipped — cannot "
                     f"resolve governing constitution: {exc}"
                 )
+            _record_verdict(
+                verdicts,
+                name,
+                "audit_failure",
+                anchored_hash=stored_hash,
+                detail=str(exc),
+            )
             continue
         governing_path = Path(governing_source.path)
 
@@ -2467,6 +2595,14 @@ def _check_constitution_drift(
                 f"audit that. The verdict below is about those pending bytes."
             )
 
+        _record_verdict(
+            verdicts,
+            name,
+            "match" if stored_hash == on_disk_hash else "mismatch",
+            anchored_hash=stored_hash,
+            governing_hash=on_disk_hash,
+            governing_path=str(governing_path),
+        )
         if stored_hash == on_disk_hash:
             report.ok.append(
                 f"{name}: constitution anchored to current file ({stored_hash[:12]}…)"
@@ -2484,14 +2620,18 @@ def _readable_governing_source(
     reading: _AgentGovernance,
     report: DoctorReport,
     env: dict | None,
+    packaged_constitution: PackagedConstitution | None = None,
 ):
     """The source that governs this agent, once it is known to be usable.
 
     Resolves the source from operator configuration (#2553) and reads it
     through the shared resolver, so it meets the runtime audit's own tests:
     present, readable, non-empty, and, when a descriptor pins it, still the
-    signed bytes. Returns the :class:`GoverningSource`, or None after
-    reporting why the agent cannot use it.
+    signed bytes. Returns ``(GoverningSource, None)``, or ``(None, reason)``
+    after reporting why the agent cannot use it.
+
+    ``packaged_constitution`` tests the packaged bytes a deploy will install
+    rather than the file on disk (#3517).
 
     An unreadable packaged default is the same fact for every agent it
     governs, so its warning is reported once.
@@ -2510,7 +2650,10 @@ def _readable_governing_source(
             agent_dids={agent_did} if agent_did else frozenset(),
             environ=env,
         )
-        resolve_governing_constitution_bytes(source=governing_source)
+        resolve_governing_constitution_bytes(
+            source=governing_source,
+            content=_deployed_content(governing_source, packaged_constitution),
+        )
     except (OSError, ValueError) as exc:
         if not _fail_unusable_governing_source(
             reading.name, governing_source, exc, report
@@ -2521,8 +2664,8 @@ def _readable_governing_source(
             )
             if message not in report.warn:
                 report.warn.append(message)
-        return None
-    return governing_source
+        return None, str(exc)
+    return governing_source, None
 
 
 def _fail_unusable_governing_source(

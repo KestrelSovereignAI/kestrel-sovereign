@@ -135,6 +135,74 @@ does not invalidate a prior failure, convert it to a pass, or rerun it. An
 operator's reviewed reevaluation must preserve the old failure evidence and
 use the normal signed recovery and fail-closed native acceptance gates.
 
+## Deploys that change the governing constitution
+
+A deploy can change the governing constitution, for example a release that
+amends the packaged text. Every agent stays anchored to the old hash, so
+restarting onto that code would boot each of them into Safe Mode until the
+reanchor procedure above runs (#3517). Every deploy path therefore runs one
+check first, `kestrel_sovereign.constitution_adoption.check_constitution_adoption`.
+It is `kestrel doctor`'s drift check: it reads each agent's anchored hash
+from the agent database, read-only, and computes the governing hash through
+the canonical resolver, as the startup integrity audit does. It does not need
+the host to be up.
+
+The code that renders a constitution is part of what a deploy replaces, and a
+process that has imported `kestrel_sovereign` keeps that code after an install
+replaces it on disk. So once code is installed, it is judged by
+`check_installed_constitution_adoption`, which runs the same check in a fresh
+interpreter launched the way the host is: same Python, the project as working
+directory, and the launcher's environment. Before an install, only the
+deploying process's own resolver exists to judge the incoming bytes with.
+
+| Path | What is judged | On a mismatch |
+|---|---|---|
+| `kestrel update [name]` | Before any step runs: the revision `git pull --ff-only` will land on, after a fetch. With `--no-pull`, or with no source checkout, the code on disk. Whenever a pull, install or feature step runs, every local agent is judged, because the package is shared; a name narrows only the restart. Its restart step then judges what was installed, in a fresh interpreter, for the same agents. | The update is refused with exit status 5. Before any step, nothing is pulled, installed or restarted. At the restart step the new code is installed but no agent is stopped. With `--no-restart` the first check refuses only while a blocking agent is running, since its periodic integrity audit reads the constitution from disk; otherwise it warns. |
+| `kestrel restart [name]` | The installed code, in a fresh interpreter, for the named agent or every local agent. | Refused with exit status 5 before anything is terminated. |
+| Restart coordinator | A `restart_only` request: the installed code, in a fresh interpreter, before the request is claimed. An `update_then_restart` request: the fetched revision, before the update checks it out, and then the code the update installed, in a fresh interpreter, before the restart. | The request ends in the terminal `refused` status. Its `status_reason` names the agents and both hashes, and says when the update was already installed. |
+
+The refusal names each agent, its anchored hash, the governing hash, and the
+adoption steps below. Two findings refuse:
+
+- the anchored hash differs from the governing hash;
+- the governing constitution cannot be produced at all: an untrusted
+  descriptor, a blank source, or new package bytes that no longer match a
+  `package` descriptor's pinned digest.
+
+The audit puts the agent in Safe Mode in both cases. An agent whose anchor
+cannot be read (an encrypted database, no agent node) is reported as not
+verified. It does not block the restart.
+
+A deploy replaces the package. A descriptor-selected external source is
+operator configuration, so it is read from disk.
+
+### Adopting a new constitution
+
+`--allow-constitution-safe-mode` on `kestrel update` or `kestrel restart`
+restarts anyway. Use it only when you are about to run the ceremony. The
+coordinator has no override, so an agent cannot restart the fleet into Safe
+Mode. `kestrel start` is not gated. Either order works:
+
+- **Offline.** `kestrel terminate` first: a running agent's periodic
+  integrity audit reads the constitution from disk, and the Safe Mode it
+  enters persists across restarts. Then `kestrel update --no-restart`
+  installs the new code. Reanchor each agent with `kestrel constitution
+  reanchor --force` and an artifact signed for its new hash, then
+  `kestrel start`. The agents boot already anchored.
+- **Live.** `kestrel restart --allow-constitution-safe-mode`, or the same
+  flag on `kestrel update`. Then on each agent run
+  `!reanchor-constitution <artifact> <hash-prefix>` and `!safe-mode exit`.
+
+`kestrel update` hashes the incoming bytes with the resolver it was started
+with. Its restart step checks again, in a fresh interpreter, against what was
+installed. That second check catches a revision that changes how the resolver
+or the Amendment VIII rendering produces the governing bytes, a feature step
+that upgraded the core package, and an upstream that moved between the gate's
+fetch and the pull. It refuses before anything restarts, leaving the new code
+installed and the running agents on the old code. Adopt the constitution
+before they restart, and before their next periodic integrity audit if the
+installed text itself changed.
+
 ## Rotation
 
 Trust-root rotation is an operator ceremony, not a database migration:
