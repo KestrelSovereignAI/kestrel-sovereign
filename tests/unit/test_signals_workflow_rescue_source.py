@@ -161,6 +161,22 @@ def _signal(source: str, payload: dict) -> Signal:
     )
 
 
+def _execution(trigger_kind, stage_name: str = "dispatch_repairs") -> dict:
+    """The runner-owned ``workflow_execution`` block a stage receives (#3518)."""
+    return {
+        "run_id": "run-1",
+        "stage_name": stage_name,
+        "attempt_number": 1,
+        "idempotency_key": "idem-1",
+        "trigger_kind": trigger_kind,
+    }
+
+
+def _cron(stage_name: str = "dispatch_repairs") -> dict:
+    """Stage payload provenance for a run the definition's CRON trigger started."""
+    return {"workflow_execution": _execution("cron", stage_name)}
+
+
 async def test_fleet_stalled_sweep_observes_and_quotes(dispatcher):
     result = await dispatcher.dispatch_signal(
         _signal("fleet_stalled_sweep", {"stale_days": 3, "stalled_items": ["#1", "#2"]})
@@ -225,17 +241,19 @@ async def test_a2a_repair_dispatch_fails_closed_with_only_stalled_items(dispatch
 
 
 async def test_a2a_repair_dispatch_recurring_tick_no_targets_is_clean_noop(dispatcher):
-    # A recurring observation-only tick reaches dispatch with no per-run approval
-    # having selected any target. It must complete cleanly (no-op), not fail the
-    # unattended run (#2249). Direct fail-closed calls above are unaffected.
+    # A cron tick reaches dispatch with no per-run approval having selected any
+    # target. It must complete cleanly (no-op), not fail the unattended run
+    # (#2249). Direct fail-closed calls above are unaffected.
     result = await dispatcher.dispatch_signal(
-        _signal("a2a_repair_dispatch", {"recurring": True, "stale_days": 3})
+        _signal("a2a_repair_dispatch", {**_cron(), "stale_days": 3})
     )
     assert result.status == Status.OK
     data = result.action_result
     assert data["skipped"] is True
     assert data["dispatched_count"] == 0
     assert data["state"] == "skipped"
+    # The skip names the provenance it was decided from (#3518).
+    assert data["trigger_kind"] == "cron"
     # A no-op must never look like real work — no merged/shipped/dispatched list.
     assert "merged" not in data
     assert "shipped" not in data
@@ -244,12 +262,12 @@ async def test_a2a_repair_dispatch_recurring_tick_no_targets_is_clean_noop(dispa
 async def test_a2a_repair_dispatch_recurring_with_stalled_items_still_no_dispatch(
     dispatcher,
 ):
-    # Even carrying detected stalled_items, a recurring tick with no explicit
-    # repair targets must not dispatch them — it skips cleanly (#2249 + #2200).
+    # Even carrying detected stalled_items, a cron tick with no explicit repair
+    # targets must not dispatch them — it skips cleanly (#2249 + #2200).
     result = await dispatcher.dispatch_signal(
         _signal(
             "a2a_repair_dispatch",
-            {"recurring": True, "stalled_items": ["#1", "#2"]},
+            {**_cron(), "stalled_items": ["#1", "#2"]},
         )
     )
     assert result.status == Status.OK
@@ -261,10 +279,10 @@ async def test_a2a_repair_dispatch_recurring_with_stalled_items_still_no_dispatc
 
 
 async def test_a2a_repair_dispatch_recurring_with_targets_still_dispatches(dispatcher):
-    # When a per-run approval DOES select targets mid-loop, a recurring tick
+    # When a per-run approval DOES select targets mid-loop, a cron tick
     # dispatches them normally — the no-op branch only triggers on empty targets.
     result = await dispatcher.dispatch_signal(
-        _signal("a2a_repair_dispatch", {"recurring": True, "repairs": ["#9"]})
+        _signal("a2a_repair_dispatch", {**_cron(), "repairs": ["#9"]})
     )
     assert result.status == Status.OK
     data = result.action_result
@@ -314,10 +332,10 @@ async def test_close_resolved_fails_closed_without_evidence(dispatcher):
 
 
 async def test_evidence_verify_recurring_tick_no_evidence_is_clean_noop(dispatcher):
-    # A recurring tick that dispatched nothing has nothing to verify — it must
+    # A cron tick that dispatched nothing has nothing to verify — it must
     # complete cleanly, not fail closed (#2249).
     result = await dispatcher.dispatch_signal(
-        _signal("evidence_verify", {"recurring": True})
+        _signal("evidence_verify", _cron("verify_evidence"))
     )
     assert result.status == Status.OK
     data = result.action_result
@@ -330,12 +348,12 @@ async def test_evidence_verify_recurring_with_dispatched_repairs_still_fails_clo
     dispatcher,
 ):
     # #2249 P1: the runner merges run params into every stage payload, so a
-    # recurring run that DID select explicit repair targets carries them into
+    # cron run that DID select explicit repair targets carries them into
     # evidence_verify. A real dispatch happened — the recurring no-op branch must
     # NOT skip verification. Without evidence this must fail closed, not pass as a
     # no-op (which would complete the run with an unverified irreversible action).
     result = await dispatcher.dispatch_signal(
-        _signal("evidence_verify", {"recurring": True, "repairs": ["#9"]})
+        _signal("evidence_verify", {**_cron("verify_evidence"), "repairs": ["#9"]})
     )
     assert result.status == Status.FAILED
 
@@ -344,25 +362,29 @@ async def test_evidence_verify_recurring_with_dispatched_marker_fails_closed(
     dispatcher,
 ):
     # The dispatch stage's forwarded output (dispatched/dispatched_count) also
-    # marks a real action — a recurring tick that sees it must be proven, not
+    # marks a real action — a cron tick that sees it must be proven, not
     # skipped.
     result = await dispatcher.dispatch_signal(
         _signal(
             "evidence_verify",
-            {"recurring": True, "dispatched": ["#9"], "dispatched_count": 1},
+            {
+                **_cron("verify_evidence"),
+                "dispatched": ["#9"],
+                "dispatched_count": 1,
+            },
         )
     )
     assert result.status == Status.FAILED
 
 
 async def test_evidence_verify_recurring_after_noop_dispatch_still_skips(dispatcher):
-    # A recurring tick whose dispatch was itself a no-op forwards
+    # A cron tick whose dispatch was itself a no-op forwards
     # ``skipped: True`` / ``dispatched_count: 0`` — that is not a selected action,
     # so evidence_verify may still complete cleanly as a no-op.
     result = await dispatcher.dispatch_signal(
         _signal(
             "evidence_verify",
-            {"recurring": True, "skipped": True, "dispatched_count": 0},
+            {**_cron("verify_evidence"), "skipped": True, "dispatched_count": 0},
         )
     )
     assert result.status == Status.OK
@@ -372,24 +394,187 @@ async def test_evidence_verify_recurring_after_noop_dispatch_still_skips(dispatc
 async def test_close_resolved_recurring_with_dispatched_repairs_fails_closed(
     dispatcher,
 ):
-    # #2249 P1 mirror for the close stage: a recurring run that selected explicit
+    # #2249 P1 mirror for the close stage: a cron run that selected explicit
     # repair targets must not slip past the close gate as a no-op.
     result = await dispatcher.dispatch_signal(
-        _signal("close_resolved_todos", {"recurring": True, "repairs": ["#9"]})
+        _signal(
+            "close_resolved_todos", {**_cron("close_resolved"), "repairs": ["#9"]}
+        )
     )
     assert result.status == Status.FAILED
 
 
 async def test_close_resolved_recurring_tick_no_todos_is_clean_noop(dispatcher):
-    # A recurring tick that resolved nothing has nothing to close — clean no-op,
+    # A cron tick that resolved nothing has nothing to close — clean no-op,
     # not a failed run (#2249).
     result = await dispatcher.dispatch_signal(
-        _signal("close_resolved_todos", {"recurring": True})
+        _signal("close_resolved_todos", _cron("close_resolved"))
     )
     assert result.status == Status.OK
     data = result.action_result
     assert data["skipped"] is True
     assert data["closed_count"] == 0
+
+
+# The three evidence-gated stages, keyed by source, with the built-in stage
+# name and the zero count a no-op skip reports.
+_GATED_STAGES = [
+    ("a2a_repair_dispatch", "dispatch_repairs", "dispatched_count"),
+    ("evidence_verify", "verify_evidence", "verified_count"),
+    ("close_resolved_todos", "close_resolved", "closed_count"),
+]
+
+
+@pytest.mark.parametrize(("source", "stage", "count_field"), _GATED_STAGES)
+async def test_cron_provenance_no_targets_skips_every_gated_stage(
+    dispatcher, source, stage, count_field
+):
+    # #3518: a run the definition's CRON trigger started, with nothing approved,
+    # completes each evidence-gated stage as a no-op. The decision comes from
+    # runner-owned provenance, so the run params carry nothing.
+    result = await dispatcher.dispatch_signal(
+        _signal(source, {**_cron(stage), "stale_days": 3})
+    )
+    assert result.status == Status.OK
+    data = result.action_result
+    assert data["skipped"] is True
+    assert data["state"] == "skipped"
+    assert data[count_field] == 0
+    assert data["trigger_kind"] == "cron"
+
+
+@pytest.mark.parametrize(("source", "stage", "count_field"), _GATED_STAGES)
+@pytest.mark.parametrize("trigger_kind", ["manual", "signal_source"])
+async def test_non_cron_provenance_no_targets_fails_closed(
+    dispatcher, source, stage, count_field, trigger_kind
+):
+    # A manual (or signal-triggered) run with nothing approved is not an
+    # unattended recurring tick: every gated stage still fails closed (#3518).
+    result = await dispatcher.dispatch_signal(
+        _signal(
+            source,
+            {"workflow_execution": _execution(trigger_kind, stage), "stale_days": 3},
+        )
+    )
+    assert result.status == Status.FAILED
+
+
+@pytest.mark.parametrize(("source", "stage", "count_field"), _GATED_STAGES)
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"recurring": True},
+        {"recurring": True, "stale_days": 3},
+        {"recurring": "true"},
+    ],
+    ids=["recurring", "recurring-with-stale-days", "recurring-string"],
+)
+async def test_recurring_param_alone_no_longer_skips(
+    dispatcher, source, stage, count_field, payload
+):
+    # #3518: the ``recurring`` run param was a caller-settable proxy for "this
+    # is a cron tick". It is no longer read; without cron provenance a gated
+    # stage with nothing approved fails closed, exactly like a direct call.
+    result = await dispatcher.dispatch_signal(_signal(source, payload))
+    assert result.status == Status.FAILED
+
+
+@pytest.mark.parametrize(("source", "stage", "count_field"), _GATED_STAGES)
+async def test_recurring_param_does_not_override_manual_provenance(
+    dispatcher, source, stage, count_field
+):
+    result = await dispatcher.dispatch_signal(
+        _signal(
+            source,
+            {"workflow_execution": _execution("manual", stage), "recurring": True},
+        )
+    )
+    assert result.status == Status.FAILED
+
+
+@pytest.mark.parametrize(("source", "stage", "count_field"), _GATED_STAGES)
+@pytest.mark.parametrize(
+    "execution",
+    [
+        "cron",
+        ["cron"],
+        {"trigger_kind": "CRON"},
+        {"trigger_kind": ["cron"]},
+        {"trigger_kind": None},
+        {},
+        None,
+    ],
+    ids=[
+        "bare-string",
+        "list",
+        "wrong-case",
+        "kind-list",
+        "kind-none",
+        "no-kind",
+        "none",
+    ],
+)
+async def test_malformed_provenance_fails_closed(
+    dispatcher, source, stage, count_field, execution
+):
+    # Only an exact ``trigger_kind == "cron"`` inside a ``workflow_execution``
+    # mapping is cron provenance; anything else is no provenance and fails closed.
+    result = await dispatcher.dispatch_signal(
+        _signal(source, {"workflow_execution": execution})
+    )
+    assert result.status == Status.FAILED
+
+
+async def test_cron_run_with_explicit_targets_dispatches_and_must_be_proven(
+    dispatcher,
+):
+    # #3518 keeps #2249 P1: a cron run whose params select explicit repair
+    # targets dispatches them, and the runner merges those params into every
+    # later stage, so verify and close must be proven rather than skipped.
+    run_params = {"stale_days": 3, "repairs": ["#9"]}
+
+    dispatched = await dispatcher.dispatch_signal(
+        _signal("a2a_repair_dispatch", {**run_params, **_cron("dispatch_repairs")})
+    )
+    assert dispatched.status == Status.OK
+    assert dispatched.action_result["state"] == "dispatched"
+    assert dispatched.action_result["dispatched"] == ["#9"]
+    assert dispatched.action_result.get("skipped") is not True
+
+    for source, stage in (
+        ("evidence_verify", "verify_evidence"),
+        ("close_resolved_todos", "close_resolved"),
+    ):
+        result = await dispatcher.dispatch_signal(
+            _signal(source, {**run_params, **_cron(stage)})
+        )
+        assert result.status == Status.FAILED, source
+
+    # With real evidence the same cron run verifies and closes normally.
+    verified = await dispatcher.dispatch_signal(
+        _signal(
+            "evidence_verify",
+            {
+                **run_params,
+                **_cron("verify_evidence"),
+                "evidence": {"pr": 42, "merged_sha": "abc"},
+            },
+        )
+    )
+    assert verified.status == Status.OK
+    assert verified.action_result["verified"] is True
+    closed = await dispatcher.dispatch_signal(
+        _signal(
+            "close_resolved_todos",
+            {
+                **run_params,
+                **_cron("close_resolved"),
+                "resolved_todos": [{"id": 7, "evidence": {"pr": 42}}],
+            },
+        )
+    )
+    assert closed.status == Status.OK
+    assert closed.action_result["closed"] == [7]
 
 
 async def test_close_resolved_closes_only_with_evidence(dispatcher):
@@ -429,8 +614,9 @@ def test_recurring_schedule_request_shape_defaults():
     assert req["task_name"] == RECURRING_SCHEDULE_TASK_NAME == "workflow_run"
     args = json.loads(req["args_json"])
     assert args["name"] == RECURRING_WORKFLOW_NAME == "stalled_work_rescue"
-    # Observation-only params: no repair targets, no evidence, no approval.
-    assert args["params"] == {"stale_days": 3, "recurring": True}
+    # Observation-only params: no repair targets, no evidence, no approval —
+    # and no ``recurring`` flag, which is not provenance (#3518).
+    assert args["params"] == {"stale_days": 3}
 
 
 def test_recurring_schedule_request_custom_cron_and_stale_days():
@@ -440,7 +626,7 @@ def test_recurring_schedule_request_custom_cron_and_stale_days():
 
 
 def test_recurring_default_params_are_safe():
-    assert is_safe_recurring_params({"stale_days": 3, "recurring": True})
+    assert is_safe_recurring_params({"stale_days": 3})
     assert assert_safe_recurring_params(None) == {}
     assert assert_safe_recurring_params({}) == {}
 
@@ -494,7 +680,7 @@ async def test_fleet_stalled_sweep_discovers_without_preseeded_items():
     # via live discovery (#2200, acceptance criterion 1 + P2 review finding).
     req = build_recurring_schedule_request(stale_days=5)
     params = json.loads(req["args_json"])["params"]
-    assert params == {"stale_days": 5, "recurring": True}
+    assert params == {"stale_days": 5}
 
     seen_stale_days = []
 
@@ -533,7 +719,7 @@ async def test_fleet_stalled_sweep_discovery_error_degrades_to_zero():
         raise RuntimeError("survey backend unavailable")
 
     reg = build_fleet_stalled_sweep_registration(discover)
-    result = await reg.handler({"stale_days": 3, "recurring": True})
+    result = await reg.handler({"stale_days": 3})
     # Observation degrades to "observed nothing" rather than aborting the loop.
     assert result["stalled_count"] == 0
     assert result["discovered"] is False
@@ -638,5 +824,74 @@ async def test_start_fails_closed_when_sources_are_missing(tmp_path):
             await runner.start_run(name="stalled_work_rescue", params={})
         # And no run record leaked from the failed start.
         assert await store.list_runs(limit=10) == []
+    finally:
+        await backend.close()
+
+
+async def test_real_runner_refuses_cron_provenance_forged_through_run_params(
+    tmp_path,
+):
+    # #3518 decides "cron tick" from ``workflow_execution.trigger_kind``. That is
+    # only sound because the runner owns the block: a run param of that name is
+    # refused at launch, so a caller cannot claim cron provenance.
+    pytest.importorskip("kestrel_feature_workflows")
+    from kestrel_feature_workflows.runner import WorkflowRunnerError
+
+    registry = SourceRegistry()
+    register_workflow_rescue_sources(registry)
+    runner, store, identity, backend = await _make_runner(tmp_path, registry)
+    try:
+        await _define_builtin(store, identity)
+        with pytest.raises(WorkflowRunnerError, match="reserved"):
+            await runner.start_run(
+                name="stalled_work_rescue",
+                params={"workflow_execution": {"trigger_kind": "cron"}},
+            )
+        assert await store.list_runs(limit=10) == []
+    finally:
+        await backend.close()
+
+
+async def test_real_runner_manual_run_with_recurring_param_fails_at_dispatch(
+    tmp_path,
+):
+    # End to end through the real runner: a manual run whose params carry the
+    # retired ``recurring`` flag reaches the dispatch stage with execution
+    # context and nothing approved, and fails closed (#3518).
+    pytest.importorskip("kestrel_feature_workflows")
+    from kestrel_feature_workflows.models import (
+        Gate,
+        RunStatus,
+        Stage,
+        WorkflowSpec,
+    )
+    from kestrel_feature_workflows.signing import sign_workflow_spec
+
+    registry = SourceRegistry()
+    register_workflow_rescue_sources(registry)
+    runner, store, identity, backend = await _make_runner(tmp_path, registry)
+    try:
+        spec = WorkflowSpec(
+            name="rescue_dispatch_only",
+            version=1,
+            stages=[
+                Stage(
+                    name="dispatch_repairs",
+                    signal_source="a2a_repair_dispatch",
+                    signal_mode=SignalMode.ACTION,
+                    params={},
+                    gate=Gate(type="signal_status_ok"),
+                    irreversible=True,
+                    compensate="compensate_record_only",
+                    include_execution_context=True,
+                )
+            ],
+        )
+        await store.put_definition(sign_workflow_spec(spec, identity))
+        result = await runner.run_to_completion(
+            name="rescue_dispatch_only",
+            params={"recurring": True, "stale_days": 3},
+        )
+        assert result.status == RunStatus.FAILED
     finally:
         await backend.close()

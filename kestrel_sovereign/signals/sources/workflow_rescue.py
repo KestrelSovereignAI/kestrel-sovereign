@@ -34,20 +34,29 @@ infer merged/shipped/resolved state without upstream evidence in the payload:
     - ``close_resolved_todos`` refuses to close a todo that carries no resolution
       evidence.
 
-**Recurring observation-only ticks (#2249).** A recurring schedule runs with
-``recurring: True`` in its params (see :func:`build_recurring_schedule_request`),
-and the workflow runner merges the run params into every stage payload. When a
-recurring tick reaches an irreversible/evidence-gated stage with **nothing
-approved to act on** — no repair targets, no evidence, no resolved todos — the
-stage completes cleanly as a *no-op* (``skipped: True``, zero count) instead of
-failing the whole unattended run. This does not relax the fail-closed contract:
-a **direct** (non-recurring) call to those stages still raises when its required
-targets/evidence are absent, and even a recurring tick never auto-dispatches the
-survey's detected ``stalled_items``. Dispatch/close only ever fire once a per-run
-approval selects an explicit target and supplies its evidence.
+**Recurring observation-only ticks (#2249, #3518).** A recurring tick is a run
+the workflow's own CRON trigger started. The workflows runner hands that
+provenance to stages that request execution context, as
+``payload["workflow_execution"]["trigger_kind"] == "cron"`` (from
+kestrel-feature-workflows#30; a runner that does not supply the field gives a
+cron run no provenance, so its stages fail closed). ``workflow_execution`` is
+runner-owned: a run param of that name is refused at launch and stripped from
+older persisted runs, so a caller cannot claim cron provenance. When a cron
+tick reaches an irreversible/evidence-gated stage with **nothing approved to
+act on** — no repair targets, no evidence, no resolved todos — the stage
+completes cleanly as a *no-op* (``skipped: True``, zero count) instead of
+failing the whole unattended run. This does not relax the fail-closed
+contract: a **direct** or **manual**
+call to those stages, or a stage payload without that provenance, still raises
+when its required targets/evidence are absent, and even a cron tick never
+auto-dispatches the survey's detected ``stalled_items``. Dispatch/close only ever
+fire once a per-run approval selects an explicit target and supplies its
+evidence. A ``recurring`` run param is not provenance and is ignored: it was the
+caller-settable proxy that stopped being set when cron runs moved to the
+definition's own trigger.
 
 Crucially, the no-op branch is gated on *nothing having been selected this run*.
-If a recurring run **did** select explicit repair targets (``repairs`` /
+If a cron run **did** select explicit repair targets (``repairs`` /
 ``repair_targets`` merged into every stage payload from the run params) and
 dispatched real work, the downstream ``evidence_verify`` / ``close_resolved``
 stages still fail closed on missing evidence — a genuine irreversible dispatch
@@ -62,6 +71,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.signals import (
@@ -97,6 +107,11 @@ SOURCE_NAMES = (
     CLOSE_RESOLVED_TODOS,
     REOPEN_RESOLVED_TODOS,
 )
+
+# The ``TriggerKind.CRON`` value the workflows runner records in a stage's
+# ``workflow_execution.trigger_kind`` when the definition's cron trigger started
+# the run.
+_CRON_TRIGGER_KIND = "cron"
 
 CONSENT_MARKER_FIELDS = frozenset(
     {
@@ -141,19 +156,24 @@ def _as_list(value: Any) -> List[Any]:
 
 
 def _is_recurring_tick(payload: Dict[str, Any]) -> bool:
-    """True when this stage payload belongs to a recurring observation-only loop.
+    """True when the workflow's CRON trigger started the run this stage is in.
 
-    A recurring ``stalled_work_rescue`` schedule runs with ``recurring: True`` in
-    its params (see :func:`build_recurring_schedule_request`); the workflow runner
-    merges the run params into every stage payload, so the flag reaches each
-    irreversible/evidence-gated stage. When a recurring tick reaches such a stage
-    with **nothing approved to act on**, the stage completes cleanly as a no-op
-    instead of failing the whole unattended run (#2249). A **direct**
-    (non-recurring) call is unaffected and still fails closed when its required
-    targets/evidence are absent — so "detected" never becomes "dispatched" and
-    nothing is closed without evidence.
+    Decided only from runner-owned provenance,
+    ``payload["workflow_execution"]["trigger_kind"]`` (#3518). The runner refuses
+    a ``workflow_execution`` run param at launch and strips it from older
+    persisted runs, so a caller cannot forge it; a ``recurring`` run param is
+    deliberately ignored. When a
+    cron tick reaches an irreversible/evidence-gated stage with **nothing approved
+    to act on**, the stage completes cleanly as a no-op instead of failing the
+    whole unattended run (#2249). A direct or manual call, or a payload carrying
+    no provenance, still fails closed when its required targets/evidence are
+    absent — so "detected" never becomes "dispatched" and nothing is closed
+    without evidence.
     """
-    return bool(payload.get("recurring"))
+    execution = payload.get("workflow_execution")
+    if not isinstance(execution, Mapping):
+        return False
+    return execution.get("trigger_kind") == _CRON_TRIGGER_KIND
 
 
 # Markers that mean a real, per-run-approved action was selected/performed this
@@ -169,8 +189,8 @@ _DISPATCHED_MARKER_FIELDS = ("dispatched", "dispatched_count")
 def _run_selected_action(payload: Dict[str, Any]) -> bool:
     """True when this run selected/performed an explicit irreversible action.
 
-    Guards the recurring no-op branch of the evidence-gated stages: a recurring
-    tick is only allowed to skip when *nothing* was approved to act on. If the
+    Guards the recurring no-op branch of the evidence-gated stages: a cron tick
+    is only allowed to skip when *nothing* was approved to act on. If the
     run carries explicit repair targets or a dispatched-work marker (from
     ``a2a_repair_dispatch``), the fix must be verified with real evidence — the
     no-op branch must not turn a real dispatch into a completed run without proof.
@@ -190,16 +210,17 @@ def _run_selected_action(payload: Dict[str, Any]) -> bool:
 
 
 def _recurring_skip(source: str, count_field: str, reason: str) -> Dict[str, Any]:
-    """A clean no-op result for a recurring tick with nothing to act on.
+    """A clean no-op result for a cron tick with nothing to act on.
 
     Records ``skipped: True`` and a zero count so no reader (or downstream
     synthesis stage) can mistake it for real work performed. Returning normally
-    yields ``SignalResult.status == OK`` so the recurring run completes cleanly.
+    yields ``SignalResult.status == OK`` so the cron run completes cleanly.
     """
     return {
         "source": source,
         "skipped": True,
-        "recurring": True,
+        # The provenance the skip was decided from, never a caller-set flag.
+        "trigger_kind": _CRON_TRIGGER_KIND,
         "state": "skipped",
         count_field: 0,
         "reason": reason,
@@ -318,18 +339,18 @@ async def a2a_repair_dispatch_handler(payload: Dict[str, Any]) -> Dict[str, Any]
         or payload.get("repair_targets")
     )
     if not targets:
-        # A recurring observation-only tick reached dispatch with no per-run
-        # approval having selected any target: complete cleanly as a no-op
-        # rather than failing the unattended run (#2249). This does NOT relax
-        # the fail-closed contract — a direct call still raises below, and even
-        # a recurring tick never auto-dispatches detected ``stalled_items``
-        # (they are not forwarded here; only explicit repair targets dispatch).
+        # A cron tick reached dispatch with no per-run approval having
+        # selected any target: complete cleanly as a no-op rather than failing
+        # the unattended run (#2249). This does NOT relax the fail-closed
+        # contract — a direct or manual call still raises below, and even a
+        # cron tick never auto-dispatches detected ``stalled_items`` (they are
+        # not forwarded here; only explicit repair targets dispatch).
         if _is_recurring_tick(payload):
             return _recurring_skip(
                 A2A_REPAIR_DISPATCH,
                 "dispatched_count",
-                "recurring observation-only tick: no approved repair targets "
-                "selected this run",
+                "cron-triggered observation-only tick: no approved repair "
+                "targets selected this run",
             )
         raise ValueError(
             "a2a_repair_dispatch: no explicit repair targets supplied "
@@ -357,17 +378,18 @@ async def evidence_verify_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     evidence = payload.get("evidence")
     if not evidence:
-        # A recurring observation-only tick that dispatched nothing has nothing
-        # to verify: complete cleanly as a no-op (#2249). But a recurring run
-        # that DID select explicit repair targets and dispatched real work must
-        # still be proven — otherwise the no-op branch would turn a genuine
-        # irreversible dispatch into a completed run without evidence (#2249 P1).
-        # A direct call is likewise unaffected and still fails closed.
+        # A cron tick that dispatched nothing has nothing to verify: complete
+        # cleanly as a no-op (#2249). But a cron run that DID select explicit
+        # repair targets and dispatched real work must still be proven —
+        # otherwise the no-op branch would turn a genuine irreversible dispatch
+        # into a completed run without evidence (#2249 P1). A direct or manual
+        # call is likewise unaffected and still fails closed.
         if _is_recurring_tick(payload) and not _run_selected_action(payload):
             return _recurring_skip(
                 EVIDENCE_VERIFY,
                 "verified_count",
-                "recurring observation-only tick: no dispatched work to verify",
+                "cron-triggered observation-only tick: no dispatched work to "
+                "verify",
             )
         raise ValueError(
             "evidence_verify: no evidence supplied; cannot confirm the fix "
@@ -390,17 +412,18 @@ async def close_resolved_todos_handler(payload: Dict[str, Any]) -> Dict[str, Any
     """
     resolved = _as_list(payload.get("resolved_todos"))
     if not resolved:
-        # A recurring observation-only tick that resolved nothing has nothing to
-        # close: complete cleanly as a no-op (#2249). But a recurring run that
-        # selected explicit repair targets / dispatched real work must not slip
-        # past the close gate as a no-op — a real intervention has to reconcile
-        # its own resolution evidence (#2249 P1). A direct call still fails
+        # A cron tick that resolved nothing has nothing to close: complete
+        # cleanly as a no-op (#2249). But a cron run that selected explicit
+        # repair targets / dispatched real work must not slip past the close
+        # gate as a no-op — a real intervention has to reconcile its own
+        # resolution evidence (#2249 P1). A direct or manual call still fails
         # closed — a todo is never closed without upstream resolution evidence.
         if _is_recurring_tick(payload) and not _run_selected_action(payload):
             return _recurring_skip(
                 CLOSE_RESOLVED_TODOS,
                 "closed_count",
-                "recurring observation-only tick: no resolved todos to close",
+                "cron-triggered observation-only tick: no resolved todos to "
+                "close",
             )
         raise ValueError(
             "close_resolved_todos: no resolved todos supplied; nothing may be "
@@ -672,11 +695,17 @@ def build_recurring_schedule_request(
     stalled work and requests fresh consent, so the irreversible dispatch/close
     stages only proceed once that per-run approval (and its evidence) is granted.
 
+    A run this schedule starts goes through ``workflow_run``, so the workflows
+    runner records it as a manual run, not a cron one. Its evidence-gated
+    stages never take the cron no-op branch (#3518): with nothing approved,
+    ``dispatch_repairs`` fails closed. That branch belongs to runs the
+    definition's own CRON trigger starts.
+
     Fails closed via :func:`assert_safe_recurring_params` if ``extra_params``
     tries to pre-seed repair targets, resolution evidence, or a blanket
     approval marker.
     """
-    params: Dict[str, Any] = {"stale_days": int(stale_days), "recurring": True}
+    params: Dict[str, Any] = {"stale_days": int(stale_days)}
     if extra_params:
         params.update(extra_params)
     assert_safe_recurring_params(params)
