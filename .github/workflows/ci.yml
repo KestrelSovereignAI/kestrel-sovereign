@@ -754,14 +754,19 @@ jobs:
           KESTREL_DATA_KEY: "ci-test-encryption-key-32-chars!!"
           DATABASE_URL: ${{ env.DATABASE_URL }}
           REDIS_URL: ${{ env.REDIS_URL }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
-          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
-          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          # Routine PR/release CI must not spend provider credits, including
+          # when credentials are inherited from organization secrets.
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GOOGLE_API_KEY: ""
+          GEMINI_API_KEY: ""
+          TAVILY_API_KEY: ""
+          REPLICATE_API_TOKEN: ""
+          RUNPOD_API_KEY: ""
+          XAI_API_KEY: ""
           GITHUB_PAT: ${{ secrets.GH_PAT }}
 
-  # LLM integration tests (require API keys)
+  # Offline LLM adapter tests (live credential-gated cases intentionally skip).
   #
   # The `if:` below must stay byte-identical to integration-tests'. This job
   # used to declare `needs: integration-tests` and was skipped on main-branch
@@ -774,22 +779,11 @@ jobs:
   # It runs 193 tests in ~10 seconds, and under the old chain it waited ~21
   # minutes to do so.
   #
-  # This job costs nothing in API credits today, and it is worth being
-  # precise about why: none of the provider secrets referenced below
-  # (OPENAI_API_KEY, TAVILY_API_KEY, REPLICATE_API_TOKEN, RUNPOD_API_KEY)
-  # are actually configured on this repository. They expand to the empty
-  # string and every credential-gated test skips — hence "123 passed,
-  # 70 skipped in 9.88s".
-  #
-  # That is a property of the current secret configuration, NOT of the test
-  # suite's design. Seven tests gate on a bare `OPENAI_API_KEY` check
-  # without also requiring KESTREL_LIVE_TESTS — three in
-  # tests/llm/test_token_tracking.py, four in
-  # tests/llm/test_streaming_tool_detection.py. If someone adds
-  # OPENAI_API_KEY as a repo secret, those start issuing real provider
-  # calls on every PR. Gate them properly before adding the secret. (The
-  # pair in test_openai_adapter.py is already correctly gated on
-  # KESTREL_LIVE_TESTS=1 as well.)
+  # Provider credentials are explicitly blank here and in integration-tests,
+  # not merely absent from today's repository secrets. Adding a repository or
+  # organization provider secret must not silently enable paid calls on every
+  # PR or release. Real model acceptance runs separately with explicit operator
+  # authorization and retained evidence; skipped live cases are not live proof.
   llm-tests:
     runs-on: ubuntu-latest
     # Explicit `contents: read` so this job does NOT inherit the wider grant
@@ -825,10 +819,14 @@ jobs:
         run: uv run pytest tests/llm/ -v --tb=short -x --timeout=120
         timeout-minutes: 15
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
-          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
-          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GOOGLE_API_KEY: ""
+          GEMINI_API_KEY: ""
+          TAVILY_API_KEY: ""
+          REPLICATE_API_TOKEN: ""
+          RUNPOD_API_KEY: ""
+          XAI_API_KEY: ""
 
   # Sovereign Console browser smoke (#2682).
   #
