@@ -341,7 +341,7 @@ class DecisionServiceMixin:
         selector: Optional[DecisionSelector] = (
             parse_decision_selector(model_override) if model_override else None
         )
-        effective_local_only = bool(local_only) or self._current_force_local_only()
+        effective_local_only = self._effective_force_local_only(local_only)
         context = self._resolve_invocation_context(session_id=session_id)
         footprint = RequestFootprint.of(snapshot)
 

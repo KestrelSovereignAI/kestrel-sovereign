@@ -2258,7 +2258,10 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         Routes that have already failed in this session with a permanent auth
         error (``self._disabled_routes``) are filtered out here so the
         fallback chain skips them immediately on the next user turn (#655).
+
+        ``force_local_only`` is ORed with the live privacy state (#3525).
         """
+        force_local_only = self._effective_force_local_only(force_local_only)
         providers_to_use = self._available_providers()
         target_model: Optional[str] = None
 
@@ -2420,21 +2423,22 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
     ) -> None:
         """Bind a callable that returns the live ``force_local_only`` state.
 
-        The chat path passes ``force_local_only`` explicitly because
-        it always has the agent's ``privacy_agent`` in scope. The
-        embedding path is invoked from the storage layer (e.g.
-        ``AsyncConversationStore.add_conversation``) which does not,
-        so without this hook ISOLATED / EPHEMERAL would silently ship
-        plaintext to whatever cloud embedding provider sits at the top
-        of priority — violating the documented "local LLM only"
-        contract (#1492).
+        Every entry point that sends content reads it: embeddings (#1492),
+        ``decide``, ``get_audit_response`` (#3491) and the chat entry points
+        (``get_response``, ``generate``, ``generate_with_messages``,
+        ``resolve_provider_routing``; #3525), each ORing it with the
+        caller's own flag. The turn path passes the same restriction
+        explicitly; secondary callers (summaries, audits, attestation,
+        feature hooks) no longer have to remember to, so ISOLATED /
+        EPHEMERAL never ship content to a cloud route because a caller
+        omitted the flag.
 
         Pass ``None`` to clear; useful in tests.
         """
         self._force_local_only_provider = provider
 
     def _current_force_local_only(self) -> bool:
-        """Read the live ``force_local_only`` state for the embedding path.
+        """Read the live ``force_local_only`` state.
 
         Returns False if no provider is bound (process-local
         ``LLMService()`` not attached to an agent). Fails closed: if
@@ -2452,6 +2456,15 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 exc,
             )
             return True
+
+    def _effective_force_local_only(self, force_local_only: Optional[bool]) -> bool:
+        """The caller's flag ORed with the live privacy state (#3525).
+
+        Privacy only tightens: a caller may ask for local-only routes, but
+        cannot loosen the agent's live restriction by passing ``False`` or by
+        omitting the flag.
+        """
+        return bool(force_local_only) or self._current_force_local_only()
 
     def _lookup_sibling_provider(
         self, sibling_name: str
@@ -4438,7 +4451,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         invocation_context = self._resolve_invocation_context(invocation_context)
         if redact_content and not invocation_context.redact_content:
             invocation_context = replace(invocation_context, redact_content=True)
-        local_only = bool(force_local_only) or self._current_force_local_only()
+        local_only = self._effective_force_local_only(force_local_only)
         if not self.providers:
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
@@ -4717,6 +4730,7 @@ No other text or formatting.
         """Get a response after freezing request identity at API entry."""
 
         self._check_policy()
+        force_local_only = self._effective_force_local_only(force_local_only)
         frozen_context = self._resolve_invocation_context(invocation_context)
         _redact = frozen_context.redact_content
         with self._llm_request_span(
@@ -5101,6 +5115,7 @@ No other text or formatting.
             String content or LLMResponse (if tools/structured output)
         """
         self._check_policy()
+        force_local_only = self._effective_force_local_only(force_local_only)
         invocation_context = self._resolve_invocation_context(
             invocation_context,
             session_id=session_id,
@@ -5227,6 +5242,7 @@ No other text or formatting.
             String content or LLMResponse
         """
         self._check_policy()
+        force_local_only = self._effective_force_local_only(force_local_only)
         invocation_context = self._resolve_invocation_context(
             invocation_context,
             session_id=session_id,
