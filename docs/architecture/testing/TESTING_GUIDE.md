@@ -180,10 +180,14 @@ def check_docker():
 
 A dual-backend test runs its PostgreSQL case when `TEST_POSTGRES_URL` is set.
 That database outlives the run, and a developer's is often reused between runs
-or shared. Only an xdist worker gets a schema of its own
+or shared. Only an xdist worker gets a database of its own, created empty when
+the worker starts and dropped when it exits
 ([`tests/shared/postgres_worker_isolation.py`](../../../tests/shared/postgres_worker_isolation.py));
-a serial run uses the URL's schema as it is. A PostgreSQL case must therefore
-leave alone every row and column it did not create:
+the URL's role needs `CREATEDB` for that. Without it a required run stops at
+startup, and an unrequired one runs its workers unisolated in the URL's
+database. A serial run uses the URL's database as it is. Either way, the cases
+that run against one database share it. A PostgreSQL case must therefore leave
+alone every row and column it did not create:
 
 - A case whose operation spans a whole table (a backfill, a migration, a
   table-wide count) runs in a schema of its own:
