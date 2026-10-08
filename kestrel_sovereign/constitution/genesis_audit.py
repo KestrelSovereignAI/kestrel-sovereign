@@ -205,6 +205,8 @@ def validate_completed_genesis_audit(
     if not (record.get("completed_at") or record.get("timestamp")):
         raise GenesisAuditError("Completed genesis audit lacks a completion time.")
     risk_level = record.get("risk_level")
+    if type(risk_level) is not int:
+        raise GenesisAuditError("Completed genesis audit has an invalid risk level.")
     if status == GENESIS_AUDIT_PASSED and risk_level not in (1, 2):
         raise GenesisAuditError("Passed genesis audit has an invalid risk level.")
     if status == GENESIS_AUDIT_FAILED and risk_level != 3:

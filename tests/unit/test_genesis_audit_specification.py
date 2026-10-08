@@ -7,6 +7,7 @@ import pytest
 
 from kestrel_sovereign.constitution.genesis_audit import (
     GENESIS_AUDIT_SPEC_VERSION,
+    GenesisAuditError,
     GenesisAuditPendingError,
     GenesisAuditRejectedError,
     evaluate_genesis_constitution,
@@ -122,3 +123,32 @@ async def test_specification_does_not_relax_invalid_result_rejection(result):
             auditor=malformed,
             provenance="test:invalid",
         )
+
+
+@pytest.mark.parametrize("status", ["passed", "failed"])
+@pytest.mark.parametrize("risk", [True, False, 1.0, 2.0, 3.0, "1", None, 0, 4])
+def test_completed_receipt_rejects_malformed_persisted_risk(status, risk):
+    record = {
+        "status": status,
+        "constitution_hash": "exact",
+        "audited": True,
+        "completed_at": "2026-10-08T00:00:00Z",
+        "risk_level": risk,
+    }
+    original = deepcopy(record)
+    with pytest.raises(GenesisAuditError, match="risk level"):
+        validate_completed_genesis_audit(record, "exact")
+    assert record == original
+
+
+@pytest.mark.parametrize("risk", [1, 2, 3])
+def test_completed_receipt_preserves_valid_integer_and_pending_states(risk):
+    record = {
+        "status": "failed" if risk == 3 else "passed",
+        "constitution_hash": "exact",
+        "audited": True,
+        "timestamp": "legacy-completion",
+        "risk_level": risk,
+    }
+    assert validate_completed_genesis_audit(record, "exact") == record["status"]
+    assert validate_completed_genesis_audit({"status": "pending"}, "exact") is None
