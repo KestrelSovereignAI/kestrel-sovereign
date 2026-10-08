@@ -10,6 +10,10 @@ The store tables are built here with the columns kestrel-feature-workflows
 creates (core cannot import that package). When it is installed,
 ``test_reader_matches_the_real_workflows_schema`` checks the reader against
 the real ``WorkflowStore`` schema too.
+
+A gate reason is free text that can carry conversation-derived content, so in
+EPHEMERAL, ISOLATED and DEIDENTIFIED the briefing withholds it while keeping
+the counts, stages and persistent-failure call-out.
 """
 
 from __future__ import annotations
@@ -30,11 +34,13 @@ from kestrel_sovereign.features.strategic_memory.morning_signal import (
 )
 from kestrel_sovereign.features.strategic_memory.workflow_runs import (
     SECTION_TITLE,
+    WITHHELD_GATE_REASON,
     WorkflowRunsNotAssessed,
     assess_workflow_runs,
     read_workflow_run_report,
     render_workflow_runs_section,
 )
+from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
@@ -216,8 +222,11 @@ async def store(database):
     return workflows
 
 
-def _agent(db, did: str = OWNER):
-    return SimpleNamespace(did=did, _raw_storage=SimpleNamespace(db=db))
+def _agent(db, did: str = OWNER, *, privacy: PrivacyMode | None = None):
+    agent = SimpleNamespace(did=did, _raw_storage=SimpleNamespace(db=db))
+    if privacy is not None:
+        agent.privacy_config = privacy_mode_to_config(privacy)
+    return agent
 
 
 def _by_name(report):
@@ -608,6 +617,145 @@ async def test_the_morning_signal_tool_says_when_runs_cannot_be_read():
 
     assert result.status is ToolResultStatus.OK
     assert f"## {SECTION_TITLE}\nWorkflow runs could not be assessed: " in result.confirmation
+
+
+# ---------------------------------------------------------------------------
+# Privacy
+# ---------------------------------------------------------------------------
+
+VOLATILE_MODES = [PrivacyMode.EPHEMERAL, PrivacyMode.ISOLATED, PrivacyMode.DEIDENTIFIED]
+# Stands in for conversation-derived text a failing stage's error carried.
+SENTINEL = "SENTINEL-user-said-7f3a91"
+LEAKY_REASON = f"ValueError: a2a_repair_dispatch: user asked to {SENTINEL} (fail closed)"
+
+
+async def _seed_leaky_failures(store, now: datetime = NOW) -> str:
+    """A success, then three failures whose gate reason carries user text.
+
+    Returns the latest failed run's id.
+    """
+    await store.run(RESCUE, "completed", now - timedelta(hours=23))
+    for hours in (20, 10, 1):
+        latest = await store.run(
+            RESCUE,
+            "failed",
+            now - timedelta(hours=hours),
+            passed=("detect_stalled",),
+            failed_at=(("dispatch_repairs", LEAKY_REASON),),
+        )
+    return latest
+
+
+@pytest.mark.parametrize("mode", VOLATILE_MODES, ids=lambda mode: mode.value)
+async def test_a_volatile_mode_withholds_gate_reasons_but_keeps_the_structure(store, mode):
+    latest = await _seed_leaky_failures(store)
+
+    report = await read_workflow_run_report(_agent(store.db, privacy=mode), now=NOW)
+    briefing = await generate_morning_signal(
+        {"morning_signal_config": {"scan_repos": []}}, report
+    )
+    no_strategy = await generate_morning_signal({}, report)
+
+    # Withheld as it is read, so nothing built from the report can carry it.
+    assert SENTINEL not in repr(report)
+    assert {run.gate_reason for run in _by_name(report)[RESCUE].failed_runs} == {
+        WITHHELD_GATE_REASON
+    }
+    for text in (briefing, no_strategy):
+        assert SENTINEL not in text
+        assert f"- `{RESCUE}`: 1 completed, 3 failed" in text
+        assert (
+            f"- **PERSISTENTLY FAILING** `{RESCUE}`: its last 3 runs failed. "
+            f"Latest run `{latest}` failed at stage `dispatch_repairs`: "
+            f"{WITHHELD_GATE_REASON}. Last success: 2026-10-07."
+        ) in text
+        assert (
+            f"  - 3 failed at stage `dispatch_repairs`: {WITHHELD_GATE_REASON} "
+            f"(latest run `{latest}` at 2026-10-08 11:30 UTC)"
+        ) in text
+    assert (
+        f"Repair workflow `{RESCUE}`: failing at stage `dispatch_repairs`, "
+        "last success 2026-10-07"
+    ) in briefing
+
+
+@pytest.mark.parametrize("mode", VOLATILE_MODES, ids=lambda mode: mode.value)
+async def test_the_morning_signal_tool_withholds_gate_reasons_in_a_volatile_mode(store, mode):
+    await _seed_leaky_failures(store, now=datetime.now(timezone.utc))
+    feature = StrategicMemoryFeature(agent=_agent(store.db, privacy=mode))
+    feature._data = {"morning_signal_config": {"scan_repos": []}}
+
+    result = await feature.morning_signal()
+
+    assert result.status is ToolResultStatus.OK
+    for text in (result.confirmation, result.data["briefing"]):
+        assert SENTINEL not in text
+        assert f"- `{RESCUE}`: 1 completed, 3 failed" in text
+        assert f"**PERSISTENTLY FAILING** `{RESCUE}`" in text
+        assert f"at stage `dispatch_repairs`: {WITHHELD_GATE_REASON}" in text
+
+
+async def test_a_volatile_mode_does_not_invent_a_reason_none_was_recorded_for(store):
+    await store.run(RESCUE, "failed", _hours_ago(1), passed=("detect_stalled",))
+
+    report = await read_workflow_run_report(
+        _agent(store.db, privacy=PrivacyMode.EPHEMERAL), now=NOW
+    )
+
+    section = "\n".join(render_workflow_runs_section(report))
+    assert "1 failed with no failing stage recorded: no gate reason recorded" in section
+    assert WITHHELD_GATE_REASON not in section
+
+
+@pytest.mark.parametrize(
+    "mode", [*VOLATILE_MODES, PrivacyMode.NORMAL], ids=lambda mode: mode.value
+)
+async def test_a_store_error_quoting_row_text_is_withheld_in_a_volatile_mode(tmp_path, mode):
+    # SQLite's decode error quotes the text of the row it could not read.
+    # SQLite only: PostgreSQL cannot store a TEXT value that is not UTF-8.
+    db = await _sqlite_db(tmp_path)
+    try:
+        store = _Store(db)
+        await store.create()
+        run_id = await store.run(RESCUE, "failed", _hours_ago(1), failed_at=(("dispatch_repairs", "x"),))
+        await db.execute(
+            "UPDATE workflow_stage_links SET gate_reason = CAST(? AS TEXT) WHERE run_id = ?",
+            (SENTINEL.encode() + b"\xff", run_id),
+        )
+
+        assessment = await assess_workflow_runs(_agent(db, privacy=mode), {}, now=NOW)
+    finally:
+        await db.close()
+
+    assert isinstance(assessment, WorkflowRunsNotAssessed)
+    section = "\n".join(render_workflow_runs_section(assessment))
+    assert section.startswith(
+        f"## {SECTION_TITLE}\nWorkflow runs could not be assessed: "
+        "reading the Workflows store failed: "
+    )
+    if mode is PrivacyMode.NORMAL:
+        assert SENTINEL in section
+    else:
+        assert SENTINEL not in section
+        assert "(details withheld in this privacy mode)" in section
+
+
+async def test_a_persistent_mode_shows_gate_reasons(store):
+    latest = await _seed_leaky_failures(store)
+
+    report = await read_workflow_run_report(
+        _agent(store.db, privacy=PrivacyMode.NORMAL), now=NOW
+    )
+    briefing = await generate_morning_signal(
+        {"morning_signal_config": {"scan_repos": []}}, report
+    )
+
+    assert WITHHELD_GATE_REASON not in briefing
+    assert (
+        f"- **PERSISTENTLY FAILING** `{RESCUE}`: its last 3 runs failed. "
+        f"Latest run `{latest}` failed at stage `dispatch_repairs`: "
+        f"{LEAKY_REASON}. Last success: 2026-10-07."
+    ) in briefing
 
 
 # ---------------------------------------------------------------------------

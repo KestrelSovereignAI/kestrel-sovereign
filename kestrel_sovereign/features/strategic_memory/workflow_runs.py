@@ -31,6 +31,15 @@ succeeded, so neither counts toward, or breaks, a run of failures.
 A store that cannot be read is reported as unreadable, never as a quiet
 section: a briefing that says nothing about workflow runs is the silence this
 module exists to end.
+
+A gate reason is free text: Workflows stores a failing stage's error there,
+and that can carry conversation-derived content. Under EPHEMERAL, ISOLATED or
+DEIDENTIFIED no reader returns persisted user content, so in those modes each
+reason is replaced by :data:`WITHHELD_GATE_REASON` as it is read, and a store
+read error is reported by its type alone (SQLite's decode error quotes the
+row's text). The counts, the failing stage, and the persistent-failure
+call-out with its last-success date are run structure, not content, and stay:
+withholding them too would bring back the silence.
 """
 
 from __future__ import annotations
@@ -44,6 +53,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from kestrel_sovereign.features.storage_access import (
     AgentIdentityUnavailable,
+    hides_persisted_user_content,
     resolve_feature_database,
     resolve_scoped_agent_did,
 )
@@ -72,6 +82,10 @@ PERSISTENT_FAILURE_RUNS_KEY = "persistent_failure_runs"
 
 COMPLETED = "completed"
 FAILED = "failed"
+
+#: What a recorded gate reason reads as in a volatile privacy mode. A marker,
+#: not ``None``, so a withheld reason is not mistaken for one never recorded.
+WITHHELD_GATE_REASON = "reason withheld (privacy mode)"
 
 #: A gate reason can carry a whole CI snapshot. The briefing shows its start;
 #: ``workflow_history`` on the named run has the rest.
@@ -154,6 +168,8 @@ class FailedRun:
     ended_at: Optional[datetime]
     #: ``None`` when no stage of the run recorded a failed gate.
     stage_name: Optional[str]
+    #: ``None`` when none was recorded; :data:`WITHHELD_GATE_REASON` when one
+    #: was and the agent's privacy mode forbids showing it.
     gate_reason: Optional[str]
 
 
@@ -252,7 +268,8 @@ async def read_workflow_run_report(
     An agent whose database has no Workflows store has run no workflows: the
     report is empty. Raises :class:`WorkflowRunsNotAssessed` when the agent has
     no DID or database, when only one of the two store tables exists, or when
-    reading them fails.
+    reading them fails. Gate reasons, and the text of a store read error, are
+    withheld when the agent's privacy mode hides persisted user content.
     """
     if isinstance(persistent_failure_runs, bool) or persistent_failure_runs < 1:
         raise ValueError("persistent_failure_runs must be a positive integer")
@@ -267,6 +284,7 @@ async def read_workflow_run_report(
         raise WorkflowRunsNotAssessed(
             "the agent has no database to read workflow runs from"
         )
+    withhold_content = hides_persisted_user_content(agent)
     until = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     since = until - WINDOW
     try:
@@ -300,8 +318,13 @@ async def read_workflow_run_report(
     except WorkflowRunsNotAssessed:
         raise
     except Exception as exc:  # noqa: BLE001 - store boundary; reported, not swallowed
+        detail = (
+            f"{type(exc).__name__} (details withheld in this privacy mode)"
+            if withhold_content
+            else str(exc)
+        )
         raise WorkflowRunsNotAssessed(
-            f"reading the Workflows store failed: {exc}"
+            f"reading the Workflows store failed: {detail}"
         ) from exc
 
     last_success = {str(name): _instant(at) for name, at in success_rows}
@@ -310,7 +333,12 @@ async def read_workflow_run_report(
         since=since,
         until=until,
         persistent_failure_runs=persistent_failure_runs,
-        workflows=_outcomes(window_rows, last_success, streaks),
+        workflows=_outcomes(
+            window_rows,
+            last_success,
+            streaks,
+            withhold_reasons=withhold_content,
+        ),
         store_present=True,
     )
 
@@ -319,6 +347,8 @@ def _outcomes(
     rows: List[Tuple[Any, ...]],
     last_success: Dict[str, Optional[datetime]],
     streaks: Dict[str, int],
+    *,
+    withhold_reasons: bool,
 ) -> Tuple[WorkflowOutcomes, ...]:
     # One entry per run; a later row for the same run is a later failing link.
     runs: Dict[str, Tuple[str, str, Optional[datetime], Any, Any]] = {}
@@ -338,7 +368,7 @@ def _outcomes(
                     run_id=run_id,
                     ended_at=ended_at,
                     stage_name=_text(stage_name),
-                    gate_reason=_text(gate_reason),
+                    gate_reason=_gate_reason(gate_reason, withhold=withhold_reasons),
                 )
             )
     return tuple(
@@ -440,6 +470,13 @@ def _reason_text(reason: Optional[str]) -> Optional[str]:
     if len(text) > _REASON_LIMIT:
         return text[:_REASON_LIMIT].rstrip() + "…"
     return text
+
+
+def _gate_reason(value: Any, *, withhold: bool) -> Optional[str]:
+    reason = _text(value)
+    if reason is not None and withhold:
+        return WITHHELD_GATE_REASON
+    return reason
 
 
 def _text(value: Any) -> Optional[str]:
