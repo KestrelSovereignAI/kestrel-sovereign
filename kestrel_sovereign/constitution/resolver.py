@@ -173,6 +173,7 @@ def resolve_governing_constitution_bytes(
     *,
     constitution_path: Optional[str] = None,
     source: Optional[GoverningSource] = None,
+    content: Optional[bytes] = None,
 ) -> bytes:
     """Return the authoritative governing constitution bytes.
 
@@ -189,6 +190,11 @@ def resolve_governing_constitution_bytes(
         source: The :class:`GoverningSource` from
             :func:`resolve_governing_source`. When it carries a pinned
             ``content_sha256``, the raw bytes must hash to it.
+        content: The source's raw bytes as they will be when the agent next
+            starts, instead of reading the path now. A deploy gate passes the
+            packaged constitution of a revision that is not checked out yet
+            (#3517), so the bytes meet exactly the tests and rendering the
+            startup audit applies to the file on disk.
 
     Raises:
         FileNotFoundError: If the resolved path does not exist.
@@ -222,10 +228,11 @@ def resolve_governing_constitution_bytes(
         path = source.path
     else:
         path = constitution_path or governing_constitution_path()
-    # ``open`` raises FileNotFoundError (missing) or OSError/PermissionError
-    # (unreadable) — both propagate so callers fail closed.
-    with open(path, "rb") as f:
-        content = f.read()
+    if content is None:
+        # ``open`` raises FileNotFoundError (missing) or OSError/PermissionError
+        # (unreadable) — both propagate so callers fail closed.
+        with open(path, "rb") as f:
+            content = f.read()
     if not content.strip():
         # A blank authoritative source is not a valid constitution; refuse to
         # hand back empty bytes that would hash to a spurious "valid" digest.

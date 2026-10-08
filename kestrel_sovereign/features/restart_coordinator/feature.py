@@ -1062,7 +1062,9 @@ class RestartCoordinatorFeature(Feature):
             "List restart requests filed by this agent, optionally filtered "
             "by status. Other agents' requests are never visible. Valid "
             "statuses: pending|approved|updating|executing|completed|"
-            "rejected|canceled (omit status for all). An unknown status is "
+            "rejected|refused|canceled (omit status for all). refused means "
+            "the restart would have booted agents into constitution Safe "
+            "Mode; status_reason names them. An unknown status is "
             "rejected with the valid set rather than silently returning no "
             "rows.\n\n"
             "Returns: data={count: int, requests: [<public dict>, ...]}."
@@ -1233,7 +1235,7 @@ class RestartCoordinatorFeature(Feature):
             "Cancel this agent's still-pending restart request (status "
             "pending or approved). Another agent's request cannot be "
             "canceled. Rows already updating/executing/completed/rejected/"
-            "canceled cannot be canceled. Pass request_id from "
+            "refused/canceled cannot be canceled. Pass request_id from "
             "data.request.id of request_restart (or data.requests[].id of "
             "list_restart_requests).\n\n"
             "Returns: data={canceled: bool, request_id: str} (plus "
@@ -1368,6 +1370,7 @@ class RestartCoordinatorFeature(Feature):
 
         executed: List[Dict[str, Any]] = []
         deferred: List[Dict[str, Any]] = []
+        refused: List[Dict[str, Any]] = []
         for req in candidates:
             # Reject unsigned legacy, forged, tampered, or key-revoked rows
             # before policy/safety can defer them indefinitely. This is the
@@ -1414,6 +1417,19 @@ class RestartCoordinatorFeature(Feature):
                         req, state="rejected", status_reason=decision["reason"],
                     )
                 continue
+
+            # A plain restart boots the installed code. If an agent is not
+            # anchored to the constitution that code governs by, the restart
+            # would put it in constitution Safe Mode (#3517): refuse,
+            # terminally and with the agents named, before claiming. An
+            # update_then_restart is judged after its fetch instead, against
+            # the revision the update is about to check out.
+            if req.operation != "update_then_restart":
+                refusal = await self._constitution_adoption_refusal()
+                if refusal is not None:
+                    if await self._refuse_restart(req, refusal):
+                        refused.append({"request_id": req.id, "reason": refusal})
+                    continue
 
             # Safety checks can await fleet state. Re-verify immediately before
             # crossing into update/execution so key rotation during that wait
@@ -1532,17 +1548,22 @@ class RestartCoordinatorFeature(Feature):
                     continue
                 handled = await self._handle_update_then_restart(req)
                 if handled is not None:
-                    # Either deferred (retryable) or rejected (terminal).
-                    deferred.append(handled)
+                    # Deferred (retryable), or rejected/refused (terminal).
                     # Reflect the post-update outcome the helper landed
                     # the row on — fetch the fresh status so a rejected
                     # update reads as rejected, a retryable one as a
                     # deferred pending (#1551).
                     fresh = await get_request(self._db, req.id)
+                    if fresh is not None and fresh.status == "refused":
+                        refused.append(
+                            {"request_id": req.id, "reason": fresh.status_reason}
+                        )
+                    else:
+                        deferred.append(handled)
                     if fresh is not None:
-                        if fresh.status == "rejected":
+                        if fresh.status in {"rejected", "refused"}:
                             await self._emit_status_event(
-                                fresh, state="rejected",
+                                fresh, state=fresh.status,
                                 status_reason=fresh.status_reason,
                             )
                         else:
@@ -1690,18 +1711,93 @@ class RestartCoordinatorFeature(Feature):
         return ToolResult.ok(
             confirmation=(
                 f"restart_coordinator: pending={len(candidates)} "
-                f"executed={len(executed)} deferred={len(deferred)}"
+                f"executed={len(executed)} deferred={len(deferred)} "
+                f"refused={len(refused)}"
             ),
             data={
                 "pending": len(candidates),
                 "executed": executed,
                 "deferred": deferred,
+                "refused": refused,
             },
         )
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _constitution_adoption_refusal(
+        self, *, repo_path: str = "", revision: str = "",
+    ) -> Optional[str]:
+        """Why restarting now would boot agents into constitution Safe Mode.
+
+        The deploy gate ``kestrel restart`` and ``kestrel update`` run
+        (#3517), against the code the spawned ``kestrel restart`` will boot:
+        the installed code, or ``revision`` of the ``repo_path`` checkout an
+        update is about to land. Same project resolution as that child, which
+        inherits this process's working directory and environment. Returns
+        the terminal refusal reason, or None when the restart is safe.
+
+        A gate that cannot work out what the code would govern by refuses
+        too; an agent cannot override it — the operator restarts by hand with
+        ``kestrel restart --allow-constitution-safe-mode``.
+        """
+        from kestrel_sovereign.constitution_adoption import (
+            ConstitutionAdoptionError,
+            check_constitution_adoption,
+            packaged_constitution_at,
+            refusal_reason,
+            unverified_lines,
+        )
+        from kestrel_sovereign.paths import project_dir
+
+        def _check():
+            return check_constitution_adoption(
+                project_dir(),
+                packaged_constitution=(
+                    (lambda: packaged_constitution_at(repo_path, revision))
+                    if revision
+                    else None
+                ),
+                code_label=(
+                    f"{revision} of {repo_path}" if revision
+                    else "the installed code"
+                ),
+            )
+
+        try:
+            check = await asyncio.to_thread(_check)
+        except ConstitutionAdoptionError as exc:
+            return (
+                "constitution adoption could not be verified, so the restart "
+                f"is refused: {exc}"
+            )
+        for line in unverified_lines(check):
+            logger.warning("restart_coordinator: %s", line.strip())
+        if check.safe:
+            return None
+        return refusal_reason(check)
+
+    async def _refuse_restart(self, req, reason: str) -> bool:
+        """Terminally refuse a pending request the adoption gate stopped."""
+        refused = await update_status(
+            self._db, req.id,
+            status="refused",
+            status_reason=reason,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            expected_current_status=req.status,
+            expected_authority_signature=req.authority_signature,
+        )
+        if refused:
+            logger.warning(
+                "restart_coordinator: refused restart request %s: %s",
+                req.id, reason,
+            )
+            req.status = "refused"
+            await self._emit_status_event(
+                req, state="refused", status_reason=reason,
+            )
+        return refused
 
     async def _reject_invalid_authority(
         self,
@@ -2642,6 +2738,21 @@ class RestartCoordinatorFeature(Feature):
                 "%s: %s", req.id, e,
             )
 
+        if update.get("constitution_refusal"):
+            # Not retryable: the fetched revision governs by a constitution an
+            # agent is not anchored to, and polling again cannot change that.
+            # Only a Sovereign reanchor can (#3517).
+            reason = update["constitution_refusal"]
+            await update_status(
+                self._db, req.id,
+                status="refused",
+                status_reason=reason,
+                completed_at=now(),
+                expected_current_status="updating",
+                expected_authority_signature=req.authority_signature,
+            )
+            return {"request_id": req.id, "reason": f"refused: {reason}"}
+
         if not update["ok"]:
             # Fetch/checkout/install failed before any restart. Leave the
             # request retryable — the next poll re-runs the idempotent
@@ -2753,6 +2864,7 @@ class RestartCoordinatorFeature(Feature):
         resolved_ref = ""
         ok = True
         failed_step: Optional[str] = None
+        constitution_refusal: Optional[str] = None
         for step in steps:
             outcome = await self._run_update_step(step)
             results.append(outcome)
@@ -2764,6 +2876,19 @@ class RestartCoordinatorFeature(Feature):
                 ok = False
                 failed_step = step.name
                 break
+            if step.name == "fetch":
+                # The fetch only moved remote-tracking refs. Judge the
+                # revision it fetched before checkout lands it: an agent not
+                # anchored to that revision's constitution would boot into
+                # Safe Mode, and refusing now leaves the checkout as it was
+                # (#3517).
+                constitution_refusal = await self._constitution_adoption_refusal(
+                    repo_path=req.update_repo_path, revision="FETCH_HEAD",
+                )
+                if constitution_refusal is not None:
+                    ok = False
+                    failed_step = "constitution_adoption"
+                    break
 
         if not profile.supports_migrations:
             migration = {
@@ -2792,6 +2917,7 @@ class RestartCoordinatorFeature(Feature):
             "steps": results,
             "migration": migration,
             "failed_step": failed_step,
+            "constitution_refusal": constitution_refusal,
         }
 
     async def _run_update_step(self, step) -> Dict[str, Any]:

@@ -7924,3 +7924,189 @@ async def test_sovereign_update_is_not_subject_to_agent_tag_bound(
     row = await get_request(backend, request_id)
     assert row.status == "executing"
     assert row.update_repo_path == default_repo
+
+
+# ---------------------------------------------------------------------------
+# Constitution adoption gate (#3517): a restart that would boot agents into
+# constitution Safe Mode is refused terminally, with the agents and hashes
+# named, before anything restarts.
+# ---------------------------------------------------------------------------
+
+_ANCHORED_TEXT = b"# Kestrel Constitution\nthe text the fleet is anchored to\n"
+_AMENDED_TEXT = b"# Kestrel Constitution\nthe text a merged PR introduced\n"
+
+
+@pytest.fixture
+def adoption_project(tmp_path, monkeypatch):
+    """The project the coordinator's ``kestrel restart`` child would boot."""
+    from tests.utils.constitution_anchor import sha256
+
+    for name in (
+        "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH",
+        "KESTREL_SOVEREIGN_TRUST_ROOT_PATH",
+        "KESTREL_DB_BACKEND",
+        "KESTREL_DATABASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr("kestrel_sovereign.paths.project_dir", lambda: project)
+    return project, sha256
+
+
+def _install_constitution(tmp_path, monkeypatch, content: bytes) -> None:
+    package = tmp_path / "pkg" / "KESTREL_CONSTITUTION.md"
+    package.parent.mkdir(parents=True, exist_ok=True)
+    package.write_bytes(content)
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(package))
+
+
+@pytest.mark.asyncio
+async def test_restart_onto_an_unadopted_constitution_is_refused_terminally(
+    tmp_path, monkeypatch, adoption_project,
+):
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    _install_constitution(tmp_path, monkeypatch, _AMENDED_TEXT)
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="ship the merged constitution PR")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        result = await feat.restart_coordinator()
+        again = await feat.restart_coordinator()
+
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    assert row.completed_at
+    for text in (
+        "Emma",
+        sha256(_ANCHORED_TEXT),
+        sha256(_AMENDED_TEXT),
+        "constitution Safe Mode",
+        "docs/architecture/security/SOVEREIGN_TRUST_ROOT.md",
+    ):
+        assert text in row.status_reason
+    assert result.data["refused"] == [
+        {"request_id": request_id, "reason": row.status_reason}
+    ]
+    assert result.data["executed"] == []
+    # Terminal: the next tick has nothing to run, and the row stays refused.
+    assert again.data["pending"] == 0
+    assert (await get_request(backend, request_id)).status == "refused"
+    events = await list_events_for_request(backend, request_id)
+    assert [event.state for event in events][-1] == "refused"
+    # A refused request cannot be canceled back into the queue.
+    canceled = await feat.cancel_restart_request(request_id)
+    assert canceled.data["canceled"] is False
+
+    # Refusal is terminal for its authority too: rewriting the row back to
+    # pending, even after the fleet adopts the constitution, is a replay.
+    _install_constitution(tmp_path, monkeypatch, _ANCHORED_TEXT)
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'pending' WHERE id = ?",
+        (request_id,),
+    )
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+    spawn.assert_not_called()
+    replayed = await get_request(backend, request_id)
+    assert replayed.status == "rejected"
+    assert "consumed" in replayed.status_reason
+
+
+@pytest.mark.asyncio
+async def test_restart_onto_the_anchored_constitution_proceeds(
+    tmp_path, monkeypatch, adoption_project,
+):
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    _install_constitution(tmp_path, monkeypatch, _ANCHORED_TEXT)
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="routine restart")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        result = await feat.restart_coordinator()
+
+    spawn.assert_called_once()
+    assert result.data["refused"] == []
+    assert (await get_request(backend, request_id)).status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_update_onto_an_unadopted_constitution_is_refused_before_checkout(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """The fetched revision is judged before the update checks it out."""
+    from tests.utils.constitution_anchor import (
+        PACKAGED_CONSTITUTION_RELPATH,
+        commit_constitution,
+        git,
+        origin_and_clone,
+        seed_anchored_agents,
+    )
+
+    project, sha256 = adoption_project
+    origin, checkout = origin_and_clone(tmp_path, _ANCHORED_TEXT)
+    commit_constitution(origin, _AMENDED_TEXT, "merge the constitution PR")
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(checkout / PACKAGED_CONSTITUTION_RELPATH),
+    )
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    head = git(checkout, "rev-parse", "HEAD").strip()
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="ship the merged constitution PR",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=str(checkout),
+    )
+    assert created.status is ToolResultStatus.OK, created.error
+    request_id = created.data["request"]["id"]
+
+    ran = []
+    real_step = RestartCoordinatorFeature._run_update_step
+
+    async def _step(self, step):
+        ran.append(step.name)
+        if step.name == "fetch":
+            return await real_step(self, step)
+        return {
+            "step": step.name, "argv": list(step.argv), "returncode": 0,
+            "ok": True, "stdout_tail": "", "stderr_tail": "",
+        }
+
+    with patch.object(RestartCoordinatorFeature, "_run_update_step", _step), \
+            patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+        result = await feat.restart_coordinator()
+
+    assert ran == ["fetch"]
+    spawn.assert_not_called()
+    assert git(checkout, "rev-parse", "HEAD").strip() == head
+    assert (checkout / PACKAGED_CONSTITUTION_RELPATH).read_bytes() == _ANCHORED_TEXT
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    for text in ("Emma", sha256(_ANCHORED_TEXT), sha256(_AMENDED_TEXT)):
+        assert text in row.status_reason
+    assert row.update_log_dict()["failed_step"] == "constitution_adoption"
+    assert result.data["refused"] == [
+        {"request_id": request_id, "reason": row.status_reason}
+    ]
+    events = await list_events_for_request(backend, request_id)
+    assert [event.state for event in events][-1] == "refused"
