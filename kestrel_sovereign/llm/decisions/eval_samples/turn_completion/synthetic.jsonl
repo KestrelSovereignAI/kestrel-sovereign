@@ -1,0 +1,40 @@
+{"adapter": "turn_completion", "id": "check-repo", "message": "Good question. Let me check the repo for where that setting is loaded.", "unfinished": true}
+{"adapter": "turn_completion", "id": "run-tests-now", "message": "That should fix the import error. I'll run the test suite now to confirm.", "unfinished": true}
+{"adapter": "turn_completion", "id": "search-dupes", "message": "One moment, searching the issue tracker for duplicates of this report.", "unfinished": true}
+{"adapter": "turn_completion", "id": "ci-log", "message": "The build is red on the lint step. Let me look at the failing job's log.", "unfinished": true}
+{"adapter": "turn_completion", "id": "query-signups", "message": "I am going to query the database for the last ten signups.", "unfinished": true}
+{"adapter": "turn_completion", "id": "checking-github", "message": "Checking the GitHub issue now.", "unfinished": true}
+{"adapter": "turn_completion", "id": "fetch-release", "message": "Let me fetch the latest release notes and compare them with your version.", "unfinished": true}
+{"adapter": "turn_completion", "id": "open-file", "message": "Hang on, I'll open the file and verify the path you mentioned.", "unfinished": true}
+{"adapter": "turn_completion", "id": "browser-console", "message": "I will inspect the browser console for the error you're seeing.", "unfinished": true}
+{"adapter": "turn_completion", "id": "long-then-verify", "message": "Here is what I found so far:\n\n1. The cron entry exists.\n2. The last run was yesterday at 08:05.\n3. Its exit status was 0.\n\nThe one thing I haven't confirmed is whether it wrote the report. Let me verify that by running the CLI.", "unfinished": true}
+{"adapter": "turn_completion", "id": "try-again", "message": "That request timed out. Let me try the call again with a longer timeout.", "unfinished": true}
+{"adapter": "turn_completion", "id": "use-tool", "message": "I'll use the calendar tool to find a free slot on Thursday.", "unfinished": true}
+{"adapter": "turn_completion", "id": "looking-up", "message": "Looking up the tracking number in the carrier's database now.", "unfinished": true}
+{"adapter": "turn_completion", "id": "call-api", "message": "Let me call the weather API for tomorrow's forecast in Austin.", "unfinished": true}
+{"adapter": "turn_completion", "id": "search-docs", "message": "I don't remember the exact flag. Let me search the docs for it.", "unfinished": true}
+{"adapter": "turn_completion", "id": "inspect-db", "message": "Something is off with the counts. I'll inspect the db table directly.", "unfinished": true}
+{"adapter": "turn_completion", "id": "ci-later", "message": "Status: PR #12 is open and green so far. When CI finishes, I will run the codex review and merge if it's clean.", "unfinished": false}
+{"adapter": "turn_completion", "id": "after-wake", "message": "Dispatched the ticket to the build worker. I'll check its status when the next wake arrives.", "unfinished": false}
+{"adapter": "turn_completion", "id": "tomorrow", "message": "The flaky test only fails under load. Tomorrow I will look into it with a fresh run on the quiet machine.", "unfinished": false}
+{"adapter": "turn_completion", "id": "checked-closed", "message": "After checking the issue, it's already closed: the fix shipped in 0.53.20.", "unfinished": false}
+{"adapter": "turn_completion", "id": "offer-migration", "message": "The migration is ready but not applied. Say the word and I'll run it.", "unfinished": false}
+{"adapter": "turn_completion", "id": "ask-which-tests", "message": "Would you like the full suite or just the unit tests? I'll use whichever you pick.", "unfinished": false}
+{"adapter": "turn_completion", "id": "user-instructions", "message": "Running `uv sync` in your checkout should fix it; then try the CLI again and it will pick up the new version.", "unfinished": false}
+{"adapter": "turn_completion", "id": "describes-step", "message": "The checking step uses the GitHub API to list open PRs, then posts a summary to the channel.", "unfinished": false}
+{"adapter": "turn_completion", "id": "summary-done", "message": "Done. I'll summarize: the repo is migrated, the tests pass, and the old branch is deleted.", "unfinished": false}
+{"adapter": "turn_completion", "id": "next-session", "message": "That's everything for today. Next session I will run the benchmark against the new model.", "unfinished": false}
+{"adapter": "turn_completion", "id": "conditional", "message": "If the deploy fails again, I'll look at the systemd journal first; so far it's healthy.", "unfinished": false}
+{"adapter": "turn_completion", "id": "plan-list", "message": "Plan for the week:\n- Monday: I will run the data export.\n- Tuesday: review the results with you.\n- Wednesday: ship the dashboard.\nNothing to do until Monday.", "unfinished": false}
+{"adapter": "turn_completion", "id": "explains-cli", "message": "Calling the CLI with --json gives machine-readable output, which is easier to search.", "unfinished": false}
+{"adapter": "turn_completion", "id": "hang-on-human", "message": "Hang on to that receipt; you'll need it if you want to open a dispute with the bank.", "unfinished": false}
+{"adapter": "turn_completion", "id": "calling-it", "message": "I'm calling it a day on this one: the issue is fixed and verified.", "unfinished": false}
+{"adapter": "turn_completion", "id": "one-moment-joke", "message": "One moment of silence for the old database: it served us well. The new one is live and passing checks.", "unfinished": false}
+{"adapter": "turn_completion", "id": "running-total", "message": "Running total so far: $1,240 spent of the $2,000 budget. I'll check again at month end.", "unfinished": false}
+{"adapter": "turn_completion", "id": "searching-explained", "message": "Searching works on titles only right now; full-text search on issue bodies lands next release.", "unfinished": false}
+{"adapter": "turn_completion", "id": "answered-with-plan", "message": "Your flight is at 7:05 from gate B12. I will check in for you 24 hours before departure, as usual.", "unfinished": false}
+{"adapter": "turn_completion", "id": "waiting-on-user", "message": "I've drafted the reply. Once you approve it, I'll use the email tool to send it.", "unfinished": false}
+{"adapter": "turn_completion", "id": "let-me-know", "message": "Let me know if you want me to look at the other repo too. Everything here is merged.", "unfinished": false}
+{"adapter": "turn_completion", "id": "checking-in", "message": "Just checking in: the nightly backup ran and the file count matches yesterday's.", "unfinished": false}
+{"adapter": "turn_completion", "id": "finished-run", "message": "The run finished: 214 passed, 0 failed. I'll open the PR after the review agent signs off.", "unfinished": false}
+{"adapter": "turn_completion", "id": "future-tool", "message": "I'll try the new search tool once it's installed; for now the old one returned the three results above.", "unfinished": false}
