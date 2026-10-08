@@ -8,7 +8,7 @@ having to trust the agent's natural-language report.
 This module builds the JSON payload for the ``restart_status`` UI
 side-channel event. The feature emits one through ``agent.emit_event``
 at each lifecycle point (filed/pending, deferred, escalated, executing/updating,
-completed, rejected, canceled); the Sovereign Console renders it as a
+completed, rejected, refused, canceled); the Sovereign Console renders it as a
 system/status bubble in the conversation.
 
 The payload deliberately mirrors the fields the issue calls out:

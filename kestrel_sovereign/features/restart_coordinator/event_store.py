@@ -48,6 +48,7 @@ LIFECYCLE_STATES = (
     "executing",
     "completed",
     "rejected",
+    "refused",
     "canceled",
 )
 

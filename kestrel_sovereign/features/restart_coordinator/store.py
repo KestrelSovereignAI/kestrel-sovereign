@@ -4,7 +4,7 @@ The table lives in the same SQLite database the rest of the feature
 suite uses (resolved via :func:`resolve_feature_database`). Each row
 captures one agent-initiated restart request through its full life:
 ``pending`` → ``approved`` → ``executing`` → ``completed`` (terminal)
-or ``rejected`` / ``canceled`` (terminal).
+or ``rejected`` / ``refused`` / ``canceled`` (terminal).
 
 Schema is additive: when a feature loads against a pre-existing DB
 without the table, ``ensure_restart_requests_table`` creates it. No
@@ -41,7 +41,10 @@ from .authority import (
 
 # Terminal states — a request in any of these is locked. The
 # coordinator must not re-execute, the agent must not re-modify.
-TERMINAL_STATES = frozenset({"completed", "rejected", "canceled"})
+# ``refused`` is the restart the constitution adoption gate stopped because it
+# would have booted agents into constitution Safe Mode (#3517); ``rejected``
+# remains the authority/validity verdict.
+TERMINAL_STATES = frozenset({"completed", "rejected", "refused", "canceled"})
 
 # In-flight states the coordinator considers when picking the next
 # request to execute. Two further in-flight states exist but are NOT
@@ -54,9 +57,9 @@ PENDING_STATES = frozenset({"pending", "approved"})
 
 # Every status a row can carry through its life. ``pending`` → ``approved``
 # → (``updating`` for update_then_restart rows) → ``executing`` →
-# ``completed``; or the terminal ``rejected`` / ``canceled``. Used to
-# validate the ``list_restart_requests`` status filter so an unknown value
-# is rejected with a clear message rather than silently returning 0 rows.
+# ``completed``; or the terminal ``rejected`` / ``refused`` / ``canceled``.
+# Used to validate the ``list_restart_requests`` status filter so an unknown
+# value is rejected with a clear message rather than silently returning 0 rows.
 KNOWN_STATUSES = frozenset(
     {
         "pending",
@@ -65,6 +68,7 @@ KNOWN_STATUSES = frozenset(
         "executing",
         "completed",
         "rejected",
+        "refused",
         "canceled",
     }
 )

@@ -1961,7 +1961,7 @@ export function connectNotifications() {
         // #1551: restart/update is an audited deployment primitive. The
         // coordinator emits `restart_status` as it drives a request
         // through its lifecycle (pending → executing → completed, plus
-        // deferred/rejected/canceled). Render each as a system/status
+        // deferred/rejected/refused/canceled). Render each as a system/status
         // bubble so the Sovereign sees the request first-class rather
         // than only via the agent's prose.
         notificationEventSource.addEventListener('restart_status', (e) => {
@@ -2259,6 +2259,7 @@ const RESTART_STATE_ACCENTS = {
     executing: 'rgba(245, 158, 11, 0.9)',  // amber — restart dispatched
     completed: 'rgba(34, 197, 94, 0.9)',   // green — landed
     rejected: 'rgba(239, 68, 68, 0.9)',    // red — terminal reject
+    refused: 'rgba(239, 68, 68, 0.9)',     // red — would boot into Safe Mode
     canceled: 'rgba(245, 158, 11, 0.8)',   // amber — canceled by agent
 };
 

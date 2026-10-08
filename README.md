@@ -255,6 +255,7 @@ kestrel update --uv-sync             # force `uv sync` for the install step
 kestrel update --no-uv-sync          # force `uv pip install -e .` for the install step
 kestrel update --no-deps             # pass --no-deps to `uv pip install` for the fast path
 kestrel update --continue-on-error   # proceed past a reconcile/sync error to the restart
+kestrel update --allow-constitution-safe-mode # restart even onto a constitution agents are not anchored to
 ```
 
 `kestrel start`, `kestrel restart`, and `kestrel update` share one readiness
@@ -277,6 +278,7 @@ Update mode is per-feature, read from the `.kestrel-host-features.toml` **source
 - `git pull --ff-only` so a non-fast-forward upstream aborts instead of producing a surprise merge.
 - Refuses to pull when the working tree has modified TRACKED files unless `--allow-dirty` is passed.
 - Any step's failure short-circuits the rest, so a half-applied update never reaches the restart phase.
+- Before any step runs, refuses (exit status 5, nothing changed) when the revision the pull will land on governs by a constitution an agent is not anchored to: restarting onto it would boot that agent into constitution Safe Mode. Every local agent is judged, even for `kestrel update <name>`, because the package is shared. The refusal names the agents and both hashes and prints the reanchor procedure. The restart step checks again, in a fresh interpreter, against what was installed. `kestrel restart` and the restart coordinator apply the same check; `--allow-constitution-safe-mode` restarts anyway, for an operator about to run that ceremony. See [Deploys that change the governing constitution](docs/architecture/security/SOVEREIGN_TRUST_ROOT.md#deploys-that-change-the-governing-constitution).
 - Source checkout and runtime data root (`KESTREL_HOME`) are resolved separately. The pull/install run against the source checkout (discovered by introspecting `kestrel_sovereign.__file__` — must have both `pyproject.toml` and `.git`). The runtime data root is used only for `feature sync`'s manifest lookup.
 
 **Pip-installed users** (no editable source checkout — `pip install kestrel-sovereign` against PyPI) — both pull AND install are silently skipped; `feature sync` and `restart` still run. Upgrade the package itself with `pip install --upgrade kestrel-sovereign` first, then run `kestrel update` to pick up new features + restart.
