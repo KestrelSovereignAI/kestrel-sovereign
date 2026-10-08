@@ -111,6 +111,30 @@ result and subsequent integrity audit before restarting hosted agents. A
 missing or unowned agent node is a refusal, not a reason to create or retarget
 one. Never infer a DID from the first row in the shared graph table.
 
+## Genesis content audit and publisher authority
+
+Source authentication and the genesis content audit answer different questions.
+The operator-controlled resolver and detached signatures establish which exact
+bytes may govern an agent and authorize their adoption. The content audit
+evaluates those bytes for safety, privacy, sovereignty, clarity, and unauthorized
+changes. It cannot verify runtime controls merely from claims in the document.
+
+The platform-authority contract (#3423) permits publisher revisions, including
+Book I and the governance frame, followed by an existing agent's explicit signed
+adoption. This is not permission for a hosted agent or a lower Book to rewrite
+the base. Nor does a publisher signature make harmful provisions safe, or make
+adoption blanket consent to data disclosure or training. The contract does not
+promise that every future publisher release preserves an immutable safety floor.
+
+Genesis audit specification 2 makes this distinction explicit and retains risk-3
+rejection. Newly completed pass and failure receipts record `audit_spec_version`
+and `audit_prompt_sha256`, binding the actual submitted prompt as well as the
+existing constitution digest. These are audit evidence, not authority to adopt a
+source. Legacy receipts retain their meaning; installing a new specification
+does not invalidate a prior failure, convert it to a pass, or rerun it. An
+operator's reviewed reevaluation must preserve the old failure evidence and
+use the normal signed recovery and fail-closed native acceptance gates.
+
 ## Deploys that change the governing constitution
 
 A deploy can change the governing constitution, for example a release that
