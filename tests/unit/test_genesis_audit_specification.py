@@ -185,6 +185,10 @@ def test_completed_receipt_rejects_malformed_completion_shape(
         "2026-10-08T12:00:00",
         "2026-02-30T12:00:00Z",
         "2026-10-08T12:00:00+25:00",
+        "2026-10-08T12:00:00+00:60",
+        "2026-10-08T12:00:00-00:60",
+        "2026-10-08T12:00:00+00:00:60",
+        "2026-10-08T12:00:00.0000001Z",
     ],
 )
 def test_completed_receipt_requires_a_real_timezone_aware_instant(

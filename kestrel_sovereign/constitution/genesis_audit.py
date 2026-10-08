@@ -9,6 +9,7 @@ shape.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -189,7 +190,9 @@ def validate_completed_genesis_audit(
     """Validate a completed receipt and return its status.
 
     ``None`` means the receipt is still pending. A claimed completion with an
-    invalid shape fails closed instead of being treated as ready.
+    invalid shape fails closed instead of being treated as ready. Completion
+    times use the canonical ISO-8601/RFC-3339 shape emitted by this module,
+    with at most microsecond precision and an explicit UTC or numeric offset.
     """
     status = record.get("status")
     if status == GENESIS_AUDIT_PENDING:
@@ -214,6 +217,12 @@ def validate_completed_genesis_audit(
     instants = []
     for value in completion_times:
         try:
+            if re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+                r"(?:\.[0-9]{1,6})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])",
+                value,
+            ) is None:
+                raise ValueError("Completion time is not a canonical ISO-8601 instant.")
             instant = datetime.fromisoformat(value)
             if instant.tzinfo is None or instant.utcoffset() is None:
                 raise ValueError("Completion time has no timezone.")
