@@ -157,7 +157,7 @@ def test_completed_receipt_preserves_valid_integer_and_pending_states(risk):
 @pytest.mark.parametrize("status,risk", [("passed", 1), ("failed", 3)])
 @pytest.mark.parametrize("field", ["completed_at", "timestamp"])
 @pytest.mark.parametrize(
-    "value", [True, False, 1, 1.5, [], ["time"], {}, {"time": "now"}, "", "  "]
+    "value", [None, True, False, 1, 1.5, [], ["time"], {}, {"time": "now"}, "", "  "]
 )
 def test_completed_receipt_rejects_malformed_completion_shape(
     status, risk, field, value
@@ -169,6 +169,26 @@ def test_completed_receipt_rejects_malformed_completion_shape(
         "audited": True,
         field: value,
     }
+    original = deepcopy(record)
+    with pytest.raises(GenesisAuditError, match="completion time"):
+        validate_completed_genesis_audit(record, "exact")
+    assert record == original
+
+
+@pytest.mark.parametrize("status,risk", [("passed", 1), ("failed", 3)])
+@pytest.mark.parametrize("null_field", ["completed_at", "timestamp"])
+def test_valid_completion_alias_does_not_hide_a_present_null(
+    status, risk, null_field
+):
+    record = {
+        "status": status,
+        "risk_level": risk,
+        "constitution_hash": "exact",
+        "audited": True,
+        "completed_at": "2026-10-08T00:00:00Z",
+        "timestamp": "2026-10-08T00:00:00Z",
+    }
+    record[null_field] = None
     original = deepcopy(record)
     with pytest.raises(GenesisAuditError, match="completion time"):
         validate_completed_genesis_audit(record, "exact")

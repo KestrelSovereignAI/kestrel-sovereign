@@ -205,7 +205,7 @@ def validate_completed_genesis_audit(
     completion_times = [
         record[key]
         for key in ("completed_at", "timestamp")
-        if record.get(key) is not None
+        if key in record
     ]
     if not completion_times or any(
         not isinstance(value, str) or not value.strip() for value in completion_times
