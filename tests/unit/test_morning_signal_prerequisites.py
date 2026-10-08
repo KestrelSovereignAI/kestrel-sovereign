@@ -5,6 +5,7 @@ misleading "Set GITHUB_TOKEN" message, since the token may be present and valid.
 """
 
 import urllib.error
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
@@ -21,8 +22,22 @@ from kestrel_sovereign.features.strategic_memory.github_integration import (
 from kestrel_sovereign.features.strategic_memory.morning_signal import (
     generate_morning_signal,
 )
+from kestrel_sovereign.features.strategic_memory.workflow_runs import (
+    WINDOW,
+    WorkflowRunReport,
+)
 
 _GH_MOD = "kestrel_sovereign.features.strategic_memory.github_integration"
+
+_NOW = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+# These cases are about GitHub remediation; the agent ran no workflows.
+_NO_WORKFLOW_RUNS = WorkflowRunReport(
+    since=_NOW - WINDOW,
+    until=_NOW,
+    persistent_failure_runs=3,
+    workflows=(),
+    store_present=True,
+)
 
 
 def _data(repos):
@@ -119,7 +134,7 @@ async def test_fetch_raises_auth_error_for_invalid_token_with_repos():
 @pytest.mark.asyncio
 async def test_signal_reports_scan_repos_remediation_when_token_present():
     with patch(f"{_GH_MOD}.get_github_token", return_value="ghp_valid"):
-        report = await generate_morning_signal(_data([]))
+        report = await generate_morning_signal(_data([]), _NO_WORKFLOW_RUNS)
     assert "scan_repos" in report
     assert "Set GITHUB_TOKEN" not in report
 
@@ -127,7 +142,7 @@ async def test_signal_reports_scan_repos_remediation_when_token_present():
 @pytest.mark.asyncio
 async def test_signal_reports_token_remediation_when_token_missing():
     with patch(f"{_GH_MOD}.get_github_token", return_value=None):
-        report = await generate_morning_signal(_data(["owner/repo"]))
+        report = await generate_morning_signal(_data(["owner/repo"]), _NO_WORKFLOW_RUNS)
     assert "Set GITHUB_TOKEN" in report
     assert "scan_repos" not in report
 
@@ -142,6 +157,6 @@ async def test_signal_reports_token_remediation_when_token_invalid():
     with patch(f"{_GH_MOD}.get_github_token", return_value="ghp_invalid"), patch(
         f"{_GH_MOD}.urllib.request.urlopen", side_effect=lambda *a, **k: _boom()
     ):
-        report = await generate_morning_signal(_data(["owner/repo"]))
+        report = await generate_morning_signal(_data(["owner/repo"]), _NO_WORKFLOW_RUNS)
     assert "Set GITHUB_TOKEN" in report
     assert "Live data from GitHub" not in report

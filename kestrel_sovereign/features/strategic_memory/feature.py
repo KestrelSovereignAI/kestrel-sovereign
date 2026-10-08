@@ -61,6 +61,7 @@ from .ledger_index import (
 from .morning_signal import generate_morning_signal
 from .run_history import RunHistoryUnreadable, read_run_history
 from .session_log import collect_session_log
+from .workflow_runs import assess_workflow_runs
 
 logger = logging.getLogger(__name__)
 
@@ -1652,7 +1653,7 @@ class StrategicMemoryFeature(Feature):
 
     @tool(
         name="morning_signal",
-        description="Generate a morning strategic briefing -- milestone status, blockers, recommended work items. Pulls live data from GitHub when GITHUB_TOKEN is available.",
+        description="Generate a morning strategic briefing -- milestone status, blockers, the last 24h of workflow runs (failures and persistently failing workflows), recommended work items. Pulls live data from GitHub when GITHUB_TOKEN is available.",
         category=ToolCategory.SYSTEM,
         command_prefix="!morning",
     )
@@ -1660,7 +1661,10 @@ class StrategicMemoryFeature(Feature):
         """Generate the Morning Signal briefing from strategic memory + live GitHub data."""
         # The merged view, not ``self._data``: the briefing has always led with
         # blockers, and the file split must not quietly empty that section.
-        briefing = await generate_morning_signal(self._strategy_data_view())
+        data = self._strategy_data_view()
+        briefing = await generate_morning_signal(
+            data, await assess_workflow_runs(self.agent, data)
+        )
         return ToolResult.ok(
             confirmation=briefing,
             data={"briefing": briefing},

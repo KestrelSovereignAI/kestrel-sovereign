@@ -729,6 +729,7 @@ ROUTED_MODULES = {
     "features/consent/feature.py",
     "features/spawn/feature.py",  # the descendant-Hold holder's identity (#3168)
     "features/storage_access.py",  # the definition itself
+    "features/strategic_memory/workflow_runs.py",  # whose Workflows runs (#3519)
     "hold/enforcement.py",  # the turn-start Hold latch's own scope
     "features/tasks/feature.py",
     "features/tasks/wait_provider.py",
