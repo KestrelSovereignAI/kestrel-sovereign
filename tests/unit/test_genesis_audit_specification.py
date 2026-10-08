@@ -147,7 +147,7 @@ def test_completed_receipt_preserves_valid_integer_and_pending_states(risk):
         "status": "failed" if risk == 3 else "passed",
         "constitution_hash": "exact",
         "audited": True,
-        "timestamp": "legacy-completion",
+        "timestamp": "2026-10-08T00:00:00Z",
         "risk_level": risk,
     }
     assert validate_completed_genesis_audit(record, "exact") == record["status"]
@@ -176,10 +176,65 @@ def test_completed_receipt_rejects_malformed_completion_shape(
 
 
 @pytest.mark.parametrize("status,risk", [("passed", 1), ("failed", 3)])
-@pytest.mark.parametrize("null_field", ["completed_at", "timestamp"])
-def test_valid_completion_alias_does_not_hide_a_present_null(
-    status, risk, null_field
+@pytest.mark.parametrize("field", ["completed_at", "timestamp"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "not-a-date",
+        "2026-10-08",
+        "2026-10-08T12:00:00",
+        "2026-02-30T12:00:00Z",
+        "2026-10-08T12:00:00+25:00",
+    ],
+)
+def test_completed_receipt_requires_a_real_timezone_aware_instant(
+    status, risk, field, value
 ):
+    record = {
+        "status": status,
+        "risk_level": risk,
+        "constitution_hash": "exact",
+        "audited": True,
+        field: value,
+    }
+    original = deepcopy(record)
+    with pytest.raises(GenesisAuditError, match="completion time"):
+        validate_completed_genesis_audit(record, "exact")
+    assert record == original
+
+
+@pytest.mark.parametrize("status,risk", [("passed", 1), ("failed", 3)])
+@pytest.mark.parametrize(
+    "alias,equivalent",
+    [
+        ("2026-10-08T12:00:00+00:00", True),
+        ("2026-10-08T07:00:00-05:00", True),
+        ("2026-10-07T12:00:00Z", False),
+    ],
+)
+def test_completed_receipt_aliases_must_identify_the_same_instant(
+    status, risk, alias, equivalent
+):
+    record = {
+        "status": status,
+        "risk_level": risk,
+        "constitution_hash": "exact",
+        "audited": True,
+        "completed_at": "2026-10-08T12:00:00Z",
+        "timestamp": alias,
+    }
+    original = deepcopy(record)
+    if equivalent:
+        assert validate_completed_genesis_audit(record, "exact") == status
+    else:
+        with pytest.raises(GenesisAuditError, match="completion time"):
+            validate_completed_genesis_audit(record, "exact")
+    assert record == original
+
+
+@pytest.mark.parametrize("status,risk", [("passed", 1), ("failed", 3)])
+@pytest.mark.parametrize("null_field", ["completed_at", "timestamp"])
+def test_valid_completion_alias_does_not_hide_a_present_null(status, risk, null_field):
     record = {
         "status": status,
         "risk_level": risk,

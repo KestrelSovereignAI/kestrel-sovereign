@@ -211,6 +211,21 @@ def validate_completed_genesis_audit(
         not isinstance(value, str) or not value.strip() for value in completion_times
     ):
         raise GenesisAuditError("Completed genesis audit lacks a completion time.")
+    instants = []
+    for value in completion_times:
+        try:
+            instant = datetime.fromisoformat(value)
+            if instant.tzinfo is None or instant.utcoffset() is None:
+                raise ValueError("Completion time has no timezone.")
+            instants.append(instant.astimezone(timezone.utc))
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise GenesisAuditError(
+                "Completed genesis audit has an invalid completion time."
+            ) from exc
+    if any(instant != instants[0] for instant in instants[1:]):
+        raise GenesisAuditError(
+            "Completed genesis audit has contradictory completion times."
+        )
     risk_level = record.get("risk_level")
     if type(risk_level) is not int:
         raise GenesisAuditError("Completed genesis audit has an invalid risk level.")
