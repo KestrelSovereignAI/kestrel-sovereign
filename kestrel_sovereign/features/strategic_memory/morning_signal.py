@@ -1,7 +1,7 @@
 """Morning Signal briefing generator for Strategic Memory.
 
 Builds the Morning Signal report from STRATEGY.yaml data
-enriched with live GitHub data.
+enriched with live GitHub data and the agent's workflow run outcomes.
 """
 
 from datetime import date, datetime
@@ -15,19 +15,37 @@ from .github_integration import (
     github_signal_prerequisite,
     short_repo,
 )
+from .workflow_runs import (
+    WorkflowRunReport,
+    WorkflowRunsAssessment,
+    last_success_date,
+    render_workflow_runs_section,
+)
 
 
-async def generate_morning_signal(data: Dict[str, Any]) -> str:
+async def generate_morning_signal(
+    data: Dict[str, Any], workflow_runs: WorkflowRunsAssessment
+) -> str:
     """Generate the Morning Signal briefing from strategic memory + live GitHub data.
 
     Args:
         data: The strategic memory data dict.
+        workflow_runs: The agent's workflow run outcomes, or why they could
+            not be assessed (see :func:`.workflow_runs.assess_workflow_runs`).
 
     Returns:
         Formatted markdown briefing string.
     """
     if not data:
-        return "No strategic memory loaded. Create a STRATEGY.yaml first."
+        # A failed workflow run reaches its agent whether or not it keeps a
+        # STRATEGY.yaml (#3519).
+        return "\n".join(
+            [
+                "No strategic memory loaded. Create a STRATEGY.yaml first.",
+                "",
+                *render_workflow_runs_section(workflow_runs),
+            ]
+        )
 
     today = date.today()
     lines = [f"# Morning Signal -- {today.strftime('%B %d, %Y')}", ""]
@@ -150,6 +168,9 @@ async def generate_morning_signal(data: Dict[str, Any]) -> str:
             if str(lb["number"]) not in yaml_issues:
                 lines.append(f"- [GITHUB] {lb['repo']}#{lb['number']}: {lb['title']}")
 
+    lines.append("")
+    lines.extend(render_workflow_runs_section(workflow_runs))
+
     # Recent activity highlights (live data)
     if has_live:
         active_repos = [
@@ -174,6 +195,21 @@ async def generate_morning_signal(data: Dict[str, Any]) -> str:
     for b in blockers:
         if b.get("severity") in ("high", "critical"):
             suggestions.append(f"Unblock {b.get('issue', '?')}: {b.get('title', '?')}")
+
+    # A persistently failing workflow is work to do; without this the list
+    # could say "No urgent items" under a section reporting one.
+    if isinstance(workflow_runs, WorkflowRunReport):
+        for outcomes in workflow_runs.persistently_failing():
+            latest = outcomes.failed_runs[0]
+            where = (
+                f"at stage `{latest.stage_name}`"
+                if latest.stage_name
+                else "with no failing stage recorded"
+            )
+            suggestions.append(
+                f"Repair workflow `{outcomes.workflow_name}`: failing {where}, "
+                f"last success {last_success_date(outcomes)}"
+            )
 
     # Suggest work on in-progress milestones
     for m in data.get("milestones", []):

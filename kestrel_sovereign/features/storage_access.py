@@ -90,8 +90,9 @@ def resolve_scoped_agent_did(agent: Any) -> str:
     scope (``hold/enforcement.py``), and (#3164) the host Hold door's latch
     target, which must address exactly the row turn-start reads —
     a latch written against any other identity is never read by anything
-    — (#3169) the peer Stop recipient's own Stop address, and (#3168) the
-    holder a descendant Hold is set under by the spawn feature.
+    — (#3169) the peer Stop recipient's own Stop address, (#3168) the
+    holder a descendant Hold is set under by the spawn feature, and (#3519)
+    the owner whose Workflows runs the Morning Signal reports.
     They had drifted — one gated on truthiness alone,
     so a non-string truthy value was bound as a query parameter; the task
     routes and the inbound-scope gate read ``agent_id`` before ``did``; the
