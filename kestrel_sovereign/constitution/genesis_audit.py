@@ -202,9 +202,18 @@ def validate_completed_genesis_audit(
         )
     if record.get("audited") is not True:
         raise GenesisAuditError("Completed genesis audit lacks auditor evidence.")
-    if not (record.get("completed_at") or record.get("timestamp")):
+    completion_times = [
+        record[key]
+        for key in ("completed_at", "timestamp")
+        if key in record
+    ]
+    if not completion_times or any(
+        not isinstance(value, str) or not value.strip() for value in completion_times
+    ):
         raise GenesisAuditError("Completed genesis audit lacks a completion time.")
     risk_level = record.get("risk_level")
+    if type(risk_level) is not int:
+        raise GenesisAuditError("Completed genesis audit has an invalid risk level.")
     if status == GENESIS_AUDIT_PASSED and risk_level not in (1, 2):
         raise GenesisAuditError("Passed genesis audit has an invalid risk level.")
     if status == GENESIS_AUDIT_FAILED and risk_level != 3:
@@ -259,11 +268,7 @@ async def evaluate_genesis_constitution(
 
     completed_at = utc_timestamp()
     record = {
-        "status": (
-            GENESIS_AUDIT_FAILED
-            if risk_level >= 3
-            else GENESIS_AUDIT_PASSED
-        ),
+        "status": (GENESIS_AUDIT_FAILED if risk_level >= 3 else GENESIS_AUDIT_PASSED),
         "completed_at": completed_at,
         # Compatibility alias for the original genesis-audit receipt shape.
         "timestamp": completed_at,
