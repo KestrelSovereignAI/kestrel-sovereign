@@ -494,20 +494,24 @@ async def evaluate_model(
     async def ask(sample: Sample, request: DecisionRequest) -> Any:
         keys = {qid: sample.threshold_keys[qid] for qid in request.questions
                 if qid in sample.threshold_keys}
-        async with gate:
-            return await llm_service.decide(
-                request,
-                caller=eval_caller_id(caller),
-                timeout_seconds=timeout_seconds,
-                model_override=selector,
-                local_only=local_only,
-                threshold_keys=keys or None,
-            )
+        return await llm_service.decide(
+            request,
+            caller=eval_caller_id(caller),
+            timeout_seconds=timeout_seconds,
+            model_override=selector,
+            local_only=local_only,
+            threshold_keys=keys or None,
+        )
 
     async def one(sample: Sample) -> None:
-        outcomes = await asyncio.gather(
-            *(ask(sample, request) for request in sample.requests), return_exceptions=True
-        )
+        # ``concurrency`` bounds call sites, not requests: a sample's own
+        # requests always run together, as its caller sends them, so the
+        # slowest one is the sample's latency.
+        async with gate:
+            outcomes = await asyncio.gather(
+                *(ask(sample, request) for request in sample.requests),
+                return_exceptions=True,
+            )
         for outcome in outcomes:
             if isinstance(outcome, BaseException) and not isinstance(outcome, DecisionError):
                 raise outcome
@@ -517,7 +521,6 @@ async def evaluate_model(
             name = _error_label(failed[0])
             report.errors[name] = report.errors.get(name, 0) + 1
             return
-        # Requests run in parallel: the call site waits for the slowest.
         report.latencies_ms.append(max(result.duration_ms for result in outcomes))
         for request, result in zip(sample.requests, outcomes):
             for qid, question in request.questions.items():

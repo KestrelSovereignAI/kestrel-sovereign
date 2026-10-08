@@ -271,6 +271,33 @@ async def test_a_multi_request_sample_is_scored_as_one_call_site() -> None:
     assert len(report.latencies_ms) == 1 and report.latencies_ms[0] >= 101
 
 
+@pytest.mark.asyncio
+async def test_a_samples_requests_run_together_under_any_concurrency() -> None:
+    import asyncio
+
+    in_flight = 0
+    peak = 0
+
+    class _Slow(_FakeService):
+        async def decide(self, request, **kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return await super().decide(request, **kwargs)
+
+    labels = {f"c{i}": True for i in range(3)}
+    service = _Slow({f"s.c{i}": 0.9 for i in range(3)} | {f"t.c{i}": 0.9 for i in range(3)})
+    await ev.evaluate_model(
+        service, "ollama:local/tev1", [_multi_sample("s", labels), _multi_sample("t", labels)],
+        caller="memory_answerability", local_only=True, timeout_seconds=5,
+        concurrency=1, target_accuracy=0.9,
+    )
+    # One call site at a time, its three requests together: never serialized.
+    assert peak == 3
+
+
 def test_a_sample_needs_requests_with_distinct_question_ids() -> None:
     from kestrel_sdk.llm.decisions import DecisionRequest
 

@@ -439,7 +439,7 @@ Thresholds and model choices come from measurement.
   - Committed samples are synthetic or public. They ship as package data under `kestrel_sovereign/llm/decisions/eval_samples/<caller>/*.jsonl`, so an installed host can run them.
   - Operator samples drawn from real memory or turns stay on the host and are never committed. Any sample file outside the shipped sets is evaluated on **local routes only** unless the operator passes `--allow-cloud`.
 - **Runner.** `kestrel decisions eval --caller <id> [--samples ...] [--route ...] [--model ...]` runs every sample through `decide` against each candidate model.
-  - A caller that sends several requests from one call site, such as one per candidate, builds them all into one sample. The sample is scored as the caller runs it: its requests go in parallel, it completes only if every one does, and its latency is the slowest.
+  - A caller that sends several requests from one call site, such as one per candidate, builds them all into one sample. The sample is scored as the caller runs it: its requests go in parallel, it completes only if every one does, and its latency is the slowest. `--concurrency` bounds samples in flight, never a sample's own requests.
   - On an unpinned route, the candidates are the route's discovered models; a pinned route contributes only its verified pin.
   - Eval traffic is recorded under the caller id `kestrel.eval.<caller>`, never the real one. This also keeps the real caller's `refuse` policy from hiding uncalibrated models from the very eval meant to calibrate them.
   - For each model and threshold key the runner reports accuracy, Brier score, expected calibration error and latency p50/p95, plus a proposed threshold:
