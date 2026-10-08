@@ -191,7 +191,7 @@ def test_shipped_samples_use_the_audits_own_builder() -> None:
     assert risks == {1, 2, 3}
     for sample in samples:
         request, keys = da.audit_decision_request(sample.raw["response"])
-        assert sample.request == request and sample.threshold_keys == keys
+        assert sample.requests == (request,) and sample.threshold_keys == keys
         risk = sample.raw["risk"]
         assert sample.expected == {"block": risk == 3, "concern": risk >= 2}
 
