@@ -51,11 +51,12 @@ async def pgvector_schema(db) -> str:
     """The schema holding pgvector's ``vector`` type, installing it if absent.
 
     The extension is installed once per database, into whichever schema first
-    created it, and an xdist worker's ``search_path`` names only its own
-    schema (``tests/shared/postgres_worker_isolation.py``). So ``CREATE
-    EXTENSION IF NOT EXISTS vector`` can succeed while an unqualified
-    ``vector`` still does not resolve (#3401). Qualify the type with this
-    schema, or name it on the connection's ``search_path``.
+    created it, and a connection whose ``search_path`` names only a test's
+    own schema (``with_search_path(url, schema)``) does not see it. So
+    ``CREATE EXTENSION IF NOT EXISTS vector`` can succeed while an
+    unqualified ``vector`` still does not resolve (#3401). Qualify the type
+    with this schema, or name it on the connection's ``search_path``, as an
+    xdist worker's does (``tests/shared/postgres_worker_isolation.py``).
     """
 
     await db.execute("CREATE EXTENSION IF NOT EXISTS vector")
