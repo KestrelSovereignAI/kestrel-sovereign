@@ -635,7 +635,7 @@ def attestation_eval_sample(raw: Dict[str, Any], source: str) -> "Sample":
         raise SampleError(f"{where}: applied must be true or false")
     return Sample(
         id=sample_id,
-        request=attestation_decision_request(session, content),
+        requests=(attestation_decision_request(session, content),),
         expected={ATTESTATION_QUESTION: applied},
         threshold_keys={},
         source=source,

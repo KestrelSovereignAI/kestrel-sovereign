@@ -64,7 +64,7 @@ def add_decisions_subparser(subparsers: argparse._SubParsersAction) -> None:
         help="Allow cloud routes for sample files outside the shipped synthetic sets",
     )
     eval_p.add_argument("--timeout", type=float, default=30.0, help="Per-request deadline (s)")
-    eval_p.add_argument("--concurrency", type=int, default=4, help="Requests in flight per model")
+    eval_p.add_argument("--concurrency", type=int, default=4, help="Samples in flight per model (a sample's own requests always run together)")
     eval_p.add_argument(
         "--target-accuracy", type=float, default=0.9,
         help="Accuracy a choice/score threshold must reach on the answers it keeps",

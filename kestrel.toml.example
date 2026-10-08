@@ -286,8 +286,9 @@ banned = []
 # memory_answerability_backend = "chat"  # "chat" (generate, above) or "decision" (decide; #3424)
 # memory_answerability_decision_model = "ollama:local/<model>"  # decision backend only; <vendor>[:<route>][/<model>]
 #
-# The decision backend asks one noul question per candidate; all share the
-# threshold key "answers" (default 0.5 until calibrated). Measure first:
+# The decision backend sends one request per candidate, in parallel, each a
+# single noul; all share the threshold key "answers" (default 0.5 until
+# calibrated). Measure first:
 #   kestrel decisions eval --caller memory_answerability --baseline chat
 # then paste the proposed blocks, e.g.:
 # [decisions.thresholds."memory_answerability"]

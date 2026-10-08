@@ -55,10 +55,10 @@ def test_parse_sample_builds_sdk_questions() -> None:
         },
         "expected": {"n": False, "c": "b", "s": 1},
     }), "f:1")
-    assert isinstance(sample.request.questions["n"], NoulQuestion)
-    assert sample.request.questions["n"].true_means == "yes"
-    assert dict(sample.request.questions["c"].options) == {"a": None, "b": "B"}
-    assert list(sample.request.questions["s"].levels) == ["lo", "hi"]
+    assert isinstance(sample.questions["n"], NoulQuestion)
+    assert sample.questions["n"].true_means == "yes"
+    assert dict(sample.questions["c"].options) == {"a": None, "b": "B"}
+    assert list(sample.questions["s"].levels) == ["lo", "hi"]
     assert sample.threshold_keys == {}
 
 
@@ -79,6 +79,26 @@ def test_parse_sample_builds_sdk_questions() -> None:
 def test_parse_sample_rejects_malformed(overrides, message) -> None:
     with pytest.raises(ev.SampleError, match=message):
         ev.parse_sample(_line(**overrides), "f:1")
+
+
+def test_set_hash_follows_what_is_sent_not_file_bytes(tmp_path: Path, monkeypatch) -> None:
+    a = tmp_path / "a.jsonl"
+    a.write_text(_line() + "\n")
+    _, digest = ev.load_samples([a])
+    # Reformatting the same sample is the same evidence.
+    a.write_text(json.dumps(json.loads(_line()), indent=2).replace("\n", " ") + "\n")
+    assert ev.load_samples([a])[1] == digest
+    # A label edit is not.
+    a.write_text(_line(expected={"c0": False}) + "\n")
+    assert ev.load_samples([a])[1] != digest
+
+    # A caller's prompt change is new evidence even though its file is unchanged.
+    from kestrel_sovereign.storage import memory_answerability as ma
+
+    shipped = ev.sample_files([ev.PACKAGED_SAMPLES_DIR / "memory_answerability"])
+    _, before = ev.load_samples(shipped)
+    monkeypatch.setattr(ma, "_DECISION_INSTRUCTIONS", ma._DECISION_INSTRUCTIONS + " Be strict.")
+    assert ev.load_samples(shipped)[1] != before
 
 
 def test_load_samples_hashes_content_and_refuses_duplicates(tmp_path: Path) -> None:
@@ -210,6 +230,83 @@ async def test_evaluate_model_runs_under_the_eval_caller_and_counts_errors() -> 
     assert len(report.latencies_ms) == 4
     [m] = report.metrics
     assert m.key == "answers" and m.accuracy == 1.0 and m.proposed_threshold is not None
+
+
+def _multi_sample(sample_id: str, labels: Dict[str, bool]) -> ev.Sample:
+    """One call site sending a one-question request per label, in parallel."""
+
+    from kestrel_sdk.llm.decisions import DecisionRequest
+
+    return ev.Sample(
+        id=sample_id,
+        requests=tuple(
+            DecisionRequest(state={"id": f"{sample_id}.{qid}"},
+                            questions={qid: NoulQuestion(instructions="?")})
+            for qid in labels
+        ),
+        expected=dict(labels),
+        threshold_keys={qid: "answers" for qid in labels},
+        source="f:1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_multi_request_sample_is_scored_as_one_call_site() -> None:
+    service = _FakeService({"s.c0": 0.9, "s.c1": 0.1, "t.c0": 0.9}, fail_ids={"t.c1"})
+    report = await ev.evaluate_model(
+        service, "ollama:local/tev1",
+        [_multi_sample("s", {"c0": True, "c1": False}),
+         _multi_sample("t", {"c0": True, "c1": True})],
+        caller="memory_answerability", local_only=True, timeout_seconds=5,
+        concurrency=1, target_accuracy=0.9,
+    )
+    # Each request carries only its own question's threshold key.
+    assert sorted(map(str, (c["threshold_keys"] for c in service.calls))) == sorted(
+        [str({"c0": "answers"}), str({"c1": "answers"})] * 2)
+    # One failed request fails the whole call site, which contributes nothing.
+    assert report.errors == {"DecisionTransportError": 1}
+    [m] = report.metrics
+    assert m.key == "answers" and m.n == 2 and m.accuracy == 1.0
+    # Its latency is the slowest of its parallel requests.
+    assert len(report.latencies_ms) == 1 and report.latencies_ms[0] >= 101
+
+
+@pytest.mark.asyncio
+async def test_a_samples_requests_run_together_under_any_concurrency() -> None:
+    import asyncio
+
+    in_flight = 0
+    peak = 0
+
+    class _Slow(_FakeService):
+        async def decide(self, request, **kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return await super().decide(request, **kwargs)
+
+    labels = {f"c{i}": True for i in range(3)}
+    service = _Slow({f"s.c{i}": 0.9 for i in range(3)} | {f"t.c{i}": 0.9 for i in range(3)})
+    await ev.evaluate_model(
+        service, "ollama:local/tev1", [_multi_sample("s", labels), _multi_sample("t", labels)],
+        caller="memory_answerability", local_only=True, timeout_seconds=5,
+        concurrency=1, target_accuracy=0.9,
+    )
+    # One call site at a time, its three requests together: never serialized.
+    assert peak == 3
+
+
+def test_a_sample_needs_requests_with_distinct_question_ids() -> None:
+    from kestrel_sdk.llm.decisions import DecisionRequest
+
+    request = DecisionRequest(state={}, questions={"c0": NoulQuestion(instructions="?")})
+    with pytest.raises(ev.SampleError, match="repeat across"):
+        ev.Sample(id="x", requests=(request, request), expected={"c0": True},
+                  threshold_keys={}, source="f:1")
+    with pytest.raises(ev.SampleError, match="needs a request"):
+        ev.Sample(id="x", requests=(), expected={}, threshold_keys={}, source="f:1")
 
 
 def test_report_and_snippet_rendering() -> None:
@@ -347,7 +444,7 @@ async def test_default_samples_must_exist(tmp_path: Path, capsys) -> None:
 
 
 def test_shipped_answerability_samples_use_the_gates_own_builder() -> None:
-    from kestrel_sovereign.storage.memory_answerability import answerability_decision_request
+    from kestrel_sovereign.storage.memory_answerability import answerability_decision_requests
 
     files = ev.sample_files([ev.PACKAGED_SAMPLES_DIR / "memory_answerability"])
     samples, _ = ev.load_samples(files)
@@ -355,9 +452,9 @@ def test_shipped_answerability_samples_use_the_gates_own_builder() -> None:
     labels = [v for s in samples for v in s.expected.values()]
     assert any(labels) and not all(labels)
     for sample in samples:
-        request, keys = answerability_decision_request(
+        requests, keys = answerability_decision_requests(
             sample.raw["question"], sample.raw["candidates"])
-        assert sample.request == request and sample.threshold_keys == keys
+        assert sample.requests == requests and sample.threshold_keys == keys
 
 
 @pytest.mark.parametrize(

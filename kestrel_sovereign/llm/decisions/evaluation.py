@@ -5,7 +5,8 @@ decision model, and the answers are scored per threshold key: accuracy, Brier
 score, expected calibration error, latency, and a proposed threshold. The
 proposal is printed as a ``[decisions.thresholds...]`` snippet carrying the
 sample-set hash and date, so every configured threshold traces back to the
-evidence that set it.
+evidence that set it. The hash covers the requests the samples build, not
+the file bytes: a caller's prompt or request-shape change is new evidence.
 
 Sample format (JSON Lines, one sample per line)::
 
@@ -22,7 +23,10 @@ Sample format (JSON Lines, one sample per line)::
 
 A caller may instead register a sample *adapter*: a line carrying
 ``"adapter": "<caller>"`` is built by that caller's own request builder, so
-the eval measures exactly the request the caller sends. A caller may also
+the eval measures exactly the request the caller sends. One call site may
+send several requests in parallel (one per candidate, say): a sample then
+carries all of them, and is scored as the caller runs them, completing only
+when every request does, with the slowest one as its latency. A caller may also
 register *baselines* (``--baseline``): another way of making the same
 judgement, scored on the same samples for comparison.
 """
@@ -44,10 +48,12 @@ from kestrel_sdk.llm.decisions import (
     ChoiceQuestion,
     DecisionError,
     DecisionRequest,
+    DecisionRequestInvalid,
     NoulAnswer,
     NoulQuestion,
     Question,
     ScoreQuestion,
+    validate_decision_request,
 )
 
 #: Package-shipped sample sets: ``eval_samples/<caller>/*.jsonl``.
@@ -100,12 +106,34 @@ class SampleError(ValueError):
 @dataclass(frozen=True)
 class Sample:
     id: str
-    request: DecisionRequest
+    #: Every request one call site sends for this case, in parallel. Question
+    #: ids are unique across them, so ``expected`` and ``threshold_keys`` key
+    #: one namespace.
+    requests: Tuple[DecisionRequest, ...]
     expected: Mapping[str, Any]
     threshold_keys: Mapping[str, str]
     source: str
     #: The adapter's original fields, for caller-owned baselines.
     raw: Optional[Mapping[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        if not self.requests:
+            raise SampleError(f"{self.source} [{self.id}]: a sample needs a request")
+        ids = [qid for request in self.requests for qid in request.questions]
+        if len(set(ids)) != len(ids):
+            raise SampleError(
+                f"{self.source} [{self.id}]: question ids repeat across the sample's requests"
+            )
+
+    @property
+    def questions(self) -> Dict[str, Question]:
+        """Every question across the sample's requests, by id."""
+
+        return {
+            qid: question
+            for request in self.requests
+            for qid, question in request.questions.items()
+        }
 
 
 def _question(raw: Any, where: str) -> Question:
@@ -177,7 +205,7 @@ def parse_sample(line: str, source: str) -> Sample:
         raise SampleError(f"{where}: threshold_keys must be an object")
     return Sample(
         id=sample_id,
-        request=DecisionRequest(state=raw.get("state"), questions=questions),
+        requests=(DecisionRequest(state=raw.get("state"), questions=questions),),
         expected=expected,
         threshold_keys=dict(keys),
         source=source,
@@ -199,22 +227,39 @@ def sample_files(paths: Iterable[Path]) -> List[Path]:
 
 
 def load_samples(files: Sequence[Path]) -> Tuple[List[Sample], str]:
-    """Load samples and return them with the sample set's content hash."""
+    """Load samples and return them with the sample set's hash.
+
+    The hash covers what is measured: each sample's id, the canonical wire
+    form of every request it builds, its labels and its threshold keys. A
+    caller changing its prompt or request shape changes it, as does any
+    label edit; reformatting a file does not.
+    """
 
     digest = hashlib.sha256()
     samples: List[Sample] = []
     seen: set[str] = set()
     for path in files:
         content = path.read_bytes()
-        digest.update(path.name.encode("utf-8") + b"\0" + content + b"\0")
         for number, line in enumerate(content.decode("utf-8").splitlines(), start=1):
             if not line.strip():
                 continue
-            sample = parse_sample(line, f"{path.name}:{number}")
+            where = f"{path.name}:{number}"
+            sample = parse_sample(line, where)
             if sample.id in seen:
-                raise SampleError(f"{path.name}:{number}: duplicate sample id {sample.id!r}")
+                raise SampleError(f"{where}: duplicate sample id {sample.id!r}")
             seen.add(sample.id)
             samples.append(sample)
+            try:
+                wire = [validate_decision_request(r).canonical_json for r in sample.requests]
+            except DecisionRequestInvalid as error:
+                raise SampleError(f"{where} [{sample.id}]: {error}") from None
+            digest.update(json.dumps(sample.id).encode("utf-8") + b"\0")
+            for body in wire:
+                digest.update(body + b"\0")
+            digest.update(json.dumps(
+                {"expected": dict(sample.expected), "threshold_keys": dict(sample.threshold_keys)},
+                sort_keys=True,
+            ).encode("utf-8") + b"\0")
     if not samples:
         raise SampleError("no samples found")
     return samples, digest.hexdigest()
@@ -440,35 +485,51 @@ async def evaluate_model(
     expected_keys = sorted({
         sample.threshold_keys.get(qid, qid)
         for sample in samples
-        for qid in sample.request.questions
+        for qid in sample.questions
     })
     report = ModelReport(selector=selector, route=route, model=model, expected_keys=expected_keys)
     gate = asyncio.Semaphore(max(1, concurrency))
     observations: List[Observation] = []
 
+    async def ask(sample: Sample, request: DecisionRequest) -> Any:
+        keys = {qid: sample.threshold_keys[qid] for qid in request.questions
+                if qid in sample.threshold_keys}
+        return await llm_service.decide(
+            request,
+            caller=eval_caller_id(caller),
+            timeout_seconds=timeout_seconds,
+            model_override=selector,
+            local_only=local_only,
+            threshold_keys=keys or None,
+        )
+
     async def one(sample: Sample) -> None:
+        # ``concurrency`` bounds call sites, not requests: a sample's own
+        # requests always run together, as its caller sends them, so the
+        # slowest one is the sample's latency.
         async with gate:
-            try:
-                result = await llm_service.decide(
-                    sample.request,
-                    caller=eval_caller_id(caller),
-                    timeout_seconds=timeout_seconds,
-                    model_override=selector,
-                    local_only=local_only,
-                    threshold_keys=sample.threshold_keys or None,
-                )
-            except DecisionError as error:
-                name = _error_label(error)
-                report.errors[name] = report.errors.get(name, 0) + 1
-                return
-        report.latencies_ms.append(result.duration_ms)
-        for qid, question in sample.request.questions.items():
-            observations.append(Observation(
-                key=sample.threshold_keys.get(qid, qid),
-                question=question,
-                expected=sample.expected[qid],
-                answer=result.answers[qid],
-            ))
+            outcomes = await asyncio.gather(
+                *(ask(sample, request) for request in sample.requests),
+                return_exceptions=True,
+            )
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException) and not isinstance(outcome, DecisionError):
+                raise outcome
+        failed = [outcome for outcome in outcomes if isinstance(outcome, DecisionError)]
+        if failed:
+            # The call site completes only when every request does.
+            name = _error_label(failed[0])
+            report.errors[name] = report.errors.get(name, 0) + 1
+            return
+        report.latencies_ms.append(max(result.duration_ms for result in outcomes))
+        for request, result in zip(sample.requests, outcomes):
+            for qid, question in request.questions.items():
+                observations.append(Observation(
+                    key=sample.threshold_keys.get(qid, qid),
+                    question=question,
+                    expected=sample.expected[qid],
+                    answer=result.answers[qid],
+                ))
 
     await asyncio.gather(*(one(sample) for sample in samples))
     if observations:
@@ -500,7 +561,7 @@ async def evaluate_baseline(
     baseline = _resolve(target)
     report = ModelReport(
         selector=f"baseline:{name}", route="baseline", model=name, baseline=True,
-        expected_keys=sorted({s.threshold_keys.get(q, q) for s in samples for q in s.request.questions}),
+        expected_keys=sorted({s.threshold_keys.get(q, q) for s in samples for q in s.questions}),
     )
     gate = asyncio.Semaphore(max(1, concurrency))
     observations: List[Observation] = []
@@ -517,7 +578,7 @@ async def evaluate_baseline(
             report.errors["BaselineIncomplete"] = report.errors.get("BaselineIncomplete", 0) + 1
             return
         report.latencies_ms.append(elapsed)
-        for qid, question in sample.request.questions.items():
+        for qid, question in sample.questions.items():
             if not isinstance(question, NoulQuestion):
                 raise SampleError(f"baseline {name!r} only scores noul questions")
             observations.append(Observation(

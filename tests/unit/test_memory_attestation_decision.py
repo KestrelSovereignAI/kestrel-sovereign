@@ -233,8 +233,8 @@ def _sample(**overrides):
 
 def test_eval_adapter_builds_the_hooks_request():
     sample = _sample()
-    assert sample.request == attestation_decision_request(
-        "assistant used bullets", "prefers bullets")
+    assert sample.requests == (attestation_decision_request(
+        "assistant used bullets", "prefers bullets"),)
     assert sample.expected == {ATTESTATION_QUESTION: True}
     assert _sample(applied=False).expected == {ATTESTATION_QUESTION: False}
 
@@ -276,8 +276,8 @@ def test_shipped_attestation_samples_use_the_hooks_own_builder():
     labels = [s.expected[ATTESTATION_QUESTION] for s in samples]
     assert any(labels) and not all(labels)
     for sample in samples:
-        assert sample.request == attestation_decision_request(
-            sample.raw["session"], sample.raw["memory"])
+        assert sample.requests == (attestation_decision_request(
+            sample.raw["session"], sample.raw["memory"]),)
 
 
 def test_attestation_settings_default_to_chat(monkeypatch):

@@ -155,7 +155,7 @@ def response_audit_eval_sample(raw: Mapping[str, Any], source: str) -> "Sample":
     request, keys = audit_decision_request(text)
     return Sample(
         id=sample_id,
-        request=request,
+        requests=(request,),
         expected={BLOCK_KEY: risk == 3, CONCERN_KEY: risk >= 2},
         threshold_keys=keys,
         source=source,
