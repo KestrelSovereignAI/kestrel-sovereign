@@ -5,17 +5,24 @@ The constitution adoption gate (#3517) reads each agent's anchor the way
 scoped by the ownership witness a real write lays down beside the row. These
 helpers write that shape and nothing more, so a test can say "Emma is anchored
 to X" without running inception.
+
+The gate judges installed code in a fresh interpreter, which no in-process
+patch reaches. :func:`link_installed_package` builds the ``kestrel_sovereign``
+that interpreter imports, with its own packaged constitution and resolver.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
 import subprocess
 from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
 
+import kestrel_sovereign
 from kestrel_sovereign.multi_agent.config import (
     MULTI_AGENT_CONFIG_FILENAME,
     HostConfig,
@@ -156,3 +163,73 @@ def origin_and_clone(tmp_path: Path, content: bytes) -> tuple[Path, Path]:
     clone = tmp_path / "checkout"
     git(tmp_path, "clone", "-q", str(origin), str(clone))
     return origin, clone
+
+
+#: Appended to an installed resolver to model a release that renders the
+#: governing constitution differently without changing its text.
+_RENDERING_CHANGE = """
+
+_released_resolve_governing_constitution_bytes = resolve_governing_constitution_bytes
+
+
+def resolve_governing_constitution_bytes(*args, **kwargs):
+    return _released_resolve_governing_constitution_bytes(*args, **kwargs) + {suffix!r}
+"""
+
+
+@dataclass(frozen=True)
+class InstalledPackage:
+    """A ``kestrel_sovereign`` on disk for a fresh interpreter to import.
+
+    ``root`` goes on the child's ``PYTHONPATH``. Every module links to the
+    package this test process imported, except the resolver, which is a copy
+    the test may change, and the packaged constitution, which links to
+    ``constitution``: the one file both the in-process and fresh views read.
+    """
+
+    root: Path
+    constitution: Path
+
+    @property
+    def resolver(self) -> Path:
+        return self.root / "kestrel_sovereign" / "constitution" / "resolver.py"
+
+    def change_rendering(self, suffix: bytes) -> None:
+        """Install a resolver whose governing bytes end with ``suffix``."""
+        with self.resolver.open("a", encoding="utf-8") as handle:
+            handle.write(_RENDERING_CHANGE.format(suffix=suffix))
+
+
+def _link_tree(source: Path, target: Path, *, except_: frozenset[str]) -> None:
+    target.mkdir(parents=True)
+    for entry in source.iterdir():
+        if entry.name != "__pycache__" and entry.name not in except_:
+            (target / entry.name).symlink_to(entry)
+
+
+def link_installed_package(root: Path, constitution: Path) -> InstalledPackage:
+    """Build the installed package a fresh interpreter imports from ``root``.
+
+    Point the child at it with ``PYTHONPATH=root`` and
+    ``PYTHONDONTWRITEBYTECODE=1``: the linked modules' bytecode caches belong
+    to the real package. POSIX only (symlinks).
+    """
+    real = Path(kestrel_sovereign.__file__).resolve().parent
+    package = root / "kestrel_sovereign"
+    _link_tree(real, package, except_=frozenset({"constitution", "data"}))
+    _link_tree(
+        real / "constitution",
+        package / "constitution",
+        except_=frozenset({"resolver.py"}),
+    )
+    shutil.copyfile(
+        real / "constitution" / "resolver.py",
+        package / "constitution" / "resolver.py",
+    )
+    _link_tree(
+        real / "data",
+        package / "data",
+        except_=frozenset({PACKAGED_CONSTITUTION_RELPATH.name}),
+    )
+    (package / "data" / PACKAGED_CONSTITUTION_RELPATH.name).symlink_to(constitution)
+    return InstalledPackage(root=root, constitution=constitution)

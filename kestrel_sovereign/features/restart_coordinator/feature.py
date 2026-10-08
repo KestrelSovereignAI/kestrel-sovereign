@@ -1422,8 +1422,9 @@ class RestartCoordinatorFeature(Feature):
             # anchored to the constitution that code governs by, the restart
             # would put it in constitution Safe Mode (#3517): refuse,
             # terminally and with the agents named, before claiming. An
-            # update_then_restart is judged after its fetch instead, against
-            # the revision the update is about to check out.
+            # update_then_restart is judged by its update instead: after the
+            # fetch, against the revision it is about to check out, and once
+            # installed, against what it installed.
             if req.operation != "update_then_restart":
                 refusal = await self._constitution_adoption_refusal()
                 if refusal is not None:
@@ -1732,11 +1733,17 @@ class RestartCoordinatorFeature(Feature):
         """Why restarting now would boot agents into constitution Safe Mode.
 
         The deploy gate ``kestrel restart`` and ``kestrel update`` run
-        (#3517), against the code the spawned ``kestrel restart`` will boot:
-        the installed code, or ``revision`` of the ``repo_path`` checkout an
-        update is about to land. Same project resolution as that child, which
-        inherits this process's working directory and environment. Returns
-        the terminal refusal reason, or None when the restart is safe.
+        (#3517), against the code the spawned ``kestrel restart`` will boot,
+        for every local agent. Same project resolution as that child, which
+        inherits this process's working directory and environment. Returns the
+        terminal refusal reason, or None when the restart is safe.
+
+        With ``revision``, nothing is installed yet: the packaged constitution
+        that checking out ``revision`` of ``repo_path`` would leave is judged
+        by this process's resolver. Without it, the installed code is judged
+        in a fresh interpreter. This host imported ``kestrel_sovereign`` when
+        it booted, and an update since may have changed how the governing
+        bytes are rendered, which only the installed code can say.
 
         A gate that cannot work out what the code would govern by refuses
         too; an agent cannot override it — the operator restarts by hand with
@@ -1745,6 +1752,7 @@ class RestartCoordinatorFeature(Feature):
         from kestrel_sovereign.constitution_adoption import (
             ConstitutionAdoptionError,
             check_constitution_adoption,
+            check_installed_constitution_adoption,
             packaged_constitution_at,
             refusal_reason,
             unverified_lines,
@@ -1752,17 +1760,14 @@ class RestartCoordinatorFeature(Feature):
         from kestrel_sovereign.paths import project_dir
 
         def _check():
+            if not revision:
+                return check_installed_constitution_adoption(project_dir())
             return check_constitution_adoption(
                 project_dir(),
                 packaged_constitution=(
-                    (lambda: packaged_constitution_at(repo_path, revision))
-                    if revision
-                    else None
+                    lambda: packaged_constitution_at(repo_path, revision)
                 ),
-                code_label=(
-                    f"{revision} of {repo_path}" if revision
-                    else "the installed code"
-                ),
+                code_label=f"{revision} of {repo_path}",
             )
 
         try:
@@ -2739,9 +2744,10 @@ class RestartCoordinatorFeature(Feature):
             )
 
         if update.get("constitution_refusal"):
-            # Not retryable: the fetched revision governs by a constitution an
-            # agent is not anchored to, and polling again cannot change that.
-            # Only a Sovereign reanchor can (#3517).
+            # Not retryable: the fetched revision, or the code the update
+            # installed, governs by a constitution an agent is not anchored
+            # to, and polling again cannot change that. Only a Sovereign
+            # reanchor can (#3517).
             reason = update["constitution_refusal"]
             await update_status(
                 self._db, req.id,
@@ -2889,6 +2895,20 @@ class RestartCoordinatorFeature(Feature):
                     ok = False
                     failed_step = "constitution_adoption"
                     break
+
+        if ok:
+            # The check after the fetch ran this host's resolver over the
+            # fetched bytes. A revision can also change how they are rendered,
+            # which only the code just installed can say: judge it in a fresh
+            # interpreter before anything restarts (#3517).
+            installed_refusal = await self._constitution_adoption_refusal()
+            if installed_refusal is not None:
+                ok = False
+                failed_step = "constitution_adoption"
+                constitution_refusal = (
+                    f"{installed_refusal} The update itself is installed; "
+                    "only the restart was refused."
+                )
 
         if not profile.supports_migrations:
             migration = {
