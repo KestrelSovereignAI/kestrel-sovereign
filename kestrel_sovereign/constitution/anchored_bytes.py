@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import re
+from copy import deepcopy
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -96,10 +97,45 @@ def historical_anchor_hash(
             if not isinstance(entry, Mapping):
                 raise ValueError("Missing anchor pointer has unreadable historical governance receipt evidence")
             inspect(entry.get("receipt"), kind)
-            add(entry.get("superseded_by_constitution_hash"))
+            add(entry.get("superseded_by_constitution_hash"), absent_ok=False)
     if len(candidates) > 1:
         raise ValueError("Missing anchor pointer has ambiguous historical governance; restore its exact prior pointer before signed repair")
     return next(iter(candidates), None)
+
+
+def governance_evidence(properties: Mapping, governed_by_targets: Iterable[str]) -> dict:
+    """Snapshot the exact governing facts validated by signed repair preflight.
+
+    Non-governance metadata is excluded so unrelated updates are preserved.
+    Copies are essential: a caller mutating its graph node must not mutate the
+    comparison witness along with it. This evidence is not signing authority.
+    """
+    return {
+        "properties": deepcopy({key: properties.get(key) for key in (
+            "constitution_hash", "emancipation_contract", "genesis_audit",
+            "genesis_audit_history", "constitution_reanchor", "constitution_reanchor_history",
+        )}),
+        "governed_by_targets": sorted(set(governed_by_targets)),
+    }
+
+
+async def revalidate_governance_evidence(storage, agent_id: str, expected: dict):
+    """Under the writer's graph locks, refuse a changed preflight witness.
+
+    Both native signed writers use this before any governance mutation, inside
+    their owning transaction. A changed pointer/receipt/rights/edge set requires
+    a fresh inspection and authorization, never adoption of a newer CAS fence.
+    """
+    node = await storage.get_node(agent_id)
+    if node is None or node.node_type != "agent":
+        raise RuntimeError("Agent identity disappeared during signed repair")
+    rows = await storage.db.fetchall(
+        "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'",
+        (agent_id,),
+    )
+    if governance_evidence(node.properties, (row[0] for row in rows)) != expected:
+        raise RuntimeError("Signed repair governing evidence changed; reload and reauthorize before repair")
+    return node
 
 
 async def read_anchored_constitution(

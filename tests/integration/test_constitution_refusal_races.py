@@ -146,10 +146,16 @@ async def test_postgres_refusal_during_exit_write_cannot_publish_success(
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 @pytest.mark.parametrize("writer", ["runtime", "offline"])
-@pytest.mark.parametrize("history", [False, True])
+@pytest.mark.parametrize("kind,history,missing_field", [
+    ("constitution_reanchor", False, "new_hash"),
+    ("constitution_reanchor", True, "new_hash"),
+    ("constitution_reanchor", True, "superseded_by_constitution_hash"),
+    ("genesis_audit", True, "superseded_by_constitution_hash"),
+    ("genesis_audit", False, "constitution_hash"),
+])
 @pytest.mark.parametrize("null_destination", [False, True])
-async def test_public_repair_refuses_reanchor_receipt_without_destination(
-    db_backend, tmp_path, monkeypatch, writer, history, null_destination,
+async def test_public_repair_refuses_receipt_without_required_hash(
+    db_backend, tmp_path, monkeypatch, writer, kind, history, missing_field, null_destination,
 ):
     storage = (
         AsyncStorage(str(tmp_path / "kestrel_prime.db"), backend="sqlite", agent_id="did:test:bad-receipt:" + uuid4().hex)
@@ -162,11 +168,18 @@ async def test_public_repair_refuses_reanchor_receipt_without_destination(
         agent = await _agent(storage)
         content = resolve_governing_constitution_bytes(None)
         old_hash = await storage.store_file(content, "superseded-dormant.md")
-        receipt = {"old_hash": old_hash}
+        receipt = (
+            {"old_hash": "none", "new_hash": old_hash}
+            if kind == "constitution_reanchor"
+            else {"constitution_hash": old_hash}
+        )
+        entry = {"receipt": receipt, "superseded_by_constitution_hash": old_hash}
+        malformed = entry if missing_field == "superseded_by_constitution_hash" else receipt
+        malformed.pop(missing_field)
         if null_destination:
-            receipt["new_hash"] = None
-        key = "constitution_reanchor_history" if history else "constitution_reanchor"
-        props = {key: [{"receipt": receipt}] if history else receipt}
+            malformed[missing_field] = None
+        key = kind + "_history" if history else kind
+        props = {key: [entry] if history else receipt}
         await storage.add_node(GraphNode(node_id=agent.agent_id, node_type="agent", label="malformed receipt", properties=props))
         before = await agent._constitution_state_store.load(agent.agent_id)
         events_before = await agent._constitution_state_store.list_events(agent.agent_id)

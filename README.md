@@ -1000,6 +1000,10 @@ A restriction during post-commit exit notification retains the historical exit
 event but reports current Safe Mode, not successful recovery.
 Native automatic and signed anchor transactions reserve file resources before
 graph resources, then revalidate and consume custody atomically.
+Both runtime and offline signed repairs compare the exact preflight pointer,
+rights, current/history receipts and governance edges again under those graph
+locks. Changed evidence requires fresh inspection and authorization; adopting
+a newer custody fence cannot legitimize a previously validated stale repair.
 The marker is single-use; interruption before verification cannot authorize a
 second anchor. The absent successful
 audit timestamp independently keeps the full startup audit due. Consumed

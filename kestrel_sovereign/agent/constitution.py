@@ -2088,6 +2088,15 @@ class ConstitutionMixin:
             return "Error: Agent identity node not found."
 
         old_hash = agent_node.properties.get("constitution_hash") or "none"
+        from kestrel_sovereign.constitution.anchored_bytes import (
+            governance_evidence, revalidate_governance_evidence,
+        )
+
+        governance_rows = await self._raw_storage.db.fetchall(
+            "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'",
+            (self.agent_id,),
+        )
+        governance_preflight = governance_evidence(agent_node.properties, (row[0] for row in governance_rows))
 
         # Resolve the new governing bytes through the SINGLE production resolver
         # (#2463) reading the governing source the periodic audit reads — the
@@ -2268,6 +2277,8 @@ class ConstitutionMixin:
             # edge set.
             try:
                 async with ConstitutionMixin._constitution_state_guard(self), self.storage.transaction():
+                    await self.storage.lock_nodes_for_update([self.agent_id, new_hash])
+                    agent_node = await revalidate_governance_evidence(self._raw_storage, self.agent_id, governance_preflight)
                     pruned = await self._anchor_constitution_governance(new_hash)
                     consumed = await ConstitutionMixin._consume_initial_anchor_custody(self)
                 ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
@@ -2336,6 +2347,7 @@ class ConstitutionMixin:
                 await self.storage.lock_nodes_for_update(
                     [self.agent_id, artifact_hash, stored_hash]
                 )
+                agent_node = await revalidate_governance_evidence(self._raw_storage, self.agent_id, governance_preflight)
                 await self.storage.add_node(
                     artifact_node,
                     capability=acquire_control_plane_capability(),

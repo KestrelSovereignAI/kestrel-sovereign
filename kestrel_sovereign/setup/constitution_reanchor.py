@@ -623,6 +623,7 @@ async def reanchor_constitution(
             anchored_present,
             row_exists,
             visible_edge_targets,
+            governance_preflight,
         ) = await _read_agent_anchor(target)
     except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the operator
         logger.exception("Could not read the anchor from %s", target.describe())
@@ -682,6 +683,7 @@ async def reanchor_constitution(
                 anchored_present,
                 row_exists,
                 visible_edge_targets,
+                governance_preflight,
             ) = await _read_agent_anchor(target)
         except Exception as exc:  # noqa: BLE001 — surfaced to the operator
             logger.exception("Could not read the anchor at %s", target.describe())
@@ -985,6 +987,7 @@ async def reanchor_constitution(
             amendment_artifact_bytes=amendment_artifact_bytes,
             amendment_artifact=amendment_artifact,
             amendment_verification=amendment_verification,
+            governance_preflight=governance_preflight,
         )
     except Exception as exc:  # noqa: BLE001 — surface the underlying error verbatim
         logger.exception(
@@ -1118,11 +1121,11 @@ async def _read_agent_anchor(
     target: ReanchorTarget,
 ) -> tuple[
     str | None, str, dict | None, tuple[str, ...], str | None, bool, bool,
-    tuple[str, ...],
+    tuple[str, ...], dict,
 ]:
     """Return ``(constitution_hash, agent_did, emancipation_contract_json,
     governed_by_targets, anchored_text, anchored_present, row_exists,
-    visible_edge_targets)`` **from the database the runtime reads**.
+    visible_edge_targets, governance_preflight)`` **from the runtime database**.
 
     Read-only — safe to call before deciding whether to touch the DB.
     Returns ``(None, "", None, (), None, False)`` if the agent node has no
@@ -1164,7 +1167,7 @@ async def _read_agent_anchor(
                 "SELECT 1 FROM graph_nodes WHERE node_id = ?",
                 (target.agent_did,),
             )
-            return None, "", None, (), None, False, physical is not None, ()
+            return None, "", None, (), None, False, physical is not None, (), {}
         # Read the governance edges through the privileged maintenance
         # connection, NOT the bound graph store. This repair path exists to
         # heal PRE-LEDGER drift (#2616), and stale edges are unowned by
@@ -1213,7 +1216,7 @@ async def _read_agent_anchor(
         # in the cohort this guard protects whose governance edge has drifted.
         # See :mod:`kestrel_sovereign.constitution.anchored_bytes`.
         anchored_present = False
-        from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
+        from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash, governance_evidence
 
         historical_hash = historical_anchor_hash(agent.properties, governed_by_targets)
         if historical_hash:
@@ -1231,6 +1234,7 @@ async def _read_agent_anchor(
             anchored_present,
             True,
             visible_edge_targets,
+            governance_evidence(agent.properties, governed_by_targets),
         )
 
 
@@ -1249,6 +1253,7 @@ async def _write_reanchor(
     amendment_artifact_bytes: bytes,
     amendment_artifact: dict,
     amendment_verification: AmendmentArtifactVerification,
+    governance_preflight: dict,
 ) -> ConstitutionRagIndex | None:
     """Apply the five governance locations plus authorization atomically.
 
@@ -1341,6 +1346,9 @@ async def _write_reanchor(
             await storage.graph.lock_nodes_for_update(
                 [agent_did, new_hash, artifact_hash]
             )
+            from kestrel_sovereign.constitution.anchored_bytes import revalidate_governance_evidence
+
+            await revalidate_governance_evidence(storage, agent_did, governance_preflight)
 
             # 2. Document graph node for the new constitution.
             await storage.graph.add_node(

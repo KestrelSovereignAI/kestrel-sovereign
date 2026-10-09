@@ -1037,6 +1037,9 @@ async def test_signed_native_anchor_consumes_bootstrap_custody_on_both_backends(
                 expected_constitution_sha256=digest,
             )
             source = ConstitutionMixin._governing_constitution_source(first)
+            from kestrel_sovereign.constitution.anchored_bytes import governance_evidence
+            governance_rows = await storage.db.fetchall("SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'", (first.agent_id,))
+            governance_preflight = governance_evidence((await storage.get_node(first.agent_id)).properties, (row[0] for row in governance_rows))
             operation = offline._write_reanchor(
                 target=SimpleNamespace(open_storage=borrowed_storage), agent_did=first.agent_id,
                 old_hash=digest if writer.endswith("_same") else "none",
@@ -1045,6 +1048,7 @@ async def test_signed_native_anchor_consumes_bootstrap_custody_on_both_backends(
                 emancipation_contract_json=None, amendment_artifact_path=artifact_path,
                 amendment_artifact_bytes=artifact_bytes, amendment_artifact=artifact,
                 amendment_verification=verification,
+                governance_preflight=governance_preflight,
             )
             if rollback:
                 with pytest.raises(Exception, match="fault after custody consumed"):
@@ -1276,7 +1280,7 @@ async def test_public_offline_signed_missing_anchor_recovery_on_both_backends(db
 @pytest.mark.dual_backend
 @pytest.mark.parametrize("writer", ["runtime", "runtime_same", "automatic", "state_write", "initialize"])
 @pytest.mark.parametrize("unknown_ownership", [False, True])
-async def test_live_constitution_publication_refuses_outer_rollback_authority_alias(db_backend, tmp_path, writer, unknown_ownership):
+async def test_live_constitution_publication_refuses_outer_rollback_authority_alias(db_backend, tmp_path, monkeypatch, writer, unknown_ownership):
     """A local transaction exit is not a commit of the caller's outer unit."""
     import hashlib
     from kestrel_sovereign.agent.constitution import ConstitutionMixin, SafeModeCause
@@ -1312,6 +1316,24 @@ async def test_live_constitution_publication_refuses_outer_rollback_authority_al
         artifact_path, root_path = _write_authority_files(tmp_path, resolve_governing_constitution_bytes(None))
         agent._sovereign_trust_root_path = root_path
         result = None
+        initialization_io = []
+        probing_initialization = False
+        if writer == "initialize":
+            store_type = type(agent._constitution_state_store)
+            native_initialize, native_load = store_type.initialize, store_type.load
+
+            async def observed_initialize(store):
+                if probing_initialization:
+                    initialization_io.append("initialize")
+                return await native_initialize(store)
+
+            async def observed_load(store, *args, **kwargs):
+                if probing_initialization:
+                    initialization_io.append("load")
+                return await native_load(store, *args, **kwargs)
+
+            monkeypatch.setattr(store_type, "initialize", observed_initialize)
+            monkeypatch.setattr(store_type, "load", observed_load)
         try:
             async with storage.transaction():
                 if writer.startswith("runtime"):
@@ -1321,8 +1343,14 @@ async def test_live_constitution_publication_refuses_outer_rollback_authority_al
                 elif writer == "state_write":
                     result = await agent._persist_constitution_runtime_state()
                 else:
+                    probing_initialization = True
                     await agent._initialize_constitution_runtime_state()
-                    result = agent._constitution_state_load_error
+                    probing_initialization = False
+                    # Preflight refused BEFORE any schema/read/write work.
+                    # This is pending durability, not a fabricated read outage.
+                    result = agent._constitution_state_persistence_pending
+                    assert agent._constitution_state_load_error is None
+                    assert initialization_io == []
                 raise RuntimeError("caller rolls back its outer unit")
         except Exception as exc:
             assert "caller rolls back" in str(exc)
@@ -1347,7 +1375,7 @@ async def test_live_constitution_publication_refuses_outer_rollback_authority_al
         elif writer == "state_write":
             assert mutation_result is False
         else:
-            assert mutation_result is not None
+            assert mutation_result is True
     finally:
         await storage.close()
 
