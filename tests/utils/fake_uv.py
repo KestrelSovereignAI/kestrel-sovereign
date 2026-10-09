@@ -88,6 +88,22 @@ class FakeUv:
     ``repair_hangs_after_restore=True``:
     the write lands and the process is killed afterwards — a bound stops a hung
     installer, it does not undo what that installer had already done.
+
+    A git fallback installs from a DIRECT source, which this double models
+    apart from the index: a requirement naming a URL (``pkg @ git+...``, or a
+    bare ``git+...``) lands ``feature_git_version`` from that URL and records
+    it as the copy's direct URL, and is refused when a constraint line on the
+    feature excludes that version. ``feature_on_index=False`` is the reason a
+    fallback runs at all for a private package: every index request for the
+    feature fails, as it does for a package the index does not publish.
+
+    A constraint line ``-e name @ file:///<checkout>`` holds a dependency on
+    that checkout, as uv 0.9.22 was measured to (#3502): a copy linked from it
+    stays linked, ``--upgrade`` included; a requirement the checkout's version
+    (``dependency_checkouts``) does not satisfy has no solution; and a copy not
+    linked from it is linked from it when the install resolves the package.
+    ``-e <checkout>`` naming one of ``dependency_checkouts`` links that
+    dependency, the install a manifest's editable entry for it runs.
     """
 
     def __init__(
@@ -118,6 +134,9 @@ class FakeUv:
         repair_interrupted=False,
         direct_urls=None,
         unreadable_provenance=None,
+        feature_on_index=True,
+        feature_git_version=None,
+        dependency_checkouts=None,
     ):
         self.installed = {CORE: core_version}
         self.editable = {CORE: core_checkout} if core_checkout else {}
@@ -129,6 +148,11 @@ class FakeUv:
         self.checkouts = dict(checkouts or {})
         if core_checkout:
             self.checkouts.setdefault(core_checkout, core_version)
+        #: ``{checkout: (dist, version it builds)}`` for checkouts of a
+        #: dependency rather than of core, which ``checkouts`` models.
+        self.dependency_checkouts = dict(dependency_checkouts or {})
+        if sdk_checkout:
+            self.dependency_checkouts.setdefault(sdk_checkout, (SDK, "0.36.0"))
         self.feature = feature
         self.feature_version = feature_version
         #: What the INDEX artifact declares, and what a resolve reads whenever
@@ -168,6 +192,10 @@ class FakeUv:
         # Dists whose direct_url.json exists but will not read/parse: provenance
         # UNKNOWN, which is a third state distinct from both of the above.
         self.unreadable_provenance = set(unreadable_provenance or ())
+        #: False: the index publishes no copy of the feature (a private package).
+        self.feature_on_index = feature_on_index
+        #: The version the feature's git URL builds (None: ``feature_version``).
+        self.feature_git_version = feature_git_version
         self.commands = []
         #: The TEXT of each install's constraints file, captured because
         #: `_extension_install_run` deletes the file before a test can read it.
@@ -244,6 +272,8 @@ class FakeUv:
         target = str(cmd[-1])
         if self._is_core_target(cmd, target):
             return self._install_core(cmd, target, timeout)
+        if "-e" in cmd and target in self.dependency_checkouts:
+            return self._link_dependency(cmd, target)
 
         if self.feature_install_times_out:
             # A killed install is not a no-op: whatever pip had already written
@@ -285,6 +315,7 @@ class FakeUv:
             # left alone. Nothing to swap.
             if self.feature_install_fails:
                 return self._failed(cmd, f"x Failed to build `{self.feature}`")
+            self._resolve_dependencies(cmd)
             return self._install_feature(cmd)
 
         candidates = [v for v in self._core_candidates(pin) if Version(v) in wanted]
@@ -304,6 +335,7 @@ class FakeUv:
         self.editable.pop(CORE, None)
         if self.feature_install_fails:
             return self._failed(cmd, f"x Failed to build `{self.feature}`")
+        self._resolve_dependencies(cmd)
         return self._install_feature(cmd)
 
     # -- internals -----------------------------------------------------------
@@ -323,6 +355,33 @@ class FakeUv:
             return target in self.checkouts
         return target.startswith(CORE)
 
+    def _link_dependency(self, cmd, checkout):
+        """``-e <checkout>`` of a dependency: link it, at the version it builds.
+
+        Refused when a version pin on that dependency excludes the version the
+        checkout builds, as a resolver refuses a direct requirement its
+        constraint excludes.
+        """
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        dist, version = self.dependency_checkouts[checkout]
+        pin = self._constraint_lines(cmd).get(dist, "")
+        if Version(version) not in SpecifierSet(pin):
+            return self._failed(
+                cmd,
+                f"x No solution found when resolving dependencies: {dist} at "
+                f"{checkout} builds {version}, but you require {dist}{pin}.",
+            )
+        self._link(dist, checkout, version)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def _link(self, dist, checkout, version):
+        self.installed[dist] = version
+        self.editable[dist] = checkout
+        self.direct_urls.pop(dist, None)
+        self.unreadable_provenance.discard(dist)
+
     def _install_feature(self, cmd):
         """Record the feature as installed, and drop its link if reinstalled.
 
@@ -330,19 +389,101 @@ class FakeUv:
         wheel when the command actually reinstalls IT — which is the point of a
         source switch, and the reason a scoped reinstall must still reach the
         requested package.
+
+        The version that lands is :attr:`feature_version`, unless the index
+        publishes several (``package_index[feature]``). Then a resolve picks
+        the newest that the command's requirement and the feature's own
+        constraint line allow, keeps a copy that already satisfies both unless
+        the command upgrades or reinstalls it, and has no solution when none
+        does. On a source switch that is where a lock pin on the feature
+        decides which version arrives (#3502).
         """
+        url = self._direct_reference(cmd)
+        if url is None and "-e" not in cmd and not self.feature_on_index:
+            return self._failed(
+                cmd,
+                f"x Because {self.feature} was not found in the package "
+                "registry and you require it, we can conclude that your "
+                "requirements are unsatisfiable.",
+            )
+        version = self._feature_version_for(cmd, url)
+        if version is None:
+            pin = self._constraint_lines(cmd).get(self.feature, "")
+            return self._failed(
+                cmd,
+                "x No solution found when resolving dependencies: you require "
+                f"{cmd[-1]} and {self.feature}{pin}.",
+            )
         landed = (
-            self._reinstalls_package(cmd, self.feature)
-            or self.installed.get(self.feature) != self.feature_version
+            url is not None
+            or self._reinstalls_package(cmd, self.feature)
+            or self.installed.get(self.feature) != version
         )
-        self.installed[self.feature] = self.feature_version
-        if self._reinstalls_package(cmd, self.feature):
+        self.installed[self.feature] = version
+        if url is not None:
+            # Built from the URL: that is the copy's source now, whatever the
+            # replaced copy was.
             self.editable.pop(self.feature, None)
+            self.unreadable_provenance.discard(self.feature)
+            self.direct_urls[self.feature] = url
+        elif self._reinstalls_package(cmd, self.feature):
+            self.editable.pop(self.feature, None)
+            # An index install records no PEP 610 provenance: whatever direct
+            # URL the replaced copy named is gone with its dist-info.
+            self.direct_urls.pop(self.feature, None)
+            self.unreadable_provenance.discard(self.feature)
         if landed:
             # The index artifact is the one on disk now, so what the venv
             # declares as a dependency changed with the file that declared it.
             self.feature_installed_requires = self.feature_requires
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    @staticmethod
+    def _direct_reference(cmd):
+        """The URL this command installs the feature from, or None for the index.
+
+        ``pkg @ <url>`` names it; a bare ``git+<url>`` names no package, and
+        the one package this double builds from a URL is the feature.
+        """
+        from packaging.requirements import InvalidRequirement, Requirement
+
+        target = str(cmd[-1])
+        try:
+            return Requirement(target).url
+        except InvalidRequirement:
+            return target if target.startswith("git+") else None
+
+    def _feature_version_for(self, cmd, url=None):
+        """The feature version this command lands, or None when none is allowed.
+
+        From *url*, the version that URL builds, if the constraints allow it.
+        """
+        from packaging.requirements import InvalidRequirement, Requirement
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        if url is not None:
+            built = self.feature_git_version or self.feature_version
+            pin = SpecifierSet(self._constraint_lines(cmd).get(self.feature, ""))
+            return built if Version(built) in pin else None
+        published = self.package_index.get(self.feature)
+        if not published:
+            return self.feature_version
+        try:
+            wanted = Requirement(str(cmd[-1])).specifier
+        except InvalidRequirement:
+            wanted = SpecifierSet()  # a path or URL: no version requested
+        wanted &= SpecifierSet(self._constraint_lines(cmd).get(self.feature, ""))
+        current = self.installed.get(self.feature)
+        if (
+            current is not None
+            and Version(current) in wanted
+            and "--upgrade" not in cmd
+            and not self._reinstalls_package(cmd, self.feature)
+        ):
+            return current
+        candidates = [v for v in published if Version(v) in wanted]
+        return max(candidates, key=Version) if candidates else None
 
     def _resolved_feature_requires(self, cmd) -> str:
         """The feature requirement THIS command's resolve actually reads.
@@ -484,6 +625,11 @@ class FakeUv:
             # reinstall drags off their checkouts.
             self._reinstall_sdk_from_index()
         result = self._land_core(cmd, target)
+        if "--no-deps" not in cmd:
+            # A core install resolves core's dependencies as a feature install
+            # resolves the feature's: the automatic restore is an install too,
+            # and it can move a locked package unless the lock holds it (#3502).
+            self._resolve_dependencies(cmd, CORE)
         if self.repair_hangs_after_restore:
             # Killed AFTER the write above. A timeout ends a process; it does
             # not roll back what that process had already done.
@@ -550,14 +696,42 @@ class FakeUv:
             candidates = {v for v in candidates if Version(v) in allowed}
         return candidates
 
-    def _constraint_lines(self, cmd) -> dict:
-        """Every constraint line in the ``-c <file>``, by package name."""
+    @staticmethod
+    def _constraint_text(cmd) -> list:
         if "-c" not in cmd:
-            return {}
+            return []
         text = Path(cmd[cmd.index("-c") + 1]).read_text(encoding="utf-8")
+        return [line.strip() for line in text.splitlines() if line.strip()]
+
+    def _checkout_holds(self, cmd) -> dict:
+        """``{name: checkout}`` for each ``-e name @ file:///...`` constraint line."""
+        from urllib.parse import urlparse
+        from urllib.request import url2pathname
+
+        holds = {}
+        for line in self._constraint_text(cmd):
+            if not line.startswith("-e "):
+                continue
+            name, _, url = line[len("-e "):].partition(" @ ")
+            holds[name.strip()] = url2pathname(urlparse(url.strip()).path)
+        return holds
+
+    def _held_version(self, name, checkout):
+        """The version *name* is held at on *checkout*: what that checkout builds."""
+        for path, (dist, version) in self.dependency_checkouts.items():
+            if dist == name and Path(path) == Path(checkout):
+                return version
+        return None
+
+    def _constraint_lines(self, cmd) -> dict:
+        """Every version constraint line in the ``-c <file>``, by package name.
+
+        A checkout hold (``-e ...``) is not a version line: see
+        :meth:`_checkout_holds`.
+        """
         pins = {}
-        for line in (ln.strip() for ln in text.splitlines()):
-            if not line:
+        for line in self._constraint_text(cmd):
+            if line.startswith("-e "):
                 continue
             cut = len(line)
             for index, char in enumerate(line):
@@ -576,6 +750,72 @@ class FakeUv:
         """
         return self._constraint_lines(cmd).get(CORE)
 
+    def _declared_dependencies(self, dist):
+        """``(name, spec)`` for each modelled non-core requirement of *dist*."""
+        for raw in self.requires(dist):
+            if ";" in raw:
+                continue  # markers are unmodelled
+            cut = len(raw)
+            for index, char in enumerate(raw):
+                if char in "<>=!~":
+                    cut = index
+                    break
+            # Exactly core: a prefix test would also skip the SDK, whose name
+            # starts with core's.
+            if raw[:cut] == CORE:
+                continue  # core has its own handling
+            yield raw[:cut], raw[cut:]
+
+    def _resolve_dependencies(self, cmd, dist=None):
+        """Move *dist*'s other dependencies the way a resolve does.
+
+        *dist* defaults to the feature; a core install passes core.
+
+        Modelled only for a package the venv holds AND the index publishes. A
+        dependency that already satisfies its requirement and its constraint
+        line is left alone — unless the command passes ``--upgrade``, which uv
+        applies EAGERLY: every package in the resolution moves to the newest
+        version its constraints allow, not only the one named. That is how a
+        reconcile ``update`` dragged a package past the version core's
+        ``uv.lock`` pins, and why the lock's pins have to ride on the
+        constraints file (#3502).
+
+        A version other than the copy on disk comes from the index whatever
+        that copy was, so a linked dependency loses its link; the same version
+        keeps it. Measured on uv 0.9.22: ``--upgrade`` replaced an editable
+        dependency with the newest index wheel, and a constraint equal to the
+        linked version kept the link.
+        """
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        pins = self._constraint_lines(cmd)
+        holds = self._checkout_holds(cmd)
+        for name, spec in self._declared_dependencies(dist or self.feature):
+            if name in holds:
+                # Held on a checkout: it stays linked, or becomes linked, and
+                # the index is never a candidate. A requirement the checkout
+                # cannot meet was refused before anything was written
+                # (:meth:`_requirement_outside_its_pin`).
+                checkout = holds[name]
+                if Path(self.editable.get(name) or "/nonexistent") != Path(checkout):
+                    self._link(name, checkout, self._held_version(name, checkout))
+                continue
+            if name not in self.installed or name not in self.package_index:
+                continue
+            allowed = SpecifierSet(spec) & SpecifierSet(pins.get(name, ""))
+            if "--upgrade" not in cmd and Version(self.installed[name]) in allowed:
+                continue
+            candidates = [v for v in self.package_index[name] if Version(v) in allowed]
+            if not candidates:
+                continue
+            chosen = max(candidates, key=Version)
+            if Version(chosen) != Version(self.installed[name]):
+                self.installed[name] = chosen
+                self.editable.pop(name, None)
+                self.direct_urls.pop(name, None)
+                self.unreadable_provenance.discard(name)
+
     def _requirement_outside_its_pin(self, cmd, dist):
         """A requirement of *dist* that its package's own pin cannot satisfy.
 
@@ -588,15 +828,17 @@ class FakeUv:
         from packaging.version import Version
 
         pins = self._constraint_lines(cmd)
-        for raw in self.requires(dist):
-            if ";" in raw or raw.startswith(CORE):
-                continue  # markers are unmodelled; core has its own handling
-            cut = len(raw)
-            for index, char in enumerate(raw):
-                if char in "<>=!~":
-                    cut = index
-                    break
-            name, spec = raw[:cut], raw[cut:]
+        holds = self._checkout_holds(cmd)
+        for name, spec in self._declared_dependencies(dist):
+            if name in holds:
+                held = self._held_version(name, holds[name])
+                if held is None or Version(held) not in SpecifierSet(spec):
+                    return (
+                        "x No solution found when resolving dependencies: "
+                        f"{dist} depends on {name}{spec}, but {name} is held "
+                        f"on {holds[name]}, which builds {held}."
+                    )
+                continue
             pin = pins.get(name)
             if pin is None or not spec:
                 continue
