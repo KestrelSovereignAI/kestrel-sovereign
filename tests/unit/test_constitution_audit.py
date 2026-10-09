@@ -327,6 +327,53 @@ async def _open_durable_harness(db_path, now, *, is_new_identity=False):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("integrity_valid", [True, False])
+async def test_future_persisted_audit_requires_real_startup_verification(tmp_path, integrity_valid):
+    now = datetime(2026, 10, 9, 14, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(tmp_path / "future.db", now)
+    future = now + timedelta(hours=5)
+    try:
+        await first._record_successful_constitution_audit(source="legacy", audited_at=future)
+        restarted = _DurableConstitutionHarness(storage, now)
+        await restarted._initialize_constitution_runtime_state()
+        assert restarted._constitution_audit_pending is True
+        # Startup independently rejects a future deadline even if a stale
+        # in-memory pending flag is false.
+        restarted._constitution_audit_pending = False
+        restarted._verify_constitution_integrity = AsyncMock(
+            return_value=(integrity_valid, "native integrity result")
+        )
+        await restarted._audit_constitution_on_startup()
+        restarted._verify_constitution_integrity.assert_awaited_once()
+        restored = await restarted._constitution_state_store.load(first.agent_id)
+        if integrity_valid:
+            assert restored.last_successful_audit_at == now
+            assert restarted._constitution_audit_pending is False
+            assert restored.safe_mode is False
+        else:
+            assert restored.safe_mode is True
+            assert restored.last_successful_audit_at == future
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_live_clock_reversal_does_not_postpone_periodic_integrity_audit(tmp_path):
+    now = datetime(2026, 10, 9, 14, tzinfo=timezone.utc)
+    agent, storage = await _open_durable_harness(tmp_path / "clock.db", now)
+    try:
+        await agent._record_successful_constitution_audit(
+            source="before-clock-change", audited_at=now + timedelta(minutes=1)
+        )
+        agent._verify_constitution_integrity = AsyncMock(return_value=(True, "verified"))
+        await agent._maybe_audit()
+        agent._verify_constitution_integrity.assert_awaited_once()
+        assert (await agent._constitution_state_store.load(agent.agent_id)).last_successful_audit_at == now
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_preinitialization_safe_mode_entry_is_buffered_then_persisted(tmp_path):
     """A startup signal cannot fall through the DB-connect timing window."""
     from kestrel_sovereign.storage import AsyncStorage

@@ -617,6 +617,16 @@ class ConstitutionMixin:
         """Sentinel used when no successful full audit has ever been recorded."""
         return datetime.fromtimestamp(0, timezone.utc)
 
+    @staticmethod
+    def _constitution_time_audit_due(now: datetime, audited_at: datetime) -> bool:
+        """Future/expired audit times cannot authorize a deferred verifier.
+
+        Legacy PostgreSQL binds and clock reversals can produce a future
+        timestamp. Do not guess a historical offset or rewrite it as approval;
+        only a fresh successful full integrity audit advances the deadline.
+        """
+        return audited_at > now or (now - audited_at).total_seconds() >= 24 * 3600
+
     def _constitution_state_snapshot(
         self,
         *,
@@ -762,10 +772,9 @@ class ConstitutionMixin:
             self._constitution_audit_pending = (
                 state.bootstrap_pending
                 or state.last_successful_audit_at is None
-                or (
-                    self._constitution_now() - state.last_successful_audit_at
-                ).total_seconds()
-                >= 24 * 3600
+                or ConstitutionMixin._constitution_time_audit_due(
+                    self._constitution_now(), state.last_successful_audit_at
+                )
             )
             await persist_pending_entry(store)
             # A completed runtime record paired with a missing identity node is
@@ -1003,7 +1012,7 @@ class ConstitutionMixin:
             self._constitution_audit_pending
             or self._constitution_state_migration_pending
             or self._last_audit_time <= self._constitution_epoch()
-            or (now - self._last_audit_time).total_seconds() >= 24 * 3600
+            or ConstitutionMixin._constitution_time_audit_due(now, self._last_audit_time)
         )
         if not due:
             return
@@ -1058,7 +1067,10 @@ class ConstitutionMixin:
 
         hours_since_audit = (now - self._last_audit_time).total_seconds() / 3600
 
-        if self._interaction_count >= self.AUDIT_INTERVAL or hours_since_audit >= 24:
+        if (
+            self._interaction_count >= self.AUDIT_INTERVAL
+            or ConstitutionMixin._constitution_time_audit_due(now, self._last_audit_time)
+        ):
             logging.info(
                 f"Constitution audit triggered: "
                 f"interactions={self._interaction_count}, hours={hours_since_audit:.1f}"
