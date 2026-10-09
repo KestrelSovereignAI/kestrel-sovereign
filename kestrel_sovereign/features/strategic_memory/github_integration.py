@@ -22,6 +22,12 @@ GITHUB_SIGNAL_READY = "ready"
 GITHUB_SIGNAL_NO_SCAN_REPOS = "no_scan_repos"
 GITHUB_SIGNAL_NO_TOKEN = "no_token"
 
+#: The agent's own source repository: what the ``self`` repository alias
+#: names. The variable and its default are the ones documented in the README
+#: and ``.env.example`` and read by the GitHub feature's ``self`` alias.
+GITHUB_SELF_REPO_ENV = "GITHUB_SELF_REPO"
+DEFAULT_GITHUB_SELF_REPO = "KestrelSovereignAI/kestrel-sovereign"
+
 
 class GitHubAuthError(Exception):
     """GitHub rejected the supplied credentials (HTTP 401/403).
@@ -48,19 +54,32 @@ def github_signal_prerequisite(data: Dict[str, Any]) -> str:
     return GITHUB_SIGNAL_READY
 
 
-def get_github_token() -> Optional[str]:
-    """Get GitHub token from environment or .env file."""
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        return token
+def _github_setting(name: str) -> Optional[str]:
+    """A GitHub setting from the environment, else from ``.env`` in the cwd."""
+    value = os.environ.get(name)
+    if value:
+        return value
     # Try .env in project root
     env_path = Path.cwd() / ".env"
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            if line.startswith("GITHUB_TOKEN="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
+            if line.startswith(f"{name}="):
+                # Drop a trailing ``# comment``, as .env.example writes them.
+                value = line.split("=", 1)[1].split(" #", 1)[0]
+                return value.strip().strip('"').strip("'") or None
     return None
+
+
+def get_github_token() -> Optional[str]:
+    """Get GitHub token from environment or .env file."""
+    return _github_setting("GITHUB_TOKEN")
+
+
+def get_github_self_repo() -> str:
+    """The agent's own repository, ``owner/repo``: what ``self`` refers to."""
+    configured = (_github_setting(GITHUB_SELF_REPO_ENV) or "").strip()
+    return configured or DEFAULT_GITHUB_SELF_REPO
 
 
 async def github_api_get(path: str, token: str, *, raise_on_auth: bool = False) -> Any:

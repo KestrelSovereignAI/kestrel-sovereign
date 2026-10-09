@@ -2471,37 +2471,50 @@ class TestDataLossGuardsAreDefended:
 
         Binding an unqualified reference to the first configured repository
         containing that number resolved a blocker whose issue was open in one
-        project because a different project had closed its own issue 42.
+        project because a different project had closed its own issue 42. The
+        agent's own repository is the only one an unqualified number may
+        mean (#3537), and here it is not configured.
         """
         from kestrel_sovereign.features.strategic_memory.blocker_reconcile import (
             AMBIGUOUS_REPO,
-            resolve_row_repo,
+            resolve_blocker_reference,
         )
 
-        repo, problem = resolve_row_repo(
-            {"issue": "#42"}, ["owner/alpha", "owner/beta"]
+        reference = resolve_blocker_reference(
+            {"issue": "#42"}, ["owner/alpha", "owner/beta"], "home/self"
         )
 
-        assert repo is None, "must not guess a repository"
-        assert problem == AMBIGUOUS_REPO
+        assert reference.repo is None, "must not guess a repository"
+        assert reference.problem == AMBIGUOUS_REPO
 
     def test_a_row_that_names_its_repository_is_never_ambiguous(self):
         """The guard must refuse guesses without refusing known answers."""
         from kestrel_sovereign.features.strategic_memory.blocker_reconcile import (
-            resolve_row_repo,
+            REPO_FROM_ISSUE,
+            REPO_FROM_LONE_SCAN_REPO,
+            REPO_FROM_ROW,
+            resolve_blocker_reference,
         )
 
-        declared, problem = resolve_row_repo(
-            {"issue": "#42", "repo": "owner/alpha"}, ["owner/alpha", "owner/beta"]
+        configured = ["owner/alpha", "owner/beta"]
+        declared = resolve_blocker_reference(
+            {"issue": "#42", "repo": "owner/alpha"}, configured, "home/self"
         )
-        assert (declared, problem) == ("owner/alpha", None)
-
-        qualified, problem = resolve_row_repo(
-            {"issue": "owner/beta#42"}, ["owner/alpha", "owner/beta"]
+        assert (declared.repo, declared.number, declared.problem) == (
+            "owner/alpha", 42, None
         )
-        assert (qualified, problem) == ("owner/beta", None)
+        assert declared.source == REPO_FROM_ROW
 
-        single, problem = resolve_row_repo({"issue": "#42"}, ["owner/alpha"])
-        assert (single, problem) == ("owner/alpha", None), (
+        qualified = resolve_blocker_reference(
+            {"issue": "owner/beta#42"}, configured, "home/self"
+        )
+        assert (qualified.repo, qualified.problem) == ("owner/beta", None)
+        assert qualified.source == REPO_FROM_ISSUE
+
+        single = resolve_blocker_reference(
+            {"issue": "#42"}, ["owner/alpha"], "home/self"
+        )
+        assert (single.repo, single.problem) == ("owner/alpha", None), (
             "one configured repository makes an unqualified reference unambiguous"
         )
+        assert single.source == REPO_FROM_LONE_SCAN_REPO

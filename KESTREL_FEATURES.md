@@ -636,7 +636,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `recall_patterns` | `!patterns` | `memory` | `limit`, `include_superseded` | 123 | `enabled` |
 | `session_log` | `!sessionlog` | `system` | `session_id`, `focus` | 125 | `enabled` |
 | `signal_dispatch` | `!dispatch` | `system` | `mode` | 89 | `enabled` |
-| `strategy_add_blocker` |  | `system` | `issue`, `title`, `severity`, `owner`, `repo`, `notes` | 226 | `enabled` |
+| `strategy_add_blocker` |  | `system` | `issue`, `title`, `severity`, `owner`, `repo`, `notes` | 243 | `enabled` |
 | `strategy_add_decision` |  | `system` | `decision`, `rationale`, `session`, `impact` | 131 | `enabled` |
 | `strategy_add_pattern` |  | `system` | `pattern`, `source`, `implication` | 110 | `enabled` |
 | `strategy_reconcile_blockers` | `!strategy-reconcile` | `system` | `apply` | 90 | `enabled` |
