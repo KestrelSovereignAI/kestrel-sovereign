@@ -1268,6 +1268,11 @@ async def _write_reanchor(
     """
     rag_index: ConstitutionRagIndex | None = None
     async with target.open_storage() as storage:
+        from kestrel_sovereign.constitution.runtime_state import ConstitutionRuntimeStateStore
+
+        runtime_state = ConstitutionRuntimeStateStore(storage._backend)
+        # Install the additive fence before opening the graph write unit.
+        await runtime_state.initialize()
         storage.graph.bind_agent(agent_did)
         storage.files.bind_agent(agent_did)
         async with _agent_embedding(
@@ -1459,6 +1464,10 @@ async def _write_reanchor(
             if emancipation_contract_json is not None:
                 agent.properties["emancipation_contract"] = emancipation_contract_json
             await storage.graph.add_node(agent)
+            # Signed repair can be the FIRST native anchor. Its permission
+            # must become single-use in this same transaction, even for a
+            # same-hash edge repair of an older partially committed anchor.
+            await runtime_state.consume_initial_anchor_custody(agent_did)
     return rag_index
 
 

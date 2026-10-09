@@ -528,6 +528,42 @@ async def test_display_initialized_before_anchor_refreshes_actual_governing_text
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("contribution", ["application", "mandate"])
+async def test_governing_display_fails_closed_when_constraints_cannot_render(tmp_path, contribution):
+    from types import SimpleNamespace
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.features.constitution import ConstitutionFeature
+    from kestrel_sovereign.storage import GraphNode
+
+    now = datetime(2026, 10, 9, 16, tzinfo=timezone.utc)
+    agent, storage = await _open_durable_harness(tmp_path / "display-constraints.db", now, is_new_identity=True)
+    amendments = "## Book IV: Application Identity\n### Section 9: Custom Scope\nAdditional governing restriction."
+    try:
+        await storage.add_node(GraphNode(node_id=agent.agent_id, node_type="agent", label="new", properties={}))
+        extension_reader = MagicMock(return_value=amendments)
+        agent.extension = SimpleNamespace(get_constitution_amendments=extension_reader)
+        agent._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(agent)
+        agent._get_governing_constitution = ConstitutionMixin._get_governing_constitution.__get__(agent)
+        expected = await agent._get_governing_constitution()
+        assert amendments in expected
+        feature = ConstitutionFeature(agent)
+        await feature.initialize()
+        assert (await feature.get_constitution()).confirmation == expected
+
+        if contribution == "application":
+            extension_reader.side_effect = RuntimeError("application constraint rendering failed")
+            result = await feature.get_constitution()
+        else:
+            with patch("kestrel_sovereign.spawn.scoped_constitution.render_mandate_constitution_block", side_effect=RuntimeError("mandate constraint rendering failed")):
+                result = await feature.get_constitution()
+        assert result.status.value == "error"
+        assert feature.full_text == ""
+        assert not feature.books and not feature.sections
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("integrity_valid", [True, False])
 async def test_future_persisted_audit_requires_real_startup_verification(tmp_path, integrity_valid):
     now = datetime(2026, 10, 9, 14, tzinfo=timezone.utc)

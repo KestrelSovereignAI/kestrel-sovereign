@@ -422,6 +422,30 @@ class ConstitutionRuntimeStateStore:
             )
         return replace(state, revision=int(written[0]), generation=generation)
 
+    async def consume_initial_anchor_custody(
+        self, agent_id: str, *,
+        expected_fence: Optional[tuple[Optional[int], Optional[str]]] = None,
+    ) -> Optional[ConstitutionRuntimeState]:
+        """Consume first-anchor permission inside the caller's graph transaction.
+
+        All native anchor writers use this boundary. It neither clears Safe
+        Mode nor certifies an audit. Live callers must supply their loaded
+        revision/generation; offline signed repair has no volatile snapshot.
+        Publish the returned fence only AFTER the outer transaction commits.
+        """
+        current = await self.load(agent_id)
+        if expected_fence is not None and (
+            current is None
+            or (current.revision, current.generation) != expected_fence
+        ):
+            raise ConstitutionStateConflictError("initial anchor lifecycle custody changed")
+        if current is None or not current.bootstrap_pending:
+            return None
+        return await self.write(
+            replace(current, bootstrap_pending=False),
+            event_type="initial_anchor_started",
+        )
+
     async def list_events(self, agent_id: str) -> list[dict]:
         """Return transition history in insertion order (operator/test aid)."""
         rows = await self._backend.fetch_all(

@@ -1715,6 +1715,26 @@ class ConstitutionMixin:
                 )
         return "Safe mode deactivated after successful integrity verification."
 
+    async def _consume_initial_anchor_custody(self):
+        """Join an anchor writer's transaction, never mint or adopt a fence."""
+        if "_constitution_state_store" not in vars(self):
+            # Lightweight pre-runtime consumers have no durable lifecycle.
+            return None
+        store = self._constitution_state_store
+        if store is None:
+            raise RuntimeError("constitutional runtime custody is unavailable")
+        return await store.consume_initial_anchor_custody(
+            self.agent_id,
+            expected_fence=(self._constitution_state_revision, self._constitution_state_generation),
+        )
+
+    def _publish_consumed_anchor_custody(self, state):
+        """Publish only a successfully committed anchor transaction's fence."""
+        if state is not None:
+            self._constitution_state_revision = state.revision
+            self._constitution_state_generation = state.generation
+            self._constitution_bootstrap_pending = False
+
     def _trusted_sovereign_did_document(
         self,
         agent_node: Optional[GraphNode] = None,
@@ -2048,7 +2068,10 @@ class ConstitutionMixin:
             # mid-prune failure rolls back rather than committing a partial
             # edge set.
             try:
-                pruned = await self._anchor_constitution_governance(new_hash)
+                async with ConstitutionMixin._constitution_state_guard(self), self.storage.transaction():
+                    pruned = await self._anchor_constitution_governance(new_hash)
+                    consumed = await ConstitutionMixin._consume_initial_anchor_custody(self)
+                ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
             except Exception as e:
                 return (
                     f"Error: Governance edge cleanup failed and was rolled "
@@ -2081,7 +2104,7 @@ class ConstitutionMixin:
         # very command exists to repair, and a concurrent integrity audit
         # could observe it.
         try:
-            async with self.storage.transaction():
+            async with ConstitutionMixin._constitution_state_guard(self), self.storage.transaction():
                 stored_hash = await self.storage.store_file(
                     constitution_content, "KESTREL_CONSTITUTION.md"
                 )
@@ -2163,6 +2186,8 @@ class ConstitutionMixin:
                     recorded_at=self._get_timestamp(),
                 )
                 await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())
+                consumed = await ConstitutionMixin._consume_initial_anchor_custody(self)
+            ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
         except Exception as e:
             return (
                 f"Error: Reanchor failed mid-write and was rolled back; "
@@ -2309,10 +2334,7 @@ class ConstitutionMixin:
                         or bootstrap.generation != self._constitution_state_generation
                     ):
                         raise ValueError("durable new-identity bootstrap custody changed")
-                    persisted_state = await store.write(
-                        replace(bootstrap, bootstrap_pending=False),
-                        event_type="initial_anchor_started",
-                    )
+                    persisted_state = await ConstitutionMixin._consume_initial_anchor_custody(self)
                     constitution_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
                     # Mirror inception's governance wiring so the integrity audit's
                     # edge proof (#2463) holds for a lazily-anchored legacy agent.
@@ -2323,11 +2345,9 @@ class ConstitutionMixin:
                 # becomes usable custody only after that transaction commits;
                 # publishing it before commit lets rollback accidentally match
                 # another replica's subsequent lifecycle restriction.
-                self._constitution_state_revision = persisted_state.revision
-                self._constitution_state_generation = persisted_state.generation
                 # Initial-anchor custody is single-use; a missing successful
                 # audit timestamp independently keeps the full audit due.
-                self._constitution_bootstrap_pending = False
+                ConstitutionMixin._publish_consumed_anchor_custody(self, persisted_state)
                 logging.info(f"Anchored constitution with hash: {constitution_hash}")
             except Exception as e:
                 return f"Error: Failed to anchor constitution: {e}"
@@ -2336,39 +2356,26 @@ class ConstitutionMixin:
             constitution_bytes = await self.storage.retrieve_file(constitution_hash)
             constitution_text = constitution_bytes.decode('utf-8')
             if self.extension:
-                try:
-                    amendments = self.extension.get_constitution_amendments()
-                    if amendments:
-                        constitution_text = f"{constitution_text}\n\n--- APP AMENDMENTS ---\n{amendments.strip()}"
-                except Exception:
-                    pass
+                amendments = self.extension.get_constitution_amendments()
+                if amendments:
+                    constitution_text = f"{constitution_text}\n\n--- APP AMENDMENTS ---\n{amendments.strip()}"
             # Append this spawned child's mandate constraints (#2225) so its
             # behavioral_rules / restrictions reach the model in the governing
             # constitution — the anchored base is left untouched (no hash change;
             # mirrors the runtime APP AMENDMENTS append above). ``spawn_mandate``
             # is attached durably on every boot by #2137's reload path; a
             # restriction only ever tightens, so this cannot weaken the base.
-            try:
-                from kestrel_sovereign.spawn.scoped_constitution import (
-                    render_mandate_constitution_block,
-                )
+            from kestrel_sovereign.spawn.scoped_constitution import (
+                render_mandate_constitution_block,
+            )
 
-                block = render_mandate_constitution_block(
-                    getattr(self, "spawn_mandate", None)
-                )
-                if block:
-                    constitution_text = f"{constitution_text}\n\n{block}"
-            except Exception:
-                # Rendering coerces to str and shouldn't raise on accepted
-                # values; if it somehow does, surface it loudly rather than
-                # silently ship a governing constitution missing the mandate's
-                # restrictions (the control this adds). Don't abort the whole
-                # constitution — that would break the prompt entirely.
-                logging.exception(
-                    "Failed to render spawn-mandate constraints into governing "
-                    "constitution for %s; the mandate block is MISSING from this "
-                    "render.", getattr(self, "agent_id", "?"),
-                )
+            # A failed contribution makes the complete governing text
+            # unavailable. Never silently weaken it by omitting constraints.
+            block = render_mandate_constitution_block(
+                getattr(self, "spawn_mandate", None)
+            )
+            if block:
+                constitution_text = f"{constitution_text}\n\n{block}"
             return constitution_text
         except Exception as e:
             return f"Error: Could not retrieve constitution for hash {constitution_hash}. Reason: {e}"
