@@ -19,6 +19,14 @@ kestrel-feature-talon#46``), and bare numbers with no repository at all. 70 of
 Emma's 122 active rows were in one of those shapes and could never close
 (#3537). :func:`resolve_blocker_reference` is the one reading of every shape,
 used both when a row is written and when it is reconciled.
+
+A reading that has to choose between two repositories refuses instead (#3540).
+``repo: self`` with ``issue: owner/other#46`` names two repositories, and
+reading the number in the declared one retired a blocker on the home
+repository's closed issue 46 while ``owner/other#46`` was still open. A short
+name that more than one configured repository has does not say whose it is.
+:func:`issue_repository_conflict` is the rule a row's repository has to pass,
+and issue dispatch applies the same function.
 """
 
 from __future__ import annotations
@@ -46,6 +54,18 @@ UNRESOLVABLE = "unresolvable"
 #: row is perfectly well-formed -- what is missing is the identity of the
 #: project, and no amount of retrying supplies it.
 AMBIGUOUS_REPO = "ambiguous_repository"
+
+#: Returned as ``reason`` when the row names its repository by a short name
+#: (``widgets``) that more than one configured repository has (``Acme/widgets``
+#: and ``Other/widgets``). Which owner the row meant is unknown, so neither is
+#: read and the owner of the agent's own repository is not assumed (#3540).
+AMBIGUOUS_REPO_NAME = "ambiguous_repository_name"
+
+#: Returned as ``reason`` when the issue reference is written in a repository
+#: that is not the row's: ``repo: self`` with ``issue: owner/other#46``. The
+#: number belongs to one of them, and reading it in the other reaches an
+#: unrelated issue that happens to share it (#3540).
+CONFLICTING_REPOS = "conflicting_repositories"
 
 #: Returned as ``reason`` when the row names no repository, one was assumed,
 #: and GitHub's answer shows the assumed issue cannot be the one the row
@@ -76,6 +96,15 @@ REPO_SHAPE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 
 #: A repository name without its owner: ``kestrel-feature-talon``.
 REPO_NAME_SHAPE = re.compile(r"[A-Za-z0-9._-]*[A-Za-z0-9][A-Za-z0-9._-]*")
+
+#: The repository written immediately before the number: ``kestrel-talon#252``,
+#: or ``owner/kestrel-talon#252`` inside prose that :func:`split_issue_reference`
+#: does not read as a reference. Text before a spaced ``#`` is prose
+#: ("Issue #123"), so ``kestrel-talon #252`` cannot be told from it and names
+#: no repository.
+_WRITTEN_REPOSITORY = re.compile(
+    r"(?:([A-Za-z0-9._-]+)/)?([A-Za-z0-9._-]+)#\s*[0-9]+\s*$"
+)
 
 #: How far apart a blocker's recorded date and an issue's open/close instant
 #: may be before an inferred repository is judged wrong. ``blocked_since`` is
@@ -162,41 +191,115 @@ def normalize_repository(
     - ``self`` is the agent's own repository, ``GITHUB_SELF_REPO``.
     - ``owner/repo`` is already qualified.
     - A bare name is the configured scan repository of that name when exactly
-      one has it, else the same name under the owner of the agent's own
-      repository: ``kestrel-feature-talon`` is
-      ``KestrelSovereignAI/kestrel-feature-talon`` on a Kestrel host.
+      one has it. When none has it, it is the same name under the owner of
+      the agent's own repository: ``kestrel-feature-talon`` is
+      ``KestrelSovereignAI/kestrel-feature-talon`` on a Kestrel host. When
+      several have it, it names none of them: ``widgets`` with
+      ``Acme/widgets`` and ``Other/widgets`` both configured does not say
+      whose it is. The owner fallback used to pick one anyway, and a
+      reconcile then resolved the row on Acme's closed issue while Other's
+      stayed open (#3540).
     - Anything else (prose, a URL) names no repository.
     """
+    return _read_repository(value, configured, self_repo)[0]
+
+
+def _read_repository(
+    value: object, configured: List[str], self_repo: str
+) -> Tuple[Optional[str], List[str]]:
+    """``(owner/repo, [])``; ``(None, candidates)`` for an ambiguous name."""
     text = str(value or "").strip().strip("/")
     if not text:
-        return None
-    home = self_repo if REPO_SHAPE.fullmatch(self_repo or "") else None
+        return None, []
+    home = _home_repository(self_repo)
     if text.lower() == SELF_REPO_ALIAS:
-        return home
+        return home, []
     if REPO_SHAPE.fullmatch(text):
-        return text
+        return text, []
     if not REPO_NAME_SHAPE.fullmatch(text):
-        return None
-    named = [r for r in configured if r.rsplit("/", 1)[-1].lower() == text.lower()]
-    if len(named) == 1:
-        return named[0]
+        return None, []
+    named = [r for r in configured if _repository_name(r) == text.lower()]
+    if len(named) > 1:
+        return None, named
+    if named:
+        return named[0], []
     if home is None:
-        return None
-    return f"{home.split('/', 1)[0]}/{text}"
+        return None, []
+    return f"{home.split('/', 1)[0]}/{text}", []
+
+
+def _home_repository(self_repo: str) -> Optional[str]:
+    """The agent's own repository when it is ``owner/repo``, else ``None``."""
+    return self_repo if REPO_SHAPE.fullmatch(self_repo or "") else None
+
+
+def _repository_name(repo: str) -> str:
+    """A repository's name without its owner, lowercased."""
+    return repo.rsplit("/", 1)[-1].lower()
+
+
+def issue_repository_conflict(
+    issue: object, repo: str, self_repo: str
+) -> Optional[str]:
+    """The repository ``issue`` is written in, when that is not ``repo``.
+
+    ``repo`` is the ``owner/repo`` a blocker row is read in. ``None`` when
+    the reference names no repository, or names one that can be ``repo``:
+
+    - ``owner/name`` is ``repo`` only when it is ``repo`` (any case);
+    - ``self`` is ``repo`` only when ``repo`` is the agent's own repository;
+    - a bare ``name`` is ``repo`` when ``repo`` has that name. The row's own
+      repository identifies the owner, so ``repo: owner/other`` with
+      ``issue: other#46`` is ``owner/other#46``.
+
+    Both readings of the reference are checked: the one
+    :func:`split_issue_reference` makes, and the repository written just
+    before a trailing number inside prose (``blocked by other/core#5``).
+
+    One rule for every reader that binds a number to a repository (#3540):
+    the blocker reconciler refuses a conflicting row rather than resolve it,
+    and issue dispatch refuses it rather than start work on it.
+    """
+    text = str(issue or "")
+    written = [split_issue_reference(text)[0]]
+    match = _WRITTEN_REPOSITORY.search(text)
+    if match is not None:
+        owner, name = match.groups()
+        written.append(f"{owner}/{name}" if owner else name)
+    for candidate in written:
+        if candidate is not None and not _names_repository(candidate, repo, self_repo):
+            return candidate
+    return None
+
+
+def _names_repository(written: str, repo: str, self_repo: str) -> bool:
+    """Whether a repository as an issue reference writes it can be ``repo``."""
+    if "/" in written:
+        return written.lower() == repo.lower()
+    if written.lower() == SELF_REPO_ALIAS:
+        home = _home_repository(self_repo)
+        return home is not None and home.lower() == repo.lower()
+    return written.lower() == _repository_name(repo)
 
 
 @dataclass(frozen=True)
 class BlockerReference:
     """One blocker row read as one issue in one repository, or why it isn't.
 
-    ``problem`` is ``None`` exactly when both ``repo`` and ``number`` are set.
-    ``source`` says where ``repo`` came from (``REPO_FROM_*``).
+    ``problem`` is ``None`` only when both ``repo`` and ``number`` are set. A
+    row refused as :data:`CONFLICTING_REPOS` keeps the repository it is read
+    in, so the report can name both; ``conflicting`` is the other one, as the
+    issue reference writes it. ``candidates`` are the configured repositories
+    an :data:`AMBIGUOUS_REPO_NAME` row could mean. ``source`` says where
+    ``repo`` came from (``REPO_FROM_*``).
     """
 
     repo: Optional[str]
     number: Optional[int]
     source: Optional[str]
     problem: Optional[str] = None
+    conflicting: Optional[str] = None
+    candidates: Tuple[str, ...] = ()
 
     @property
     def inferred(self) -> bool:
@@ -221,21 +324,34 @@ def resolve_blocker_reference(
     42 was open in one project because a *different* project had closed its
     own issue 42. When the home repository is not among several configured
     ones, the row is ambiguous and is reported unchecked.
+
+    Nor is there a "pick one" branch (#3540). A short name that several
+    configured repositories have is :data:`AMBIGUOUS_REPO_NAME`, and a row
+    whose issue reference is written in a repository other than the one it
+    is read in is :data:`CONFLICTING_REPOS` (see
+    :func:`issue_repository_conflict`). Both are reported unchecked.
     """
-    written, number = split_issue_reference(row.get("issue"))
+    issue = row.get("issue")
+    written, number = split_issue_reference(issue)
     declared = str(row.get("repo") or "").strip()
-    if declared:
-        repo = normalize_repository(declared, configured, self_repo)
-        source = REPO_FROM_ROW
-    elif written:
-        repo = normalize_repository(written, configured, self_repo)
-        source = REPO_FROM_ISSUE
+    if declared or written:
+        repo, candidates = _read_repository(declared or written, configured, self_repo)
+        if candidates:
+            return BlockerReference(
+                None, number, None, AMBIGUOUS_REPO_NAME, candidates=tuple(candidates)
+            )
+        source = REPO_FROM_ROW if declared else REPO_FROM_ISSUE
     else:
         repo, source, problem = _infer_repository(configured, self_repo)
         if problem is not None:
             return BlockerReference(None, number, None, problem)
     if repo is None or number is None:
         return BlockerReference(repo, number, source, UNRESOLVABLE)
+    conflicting = issue_repository_conflict(issue, repo, self_repo)
+    if conflicting is not None:
+        return BlockerReference(
+            repo, number, source, CONFLICTING_REPOS, conflicting=conflicting
+        )
     return BlockerReference(repo, number, source)
 
 
@@ -302,9 +418,12 @@ async def check_blockers(
 
     Returns a report with ``closed``/``open``/``unresolvable`` row lists and a
     ``reason`` (with a ``reason_code``) when the check could not run at all. A
-    missing token or a ledger whose rows name no repository is a *skipped*
-    check, never an empty result set — reporting "0 stale blockers" because
-    nothing was queried would be the same lie the ticket was filed about.
+    missing token, or no ``scan_repos`` and no row naming a repository, is a
+    *skipped* check, never an empty result set — reporting "0 stale blockers"
+    because nothing was queried would be the same lie the ticket was filed
+    about. With ``scan_repos`` configured, a row that names no usable
+    repository (an ambiguous one, or two) is listed unresolvable with its
+    reason rather than reported as a missing configuration.
     ``checked`` counts the rows whose live state was established.
     """
     rows = active_blockers(
@@ -326,7 +445,7 @@ async def check_blockers(
     references = [
         (row, resolve_blocker_reference(row, configured, self_repo)) for row in rows
     ]
-    if not any(reference.repo for _, reference in references):
+    if not configured and not any(reference.repo for _, reference in references):
         report["reason"] = (
             "No scan_repos configured in morning_signal_config and no blocker "
             "carries an explicit repo -- nothing could be looked up."
@@ -356,6 +475,10 @@ async def check_blockers(
             entry["reason"] = reference.problem
             if reference.problem == AMBIGUOUS_REPO:
                 entry["candidate_repos"] = list(configured)
+            elif reference.problem == AMBIGUOUS_REPO_NAME:
+                entry["candidate_repos"] = list(reference.candidates)
+            elif reference.problem == CONFLICTING_REPOS:
+                entry["conflicting_repo"] = reference.conflicting
             report["unresolvable"].append(entry)
             continue
 
