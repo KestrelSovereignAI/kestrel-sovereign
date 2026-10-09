@@ -602,22 +602,43 @@ class ConstitutionMixin:
 
     @asynccontextmanager
     async def _constitution_state_guard(self):
-        """Serialize state transitions, while allowing same-task nesting."""
+        """Own one refusal generation for the entire transition, including nesting.
+
+        Verification, restore, SQL, commit delivery and notifications are all
+        parts of that transition. A nested operation may not adopt a newer
+        generation after an awaited boundary invalidated its parent.
+        """
         lock = vars(self).get("_constitution_state_lock")
         current_task = asyncio.current_task()
-        if lock is None or vars(self).get("_constitution_state_lock_owner") is current_task:
+        if vars(self).get("_constitution_state_lock_owner") is current_task:
             yield
             return
         # Database owners must never wait behind a state-lock owner which may
         # itself be waiting for that database. Public lifecycle entries record
         # a fail-closed refusal before arriving here; anchor callers also refuse.
         ConstitutionMixin._require_owned_constitution_commit(self)
-        async with lock:
+        @asynccontextmanager
+        async def own_generation():
             self._constitution_state_lock_owner = current_task
+            self._constitution_transition_generation = vars(self).get("_constitution_refusal_generation", 0)
             try:
                 yield
             finally:
                 self._constitution_state_lock_owner = None
+                self._constitution_transition_generation = None
+
+        if lock is None:
+            async with own_generation():
+                yield
+        else:
+            async with lock, own_generation():
+                yield
+
+    def _constitution_transition_is_current(self) -> bool:
+        """A later fail-closed refusal invalidates every remaining publication."""
+        if vars(self).get("_constitution_state_lock_owner") is not asyncio.current_task():
+            return True  # Lightweight consumers outside a native transition.
+        return vars(self).get("_constitution_transition_generation") == vars(self).get("_constitution_refusal_generation", 0)
 
     @staticmethod
     def _constitution_epoch() -> datetime:
@@ -682,6 +703,17 @@ class ConstitutionMixin:
     async def _initialize_constitution_runtime_state(
         self, *, is_new_identity: bool = False
     ) -> None:
+        """Restore durable state inside one generation-bound transition."""
+        if not ConstitutionMixin._prepare_constitution_state_transition(self):
+            return
+        async with ConstitutionMixin._constitution_state_guard(self):
+            await ConstitutionMixin._initialize_constitution_runtime_state_locked(
+                self, is_new_identity=is_new_identity
+            )
+
+    async def _initialize_constitution_runtime_state_locked(
+        self, *, is_new_identity: bool = False
+    ) -> None:
         """Restore Safe Mode and audit deadlines before the agent becomes ready.
 
         A missing row for an existing identity is an explicit legacy migration:
@@ -706,8 +738,10 @@ class ConstitutionMixin:
         # would be written with the previous row's cause or none at all.
         pending_cause = vars(self).get("_safe_mode_cause")
 
-        async def persist_pending_entry(store) -> None:
+        async def persist_pending_entry() -> None:
             if not pending_entry:
+                return
+            if not ConstitutionMixin._constitution_transition_is_current(self):
                 return
             self._safe_mode = True
             self._safe_mode_reason = pending_reason
@@ -716,21 +750,22 @@ class ConstitutionMixin:
             self._safe_mode_exited_at = None
             self._safe_mode_exit_authorization = None
             now = self._constitution_now()
-            persisted_state = await store.write(
-                self._constitution_state_snapshot(now=now),
+            await ConstitutionMixin._persist_constitution_runtime_state(
+                self, now=now,
                 event_type="safe_mode_entered",
                 event_reason=pending_reason,
             )
-            self._constitution_state_revision = persisted_state.revision
-            self._constitution_state_generation = persisted_state.generation
-            self._constitution_state_persistence_pending = False
 
         try:
             ConstitutionMixin._require_owned_constitution_commit(self)
             store = ConstitutionRuntimeStateStore(self._raw_storage._backend)
             await store.initialize()
             self._constitution_state_store = store
+            if not ConstitutionMixin._constitution_transition_is_current(self):
+                return
             state = await store.load(self.agent_id)
+            if not ConstitutionMixin._constitution_transition_is_current(self):
+                return
             if state is None:
                 self._interaction_count = 0
                 self._last_audit_time = self._constitution_epoch()
@@ -738,8 +773,8 @@ class ConstitutionMixin:
                 self._constitution_state_migration_pending = not is_new_identity
                 self._constitution_audit_pending = True
                 now = self._constitution_now()
-                persisted_state = await store.write(
-                    self._constitution_state_snapshot(now=now),
+                persisted = await ConstitutionMixin._persist_constitution_runtime_state(
+                    self, now=now,
                     event_type=(
                         "new_identity_bootstrap_required"
                         if is_new_identity
@@ -751,9 +786,9 @@ class ConstitutionMixin:
                         else "full constitutional audit required before readiness"
                     ),
                 )
-                self._constitution_state_revision = persisted_state.revision
-                self._constitution_state_generation = persisted_state.generation
-                await persist_pending_entry(store)
+                if not persisted:
+                    return
+                await persist_pending_entry()
                 return
 
             self._constitution_state_revision = state.revision
@@ -793,7 +828,9 @@ class ConstitutionMixin:
                     self._constitution_now(), state.last_successful_audit_at
                 )
             )
-            await persist_pending_entry(store)
+            await persist_pending_entry()
+            if not ConstitutionMixin._constitution_transition_is_current(self):
+                return
             # A completed runtime record paired with a missing identity node is
             # deletion/corruption, not a second first boot. Only a persisted,
             # still-pending bootstrap marker authorizes initial auto-anchoring.
@@ -908,6 +945,8 @@ class ConstitutionMixin:
             )
 
             ConstitutionMixin._require_owned_constitution_commit(self)
+            if not ConstitutionMixin._constitution_transition_is_current(self):
+                raise RuntimeError("constitutional transition invalidated by an unpersisted restriction")
             refusal_generation = vars(self).get("_constitution_refusal_generation", 0)
             snapshot = self._constitution_state_snapshot(
                 now=now,
@@ -1097,21 +1136,35 @@ class ConstitutionMixin:
                 )
 
             is_valid, message = await self._verify_constitution_integrity()
-            self._constitution_verified = is_valid
+            if not ConstitutionMixin._constitution_transition_is_current(self):
+                return None, "Verification invalidated by an unpersisted restriction", False
             if is_valid:
                 recorded = await (
                     ConstitutionMixin._record_successful_constitution_audit_locked(
                         self, source="explicit_verification"
                     )
                 )
+                if not ConstitutionMixin._constitution_transition_is_current(self):
+                    return None, "Verification invalidated by an unpersisted restriction", False
+                self._constitution_verified = is_valid
                 return is_valid, message, recorded
 
             recorded = await ConstitutionMixin._enter_safe_mode_locked(
                 self, message
             )
+            if not ConstitutionMixin._constitution_transition_is_current(self):
+                return None, "Verification invalidated by an unpersisted restriction", False
+            self._constitution_verified = is_valid
             return is_valid, message, recorded
 
     async def _audit_constitution_on_startup(self) -> None:
+        """Keep startup verification and completion in one owned transition."""
+        if not ConstitutionMixin._prepare_constitution_state_transition(self):
+            return
+        async with ConstitutionMixin._constitution_state_guard(self):
+            await ConstitutionMixin._audit_constitution_on_startup_locked(self)
+
+    async def _audit_constitution_on_startup_locked(self) -> None:
         """Run a due/migration audit before initialization reports readiness."""
         if self._constitution_state_load_error is not None:
             return
@@ -1132,6 +1185,8 @@ class ConstitutionMixin:
                 return
         if self._constitution_bootstrap_pending:
             governing = await self._get_governing_constitution()
+            if not ConstitutionMixin._constitution_transition_is_current(self):
+                return
             if governing.startswith("Error:"):
                 await self.enter_safe_mode(
                     f"Startup constitution bootstrap failed: {governing}",
@@ -1139,6 +1194,8 @@ class ConstitutionMixin:
                 )
                 return
         is_valid, message = await self._verify_constitution_integrity()
+        if not ConstitutionMixin._constitution_transition_is_current(self):
+            return
         if is_valid:
             await self._record_successful_constitution_audit(
                 source="startup", audited_at=now
@@ -1197,6 +1254,8 @@ class ConstitutionMixin:
                 f"interactions={self._interaction_count}, hours={hours_since_audit:.1f}"
             )
             is_valid, message = await self._verify_constitution_integrity()
+            if not ConstitutionMixin._constitution_transition_is_current(self):
+                return
 
             if not is_valid:
                 # Constitution integrity failure - enter safe mode
@@ -1208,6 +1267,8 @@ class ConstitutionMixin:
                 )
 
             # Notify audit anchor feature if available
+            if not ConstitutionMixin._constitution_transition_is_current(self):
+                return
             try:
                 for feature in getattr(self, 'features', {}).values():
                     if type(feature).__name__ == 'AuditAnchorFeature':
@@ -1587,6 +1648,8 @@ class ConstitutionMixin:
         self, reason: str, *, cause: str = SafeModeCause.INTEGRITY.value
     ) -> bool:
         """Locked implementation of :meth:`enter_safe_mode`."""
+        if not ConstitutionMixin._constitution_transition_is_current(self):
+            return False
         refusal_generation = vars(self).get("_constitution_refusal_generation", 0)
         existing_lifecycle_cause = (
             getattr(self, "_safe_mode", False) is True
@@ -1670,7 +1733,7 @@ class ConstitutionMixin:
                     "Could not append Safe Mode conversation event: %s",
                     type(exc).__name__,
                 )
-        return persisted
+        return persisted and ConstitutionMixin._constitution_transition_is_current(self)
 
     async def exit_safe_mode(self, authorization: str = None):
         """Exit Safe Mode after explicit authority and a fresh full audit."""
@@ -1683,6 +1746,8 @@ class ConstitutionMixin:
 
     async def _exit_safe_mode_locked(self, authorization: str = None):
         """Locked implementation of :meth:`exit_safe_mode`."""
+        if not ConstitutionMixin._constitution_transition_is_current(self):
+            return "Safe Mode remains active: transition invalidated by an unpersisted restriction."
         refusal_generation = vars(self).get("_constitution_refusal_generation", 0)
         if not self._safe_mode:
             return "Not in safe mode."
@@ -1770,6 +1835,8 @@ class ConstitutionMixin:
                     "Could not append Safe Mode exit conversation event: %s",
                     type(exc).__name__,
                 )
+        if not ConstitutionMixin._constitution_transition_is_current(self):
+            return "Safe Mode remains active: a new restriction was latched during recovery notification."
         return "Safe mode deactivated after successful integrity verification."
 
     def _prepare_constitution_state_transition(
@@ -1803,7 +1870,7 @@ class ConstitutionMixin:
                     self._feature_lifecycle_integrity_uncertain = True
                     self._feature_lifecycle_repair_verified = False
             return False
-        return True
+        return ConstitutionMixin._constitution_transition_is_current(self)
 
     def _require_owned_constitution_commit(self):
         """Do not publish state from a joined scope or released savepoint.
