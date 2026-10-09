@@ -100,6 +100,7 @@ async def template_artifact_handler(template_path: Path) -> ArtifactHandler:
 | Cron `backup_snapshot` | ACTION | Pure ops |
 | Cron `memory_consolidate` | ARTIFACT (likely) | Feature owner confirms during migration |
 | Cron `training_cycle` | ACTION | Long-running ops |
+| Cron `strategy_reconcile_blockers` | ACTION | Resolves strategy-ledger blockers whose GitHub issue closed; seeded daily before `morning_signal` with `apply: yes` (#3537) |
 | A2A task complete | COGNITION | Bird decides "what now" |
 | Stripe `deposit_complete` | COGNITION | Bird may want to act |
 | Approval grant/deny | **not a signal** | Gate release on paused turn — hook system |

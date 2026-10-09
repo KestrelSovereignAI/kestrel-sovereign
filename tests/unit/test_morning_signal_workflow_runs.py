@@ -683,7 +683,9 @@ async def test_the_briefing_carries_the_section_and_suggests_the_repair(store):
     report = await read_workflow_run_report(_agent(store.db), now=NOW)
 
     briefing = await generate_morning_signal(
-        {"morning_signal_config": {"scan_repos": []}}, report
+        {"morning_signal_config": {"scan_repos": []}},
+        report,
+        blocker_reconciliation=None,
     )
 
     assert f"## {SECTION_TITLE}" in briefing
@@ -700,7 +702,9 @@ async def test_the_briefing_reports_runs_without_a_strategy_file(store):
         await store.run(RESCUE, "failed", _hours_ago(hours), failed_at=(("dispatch_repairs", NO_TARGETS),))
     report = await read_workflow_run_report(_agent(store.db), now=NOW)
 
-    briefing = await generate_morning_signal({}, report)
+    briefing = await generate_morning_signal(
+        {}, report, blocker_reconciliation=None
+    )
 
     assert briefing.startswith("No strategic memory loaded.")
     assert f"**PERSISTENTLY FAILING** `{RESCUE}`" in briefing
@@ -749,9 +753,13 @@ async def test_a_volatile_mode_withholds_gate_reasons_but_keeps_the_structure(st
 
     report = await read_workflow_run_report(_agent(store.db, privacy=mode), now=NOW)
     briefing = await generate_morning_signal(
-        {"morning_signal_config": {"scan_repos": []}}, report
+        {"morning_signal_config": {"scan_repos": []}},
+        report,
+        blocker_reconciliation=None,
     )
-    no_strategy = await generate_morning_signal({}, report)
+    no_strategy = await generate_morning_signal(
+        {}, report, blocker_reconciliation=None
+    )
 
     # Withheld as it is read, so nothing built from the report can carry it.
     assert SENTINEL not in repr(report)
@@ -844,7 +852,9 @@ async def test_a_persistent_mode_shows_gate_reasons(store):
         _agent(store.db, privacy=PrivacyMode.NORMAL), now=NOW
     )
     briefing = await generate_morning_signal(
-        {"morning_signal_config": {"scan_repos": []}}, report
+        {"morning_signal_config": {"scan_repos": []}},
+        report,
+        blocker_reconciliation=None,
     )
 
     assert WITHHELD_GATE_REASON not in briefing

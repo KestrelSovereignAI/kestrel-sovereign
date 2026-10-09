@@ -90,6 +90,13 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     ("training_cycle", SignalMode.ACTION, frozenset({ResourceLock.MEMORY})),
     # Feature workflow returning briefing text. Read-only.
     ("morning_signal", SignalMode.ARTIFACT, frozenset()),
+    # Blocker reconciliation (#3537). ACTION — no LLM. Checks each active
+    # strategy-ledger blocker against its live GitHub issue and, run with
+    # ``{"apply": "yes"}`` as core seeds it, resolves the rows whose issue
+    # closed. Writes only the ledger file, under the owning feature's own
+    # ledger lock. Without a schedule nothing ever called it, so blockers
+    # outlived their closed issues until resolved by hand.
+    ("strategy_reconcile_blockers", SignalMode.ACTION, frozenset()),
     # Reflection workflow returning a structured Dict. ReflectionFeature
     # persists each session (`_persist_reflection` writes session +
     # insights rows), so it shares storage state with memory_consolidate

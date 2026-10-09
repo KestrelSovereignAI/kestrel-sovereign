@@ -17,6 +17,9 @@ Built-in cron sources (see ``signals/sources/scheduler.py`` CRON_TASKS):
                              past their per-agent retention window (#764)
     training_cycle        -- run a LoRA training cycle (ReflectionFeature)
     morning_signal        -- produce the daily briefing artifact
+    strategy_reconcile_blockers -- resolve strategy-ledger blockers whose
+                             GitHub issue closed; seeded daily before
+                             morning_signal with apply=yes (#3537)
     sleep                 -- THE nightly memory-maintenance cycle (#1674 P3):
                              reflection (via the subscribed sleep hook) +
                              consolidation + the forgetting deletion tier, all
@@ -696,6 +699,15 @@ class SchedulerFeature(Feature):
         # back up post-restart.
         if "RestartCoordinatorFeature" in agent.features:
             defaults.append(("restart_coordinator", "* * * * *", "{}"))
+
+        # Blocker reconciliation (#3537) — daily at 07:30, before the 08:00
+        # morning_signal, so the briefing lists blockers whose issues are
+        # still open and reports the rows the run could not check. Applies:
+        # a report-only run resolves nothing, and nothing else ever did.
+        if "StrategicMemoryFeature" in agent.features:
+            defaults.append(
+                ("strategy_reconcile_blockers", "30 7 * * *", '{"apply": "yes"}')
+            )
 
         for task_name, cron, args in defaults:
             # ``schedule_list`` is a snapshot used only for migration cleanup

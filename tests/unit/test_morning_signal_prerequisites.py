@@ -134,7 +134,9 @@ async def test_fetch_raises_auth_error_for_invalid_token_with_repos():
 @pytest.mark.asyncio
 async def test_signal_reports_scan_repos_remediation_when_token_present():
     with patch(f"{_GH_MOD}.get_github_token", return_value="ghp_valid"):
-        report = await generate_morning_signal(_data([]), _NO_WORKFLOW_RUNS)
+        report = await generate_morning_signal(
+            _data([]), _NO_WORKFLOW_RUNS, blocker_reconciliation=None
+        )
     assert "scan_repos" in report
     assert "Set GITHUB_TOKEN" not in report
 
@@ -142,7 +144,9 @@ async def test_signal_reports_scan_repos_remediation_when_token_present():
 @pytest.mark.asyncio
 async def test_signal_reports_token_remediation_when_token_missing():
     with patch(f"{_GH_MOD}.get_github_token", return_value=None):
-        report = await generate_morning_signal(_data(["owner/repo"]), _NO_WORKFLOW_RUNS)
+        report = await generate_morning_signal(
+            _data(["owner/repo"]), _NO_WORKFLOW_RUNS, blocker_reconciliation=None
+        )
     assert "Set GITHUB_TOKEN" in report
     assert "scan_repos" not in report
 
@@ -157,6 +161,8 @@ async def test_signal_reports_token_remediation_when_token_invalid():
     with patch(f"{_GH_MOD}.get_github_token", return_value="ghp_invalid"), patch(
         f"{_GH_MOD}.urllib.request.urlopen", side_effect=lambda *a, **k: _boom()
     ):
-        report = await generate_morning_signal(_data(["owner/repo"]), _NO_WORKFLOW_RUNS)
+        report = await generate_morning_signal(
+            _data(["owner/repo"]), _NO_WORKFLOW_RUNS, blocker_reconciliation=None
+        )
     assert "Set GITHUB_TOKEN" in report
     assert "Live data from GitHub" not in report

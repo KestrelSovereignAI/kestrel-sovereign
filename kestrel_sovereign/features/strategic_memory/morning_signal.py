@@ -4,9 +4,10 @@ Builds the Morning Signal report from STRATEGY.yaml data
 enriched with live GitHub data and the agent's workflow run outcomes.
 """
 
-from datetime import date, datetime
-from typing import Any, Dict, List
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional
 
+from .blocker_reconcile import describe_last_reconciliation, split_issue_reference
 from .github_integration import (
     GITHUB_SIGNAL_NO_SCAN_REPOS,
     GITHUB_SIGNAL_NO_TOKEN,
@@ -24,7 +25,10 @@ from .workflow_runs import (
 
 
 async def generate_morning_signal(
-    data: Dict[str, Any], workflow_runs: WorkflowRunsAssessment
+    data: Dict[str, Any],
+    workflow_runs: WorkflowRunsAssessment,
+    *,
+    blocker_reconciliation: Optional[Dict[str, Any]],
 ) -> str:
     """Generate the Morning Signal briefing from strategic memory + live GitHub data.
 
@@ -32,6 +36,10 @@ async def generate_morning_signal(
         data: The strategic memory data dict.
         workflow_runs: The agent's workflow run outcomes, or why they could
             not be assessed (see :func:`.workflow_runs.assess_workflow_runs`).
+        blocker_reconciliation: The ledger's record of the last applied
+            blocker reconcile, or ``None`` when none is recorded. Reported
+            under the blockers so rows that could not be checked against
+            GitHub stay visible (#3537).
 
     Returns:
         Formatted markdown briefing string.
@@ -162,11 +170,22 @@ async def generate_morning_signal(
             notes = b.get("notes")
             if notes:
                 lines.append(f"  - {notes}")
-        # Add any GitHub-labeled blocked issues not already in YAML
-        yaml_issues = {b.get("issue", "").replace("#", "") for b in blockers}
+        # Add any GitHub-labeled blocked issues not already in YAML. By
+        # number, read through the reference parser: a qualified
+        # ``owner/repo#12`` or an unquoted YAML ``issue: 12`` is still 12.
+        yaml_issues = {split_issue_reference(b.get("issue"))[1] for b in blockers}
         for lb in live_blocked:
-            if str(lb["number"]) not in yaml_issues:
+            if lb["number"] not in yaml_issues:
                 lines.append(f"- [GITHUB] {lb['repo']}#{lb['number']}: {lb['title']}")
+        if blockers:
+            lines.append("")
+            lines.append(
+                "*"
+                + describe_last_reconciliation(
+                    blocker_reconciliation, datetime.now(timezone.utc)
+                )
+                + "*"
+            )
 
     lines.append("")
     lines.extend(render_workflow_runs_section(workflow_runs))

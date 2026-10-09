@@ -108,6 +108,7 @@ def test_all_cron_tasks_are_classified():
         "backup_snapshot",
         "bootstrap_timeout_check",  # #378 — bootstrap watchdog
         "morning_signal",
+        "strategy_reconcile_blockers",  # #3537 — daily blocker reconcile
         "signal_dispatch",  # user-schedulable; not a core auto-seed
         "trash_retention",
         "training_cycle",
@@ -138,6 +139,7 @@ def test_action_vs_artifact_split_matches_design():
         "backup_snapshot",
         "bootstrap_timeout_check",  # #378 — bootstrap watchdog
         "signal_dispatch",  # provider-neutral user-scheduled dispatch
+        "strategy_reconcile_blockers",  # #3537 — resolves closed-issue blockers
         "trash_retention",
         "training_cycle",
         "sleep",  # #1674 P3 — built-in handler (_handle_sleep); ACTION so the

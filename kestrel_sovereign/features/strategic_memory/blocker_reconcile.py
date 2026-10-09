@@ -9,16 +9,29 @@ ceased to exist.
 This module supplies that path. It reads GitHub and reports; applying the
 result is a separate, explicit decision by the caller, because closing a
 GitHub issue is not by itself proof that the strategic blocker it stood for is
-gone.
+gone. The scheduler makes that decision once a day: the
+``strategy_reconcile_blockers`` cron source runs with ``apply='yes'`` (#3537).
+
+A row can only be reconciled if it can be read as one issue in one
+repository, and rows are written in several shapes: ``repo: self``, a bare
+repository name (``repo: kestrel-feature-talon`` with ``issue:
+kestrel-feature-talon#46``), and bare numbers with no repository at all. 70 of
+Emma's 122 active rows were in one of those shapes and could never close
+(#3537). :func:`resolve_blocker_reference` is the one reading of every shape,
+used both when a row is written and when it is reconciled.
 """
 
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from .github_integration import get_github_token, github_api_get
+from .github_integration import get_github_self_repo, get_github_token, github_api_get
 from .ledger import active_blockers
+from .timestamps import parse_instant
 
 logger = logging.getLogger(__name__)
 
@@ -28,20 +41,104 @@ logger = logging.getLogger(__name__)
 UNRESOLVABLE = "unresolvable"
 
 #: Returned as ``reason`` when the row names an issue number but not which
-#: repository it lives in, and more than one is configured. Distinct from
-#: ``UNRESOLVABLE`` because the row is perfectly well-formed -- what is missing
-#: is the identity of the project, and no amount of retrying supplies it.
+#: repository it lives in, more than one is configured, and the agent's own
+#: repository is not among them. Distinct from ``UNRESOLVABLE`` because the
+#: row is perfectly well-formed -- what is missing is the identity of the
+#: project, and no amount of retrying supplies it.
 AMBIGUOUS_REPO = "ambiguous_repository"
 
+#: Returned as ``reason`` when the row names no repository, one was assumed,
+#: and GitHub's answer shows the assumed issue cannot be the one the row
+#: meant: it was closed before the blocker was recorded, or opened after.
+INFERRED_REPO_MISMATCH = "inferred_repository_mismatch"
 
-def _issue_number(row: Dict[str, Any]) -> Optional[int]:
-    raw = str(row.get("issue") or "").strip().lstrip("#")
-    # Rows written by hand sometimes carry "owner/repo#123".
-    if "#" in raw:
-        raw = raw.rsplit("#", 1)[-1]
-    if not raw.isdigit():
-        return None
-    return int(raw)
+#: ``reason_code`` values a reconcile that could not run carries, so a
+#: scheduled run that failed names its cause in ``signal_log`` (#3184).
+NO_REPOSITORY_REASON_CODE = "NO_BLOCKER_REPOSITORY"
+NO_TOKEN_REASON_CODE = "NO_GITHUB_TOKEN"
+
+#: The repository alias for the agent's own repository (``GITHUB_SELF_REPO``),
+#: as the GitHub feature spells it.
+SELF_REPO_ALIAS = "self"
+
+#: Where a reference's repository came from. Only the first two are the row's
+#: own statement; the other two are inferred, and an inference is checked
+#: against GitHub's answer before anything is resolved on it.
+REPO_FROM_ROW = "row"
+REPO_FROM_ISSUE = "issue"
+REPO_FROM_LONE_SCAN_REPO = "lone_scan_repo"
+REPO_FROM_SELF_DEFAULT = "self_default"
+_INFERRED_SOURCES = frozenset({REPO_FROM_LONE_SCAN_REPO, REPO_FROM_SELF_DEFAULT})
+
+#: ``owner/name`` in GitHub's allowed character set. A reference prefix that
+#: does not match this (or :data:`REPO_NAME_SHAPE`) is prose, not a repository.
+REPO_SHAPE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+
+#: A repository name without its owner: ``kestrel-feature-talon``.
+REPO_NAME_SHAPE = re.compile(r"[A-Za-z0-9._-]*[A-Za-z0-9][A-Za-z0-9._-]*")
+
+#: How far apart a blocker's recorded date and an issue's open/close instant
+#: may be before an inferred repository is judged wrong. ``blocked_since`` is
+#: the recording host's local calendar date; GitHub stamps UTC.
+_RECORDING_DATE_SLACK = timedelta(days=1)
+
+#: The ledger key holding the outcome of the last applied reconcile, which the
+#: morning briefing reports so a gap stays visible after the run (#3537).
+RECONCILIATION_KEY = "blocker_reconciliation"
+
+#: The reconcile is scheduled daily; a last run older than this means the
+#: schedule stopped, and the briefing says so instead of repeating old counts.
+RECONCILIATION_STALE_AFTER = timedelta(hours=36)
+
+
+def split_issue_reference(value: object) -> Tuple[Optional[str], Optional[int]]:
+    """Split an issue reference into the repository it names and its number.
+
+    Returns ``(repository, number)`` with the repository as written:
+    ``owner/repo`` from ``owner/repo#12``, ``name`` from ``name#12``, or
+    ``None`` when the reference names none (``#12``, ``12``). A bare name is
+    only read as one when it touches the ``#``: text before a spaced ``#`` is
+    prose ("Issue #123"), not a repository. Either half may be ``None``.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None, None
+    written: Optional[str] = None
+    if "#" in text:
+        raw_head, _, tail = text.partition("#")
+        head = raw_head.strip().strip("/")
+        # Only an owner/repo (or name) shape names a repository. Treating ANY
+        # non-empty prefix as one turned "Issue #123" and "see FIXME #7" into
+        # the repos "Issue" and "see FIXME".
+        if REPO_SHAPE.fullmatch(head):
+            written = head
+        elif raw_head == raw_head.rstrip() and REPO_NAME_SHAPE.fullmatch(head):
+            written = head
+        text = tail.strip()
+    text = text.lstrip("#").strip()
+    try:
+        return written, int(text)
+    except (TypeError, ValueError):
+        return written, None
+
+
+def parse_issue_ref(value: object) -> Tuple[Optional[str], Optional[int]]:
+    """Split an issue reference into its ``owner/repo`` and its number.
+
+    ``strategy_add_blocker`` documents that it accepts a qualified reference
+    (``owner/repo#123``), so every consumer has to be able to read one back.
+    Doing that at each call site is how ``int("owner/repo#123")`` ended up in
+    the dispatch path: the string carries two facts and the reader wanted one.
+
+    Returns ``(repo, number)``. Either may be ``None``: a bare ``#123`` has no
+    repository, a short ``name#123`` names none this function can vouch for
+    (see :func:`resolve_blocker_reference` for that), and an unparseable
+    reference has no number.
+    """
+    written, number = split_issue_reference(value)
+    if written is not None and not REPO_SHAPE.fullmatch(written):
+        written = None
+    return written, number
 
 
 def configured_repos(strategy_data: Dict[str, Any]) -> List[str]:
@@ -57,31 +154,144 @@ def configured_repos(strategy_data: Dict[str, Any]) -> List[str]:
     return [str(r).strip() for r in repos if str(r).strip()]
 
 
-def resolve_row_repo(
-    row: Dict[str, Any], configured: List[str]
-) -> Tuple[Optional[str], Optional[str]]:
-    """The one repository this row's issue belongs to, or why it is unknown.
+def normalize_repository(
+    value: object, configured: List[str], self_repo: str
+) -> Optional[str]:
+    """``owner/repo`` for a repository as a row writes it, or ``None``.
 
-    Returns ``(repo, problem)`` with exactly one of the two set.
-
-    There is no "try them all" branch, and that is the point. ``#42`` is not
-    an issue identifier; ``owner/repo#42`` is. Searching every configured repo
-    for a number and binding to the first hit resolved a blocker whose issue 42
-    was open in one project because a *different* project had closed its own
-    issue 42. A row that cannot name its repository is reported unchecked.
+    - ``self`` is the agent's own repository, ``GITHUB_SELF_REPO``.
+    - ``owner/repo`` is already qualified.
+    - A bare name is the configured scan repository of that name when exactly
+      one has it, else the same name under the owner of the agent's own
+      repository: ``kestrel-feature-talon`` is
+      ``KestrelSovereignAI/kestrel-feature-talon`` on a Kestrel host.
+    - Anything else (prose, a URL) names no repository.
     """
+    text = str(value or "").strip().strip("/")
+    if not text:
+        return None
+    home = self_repo if REPO_SHAPE.fullmatch(self_repo or "") else None
+    if text.lower() == SELF_REPO_ALIAS:
+        return home
+    if REPO_SHAPE.fullmatch(text):
+        return text
+    if not REPO_NAME_SHAPE.fullmatch(text):
+        return None
+    named = [r for r in configured if r.rsplit("/", 1)[-1].lower() == text.lower()]
+    if len(named) == 1:
+        return named[0]
+    if home is None:
+        return None
+    return f"{home.split('/', 1)[0]}/{text}"
+
+
+@dataclass(frozen=True)
+class BlockerReference:
+    """One blocker row read as one issue in one repository, or why it isn't.
+
+    ``problem`` is ``None`` exactly when both ``repo`` and ``number`` are set.
+    ``source`` says where ``repo`` came from (``REPO_FROM_*``).
+    """
+
+    repo: Optional[str]
+    number: Optional[int]
+    source: Optional[str]
+    problem: Optional[str] = None
+
+    @property
+    def inferred(self) -> bool:
+        """Whether the repository was assumed rather than stated by the row."""
+        return self.source in _INFERRED_SOURCES
+
+
+def resolve_blocker_reference(
+    row: Dict[str, Any], configured: List[str], self_repo: str
+) -> BlockerReference:
+    """The one issue this row names, read the same way at write and at reconcile.
+
+    The repository comes from, in order: the row's ``repo``; the repository
+    written in its ``issue`` (``owner/repo#N``, ``name#N``, ``self#N``); the
+    lone configured scan repository; and, when several are configured, the
+    agent's own repository if it is one of them. A row naming a bare number
+    on an agent that scans several repositories means its home repository,
+    the convention GitHub itself applies to an unqualified ``#N``.
+
+    There is still no "try them all" branch. ``#42`` searched across every
+    configured repo and bound to the first hit resolved a blocker whose issue
+    42 was open in one project because a *different* project had closed its
+    own issue 42. When the home repository is not among several configured
+    ones, the row is ambiguous and is reported unchecked.
+    """
+    written, number = split_issue_reference(row.get("issue"))
     declared = str(row.get("repo") or "").strip()
     if declared:
-        return declared, None
-    raw = str(row.get("issue") or "").strip()
-    if "#" in raw and "/" in raw.split("#", 1)[0]:
-        return raw.split("#", 1)[0], None
+        repo = normalize_repository(declared, configured, self_repo)
+        source = REPO_FROM_ROW
+    elif written:
+        repo = normalize_repository(written, configured, self_repo)
+        source = REPO_FROM_ISSUE
+    else:
+        repo, source, problem = _infer_repository(configured, self_repo)
+        if problem is not None:
+            return BlockerReference(None, number, None, problem)
+    if repo is None or number is None:
+        return BlockerReference(repo, number, source, UNRESOLVABLE)
+    return BlockerReference(repo, number, source)
+
+
+def _infer_repository(
+    configured: List[str], self_repo: str
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """``(repo, source, problem)`` for a row that names no repository."""
     if len(configured) == 1:
         # Exactly one configured repository: unqualified is unambiguous.
-        return configured[0], None
+        return configured[0], REPO_FROM_LONE_SCAN_REPO, None
     if not configured:
-        return None, UNRESOLVABLE
-    return None, AMBIGUOUS_REPO
+        # Nothing says this agent's blockers are GitHub issues at all.
+        return None, None, UNRESOLVABLE
+    home = next((r for r in configured if r.lower() == self_repo.lower()), None)
+    if home is None:
+        return None, None, AMBIGUOUS_REPO
+    return home, REPO_FROM_SELF_DEFAULT, None
+
+
+def _calendar_date(value: Any) -> Optional[date]:
+    """The calendar date a ledger field records, or ``None``."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()[:10]
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def contradicts_inference(row: Dict[str, Any], issue: Dict[str, Any]) -> Optional[str]:
+    """Why GitHub's issue cannot be the one an inferred row meant, or ``None``.
+
+    A blocker waits on an issue that is open when it is recorded. An issue
+    closed before the row was written, or opened after it, is some other
+    project's issue with the same number -- low numbers exist in every
+    repository. A row without ``blocked_since`` cannot be checked this way.
+    """
+    recorded = _calendar_date(row.get("blocked_since"))
+    if recorded is None:
+        return None
+    closed = parse_instant(issue.get("closed_at"))
+    if closed is not None and closed.date() < recorded - _RECORDING_DATE_SLACK:
+        return (
+            f"closed on {closed.date()}, before this blocker was recorded on "
+            f"{recorded}"
+        )
+    created = parse_instant(issue.get("created_at"))
+    if created is not None and created.date() > recorded + _RECORDING_DATE_SLACK:
+        return (
+            f"opened on {created.date()}, after this blocker was recorded on "
+            f"{recorded}"
+        )
+    return None
 
 
 async def check_blockers(
@@ -91,10 +301,11 @@ async def check_blockers(
     """Look up each active blocker's issue and classify it.
 
     Returns a report with ``closed``/``open``/``unresolvable`` row lists and a
-    ``reason`` when the check could not run at all. A missing token or an empty
-    ``scan_repos`` is a *skipped* check, never an empty result set — reporting
-    "0 stale blockers" because nothing was queried would be the same lie the
-    ticket was filed about.
+    ``reason`` (with a ``reason_code``) when the check could not run at all. A
+    missing token or a ledger whose rows name no repository is a *skipped*
+    check, never an empty result set — reporting "0 stale blockers" because
+    nothing was queried would be the same lie the ticket was filed about.
+    ``checked`` counts the rows whose live state was established.
     """
     rows = active_blockers(
         ledger_data.get("blockers", []) if isinstance(ledger_data, dict) else []
@@ -111,12 +322,16 @@ async def check_blockers(
         return report
 
     configured = configured_repos(strategy_data)
-    resolved = [(row, *resolve_row_repo(row, configured)) for row in rows]
-    if not any(repo for _, repo, _ in resolved):
+    self_repo = get_github_self_repo()
+    references = [
+        (row, resolve_blocker_reference(row, configured, self_repo)) for row in rows
+    ]
+    if not any(reference.repo for _, reference in references):
         report["reason"] = (
             "No scan_repos configured in morning_signal_config and no blocker "
             "carries an explicit repo -- nothing could be looked up."
         )
+        report["reason_code"] = NO_REPOSITORY_REASON_CODE
         return report
 
     token = get_github_token()
@@ -124,37 +339,127 @@ async def check_blockers(
         report["reason"] = (
             "No GITHUB_TOKEN found -- live blocker state could not be checked."
         )
+        report["reason_code"] = NO_TOKEN_REASON_CODE
         return report
 
     report["ran"] = True
-    for row, repo, problem in resolved:
-        number = _issue_number(row)
-        entry = {
+    for row, reference in references:
+        entry: Dict[str, Any] = {
             "id": row.get("id"),
             "issue": row.get("issue"),
             "title": row.get("title"),
-            "repo": repo,
+            "repo": reference.repo,
+            "number": reference.number,
+            "repo_source": reference.source,
         }
-        if number is None or repo is None:
-            entry["reason"] = problem or UNRESOLVABLE
-            if entry["reason"] == AMBIGUOUS_REPO:
+        if reference.problem is not None:
+            entry["reason"] = reference.problem
+            if reference.problem == AMBIGUOUS_REPO:
                 entry["candidate_repos"] = list(configured)
             report["unresolvable"].append(entry)
             continue
 
-        issue = await github_api_get(f"/repos/{repo}/issues/{number}", token)
+        issue = await github_api_get(
+            f"/repos/{reference.repo}/issues/{reference.number}", token
+        )
         state = (
             str(issue["state"]).lower()
             if isinstance(issue, dict) and issue.get("state")
             else None
         )
-        report["checked"] += 1
-        entry["state"] = state
-        if state == "closed":
-            report["closed"].append(entry)
-        elif state == "open":
-            report["open"].append(entry)
-        else:
+        if state not in ("open", "closed"):
             entry["reason"] = UNRESOLVABLE
             report["unresolvable"].append(entry)
+            continue
+        entry["state"] = state
+        for field in ("state_reason", "closed_at", "html_url"):
+            if issue.get(field):
+                entry[field] = issue[field]
+        if reference.inferred:
+            mismatch = contradicts_inference(row, issue)
+            if mismatch is not None:
+                entry["reason"] = INFERRED_REPO_MISMATCH
+                entry["detail"] = mismatch
+                report["unresolvable"].append(entry)
+                continue
+        report["checked"] += 1
+        report[state].append(entry)
     return report
+
+
+def closing_resolution(entry: Dict[str, Any], today: date) -> str:
+    """The resolution note for a row resolved because its issue closed.
+
+    Cites what GitHub said -- which issue, when it closed and why -- so a
+    reader can audit an unattended resolution without re-asking GitHub.
+    """
+    issue = f"{entry.get('repo')}#{entry.get('number')}"
+    closed = _calendar_date(entry.get("closed_at"))
+    note = f"GitHub reports {issue} closed"
+    if closed is not None:
+        note += f" on {closed}"
+    if entry.get("state_reason"):
+        note += f" ({entry['state_reason']})"
+    note += f"; resolved by blocker reconciliation on {today}."
+    if entry.get("repo_source") in _INFERRED_SOURCES:
+        note += (
+            " The row names no repository; "
+            f"{entry.get('repo')} was assumed."
+        )
+    return note
+
+
+def reconciliation_summary(
+    report: Dict[str, Any], resolved_ids: List[str], ran_at: datetime
+) -> Dict[str, Any]:
+    """What an applied reconcile records for the morning briefing."""
+    summary: Dict[str, Any] = {
+        "ran_at": ran_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        "ran": bool(report.get("ran")),
+        "checked": int(report.get("checked", 0)),
+        "closed": len(report.get("closed", [])),
+        "resolved": len(resolved_ids),
+        "open": len(report.get("open", [])),
+        "unresolvable": len(report.get("unresolvable", [])),
+    }
+    if not summary["ran"]:
+        summary["reason"] = str(report.get("reason") or "")
+    return summary
+
+
+def describe_last_reconciliation(summary: Any, now: datetime) -> str:
+    """One line for the briefing: what the last applied reconcile found.
+
+    Says so when none is recorded, when it could not run, and when it is
+    older than :data:`RECONCILIATION_STALE_AFTER`, so a stopped schedule does
+    not keep presenting old counts as today's.
+    """
+    if not isinstance(summary, dict):
+        return (
+            "No blocker reconciliation has been recorded -- nothing has "
+            "checked these rows against GitHub."
+        )
+    ran_at = parse_instant(summary.get("ran_at"))
+    if ran_at is None:
+        return (
+            "The last blocker reconciliation recorded no time it ran, so its "
+            "counts cannot be dated -- run !strategy-reconcile yes."
+        )
+    when = ran_at.strftime("%Y-%m-%d %H:%M UTC")
+    if not summary.get("ran"):
+        line = (
+            f"Blocker reconciliation could not run at {when}: "
+            f"{summary.get('reason') or 'no reason recorded'}"
+        )
+    else:
+        line = (
+            f"Blocker reconciliation at {when}: {summary.get('checked', 0)} "
+            f"checked, {summary.get('resolved', 0)} resolved as closed, "
+            f"{summary.get('unresolvable', 0)} could not be checked"
+        )
+        if summary.get("unresolvable"):
+            line += " (run !strategy-reconcile to list them)"
+        line += "."
+    if now - ran_at > RECONCILIATION_STALE_AFTER:
+        line += " This is more than a day old: the reconcile schedule has not run since."
+    return line

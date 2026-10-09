@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.features.strategic_memory.blocker_reconcile import (
     configured_repos,
+    parse_issue_ref,
 )
 from kestrel_sovereign.features.strategic_memory.github_integration import (
     get_github_token,
@@ -38,10 +39,6 @@ from kestrel_sovereign.features.strategic_memory.run_history import (
 from kestrel_sovereign.features.strategic_memory.timestamps import parse_instant
 
 logger = logging.getLogger(__name__)
-
-#: ``owner/name`` in GitHub's allowed character set. A reference prefix that
-#: does not match this is prose, not a repository.
-_REPO_SHAPE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 
 #: The repository written immediately before the number: ``kestrel-talon#252``,
 #: or ``owner/kestrel-talon#252`` inside prose that :func:`parse_issue_ref`
@@ -195,42 +192,6 @@ query($owner: String!, $name: String!, $number: Int!) {
   }
 }
 """
-
-
-def parse_issue_ref(value: object) -> tuple[Optional[str], Optional[int]]:
-    """Split an issue reference into its repository and its number.
-
-    ``strategy_add_blocker`` documents that it accepts a qualified reference
-    (``owner/repo#123``), so every consumer has to be able to read one back.
-    Doing that at each call site is how ``int("owner/repo#123")`` ended up in
-    the dispatch path: the string carries two facts and the reader wanted one.
-    Parsing once, here, keeps the repository and the number separable wherever
-    a reference is recorded, reconciled or selected.
-
-    Returns ``(repo, number)``. Either may be ``None``: a bare ``#123`` has no
-    repository, and an unparseable reference has no number.
-    """
-    text = str(value or "").strip()
-    if not text:
-        return None, None
-    repo: Optional[str] = None
-    if "#" in text:
-        head, _, tail = text.partition("#")
-        head = head.strip().strip("/")
-        # Only an owner/repo shape names a repository. Treating ANY non-empty
-        # prefix as one turned "Issue #123" and "see FIXME #7" into the repos
-        # "Issue" and "see FIXME", which pick_top_issue would then dispatch
-        # against — and, because it returns on the first candidate, a
-        # handwritten reference like that masked every valid blocker behind it.
-        # This closed one wrong-repository path by opening another.
-        if _REPO_SHAPE.fullmatch(head):
-            repo = head
-        text = tail.strip()
-    text = text.lstrip("#").strip()
-    try:
-        return repo, int(text)
-    except (TypeError, ValueError):
-        return repo, None
 
 
 async def pick_top_issue(
@@ -585,8 +546,11 @@ def _blocker_repository(
         # A bare number names no project when several are scanned. This used
         # to walk scan_repos and take the FIRST repository that had any issue
         # with that number -- with fourteen repos, low numbers collide
-        # everywhere. The blocker reconciler and ``_resolve_blocker_repo``
-        # both refuse this guess. A lone scanned repository is not a guess.
+        # everywhere. ``strategy_add_blocker`` refuses this guess too. The
+        # blocker reconciler reads such a row as the agent's own repository,
+        # but only to ask whether it closed, and only when GitHub's dates fit
+        # the row; dispatch starts work, so it does not assume. A lone
+        # scanned repository is not a guess.
         if len(scanned) != 1:
             return None, (
                 f"the ledger row names no repository, and {len(scanned)} are "

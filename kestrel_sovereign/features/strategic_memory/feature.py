@@ -23,7 +23,7 @@ import asyncio
 import copy
 import logging
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,8 +34,23 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 
 from .backlog_hygiene import is_auto_fix, run_backlog_hygiene
-from .blocker_reconcile import AMBIGUOUS_REPO, check_blockers, configured_repos
+from .blocker_reconcile import (
+    AMBIGUOUS_REPO,
+    INFERRED_REPO_MISMATCH,
+    NO_REPOSITORY_REASON_CODE,
+    NO_TOKEN_REASON_CODE,
+    RECONCILIATION_KEY,
+    REPO_FROM_SELF_DEFAULT,
+    check_blockers,
+    closing_resolution,
+    configured_repos,
+    normalize_repository,
+    reconciliation_summary,
+    resolve_blocker_reference,
+    split_issue_reference,
+)
 from .decision_index import decision_entries, project_decisions
+from .github_integration import get_github_self_repo
 from .issue_selection import describe_exclusion, pick_top_issue
 from .ledger import (
     BLOCKERS_KEY,
@@ -116,6 +131,17 @@ SIGNAL_DISPATCH_REASON_CODES = frozenset(
         "RUN_HISTORY_UNCONFIRMED",
     }
 )
+#: The ``reason_code`` a failed ``strategy_reconcile_blockers`` result can
+#: carry. It runs unattended every morning (#3537), so a run that could not
+#: check anything names why in ``signal_log`` rather than only that it failed.
+LEDGER_UNAVAILABLE_REASON_CODE = "LEDGER_UNAVAILABLE"
+BLOCKER_RECONCILE_REASON_CODES = frozenset(
+    {
+        LEDGER_UNAVAILABLE_REASON_CODE,
+        NO_REPOSITORY_REASON_CODE,
+        NO_TOKEN_REASON_CODE,
+    }
+)
 # Prefixes that the github-backed sub-modules (backlog_hygiene,
 # session_log) return when prerequisites (scan_repos config or
 # GITHUB_TOKEN) are missing. They look like report bodies but are
@@ -178,7 +204,10 @@ class StrategicMemoryFeature(Feature):
     blockers, and learned patterns.
     """
 
-    tool_reason_codes = {"signal_dispatch": SIGNAL_DISPATCH_REASON_CODES}
+    tool_reason_codes = {
+        "signal_dispatch": SIGNAL_DISPATCH_REASON_CODES,
+        "strategy_reconcile_blockers": BLOCKER_RECONCILE_REASON_CODES,
+    }
 
     STRATEGY_FILENAME = "STRATEGY.yaml"
 
@@ -398,39 +427,58 @@ class StrategicMemoryFeature(Feature):
         view[PATTERNS_KEY] = active_patterns(self._ledger.patterns)
         return view
 
-    def _resolve_blocker_repo(
+    def _normalize_blocker_reference(
         self, issue: str, declared: str
-    ) -> tuple[str, Optional[str]]:
-        """Decide which repository a new blocker's issue belongs to.
+    ) -> Tuple[str, str, Optional[str]]:
+        """Bind a new blocker to its repository, in the shape reconcile reads.
 
-        Returns ``(repo, error)``. Three unambiguous sources, in order: what
-        the caller declared, a fully qualified ``owner/repo#N`` issue, and a
-        lone configured ``scan_repos`` entry. When several repositories are
-        configured and none of those apply, this refuses rather than guessing
-        -- the guess is what made reconciliation resolve a blocker against the
-        wrong project's issue 42.
+        Returns ``(repo, issue, error)``. The repository is read exactly as
+        :func:`resolve_blocker_reference` reads it at reconcile time: the
+        declared ``repo``, else the one written in the issue, else the lone
+        configured ``scan_repos`` entry. ``self`` becomes ``GITHUB_SELF_REPO``
+        and a bare name becomes ``owner/name`` (#3537), and an issue written
+        as ``self#N`` or ``name#N`` is rewritten ``owner/repo#N`` so every
+        reader of the row sees the repository it is bound to.
+
+        When several repositories are configured and the caller named none,
+        this refuses rather than assuming -- the caller is here to say which
+        one, and a later reconcile would otherwise have to guess.
 
         An unqualified issue with *no* configured repos is left unbound: there
         is nothing to be ambiguous between, and refusing would block recording
         a blocker on a host with no GitHub configuration at all.
         """
         declared = str(declared or "").strip()
-        if declared:
-            return declared, None
-        raw = str(issue or "").strip()
-        if "#" in raw and "/" in raw.split("#", 1)[0]:
-            return raw.split("#", 1)[0], None
         configured = configured_repos(self._data)
-        if len(configured) == 1:
-            return configured[0], None
-        if len(configured) > 1 and str(issue or "").strip():
-            return "", (
+        self_repo = get_github_self_repo()
+        reference = resolve_blocker_reference(
+            {"issue": issue, "repo": declared}, configured, self_repo
+        )
+        if declared and reference.repo is None:
+            return "", issue, (
+                f"repo {declared!r} is not 'owner/repo', a repository name, "
+                "or 'self'."
+            )
+        if str(issue or "").strip() and (
+            reference.problem == AMBIGUOUS_REPO
+            or reference.source == REPO_FROM_SELF_DEFAULT
+        ):
+            return "", issue, (
                 f"{len(configured)} repositories are configured "
                 f"({', '.join(configured)}), so issue {issue!r} is ambiguous. "
-                "Pass repo='owner/repo', or write the issue as "
-                "'owner/repo#123'."
+                f"Pass repo='owner/repo' (or repo='self' for {self_repo}), or "
+                "write the issue as 'owner/repo#123'."
             )
-        return "", None
+        repo = reference.repo or ""
+        written, number = split_issue_reference(issue)
+        if (
+            written is not None
+            and number is not None
+            and written != repo
+            and normalize_repository(written, configured, self_repo) == repo
+        ):
+            issue = f"{repo}#{number}"
+        return repo, issue, None
 
     def _ledger_unreadable_result(self, data: Dict[str, Any]) -> ToolResult:
         """The refusal every ledger tool returns when the file is unreadable.
@@ -845,7 +893,7 @@ class StrategicMemoryFeature(Feature):
             title: Short description of the blocker
             severity: How severe -- one of low, medium, high, critical (default medium)
             owner: Who owns resolving this blocker
-            repo: owner/repo the issue lives in. Inferred from a qualified issue or a single configured scan repo; required when several are configured.
+            repo: owner/repo the issue lives in; 'self' and a bare repo name are accepted. Inferred from a qualified issue (owner/repo#N or name#N) or a single configured scan repo; required when several are configured.
             notes: Additional context
         """
         # Normalize + validate so an unrecognized severity isn't persisted
@@ -866,7 +914,9 @@ class StrategicMemoryFeature(Feature):
             # repository -- binding to the first configured repo that happens
             # to have an issue 42 is how a blocker gets resolved against a
             # different project's ticket.
-            resolved_repo, repo_error = self._resolve_blocker_repo(issue, repo)
+            resolved_repo, issue, repo_error = self._normalize_blocker_reference(
+                issue, repo
+            )
             if repo_error:
                 return ToolResult.failed(
                     repo_error, data={"recorded": False, "issue": issue}
@@ -1533,15 +1583,31 @@ class StrategicMemoryFeature(Feature):
             # report "no active blockers to check" -- a clean bill of health
             # for a check that never saw the rows.
             return self._ledger_unreadable_result(
-                {"applied": False, "checked": 0, "closed_count": 0}
+                {
+                    "applied": False,
+                    "checked": 0,
+                    "closed_count": 0,
+                    "reason_code": LEDGER_UNAVAILABLE_REASON_CODE,
+                }
             )
+        applying = is_auto_fix(apply)
         report = await check_blockers(self._ledger.data, self._data)
         if not report.get("ran"):
             # The check never ran. Reporting "0 stale blockers" here would be
             # the same shape of lie the ticket was filed about.
+            data: Dict[str, Any] = {
+                "applied": False,
+                "report": report,
+                "reason_code": report.get("reason_code"),
+            }
+            if applying:
+                # The morning briefing reports the last applied run. One that
+                # could not check anything is recorded as such; leaving the
+                # previous run's counts in place would hide the gap.
+                data["recorded"] = await self._record_reconciliation(report)
             return ToolResult.failed(
                 report.get("reason", "Blocker reconciliation could not run."),
-                data={"applied": False, "report": report},
+                data=data,
             )
 
         closed = report.get("closed", [])
@@ -1550,9 +1616,10 @@ class StrategicMemoryFeature(Feature):
             "applied": False,
             "checked": report.get("checked", 0),
             "closed_count": len(closed),
+            "unresolvable_count": len(report.get("unresolvable", [])),
             "report": report,
         }
-        if not is_auto_fix(apply):
+        if not applying:
             if not closed:
                 return ToolResult.ok(confirmation=body, data=data)
             return ToolResult.partial(
@@ -1568,40 +1635,53 @@ class StrategicMemoryFeature(Feature):
         # The GitHub check above ran without the lock -- it is a network read
         # of live state, not a ledger mutation. The rows are re-found by id
         # under the lock, so a row another call changed meanwhile is resolved
-        # against its current state.
+        # against its current state, and one resolved meanwhile is left as it
+        # was resolved.
         async with self._ledger_mutation_lock:
+            today = date.today()
             resolved: List[str] = []
             for entry in closed:
                 _, row = self._ledger.find(str(entry.get("id") or ""))
-                if row is None:
+                if row is None or row.get("resolved_at"):
                     continue
                 self._ledger.resolve_blocker(
-                    row,
-                    resolution=(
-                        f"GitHub issue {entry.get('issue')} is closed "
-                        f"({entry.get('repo') or 'unknown repo'})"
-                    ),
+                    row, resolution=closing_resolution(entry, today)
                 )
                 resolved.append(str(row.get("id")))
             data["resolved_ids"] = resolved
-            if not resolved:
-                # Nothing was written, so there is no persist outcome to
-                # report. Claiming ``persisted: True`` off a run that touched
-                # no row would be a small lie in the same envelope the honesty
-                # layer reads.
-                return ToolResult.ok(
-                    confirmation=f"{body}\n\nNo blocker needed resolving.",
-                    data={**data, "applied": True},
-                )
+            self._ledger.data[RECONCILIATION_KEY] = reconciliation_summary(
+                report, resolved, datetime.now(timezone.utc)
+            )
+            outcome = (
+                f"Resolved {len(resolved)} stale blocker(s)."
+                if resolved
+                else "No blocker needed resolving."
+            )
             result, snapshot = self._persisted_ledger_result(
-                confirmation=(
-                    f"{body}\n\nResolved {len(resolved)} stale blocker(s)."
-                ),
+                confirmation=f"{body}\n\n{outcome}",
                 data={**data, "applied": True},
             )
         if snapshot is not None:
             await self._reindex_ledger(snapshot)
         return result
+
+    async def _record_reconciliation(self, report: Dict[str, Any]) -> bool:
+        """Record an applied reconcile that could not run. Returns persisted."""
+        async with self._ledger_mutation_lock:
+            self._ledger.data[RECONCILIATION_KEY] = reconciliation_summary(
+                report, [], datetime.now(timezone.utc)
+            )
+            result, snapshot = self._persisted_ledger_result(
+                confirmation="Blocker reconciliation recorded.", data={}
+            )
+        if snapshot is not None:
+            await self._reindex_ledger(snapshot)
+        persisted = bool((result.data or {}).get("persisted"))
+        if not persisted:
+            logger.warning(
+                "Blocker reconciliation outcome not recorded: %s", result.error
+            )
+        return persisted
 
     @staticmethod
     def _format_reconcile_report(report: Dict[str, Any]) -> str:
@@ -1625,8 +1705,8 @@ class StrategicMemoryFeature(Feature):
             lines.append("### Referencing closed issues")
             for entry in closed:
                 lines.append(
-                    f"- [{entry.get('id')}] {entry.get('issue')}: "
-                    f"{entry.get('title')}"
+                    f"- [{entry.get('id')}] {entry.get('repo')}#"
+                    f"{entry.get('number')}: {entry.get('title')}"
                 )
         if unchecked:
             lines.append("")
@@ -1641,6 +1721,22 @@ class StrategicMemoryFeature(Feature):
                     line += (
                         f" -- names no repository, and {candidates} are all "
                         "configured. Set repo on the row to check it."
+                    )
+                elif entry.get("reason") == INFERRED_REPO_MISMATCH:
+                    line += (
+                        f" -- names no repository, and {entry.get('repo')}#"
+                        f"{entry.get('number')} was {entry.get('detail')}, so "
+                        "it is not this row's issue. Set repo on the row to "
+                        "check it."
+                    )
+                elif entry.get("number") is None:
+                    line += " -- names no issue number."
+                elif not entry.get("repo"):
+                    line += " -- names no repository."
+                else:
+                    line += (
+                        f" -- GitHub did not answer for {entry.get('repo')}#"
+                        f"{entry.get('number')}."
                     )
                 lines.append(line)
         if not closed and not unchecked:
@@ -1663,7 +1759,9 @@ class StrategicMemoryFeature(Feature):
         # blockers, and the file split must not quietly empty that section.
         data = self._strategy_data_view()
         briefing = await generate_morning_signal(
-            data, await assess_workflow_runs(self.agent, data)
+            data,
+            await assess_workflow_runs(self.agent, data),
+            blocker_reconciliation=self._ledger.data.get(RECONCILIATION_KEY),
         )
         return ToolResult.ok(
             confirmation=briefing,
