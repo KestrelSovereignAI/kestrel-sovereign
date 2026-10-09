@@ -90,9 +90,10 @@ def resolve_scoped_agent_did(agent: Any) -> str:
     scope (``hold/enforcement.py``), and (#3164) the host Hold door's latch
     target, which must address exactly the row turn-start reads —
     a latch written against any other identity is never read by anything
-    — (#3169) the peer Stop recipient's own Stop address, (#3168) the
-    holder a descendant Hold is set under by the spawn feature, and (#3519)
-    the owner whose Workflows runs the Morning Signal reports.
+    — (#3169) the peer Stop recipient's own Stop address, and (#3168) the
+    holder a descendant Hold is set under by the spawn feature. The owner
+    whose Workflows runs the Morning Signal reports is not among them: that
+    is :func:`resolve_workflow_owner_did` (#3533).
     They had drifted — one gated on truthiness alone,
     so a non-string truthy value was bound as a query parameter; the task
     routes and the inbound-scope gate read ``agent_id`` before ``did``; the
@@ -130,6 +131,29 @@ def resolve_scoped_agent_did(agent: Any) -> str:
     if not isinstance(did, str) or not did:
         raise AgentIdentityUnavailable("agent identity unavailable")
     return did
+
+
+def resolve_workflow_owner_did(identity: Any) -> Optional[str]:
+    """The DID that owns an agent's durable Workflows runs, or ``None``.
+
+    ``identity`` is the agent's runtime ``AgentIdentity`` (``agent.identity``).
+    The legacy DID when it has one, otherwise the signing DID: a rotated agent
+    keeps the ``did:pkh`` its persisted runs were stamped with, and a
+    born-hybrid agent, which never had a legacy DID, owns its runs under its
+    ``did:web``. kestrel-feature-workflows stamps ``started_by_did`` with this
+    DID and claims runs by it, so a reader of those runs must scope by it too.
+
+    This is not :func:`resolve_scoped_agent_did`. An agent rotated onto its
+    successor ``did:web`` is constructed with that DID as ``agent.did``, while
+    its runs stay under the legacy one (#3533).
+
+    ``None`` when there is no identity, or when the DID it yields is empty or
+    not a string: such an agent owns no runs, and the caller refuses.
+    """
+    owner_did = getattr(identity, "legacy_did", None) or getattr(
+        identity, "signing_did", None
+    )
+    return owner_did if isinstance(owner_did, str) and owner_did else None
 
 
 def resolve_feature_database(agent: Any) -> Optional[Any]:

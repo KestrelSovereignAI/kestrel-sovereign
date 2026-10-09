@@ -21,8 +21,12 @@ columns of them:
 
 A run belongs to the agent whose DID the Workflows runner stamped into
 ``started_by_did``: the agent's stable DID (the legacy ``did:pkh`` of a
-rotated agent, the ``did:web`` of a born-hybrid one). A shared PostgreSQL
-database holds every hosted agent's runs, so the read is scoped to it.
+rotated agent, the ``did:web`` of a born-hybrid one), which
+:func:`~kestrel_sovereign.features.storage_access.resolve_workflow_owner_did`
+reads off the agent's identity. A rotated agent's ``agent.did`` is its
+successor DID, so scoping by that would hide every run it owns (#3533). A
+shared PostgreSQL database holds every hosted agent's runs, so the read is
+scoped to the owner.
 
 Only ``completed`` and ``failed`` runs are outcomes here. A run that is still
 going has no outcome yet, and a cancelled one was stopped, not failed or
@@ -52,10 +56,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from kestrel_sovereign.features.storage_access import (
-    AgentIdentityUnavailable,
     hides_persisted_user_content,
     resolve_feature_database,
-    resolve_scoped_agent_did,
+    resolve_workflow_owner_did,
 )
 from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
 
@@ -267,18 +270,18 @@ async def read_workflow_run_report(
 
     An agent whose database has no Workflows store has run no workflows: the
     report is empty. Raises :class:`WorkflowRunsNotAssessed` when the agent has
-    no DID or database, when only one of the two store tables exists, or when
-    reading them fails. Gate reasons, and the text of a store read error, are
-    withheld when the agent's privacy mode hides persisted user content.
+    no identity DID that owns its runs or no database, when only one of the
+    two store tables exists, or when reading them fails. Gate reasons, and the
+    text of a store read error, are withheld when the agent's privacy mode
+    hides persisted user content.
     """
     if isinstance(persistent_failure_runs, bool) or persistent_failure_runs < 1:
         raise ValueError("persistent_failure_runs must be a positive integer")
-    try:
-        owner_did = resolve_scoped_agent_did(agent)
-    except AgentIdentityUnavailable as exc:
+    owner_did = resolve_workflow_owner_did(getattr(agent, "identity", None))
+    if owner_did is None:
         raise WorkflowRunsNotAssessed(
-            "the agent has no DID to scope its workflow runs to"
-        ) from exc
+            "the agent has no identity DID to scope its workflow runs to"
+        )
     db = resolve_feature_database(agent)
     if db is None:
         raise WorkflowRunsNotAssessed(
