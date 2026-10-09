@@ -19,15 +19,16 @@ assigned to the Sovereign).
 """
 
 import logging
-import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.features.strategic_memory.blocker_reconcile import (
     configured_repos,
+    issue_repository_conflict,
     parse_issue_ref,
 )
 from kestrel_sovereign.features.strategic_memory.github_integration import (
+    get_github_self_repo,
     get_github_token,
     github_api_get,
     github_api_post,
@@ -39,15 +40,6 @@ from kestrel_sovereign.features.strategic_memory.run_history import (
 from kestrel_sovereign.features.strategic_memory.timestamps import parse_instant
 
 logger = logging.getLogger(__name__)
-
-#: The repository written immediately before the number: ``kestrel-talon#252``,
-#: or ``owner/kestrel-talon#252`` inside prose that :func:`parse_issue_ref`
-#: does not read as a reference. Text before a spaced ``#`` is prose
-#: ("Issue #123"), so ``kestrel-talon #252`` cannot be told from it and names
-#: no repository; the allow-list still governs what that row can reach.
-_WRITTEN_REPOSITORY = re.compile(
-    r"(?:([A-Za-z0-9._-]+)/)?([A-Za-z0-9._-]+)#\s*[0-9]+\s*$"
-)
 
 #: Labels Talon puts on an issue while a run owns it or is waiting on a
 #: human: ``kestreltalon/config.py`` ``label_analyzing`` / ``label_clarifying``
@@ -260,6 +252,7 @@ async def pick_top_issue(
     scanned: Dict[str, str] = {}
     for scanned_repo in configured_repos(data):
         scanned.setdefault(scanned_repo.lower(), scanned_repo)
+    self_repo = get_github_self_repo()
     stalled_after_days = _stalled_pr_days(config)
     sovereign_login = _sovereign_login(config)
 
@@ -412,7 +405,9 @@ async def pick_top_issue(
             # An unparseable reference is not dispatchable, and guessing a
             # number from it would dispatch against the wrong issue.
             continue
-        repo, problem = _blocker_repository(blocker, ref_repo, issue_number, scanned)
+        repo, problem = _blocker_repository(
+            blocker, ref_repo, issue_number, scanned, self_repo
+        )
         if problem is not None:
             refuse(_eligibility_exclusion(
                 repo, issue_number, EXCLUDED_WRONG_REPO, detail=problem
@@ -520,6 +515,7 @@ def _blocker_repository(
     ref_repo: Optional[str],
     issue_number: int,
     scanned: Dict[str, str],
+    self_repo: str,
 ) -> Tuple[Optional[str], Optional[str]]:
     """The scanned repository a blocker row dispatches against, or why none.
 
@@ -560,20 +556,14 @@ def _blocker_repository(
     repo = scanned.get(named.lower())
     if repo is None:
         return named, f"{named} is not in morning_signal_config.scan_repos"
-    written = _WRITTEN_REPOSITORY.search(str(blocker.get("issue") or ""))
+    written = issue_repository_conflict(blocker.get("issue"), repo, self_repo)
     if written is not None:
-        owner, name = written.groups()
-        repo_owner, _, repo_name = repo.partition("/")
-        if name.lower() != repo_name.lower() or (
-            owner is not None and owner.lower() != repo_owner.lower()
-        ):
-            # ``talon#5`` is Talon's issue 5. The row's repository -- bound
-            # when it was written, or the lone scanned one -- is not where the
-            # number came from.
-            return repo, (
-                "the ledger row's issue reference names "
-                f"{f'{owner}/{name}' if owner else name}, not {repo}"
-            )
+        # ``talon#5`` is Talon's issue 5. The row's repository -- bound when
+        # it was written, or the lone scanned one -- is not where the number
+        # came from. The blocker reconciler refuses the same rows (#3540).
+        return repo, (
+            f"the ledger row's issue reference names {written}, not {repo}"
+        )
     return repo, None
 
 

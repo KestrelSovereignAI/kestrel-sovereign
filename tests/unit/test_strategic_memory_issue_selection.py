@@ -1712,6 +1712,44 @@ async def test_a_reference_naming_this_repository_or_none_is_not_refused(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("self_repo", "refused"),
+    [("o/home", True), ("o/core", False)],
+    ids=["another-repository", "this-repository"],
+)
+async def test_self_in_a_reference_is_the_agents_own_repository(
+    monkeypatch, self_repo, refused
+):
+    """Dispatch reads ``self#5`` by the rule the blocker reconciler uses
+    (#3540): it is the agent's own repository's issue 5, which is o/core's
+    only when o/core is that repository."""
+    monkeypatch.setenv("GITHUB_SELF_REPO", self_repo)
+    calls = []
+    _stub_github(monkeypatch, {"/repos/o/core/issues/5": _open(5)}, calls)
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/core"]},
+        "blockers": [
+            {"severity": "high", "issue": "self#5", "repo": "o/core", "title": "x"},
+        ],
+    }
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(data, diagnostics)
+
+    if refused:
+        assert picked is None
+        assert issue_selection.describe_exclusion(
+            diagnostics["eligibility_exclusions"][0]
+        ) == (
+            "skipped o/core#5 -- the ledger row's issue reference names self, "
+            "not o/core"
+        )
+        assert "/repos/o/core/issues/5" not in calls
+    else:
+        assert picked is not None and picked["issue_number"] == 5
+
+
+@pytest.mark.asyncio
 async def test_a_qualified_reference_is_judged_by_its_repository_not_its_name(
     monkeypatch,
 ):

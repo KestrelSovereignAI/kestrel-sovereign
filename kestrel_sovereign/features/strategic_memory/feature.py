@@ -36,6 +36,8 @@ from kestrel_sovereign.features.enum_coerce import normalize_choice as _normaliz
 from .backlog_hygiene import is_auto_fix, run_backlog_hygiene
 from .blocker_reconcile import (
     AMBIGUOUS_REPO,
+    AMBIGUOUS_REPO_NAME,
+    CONFLICTING_REPOS,
     INFERRED_REPO_MISMATCH,
     NO_REPOSITORY_REASON_CODE,
     NO_TOKEN_REASON_CODE,
@@ -44,7 +46,6 @@ from .blocker_reconcile import (
     check_blockers,
     closing_resolution,
     configured_repos,
-    normalize_repository,
     reconciliation_summary,
     resolve_blocker_reference,
     split_issue_reference,
@@ -442,7 +443,10 @@ class StrategicMemoryFeature(Feature):
 
         When several repositories are configured and the caller named none,
         this refuses rather than assuming -- the caller is here to say which
-        one, and a later reconcile would otherwise have to guess.
+        one, and a later reconcile would otherwise have to guess. It refuses
+        a short name several configured repositories have, and an issue
+        written in a repository other than the row's, for the same reason:
+        the reconciler would refuse to check such a row (#3540).
 
         An unqualified issue with *no* configured repos is left unbound: there
         is nothing to be ambiguous between, and refusing would block recording
@@ -454,6 +458,21 @@ class StrategicMemoryFeature(Feature):
         reference = resolve_blocker_reference(
             {"issue": issue, "repo": declared}, configured, self_repo
         )
+        written, number = split_issue_reference(issue)
+        if reference.problem == AMBIGUOUS_REPO_NAME:
+            return "", issue, (
+                f"{len(reference.candidates)} configured repositories are "
+                f"called {declared or written!r} "
+                f"({', '.join(reference.candidates)}), so it does not say which "
+                "one. Pass repo='owner/repo', or write the issue as "
+                "'owner/repo#123'."
+            )
+        if reference.problem == CONFLICTING_REPOS:
+            return "", issue, (
+                f"issue {issue!r} names {reference.conflicting}, but the row's "
+                f"repository is {reference.repo}. Name the same repository in "
+                "both: repo='owner/repo' and the issue as 'owner/repo#123'."
+            )
         if declared and reference.repo is None:
             return "", issue, (
                 f"repo {declared!r} is not 'owner/repo', a repository name, "
@@ -470,13 +489,8 @@ class StrategicMemoryFeature(Feature):
                 "write the issue as 'owner/repo#123'."
             )
         repo = reference.repo or ""
-        written, number = split_issue_reference(issue)
-        if (
-            written is not None
-            and number is not None
-            and written != repo
-            and normalize_repository(written, configured, self_repo) == repo
-        ):
+        if reference.problem is None and written is not None and written != repo:
+            # Not a conflict, so what the issue writes names ``repo``.
             issue = f"{repo}#{number}"
         return repo, issue, None
 
@@ -1721,6 +1735,19 @@ class StrategicMemoryFeature(Feature):
                     line += (
                         f" -- names no repository, and {candidates} are all "
                         "configured. Set repo on the row to check it."
+                    )
+                elif entry.get("reason") == AMBIGUOUS_REPO_NAME:
+                    candidates = ", ".join(entry.get("candidate_repos") or [])
+                    line += (
+                        f" -- its repository name could be any of {candidates}. "
+                        "Set repo on the row to owner/repo to check it."
+                    )
+                elif entry.get("reason") == CONFLICTING_REPOS:
+                    line += (
+                        f" -- its issue reference names "
+                        f"{entry.get('conflicting_repo')}, but the row is read "
+                        f"in {entry.get('repo')}. Make repo and issue name the "
+                        "same repository to check it."
                     )
                 elif entry.get("reason") == INFERRED_REPO_MISMATCH:
                     line += (

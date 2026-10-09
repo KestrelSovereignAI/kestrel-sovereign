@@ -840,3 +840,273 @@ def test_self_repo_comes_from_the_environment_then_dotenv_then_the_default(
         encoding="utf-8",
     )
     assert get_github_self_repo() == "Acme/home"
+
+
+# ---------------------------------------------------------------------------
+# A row that names two repositories, or a short name several repositories
+# have, is refused rather than read in one of them (#3540)
+# ---------------------------------------------------------------------------
+
+
+OTHER = "owner/other"
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        pytest.param({"repo": "self", "issue": f"{OTHER}#46"}, id="self-vs-qualified"),
+        pytest.param({"repo": "self", "issue": f"{OTHER} #46"}, id="spaced-reference"),
+        pytest.param({"repo": OTHER, "issue": "self#46"}, id="qualified-vs-self"),
+        pytest.param({"repo": OTHER, "issue": "talon#46"}, id="other-short-name"),
+        pytest.param(
+            {"repo": "kestrel-feature-talon", "issue": f"{OTHER}#46"},
+            id="short-repo-vs-qualified",
+        ),
+        pytest.param(
+            {"repo": "self", "issue": "blocked by owner/other#46"},
+            id="repository-inside-prose",
+        ),
+        # No repo: the assumed home repository is not the one the prose names.
+        pytest.param({"issue": "blocked by owner/other#46"}, id="inferred-vs-prose"),
+    ],
+)
+def test_a_row_naming_two_repositories_is_refused(row):
+    reference = resolve_blocker_reference(row, SCAN_REPOS, SELF_REPO)
+
+    assert reference.problem == blocker_reconcile.CONFLICTING_REPOS
+    assert reference.conflicting is not None
+    assert not _issues_stated(row), "a refused row states no issue"
+
+
+@pytest.mark.parametrize(
+    ("row", "configured"),
+    [
+        pytest.param({"repo": OTHER, "issue": "other#46"}, SCAN_REPOS, id="unscanned"),
+        pytest.param(
+            {"repo": OTHER, "issue": "other#46"},
+            [*SCAN_REPOS, OTHER, "else/other"],
+            id="the-row-names-the-owner-a-short-name-would-not",
+        ),
+        pytest.param({"repo": OTHER, "issue": "OWNER/Other#46"}, SCAN_REPOS, id="case"),
+        pytest.param({"repo": "self", "issue": "kestrel-sovereign#46"}, SCAN_REPOS,
+                     id="self-and-its-name"),
+        pytest.param({"repo": "self", "issue": f"{SELF_REPO}#46"}, SCAN_REPOS,
+                     id="self-and-its-full-name"),
+    ],
+)
+def test_a_row_whose_reference_names_its_own_repository_is_read(row, configured):
+    reference = resolve_blocker_reference(row, configured, SELF_REPO)
+
+    expected = SELF_REPO if row["repo"] == "self" else OTHER
+    assert (reference.repo, reference.number, reference.problem) == (
+        expected, 46, None
+    )
+    assert reference.source == REPO_FROM_ROW
+
+
+ACME_WIDGETS = "Acme/widgets"
+OTHER_WIDGETS = "Other/widgets"
+WIDGET_REPOS = [ACME_WIDGETS, OTHER_WIDGETS]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        pytest.param({"issue": "widgets#46"}, id="short-name-in-issue"),
+        pytest.param({"repo": "widgets", "issue": "#46"}, id="short-name-as-repo"),
+        pytest.param({"repo": "Widgets", "issue": "widgets#46"}, id="both"),
+    ],
+)
+def test_a_short_name_several_configured_repositories_have_is_refused(row):
+    """The owner fallback (``Acme`` from ``GITHUB_SELF_REPO=Acme/home``) used
+    to pick ``Acme/widgets`` and mark it stated by the row."""
+    reference = resolve_blocker_reference(row, WIDGET_REPOS, "Acme/home")
+
+    assert reference.repo is None
+    assert reference.problem == blocker_reconcile.AMBIGUOUS_REPO_NAME
+    assert reference.source is None, "never marked as stated by the row"
+    assert reference.candidates == (ACME_WIDGETS, OTHER_WIDGETS)
+
+
+def test_a_qualified_repo_settles_a_short_name_several_repositories_have():
+    reference = resolve_blocker_reference(
+        {"repo": OTHER_WIDGETS, "issue": "widgets#46"}, WIDGET_REPOS, "Acme/home"
+    )
+    assert (reference.repo, reference.problem) == (OTHER_WIDGETS, None)
+
+
+def test_a_short_name_no_configured_repository_has_takes_the_home_owner():
+    reference = resolve_blocker_reference(
+        {"issue": "kestrel-feature-eye#4"}, SCAN_REPOS, SELF_REPO
+    )
+    assert (reference.repo, reference.problem, reference.source) == (
+        "KestrelSovereignAI/kestrel-feature-eye", None, REPO_FROM_ISSUE
+    )
+
+
+def test_a_short_name_one_configured_repository_has_is_that_one():
+    reference = resolve_blocker_reference(
+        {"issue": "widgets#46"}, [ACME_WIDGETS, SELF_REPO], "Other/home"
+    )
+    assert (reference.repo, reference.problem, reference.source) == (
+        ACME_WIDGETS, None, REPO_FROM_ISSUE
+    )
+
+
+def _issues_stated(row):
+    from kestrel_sovereign.features.strategic_memory.morning_signal import (
+        _issues_stated_by_ledger,
+    )
+
+    return _issues_stated_by_ledger([row], SCAN_REPOS, SELF_REPO)
+
+
+@pytest.mark.asyncio
+async def test_apply_does_not_retire_a_blocker_on_the_declared_repositorys_issue(
+    tmp_path,
+):
+    """``repo: self`` + ``issue: owner/other#46``: home's 46 is closed and
+    ``owner/other#46`` is open. Neither is the row's issue to resolve on."""
+    feature = await _feature(
+        tmp_path,
+        [{"id": "blk_two", "repo": "self", "issue": f"{OTHER}#46", "title": "t",
+          "blocked_since": "2026-10-01"}],
+    )
+    github = _FakeGitHub(
+        {
+            (SELF_REPO, 46): _issue(SELF_REPO, 46, "closed"),
+            (OTHER, 46): _issue(OTHER, 46, "open"),
+        }
+    )
+    token, get = _patched(github)
+
+    with token, get:
+        result = await feature.strategy_reconcile_blockers(apply="yes")
+
+    report = result.data["report"]
+    assert report["closed"] == [] and report["open"] == []
+    [entry] = report["unresolvable"]
+    assert entry["reason"] == blocker_reconcile.CONFLICTING_REPOS
+    assert (entry["repo"], entry["conflicting_repo"]) == (SELF_REPO, OTHER)
+    assert github.paths == [], "a refused row is not looked up"
+    assert (
+        f"its issue reference names {OTHER}, but the row is read in {SELF_REPO}"
+    ) in result.confirmation
+    assert not _ledger_on_disk(tmp_path)[BLOCKERS_KEY][0].get("resolved_at")
+    assert _ledger_on_disk(tmp_path)[RECONCILIATION_KEY]["unresolvable"] == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_does_not_retire_an_ambiguous_short_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_SELF_REPO", "Acme/home")
+    feature = await _feature(
+        tmp_path,
+        [{"id": "blk_w", "issue": "widgets#46", "title": "t",
+          "blocked_since": "2026-10-01"}],
+        scan_repos=WIDGET_REPOS,
+    )
+    github = _FakeGitHub(
+        {
+            (ACME_WIDGETS, 46): _issue(ACME_WIDGETS, 46, "closed"),
+            (OTHER_WIDGETS, 46): _issue(OTHER_WIDGETS, 46, "open"),
+        }
+    )
+    token, get = _patched(github)
+
+    with token, get:
+        result = await feature.strategy_reconcile_blockers(apply="yes")
+
+    [entry] = result.data["report"]["unresolvable"]
+    assert entry["reason"] == blocker_reconcile.AMBIGUOUS_REPO_NAME
+    assert entry["candidate_repos"] == WIDGET_REPOS
+    assert github.paths == []
+    assert f"could be any of {ACME_WIDGETS}, {OTHER_WIDGETS}" in result.confirmation
+    assert not _ledger_on_disk(tmp_path)[BLOCKERS_KEY][0].get("resolved_at")
+
+
+@pytest.mark.asyncio
+async def test_apply_resolves_a_short_reference_in_the_declared_repository(tmp_path):
+    feature = await _feature(
+        tmp_path,
+        [{"id": "blk_o", "repo": OTHER, "issue": "other#46", "title": "t",
+          "blocked_since": "2026-10-01"}],
+    )
+    github = _FakeGitHub({(OTHER, 46): _issue(OTHER, 46, "closed")})
+    token, get = _patched(github)
+
+    with token, get:
+        await feature.strategy_reconcile_blockers(apply="yes")
+
+    assert github.paths == [f"/repos/{OTHER}/issues/46"]
+    [row] = _ledger_on_disk(tmp_path)[BLOCKERS_KEY]
+    assert row["resolution"].startswith(f"GitHub reports {OTHER}#46 closed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("issue", "repo", "scan_repos", "message"),
+    [
+        pytest.param(
+            f"{OTHER}#46", "self", SCAN_REPOS,
+            f"names {OTHER}, but the row's repository is {SELF_REPO}",
+            id="two-repositories",
+        ),
+        pytest.param(
+            "widgets#46", "", WIDGET_REPOS,
+            f"called 'widgets' ({ACME_WIDGETS}, {OTHER_WIDGETS})",
+            id="ambiguous-short-issue",
+        ),
+        pytest.param(
+            "#46", "widgets", WIDGET_REPOS,
+            f"called 'widgets' ({ACME_WIDGETS}, {OTHER_WIDGETS})",
+            id="ambiguous-short-repo",
+        ),
+    ],
+)
+async def test_add_blocker_refuses_a_row_reconcile_would_refuse(
+    tmp_path, issue, repo, scan_repos, message
+):
+    feature = await _feature(tmp_path, [], scan_repos=scan_repos)
+
+    result = await feature.strategy_add_blocker(issue=issue, title="t", repo=repo)
+
+    assert result.status.value == "error"
+    assert message in result.error
+    assert _ledger_on_disk(tmp_path)[BLOCKERS_KEY] == []
+
+
+@pytest.mark.asyncio
+async def test_add_blocker_qualifies_a_short_reference_with_the_declared_owner(
+    tmp_path,
+):
+    feature = await _feature(tmp_path, [])
+
+    result = await feature.strategy_add_blocker(
+        issue="other#46", title="t", repo=OTHER
+    )
+
+    assert result.status.value == "ok"
+    [row] = _ledger_on_disk(tmp_path)[BLOCKERS_KEY]
+    assert (row["issue"], row["repo"]) == (f"{OTHER}#46", OTHER)
+
+
+@pytest.mark.parametrize(
+    ("issue", "repo", "self_repo", "expected"),
+    [
+        ("o/talon#5", "o/core", "o/core", "o/talon"),
+        ("talon#5", "o/core", "o/core", "talon"),
+        ("blocked by other/core#5", "o/core", "o/core", "other/core"),
+        ("self#5", "o/core", "o/home", "self"),
+        ("self#5", "o/core", "o/core", None),
+        ("O/Core#5", "o/core", "o/home", None),
+        ("core#5", "o/core", "o/home", None),
+        ("#5", "o/core", "o/home", None),
+        ("Issue #5", "o/core", "o/home", None),
+    ],
+)
+def test_the_shared_conflict_rule(issue, repo, self_repo, expected):
+    """One function decides for the reconciler and for dispatch."""
+    assert blocker_reconcile.issue_repository_conflict(issue, repo, self_repo) == (
+        expected
+    )
+
