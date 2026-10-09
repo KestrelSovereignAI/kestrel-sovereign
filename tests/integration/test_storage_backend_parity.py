@@ -673,7 +673,7 @@ async def _assert_constitution_runtime_state_round_trip(db_backend):
 
     writer = ConstitutionRuntimeStateStore(db_backend)
     await writer.initialize()
-    await writer.write(
+    state = await writer.write(
         state,
         event_type="safe_mode_entered",
         event_reason=state.safe_mode_reason,
@@ -704,8 +704,10 @@ async def _assert_constitution_runtime_state_round_trip(db_backend):
         replace(
             state, safe_mode=False, safe_mode_exited_at=exited_at,
             last_successful_audit_at=exited_at, updated_at=exited_at,
+            safe_mode_exit_authorization="fixture-signed-owner",
         ),
         event_type="safe_mode_exited",
+        event_authorization="fixture-signed-owner",
     )
     restored = await reader.load(agent_id)
     assert restored.safe_mode is False
@@ -713,6 +715,122 @@ async def _assert_constitution_runtime_state_round_trip(db_backend):
     assert restored.last_successful_audit_at == exited_at
     assert restored.updated_at == exited_at
     assert (await reader.list_events(agent_id))[-1]["occurred_at"] == exited_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_constitution_state_cas_rejects_stale_clear_and_due_marker_clobber(db_backend):
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionStateConflictError,
+    )
+
+    store = ConstitutionRuntimeStateStore(db_backend)
+    await store.initialize()
+    now = datetime.now(timezone.utc)
+    state = await store.write(ConstitutionRuntimeState(
+        agent_id="did:test:cas:" + uuid4().hex, safe_mode=False,
+        safe_mode_reason=None, safe_mode_entered_at=None,
+        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+        last_successful_audit_at=now, interaction_count=0, updated_at=now,
+    ))
+    stale = await store.load(state.agent_id)
+    latched = await store.write(replace(state, safe_mode=True, safe_mode_reason="integrity", interaction_count=100), event_type="safe_mode_entered")
+    with pytest.raises(ConstitutionStateConflictError):
+        await store.write(replace(stale, interaction_count=1), event_type="audit_succeeded")
+    assert await store.load(state.agent_id) == latched
+    with pytest.raises(ConstitutionStateConflictError):
+        await store.write(replace(latched, safe_mode=False))
+    assert await store.list_events(state.agent_id) == [
+        {"event_type": "safe_mode_entered", "reason": None, "authorization": None, "occurred_at": now}
+    ]
+    await store.write(replace(latched, safe_mode=False, safe_mode_exited_at=now,
+                             safe_mode_exit_authorization="signed-owner"),
+                      event_type="safe_mode_exited", event_authorization="signed-owner")
+    assert (await store.load(state.agent_id)).safe_mode is False
+    with pytest.raises(ConstitutionStateConflictError):
+        await store.write(latched, event_type="safe_mode_entered")
+    current = await store.load(state.agent_id)
+    await db_backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (state.agent_id,))
+    with pytest.raises(ConstitutionStateConflictError):
+        await store.write(current)
+    assert await store.load(state.agent_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_pre_revision_writer_cannot_clear_new_runtime_state(db_backend):
+    """Mixed-version replicas must fail closed, not bypass the new CAS."""
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+    )
+
+    store = ConstitutionRuntimeStateStore(db_backend)
+    await store.initialize()
+    now = datetime.now(timezone.utc)
+    state = await store.write(ConstitutionRuntimeState(
+        agent_id="did:test:old-writer:" + uuid4().hex, safe_mode=True,
+        safe_mode_reason="persisted integrity finding", safe_mode_entered_at=now,
+        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+        last_successful_audit_at=now, interaction_count=100, updated_at=now,
+    ), event_type="safe_mode_entered")
+    # The pre-upgrade UPSERT assigns these fields without touching revision.
+    with pytest.raises(QueryError, match="revision fence"):
+        await db_backend.execute(
+            "UPDATE constitution_runtime_state SET safe_mode = ?, interaction_count = 0 WHERE agent_id = ?",
+            (False if db_backend.backend_type == "postgres" else 0, state.agent_id),
+        )
+    assert await store.load(state.agent_id) == state
+    assert len(await store.list_events(state.agent_id)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_two_lifecycle_replicas_preserve_safe_mode_on_interleaved_write(db_backend):
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:lifecycle:" + uuid4().hex)
+    await storage.initialize()
+    now = datetime.now(timezone.utc)
+    first = _DurableConstitutionHarness(storage, now)
+    first.agent_id = storage.agent_id
+    await first._initialize_constitution_runtime_state()
+    await first._record_successful_constitution_audit(source="fixture")
+    stale = _DurableConstitutionHarness(storage, now)
+    stale.agent_id = storage.agent_id
+    await stale._initialize_constitution_runtime_state()
+    assert await first.enter_safe_mode("two-replica integrity finding")
+    stale._interaction_count += 1
+    assert not await stale._persist_constitution_runtime_state()
+    assert (await first._constitution_state_store.load(first.agent_id)).safe_mode is True
+    assert stale._safe_mode is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_stale_constitution_restriction_joins_without_losing_lifecycle_cause(db_backend):
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:latch-join:" + uuid4().hex)
+    await storage.initialize()
+    now = datetime.now(timezone.utc)
+    first = _DurableConstitutionHarness(storage, now)
+    first.agent_id = storage.agent_id
+    await first._initialize_constitution_runtime_state()
+    await first._record_successful_constitution_audit(source="fixture")
+    stale = _DurableConstitutionHarness(storage, now)
+    stale.agent_id = storage.agent_id
+    await stale._initialize_constitution_runtime_state()
+    first._interaction_count = 100
+    assert await first.enter_safe_mode("uncertain feature shutdown", cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value)
+    assert await stale.enter_safe_mode("second replica finding")
+    current = await first._constitution_state_store.load(first.agent_id)
+    assert current.safe_mode_cause == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+    assert current.safe_mode_reason == "uncertain feature shutdown"
+    assert current.interaction_count == stale._interaction_count == 100
+    assert stale._safe_mode_cause == current.safe_mode_cause
+    assert stale._constitution_state_revision == current.revision
 
 
 @pytest.mark.asyncio

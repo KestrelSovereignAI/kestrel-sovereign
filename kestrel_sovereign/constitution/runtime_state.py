@@ -7,7 +7,7 @@ so a process restart cannot clear either one.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -36,6 +36,12 @@ class ConstitutionRuntimeState:
     #: causes were recorded — which is not the same as no cause, and must not
     #: be read as an integrity finding (#2920 defect 3).
     safe_mode_cause: Optional[str] = None
+    # Optimistic database fencing, independent of wall-clock precision.
+    revision: int = 0
+
+
+class ConstitutionStateConflictError(RuntimeError):
+    """A stale snapshot or unauthorized restriction-clear was refused."""
 
 
 class ConstitutionRuntimeStateStore:
@@ -108,7 +114,8 @@ class ConstitutionRuntimeStateStore:
                 bootstrap_pending {boolean_type} NOT NULL,
                 schema_version INTEGER NOT NULL,
                 updated_at {timestamp_type} NOT NULL,
-                safe_mode_cause TEXT
+                safe_mode_cause TEXT,
+                revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)
             );
 
             CREATE TABLE IF NOT EXISTS constitution_runtime_events (
@@ -131,6 +138,73 @@ class ConstitutionRuntimeStateStore:
         # ``_mark_constitution_state_unavailable`` and would put every
         # existing agent into Safe Mode on upgrade.
         await self._migrate_safe_mode_cause_column()
+        if not await self._has_column("revision"):
+            await self._backend.execute(
+                "ALTER TABLE constitution_runtime_state ADD COLUMN "
+                + ("IF NOT EXISTS " if self._is_postgres else "")
+                + "revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)"
+            )
+        await self._ensure_revision_fence()
+
+    async def _ensure_revision_fence(self) -> None:
+        """Old binaries cannot overwrite a row without advancing its fence.
+
+        This is enforced in the database because a replica predating revision
+        fencing does not execute the new store's CAS statement. Repeated boots
+        inspect the catalog, avoiding an unnecessary DDL lock on a live table.
+        """
+        trigger = "constitution_runtime_revision_fence_v1"
+        if self._is_postgres:
+            existing = await self._backend.fetch_one(
+                "SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass(?) "
+                "AND tgname = ? AND NOT tgisinternal",
+                ("constitution_runtime_state", trigger),
+            )
+            if existing is not None:
+                return
+            # Serialize initial installation only. The catalog recheck after
+            # the advisory lock also handles concurrently starting replicas.
+            async with self._backend.transaction():
+                await self._backend.fetch_one(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ?, 0))",
+                    (f":{trigger}",),
+                )
+                existing = await self._backend.fetch_one(
+                    "SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass(?) "
+                    "AND tgname = ? AND NOT tgisinternal",
+                    ("constitution_runtime_state", trigger),
+                )
+                if existing is None:
+                    await self._backend.execute_script(
+                        f"""
+                        CREATE OR REPLACE FUNCTION {trigger}() RETURNS trigger AS $fence$
+                        BEGIN
+                            IF NEW.revision <> OLD.revision + 1 THEN
+                                RAISE EXCEPTION 'constitution runtime revision fence refused old writer';
+                            END IF;
+                            RETURN NEW;
+                        END;
+                        $fence$ LANGUAGE plpgsql;
+                        CREATE TRIGGER {trigger} BEFORE UPDATE ON constitution_runtime_state
+                        FOR EACH ROW EXECUTE FUNCTION {trigger}();
+                        """
+                    )
+        else:
+            existing = await self._backend.fetch_one(
+                "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                (trigger,),
+            )
+            if existing is None:
+                await self._backend.execute_script(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS {trigger}
+                    BEFORE UPDATE ON constitution_runtime_state
+                    FOR EACH ROW WHEN NEW.revision <> OLD.revision + 1
+                    BEGIN
+                        SELECT RAISE(ABORT, 'constitution runtime revision fence refused old writer');
+                    END;
+                    """
+                )
 
     async def _migrate_safe_mode_cause_column(self) -> None:
         """Add ``safe_mode_cause`` to a table created before it existed.
@@ -152,20 +226,25 @@ class ConstitutionRuntimeStateStore:
 
     async def _has_safe_mode_cause_column(self) -> bool:
         """Whether the column is already present, per the backend's catalog."""
+        return await self._has_column("safe_mode_cause")
+
+    async def _has_column(self, name: str) -> bool:
         if getattr(self._backend, "backend_type", "sqlite") == "postgres":
             row = await self._backend.fetch_one(
                 """
                 SELECT 1 FROM information_schema.columns
                  WHERE table_name = 'constitution_runtime_state'
-                   AND column_name = 'safe_mode_cause'
-                """
+                   AND table_schema = current_schema()
+                   AND column_name = ?
+                """,
+                (name,),
             )
             return row is not None
         rows = await self._backend.fetch_all(
             "PRAGMA table_info(constitution_runtime_state)"
         )
         return any(
-            (r[1] if not isinstance(r, dict) else r.get("name")) == "safe_mode_cause"
+            (r[1] if not isinstance(r, dict) else r.get("name")) == name
             for r in (rows or ())
         )
 
@@ -177,7 +256,7 @@ class ConstitutionRuntimeStateStore:
                    safe_mode_entered_at, safe_mode_exited_at,
                    safe_mode_exit_authorization, last_successful_audit_at,
                    interaction_count, bootstrap_pending, schema_version,
-                   updated_at, safe_mode_cause
+                   updated_at, safe_mode_cause, revision
               FROM constitution_runtime_state
              WHERE agent_id = ?
             """,
@@ -201,6 +280,7 @@ class ConstitutionRuntimeStateStore:
             bootstrap_pending=bool(row[8]),
             updated_at=self._timestamp_value(row[10]),
             safe_mode_cause=row[11],
+            revision=int(row[12]),
         )
 
     async def write(
@@ -210,8 +290,21 @@ class ConstitutionRuntimeStateStore:
         event_type: Optional[str] = None,
         event_reason: Optional[str] = None,
         event_authorization: Optional[str] = None,
-    ) -> None:
-        """Atomically replace current state and optionally append an event."""
+    ) -> ConstitutionRuntimeState:
+        """CAS-replace state and event; ordinary writes cannot clear SafeMode.
+
+        Return the persisted revision. Callers must carry it into their next
+        snapshot. A failed CAS appends no event and must restrict the caller,
+        not silently overwrite a newer replica's latch or audit due marker.
+        """
+        authorized_exit = (
+            event_type == "safe_mode_exited"
+            and bool(event_authorization)
+            and state.safe_mode_exit_authorization == event_authorization
+            and state.safe_mode_exited_at is not None
+            and state.last_successful_audit_at == state.safe_mode_exited_at
+            and not state.safe_mode
+        )
         values = (
             state.agent_id,
             self._boolean_param(state.safe_mode),
@@ -225,17 +318,29 @@ class ConstitutionRuntimeStateStore:
             self.SCHEMA_VERSION,
             self._timestamp_param(state.updated_at),
             state.safe_mode_cause,
+            state.revision + 1,
+            state.revision,
+            state.agent_id,
+            state.revision,
+            state.revision,
+            self._boolean_param(authorized_exit),
+            self._boolean_param(authorized_exit or event_type == "audit_succeeded"),
+            self._boolean_param(authorized_exit or event_type == "audit_succeeded"),
         )
         async with self._backend.transaction():
-            await self._backend.execute(
+            written = await self._backend.fetch_one(
                 """
                 INSERT INTO constitution_runtime_state
                     (agent_id, safe_mode, safe_mode_reason,
                      safe_mode_entered_at, safe_mode_exited_at,
                      safe_mode_exit_authorization, last_successful_audit_at,
                      interaction_count, bootstrap_pending, schema_version,
-                     updated_at, safe_mode_cause)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     updated_at, safe_mode_cause, revision)
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                 WHERE ? = 0 OR EXISTS (
+                     SELECT 1 FROM constitution_runtime_state
+                      WHERE agent_id = ? AND revision = ?
+                 )
                 ON CONFLICT(agent_id) DO UPDATE SET
                     safe_mode = excluded.safe_mode,
                     safe_mode_reason = excluded.safe_mode_reason,
@@ -247,11 +352,18 @@ class ConstitutionRuntimeStateStore:
                     bootstrap_pending = excluded.bootstrap_pending,
                     schema_version = excluded.schema_version,
                     updated_at = excluded.updated_at,
-                    safe_mode_cause = excluded.safe_mode_cause
+                    safe_mode_cause = excluded.safe_mode_cause,
+                    revision = excluded.revision
+                WHERE constitution_runtime_state.revision = ?
+                  AND (NOT constitution_runtime_state.safe_mode
+                       OR excluded.safe_mode OR ?)
+                  AND (excluded.interaction_count >= constitution_runtime_state.interaction_count OR ?)
+                  AND (NOT constitution_runtime_state.bootstrap_pending OR excluded.bootstrap_pending OR ?)
+                RETURNING revision
                 """,
                 values,
             )
-            if event_type is not None:
+            if written is not None and event_type is not None:
                 await self._backend.execute(
                     """
                     INSERT INTO constitution_runtime_events
@@ -267,6 +379,14 @@ class ConstitutionRuntimeStateStore:
                         self._timestamp_param(state.updated_at),
                     ),
                 )
+        # Both adapters wrap exceptions raised inside a transaction. A CAS
+        # refusal made no mutation/event; report its typed conflict outside
+        # that boundary so callers can distinguish it from storage failure.
+        if written is None:
+            raise ConstitutionStateConflictError(
+                "stale constitution state or unauthorized SafeMode clear"
+            )
+        return replace(state, revision=int(written[0]))
 
     async def list_events(self, agent_id: str) -> list[dict]:
         """Return transition history in insertion order (operator/test aid)."""

@@ -314,6 +314,75 @@ class _DurableConstitutionHarness:
     exit_safe_mode = KestrelAgent.exit_safe_mode
 
 
+@pytest.mark.asyncio
+async def test_stale_replica_interaction_cannot_clear_durable_safe_mode(tmp_path):
+    now = datetime(2026, 10, 9, 16, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(tmp_path / "replicas.db", now)
+    try:
+        await first._record_successful_constitution_audit(source="fixture")
+        stale = _DurableConstitutionHarness(storage, now)
+        await stale._initialize_constitution_runtime_state()
+        assert stale._safe_mode is False
+        assert await first.enter_safe_mode("integrity failure") is True
+        stale._interaction_count += 1
+        assert await stale._persist_constitution_runtime_state() is False
+        durable = await first._constitution_state_store.load(first.agent_id)
+        assert durable.safe_mode is True
+        assert durable.safe_mode_reason == "integrity failure"
+        assert stale._safe_mode is True
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completed_bootstrap", [False, True])
+async def test_missing_existing_anchor_cannot_be_lazily_recreated(tmp_path, completed_bootstrap):
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.storage import GraphNode
+
+    now = datetime(2026, 10, 9, 16, tzinfo=timezone.utc)
+    agent, storage = await _open_durable_harness(tmp_path / "missing-anchor.db", now)
+    try:
+        if completed_bootstrap:
+            await agent._record_successful_constitution_audit(source="prior completed bootstrap")
+        await storage.add_node(GraphNode(node_id=agent.agent_id, node_type="agent", label="legacy", properties={}))
+        agent.extension = None
+        agent._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(agent)
+        result = await ConstitutionMixin._get_governing_constitution(agent)
+        assert result.startswith("Error:")
+        assert "constitution_hash" not in (await storage.get_node(agent.agent_id)).properties
+        assert not [edge for edge in await storage.get_edges_from(agent.agent_id) if edge.label == "governed_by"]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_first_identity_marker_allows_native_initial_anchor(tmp_path):
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.features.constitution import ConstitutionFeature
+    from kestrel_sovereign.storage import GraphNode
+
+    now = datetime(2026, 10, 9, 16, tzinfo=timezone.utc)
+    agent, storage = await _open_durable_harness(tmp_path / "first-anchor.db", now, is_new_identity=True)
+    try:
+        await storage.add_node(GraphNode(node_id=agent.agent_id, node_type="agent", label="new", properties={}))
+        agent.extension = None
+        agent._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(agent)
+        agent._get_governing_constitution = ConstitutionMixin._get_governing_constitution.__get__(agent)
+        # Even a legitimate pending bootstrap is not authority for a display
+        # feature's initialization to mutate the identity graph.
+        await ConstitutionFeature(agent).initialize()
+        assert "constitution_hash" not in (await storage.get_node(agent.agent_id)).properties
+        result = await ConstitutionMixin._get_governing_constitution(agent)
+        assert not result.startswith("Error:")
+        durable = await agent._constitution_state_store.load(agent.agent_id)
+        assert durable.bootstrap_pending is True
+        assert durable.revision == agent._constitution_state_revision
+        assert (await storage.get_node(agent.agent_id)).properties["constitution_hash"]
+    finally:
+        await storage.close()
+
+
 async def _open_durable_harness(db_path, now, *, is_new_identity=False):
     from kestrel_sovereign.storage import AsyncStorage
 
@@ -1358,7 +1427,7 @@ async def test_a_row_written_before_causes_existed_reads_as_unrecorded(tmp_path)
         await agent.enter_safe_mode("governing bytes changed")
         # Blank the column the way a pre-#2920 row has it.
         await storage.db.execute(
-            "UPDATE constitution_runtime_state SET safe_mode_cause = NULL"
+            "UPDATE constitution_runtime_state SET safe_mode_cause = NULL, revision = revision + 1"
         )
     finally:
         await storage.close()

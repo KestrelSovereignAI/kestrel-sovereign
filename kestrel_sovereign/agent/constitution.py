@@ -579,6 +579,7 @@ class ConstitutionMixin:
         self._safe_mode_exit_authorization = None
         self._constitution_state_migration_pending = False
         self._constitution_bootstrap_pending = False
+        self._constitution_state_revision = 0
         self._constitution_state_load_error = None
         self._constitution_audit_pending = False
         self._constitution_state_persistence_pending = False
@@ -668,6 +669,7 @@ class ConstitutionMixin:
                 if bootstrap_pending is None
                 else bootstrap_pending
             ),
+            revision=getattr(self, "_constitution_state_revision", 0),
         )
 
     async def _initialize_constitution_runtime_state(
@@ -707,11 +709,12 @@ class ConstitutionMixin:
             self._safe_mode_exited_at = None
             self._safe_mode_exit_authorization = None
             now = self._constitution_now()
-            await store.write(
+            persisted_state = await store.write(
                 self._constitution_state_snapshot(now=now),
                 event_type="safe_mode_entered",
                 event_reason=pending_reason,
             )
+            self._constitution_state_revision = persisted_state.revision
             self._constitution_state_persistence_pending = False
 
         try:
@@ -726,7 +729,7 @@ class ConstitutionMixin:
                 self._constitution_state_migration_pending = not is_new_identity
                 self._constitution_audit_pending = True
                 now = self._constitution_now()
-                await store.write(
+                persisted_state = await store.write(
                     self._constitution_state_snapshot(now=now),
                     event_type=(
                         "new_identity_bootstrap_required"
@@ -739,9 +742,11 @@ class ConstitutionMixin:
                         else "full constitutional audit required before readiness"
                     ),
                 )
+                self._constitution_state_revision = persisted_state.revision
                 await persist_pending_entry(store)
                 return
 
+            self._constitution_state_revision = state.revision
             self._safe_mode = state.safe_mode
             self._safe_mode_reason = state.safe_mode_reason
             # UNRECORDED is for rows written before causes were persisted —
@@ -887,18 +892,69 @@ class ConstitutionMixin:
         # ``state_not_persisted`` and health claimed the recovered write had
         # never persisted. The except path re-sets it if this write fails.
         try:
-            await store.write(
-                self._constitution_state_snapshot(
-                    now=now,
-                    safe_mode=safe_mode,
-                    last_successful_audit_at=last_successful_audit_at,
-                    interaction_count=interaction_count,
-                    bootstrap_pending=bootstrap_pending,
-                ),
-                event_type=event_type,
-                event_reason=event_reason,
-                event_authorization=event_authorization,
+            from dataclasses import replace
+
+            from kestrel_sovereign.constitution.runtime_state import (
+                ConstitutionStateConflictError,
             )
+
+            snapshot = self._constitution_state_snapshot(
+                now=now,
+                safe_mode=safe_mode,
+                last_successful_audit_at=last_successful_audit_at,
+                interaction_count=interaction_count,
+                bootstrap_pending=bootstrap_pending,
+            )
+            for attempt in range(3):
+                try:
+                    persisted_state = await store.write(
+                        snapshot,
+                        event_type=event_type,
+                        event_reason=event_reason,
+                        event_authorization=event_authorization,
+                    )
+                    break
+                except ConstitutionStateConflictError:
+                    # Entering a restriction may monotonically join a newer
+                    # state; ordinary writes and authorized exits NEVER retry
+                    # a stale snapshot or adopt a newer authority generation.
+                    if (
+                        event_type != "safe_mode_entered"
+                        or not snapshot.safe_mode
+                        or attempt == 2
+                    ):
+                        raise
+                    current = await store.load(self.agent_id)
+                    if current is None:
+                        raise
+                    preserve_lifecycle = (
+                        current.safe_mode
+                        and current.safe_mode_cause
+                        == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+                    )
+                    snapshot = replace(
+                        snapshot,
+                        revision=current.revision,
+                        last_successful_audit_at=current.last_successful_audit_at,
+                        interaction_count=max(
+                            snapshot.interaction_count, current.interaction_count
+                        ),
+                        bootstrap_pending=current.bootstrap_pending,
+                        safe_mode_cause=current.safe_mode_cause if preserve_lifecycle else snapshot.safe_mode_cause,
+                        safe_mode_reason=current.safe_mode_reason if preserve_lifecycle else snapshot.safe_mode_reason,
+                        safe_mode_entered_at=current.safe_mode_entered_at if current.safe_mode else snapshot.safe_mode_entered_at,
+                    )
+            self._constitution_state_revision = persisted_state.revision
+            if event_type == "safe_mode_entered":
+                self._safe_mode_cause = persisted_state.safe_mode_cause
+                self._safe_mode_reason = persisted_state.safe_mode_reason
+                self._safe_mode_entered_at = persisted_state.safe_mode_entered_at
+                self._interaction_count = persisted_state.interaction_count
+                self._last_audit_time = (
+                    persisted_state.last_successful_audit_at
+                    or self._constitution_epoch()
+                )
+                self._constitution_bootstrap_pending = persisted_state.bootstrap_pending
             # The snapshot is on disk, so whatever earlier failure set this is
             # no longer true. Leaving it set reported ``state_not_persisted``
             # for the rest of the process after one transient write error.
@@ -2166,6 +2222,18 @@ class ConstitutionMixin:
                     "Error: Governing constitution is not anchored; "
                     "read-only retrieval cannot create the missing anchor."
                 )
+            store = vars(self).get("_constitution_state_store")
+            if store is None or not getattr(
+                self, "_constitution_bootstrap_pending", False
+            ):
+                return "Error: Missing governing anchor requires native signed repair; no new-identity bootstrap custody."
+            bootstrap = await store.load(self.agent_id)
+            if (
+                bootstrap is None
+                or not bootstrap.bootstrap_pending
+                or bootstrap.revision != self._constitution_state_revision
+            ):
+                return "Error: Missing governing anchor requires native signed repair; durable bootstrap custody changed."
             logging.warning("Constitution hash not found. Attempting to load and anchor default.")
 
             # Auto-anchor the SAME governing bytes the periodic audit later
@@ -2205,6 +2273,28 @@ class ConstitutionMixin:
                 # land together or not at all — a partial lazy anchor would
                 # be the same property/edge drift #2617 repairs.
                 async with self.storage.transaction():
+                    # Reserve the native graph write set, then revalidate the
+                    # durable bootstrap marker under the same transaction.
+                    initial_hash = hashlib.sha256(constitution_content).hexdigest()
+                    await self.storage.lock_nodes_for_update(
+                        sorted([self.agent_id, initial_hash])
+                    )
+                    agent_node = await self.storage.get_node(self.agent_id)
+                    if agent_node is None:
+                        raise ValueError("identity disappeared during bootstrap")
+                    if agent_node.properties.get("constitution_hash"):
+                        raise ValueError("anchor changed during bootstrap; reload required")
+                    bootstrap = await store.load(self.agent_id)
+                    if (
+                        bootstrap is None
+                        or not bootstrap.bootstrap_pending
+                        or bootstrap.revision != self._constitution_state_revision
+                    ):
+                        raise ValueError("durable new-identity bootstrap custody changed")
+                    persisted_state = await store.write(
+                        bootstrap, event_type="initial_anchor_started"
+                    )
+                    self._constitution_state_revision = persisted_state.revision
                     constitution_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
                     # Mirror inception's governance wiring so the integrity audit's
                     # edge proof (#2463) holds for a lazily-anchored legacy agent.

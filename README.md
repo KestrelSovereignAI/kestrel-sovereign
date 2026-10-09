@@ -943,6 +943,25 @@ Diagnostic/recovery commands remain available while an audit is pending. Normal
 cognition returns a clear pending/failed response without sending the user's
 turn to an LLM.
 
+### Durable constitutional state and upgrades
+
+Safe Mode, audit deadlines, interaction counters, and first-identity bootstrap
+custody are stored in the primary SQLite or PostgreSQL database. Writes use a
+database revision fence: a stale replica cannot clear another replica's
+restriction or reset its audit-due counter. Only the verified, authorized exit
+path clears a durable restriction; a conflicting writer restricts itself.
+
+The additive revision migration retains readable schema-version-1 rows, but
+database triggers reject pre-revision writers after upgrade. Retire old
+replicas rather than expecting mixed-version writers to keep operating.
+Initialization checks existing metadata before installing migration DDL.
+
+Automatic first anchoring requires a still-pending durable new-identity marker
+and matching revision, revalidated within the native graph transaction.
+Reading a constitution or initializing its display feature never repairs an
+existing identity's deleted anchor. That requires native signed reanchor and
+the normal full integrity verification; an absent anchor is not a fresh boot.
+
 ## 🔄 Next Steps
 
 After getting started:

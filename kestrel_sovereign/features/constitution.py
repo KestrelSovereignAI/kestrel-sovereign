@@ -134,7 +134,7 @@ class ConstitutionFeature(Feature):
         try:
             # Try to get from agent first to include amendments/anchored version
             if hasattr(self.agent, '_get_governing_constitution'):
-                text = await self.agent._get_governing_constitution()
+                text = await self.agent._get_governing_constitution(allow_lazy_anchor=False)
                 if text and not text.startswith("Error:"):
                     self.full_text = text
                 else:
