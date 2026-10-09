@@ -128,20 +128,48 @@ def test_two_applicable_versions_are_undetermined_rather_than_guessed(tmp_path):
     assert lock.undetermined == ("anthropic",)
 
 
-def test_constraint_lines_pin_every_locked_package_but_the_excluded(tmp_path):
+def test_constraint_lines_pin_every_locked_package_but_a_declared_checkout(tmp_path):
+    """Two inputs: the lock's versions, and the checkouts the manifest declares.
+
+    A declared checkout's package is held on that checkout, not at its locked
+    version, and the name is matched however the manifest spells it.
+    """
     lock = cl.read_core_lock(_lock(tmp_path), environment=POSIX)
 
-    assert lock.constraint_lines() == ["anthropic==0.117.0", "sqlean-py==3.50.4.5"]
-    assert lock.constraint_lines({"Anthropic"}) == ["sqlean-py==3.50.4.5"]
+    assert lock.constraint_lines() == ["anthropic===0.117.0", "sqlean-py===3.50.4.5"]
+    assert lock.constraint_lines({"Anthropic": "/src/anthropic"}) == [
+        "-e anthropic @ file:///src/anthropic", "sqlean-py===3.50.4.5",
+    ]
+    # An empty `editable` names no checkout, so it declares nothing.
+    assert lock.constraint_lines({"anthropic": ""}) == lock.constraint_lines()
+    # A checkout for a package the lock does not cover adds no line.
+    assert lock.constraint_lines({"elsewhere": "/src/x"}) == lock.constraint_lines()
+    assert lock.checkout_held({"Anthropic": "/src/anthropic", "x": "/src/x"}) == (
+        "anthropic",
+    )
+
+
+def test_a_checkout_hold_line_is_an_absolute_editable_file_url(tmp_path, monkeypatch):
+    """Relative and ``~`` paths are made absolute, as ``-e <path>`` resolves them."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    assert cl.checkout_hold_line("Kestrel_Sovereign.SDK", "sdk") == (
+        f"-e kestrel-sovereign-sdk @ {(tmp_path / 'sdk').as_uri()}"
+    )
+    assert cl.checkout_hold_line("x", "~/x") == (
+        f"-e x @ {(tmp_path / 'home' / 'x').as_uri()}"
+    )
+    assert cl.checkout_hold_line("x", "/a b/x") == "-e x @ file:///a%20b/x"
 
 
 def test_constraint_lines_refuse_while_a_locked_package_is_undetermined(tmp_path):
     """Lines holding every package but one would let an install move that one.
 
-    The lock names no single version of anthropic here, so there is no line to
-    carry for it. Returning the others anyway is how an install ran with
-    anthropic free while looking held (#3502). Excluded for a deliberate reason
-    (a link a pin would replace), it is no hole in the hold.
+    The lock names no single version of anthropic here, so there is no
+    version line to carry for it. Returning the others anyway is how an
+    install ran with anthropic free while looking held (#3502). A checkout the
+    manifest declares for it needs no version, so then it is no hole.
     """
     text = LOCK + (
         '\n[[package]]\nname = "anthropic"\nversion = "1.11.0"\n'
@@ -152,8 +180,10 @@ def test_constraint_lines_refuse_while_a_locked_package_is_undetermined(tmp_path
     with pytest.raises(cl.CoreLockError, match="no single version .*: anthropic"):
         lock.constraint_lines()
     with pytest.raises(cl.CoreLockError):
-        lock.constraint_lines({"sqlean-py"})
-    assert lock.constraint_lines({"Anthropic"}) == ["sqlean-py==3.50.4.5"]
+        lock.constraint_lines({"sqlean-py": "/src/sqlean"})
+    assert lock.constraint_lines({"Anthropic": "/src/anthropic"}) == [
+        "-e anthropic @ file:///src/anthropic", "sqlean-py===3.50.4.5",
+    ]
     assert lock.names() == ("sqlean-py", "anthropic")
 
 

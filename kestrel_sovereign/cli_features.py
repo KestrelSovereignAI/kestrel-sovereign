@@ -20,7 +20,7 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Optional
 
 # Non-patched constants — import directly. (``MultiAgentConfig`` itself is
@@ -790,11 +790,19 @@ DEFAULT_HOST_MANIFEST = ".kestrel-host-features.toml"
 
 
 def _host_manifest_path(args) -> Path:
-    """Resolve the host manifest path (``--manifest`` override or default)."""
+    """Resolve the host manifest path (``--manifest`` override or default).
+
+    The default is the project directory's manifest (``KESTREL_HOME``, else
+    the marker walk-up from the cwd, else ``~/.kestrel``): the one the host
+    reads its feature enablement from (#2293), never the bare cwd. Read from
+    the cwd, a command launched anywhere but the project directory saw no
+    manifest, and the install guard pinned every checkout the manifest
+    declares instead of holding it there (#3502).
+    """
     override = getattr(args, "manifest", None)
     if override:
         return Path(override).expanduser()
-    return Path.cwd() / DEFAULT_HOST_MANIFEST
+    return cli._get_project_dir() / DEFAULT_HOST_MANIFEST
 
 
 def _load_host_manifest(path: Path) -> list:
@@ -813,6 +821,12 @@ def _load_host_manifest(path: Path) -> list:
     exclusive: an entry records *one* place a package comes from. ``pypi = ""``
     means "from PyPI, any version". An entry with neither is the legacy
     "present / install latest from PyPI" form, preserved for back-compat.
+
+    A relative ``editable`` names a checkout beside this manifest, so it is
+    returned resolved against the manifest's directory
+    (:func:`_manifest_checkout`). Left relative, every reader resolved it
+    against its own cwd: the install linked one directory and core's lock held
+    the package on another (#3502).
 
     Raises ``ValueError`` on a malformed entry so the caller can report it.
     """
@@ -836,6 +850,13 @@ def _load_host_manifest(path: Path) -> list:
         editable = entry.get("editable")
         if editable is not None and not isinstance(editable, str):
             raise ValueError(f"manifest '{label}': 'editable' must be a string path")
+        if editable and editable.startswith("~") and os.path.expanduser(editable) == editable:
+            # `~user/...` for a user this host does not have. Every reader
+            # would expand it differently (or raise), so no checkout is named.
+            raise ValueError(
+                f"manifest '{label}': 'editable' path {editable!r} names a home "
+                "directory this host cannot resolve"
+            )
         pypi = entry.get("pypi")
         if pypi is not None and not isinstance(pypi, str):
             raise ValueError(
@@ -879,11 +900,31 @@ def _load_host_manifest(path: Path) -> list:
             raise ValueError(f"manifest '{label}': 'extras' must be an array of strings")
         cleaned.append({
             "name": str(label),
-            "editable": editable,
+            "editable": _manifest_checkout(path, editable),
             "pypi": pypi,
             "extras": list(extras),
         })
     return cleaned
+
+
+def _manifest_checkout(manifest: Path, editable: Optional[str]) -> Optional[str]:
+    """*editable* as declared in *manifest*, a relative path resolved beside it.
+
+    An absolute or ``~`` path is returned as written, and so is an empty or
+    absent one, which names no checkout. So is one with a drive or root in
+    Windows' spelling (``C:\\src\\voice``), which is not relative to anything
+    even where this host's own rules do not read it as absolute. A relative
+    one is made absolute against the manifest's directory, itself made
+    absolute against the cwd only when the manifest was named by a relative
+    ``--manifest``.
+    """
+    if (
+        not editable
+        or os.path.isabs(os.path.expanduser(editable))
+        or PureWindowsPath(editable).anchor
+    ):
+        return editable
+    return os.path.abspath(os.path.join(Path(manifest).parent, editable))
 
 
 def _pip_spec(target: str, extras: list) -> str:
@@ -1206,7 +1247,8 @@ def _extension_install_run(
     The same blindness reaches every package core's ``uv.lock`` pins: the
     resolver is free to move any of them, and uv's ``--upgrade`` is eager, so
     it does (issue #3502). :meth:`CoreInstallGuard.install_constraints` adds
-    the lock's ``name==version`` lines to the same file for that reason.
+    the lock's lines to the same file for that reason: ``name===version``, or a
+    hold on the checkout the manifest declares for that package.
 
     ``constraint_path`` names the file those lines are written to, and that
     file is NOT deleted on return. The default — a temporary file, removed —
@@ -1638,33 +1680,133 @@ class CoreGuardOutcome:
         return "\n".join(lines)
 
 
-def _lock_bound_sentence(lock, error, lines) -> Optional[str]:
+def _lock_bound_sentence(lock, error, lines, absent=None) -> Optional[str]:
     """The note naming core's ``uv.lock`` as a bound on an install, or None.
 
     Worded once for both kinds of install the guard holds to a lock (#3502).
+    *absent* is the host manifest the guard looked for and did not find
+    (:func:`_host_manifest_checkouts`): every locked package is then pinned,
+    and the note says where it looked rather than leave the pins unexplained.
     """
     if error is not None:
         return (
-            f"core's uv.lock could not be used ({error}), so the install was "
-            "not run: an install that cannot be held to the lock could move a "
-            "package CI tested. Fix what that names, then re-run."
+            f"core's uv.lock could not hold this install ({error}), so the "
+            "install was not run: an install that cannot be held to the lock "
+            "could move a package CI tested. Fix what that names, then re-run."
         )
     if not lines:
         return None
+    sentence = (
+        f"core's uv.lock ({lock.path}) holds {len(lines)} package(s) for this "
+        "install, each at its locked version or on the checkout declared "
+        "for it, so the install can move none of them. If "
+        "the conflict names one at its locked version, the install needs a "
+        "version the lock does not pin: move the lock deliberately "
+        "(`uv lock --upgrade-package <name>` and a green CI run). If it names "
+        "one held on a checkout, move that checkout to a version the install "
+        "accepts."
+    )
+    if absent is not None:
+        sentence += (
+            f" No host manifest exists at {absent}, so none is held on a "
+            "checkout: each is pinned at its locked version. To keep a linked "
+            "checkout, declare it there (`editable = \"<path>\"`)."
+        )
+    return sentence
+
+
+def _declared_checkouts(source_index) -> dict:
+    """``{package: checkout}`` for each entry of *source_index* that declares one.
+
+    An empty ``editable`` names no checkout, so it declares nothing.
+    """
+    return {
+        canonical_package(package): entry.editable
+        for package, entry in source_index.items()
+        if entry.editable
+    }
+
+
+def _host_manifest_checkouts():
+    """``(checkouts, error, absent)`` from the host manifest, for a guard given none.
+
+    The manifest ``feature sync`` and ``kestrel update``'s reconcile read by
+    default (:func:`_host_manifest_path`): the project directory's, never the
+    cwd's. A command launched elsewhere otherwise saw no manifest, and every
+    checkout the host declares was pinned at its locked version instead of
+    held there (#3502).
+
+    * The manifest exists and reads: its checkouts, no error, ``absent`` None.
+    * Nothing exists at that path: no checkouts and ``absent`` names the path.
+      Every locked package is then pinned at its locked version, which is the
+      lock's own hold, and :meth:`CoreInstallGuard.lock_bound_note` says where
+      the guard looked, so the pins are never unexplained.
+    * Anything else (the project directory or the manifest cannot be reached,
+      a link to nowhere or a directory stands at that path, it will not
+      parse): an *error*, and the install is refused. Which packages it
+      declares editable is unknown, and guessing "none" could replace a
+      declared checkout from the index.
+    """
+    import types
+
+    from kestrel_sovereign import feature_reconcile as fr
+    from kestrel_sovereign.feature_registry import load_registry
+
+    try:
+        path = cli._host_manifest_path(types.SimpleNamespace(manifest=None))
+    except (OSError, RuntimeError) as exc:
+        # RuntimeError: the project directory's last fallback is ~/.kestrel,
+        # and `Path.home()` raises it when no home directory can be found.
+        return {}, (
+            f"the host manifest could not be located ({exc}), so which locked "
+            "packages it declares editable is unknown"
+        ), None
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return {}, None, path
+    except OSError as exc:
+        return {}, (
+            f"the host manifest {path} could not be checked ({exc}), so which "
+            "locked packages it declares editable is unknown"
+        ), None
+    try:
+        entries = cli._load_host_manifest(path)
+    except (ValueError, OSError) as exc:
+        return {}, (
+            f"the host manifest {path} would not read ({exc}), so which locked "
+            "packages it declares editable is unknown"
+        ), None
     return (
-        f"core's uv.lock ({lock.path}) holds {len(lines)} package(s) at their "
-        "locked versions for this install, so it can neither upgrade nor "
-        "downgrade what CI tested. If the conflict names one of them, the "
-        "install needs a version the lock does not pin: move the lock "
-        "deliberately (`uv lock --upgrade-package <name>` and a green CI run)."
+        _declared_checkouts(fr.build_source_index(entries, load_registry())),
+        None,
+        None,
+    )
+
+
+def _pip_cannot_hold_checkouts(held) -> str:
+    """Why a lock covering a declared checkout cannot hold a pip install.
+
+    "declared", not "the host manifest declares": ``kestrel update
+    --prefer-source`` declares a package's checkout too
+    (:func:`~kestrel_sovereign.feature_reconcile.preferred_source_index`).
+    """
+    names = ", ".join(held)
+    return (
+        f"this install declares {names} editable and the lock covers "
+        f"{'it' if len(held) == 1 else 'them'}. Only uv can hold a package on "
+        "its checkout during an install (pip refuses an editable constraint), "
+        "and this host installs with pip, so the install could replace that "
+        "checkout from the index. Install uv, or declare the package from "
+        "pypi so its locked version holds it"
     )
 
 
 def _lock_refusal(pip_args, error) -> subprocess.CompletedProcess:
-    """The failed result of an install refused because its lock could not be used."""
+    """The failed result of an install refused because its lock could not hold it."""
     return subprocess.CompletedProcess(
         pip_args, 1, stdout="",
-        stderr=f"refused: core's uv.lock could not be used: {error}",
+        stderr=f"refused: core's uv.lock could not hold this install: {error}",
     )
 
 
@@ -1711,17 +1853,25 @@ class CoreInstallGuard:
         # manifest's bounds from core's shape, which is not where they come
         # from (issue #3106).
         self._manifest_bounds: list = []
-        # A THIRD set: one `name==version` per package core's uv.lock pins, so a
-        # feature install can neither upgrade nor downgrade what CI tested
-        # (issue #3502). Derived from core's shape, like core's own pin, because
-        # the lock is the one beside the checkout core is installed from — and
+        # A THIRD set: one line per package core's uv.lock covers, so a feature
+        # install can neither upgrade nor downgrade what CI tested (issue
+        # #3502). Derived from core's shape, like core's own pin, because the
+        # lock is the one beside the checkout core is installed from — and
         # re-derived with it when the batch moves core (:meth:`refresh`).
-        # `_manifest_editables` names the manifest's editable entries, whose
-        # source the operator declared and a version pin would replace.
+        # `_declared_checkouts` maps each package the manifest declares
+        # editable to its checkout: the one other input those lines are
+        # decided from (:meth:`~kestrel_sovereign.core_lock.CoreLock.constraint_lines`).
+        # None until read, for a caller that passed no manifest: see
+        # :meth:`_checkouts`.
         self._lock = None
         self._lock_error: Optional[str] = None
         self._lock_bounds: list = []
-        self._manifest_editables: frozenset = frozenset()
+        self._declared_checkouts: Optional[dict] = None
+        self._declared_error: Optional[str] = None
+        # The host manifest the guard looked for and found absent, when it read
+        # the declarations itself: named in :meth:`lock_bound_note`, because
+        # every locked package is then pinned at its locked version.
+        self._declared_absent: Optional[Path] = None
         # The lock note for the last core install, whose lock is its target's
         # (:meth:`install_core`), not the one feature installs keep.
         self._core_lock_note: Optional[str] = None
@@ -1740,7 +1890,10 @@ class CoreInstallGuard:
         manifest when the caller has one (``feature sync``, ``update``'s
         reconcile). Commands with no manifest in their contract
         (``feature install`` / ``upgrade``, the install endpoint) pass nothing
-        and guard whatever the venv actually has.
+        and guard whatever the venv actually has. The checkouts the host
+        manifest declares editable still decide how core's lock holds their
+        installs (issue #3502), so for them the guard reads those declarations
+        itself, and only when there is a lock (:meth:`_checkouts`).
         """
         from kestrel_sovereign import feature_reconcile as fr
 
@@ -1757,10 +1910,8 @@ class CoreInstallGuard:
         # another outside its declared window and the run reports success over
         # the violation (issue #3106).
         guard._manifest_bounds = fr.manifest_version_constraints(source_index or {})
-        guard._manifest_editables = frozenset(
-            canonical_package(package)
-            for package, entry in (source_index or {}).items()
-            if entry.editable
+        guard._declared_checkouts = (
+            None if source_index is None else _declared_checkouts(source_index)
         )
         guard._derive_lock(before)
         return guard
@@ -1804,26 +1955,20 @@ class CoreInstallGuard:
 
         *error* is set, and *lines* empty, when the lock exists and cannot be
         read or cannot hold every package it covers here; all three are empty
-        when there is no lock. Two kinds of locked
-        package are left out of *lines*, because a ``==`` pin would replace a
-        source someone chose rather than keep a version CI tested: the
-        manifest's editable entries, and a locked package this venv holds from
-        a source its metadata names (an editable SDK on a dev host). ``uv sync``
-        installs every locked package from the index, so on the update path
-        the second set is exactly what the operator linked by hand. The drift
-        check still reports either one whose version differs from the lock.
+        when there is no lock. *lines* come from
+        :meth:`~kestrel_sovereign.core_lock.CoreLock.constraint_lines`, decided
+        from the lock and the manifest's declared checkouts alone: every locked
+        package is pinned at its locked version, however the venv holds it now,
+        except one the manifest declares editable, which is held on that
+        checkout instead. Nothing about the install that carries the lines, or
+        about how a package is installed, can leave a locked package free. Each
+        rule that tried to decided wrongly for some spelling of an install or
+        some state of a ``direct_url.json`` (#3502).
 
-        Only a POSITIVELY direct install is left out
-        (:attr:`~kestrel_sovereign.feature_reconcile.Provenance.is_direct`).
-        A ``direct_url.json`` that will not read says nothing about a link, so
-        that package keeps its pin: reading "unknown" as "linked" let a damaged
-        metadata file take a locked package out from under the lock.
-
-        A locked package the lock names no single version of here
-        (:attr:`~kestrel_sovereign.core_lock.CoreLock.undetermined`) is an
-        *error*, not a missing line, unless it is left out for the reasons
-        above: lines that held every package but it would let the install move
-        it (:meth:`~kestrel_sovereign.core_lock.CoreLock.constraint_lines`).
+        A hold on a checkout can only be carried by uv: pip refuses an editable
+        constraint. On a host that installs with pip, a lock covering a
+        declared checkout is therefore an *error*, and the install is refused
+        rather than run with that package free to leave its checkout.
         """
         from kestrel_sovereign.core_lock import CoreLockError
 
@@ -1831,14 +1976,35 @@ class CoreInstallGuard:
             lock = read_lock()
             if lock is None:
                 return None, None, []
-            linked = frozenset(
-                name for name in lock.names()
-                if cli._direct_url_provenance(name).is_direct
-            )
-            lines = lock.constraint_lines(self._manifest_editables | linked)
+            checkouts, error = self._checkouts()
+            if error is not None:
+                return None, error, []
+            lines = lock.constraint_lines(checkouts)
         except CoreLockError as exc:
             return None, str(exc), []
+        held = lock.checkout_held(checkouts)
+        if held and not _have_uv():
+            return None, _pip_cannot_hold_checkouts(held), []
         return lock, None, lines
+
+    def _checkouts(self):
+        """``(declared checkouts, error)``: the second input to the lock's lines.
+
+        The manifest's, when the caller passed one. Otherwise the host
+        manifest's, read once and only here, which is only reached when there
+        is a lock to hold an install to: without one the declarations decide
+        nothing, so a command that never read the manifest still does not.
+        A manifest that exists and will not read is an *error*: which packages
+        it declares editable is unknown, and guessing "none" could replace a
+        declared checkout from the index.
+        """
+        if self._declared_checkouts is None:
+            (
+                self._declared_checkouts,
+                self._declared_error,
+                self._declared_absent,
+            ) = _host_manifest_checkouts()
+        return self._declared_checkouts, self._declared_error
 
     @property
     def constraints(self) -> list:
@@ -1892,7 +2058,9 @@ class CoreInstallGuard:
 
         ``None`` when no lock binds the install.
         """
-        return _lock_bound_sentence(self._lock, self._lock_error, self._lock_bounds)
+        return _lock_bound_sentence(
+            self._lock, self._lock_error, self._lock_bounds, self._declared_absent,
+        )
 
     def core_lock_bound_note(self) -> Optional[str]:
         """The same sentence for the last :meth:`install_core`, whose lock is its target's."""
@@ -1905,12 +2073,13 @@ class CoreInstallGuard:
         The other fact, under its own name. Core's pin bounds core's source and
         version; the manifest's windows bound everything else it declares, and
         an install that has to satisfy one entry must not move another out of
-        its own (issue #3106). The lock's pins hold every package CI installed
-        at the version CI tested (issue #3502): ``uv pip`` never reads the lock,
-        and an eager ``--upgrade`` otherwise moves the whole resolution. A
-        package named by both the manifest and the lock carries both lines; the
-        resolver intersects them, so a window that excludes the locked version
-        fails the install rather than moving the package.
+        its own (issue #3106). The lock's lines hold every package CI installed
+        at the version CI tested, or on the checkout the manifest declares for
+        it (issue #3502): ``uv pip`` never reads the lock, and an eager
+        ``--upgrade`` otherwise moves the whole resolution. A package named by
+        both the manifest and the lock carries both lines; the resolver
+        intersects them, so a window that excludes the locked version fails the
+        install rather than moving the package.
         """
         return (
             list(self._constraints)
@@ -1971,7 +2140,9 @@ class CoreInstallGuard:
             lock, error, lines = self._bind_lock(
                 lambda: load_core_lock(Path(lock_checkout).expanduser())
             )
-        self._core_lock_note = _lock_bound_sentence(lock, error, lines)
+        self._core_lock_note = _lock_bound_sentence(
+            lock, error, lines, self._declared_absent,
+        )
         if error is not None:
             return _lock_refusal(pip_args, error)
         result = self._install(
@@ -2351,7 +2522,9 @@ class CoreInstallGuard:
                 constraint_path=None,
                 lock_error=lock_error,
             )
-        lock_note = _lock_bound_sentence(lock, None, lock_lines) or ""
+        lock_note = (
+            _lock_bound_sentence(lock, None, lock_lines, self._declared_absent) or ""
+        )
         lines, constraint_path = self._restore_constraints(lock_lines)
         if lines and not constraint_path:
             # Bounds exist and nothing carries them. Rendering the command
@@ -3516,7 +3689,11 @@ def add_feature_subparser(subparsers) -> None:
     feat_sync.add_argument(
         "--manifest",
         default=None,
-        help=f"Path to the host manifest (default: ./{DEFAULT_HOST_MANIFEST})",
+        help=(
+            f"Path to the host manifest (default: {DEFAULT_HOST_MANIFEST} in "
+            "the project directory: KESTREL_HOME, else the project found from "
+            "the cwd)"
+        ),
     )
     feat_sync.add_argument(
         "--capture",
@@ -3549,7 +3726,11 @@ def add_feature_subparser(subparsers) -> None:
     feat_status.add_argument(
         "--manifest",
         default=None,
-        help=f"Path to the host manifest (default: ./{DEFAULT_HOST_MANIFEST})",
+        help=(
+            f"Path to the host manifest (default: {DEFAULT_HOST_MANIFEST} in "
+            "the project directory: KESTREL_HOME, else the project found from "
+            "the cwd)"
+        ),
     )
 
     feat_enable = feature_sub.add_parser("enable", help="Enable a disabled feature")

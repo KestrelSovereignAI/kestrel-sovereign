@@ -13,9 +13,11 @@ its own ``uv sync`` had put the locked version back.
 
 One reading of the lock serves two purposes:
 
-* :meth:`CoreLock.constraint_lines` gives one ``name==version`` line per locked
-  package. Every feature install carries them, so a feature can neither
-  upgrade nor downgrade a package the lock pins. A conflict fails the install
+* :meth:`CoreLock.constraint_lines` gives one line per locked package: its
+  ``name===version``, or, for a package the host manifest declares editable,
+  a hold on that checkout. Every feature install carries them, so a feature
+  can neither upgrade nor downgrade a package the lock pins, nor resolve a
+  declared checkout's package from the index. A conflict fails the install
   instead of moving the package, and a locked package with no single version
   for this environment refuses it.
 * :func:`lock_drift` lists every installed package whose version differs from
@@ -33,6 +35,7 @@ import stat
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from kestrel_sovereign.feature_reconcile import (
@@ -90,22 +93,50 @@ class CoreLock:
         """Every package this lock covers here: the pinned and the undetermined."""
         return tuple(package.name for package in self.packages) + self.undetermined
 
-    def constraint_lines(self, exclude: Iterable[str] = ()) -> List[str]:
-        """``name==version`` for every locked package not in *exclude*.
+    def constraint_lines(
+        self, declared_checkouts: Mapping[str, str] = MappingProxyType({}),
+    ) -> List[str]:
+        """The line every install carries for each package this lock covers.
 
-        *exclude* holds canonical names the caller has a deliberate reason to
-        leave free: a locked package someone linked from a checkout or another
-        direct source. A version pin would replace that source rather than
-        keep a tested version. :func:`lock_drift` still reports it.
+        Decided from two inputs and nothing else: this lock, for the versions,
+        and *declared_checkouts*, the packages the host manifest declares
+        ``editable``, mapped to the checkout each names. Not from the
+        arguments of the install the lines are for, and not from how a package
+        is installed now: either let one install, or one damaged
+        ``direct_url.json``, take a locked package out from under the lock
+        (#3502).
 
-        Raises :class:`CoreLockError` when an :attr:`undetermined` package is
-        not in *exclude*. It has no version to carry, so the lines would hold
-        every package but that one, and an install held to them would be free
-        to move it: the lines are a whole hold of the lock or none. The drift
-        check never asks for lines, so it still reports what it can compare.
+        * A package with no declared checkout gets ``name===<locked version>``,
+          however it is installed. A linked copy at another version is put
+          back to the locked one or the install fails, and so is one installed
+          from a URL. ``===``, not ``==``: PEP 440 lets ``==1.0`` match any
+          local build ``1.0+<label>``, and uv prefers one when an index offers
+          it, so ``==`` would let an install move a locked package to a build
+          the lock never named (and :func:`lock_drift` would then report it).
+          Measured on uv 0.9.22 and pip 25.0: ``===`` refuses the local build,
+          and still matches the locked version however the artifact spells it
+          (``2024.01.01`` for a locked ``2024.1.1``, ``v1.2``,
+          ``1.0.0.POST1``), because both compare the parsed version.
+        * A package with a declared checkout gets ``-e name @ <file URL>`` (see
+          :func:`checkout_hold_line`). It stays on that checkout: the resolver
+          may neither replace the link from the index nor move it to another
+          version, and an install whose resolution needs another version fails.
+          Its locked version is not pinned, since the operator chose to run
+          what that checkout builds.
+
+        Raises :class:`CoreLockError` when an :attr:`undetermined` package has
+        no declared checkout. It has no version to carry, so the lines would
+        hold every package but that one, and an install held to them would be
+        free to move it: the lines are a whole hold of the lock or none. The
+        drift check never asks for lines, so it still reports what it can
+        compare.
         """
-        skip = {canonical_package(name) for name in exclude}
-        unpinnable = [name for name in self.undetermined if name not in skip]
+        checkouts = {
+            canonical_package(name): checkout
+            for name, checkout in declared_checkouts.items()
+            if checkout
+        }
+        unpinnable = [name for name in self.undetermined if name not in checkouts]
         if unpinnable:
             raise CoreLockError(
                 f"{self.path} names no single version for this environment of: "
@@ -115,11 +146,42 @@ class CoreLock:
                 "lock was resolved for, or its markers or versions do not "
                 "evaluate here"
             )
-        return [
-            f"{package.name}=={package.version}"
-            for package in self.packages
-            if package.name not in skip
-        ]
+        versions = self.versions()
+        lines = []
+        for name in sorted(self.names()):
+            if name in checkouts:
+                lines.append(checkout_hold_line(name, checkouts[name]))
+            else:
+                lines.append(f"{name}==={versions[name]}")
+        return lines
+
+    def checkout_held(self, declared_checkouts: Mapping[str, str]) -> Tuple[str, ...]:
+        """The packages this lock covers that :meth:`constraint_lines` holds by checkout."""
+        held = {canonical_package(name) for name, path in declared_checkouts.items() if path}
+        return tuple(sorted(name for name in self.names() if name in held))
+
+
+def checkout_hold_line(name: str, checkout: str) -> str:
+    """The constraint that keeps *name* on its editable *checkout*.
+
+    ``-e name @ file:///<checkout>``. Measured on uv 0.9.22 against an
+    editable dependency: the link is kept by a plain install and by an eager
+    ``--upgrade``; an install whose resolution needs another version fails
+    instead of taking an index wheel; a package not linked from the checkout
+    is linked from it when the install resolves it; a constraint on a package
+    the install never resolves is ignored. A ``name @ file:///...`` constraint
+    without ``-e`` is not a substitute: uv replaces the editable link with a
+    non-editable build of the same directory.
+
+    pip refuses an editable constraint outright, so only an install that runs
+    on uv can carry this line (``CoreInstallGuard`` refuses the rest).
+
+    The path is made absolute without touching the filesystem, as the
+    ``-e <checkout>`` an install of the entry itself names. uv compares the two
+    after resolving links (``/tmp`` against ``/private/tmp`` on macOS).
+    """
+    absolute = os.path.abspath(os.path.expanduser(checkout))
+    return f"-e {canonical_package(name)} @ {Path(absolute).as_uri()}"
 
 
 @dataclass(frozen=True)

@@ -1342,13 +1342,21 @@ def _run_feature_reconcile(
             installed_versions[pkg] = None
         editable_paths[pkg] = cli._editable_install_path(pkg)
 
+    # `--prefer-*` overrides the source map's declarations, so it is applied to
+    # them once, here, and the plan and the guard (step 4) both read the
+    # result. Applied to the plan alone, `--prefer-pypi` planned an index
+    # install of an entry declared editable while core's lock held that
+    # package on its checkout (#3502).
+    source_index = fr.preferred_source_index(
+        source_index, pkg_infos, editable_paths, prefer,
+    )
+
     actions, no_source = fr.plan_reconcile(
         pkg_infos,
         source_index,
         installed_versions,
         editable_paths,
         class_to_pkg,
-        prefer=prefer,
     )
 
     if no_source:
@@ -1385,6 +1393,8 @@ def _run_feature_reconcile(
     # to the SAME source-map policy: reconcile never installs core itself (core
     # classes are bundled, so they are excluded from the plan), so there is no
     # core entry to apply first here — only a policy to hold everything else to.
+    # `source_index` is the one the plan read, `--prefer-*` included, so the
+    # lock holds each package to the source the plan chose for it.
     guard = CoreInstallGuard.snapshot(source_index)
 
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")

@@ -4012,8 +4012,11 @@ async def test_profile_checkout_lands_on_fetched_branch_commit(tmp_path):
         repo_path=str(work), target_ref="main", allow_migrations=False,
     )
     for step in steps:
-        if step.name == "install":
-            continue  # do not run `uv sync` in a unit test
+        if step.name in ("install", "feature_sync"):
+            # Do not run `uv sync` or a real `kestrel feature sync` in a unit
+            # test. The suite's project directory carries a host manifest, so
+            # the profile includes the sync step.
+            continue
         outcome = await feat._run_update_step(step)
         assert outcome["ok"], f"step {step.name!r} failed: {outcome}"
 

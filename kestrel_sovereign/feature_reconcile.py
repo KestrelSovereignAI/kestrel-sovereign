@@ -25,7 +25,7 @@ it is trivially testable; ``cli_lifecycle.cmd_update`` owns execution + display.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from packaging.utils import canonicalize_name
 
@@ -229,18 +229,6 @@ class Provenance:
         which is the defect.
         """
         return self.known and self.url is None
-
-    @property
-    def is_direct(self) -> bool:
-        """Did this name its source directly? Unknown answers **no** here too.
-
-        The mirror of :attr:`is_from_index`, and not its negation: unknown is
-        neither. Asked to decide whether a package was deliberately linked
-        from a source a version pin would replace. "The metadata would not
-        read" is not evidence of a deliberate link, so it keeps the pin
-        (issue #3502).
-        """
-        return self.known and self.url is not None
 
     @property
     def editable_path(self) -> Optional[str]:
@@ -1157,26 +1145,92 @@ def package_for_label(label: str, registry) -> str:
     return canonical_package(label)
 
 
+SOURCE_PREFERENCES = ("source", "pypi")
+
+
+def preferred_source_index(
+    source_index: Dict[str, SourceEntry],
+    packages: Iterable[str],
+    editable_paths: Dict[str, Optional[str]],
+    prefer: Optional[str],
+) -> Dict[str, SourceEntry]:
+    """The source declarations a reconcile acts on: the manifest's, with *prefer* applied.
+
+    ``kestrel update --prefer-source`` / ``--prefer-pypi`` override where each
+    planned package comes from, so the override is a declaration, and both
+    readers of the declarations take it from here: :func:`plan_reconcile`,
+    for the action it takes on each package, and the install guard, for the
+    lock line every install in the batch carries for it. Applied to the plan
+    alone, ``--prefer-pypi`` planned an index install of an entry declared
+    editable while the lock line held that package on its checkout, so the
+    install the plan asked for was one the lock forbade (#3502).
+
+    * ``"pypi"``: each package in *packages* is declared from the index,
+      keeping its entry's version spec and extras. An editable entry has no
+      spec, so it becomes the legacy "latest from the index" entry.
+    * ``"source"``: each package in *packages* with a known checkout is
+      declared editable at it: its entry's ``editable``, else the checkout the
+      venv links it to now (*editable_paths*). A ``pypi`` window belongs to
+      the index declaration this replaces, so it is replaced with it. A
+      package with no known checkout keeps its entry.
+    * ``None``: the manifest's declarations, unchanged.
+
+    Only *packages*, the ones the plan covers, are overridden. That never
+    includes core (:func:`resolve_packages` leaves it out): the plan never
+    installs it, and its entry is the source policy every feature install
+    holds it to (#2949), which a preference for features must not rewrite.
+    """
+    if prefer is not None and prefer not in SOURCE_PREFERENCES:
+        raise ValueError(
+            f"unknown source preference {prefer!r}; expected one of "
+            f"{', '.join(SOURCE_PREFERENCES)} or None"
+        )
+    effective = dict(source_index)
+    if prefer is None:
+        return effective
+    for package in packages:
+        if canonical_package(package) == CORE_DISTRIBUTION:
+            continue
+        entry = source_index.get(package)
+        extras = list(entry.extras) if entry is not None else []
+        if prefer == "pypi":
+            effective[package] = SourceEntry(
+                package=package,
+                pypi=entry.pypi if entry is not None else None,
+                extras=extras,
+            )
+            continue
+        checkout = (entry.editable if entry is not None else None) or editable_paths.get(
+            package
+        )
+        if checkout:
+            effective[package] = SourceEntry(
+                package=package, editable=checkout, extras=extras,
+            )
+    return effective
+
+
 def plan_reconcile(
     pkg_infos: Dict,
     source_index: Dict[str, SourceEntry],
     installed_versions: Dict[str, Optional[str]],
     editable_paths: Dict[str, Optional[str]],
     class_to_pkg: Dict[str, str],
-    prefer: Optional[str] = None,
 ) -> Tuple[List[ReconcileAction], List[str]]:
     """Plan the reconcile for every required, installable package.
 
     Args:
         pkg_infos: required packages → FeaturePackageInfo (from resolve_packages).
-        source_index: package → SourceEntry (from the source map).
+        source_index: package → SourceEntry: the source map with any
+            ``--prefer-*`` override already applied by
+            :func:`preferred_source_index`. The plan takes the preference from
+            there and nowhere else, so the guard holding the batch's installs,
+            which reads the same index, holds each package to the source the
+            plan chose.
         installed_versions: package → installed version (or None if absent).
         editable_paths: package → editable checkout path (or None) as the venv
             *currently* records it (PEP 660 ``direct_url.json``).
         class_to_pkg: class → package, to populate ``required_by``.
-        prefer: ``"source"`` forces editable update mode where a checkout path
-            is known; ``"pypi"`` forces pip-upgrade mode even for editable
-            installs; ``None`` honours the source map.
 
     Returns ``(actions, no_source)`` where ``no_source`` lists required packages
     with neither a source-map entry nor a registry-resolvable install source —
@@ -1214,15 +1268,10 @@ def plan_reconcile(
         if editable_path is None and detected_editable:
             editable_path = detected_editable
 
-        # Resolve mode, honouring the prefer override.
-        if prefer == "pypi":
-            mode = "pypi"
-        elif prefer == "source" and editable_path:
+        # An entry that declares the index wins over a detected link; any
+        # ``--prefer-*`` override is already in the entry.
+        if editable_path and (src is None or src.mode == "editable"):
             mode = "editable"
-        elif editable_path and (src is None or src.mode == "editable"):
-            mode = "editable"
-        elif pypi_spec is not None or current is not None or info.package:
-            mode = "pypi"
         else:
             mode = "pypi"
 
@@ -1231,10 +1280,6 @@ def plan_reconcile(
         force_reinstall = False
         op = "update" if current is not None else "install"
         if mode == "editable":
-            if not editable_path:
-                # prefer=source asked for editable but no checkout is known.
-                no_source.append(package)
-                continue
             source = editable_path
             # The venv must be re-linked via ``pip install -e`` (not just
             # git-pulled) when the package is absent, is installed from a

@@ -1962,6 +1962,9 @@ class TestInstallFeature:
         refused it (#3502).
         """
         mock_registry.return_value = dict(FAKE_REGISTRY)
+        # The guard reads the project directory's host manifest; keep it this
+        # test's own.
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
         checkout = tmp_path / "core"
         checkout.mkdir()
         (checkout / "uv.lock").write_text(
@@ -1985,7 +1988,7 @@ class TestInstallFeature:
         detail = resp.json()["detail"]
         assert "No solution found" in detail
         assert "core's uv.lock" in detail
-        assert "anthropic==0.117.0" in venv.constraint_files[0].splitlines()
+        assert "anthropic===0.117.0" in venv.constraint_files[0].splitlines()
         assert venv.installed["anthropic"] == "0.117.0"
         assert "kestrel-feature-test" not in venv.installed
 
