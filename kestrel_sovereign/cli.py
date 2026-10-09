@@ -1488,6 +1488,15 @@ def cmd_constitution_reanchor(args) -> int:
         )
         return 0
     if result.drift_unforced:
+        if result.bootstrap_custody_pending:
+            print(
+                f"{result.agent_name}: initial-anchor custody remains pending.\n"
+                f"  Anchor: {result.new_hash[:12]}… (current)\n"
+                f"{target}\n"
+                f"Re-run with --force and a Sovereign-signed artifact to consume "
+                f"custody atomically. Full integrity verification remains required. {planned_backup}"
+            )
+            return 1
         if result.governance_edge_drift and result.old_hash == result.new_hash:
             # Edge-only drift (#2616): the hash is current but the
             # governed_by edge set is inconsistent — integrity proof 2
@@ -1506,7 +1515,7 @@ def cmd_constitution_reanchor(args) -> int:
             return 1
         print(
             f"{result.agent_name}: constitution drift detected.\n"
-            f"  Stored: {result.old_hash[:12]}…\n"
+            f"  Stored: {(result.old_hash[:12] + '…') if result.old_hash else '(none)'}\n"
             f"  File:   {result.new_hash[:12]}… ({result.canonical_path})\n"
             f"{target}\n"
             f"\n"
@@ -1526,7 +1535,7 @@ def cmd_constitution_reanchor(args) -> int:
         return 0
     print(
         f"{result.agent_name}: reanchored.\n"
-        f"  Old: {result.old_hash[:12]}…\n"
+        f"  Old: {(result.old_hash[:12] + '…') if result.old_hash else '(none)'}\n"
         f"  New: {result.new_hash[:12]}…\n"
         f"  Source:  {result.canonical_path}\n"
         f"{target}\n"

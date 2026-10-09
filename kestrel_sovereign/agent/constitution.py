@@ -1726,6 +1726,7 @@ class ConstitutionMixin:
         return await store.consume_initial_anchor_custody(
             self.agent_id,
             expected_fence=(self._constitution_state_revision, self._constitution_state_generation),
+            occurred_at=self._constitution_now(),
         )
 
     def _publish_consumed_anchor_custody(self, state):

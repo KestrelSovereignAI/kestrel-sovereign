@@ -425,6 +425,7 @@ class ConstitutionRuntimeStateStore:
     async def consume_initial_anchor_custody(
         self, agent_id: str, *,
         expected_fence: Optional[tuple[Optional[int], Optional[str]]] = None,
+        occurred_at: Optional[datetime] = None,
     ) -> Optional[ConstitutionRuntimeState]:
         """Consume first-anchor permission inside the caller's graph transaction.
 
@@ -442,7 +443,7 @@ class ConstitutionRuntimeStateStore:
         if current is None or not current.bootstrap_pending:
             return None
         return await self.write(
-            replace(current, bootstrap_pending=False),
+            replace(current, bootstrap_pending=False, updated_at=occurred_at or datetime.now(timezone.utc)),
             event_type="initial_anchor_started",
         )
 

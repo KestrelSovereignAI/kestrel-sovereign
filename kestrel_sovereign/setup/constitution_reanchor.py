@@ -412,6 +412,8 @@ class ReanchorResult:
     #: Set when a forced reanchor re-indexed RAG, i.e. the hash moved. None
     #: for a same-hash governance repair, which leaves the index alone.
     rag_index: ConstitutionRagIndex | None = None
+    #: A same-hash inspection may still require signed custody consumption.
+    bootstrap_custody_pending: bool = False
 
 
 async def reanchor_constitution(
@@ -692,13 +694,13 @@ async def reanchor_constitution(
                 ),
             )
 
-    if old_hash is None:
+    if old_hash is None and (not row_exists or agent_did != target.agent_did):
         return _result(
             old_hash=None,
             new_hash=None,
             error=(
                 f"Agent has no constitution_hash property in {target.describe()}. "
-                "Re-incept the agent rather than reanchoring."
+                "Restore the correctly owned identity/birth record before signed repair."
             ),
         )
 
@@ -812,7 +814,7 @@ async def reanchor_constitution(
         anchored_contract=anchored_contract,
         anchored_text=anchored_text,
         anchored_present=anchored_present,
-        old_hash=old_hash,
+        old_hash=old_hash or "missing-pointer",
         new_hash=new_hash,
         new_text=new_text,
     )
@@ -859,11 +861,18 @@ async def reanchor_constitution(
     governance_edge_drift = (
         new_hash not in visible_edge_targets or bool(stale_edge_targets)
     )
+    custody_pending = False
+    if old_hash == new_hash:
+        try:
+            custody_pending = await _initial_anchor_custody_pending(target)
+        except Exception as exc:
+            return _result(old_hash=old_hash, new_hash=new_hash, error=f"Cannot inspect initial-anchor custody: {exc}. Nothing was written.")
 
     if (
         old_hash == new_hash
         and not needs_sidecar_backfill
         and not governance_edge_drift
+        and not custody_pending
     ):
         return _result(
             old_hash=old_hash,
@@ -876,6 +885,7 @@ async def reanchor_constitution(
             old_hash=old_hash,
             new_hash=new_hash,
             drift_unforced=True,
+            bootstrap_custody_pending=custody_pending,
             governance_edge_drift=governance_edge_drift,
             stale_edge_targets=stale_edge_targets,
         )
@@ -1001,6 +1011,7 @@ async def reanchor_constitution(
         backup_path=backup_path,
         backup_unavailable_reason=backup_unavailable_reason,
         reanchored=True,
+        bootstrap_custody_pending=custody_pending,
         governance_edge_drift=governance_edge_drift,
         stale_edge_targets=stale_edge_targets,
         rag_index=rag_index,
@@ -1086,6 +1097,21 @@ async def runtime_record_is_pending(target: ReanchorTarget) -> bool:
             "SELECT 1 FROM graph_nodes WHERE node_id = ?", (target.agent_did,)
         )
         return physical is None
+
+
+async def _initial_anchor_custody_pending(target: ReanchorTarget) -> bool:
+    """Read existing custody without initializing/migrating a legacy schema."""
+    from kestrel_sovereign.constitution.runtime_state import ConstitutionRuntimeStateStore
+
+    async with target.open_storage(cold_read=True) as storage:
+        store = ConstitutionRuntimeStateStore(storage._backend)
+        if not await store._has_column("bootstrap_pending"):
+            return False
+        row = await storage._backend.fetch_one(
+            "SELECT bootstrap_pending FROM constitution_runtime_state WHERE agent_id = ?",
+            (target.agent_did,),
+        )
+        return row is not None and bool(row[0])
 
 
 async def _read_agent_anchor(
@@ -1187,9 +1213,18 @@ async def _read_agent_anchor(
         # in the cohort this guard protects whose governance edge has drifted.
         # See :mod:`kestrel_sovereign.constitution.anchored_bytes`.
         anchored_present = False
-        if anchored_hash:
+        historical_hash = anchored_hash
+        if not historical_hash and governed_by_targets:
+            candidates = set(governed_by_targets)
+            if len(candidates) != 1:
+                raise ValueError("Missing anchor pointer has ambiguous historical governance; restore its exact prior pointer before signed repair")
+            # Deleting the pointer cannot waive rights still witnessed in the
+            # previous governing bytes. This is historical evidence ONLY,
+            # never an unsigned replacement pointer or governing source.
+            historical_hash = next(iter(candidates))
+        if historical_hash:
             anchored_text, anchored_present = await read_anchored_constitution(
-                storage.db, anchored_hash
+                storage.db, historical_hash
             )
         return (
             anchored_hash,
@@ -1207,7 +1242,7 @@ async def _write_reanchor(
     *,
     target: ReanchorTarget,
     agent_did: str,
-    old_hash: str,
+    old_hash: str | None,
     new_hash: str,
     new_content: bytes,
     canonical_path: Path,
@@ -1514,7 +1549,7 @@ async def _reindex_constitution_rag(
     *,
     agent_did: str,
     embedding: AgentEmbeddingResolution,
-    old_hash: str,
+    old_hash: str | None,
     new_hash: str,
     content: str,
 ) -> ConstitutionRagIndex:
@@ -1538,7 +1573,8 @@ async def _reindex_constitution_rag(
         compute_embeddings=embedding.error is None,
     )
     stored = await rag.read_indexed_chunks(new_hash)
-    await rag.delete_chunks_for_file(old_hash)
+    if old_hash is not None:
+        await rag.delete_chunks_for_file(old_hash)
 
     target = embedding.profile_id
     unembedded = sum(1 for chunk in stored if not chunk.embedding)

@@ -980,6 +980,16 @@ revision. An absent anchor in that cohort requires native signed repair.
 Reading a constitution or initializing its display feature never repairs an
 existing identity's deleted anchor. That requires native signed reanchor and
 the normal full integrity verification; an absent anchor is not a fresh boot.
+The public offline repair accepts a missing hash only on the exact correctly
+owned identity. Unsigned inspection reports drift without writing; forced
+repair still verifies the operator-pinned root and exact signed governing hash.
+Existing emancipation receipts and historical governance bytes remain protected;
+ambiguous historical anchors or unreadable rights evidence refuse repair.
+Custody consumption records the transition's current UTC time, not the prior
+bootstrap state's timestamp, and does not count as a successful full audit.
+An unchanged hash/edge set is not an unchanged outcome while first-anchor
+custody remains pending: inspection reports that state, and only signed forced
+repair consumes it. Read-only inspection never installs lifecycle schema.
 The display feature reads the authoritative anchored text before each request;
 pre-anchor initialization never caches unrelated packaged governing text.
 Failure to retrieve application amendments or render mandate constraints
