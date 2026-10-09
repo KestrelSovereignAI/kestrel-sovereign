@@ -953,6 +953,98 @@ def test_a_short_name_one_configured_repository_has_is_that_one():
     )
 
 
+# ---------------------------------------------------------------------------
+# A repeated or differently cased scan_repos entry is one repository (#3542)
+# ---------------------------------------------------------------------------
+
+
+REPEATED_WIDGETS = [
+    pytest.param([ACME_WIDGETS, ACME_WIDGETS], id="repeated"),
+    pytest.param([ACME_WIDGETS, "acme/Widgets"], id="case-variant"),
+    pytest.param([ACME_WIDGETS, "ACME/WIDGETS", ACME_WIDGETS], id="both"),
+]
+
+
+@pytest.mark.parametrize("configured", REPEATED_WIDGETS)
+@pytest.mark.parametrize(
+    ("row", "source"),
+    [
+        pytest.param({"issue": "widgets#46"}, REPO_FROM_ISSUE, id="short-issue"),
+        pytest.param({"repo": "widgets", "issue": "#46"}, REPO_FROM_ROW,
+                     id="short-repo"),
+    ],
+)
+def test_a_short_name_one_repository_has_under_two_spellings_is_that_one(
+    row, source, configured
+):
+    """``Acme/widgets`` listed twice used to count as two candidates, and
+    ``widgets#46`` was refused as ambiguous between a repository and itself."""
+    reference = resolve_blocker_reference(row, configured, "Acme/home")
+
+    assert (reference.repo, reference.number, reference.problem) == (
+        ACME_WIDGETS, 46, None
+    )
+    assert reference.source == source
+
+
+@pytest.mark.parametrize("configured", REPEATED_WIDGETS)
+def test_a_bare_number_on_one_repository_under_two_spellings_is_that_one(
+    configured,
+):
+    reference = resolve_blocker_reference({"issue": "#46"}, configured, "Acme/home")
+
+    assert (reference.repo, reference.problem, reference.source) == (
+        ACME_WIDGETS, None, blocker_reconcile.REPO_FROM_LONE_SCAN_REPO
+    )
+
+
+def test_a_repeated_entry_does_not_settle_a_short_name_two_owners_have():
+    reference = resolve_blocker_reference(
+        {"issue": "widgets#46"},
+        [ACME_WIDGETS, "acme/Widgets", OTHER_WIDGETS, "other/WIDGETS"],
+        "Acme/home",
+    )
+
+    assert reference.problem == blocker_reconcile.AMBIGUOUS_REPO_NAME
+    assert reference.candidates == (ACME_WIDGETS, OTHER_WIDGETS)
+
+
+def test_configured_repos_lists_each_repository_once_as_first_spelled():
+    data = {
+        "morning_signal_config": {
+            "scan_repos": [ACME_WIDGETS, " acme/Widgets ", OTHER_WIDGETS,
+                           ACME_WIDGETS],
+        }
+    }
+
+    assert blocker_reconcile.configured_repos(data) == [ACME_WIDGETS, OTHER_WIDGETS]
+
+
+@pytest.mark.asyncio
+async def test_add_blocker_and_apply_read_a_short_name_under_two_spellings(
+    tmp_path, monkeypatch
+):
+    """The reported shape: ``strategy_add_blocker`` refused ``widgets#46``
+    with ``scan_repos: [Acme/widgets, acme/Widgets]``."""
+    monkeypatch.setenv("GITHUB_SELF_REPO", "Acme/home")
+    feature = await _feature(tmp_path, [], scan_repos=[ACME_WIDGETS, "acme/Widgets"])
+
+    added = await feature.strategy_add_blocker(issue="widgets#46", title="t")
+
+    assert added.status.value == "ok", added.error
+    [row] = _ledger_on_disk(tmp_path)[BLOCKERS_KEY]
+    assert (row["issue"], row["repo"]) == (f"{ACME_WIDGETS}#46", ACME_WIDGETS)
+
+    github = _FakeGitHub({(ACME_WIDGETS, 46): _issue(ACME_WIDGETS, 46, "closed")})
+    token, get = _patched(github)
+    with token, get:
+        await feature.strategy_reconcile_blockers(apply="yes")
+
+    assert github.paths == [f"/repos/{ACME_WIDGETS}/issues/46"]
+    [row] = _ledger_on_disk(tmp_path)[BLOCKERS_KEY]
+    assert row["resolution"].startswith(f"GitHub reports {ACME_WIDGETS}#46 closed")
+
+
 def _issues_stated(row):
     from kestrel_sovereign.features.strategic_memory.morning_signal import (
         _issues_stated_by_ledger,
