@@ -108,8 +108,9 @@ def _quoted_end(sql: str, position: int, *, escapes: bool, postgres: bool) -> in
 
 def _statement_heads(sql: str, *, postgres: bool, backslash_strings: bool):
     position, length, head = 0, len(sql), True
-    create_definition, routine_definition = False, False
-    atomic_depth, case_depth = 0, 0
+    create_prefix = None
+    routine_definition, signature_complete = False, False
+    atomic_depth, paren_depth = 0, 0
     previous_word = None
     while position < length:
         character = sql[position]
@@ -117,7 +118,8 @@ def _statement_heads(sql: str, *, postgres: bool, backslash_strings: bool):
             position += 1
         elif sql.startswith("--", position):
             position += 2
-            while position < length and sql[position] not in "\r\n":
+            line_endings = "\r\n" if postgres else "\n"
+            while position < length and sql[position] not in line_endings:
                 position += 1
         elif sql.startswith("/*", position):
             position += 2
@@ -156,9 +158,12 @@ def _statement_heads(sql: str, *, postgres: bool, backslash_strings: bool):
             previous_word = None
         elif character == ";":
             position += 1
-            if not atomic_depth:
-                head = True
-                create_definition = routine_definition = False
+            # SQL-standard bodies contain complete SQL statements. Their END
+            # delimiter occurs at a statement head, never as a SELECT alias or
+            # an expression's CASE END. Do not try to count expression words.
+            head = True
+            create_prefix = None
+            routine_definition = signature_complete = False
             previous_word = None
         elif _identifier_character(character):
             start = position
@@ -166,20 +171,36 @@ def _statement_heads(sql: str, *, postgres: bool, backslash_strings: bool):
                 position += 1
             word = sql[start:position]
             upper = word.upper()
+            if head and atomic_depth and not paren_depth and upper == "END":
+                atomic_depth -= 1
+                head = False
+                create_prefix = None
+                routine_definition = signature_complete = False
+                previous_word = None
+                continue
             if head:
-                yield upper
-                create_definition = postgres and upper == "CREATE"
-            if create_definition and upper in {"FUNCTION", "PROCEDURE"}:
-                routine_definition = True
-            if routine_definition and upper == "ATOMIC" and previous_word == "BEGIN":
-                atomic_depth += 1
-            elif atomic_depth and upper == "CASE":
-                case_depth += 1
-            elif atomic_depth and upper == "END":
-                if case_depth:
-                    case_depth -= 1
+                if not atomic_depth:
+                    yield upper
+                create_prefix = "create" if postgres and upper == "CREATE" else None
+                routine_definition = signature_complete = False
+            elif create_prefix == "create":
+                if upper == "OR":
+                    create_prefix = "or"
                 else:
-                    atomic_depth -= 1
+                    routine_definition = upper in {"FUNCTION", "PROCEDURE"}
+                    create_prefix = None
+            elif create_prefix == "or":
+                create_prefix = "replace" if upper == "REPLACE" else None
+            elif create_prefix == "replace":
+                routine_definition = upper in {"FUNCTION", "PROCEDURE"}
+                create_prefix = None
+            body_start = (
+                routine_definition and signature_complete and not paren_depth
+                and upper == "ATOMIC" and previous_word == "BEGIN"
+            )
+            if body_start:
+                atomic_depth += 1
+                routine_definition = signature_complete = False
             # PostgreSQL E'...' always uses backslash escapes, regardless of
             # the ordinary-string setting. Consume it in the same quote path.
             if (
@@ -189,12 +210,21 @@ def _statement_heads(sql: str, *, postgres: bool, backslash_strings: bool):
                 and sql[position] == "'"
             ):
                 position = _quoted_end(sql, position, escapes=True, postgres=True)
-            head = False
+            head = body_start
             previous_word = upper
         else:
+            if character == "(":
+                paren_depth += 1
+            elif character == ")":
+                paren_depth = max(0, paren_depth - 1)
+                if routine_definition and not paren_depth:
+                    signature_complete = True
             position += 1
             head = False
             previous_word = None
+    if atomic_depth:
+        # An ambiguous/unclosed exemption must not hide a later COMMIT.
+        raise QueryError("owned SQL may not contain transaction control in an unclosed routine body")
 
 
 def reject_transaction_control(sql: str, *, dialect: str) -> None:

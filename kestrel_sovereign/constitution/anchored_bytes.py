@@ -203,7 +203,10 @@ def governance_evidence(properties: Mapping, governed_by_targets: Iterable[str])
     }
 
 
-async def lock_governance_rows(storage, agent_id: str, *, required_target: str | None = None) -> None:
+async def lock_governance_rows(
+    storage, agent_id: str, *, required_target: str | None = None,
+    expected_targets: Iterable[str] | None = None,
+) -> None:
     """After graph reservation, retain the physical governing row witness.
 
     All publishers use ownership-before-edge order, matching native deletion.
@@ -219,14 +222,26 @@ async def lock_governance_rows(storage, agent_id: str, *, required_target: str |
         )
         if identity is None or not identity_owners:
             raise RuntimeError("Agent identity or its ownership disappeared before governing custody")
-        edge_owners = await storage.db.fetchall(
-            "SELECT target_id, agent_id FROM graph_edge_owners WHERE source_id = ? AND label = 'governed_by' ORDER BY target_id, agent_id FOR UPDATE",
-            (agent_id,),
+        # Never lock an endpoint outside the graph reservation set. Exit needs
+        # only its current governing edge; signed repair/genesis pass their
+        # complete captured set and reject changes without extending custody.
+        targets = sorted(set(expected_targets)) if expected_targets is not None else (
+            [required_target] if required_target is not None else []
         )
-        edges = await storage.db.fetchall(
-            "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by' ORDER BY target_id FOR UPDATE",
-            (agent_id,),
-        )
+        edge_owners, edges = [], []
+        if targets:
+            predicate = " AND target_id IN (" + ",".join("?" for _ in targets) + ")"
+            params = (agent_id, *targets)
+            edge_owners = await storage.db.fetchall(
+                "SELECT target_id, agent_id FROM graph_edge_owners WHERE source_id = ? AND label = 'governed_by'"
+                + predicate + " ORDER BY target_id, agent_id FOR UPDATE", params,
+            )
+            edges = await storage.db.fetchall(
+                "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'"
+                + predicate + " ORDER BY target_id FOR UPDATE", params,
+            )
+        if expected_targets is not None and [row[0] for row in edges] != targets:
+            raise RuntimeError("Captured governing edges disappeared before physical custody")
         if required_target is not None and (
             (required_target, agent_id) not in edge_owners
             or (required_target,) not in edges
@@ -234,14 +249,19 @@ async def lock_governance_rows(storage, agent_id: str, *, required_target: str |
             raise RuntimeError("Missing or mis-targeted governed_by edge or ownership custody")
 
 
-async def revalidate_governance_evidence(storage, agent_id: str, expected: dict):
+async def revalidate_governance_evidence(
+    storage, agent_id: str, expected: dict, *, required_target: str | None = None,
+):
     """Under the writer's graph locks, refuse a changed preflight witness.
 
     Both native signed writers use this before any governance mutation, inside
     their owning transaction. A changed pointer/receipt/rights/edge set requires
     a fresh inspection and authorization, never adoption of a newer CAS fence.
     """
-    await lock_governance_rows(storage, agent_id)
+    await lock_governance_rows(
+        storage, agent_id, expected_targets=expected["governed_by_targets"],
+        required_target=required_target,
+    )
     node = await storage.get_node(agent_id)
     if node is None or node.node_type != "agent":
         raise RuntimeError("Agent identity disappeared during signed repair")

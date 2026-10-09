@@ -17,7 +17,7 @@ from tests.integration.test_constitution_refusal_races import _agent
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-@pytest.mark.parametrize("rejection", ["foreign-owner", "oversized"])
+@pytest.mark.parametrize("rejection", ["foreign-owner", "oversized", "unowned-blob"])
 async def test_rejected_avatar_has_no_joined_transaction_side_effects(
     db_backend, monkeypatch, rejection
 ):
@@ -36,6 +36,13 @@ async def test_rejected_avatar_has_no_joined_transaction_side_effects(
     try:
         if rejection == "oversized":
             monkeypatch.setattr(async_file_store, "MAX_FILE_SIZE", 1)
+        elif rejection == "unowned-blob":
+            import hashlib
+
+            await storage.db.execute_commit(
+                "INSERT INTO files (content_hash,original_name,content) VALUES (?,?,?)",
+                (hashlib.sha256(b"avatar").hexdigest(), "legacy.jpg", b"avatar"),
+            )
         async with storage.transaction():
             # A caller may catch a validation error and commit other work.
             # Native SQLite joins rather than rolling back the nested scope.

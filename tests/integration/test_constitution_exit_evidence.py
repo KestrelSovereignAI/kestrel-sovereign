@@ -15,6 +15,55 @@ from kestrel_sovereign.agent.constitution import ConstitutionMixin
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_exit_does_not_lock_unreserved_stale_governance_rows(db_backend):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL independent stale-target cleanup custody")
+    import asyncpg
+
+    identity = "did:test:exit-stale-custody:" + uuid4().hex
+    storage = AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    peer = await asyncpg.connect(db_backend._dsn)
+    try:
+        agent = await _agent(storage)
+        digest = await storage.store_file(
+            resolve_governing_constitution_bytes(None), "constitution.md"
+        )
+        await storage.add_node(
+            GraphNode(
+                node_id=identity,
+                node_type="agent",
+                label="stale custody",
+                properties={"constitution_hash": digest},
+            )
+        )
+        await agent._anchor_constitution_governance(digest)
+        stale = uuid4().hex
+        await storage.add_node(
+            GraphNode(node_id=stale, node_type="document", label="stale", properties={})
+        )
+        await storage.add_edge(identity, stale, "governed_by")
+        async with peer.transaction():
+            await peer.fetch(
+                "SELECT target_id FROM graph_edge_owners WHERE source_id=$1 AND target_id=$2 FOR UPDATE",
+                identity,
+                stale,
+            )
+
+            # Exit reserves identity/current digest only. It must not reach
+            # into a cleanup's independently held stale-target ownership.
+            async def exit_custody():
+                async with storage.transaction():
+                    await ConstitutionMixin._lock_verified_constitution_exit(agent)
+
+            await asyncio.wait_for(exit_custody(), timeout=2)
+    finally:
+        await peer.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 @pytest.mark.parametrize("evidence", ["identity-owner", "edge", "edge-owner"])
 async def test_exit_requires_actual_governance_witness_custody(
     db_backend, monkeypatch, evidence

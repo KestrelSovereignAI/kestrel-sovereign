@@ -141,6 +141,18 @@ class AsyncFileStore:
             prefix = f"{table_alias}." if table_alias else ""
             return f"ORDER BY {prefix}rowid {direction}"
     
+    async def _validate_existing_file_claim(self, content_hash: str, owner: str) -> None:
+        """Check native file admission before any joined-scope publication."""
+        existing = await self.db.fetchone(
+            "SELECT 1 FROM files WHERE content_hash = ?", (content_hash,),
+        )
+        if existing and owner:
+            owner_rows = await self.db.fetchall(
+                "SELECT agent_id FROM file_owners WHERE content_hash = ?", (content_hash,),
+            )
+            if not owner_rows:
+                raise ValueError("Cannot claim an unowned legacy file")
+
     async def store_file(self, content: bytes, original_name: str,
                          metadata: Optional[Dict] = None) -> str:
         """Store a file and return its content hash."""
@@ -158,17 +170,7 @@ class AsyncFileStore:
 
         metadata_json = json.dumps(meta) if meta else None
         async with self.db.transaction():
-            existing = await self.db.fetchone(
-                "SELECT 1 FROM files WHERE content_hash = ?",
-                (content_hash,),
-            )
-            if existing and owner:
-                owner_rows = await self.db.fetchall(
-                    "SELECT agent_id FROM file_owners WHERE content_hash = ?",
-                    (content_hash,),
-                )
-                if not owner_rows:
-                    raise ValueError("Cannot claim an unowned legacy file")
+            await self._validate_existing_file_claim(content_hash, owner)
 
             await self.db.execute(
                 "INSERT OR IGNORE INTO files "
@@ -306,6 +308,11 @@ class AsyncFileStore:
             # rows. The graph id is tenant/type namespaced because identical
             # bytes do not imply shared avatar metadata (#2649).
             graph = AsyncGraphStore(self.db, agent_id=agent_id)
+            await graph.lock_nodes_for_update([agent_id, avatar_node_id])
+            # SQLite's owning writer prevents admission evidence from changing
+            # before store_file. This canonical check also runs in store_file;
+            # it must precede provisional ownership if a caller catches refusal.
+            await self._validate_existing_file_claim(content_hash, self._write_owner(metadata))
             # Some bootstrap/test callers store an avatar before the physical
             # agent root is inserted. The DID is still the canonical self-owner,
             # so reserve that witness; later root creation uses the same owner.

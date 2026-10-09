@@ -14,6 +14,150 @@ from tests.integration.test_constitution_refusal_races import _agent
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+@pytest.mark.parametrize("risk", [1, 3])
+async def test_native_genesis_outcome_survives_post_commit_notice_failure(
+    db_backend, monkeypatch, risk
+):
+    from kestrel_sovereign.features.privacy.feature import PrivacyAgent
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+    from kestrel_sovereign.storage.db.interface import QueryError
+    from kestrel_sovereign.constitution.genesis_audit import GenesisAuditRejectedError
+
+    storage = AsyncStorage(
+        backend=db_backend, agent_id="did:test:notice-error:" + uuid4().hex
+    )
+    await storage.initialize()
+    try:
+        agent = await _agent(storage)
+        for name in (
+            "_persist_governance_receipt_node",
+            "_persist_genesis_audit_completion",
+            "_persist_genesis_audit_pending_attempt",
+            "perform_genesis_audit",
+        ):
+            setattr(agent, name, getattr(ConstitutionMixin, name).__get__(agent))
+        agent.privacy_agent = PrivacyAgent(
+            PrivacyEnforcingStorage(storage, "normal"), "normal"
+        )
+        digest = await storage.store_file(
+            resolve_governing_constitution_bytes(None), "constitution.md"
+        )
+        await storage.add_node(
+            GraphNode(
+                node_id=agent.agent_id,
+                node_type="agent",
+                label="notice",
+                properties={"constitution_hash": digest},
+            )
+        )
+        await agent._anchor_constitution_governance(digest)
+        calls, notices = [], []
+
+        async def auditor(prompt):
+            calls.append(prompt)
+            return {"risk_level": risk, "reasoning": "Injected provider-free outcome"}
+
+        async def failed_notice(**kwargs):
+            assert storage.owns_open_transaction is False
+            notices.append(kwargs)
+            raise QueryError("injected post-commit conversation storage failure")
+
+        agent.get_audit_response = auditor
+        monkeypatch.setattr(agent.privacy_agent, "add_conversation", failed_notice)
+        for _ in range(2):
+            if risk == 3:
+                with pytest.raises(GenesisAuditRejectedError):
+                    await agent.perform_genesis_audit()
+            else:
+                assert await agent.perform_genesis_audit() is True
+        assert len(calls) == len(notices) == 1
+        record = (await storage.get_node(agent.agent_id)).properties["genesis_audit"]
+        assert record["status"] == ("failed" if risk == 3 else "passed")
+        assert record["constitution_hash"] == digest
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("evidence", ["edge", "edge-owner"])
+async def test_genesis_requires_actual_preflight_edge_lock_rows(
+    db_backend, monkeypatch, evidence
+):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL physical genesis governance custody")
+    import asyncpg
+    from kestrel_sovereign.constitution.genesis_audit import GenesisAuditError
+
+    identity = "did:test:genesis-missing-lock:" + uuid4().hex
+    storage = AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    peer = await asyncpg.connect(db_backend._dsn)
+    try:
+        agent = await _agent(storage)
+        digest = await storage.store_file(
+            resolve_governing_constitution_bytes(None), "constitution.md"
+        )
+        await storage.add_node(
+            GraphNode(
+                node_id=identity,
+                node_type="agent",
+                label="lock",
+                properties={"constitution_hash": digest},
+            )
+        )
+        await agent._anchor_constitution_governance(digest)
+        node = await storage.get_node(identity)
+        expected = await ConstitutionMixin._genesis_publication_witness(agent, node)
+        before = await agent._constitution_state_store.load(identity)
+        node.properties["genesis_audit"] = {
+            "status": "passed",
+            "constitution_hash": digest,
+        }
+        table = "graph_edges" if evidence == "edge" else "graph_edge_owners"
+        predicate = "source_id=$1 AND target_id=$2 AND label='governed_by'"
+        snapshot = await peer.fetchrow(
+            f"SELECT * FROM {table} WHERE {predicate}", identity, digest
+        )
+        native_fetch = db_backend.fetch_all
+        reached = []
+
+        async def replaced(query, arguments=()):
+            if (
+                not reached
+                and query.startswith("SELECT target_id")
+                and f"FROM {table} " in query
+                and "FOR UPDATE" in query
+            ):
+                await peer.execute(
+                    f"DELETE FROM {table} WHERE {predicate}", identity, digest
+                )
+                result = await native_fetch(query, arguments)
+                assert result == []
+                columns = list(snapshot.keys())
+                await peer.execute(
+                    f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('$' + str(i + 1) for i in range(len(columns)))})",
+                    *snapshot.values(),
+                )
+                reached.append(True)
+                return result
+            return await native_fetch(query, arguments)
+
+        monkeypatch.setattr(db_backend, "fetch_all", replaced)
+        with pytest.raises(GenesisAuditError, match="custody"):
+            await ConstitutionMixin._persist_governance_receipt_node(
+                agent, node, expected=expected
+            )
+        assert reached == [True]
+        assert "genesis_audit" not in (await storage.get_node(identity)).properties
+        assert await agent._constitution_state_store.load(identity) == before
+    finally:
+        await peer.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_changed_hash_genesis_can_complete_in_safe_mode_before_explicit_exit(
     db_backend, tmp_path
 ):
@@ -351,8 +495,8 @@ async def test_native_edge_deletion_waits_for_genesis_publication(
 
         agent.get_audit_response = fixture_auditor
 
-        async def checked_then_delete(raw, agent_id, expected):
-            fresh = await native_revalidate(raw, agent_id, expected)
+        async def checked_then_delete(raw, agent_id, expected, **kwargs):
+            fresh = await native_revalidate(raw, agent_id, expected, **kwargs)
             with pytest.raises(Exception, match="lock timeout"):
                 async with peer_backend.transaction():
                     await peer_backend.execute("SET LOCAL lock_timeout = '100ms'")

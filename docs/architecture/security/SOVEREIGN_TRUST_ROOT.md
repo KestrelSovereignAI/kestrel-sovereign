@@ -116,6 +116,9 @@ signer and retains the previous reanchor receipt as history. Existing content
 must exactly match the signed bytes; corrupted content is refused. Because
 the governing hash did not change, an existing genesis receipt is preserved
 and the content audit is not repeated merely for key rotation.
+This also applies when signed repair restores a lost operative pointer from
+unambiguous validated historical evidence: unchanged bytes preserve the exact
+completed receipt, including rejection. Pointer loss is not a new constitution.
 The signed writer retains a physical blob lock while validating those bytes,
 including validating the actual winner of a concurrent absent-row insertion.
 Restoring ownership inserts only a missing witness and preserves existing
@@ -128,6 +131,10 @@ commit. If the witness changed, cognition reports a blocked genesis audit
 without overwriting the newer governance, rejection or identity metadata.
 Conversation notices are delivered only after the authoritative receipt commits;
 volatile privacy buffers cannot retain a success notice from SQL rollback.
+An ordinary SQL notice-delivery failure is reported separately and cannot
+replace the committed audit outcome or cause that hash to be audited again.
+The locking reads must actually return each captured existing edge and the
+current edge's own tenant witness; a later ordinary reread is not a substitute.
 Initial bootstrap refuses any prior governance evidence rather than expanding
 its lock set and pruning history without a signed repair.
 
@@ -140,6 +147,9 @@ After a changed-hash repair the public genesis audit/readiness path can complete
 the new hash's pending audit while Safe Mode remains active. Explicit authorized
 exit follows that real audit; repeating a same-hash repair does not reroll it.
 Physical edge locks follow ownership-then-edge order, matching native deletion.
+Exit locks only its reserved current governing target, not unrelated stale-edge
+ownership held by cleanup. Other publishers reserve the complete captured set
+and refuse set changes without acquiring new endpoints out of order.
 
 All native SQL entry points, including script execution and SQLite diagnostic
 reads, refuse SQL transaction-control commands while an owning transaction is

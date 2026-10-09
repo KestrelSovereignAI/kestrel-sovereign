@@ -2416,7 +2416,10 @@ class ConstitutionMixin:
                 # require a fresh audit bound to the new hash. The reanchor
                 # command itself remains available; the next ordinary
                 # cognition turn completes this explicit pending state.
-                if new_hash != old_hash:
+                # A lost operative pointer is not a change of governing bytes.
+                # Keep a completed hash-bound rejection as well as a pass when
+                # signed repair restores that same validated historical hash.
+                if new_hash != historical_hash:
                     supersede_genesis_audit(
                         agent_node.properties,
                         constitution_hash=stored_hash,
@@ -2696,7 +2699,13 @@ class ConstitutionMixin:
         # PrivacyAgent's volatile buffers do not participate in SQL rollback;
         # publish only after the owning commit and all refusal checks succeed.
         if conversation is not None:
-            await self.privacy_agent.add_conversation(**conversation)
+            try:
+                await self.privacy_agent.add_conversation(**conversation)
+            except (QueryError, TransactionError) as exc:
+                # SQL notice delivery cannot change the already committed
+                # verdict or replace a rejection with a storage exception.
+                # Do not log private notice contents or provider diagnostics.
+                logging.error("Committed genesis receipt notification failed: %s", type(exc).__name__)
 
     async def _persist_governance_receipt_node_owned(
         self, agent_node: GraphNode, *, expected: dict,
@@ -2742,7 +2751,10 @@ class ConstitutionMixin:
                     *expected["governance"]["governed_by_targets"],
                     agent_node.properties["constitution_hash"],
                 }))
-                fresh = await revalidate_governance_evidence(raw, self.agent_id, expected["governance"])
+                fresh = await revalidate_governance_evidence(
+                    raw, self.agent_id, expected["governance"],
+                    required_target=agent_node.properties["constitution_hash"],
+                )
                 # Merge only this receipt. A pre-auditor graph node is never a
                 # replacement for metadata written during the awaited audit.
                 fresh.properties["genesis_audit"] = deepcopy(agent_node.properties["genesis_audit"])

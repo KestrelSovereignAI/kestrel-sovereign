@@ -4,6 +4,68 @@ from uuid import uuid4
 
 import pytest
 
+from tests.utils.postgres_schema import disposable_postgres_schema
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("trap", ["identifiers", "case-alias"])
+async def test_postgres_atomic_identifiers_cannot_hide_commit(db_backend, trap):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL SQL-standard identifier grammar")
+    async with disposable_postgres_schema(db_backend, "owned_atomic_names") as schema:
+        await db_backend.execute(f'CREATE TABLE "{schema}".proof (value integer)')
+        definition = (
+            "CREATE DOMAIN atomic AS integer; CREATE TABLE function (begin atomic);"
+            if trap == "identifiers"
+            else f'CREATE FUNCTION "{schema}".owned_case_label() RETURNS integer '
+            "LANGUAGE SQL BEGIN ATOMIC SELECT 1 AS case; END;"
+        )
+        # Use a session-local path, so the actual unquoted BEGIN/ATOMIC pair
+        # belongs to the test's disposable type, never any shared schema.
+        refusal = None
+        try:
+            async with db_backend.transaction():
+                await db_backend.execute(f'SET LOCAL search_path TO "{schema}"')
+                await db_backend.execute(f'INSERT INTO "{schema}".proof VALUES (1)')
+                await db_backend.execute_script(definition + " COMMIT;")
+        except Exception as exc:
+            refusal = exc
+        assert await db_backend.fetch_val(f'SELECT COUNT(*) FROM "{schema}".proof') == 0
+        assert refusal is not None and "transaction control" in str(refusal)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("alias", ["case", "end"])
+async def test_postgres_atomic_keyword_alias_retains_outer_rollback(db_backend, alias):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL SQL-standard alias grammar")
+    name = "owned_alias_" + uuid4().hex
+    definition = f"CREATE FUNCTION {name}() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT 1 AS {alias}; END;"
+
+    class RollbackProof(Exception):
+        pass
+
+    with pytest.raises(Exception, match="rollback proof"):
+        async with db_backend.transaction():
+            await db_backend.execute_script(definition)
+            assert await db_backend.fetch_val(f"SELECT {name}()") == 1
+            raise RollbackProof("rollback proof")
+    assert (
+        await db_backend.fetch_val("SELECT to_regprocedure(?)", (name + "()",)) is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_sqlite_carriage_return_keeps_comment_text(sqlite_backend):
+    async with sqlite_backend.transaction():
+        await sqlite_backend.execute_script(
+            "-- note\rCOMMIT;\nCREATE TABLE comment_proof (value integer);"
+        )
+        await sqlite_backend.execute("INSERT INTO comment_proof VALUES (1)")
+        assert await sqlite_backend.fetch_val("SELECT COUNT(*) FROM comment_proof") == 1
+
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend

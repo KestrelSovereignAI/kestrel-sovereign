@@ -1304,6 +1304,11 @@ async def _write_reanchor(
     the target is a local file, remains untouched and available either way.
     """
     rag_index: ConstitutionRagIndex | None = None
+    from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
+
+    historical_hash = old_hash or historical_anchor_hash(
+        governance_preflight["properties"], governance_preflight["governed_by_targets"],
+    )
     async with target.open_storage() as storage:
         from kestrel_sovereign.constitution.runtime_state import ConstitutionRuntimeStateStore
 
@@ -1313,7 +1318,7 @@ async def _write_reanchor(
         storage.graph.bind_agent(agent_did)
         storage.files.bind_agent(agent_did)
         async with _agent_embedding(
-            storage.db, agent_did, needed=old_hash != new_hash,
+            storage.db, agent_did, needed=historical_hash != new_hash,
         ) as embedding, storage.db.transaction():
             # The digests are known from the externally verified bytes.
             # Match the runtime writer: complete graph custody and evidence
@@ -1470,6 +1475,8 @@ async def _write_reanchor(
                     storage.db,
                     agent_did=agent_did,
                     embedding=embedding,
+                    # Historical evidence determines whether content changed,
+                    # not authority to delete chunks for a missing pointer.
                     old_hash=old_hash,
                     new_hash=new_hash,
                     content=new_content.decode("utf-8"),
@@ -1483,7 +1490,7 @@ async def _write_reanchor(
             if agent is None or agent.node_type != "agent":
                 raise RuntimeError("Agent node disappeared mid-reanchor")
             agent.properties["constitution_hash"] = new_hash
-            if old_hash != new_hash:
+            if historical_hash != new_hash:
                 from kestrel_sovereign.constitution.genesis_audit import (
                     supersede_genesis_audit,
                 )
