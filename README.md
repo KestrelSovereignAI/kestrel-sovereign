@@ -978,10 +978,15 @@ the graph transaction. Live writers publish the resulting fence only after
 commit; neither signed repair nor anchor consumption clears Safe Mode or
 records a successful audit. An outer caller transaction must not publish a
 live fence before committing. Native live
-anchor and state-publication paths refuse ambient transactions before writing
+anchor and state-publication paths refuse ambient transactions before waiting
+for the constitutional state lock or writing
 (including SQLite joined scopes and PostgreSQL savepoints); retry the command
 outside that caller's transaction. Unknown commit-ownership adapters fail
 closed as well. The signed repair's own graph/state unit remains atomic.
+Refused lifecycle/audit transitions retain a volatile Safe Mode restriction
+and mark persistence pending; they do not claim a durable transition. That
+refusal also invalidates an in-flight verified exit or state writer before
+its database commit, so a lock owner cannot erase the new restriction.
 The marker is single-use; interruption before verification cannot authorize a
 second anchor. The absent successful
 audit timestamp independently keeps the full startup audit due. Consumed

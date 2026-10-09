@@ -608,6 +608,10 @@ class ConstitutionMixin:
         if lock is None or vars(self).get("_constitution_state_lock_owner") is current_task:
             yield
             return
+        # Database owners must never wait behind a state-lock owner which may
+        # itself be waiting for that database. Public lifecycle entries record
+        # a fail-closed refusal before arriving here; anchor callers also refuse.
+        ConstitutionMixin._require_owned_constitution_commit(self)
         async with lock:
             self._constitution_state_lock_owner = current_task
             try:
@@ -904,6 +908,7 @@ class ConstitutionMixin:
             )
 
             ConstitutionMixin._require_owned_constitution_commit(self)
+            refusal_generation = vars(self).get("_constitution_refusal_generation", 0)
             snapshot = self._constitution_state_snapshot(
                 now=now,
                 safe_mode=safe_mode,
@@ -913,12 +918,27 @@ class ConstitutionMixin:
             )
             for attempt in range(3):
                 try:
-                    persisted_state = await store.write(
-                        snapshot,
-                        event_type=event_type,
-                        event_reason=event_reason,
-                        event_authorization=event_authorization,
-                    )
+                    conflict = None
+                    async with store._backend.transaction():
+                        # A transaction-owning task can refuse without waiting
+                        # for our state lock. Recheck AFTER the database writer
+                        # lock is acquired, never publish over that new latch.
+                        if vars(self).get("_constitution_refusal_generation", 0) != refusal_generation:
+                            raise RuntimeError("constitutional transition invalidated by an unpersisted restriction")
+                        try:
+                            persisted_state = await store.write(
+                                snapshot,
+                                event_type=event_type,
+                                event_reason=event_reason,
+                                event_authorization=event_authorization,
+                            )
+                        except ConstitutionStateConflictError as exc:
+                            # CAS conflicts have no write/event. Surface the
+                            # typed refusal AFTER leaving the empty owning
+                            # scope, whose backend otherwise wraps exceptions.
+                            conflict = exc
+                    if conflict is not None:
+                        raise conflict
                     break
                 except ConstitutionStateConflictError:
                     # Entering a restriction may monotonically join a newer
@@ -998,6 +1018,8 @@ class ConstitutionMixin:
         self, *, source: str, audited_at: Optional[datetime] = None
     ) -> bool:
         """Advance the deadline only after a complete verifier succeeds."""
+        if not ConstitutionMixin._prepare_constitution_state_transition(self):
+            return False
         async with ConstitutionMixin._constitution_state_guard(self):
             return await ConstitutionMixin._record_successful_constitution_audit_locked(
                 self, source=source, audited_at=audited_at
@@ -1036,6 +1058,8 @@ class ConstitutionMixin:
         next restart instead of leaving a recent-success timestamp that could
         make the restarted process look normal.
         """
+        if not ConstitutionMixin._prepare_constitution_state_transition(self):
+            return False
         async with ConstitutionMixin._constitution_state_guard(self):
             due_count = max(self._interaction_count, self.AUDIT_INTERVAL)
             persisted = await self._persist_constitution_runtime_state(
@@ -1051,6 +1075,8 @@ class ConstitutionMixin:
         self,
     ) -> tuple[Optional[bool], str, bool]:
         """Run an explicit full audit as one serialized state transition."""
+        if not ConstitutionMixin._prepare_constitution_state_transition(self):
+            return None, "Durable constitutional audit marker unavailable", False
         async with ConstitutionMixin._constitution_state_guard(self):
             started = await self._begin_explicit_constitution_audit()
             if not started:
@@ -1124,6 +1150,8 @@ class ConstitutionMixin:
         # available via !verify-constitution; blocked prompts do not consume or
         # reset the persisted audit deadline.
         if self._safe_mode or vars(self).get("_constitution_audit_pending", False):
+            return
+        if not ConstitutionMixin._prepare_constitution_state_transition(self):
             return
 
         # Lazy initialization for backward compatibility
@@ -1536,6 +1564,10 @@ class ConstitutionMixin:
         failed verification. Callers restricting cognition for a different
         reason must say so — the report must not have to guess.
         """
+        if not ConstitutionMixin._prepare_constitution_state_transition(
+            self, restriction_reason=reason, restriction_cause=cause
+        ):
+            return False
         async with ConstitutionMixin._constitution_state_guard(self):
             return await ConstitutionMixin._enter_safe_mode_locked(
                 self, reason, cause=cause
@@ -1625,6 +1657,8 @@ class ConstitutionMixin:
 
     async def exit_safe_mode(self, authorization: str = None):
         """Exit Safe Mode after explicit authority and a fresh full audit."""
+        if not ConstitutionMixin._prepare_constitution_state_transition(self):
+            return "Safe Mode remains active: constitutional transition requires an owned top-level commit."
         async with ConstitutionMixin._constitution_state_guard(self):
             return await ConstitutionMixin._exit_safe_mode_locked(
                 self, authorization
@@ -1632,6 +1666,7 @@ class ConstitutionMixin:
 
     async def _exit_safe_mode_locked(self, authorization: str = None):
         """Locked implementation of :meth:`exit_safe_mode`."""
+        refusal_generation = vars(self).get("_constitution_refusal_generation", 0)
         if not self._safe_mode:
             return "Not in safe mode."
         if not authorization:
@@ -1663,6 +1698,9 @@ class ConstitutionMixin:
             self._feature_lifecycle_repair_verified = True
 
         is_valid, message = await self._verify_constitution_integrity()
+        if vars(self).get("_constitution_refusal_generation", 0) != refusal_generation:
+            self._feature_lifecycle_repair_verified = False
+            return "Safe Mode remains active: verification was invalidated by an unpersisted restriction."
         if not is_valid:
             await self.enter_safe_mode(f"Safe Mode exit verification failed: {message}")
             return f"Safe Mode remains active: integrity verification failed: {message}"
@@ -1716,6 +1754,39 @@ class ConstitutionMixin:
                     type(exc).__name__,
                 )
         return "Safe mode deactivated after successful integrity verification."
+
+    def _prepare_constitution_state_transition(
+        self, *, restriction_reason: Optional[str] = None,
+        restriction_cause: Optional[str] = None,
+    ) -> bool:
+        """Refuse before waiting for a lock, preserving a volatile safety latch.
+
+        No database I/O or provider call can occur on this refusal path. The
+        local generation invalidates any in-flight verified exit or writer
+        already holding the state lock and waiting on the caller transaction.
+        It is NOT a durable authority revision and never authorizes recovery.
+        """
+        try:
+            ConstitutionMixin._require_owned_constitution_commit(self)
+        except RuntimeError as exc:
+            self._constitution_refusal_generation = vars(self).get("_constitution_refusal_generation", 0) + 1
+            self._constitution_state_persistence_pending = True
+            self._mark_constitution_state_unavailable(
+                exc, cause=SafeModeCause.STATE_NOT_PERSISTED.value,
+                read_failed=False,
+            )
+            if restriction_reason is not None:
+                preserve_lifecycle = self._safe_mode_cause == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+                if not preserve_lifecycle:
+                    self._safe_mode_reason = restriction_reason
+                    self._safe_mode_cause = restriction_cause
+                self._safe_mode_exited_at = None
+                self._safe_mode_exit_authorization = None
+                if restriction_cause == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value:
+                    self._feature_lifecycle_integrity_uncertain = True
+                    self._feature_lifecycle_repair_verified = False
+            return False
+        return True
 
     def _require_owned_constitution_commit(self):
         """Do not publish state from a joined scope or released savepoint.

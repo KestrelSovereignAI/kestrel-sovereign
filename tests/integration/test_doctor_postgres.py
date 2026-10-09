@@ -847,8 +847,26 @@ async def test_a_present_but_unanchored_postgres_node_stays_in_postgres(
     # "postgres" passes no matter what the code does. Mutation testing found
     # that the hard way.
     assert result.target_backend == "postgres", result.target_label
-    assert result.error is not None
-    assert "no constitution_hash" in result.error
+    # Missing-pointer inspection reports unsigned drift, not a repair. Only
+    # the native root-signed forced path can establish a replacement anchor.
+    assert result.error is None
+    assert result.drift_unforced is True
+    assert result.reanchored is False
+    assert result.old_hash is None
+    assert result.backup_path is None
+    import psycopg2
+
+    with psycopg2.connect(runtime_db.dsn) as check:
+        with check.cursor() as cursor:
+            cursor.execute("SELECT properties FROM graph_nodes WHERE node_id = %s", (AGENT_DID,))
+            properties = cursor.fetchone()[0]
+            assert (json.loads(properties) if isinstance(properties, str) else properties) == {"name": "Test"}
+            cursor.execute("SELECT COUNT(*) FROM graph_edges WHERE source_id = %s AND label = 'governed_by'", (AGENT_DID,))
+            assert cursor.fetchone()[0] == 0
+    # The local birth record must not be selected or mutated instead.
+    with sqlite3.connect(tmp_path / "agent_data" / "test" / "kestrel_prime.db") as check:
+        props = json.loads(check.execute("SELECT properties FROM graph_nodes WHERE node_id = ?", (AGENT_DID,)).fetchone()[0])
+        assert props["constitution_hash"] == canonical
 
 
 async def test_an_unowned_postgres_row_does_not_retarget_the_anchor(
