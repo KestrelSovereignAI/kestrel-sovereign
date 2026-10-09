@@ -990,6 +990,9 @@ its database commit, so a lock owner cannot erase the new restriction. Writers
 check again after awaited SQL and roll back invalidated state/events; a refusal
 during commit/result delivery retains its volatile restriction and pending
 durability instead of reporting the earlier committed exit as recovery.
+An entry also checks after awaited consent, before replacing a later restriction.
+Native automatic and signed anchor transactions reserve file resources before
+graph resources, then revalidate and consume custody atomically.
 The marker is single-use; interruption before verification cannot authorize a
 second anchor. The absent successful
 audit timestamp independently keeps the full startup audit due. Consumed

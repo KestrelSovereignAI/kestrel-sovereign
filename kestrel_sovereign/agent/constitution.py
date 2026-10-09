@@ -1587,6 +1587,7 @@ class ConstitutionMixin:
         self, reason: str, *, cause: str = SafeModeCause.INTEGRITY.value
     ) -> bool:
         """Locked implementation of :meth:`enter_safe_mode`."""
+        refusal_generation = vars(self).get("_constitution_refusal_generation", 0)
         existing_lifecycle_cause = (
             getattr(self, "_safe_mode", False) is True
             and getattr(self, "_safe_mode_cause", None)
@@ -1627,6 +1628,12 @@ class ConstitutionMixin:
             except Exception:
                 pass  # Never block on consent failure -- safe mode is critical
 
+        # Consent is an awaited provider-bearing boundary. A transaction owner
+        # can latch a stronger refusal while this task retains the state lock.
+        # Do not overwrite that restriction or capture its new token as if it
+        # belonged to this earlier entry's authority.
+        if vars(self).get("_constitution_refusal_generation", 0) != refusal_generation:
+            return False
         now = self._constitution_now()
         self._safe_mode = True
         self._safe_mode_reason = reason
@@ -2443,6 +2450,10 @@ class ConstitutionMixin:
                 # land together or not at all — a partial lazy anchor would
                 # be the same property/edge drift #2617 repairs.
                 async with ConstitutionMixin._constitution_state_guard(self), self.storage.transaction():
+                    # All native anchor writers reserve files BEFORE graph
+                    # rows. PostgreSQL uniqueness waits on an uncommitted blob
+                    # must never hold graph locks a signed file writer needs.
+                    constitution_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
                     # Reserve the native graph write set, then revalidate the
                     # durable bootstrap marker under the same transaction.
                     initial_hash = hashlib.sha256(constitution_content).hexdigest()
@@ -2464,7 +2475,6 @@ class ConstitutionMixin:
                     ):
                         raise ValueError("durable new-identity bootstrap custody changed")
                     persisted_state = await ConstitutionMixin._consume_initial_anchor_custody(self)
-                    constitution_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
                     # Mirror inception's governance wiring so the integrity audit's
                     # edge proof (#2463) holds for a lazily-anchored legacy agent.
                     await self._anchor_constitution_governance(constitution_hash)
