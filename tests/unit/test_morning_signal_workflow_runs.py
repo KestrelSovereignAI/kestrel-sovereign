@@ -14,6 +14,10 @@ the real ``WorkflowStore`` schema too.
 A gate reason is free text that can carry conversation-derived content, so in
 EPHEMERAL, ISOLATED and DEIDENTIFIED the briefing withholds it while keeping
 the counts, stages and persistent-failure call-out.
+
+The runs are the ones the Workflows runner stamped with the agent's owner DID:
+the legacy DID of a rotated agent, which runs as its successor ``did:web``, and
+the signing DID of a born-hybrid one (#3533).
 """
 
 from __future__ import annotations
@@ -44,9 +48,18 @@ from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
+from tests.utils.agent_identities import (
+    born_hybrid_identity,
+    legacy_identity,
+    rotated_identity,
+)
 from tests.utils.postgres_schema import disposable_postgres_schema, with_search_path
 
 OWNER = "did:pkh:eip155:1:0x00000000000000000000000000000000000000a1"
+OWNER_IDENTITY = legacy_identity(OWNER)
+# OWNER rotated onto this did:web: the agent runs as it, its runs stay OWNER's.
+SUCCESSOR = "did:web:agents.example.test:rotated-owner"
+BORN_HYBRID = "did:web:agents.example.test:born-hybrid"
 OTHER_AGENT = "did:web:agents.example.test:someone-else"
 NOW = datetime(2026, 10, 8, 12, 30, tzinfo=timezone.utc)
 
@@ -222,8 +235,16 @@ async def store(database):
     return workflows
 
 
-def _agent(db, did: str = OWNER, *, privacy: PrivacyMode | None = None):
-    agent = SimpleNamespace(did=did, _raw_storage=SimpleNamespace(db=db))
+def _agent(
+    db,
+    *,
+    did: str = OWNER,
+    identity: object = OWNER_IDENTITY,
+    privacy: PrivacyMode | None = None,
+):
+    agent = SimpleNamespace(
+        did=did, identity=identity, _raw_storage=SimpleNamespace(db=db)
+    )
     if privacy is not None:
         agent.privacy_config = privacy_mode_to_config(privacy)
     return agent
@@ -523,17 +544,107 @@ async def test_an_invalid_threshold_is_refused_not_guessed(store, value):
 
 
 # ---------------------------------------------------------------------------
+# Whose runs: the owner the Workflows runner stamps (#3533)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_rotated_agent_reports_the_runs_stamped_under_its_legacy_did(store):
+    for hours in (20, 10, 1):
+        latest = await store.run(
+            RESCUE, "failed", _hours_ago(hours), failed_at=(("dispatch_repairs", NO_TARGETS),)
+        )
+    await store.run(PIPELINE, "completed", _hours_ago(2))
+    # The runner never stamps a rotated agent's runs with its successor DID,
+    # so a run that carries it is not one this agent's runner owns.
+    await store.run(PIPELINE, "failed", _hours_ago(3), owner=SUCCESSOR)
+    agent = _agent(store.db, did=SUCCESSOR, identity=rotated_identity(OWNER, SUCCESSOR))
+
+    report = await read_workflow_run_report(agent, now=NOW)
+
+    outcomes = _by_name(report)
+    assert (outcomes[RESCUE].completed, outcomes[RESCUE].failed) == (0, 3)
+    assert (outcomes[PIPELINE].completed, outcomes[PIPELINE].failed) == (1, 0)
+    assert report.persistently_failing() == (outcomes[RESCUE],)
+    assert render_workflow_runs_section(report)[1].startswith(
+        f"- **PERSISTENTLY FAILING** `{RESCUE}`: its last 3 runs failed. "
+        f"Latest run `{latest}` failed at stage `dispatch_repairs`"
+    )
+
+
+async def test_a_born_hybrid_agent_reports_the_runs_stamped_under_its_signing_did(store):
+    await store.run(PIPELINE, "completed", _hours_ago(2), owner=BORN_HYBRID)
+    await store.run(
+        PIPELINE, "failed", _hours_ago(1), owner=BORN_HYBRID, failed_at=(("verify_ci", CI_RED),)
+    )
+    # Another agent's runs, under a legacy did:pkh, stay out.
+    await store.run(PIPELINE, "failed", _hours_ago(1), failed_at=(("verify_ci", CI_RED),))
+    agent = _agent(store.db, did=BORN_HYBRID, identity=born_hybrid_identity(BORN_HYBRID))
+
+    report = await read_workflow_run_report(agent, now=NOW)
+
+    pipeline = _by_name(report)[PIPELINE]
+    assert (pipeline.completed, pipeline.failed) == (1, 1)
+    assert (pipeline.failed_runs[0].stage_name, pipeline.failed_runs[0].gate_reason) == (
+        "verify_ci",
+        CI_RED,
+    )
+
+
+@pytest.mark.parametrize(
+    ("did", "identity", "stamped_as"),
+    [
+        pytest.param(OWNER, OWNER_IDENTITY, OWNER, id="single-did"),
+        pytest.param(SUCCESSOR, rotated_identity(OWNER, SUCCESSOR), OWNER, id="rotated"),
+        pytest.param(BORN_HYBRID, born_hybrid_identity(BORN_HYBRID), BORN_HYBRID, id="born-hybrid"),
+    ],
+)
+async def test_the_morning_signal_tool_reports_the_runs_the_runner_stamped(
+    store, did, identity, stamped_as
+):
+    now = datetime.now(timezone.utc)
+    for hours in (3, 2, 1):
+        await store.run(
+            RESCUE,
+            "failed",
+            now - timedelta(hours=hours),
+            owner=stamped_as,
+            failed_at=(("dispatch_repairs", NO_TARGETS),),
+        )
+    feature = StrategicMemoryFeature(agent=_agent(store.db, did=did, identity=identity))
+    feature._data = {"morning_signal_config": {"scan_repos": []}}
+
+    result = await feature.morning_signal()
+
+    assert result.status is ToolResultStatus.OK
+    assert f"- `{RESCUE}`: 0 completed, 3 failed" in result.confirmation
+    assert f"**PERSISTENTLY FAILING** `{RESCUE}`" in result.confirmation
+
+
+# ---------------------------------------------------------------------------
 # Unreadable is not empty
 # ---------------------------------------------------------------------------
 
 
-async def test_an_agent_without_a_did_is_not_assessed(store):
-    with pytest.raises(WorkflowRunsNotAssessed, match="no DID"):
-        await read_workflow_run_report(_agent(store.db, did=""), now=NOW)
+@pytest.mark.parametrize(
+    "identity",
+    [
+        pytest.param(None, id="no-identity"),
+        pytest.param(MagicMock(), id="fabricated-attributes"),
+        pytest.param(SimpleNamespace(legacy_did="", signing_did=""), id="empty"),
+    ],
+)
+async def test_an_agent_without_an_identity_did_is_not_assessed(store, identity):
+    # A run stamped under ``agent.did`` is still not reported: that DID is no
+    # stand-in for the owner, since a rotated agent's is not the one its runs
+    # carry.
+    await store.run(RESCUE, "failed", _hours_ago(1), failed_at=(("dispatch_repairs", NO_TARGETS),))
+
+    with pytest.raises(WorkflowRunsNotAssessed, match="no identity DID"):
+        await read_workflow_run_report(_agent(store.db, identity=identity), now=NOW)
 
 
 async def test_an_agent_without_a_database_is_not_assessed():
-    agent = SimpleNamespace(did=OWNER)
+    agent = SimpleNamespace(did=OWNER, identity=OWNER_IDENTITY)
 
     assessment = await assess_workflow_runs(agent, {}, now=NOW)
 
@@ -593,20 +704,6 @@ async def test_the_briefing_reports_runs_without_a_strategy_file(store):
 
     assert briefing.startswith("No strategic memory loaded.")
     assert f"**PERSISTENTLY FAILING** `{RESCUE}`" in briefing
-
-
-async def test_the_morning_signal_tool_reads_the_agents_runs(store):
-    now = datetime.now(timezone.utc)
-    for hours in (3, 2, 1):
-        await store.run(RESCUE, "failed", now - timedelta(hours=hours), failed_at=(("dispatch_repairs", NO_TARGETS),))
-    feature = StrategicMemoryFeature(agent=_agent(store.db))
-    feature._data = {"morning_signal_config": {"scan_repos": []}}
-
-    result = await feature.morning_signal()
-
-    assert result.status is ToolResultStatus.OK
-    assert f"- `{RESCUE}`: 0 completed, 3 failed" in result.confirmation
-    assert f"**PERSISTENTLY FAILING** `{RESCUE}`" in result.confirmation
 
 
 async def test_the_morning_signal_tool_says_when_runs_cannot_be_read():
