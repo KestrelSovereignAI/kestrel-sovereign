@@ -385,8 +385,12 @@ class Feature(_SdkFeature):
         tool_executor: Optional[Any] = None,
         model_override: Optional[str] = None,
         session_id: Optional[str] = None,
+        request: Optional[str] = None,
     ) -> Any:
         """Give a feature subagent one more step when it narrates but emits no tool.
+
+        ``request`` is the task prompt the message answers, for the decision
+        check (#3527).
 
         ``tool_executor`` is threaded through to ``generate_with_messages``
         so codex-routed repair turns don't hit the same "requires a
@@ -407,7 +411,7 @@ class Feature(_SdkFeature):
         # The pattern is usually a finished answer's plan; confirm it first
         # when the decision check is on (#3527).
         if not await confirm_unfinished(
-            self.agent.llm_service, content, session_id=session_id,
+            self.agent.llm_service, content, request=request, session_id=session_id,
         ):
             return response
 
@@ -2107,6 +2111,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 tool_executor=tool_executor,
                 model_override=model_override,
                 session_id=session_id,
+                request=user_prompt,
             )
             if isinstance(response, str):
                 return response
@@ -2214,6 +2219,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     tool_executor=tool_executor,
                     model_override=model_override,
                     session_id=session_id,
+                    request=user_prompt,
                 )
                 if isinstance(response, str):
                     return response

@@ -533,7 +533,7 @@ async def test_signal_dispatch_does_not_call_an_unreachable_github_nothing_to_do
     agent = _dispatch_agent(registration=None)
     feat = _make_feature({}, agent=agent)
 
-    async def unreachable(view, diagnostics=None, run_history=None):
+    async def unreachable(view, diagnostics=None, run_history=None, talon_workspaces=None):
         diagnostics.update(blockers_checked=3, blockers_unreadable=3)
         return None
 
@@ -557,7 +557,7 @@ async def test_signal_dispatch_still_says_nothing_to_do_when_github_answered():
     agent = _dispatch_agent(registration=None)
     feat = _make_feature({}, agent=agent)
 
-    async def all_closed(view, diagnostics=None, run_history=None):
+    async def all_closed(view, diagnostics=None, run_history=None, talon_workspaces=None):
         diagnostics.update(blockers_checked=3, blockers_unreadable=0)
         return None
 
@@ -622,7 +622,7 @@ async def test_signal_dispatch_one_unreadable_candidate_is_still_unconfirmed():
     agent = _dispatch_agent(registration=None)
     feat = _make_feature({}, agent=agent)
 
-    async def mixed(view, diagnostics=None, run_history=None):
+    async def mixed(view, diagnostics=None, run_history=None, talon_workspaces=None):
         diagnostics.update(
             blockers_checked=0, candidates_checked=3, candidates_unreadable=1,
         )
@@ -646,7 +646,7 @@ async def test_signal_dispatch_says_nothing_to_do_when_candidate_linkage_answere
     agent = _dispatch_agent(registration=None)
     feat = _make_feature({}, agent=agent)
 
-    async def all_in_flight(view, diagnostics=None, run_history=None):
+    async def all_in_flight(view, diagnostics=None, run_history=None, talon_workspaces=None):
         diagnostics.update(candidates_checked=2, candidates_unreadable=0)
         return None
 
@@ -678,7 +678,7 @@ async def test_signal_dispatch_says_why_an_in_flight_issue_was_not_selected(mode
     agent = _dispatch_agent(registration=SimpleNamespace(owner="feature:x"))
     feat = _make_feature({}, agent=agent)
 
-    async def only_in_flight(view, diagnostics=None, run_history=None):
+    async def only_in_flight(view, diagnostics=None, run_history=None, talon_workspaces=None):
         diagnostics.update(
             blockers_checked=1, blockers_unreadable=0,
             open_pr_exclusions=[dict(_IN_FLIGHT)],
@@ -705,7 +705,7 @@ async def test_signal_dispatch_reports_skips_alongside_the_issue_it_dispatched()
     agent = _dispatch_agent(registration=registration)
     feat = _make_feature({}, agent=agent)
 
-    async def skip_then_pick(view, diagnostics=None, run_history=None):
+    async def skip_then_pick(view, diagnostics=None, run_history=None, talon_workspaces=None):
         diagnostics.update(open_pr_exclusions=[dict(_IN_FLIGHT)])
         return dict(_TOP_ISSUE)
 
@@ -748,15 +748,27 @@ class _TalonJobs:
     ``mode='suggest'`` preview, must use neither. Each records the call in
     ``effects`` before failing, so a test can assert none happened even where
     the failure itself is caught.
+
+    ``workspace_readiness()`` answers as kestrel-feature-talon >=0.2.13 does
+    (#3548): every repository is provisioned except those in
+    ``unprovisioned``, and the read raises for those in
+    ``unreadable_workspaces``. Each repository asked about is recorded in
+    ``workspace_reads``.
     """
 
     kind = "talon"
     signal = None
 
-    def __init__(self, runs, complete=True, reason="", error=None):
+    def __init__(
+        self, runs, complete=True, reason="", error=None,
+        unprovisioned=(), unreadable_workspaces=(),
+    ):
         self._report = {"complete": complete, "runs": list(runs), "reason": reason}
         self._error = error
+        self._unprovisioned = set(unprovisioned)
+        self._unreadable_workspaces = set(unreadable_workspaces)
         self.reads = 0
+        self.workspace_reads = []
         self.effects = []
 
     async def finished_runs(self):
@@ -764,6 +776,22 @@ class _TalonJobs:
         if self._error is not None:
             raise self._error
         return self._report
+
+    async def workspace_readiness(self, repo):
+        self.workspace_reads.append(repo)
+        if repo in self._unreadable_workspaces:
+            raise OSError(f"{repo}: talon policy unreadable")
+        workspace = f"/srv/talon/projects/{repo.replace('/', '__')}"
+        if repo not in self._unprovisioned:
+            return {"repo": repo, "provisioned": True, "workspace": workspace}
+        return {
+            "repo": repo,
+            "provisioned": False,
+            "reason": "no_talon_workspace",
+            "workspace": workspace,
+            "next_step": f"talon_setup_workspace(repo='{repo}')",
+            "detail": f"No talon workspace exists for {repo} at {workspace}.",
+        }
 
     async def active_handles(self):
         self.effects.append("active_handles")
@@ -1232,3 +1260,255 @@ async def test_signal_dispatch_with_no_eligible_candidate_dispatches_nothing(mon
     ]
     assert "/repos/o/talon/issues/35" not in reads
     agent.execute_named_tool.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# #3548: a candidate whose repository has no provisioned Talon workspace is
+# skipped, and named, instead of started and then failed at talon_run
+# ---------------------------------------------------------------------------
+
+
+class _TalonJobsBefore0213(_TalonJobs):
+    """kestrel-feature-talon 0.2.10-0.2.12: ``finished_runs()``, and no
+    ``workspace_readiness()``."""
+
+    workspace_readiness = None
+
+
+def _two_repo_feature(agent, *blockers):
+    return _make_feature(
+        {"morning_signal_config": {"scan_repos": ["o/w", "o/r"]}},
+        agent=agent,
+        blockers=list(blockers),
+    )
+
+
+_UNPROVISIONED_BLOCKER = {"severity": "critical", "issue": "o/w#30", "title": "loudest"}
+_PROVISIONED_BLOCKER = {"severity": "high", "issue": "o/r#2", "title": "next"}
+
+
+def _board_with_both(monkeypatch):
+    return _github_board(monkeypatch, {
+        ("o/w", 30): _agent_ready_issue(30, "no workspace", repo="o/w"),
+        ("o/r", 2): _agent_ready_issue(2, "provisioned"),
+    })
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_skips_an_issue_in_an_unprovisioned_repository(monkeypatch):
+    """#3548 acceptance, through the real selector and the real readiness
+    read: the critical blocker is in a repository nobody has provisioned a
+    Talon workspace for. It is skipped with ``no_talon_workspace`` and named
+    in ``skipped``, ``workflow_run`` is never called for it, and the next
+    eligible candidate is dispatched."""
+    _board_with_both(monkeypatch)
+    provider = _TalonJobs([], unprovisioned={"o/w"})
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")), provider
+    )
+    feat = _two_repo_feature(agent, _UNPROVISIONED_BLOCKER, _PROVISIONED_BLOCKER)
+
+    result = await feat.signal_dispatch(mode="execute")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["dispatched"] is True
+    assert (result.data["issue"]["repo"], result.data["issue"]["issue_number"]) == (
+        "o/r", 2,
+    )
+    agent.execute_named_tool.assert_awaited_once()
+    [name, request] = agent.execute_named_tool.await_args.args
+    assert name == "workflow_run"
+    assert (request["params"]["repo"], request["params"]["issue"]) == ("o/r", 2)
+    [skip] = result.data["skipped"]
+    assert skip == {
+        "repo": "o/w",
+        "issue_number": 30,
+        "reason": "no_talon_workspace",
+        "workspace": "/srv/talon/projects/o__w",
+        "next_step": "talon_setup_workspace(repo='o/w')",
+        "detail": "No talon workspace exists for o/w at /srv/talon/projects/o__w.",
+    }
+    assert (
+        "skipped o/w#30 -- no Talon workspace is provisioned for o/w; "
+        "talon_setup_workspace(repo='o/w') provisions one, with approval"
+    ) in result.confirmation
+    assert provider.workspace_reads == ["o/w", "o/r"]
+    assert provider.effects == []
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_suggest_names_the_repository_to_provision(monkeypatch):
+    _board_with_both(monkeypatch)
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")),
+        _TalonJobs([], unprovisioned={"o/w"}),
+    )
+    feat = _two_repo_feature(agent, _UNPROVISIONED_BLOCKER, _PROVISIONED_BLOCKER)
+
+    result = await feat.signal_dispatch(mode="suggest")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["dispatched"] is False
+    assert result.data["issue"]["repo"] == "o/r"
+    assert [skip["reason"] for skip in result.data["skipped"]] == ["no_talon_workspace"]
+    assert "talon_setup_workspace(repo='o/w')" in result.confirmation
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_with_only_an_unprovisioned_repository_starts_nothing(
+    monkeypatch,
+):
+    """Talon answered, so nothing is actionable until someone provisions the
+    workspace -- and the output says which, and how."""
+    _board_with_both(monkeypatch)
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")),
+        _TalonJobs([], unprovisioned={"o/w"}),
+    )
+    feat = _two_repo_feature(agent, _UNPROVISIONED_BLOCKER)
+
+    result = await feat.signal_dispatch(mode="execute")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["dispatched"] is False
+    assert result.data["issue"] is None
+    assert "No actionable issue found." in result.confirmation
+    assert "talon_setup_workspace(repo='o/w')" in result.confirmation
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_dispatches_a_provisioned_repository_as_before(monkeypatch):
+    _board_with_both(monkeypatch)
+    provider = _TalonJobs([])
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")), provider
+    )
+    feat = _two_repo_feature(agent, _PROVISIONED_BLOCKER)
+
+    result = await feat.signal_dispatch(mode="execute")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["dispatched"] is True
+    assert result.data["skipped"] == []
+    agent.execute_named_tool.assert_awaited_once_with(
+        "workflow_run",
+        {
+            "name": "fleet_coding_pipeline",
+            "params": {
+                "repo": "o/r",
+                "issue": 2,
+                "issue_title": "provisioned",
+                "priority": "high",
+                "context": "Blocker (severity: high): next.",
+            },
+        },
+        session_id="chat-7",
+        source="strategic_memory.signal_dispatch",
+    )
+    assert provider.workspace_reads == ["o/r"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["execute", "suggest"])
+async def test_signal_dispatch_names_the_talon_release_workspace_readiness_needs(mode):
+    """A ``talon`` provider without ``workspace_readiness()`` cannot say
+    whether any repository has a workspace, so nothing is selected or
+    dispatched. The refusal names the release that fixes it, and is not
+    "nothing to do"."""
+    provider = _TalonJobsBefore0213([])
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")), provider
+    )
+    feat = _make_feature({}, agent=agent)
+    pick = AsyncMock(return_value=_TOP_ISSUE)
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue", new=pick
+    ):
+        result = await feat.signal_dispatch(mode=mode)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["reason_code"] == "TALON_WORKSPACE_UNCONFIRMED"
+    assert result.data["requirement"] == "kestrel-feature-talon>=0.2.13"
+    assert result.data["dispatched"] is False
+    assert "kestrel-feature-talon>=0.2.13" in result.confirmation
+    assert "kestrel-feature-talon>=0.2.13" in result.error
+    assert "No actionable issue found" not in result.confirmation
+    assert provider.effects == []
+    pick.assert_not_awaited()
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["execute", "suggest"])
+async def test_signal_dispatch_does_not_start_a_run_talon_cannot_confirm(
+    mode, monkeypatch
+):
+    """A readiness read that raises withholds the candidate, and the result
+    is unconfirmed rather than "No actionable issue found"."""
+    _board_with_both(monkeypatch)
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")),
+        _TalonJobs([], unreadable_workspaces={"o/r"}),
+    )
+    feat = _two_repo_feature(agent, _PROVISIONED_BLOCKER)
+
+    result = await feat.signal_dispatch(mode=mode)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["reason_code"] == "TALON_WORKSPACE_UNCONFIRMED"
+    assert result.data["workspaces_unconfirmed"] == ["o/r"]
+    assert result.data["dispatched"] is False
+    assert result.data["issue"] is None
+    [skip] = result.data["skipped"]
+    assert skip["reason"] == "talon_workspace_unconfirmed"
+    assert "o/r: talon policy unreadable" in skip["detail"]
+    assert "No actionable issue found" not in result.confirmation
+    assert "Could not confirm that Talon has a workspace for o/r" in result.confirmation
+    assert "skipped o/r#2 -- Talon could not say whether o/r has a workspace" in (
+        result.confirmation
+    )
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_still_dispatches_past_a_repository_talon_cannot_confirm(
+    monkeypatch,
+):
+    """Only the candidate whose workspace is unknown is withheld: a
+    provisioned one behind it is dispatched, and the skip is reported."""
+    _board_with_both(monkeypatch)
+    agent = _with_talon(
+        _dispatch_agent(registration=SimpleNamespace(owner="feature:x")),
+        _TalonJobs([], unreadable_workspaces={"o/w"}),
+    )
+    feat = _two_repo_feature(agent, _UNPROVISIONED_BLOCKER, _PROVISIONED_BLOCKER)
+
+    result = await feat.signal_dispatch(mode="execute")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["dispatched"] is True
+    assert result.data["issue"]["repo"] == "o/r"
+    assert [
+        (skip["repo"], skip["issue_number"], skip["reason"])
+        for skip in result.data["skipped"]
+    ] == [("o/w", 30, "talon_workspace_unconfirmed")]
+    agent.execute_named_tool.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_without_talon_asks_about_no_workspace():
+    """An agent with no ``talon`` provider has no Talon workspace to confirm;
+    selection is handed no readiness read, as it is handed no history."""
+    agent = _dispatch_agent(registration=None)
+    feat = _make_feature({}, agent=agent)
+    pick = AsyncMock(return_value=None)
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue", new=pick
+    ):
+        await feat.signal_dispatch(mode="suggest")
+
+    assert pick.await_args.kwargs["talon_workspaces"] is None

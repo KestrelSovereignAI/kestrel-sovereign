@@ -388,6 +388,22 @@ def host_runtime_isolation_root(_isolate_host_runtime_paths):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_decision_check_env(monkeypatch):
+    """Strip operator decision-check settings from every test (#3527).
+
+    The continuation check reads ``KESTREL_CONTINUATION_CHECK`` when it runs,
+    so a host ``.env`` that enables it would send every repair-path test's
+    ``MagicMock`` service through ``decide``. Tests that exercise a check
+    opt in with ``monkeypatch.setenv``.
+    """
+    for var in (
+        "KESTREL_CONTINUATION_CHECK",
+        "KESTREL_CONTINUATION_CHECK_DECISION_MODEL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_otel_export_env(monkeypatch):
     """Strip live OTLP export env from every test and reset the tracer cache.
 

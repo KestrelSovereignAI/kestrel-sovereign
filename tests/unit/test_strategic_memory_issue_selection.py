@@ -451,6 +451,7 @@ async def test_diagnostics_say_when_nothing_could_be_confirmed(monkeypatch):
         ],
         "open_pr_exclusions": [],
         "run_exclusions": [],
+        "workspace_exclusions": [],
     }
 
 
@@ -478,6 +479,7 @@ async def test_a_closed_blocker_is_checked_but_not_unreadable(monkeypatch):
         ],
         "open_pr_exclusions": [],
         "run_exclusions": [],
+        "workspace_exclusions": [],
     }
 
 
@@ -2365,3 +2367,285 @@ async def test_a_non_mapping_config_does_not_crash_selection(monkeypatch):
     assert await issue_selection.pick_top_issue(
         {"morning_signal_config": ["o/r"]}
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# #3548: a candidate whose repository has no provisioned Talon workspace is
+# skipped, not started and then failed at talon_run
+# ---------------------------------------------------------------------------
+
+from kestrel_sovereign.features.strategic_memory.workspace_readiness import (  # noqa: E402
+    TalonWorkspaces,
+)
+
+
+def _workspaces(asked, *, unprovisioned=(), unusable=(), unreadable=()):
+    """Talon's ``workspace_readiness()`` as kestrel-feature-talon 0.2.13
+    answers it: every repository is provisioned except those named. Each
+    repository asked about is appended to ``asked``."""
+
+    async def read(repo):
+        asked.append(repo)
+        if repo in unreadable:
+            raise OSError("talon policy unreadable")
+        workspace = f"/srv/talon/projects/{repo.replace('/', '__')}"
+        if repo in unprovisioned:
+            return {
+                "repo": repo,
+                "provisioned": False,
+                "reason": "no_talon_workspace",
+                "workspace": workspace,
+                "next_step": f"talon_setup_workspace(repo='{repo}')",
+                "detail": f"No talon workspace exists for {repo} at {workspace}.",
+            }
+        if repo in unusable:
+            return {
+                "repo": repo,
+                "provisioned": False,
+                "reason": "talon_workspace_unusable",
+                "detail": "talon runtime paths are not configured",
+            }
+        return {"repo": repo, "provisioned": True, "workspace": workspace}
+
+    return TalonWorkspaces(read)
+
+
+def _no_workspace(repo, number):
+    workspace = f"/srv/talon/projects/{repo.replace('/', '__')}"
+    return {
+        "repo": repo,
+        "issue_number": number,
+        "reason": "no_talon_workspace",
+        "workspace": workspace,
+        "next_step": f"talon_setup_workspace(repo='{repo}')",
+        "detail": f"No talon workspace exists for {repo} at {workspace}.",
+    }
+
+
+def _backlog(repo):
+    return f"/repos/{repo}/issues?state=open&labels=agent-ready&per_page=5&sort=updated"
+
+
+@pytest.mark.asyncio
+async def test_a_blocker_in_an_unprovisioned_repository_is_skipped_for_the_next(
+    monkeypatch,
+):
+    """10-08: run d7e2268a for kestrel-feature-workflows#30 failed at
+    talon_run in about 90 ms -- nobody had provisioned a Talon workspace for
+    that repository. The critical blocker there is skipped with Talon's
+    reason, and the next eligible blocker is the pick."""
+    _stub_github(monkeypatch, {
+        "/repos/o/w/issues/30": _open(30, "no workspace"),
+        "/repos/o/r/issues/2": _open(2, "provisioned"),
+    })
+    asked = []
+    diagnostics = {}
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/w", "o/r"]},
+        "blockers": [
+            {"severity": "critical", "issue": "o/w#30", "title": "loudest"},
+            {"severity": "high", "issue": "o/r#2", "title": "next"},
+        ],
+    }
+
+    picked = await issue_selection.pick_top_issue(
+        data, diagnostics, talon_workspaces=_workspaces(asked, unprovisioned={"o/w"})
+    )
+
+    assert (picked["repo"], picked["issue_number"]) == ("o/r", 2)
+    assert diagnostics["workspace_exclusions"] == [_no_workspace("o/w", 30)]
+    assert issue_selection.describe_exclusion(diagnostics["workspace_exclusions"][0]) == (
+        "skipped o/w#30 -- no Talon workspace is provisioned for o/w; "
+        "talon_setup_workspace(repo='o/w') provisions one, with approval"
+    )
+    assert asked == ["o/w", "o/r"]
+    # Talon answered: this is a confirmed skip, not an outage.
+    assert diagnostics["blockers_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_milestone_scan_skips_an_unprovisioned_repository(monkeypatch):
+    _stub_github(monkeypatch, {
+        "/repos/o/w/milestones?state=open&per_page=20": [{"number": 4, "title": "Extraction"}],
+        "/repos/o/w/issues?milestone=4&state=open&labels=agent-ready&per_page=10&sort=updated": [
+            _open(11),
+        ],
+        _MILESTONES: [{"number": 4, "title": "Extraction"}],
+        _MILESTONE_ISSUES: [_open(12)],
+    })
+    asked = []
+    diagnostics = {}
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/w", "o/r"]},
+        "milestones": [
+            {"name": "Extraction", "status": "at_risk", "repos": ["o/w", "o/r"]},
+        ],
+    }
+
+    picked = await issue_selection.pick_top_issue(
+        data, diagnostics, talon_workspaces=_workspaces(asked, unprovisioned={"o/w"})
+    )
+
+    assert (picked["repo"], picked["issue_number"]) == ("o/r", 12)
+    assert diagnostics["workspace_exclusions"] == [_no_workspace("o/w", 11)]
+    assert diagnostics["candidates_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_backlog_scan_reads_each_repository_once(monkeypatch):
+    """Every candidate in an unprovisioned repository is skipped, and named,
+    on one read of that repository."""
+    _stub_github(monkeypatch, {
+        _backlog("o/w"): [_open(1), {**_open(2), "comments": 3}],
+        _backlog("o/r"): [_open(3)],
+    })
+    asked = []
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": {"scan_repos": ["o/w", "o/r"]}},
+        diagnostics,
+        talon_workspaces=_workspaces(asked, unprovisioned={"o/w"}),
+    )
+
+    assert (picked["repo"], picked["issue_number"]) == ("o/r", 3)
+    assert diagnostics["workspace_exclusions"] == [
+        _no_workspace("o/w", 1), _no_workspace("o/w", 2),
+    ]
+    assert asked == ["o/w", "o/r"]
+    assert diagnostics["candidates_checked"] == 3
+    assert diagnostics["candidates_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_workspace_is_read_once_per_repository_across_passes(monkeypatch):
+    """A blocker's issue reappears in the backlog scan: one read, and one
+    exclusion per issue."""
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/1": _open(1),
+        _BACKLOG: [_open(1), _open(2)],
+    })
+    asked = []
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(1), diagnostics,
+        talon_workspaces=_workspaces(asked, unprovisioned={"o/r"}),
+    ) is None
+    assert asked == ["o/r"]
+    assert diagnostics["workspace_exclusions"] == [
+        _no_workspace("o/r", 1), _no_workspace("o/r", 2),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_provisioned_repository_is_picked_as_before(monkeypatch):
+    _stub_github(monkeypatch, {"/repos/o/r/issues/7": _open(7, "provisioned")})
+    asked = []
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        _blockers(7), diagnostics, talon_workspaces=_workspaces(asked)
+    )
+
+    assert picked == {
+        "repo": "o/r",
+        "issue_number": 7,
+        "issue_title": "provisioned",
+        "priority": "high",
+        "context": "Blocker (severity: high): row 7.",
+    }
+    assert asked == ["o/r"]
+    assert diagnostics["workspace_exclusions"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_workspace_is_asked_about_under_the_scanned_spelling(monkeypatch):
+    """Talon derives the workspace path from the repository it is given, so
+    it is asked about the spelling the run would be given."""
+    _stub_github(monkeypatch, {"/repos/Org/Repo/issues/5": _open(5)})
+    asked = []
+    data = {
+        "morning_signal_config": {"scan_repos": ["Org/Repo"]},
+        "blockers": [{"severity": "high", "issue": "org/repo#5", "title": "x"}],
+    }
+
+    picked = await issue_selection.pick_top_issue(
+        data, talon_workspaces=_workspaces(asked)
+    )
+
+    assert picked["repo"] == "Org/Repo"
+    assert asked == ["Org/Repo"]
+
+
+@pytest.mark.asyncio
+async def test_a_workspace_provisioning_does_not_fix_is_skipped_with_its_refusal(
+    monkeypatch,
+):
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": _open(1)})
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(1), diagnostics, talon_workspaces=_workspaces([], unusable={"o/r"})
+    ) is None
+    [exclusion] = diagnostics["workspace_exclusions"]
+    assert exclusion == {
+        "repo": "o/r",
+        "issue_number": 1,
+        "reason": "talon_workspace_unusable",
+        "workspace": None,
+        "next_step": None,
+        "detail": "talon runtime paths are not configured",
+    }
+    assert issue_selection.describe_exclusion(exclusion) == (
+        "skipped o/r#1 -- Talon would refuse its workspace for o/r, and "
+        "provisioning does not fix that: talon runtime paths are not configured"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unread_workspace_withholds_and_is_reported_unconfirmed(monkeypatch):
+    """A read that cannot answer must not start a run. It is not a GitHub
+    outage either, so it is not counted with the unreadable blockers."""
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": _open(1)})
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(1), diagnostics, talon_workspaces=_workspaces([], unreadable={"o/r"})
+    ) is None
+    [exclusion] = diagnostics["workspace_exclusions"]
+    assert exclusion["reason"] == issue_selection.EXCLUDED_TALON_WORKSPACE_UNCONFIRMED
+    assert "talon policy unreadable" in exclusion["detail"]
+    assert issue_selection.describe_exclusion(exclusion).startswith(
+        "skipped o/r#1 -- Talon could not say whether o/r has a workspace a "
+        "dispatch would run in: "
+    )
+    assert diagnostics["blockers_checked"] == 1
+    assert diagnostics["blockers_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_workspace_is_asked_about_only_for_a_candidate_otherwise_free(
+    monkeypatch,
+):
+    """Asked last: a candidate already withheld -- an open PR on it, or a
+    last run still waiting on an answer -- keeps that reason, and its
+    repository costs no read."""
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/1": _open(1), "/repos/o/r/issues/2": _open(2)},
+        linked_prs={("o/r", 1): [_pr(5, updated_at=_fresh_now())]},
+    )
+    asked = []
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        _blockers(1, 2),
+        diagnostics,
+        run_history=_history(_run(2, "blocked")),
+        talon_workspaces=_workspaces(asked, unprovisioned={"o/r"}),
+    ) is None
+    assert asked == []
+    assert diagnostics["workspace_exclusions"] == []
+    assert [e["issue_number"] for e in diagnostics["open_pr_exclusions"]] == [1]
+    assert [e["issue_number"] for e in diagnostics["run_exclusions"]] == [2]

@@ -529,8 +529,12 @@ class OrchestratorEngineMixin:
         request_id: Optional[str] = None,
         invocation_context=None,
         original_delivered: bool = False,
+        request: Optional[str] = None,
     ) -> Union[str, LLMResponse]:
         """Give the model one more step when it narrates continuing but emits no tool call.
+
+        ``request`` is the user text the message answers, for the decision
+        check (#3527).
 
         ``original_delivered`` says the repaired message has already been
         yielded to the client (the streaming tool loop streams text as it
@@ -544,7 +548,7 @@ class OrchestratorEngineMixin:
         # confirmed first when the decision check is on (#3527).
         if not OrchestratorEngineMixin._tool_call_emitted_as_text(content) and not (
             await confirm_unfinished(
-                self.llm_service, content,
+                self.llm_service, content, request=request,
                 local_only=force_local_only, session_id=session_id,
             )
         ):
@@ -2687,6 +2691,7 @@ class OrchestratorEngineMixin:
                 )
                 response = await self._repair_premature_turn_yield(
                     response=response,
+                    request=continuation_user_content or user_message,
                     messages=messages,
                     tools=feature_tools,
                     force_local_only=force_local_only,
@@ -2781,6 +2786,7 @@ class OrchestratorEngineMixin:
                 if all_tools and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or ""):
                     response = await self._repair_premature_turn_yield(
                         response=response,
+                        request=continuation_user_content or user_message,
                         messages=messages,
                         tools=all_tools,
                         force_local_only=force_local_only,
@@ -3158,6 +3164,7 @@ class OrchestratorEngineMixin:
                 )
                 response = await self._repair_premature_turn_yield(
                     response=response,
+                    request=continuation_user_content or user_message,
                     messages=messages,
                     tools=feature_tools,
                     force_local_only=force_local_only,
@@ -3500,6 +3507,7 @@ class OrchestratorEngineMixin:
                 if repaired_missing_tool_call:
                     response = await self._repair_premature_turn_yield(
                         response=response,
+                        request=continuation_user_content or user_message,
                         messages=messages,
                         tools=all_tools,
                         force_local_only=force_local_only,
