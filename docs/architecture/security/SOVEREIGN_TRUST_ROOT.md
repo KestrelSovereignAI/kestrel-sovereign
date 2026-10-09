@@ -113,6 +113,23 @@ one. Never infer a DID from the first row in the shared graph table.
 
 ## Genesis content audit and publisher authority
 
+### Runtime audit deadlines on PostgreSQL
+
+Core 0.53.24 preserves the absolute UTC instant of runtime-state and transition
+timestamps through PostgreSQL's timezone-aware binding. Older versions could
+shift them by the operator process's local timezone. No blanket offset
+backfill is safe: historical writers may have used different timezones.
+On restart, a future last-successful-audit time now requires a fresh native
+full integrity verification before cognition, just like an expired deadline.
+Only successful verification persists the actual current audit time; failure
+retains Safe Mode and does not invent a successful historical timestamp.
+The future-deadline verifier first persists the existing audit-required
+interaction marker. Restart honors that marker even after the future time
+has elapsed, including when saving the later failure/Safe Mode result failed.
+If the marker cannot be saved, verification/readiness remain fail-closed.
+This does not repeat the genesis content evaluation or alter its receipt,
+the governing constitution bytes, or signed reanchor authority.
+
 Source authentication and the genesis content audit answer different questions.
 The operator-controlled resolver and detached signatures establish which exact
 bytes may govern an agent and authorize their adoption. The content audit

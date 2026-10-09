@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -630,15 +631,32 @@ async def test_semantic_maintenance_lease_precision_upgrade_is_backend_neutral(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_constitution_runtime_state_round_trips_on_both_backends(db_backend):
+@pytest.mark.parametrize("process_timezone", ["UTC", "America/Chicago", "Asia/Kolkata"])
+async def test_constitution_runtime_state_round_trips_on_both_backends(
+    db_backend, process_timezone, monkeypatch
+):
     """Safe Mode and UTC audit deadlines survive the SQLite/Postgres codecs."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("process timezone codec regression requires tzset")
+    with monkeypatch.context() as environment:
+        environment.setenv("TZ", process_timezone)
+        time.tzset()
+        try:
+            await _assert_constitution_runtime_state_round_trip(db_backend)
+        finally:
+            # Restore the process clock even when a codec assertion fails.
+            environment.undo()
+            time.tzset()
+
+
+async def _assert_constitution_runtime_state_round_trip(db_backend):
     from kestrel_sovereign.constitution.runtime_state import (
         ConstitutionRuntimeState,
         ConstitutionRuntimeStateStore,
     )
 
     agent_id = f"did:test:{uuid4()}"
-    entered_at = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    entered_at = datetime(2026, 7, 17, 17, 30, tzinfo=timezone(timedelta(hours=5.5)))
     last_audit_at = entered_at - timedelta(hours=2)
     state = ConstitutionRuntimeState(
         agent_id=agent_id,
@@ -677,6 +695,24 @@ async def test_constitution_runtime_state_round_trips_on_both_backends(db_backen
     assert restored.bootstrap_pending is True
     assert restored.safe_mode_entered_at.tzinfo == timezone.utc
     assert restored.last_successful_audit_at.tzinfo == timezone.utc
+    assert restored.updated_at == entered_at
+    events = await reader.list_events(agent_id)
+    assert events[0]["occurred_at"] == entered_at
+
+    exited_at = entered_at + timedelta(minutes=1)
+    await writer.write(
+        replace(
+            state, safe_mode=False, safe_mode_exited_at=exited_at,
+            last_successful_audit_at=exited_at, updated_at=exited_at,
+        ),
+        event_type="safe_mode_exited",
+    )
+    restored = await reader.load(agent_id)
+    assert restored.safe_mode is False
+    assert restored.safe_mode_exited_at == exited_at
+    assert restored.last_successful_audit_at == exited_at
+    assert restored.updated_at == exited_at
+    assert (await reader.list_events(agent_id))[-1]["occurred_at"] == exited_at
 
 
 @pytest.mark.asyncio

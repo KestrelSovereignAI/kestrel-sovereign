@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
+from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
 
 
 @dataclass(frozen=True)
@@ -61,9 +62,14 @@ class ConstitutionRuntimeStateStore:
         return "INTEGER PRIMARY KEY AUTOINCREMENT"
 
     def _timestamp_param(self, value: Optional[datetime]):
-        if value is None or self._is_postgres:
-            return value
-        return self._as_utc(value).isoformat()
+        if value is None:
+            return None
+        instant = self._as_utc(value)
+        if self._is_postgres:
+            # These columns are TIMESTAMPTZ, not legacy naive TIMESTAMP.
+            # Preserve the instant through PostgresBackend's shared adapter.
+            return TimestamptzParameter(instant)
+        return instant.isoformat()
 
     def _boolean_param(self, value: bool):
         return value if self._is_postgres else int(value)
