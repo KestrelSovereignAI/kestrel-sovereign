@@ -287,13 +287,9 @@ class AsyncFileStore:
             "created_at": datetime.now(UTC).isoformat()
         }
 
+        content_hash = hashlib.sha256(image_data).hexdigest()
+        avatar_node_id = self._avatar_node_id(agent_id, avatar_type, content_hash)
         async with self.db.transaction():
-            content_hash = await self.store_file(
-                image_data, f"avatar_{avatar_type}.jpg", metadata
-            )
-            avatar_node_id = self._avatar_node_id(
-                agent_id, avatar_type, content_hash
-            )
             graph_metadata = {**metadata, "hash": content_hash}
 
             # Use the canonical graph writer so the node and edge receive
@@ -310,6 +306,9 @@ class AsyncFileStore:
                 self.db,
                 agent_id,
                 additional_graph_node_ids=[avatar_node_id],
+            )
+            await self.store_file(
+                image_data, f"avatar_{avatar_type}.jpg", metadata
             )
             await graph.add_node(
                 GraphNode(

@@ -17,7 +17,7 @@ from tests.integration.test_constitution_refusal_races import _agent
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-@pytest.mark.parametrize("writer", ["runtime", "offline", "bootstrap"])
+@pytest.mark.parametrize("writer", ["runtime", "offline", "bootstrap", "avatar"])
 async def test_postgres_governance_custody_precedes_file_owner_write(
     db_backend,
     tmp_path,
@@ -82,6 +82,8 @@ async def test_postgres_governance_custody_precedes_file_owner_write(
         monkeypatch.setattr(offline, "_agent_embedding", no_embedding)
 
         async def repair():
+            if writer == "avatar":
+                return await storage.files.store_avatar(content, identity)
             if writer == "runtime":
                 return await ConstitutionMixin.reanchor_constitution(
                     agent, amendment_artifact_path=str(artifact)

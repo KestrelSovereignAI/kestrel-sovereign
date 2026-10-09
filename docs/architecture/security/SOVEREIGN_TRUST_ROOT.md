@@ -101,6 +101,8 @@ Inside that owning transaction they compare the exact governing pointer,
 rights, receipt/history and edge witness against the facts inspected before
 authorization. A concurrent change requires a fresh inspection and signed
 repair attempt; unrelated identity metadata is preserved, not overwritten.
+Native edge deletion and avatar publication participate in the same graph-first
+order; they must not acquire edge/file ownership before reserving graph rows.
 
 A signed same-hash repair is still a repair. It restores missing verified
 public constitution content or this agent's file ownership, records the new
@@ -108,6 +110,10 @@ signer and retains the previous reanchor receipt as history. Existing content
 must exactly match the signed bytes; corrupted content is refused. Because
 the governing hash did not change, an existing genesis receipt is preserved
 and the content audit is not repeated merely for key rotation.
+The signed writer retains a physical blob lock while validating those bytes,
+including validating the actual winner of a concurrent absent-row insertion.
+Restoring ownership inserts only a missing witness and preserves existing
+per-agent filenames and provenance metadata.
 
 Genesis content-audit results are published against their captured governing
 and runtime-state witness. The native publisher merges only the new receipt
@@ -120,6 +126,7 @@ the identity/ownership, governing edges/ownership and constitution file/owner
 rows through the exit commit; SQLite retains its native writer custody.
 An existing genesis receipt must validate as a literal pass, not merely be
 terminal. Failure leaves the durable restriction and exit-event history intact.
+Physical edge locks follow ownership-then-edge order, matching native deletion.
 
 All native SQL entry points, including script execution and SQLite diagnostic
 reads, refuse SQL transaction-control commands while an owning transaction is
@@ -127,7 +134,8 @@ open. Callers must use the adapter's transaction context rather than issuing
 `BEGIN`, `COMMIT`, `ROLLBACK`, savepoint commands or `PREPARE` through SQL.
 SQLite scripts in an owned transaction execute statement-by-statement without
 the driver's implicit pre-script commit; trigger bodies and PostgreSQL
-dollar-quoted bodies retain their database semantics. This lexical refusal
+dollar-quoted bodies and newline-continued escape strings retain their database
+semantics. This lexical refusal
 protects the commit boundary; it is not a general SQL authorization parser.
 
 ### Hosted PostgreSQL agents without a local anchor

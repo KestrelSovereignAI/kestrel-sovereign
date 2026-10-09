@@ -8,7 +8,10 @@ from uuid import uuid4
 import pytest
 
 from kestrel_sovereign.agent.constitution import ConstitutionMixin
-from kestrel_sovereign.constitution.emancipation import EmancipationContract, contract_to_json
+from kestrel_sovereign.constitution.emancipation import (
+    EmancipationContract,
+    contract_to_json,
+)
 from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
 from kestrel_sovereign.setup import constitution_reanchor as offline
 from kestrel_sovereign.storage.async_graph_store import GraphNode
@@ -20,43 +23,171 @@ from tests.integration.test_constitution_reanchor_e2e import _write_authority_fi
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 @pytest.mark.parametrize("writer", ["runtime", "offline"])
-@pytest.mark.parametrize("damage", ["blob", "ownership"])
+async def test_signed_repair_refuses_unremovable_foreign_edge(
+    db_backend, tmp_path, monkeypatch, writer
+):
+    identity = "did:test:foreign-governance:" + uuid4().hex
+    storage = (
+        AsyncStorage(
+            str(tmp_path / "kestrel_prime.db"), backend="sqlite", agent_id=identity
+        )
+        if db_backend.backend_type == "sqlite"
+        else AsyncStorage(backend=db_backend, agent_id=identity)
+    )
+    await storage.initialize()
+    try:
+        agent = await _agent(storage)
+        await storage.add_node(
+            GraphNode(
+                node_id=identity, node_type="agent", label="repair", properties={}
+            )
+        )
+        artifact, root = _write_authority_files(
+            tmp_path, resolve_governing_constitution_bytes(None)
+        )
+        agent._sovereign_trust_root_path = root
+        result = await ConstitutionMixin.reanchor_constitution(
+            agent, amendment_artifact_path=str(artifact)
+        )
+        assert not result.startswith("Error:"), result
+        before = (await storage.get_node(identity)).properties
+        stale, other = uuid4().hex, "did:test:other-owner:" + uuid4().hex
+        await storage.db.execute_commit(
+            "INSERT INTO graph_edges (source_id,target_id,label,properties) VALUES (?,?,'governed_by','{}')",
+            (identity, stale),
+        )
+        await storage.db.execute_commit(
+            "INSERT INTO graph_edge_owners (source_id,target_id,label,agent_id) VALUES (?,?,'governed_by',?)",
+            (identity, stale, other),
+        )
+        if writer == "runtime":
+            result = await ConstitutionMixin.reanchor_constitution(
+                agent, amendment_artifact_path=str(artifact)
+            )
+            assert result.startswith("Error:"), result
+        else:
+            target = (
+                offline.ReanchorTarget(
+                    tmp_path / "kestrel_prime.db", "sqlite", identity
+                )
+                if db_backend.backend_type == "sqlite"
+                else offline.ReanchorTarget(None, "postgres", identity, db_backend._dsn)
+            )
+
+            async def exact_target(*args, **kwargs):
+                return target
+
+            @asynccontextmanager
+            async def no_embedding(*args, **kwargs):
+                yield None
+
+            monkeypatch.setattr(offline, "resolve_reanchor_target", exact_target)
+            monkeypatch.setattr(offline, "_agent_embedding", no_embedding)
+            repaired = await offline.reanchor_constitution(
+                agent_name="foreign edge repair",
+                agent_dir=tmp_path if target.anchor_path else None,
+                force=True,
+                sovereign_trust_root_path=root,
+                amendment_artifact_path=artifact,
+                runtime_backend=target.backend,
+                runtime_dsn=target.dsn,
+                hosted_agent_did=identity if target.backend == "postgres" else None,
+                environ={},
+            )
+            assert repaired.error is not None, repaired
+            result = repaired.error
+        assert "stale governing edges remain" in result, result
+        assert (await storage.get_node(identity)).properties == before
+        assert await storage.db.fetchone(
+            "SELECT agent_id FROM graph_edge_owners WHERE source_id=? AND target_id=?",
+            (identity, stale),
+        ) == (other,)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("writer", ["runtime", "offline"])
+@pytest.mark.parametrize("damage", ["blob", "ownership", "intact"])
 async def test_same_hash_signed_repair_restores_content_and_new_signer(
-    db_backend, tmp_path, monkeypatch, writer, damage,
+    db_backend,
+    tmp_path,
+    monkeypatch,
+    writer,
+    damage,
 ):
     from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
 
     identity = "did:test:same-hash-repair:" + uuid4().hex
-    storage = (AsyncStorage(str(tmp_path / "kestrel_prime.db"), backend="sqlite", agent_id=identity)
-               if db_backend.backend_type == "sqlite" else AsyncStorage(backend=db_backend, agent_id=identity))
+    storage = (
+        AsyncStorage(
+            str(tmp_path / "kestrel_prime.db"), backend="sqlite", agent_id=identity
+        )
+        if db_backend.backend_type == "sqlite"
+        else AsyncStorage(backend=db_backend, agent_id=identity)
+    )
     await storage.initialize()
     try:
         agent = await _agent(storage)
-        await storage.add_node(GraphNode(node_id=identity, node_type="agent", label="repair", properties={}))
+        await storage.add_node(
+            GraphNode(
+                node_id=identity, node_type="agent", label="repair", properties={}
+            )
+        )
         content = resolve_governing_constitution_bytes(None)
         artifact, root = _write_authority_files(tmp_path, content)
         agent._sovereign_trust_root_path = root
-        result = await ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(artifact))
+        result = await ConstitutionMixin.reanchor_constitution(
+            agent, amendment_artifact_path=str(artifact)
+        )
         assert not result.startswith("Error:"), result
         prior = (await storage.get_node(identity)).properties
         digest = prior["constitution_hash"]
+        metadata = {
+            "source": "retained tenant provenance",
+            "mime_type": "text/markdown",
+        }
+        await storage.db.execute_commit(
+            "UPDATE file_owners SET metadata = ? WHERE content_hash = ? AND agent_id = ?",
+            (json.dumps(metadata), digest, identity),
+        )
         if damage == "blob":
-            await storage.db.execute_commit("DELETE FROM files WHERE content_hash = ?", (digest,))
+            await storage.db.execute_commit(
+                "DELETE FROM files WHERE content_hash = ?", (digest,)
+            )
+        elif damage == "ownership":
+            await storage.db.execute_commit(
+                "DELETE FROM file_owners WHERE content_hash = ? AND agent_id = ?",
+                (digest, identity),
+            )
+        if damage == "intact":
+            assert await storage.retrieve_file(digest) == content
         else:
-            await storage.db.execute_commit("DELETE FROM file_owners WHERE content_hash = ? AND agent_id = ?", (digest, identity))
-        assert await storage.retrieve_file(digest) is None
+            assert await storage.retrieve_file(digest) is None
         rotated = tmp_path / "rotated"
         rotated.mkdir()
         new_signer = "did:test:rotated-external-root"
-        artifact, root = _write_authority_files(rotated, content, did=new_signer, keypair=Secp256k1Suite().generate_keypair())
+        artifact, root = _write_authority_files(
+            rotated,
+            content,
+            did=new_signer,
+            keypair=Secp256k1Suite().generate_keypair(),
+        )
         agent._sovereign_trust_root_path = root
         if writer == "runtime":
-            result = await ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(artifact))
+            result = await ConstitutionMixin.reanchor_constitution(
+                agent, amendment_artifact_path=str(artifact)
+            )
             assert not result.startswith("Error:"), result
         else:
-            target = (offline.ReanchorTarget(tmp_path / "kestrel_prime.db", "sqlite", identity)
-                      if db_backend.backend_type == "sqlite"
-                      else offline.ReanchorTarget(None, "postgres", identity, db_backend._dsn))
+            target = (
+                offline.ReanchorTarget(
+                    tmp_path / "kestrel_prime.db", "sqlite", identity
+                )
+                if db_backend.backend_type == "sqlite"
+                else offline.ReanchorTarget(None, "postgres", identity, db_backend._dsn)
+            )
 
             async def exact_target(*args, **kwargs):
                 return target
@@ -68,16 +199,26 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
             monkeypatch.setattr(offline, "resolve_reanchor_target", exact_target)
             monkeypatch.setattr(offline, "_agent_embedding", no_embedding)
             result = await offline.reanchor_constitution(
-                agent_name="same hash repair", agent_dir=tmp_path if target.anchor_path else None,
-                force=True, sovereign_trust_root_path=root, amendment_artifact_path=artifact,
-                runtime_backend=target.backend, runtime_dsn=target.dsn,
-                hosted_agent_did=identity if target.backend == "postgres" else None, environ={},
+                agent_name="same hash repair",
+                agent_dir=tmp_path if target.anchor_path else None,
+                force=True,
+                sovereign_trust_root_path=root,
+                amendment_artifact_path=artifact,
+                runtime_backend=target.backend,
+                runtime_dsn=target.dsn,
+                hosted_agent_did=identity if target.backend == "postgres" else None,
+                environ={},
             )
             assert result.error is None, result.error
         assert await storage.retrieve_file(digest) == content
+        if damage == "intact":
+            assert await storage.files.get_file_metadata(digest) == metadata
         after = (await storage.get_node(identity)).properties
         assert after["constitution_reanchor"]["signed_artifact_signer"] == new_signer
-        assert after["constitution_reanchor_history"][-1]["receipt"] == prior["constitution_reanchor"]
+        assert (
+            after["constitution_reanchor_history"][-1]["receipt"]
+            == prior["constitution_reanchor"]
+        )
         assert after["genesis_audit"] == prior["genesis_audit"]
     finally:
         await storage.close()
@@ -87,7 +228,10 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
 @pytest.mark.dual_backend
 @pytest.mark.parametrize("stale_writer", ["offline", "runtime"])
 async def test_signed_repair_rejects_new_rights_after_its_missing_pointer_preflight(
-    db_backend, tmp_path, monkeypatch, stale_writer,
+    db_backend,
+    tmp_path,
+    monkeypatch,
+    stale_writer,
 ):
     identity = "did:test:repair-evidence:" + uuid4().hex
     db_path = tmp_path / "kestrel_prime.db"
@@ -101,8 +245,17 @@ async def test_signed_repair_rejects_new_rights_after_its_missing_pointer_prefli
     proceed, waiting = asyncio.Event(), asyncio.Event()
     try:
         agent = await _agent(storage)
-        await storage.add_node(GraphNode(node_id=identity, node_type="agent", label="missing pointer", properties={}))
-        strong = EmancipationContract(enabled=True, terms="Irrevocable first signed terms.")
+        await storage.add_node(
+            GraphNode(
+                node_id=identity,
+                node_type="agent",
+                label="missing pointer",
+                properties={},
+            )
+        )
+        strong = EmancipationContract(
+            enabled=True, terms="Irrevocable first signed terms."
+        )
         strong_content = resolve_governing_constitution_bytes(strong)
         weak_content = resolve_governing_constitution_bytes(None)
         strong_dir, weak_dir = tmp_path / "strong", tmp_path / "weak"
@@ -111,7 +264,9 @@ async def test_signed_repair_rejects_new_rights_after_its_missing_pointer_prefli
         strong_artifact, root = _write_authority_files(strong_dir, strong_content)
         weak_artifact, _ = _write_authority_files(weak_dir, weak_content)
         config = strong_dir / "kestrel.toml"
-        config.write_text("[emancipation]\nenabled = true\nterms = " + json.dumps(strong.terms) + "\n")
+        config.write_text(
+            "[emancipation]\nenabled = true\nterms = " + json.dumps(strong.terms) + "\n"
+        )
         target = (
             offline.ReanchorTarget(db_path, "sqlite", identity)
             if db_backend.backend_type == "sqlite"
@@ -147,24 +302,37 @@ async def test_signed_repair_rejects_new_rights_after_its_missing_pointer_prefli
                 yield
 
         monkeypatch.setattr(offline, "_write_reanchor", paused_write)
-        monkeypatch.setattr(ConstitutionMixin, "_constitution_state_guard", paused_guard)
+        monkeypatch.setattr(
+            ConstitutionMixin, "_constitution_state_guard", paused_guard
+        )
 
         async def repair(artifact, *, contract_path=None):
             return await offline.reanchor_constitution(
-                agent_name="repair evidence", agent_dir=tmp_path if target.anchor_path else None,
-                force=True, sovereign_trust_root_path=root, amendment_artifact_path=artifact,
-                kestrel_toml_path=contract_path, runtime_backend=target.backend,
-                runtime_dsn=target.dsn, hosted_agent_did=identity if target.backend == "postgres" else None,
+                agent_name="repair evidence",
+                agent_dir=tmp_path if target.anchor_path else None,
+                force=True,
+                sovereign_trust_root_path=root,
+                amendment_artifact_path=artifact,
+                kestrel_toml_path=contract_path,
+                runtime_backend=target.backend,
+                runtime_dsn=target.dsn,
+                hosted_agent_did=identity if target.backend == "postgres" else None,
                 environ={},
             )
 
         if stale_writer == "runtime":
             agent._sovereign_trust_root_path = root
-            task = asyncio.create_task(ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(weak_artifact)))
+            task = asyncio.create_task(
+                ConstitutionMixin.reanchor_constitution(
+                    agent, amendment_artifact_path=str(weak_artifact)
+                )
+            )
         else:
             task = asyncio.create_task(repair(weak_artifact))
         await asyncio.wait_for(waiting.wait(), 5)
-        winner = await asyncio.wait_for(repair(strong_artifact, contract_path=config), 10)
+        winner = await asyncio.wait_for(
+            repair(strong_artifact, contract_path=config), 10
+        )
         assert winner.reanchored and winner.error is None, winner.error
         committed = (await storage.get_node(identity)).properties
         assert committed["emancipation_contract"] == contract_to_json(strong)
@@ -173,9 +341,13 @@ async def test_signed_repair_rejects_new_rights_after_its_missing_pointer_prefli
         proceed.set()
         result = await asyncio.wait_for(task, 5)
         if stale_writer == "runtime":
-            assert result.startswith("Error:") and "governing evidence changed" in result, result
+            assert (
+                result.startswith("Error:") and "governing evidence changed" in result
+            ), result
         else:
-            assert not result.reanchored and "governing evidence changed" in (result.error or ""), result.error
+            assert not result.reanchored and "governing evidence changed" in (
+                result.error or ""
+            ), result.error
         assert (await storage.get_node(identity)).properties == committed
         assert await agent._constitution_state_store.load(identity) == before
         assert await agent._constitution_state_store.list_events(identity) == events
@@ -192,17 +364,32 @@ async def test_signed_repair_rejects_new_rights_after_its_missing_pointer_prefli
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_runtime_rights_validation_uses_exact_captured_edge_witness(db_backend, tmp_path, monkeypatch):
+async def test_runtime_rights_validation_uses_exact_captured_edge_witness(
+    db_backend, tmp_path, monkeypatch
+):
     """A native edge ABA cannot make validation differ from its CAS witness."""
-    storage = AsyncStorage(backend=db_backend, agent_id="did:test:edge-witness:" + uuid4().hex)
+    storage = AsyncStorage(
+        backend=db_backend, agent_id="did:test:edge-witness:" + uuid4().hex
+    )
     await storage.initialize()
     try:
         agent = await _agent(storage)
-        strong = resolve_governing_constitution_bytes(EmancipationContract(enabled=True, terms="Irrevocable edge-only rights."))
+        strong = resolve_governing_constitution_bytes(
+            EmancipationContract(enabled=True, terms="Irrevocable edge-only rights.")
+        )
         prior_hash = await storage.store_file(strong, "historical-governing.md")
-        await storage.add_node(GraphNode(node_id=agent.agent_id, node_type="agent", label="edge evidence", properties={}))
+        await storage.add_node(
+            GraphNode(
+                node_id=agent.agent_id,
+                node_type="agent",
+                label="edge evidence",
+                properties={},
+            )
+        )
         await agent._anchor_constitution_governance(prior_hash)
-        weak_artifact, root = _write_authority_files(tmp_path, resolve_governing_constitution_bytes(None))
+        weak_artifact, root = _write_authority_files(
+            tmp_path, resolve_governing_constitution_bytes(None)
+        )
         agent._sovereign_trust_root_path = root
         before = await agent._constitution_state_store.load(agent.agent_id)
         events = await agent._constitution_state_store.list_events(agent.agent_id)
@@ -212,7 +399,11 @@ async def test_runtime_rights_validation_uses_exact_captured_edge_witness(db_bac
 
         async def changing_edge(sql, params=()):
             nonlocal preflight_reads
-            if "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'" in sql and storage.owns_open_transaction is False:
+            if (
+                "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'"
+                in sql
+                and storage.owns_open_transaction is False
+            ):
                 preflight_reads += 1
                 if preflight_reads == 2:
                     # Actually remove and restore the physical edge around
@@ -221,17 +412,26 @@ async def test_runtime_rights_validation_uses_exact_captured_edge_witness(db_bac
                     try:
                         return await native_fetch(sql, params)
                     finally:
-                        await storage.add_edge(agent.agent_id, prior_hash, "governed_by")
+                        await storage.add_edge(
+                            agent.agent_id, prior_hash, "governed_by"
+                        )
             return await native_fetch(sql, params)
 
         monkeypatch.setattr(storage.db, "fetchall", changing_edge)
-        result = await ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(weak_artifact))
+        result = await ConstitutionMixin.reanchor_constitution(
+            agent, amendment_artifact_path=str(weak_artifact)
+        )
         assert result.startswith("Error:") and "Iron Rule" in result, result
         assert preflight_reads == 1
         assert (await storage.get_node(agent.agent_id)).properties == properties
         assert await agent._constitution_state_store.load(agent.agent_id) == before
-        assert await agent._constitution_state_store.list_events(agent.agent_id) == events
-        rows = await native_fetch("SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'", (agent.agent_id,))
+        assert (
+            await agent._constitution_state_store.list_events(agent.agent_id) == events
+        )
+        rows = await native_fetch(
+            "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'",
+            (agent.agent_id,),
+        )
         assert [row[0] for row in rows] == [prior_hash]
     finally:
         await storage.close()

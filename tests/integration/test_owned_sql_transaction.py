@@ -82,3 +82,22 @@ async def test_native_script_retains_quoted_body_semantics(db_backend):
         await db_backend.execute_script(
             "DO $😀$ BEGIN PERFORM 'COMMIT; END;'; END; $😀$;"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_escape_continuation_cannot_hide_commit(db_backend):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL escape-string continuation grammar")
+    table = "continued_string_" + uuid4().hex
+    await db_backend.execute(f"CREATE TABLE {table} (value INTEGER)")
+    try:
+        with pytest.raises(Exception, match="transaction control"):
+            async with db_backend.transaction():
+                await db_backend.execute(f"INSERT INTO {table} VALUES (1)")
+                await db_backend.execute_script(
+                    "SELECT E'a'\n'b\\'x';\nSELECT 'c\\';\nCOMMIT;"
+                )
+        assert await db_backend.fetch_val(f"SELECT COUNT(*) FROM {table}") == 0
+    finally:
+        await db_backend.execute(f"DROP TABLE {table}")

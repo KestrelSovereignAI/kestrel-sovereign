@@ -1,6 +1,8 @@
 """A verified exit must retain native graph/content custody through commit."""
 
 from uuid import uuid4
+import asyncio
+from contextlib import suppress
 
 import pytest
 
@@ -8,6 +10,101 @@ from kestrel_sovereign.constitution.resolver import resolve_governing_constituti
 from kestrel_sovereign.storage.async_graph_store import GraphNode
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from tests.integration.test_constitution_refusal_races import _agent
+from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_exit_takes_edge_owners_before_edge_rows(db_backend, monkeypatch):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL independent physical owner/edge lock order")
+    import asyncpg
+
+    identity = "did:test:exit-lock-order:" + uuid4().hex
+    storage = AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    external = probe = transaction = task = None
+    try:
+        agent = await _agent(storage)
+        digest = await storage.store_file(
+            resolve_governing_constitution_bytes(None), "KESTREL_CONSTITUTION.md"
+        )
+        await storage.add_node(
+            GraphNode(
+                node_id=identity,
+                node_type="agent",
+                label="exit order",
+                properties={"constitution_hash": digest},
+            )
+        )
+        await agent._anchor_constitution_governance(digest)
+        external = await asyncpg.connect(db_backend._dsn)
+        probe = await asyncpg.connect(db_backend._dsn)
+        transaction = external.transaction()
+        await transaction.start()
+        await external.execute("SET LOCAL lock_timeout = '100ms'")
+        await external.fetchrow(
+            "SELECT agent_id FROM graph_edge_owners WHERE source_id=$1 AND target_id=$2 AND label='governed_by' AND agent_id=$1 FOR UPDATE",
+            identity,
+            digest,
+        )
+        reached = asyncio.Event()
+        pid = None
+        native_fetch = type(db_backend).fetch_all
+
+        async def observed_fetch(backend, query, params=()):
+            nonlocal pid
+            if (
+                asyncio.current_task() is task
+                and "FROM graph_edge_owners" in query
+                and "FOR UPDATE" in query
+            ):
+                pid = await backend.fetch_val("SELECT pg_backend_pid()")
+                reached.set()
+            return await native_fetch(backend, query, params)
+
+        monkeypatch.setattr(type(db_backend), "fetch_all", observed_fetch)
+
+        async def verify_exit():
+            async with storage.transaction():
+                await ConstitutionMixin._lock_verified_constitution_exit(agent)
+
+        task = asyncio.create_task(verify_exit())
+        await asyncio.wait_for(reached.wait(), 5)
+        async with asyncio.timeout(5):
+            while (
+                await probe.fetchval(
+                    "SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1", pid
+                )
+                != "Lock"
+            ):
+                await asyncio.sleep(0.02)
+        # Exit waiting on the owner must not already own the edge. Otherwise
+        # the actual owner-first native deletion order creates a lock cycle.
+        assert (
+            await external.execute(
+                "UPDATE graph_edges SET properties=properties WHERE source_id=$1 AND target_id=$2 AND label='governed_by'",
+                identity,
+                digest,
+            )
+            == "UPDATE 1"
+        )
+        await transaction.rollback()
+        transaction = None
+        await asyncio.wait_for(task, 5)
+    finally:
+        if transaction is not None:
+            await transaction.rollback()
+        if task is not None and not task.done():
+            task.cancel()
+        if task is not None:
+            with suppress(asyncio.CancelledError):
+                await task
+        if external is not None:
+            await external.close()
+        if probe is not None:
+            await probe.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio

@@ -65,16 +65,29 @@ async def store_verified_governing_file(storage, content: bytes, *, verification
         raise RuntimeError("governing file restoration requires verified signed content and owned custody")
     files = storage.files
     unbound = AsyncFileStore(storage.db)
-    existing = await unbound.retrieve_file(digest)
-    if existing is not None:
-        if existing != content:
-            raise RuntimeError("stored governing file differs from exact signed content")
-        metadata = await unbound.get_file_metadata(digest)
-        await storage.db.execute(
-            files._reference_upsert_sql(),
-            (digest, files.agent_id, "KESTREL_CONSTITUTION.md", json.dumps(metadata) if metadata else None),
+    lock = " FOR UPDATE" if storage.db.backend_type == "postgres" else ""
+    row = await storage.db.fetchone(
+        "SELECT content_hash FROM files WHERE content_hash = ?" + lock, (digest,),
+    )
+    if row is None:
+        # Canonical native storage owns hashing, encryption and size limits.
+        # Another creator may win the absent-row race; INSERT ignores that
+        # conflict, so lock and validate the ACTUAL winner below, not our input.
+        await unbound.store_file(content, "KESTREL_CONSTITUTION.md")
+        await storage.db.fetchone(
+            "SELECT content_hash FROM files WHERE content_hash = ?" + lock, (digest,),
         )
-    return await storage.store_file(content, "KESTREL_CONSTITUTION.md")
+    existing = await unbound.retrieve_file(digest)
+    if existing != content:
+        raise RuntimeError("stored governing file differs from exact signed content")
+    metadata = await unbound.get_file_metadata(digest)
+    # Restore only a missing ownership witness. Existing per-tenant name and
+    # provenance are not replaced by generic metadata on the shared blob.
+    await storage.db.execute(
+        "INSERT OR IGNORE INTO file_owners (content_hash, agent_id, original_name, metadata) VALUES (?, ?, ?, ?)",
+        (digest, files.agent_id, "KESTREL_CONSTITUTION.md", json.dumps(metadata) if metadata else None),
+    )
+    return digest
 
 
 def historical_anchor_hash(
@@ -155,6 +168,27 @@ def governance_evidence(properties: Mapping, governed_by_targets: Iterable[str])
     }
 
 
+async def lock_governance_rows(storage, agent_id: str) -> None:
+    """After graph reservation, retain the physical governing row witness.
+
+    All publishers use ownership-before-edge order, matching native deletion.
+    SQLite's owning writer already supplies this physical serialization.
+    """
+    if storage.db.backend_type == "postgres":
+        await storage.db.fetchall(
+            "SELECT node_id FROM graph_node_owners WHERE node_id = ? AND agent_id = ? FOR UPDATE",
+            (agent_id, agent_id),
+        )
+        await storage.db.fetchall(
+            "SELECT target_id FROM graph_edge_owners WHERE source_id = ? AND label = 'governed_by' ORDER BY target_id, agent_id FOR UPDATE",
+            (agent_id,),
+        )
+        await storage.db.fetchall(
+            "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by' ORDER BY target_id FOR UPDATE",
+            (agent_id,),
+        )
+
+
 async def revalidate_governance_evidence(storage, agent_id: str, expected: dict):
     """Under the writer's graph locks, refuse a changed preflight witness.
 
@@ -162,6 +196,7 @@ async def revalidate_governance_evidence(storage, agent_id: str, expected: dict)
     their owning transaction. A changed pointer/receipt/rights/edge set requires
     a fresh inspection and authorization, never adoption of a newer CAS fence.
     """
+    await lock_governance_rows(storage, agent_id)
     node = await storage.get_node(agent_id)
     if node is None or node.node_type != "agent":
         raise RuntimeError("Agent identity disappeared during signed repair")

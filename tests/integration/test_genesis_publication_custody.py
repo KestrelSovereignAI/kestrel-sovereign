@@ -14,6 +14,39 @@ from tests.integration.test_constitution_refusal_races import _agent
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_native_edge_deletion_respects_graph_reservations(db_backend):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL independent native graph deletion custody")
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    identity, target = "did:test:delete-graph:" + uuid4().hex, uuid4().hex
+    storage = AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    peer_backend = PostgresBackend(db_backend._dsn, min_pool_size=1, max_pool_size=1)
+    await peer_backend.connect()
+    peer = AsyncGraphStore(AsyncDatabase(peer_backend), agent_id=identity)
+    try:
+        for node_id in (identity, target):
+            await storage.add_node(GraphNode(node_id=node_id, node_type="agent" if node_id == identity else "note", label="native deletion", properties={}))
+        await storage.add_edge(identity, target, "fixture-edge")
+        async with storage.transaction():
+            await storage.lock_nodes_for_update([identity, target])
+            with pytest.raises(Exception, match="lock timeout"):
+                async with peer_backend.transaction():
+                    await peer_backend.execute("SET LOCAL lock_timeout = '100ms'")
+                    await peer.delete_edge(identity, target, "fixture-edge")
+        assert len(await storage.get_edges_from(identity)) == 1
+        await peer.delete_edge(identity, target, "fixture-edge")
+        assert await storage.get_edges_from(identity) == []
+    finally:
+        await peer_backend.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 @pytest.mark.parametrize("changed", ["metadata", "governance", "receipt"])
 @pytest.mark.parametrize("entrypoint", ["explicit", "cognition"])
 async def test_native_genesis_publication_preserves_or_refuses_newer_node(
@@ -106,4 +139,92 @@ async def test_native_genesis_publication_preserves_or_refuses_newer_node(
                 assert "No cognition request was sent" in result
             assert (await storage.get_node(agent.agent_id)).properties == winner
     finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("entrypoint", ["explicit", "cognition"])
+async def test_native_edge_deletion_waits_for_genesis_publication(
+    db_backend,
+    monkeypatch,
+    entrypoint,
+):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL independent native edge producer")
+    from kestrel_sovereign.constitution import anchored_bytes
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    identity = "did:test:genesis-edge-custody:" + uuid4().hex
+    storage = AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    peer_backend = PostgresBackend(db_backend._dsn, min_pool_size=1, max_pool_size=1)
+    await peer_backend.connect()
+    peer = AsyncGraphStore(AsyncDatabase(peer_backend), agent_id=identity)
+    native_revalidate = anchored_bytes.revalidate_governance_evidence
+    observed = []
+    try:
+        agent = await _agent(storage)
+        for name in (
+            "_persist_governance_receipt_node",
+            "_persist_genesis_audit_completion",
+            "_persist_genesis_audit_pending_attempt",
+            "_ensure_genesis_audit_ready",
+            "perform_genesis_audit",
+        ):
+            setattr(agent, name, getattr(ConstitutionMixin, name).__get__(agent))
+        digest = await storage.store_file(
+            resolve_governing_constitution_bytes(None), "KESTREL_CONSTITUTION.md"
+        )
+        await storage.add_node(
+            GraphNode(
+                node_id=identity,
+                node_type="agent",
+                label="genesis",
+                properties={"constitution_hash": digest},
+            )
+        )
+        await agent._anchor_constitution_governance(digest)
+
+        async def fixture_auditor(_prompt):
+            return {"risk_level": 1, "reasoning": "Deterministic custody test only."}
+
+        agent.get_audit_response = fixture_auditor
+
+        async def checked_then_delete(raw, agent_id, expected):
+            fresh = await native_revalidate(raw, agent_id, expected)
+            with pytest.raises(Exception, match="lock timeout"):
+                async with peer_backend.transaction():
+                    await peer_backend.execute("SET LOCAL lock_timeout = '100ms'")
+                    await peer.delete_edge(identity, digest, "governed_by")
+            observed.append(True)
+            return fresh
+
+        monkeypatch.setattr(
+            anchored_bytes, "revalidate_governance_evidence", checked_then_delete
+        )
+        if entrypoint == "explicit":
+            assert await ConstitutionMixin.perform_genesis_audit(agent) is True
+        else:
+            assert (
+                await ConstitutionMixin._genesis_audit_cognition_block(
+                    agent, "ordinary cognition"
+                )
+                is None
+            )
+        assert observed
+        assert (await storage.get_node(identity)).properties["genesis_audit"][
+            "status"
+        ] == "passed"
+        # The independent writer succeeds once publication releases custody.
+        await peer.delete_edge(identity, digest, "governed_by")
+        assert not [
+            edge
+            for edge in await storage.get_edges_from(identity)
+            if edge.label == "governed_by"
+        ]
+    finally:
+        await peer_backend.close()
         await storage.close()

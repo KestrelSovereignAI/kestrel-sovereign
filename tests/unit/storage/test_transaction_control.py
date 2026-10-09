@@ -46,6 +46,9 @@ def test_postgres_body_strings_and_comments_are_not_transaction_commands(sql):
         "SELECT 1; START TRANSACTION;",
         "SELECT 1; ABORT;",
         "SELECT E'escaped\\'; still-string'; COMMIT;",
+        "SELECT E'a'\n'b\\'x';\nSELECT 'c\\';\nCOMMIT;",
+        "SELECT E'a' -- continuation\n'b\\'x'; SELECT 'c\\'; COMMIT;",
+        "SELECT E'a' /* newline\n comment */ 'b\\'x'; SELECT 'c\\'; COMMIT;",
     ],
 )
 def test_postgres_control_after_opaque_body_or_nested_comment_is_refused(sql):

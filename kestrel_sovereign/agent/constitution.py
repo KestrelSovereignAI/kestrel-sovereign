@@ -1773,19 +1773,10 @@ class ConstitutionMixin:
         node = await raw.get_node(self.agent_id)
         digest = node.properties.get("constitution_hash") if node is not None else None
         await raw.lock_nodes_for_update([self.agent_id, digest] if digest else [self.agent_id])
+        from kestrel_sovereign.constitution.anchored_bytes import lock_governance_rows
+
+        await lock_governance_rows(raw, self.agent_id)
         if raw.db.backend_type == "postgres":
-            await raw.db.fetchall(
-                "SELECT node_id FROM graph_node_owners WHERE node_id = ? AND agent_id = ? FOR UPDATE",
-                (self.agent_id, self.agent_id),
-            )
-            await raw.db.fetchall(
-                "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by' ORDER BY target_id FOR UPDATE",
-                (self.agent_id,),
-            )
-            await raw.db.fetchall(
-                "SELECT target_id FROM graph_edge_owners WHERE source_id = ? AND label = 'governed_by' AND agent_id = ? ORDER BY target_id FOR UPDATE",
-                (self.agent_id, self.agent_id),
-            )
             if digest:
                 await raw.db.fetchone("SELECT content_hash FROM files WHERE content_hash = ? FOR UPDATE", (digest,))
                 await raw.db.fetchone("SELECT content_hash FROM file_owners WHERE content_hash = ? AND agent_id = ? FOR UPDATE", (digest, self.agent_id))
@@ -2072,9 +2063,25 @@ class ConstitutionMixin:
         """
         pruned: list[str] = []
         async with self.storage.transaction():
+            if verified_targets is None:
+                edges = await self.storage.get_edges_from(self.agent_id)
+                targets = {
+                    edge.target_id for edge in edges or []
+                    if getattr(edge, "label", None) == "governed_by"
+                }
+            else:
+                targets = set(verified_targets)
             await self.storage.lock_nodes_for_update(
-                [self.agent_id, constitution_hash]
+                [self.agent_id, constitution_hash, *targets]
             )
+            if verified_targets is None:
+                current_edges = await self.storage.get_edges_from(self.agent_id)
+                current_targets = {
+                    edge.target_id for edge in current_edges or []
+                    if getattr(edge, "label", None) == "governed_by"
+                }
+                if current_targets != targets:
+                    raise RuntimeError("governing edges changed during anchor custody acquisition")
             if await self.storage.get_node(constitution_hash) is None:
                 constitution_node = GraphNode(
                     node_id=constitution_hash,
@@ -2090,23 +2097,22 @@ class ConstitutionMixin:
             await self.storage.add_edge(
                 self.agent_id, constitution_hash, "governed_by"
             )
-            if verified_targets is None:
-                edges = await self.storage.get_edges_from(self.agent_id)
-                targets = {
-                    edge.target_id for edge in edges or []
-                    if getattr(edge, "label", None) == "governed_by"
-                }
-            else:
-                # A signed writer's exact unscoped witness was revalidated
-                # under its native graph locks. Include pre-ledger ownerless
-                # edges which a tenant-bound read deliberately cannot see.
-                targets = set(verified_targets)
             for target in sorted(targets):
                 if target != constitution_hash:
                     await self.storage.delete_edge(
                         self.agent_id, target, "governed_by"
                     )
                     pruned.append(target)
+            if verified_targets is not None:
+                # A foreign-owned stale edge may not be removed by this bound
+                # tenant. Refuse/rollback rather than report a successful prune
+                # with physical governance still pointing at another digest.
+                remaining = await self._raw_storage.db.fetchall(
+                    "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by' AND target_id <> ?",
+                    (self.agent_id, constitution_hash),
+                )
+                if remaining:
+                    raise RuntimeError("stale governing edges remain outside this agent's ownership")
         if pruned:
             logging.warning(
                 "Pruned %d stale governed_by edge(s) while anchoring %s: %s",
@@ -2352,7 +2358,7 @@ class ConstitutionMixin:
                 # stale authorization must not stage mutations first.
                 artifact_hash = hashlib.sha256(amendment_artifact_bytes).hexdigest()
                 await self.storage.lock_nodes_for_update(
-                    [self.agent_id, artifact_hash, new_hash]
+                    [self.agent_id, artifact_hash, new_hash, *governance_preflight["governed_by_targets"]]
                 )
                 agent_node = await revalidate_governance_evidence(
                     self._raw_storage, self.agent_id, governance_preflight

@@ -1320,7 +1320,7 @@ async def _write_reanchor(
             # comparison precede *all* file/ownership writes.
             artifact_hash = hashlib.sha256(amendment_artifact_bytes).hexdigest()
             await storage.graph.lock_nodes_for_update(
-                [agent_did, new_hash, artifact_hash]
+                [agent_did, new_hash, artifact_hash, *governance_preflight["governed_by_targets"]]
             )
             from kestrel_sovereign.constitution.anchored_bytes import revalidate_governance_evidence
 
@@ -1406,6 +1406,17 @@ async def _write_reanchor(
                 (agent_did, new_hash),
             )
             stale_edge_targets = sorted({row[0] for row in stale_rows})
+            for stale_target in stale_edge_targets:
+                foreign_owner = await storage.db.fetchone(
+                    "SELECT 1 FROM graph_edge_owners "
+                    "WHERE source_id = ? AND target_id = ? "
+                    "AND label = 'governed_by' AND agent_id <> ?",
+                    (agent_did, stale_target, agent_did),
+                )
+                if foreign_owner:
+                    raise RuntimeError(
+                        "stale governing edges remain outside this agent's ownership"
+                    )
 
             # A physical edge at the correct hash with no ownership witness is
             # invisible to the bound store — it fails integrity proof 2 — and

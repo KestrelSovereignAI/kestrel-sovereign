@@ -2275,6 +2275,12 @@ class AsyncGraphStore:
     async def delete_edge(self, source_id: str, target_id: str, label: str) -> None:
         """Release this tenant's edge witness, reclaiming only ownerless rows."""
         async with self.db.transaction():
+            # Deletion is a graph writer too: reserve both endpoints before
+            # touching ownership, just as admission and node deletion do.
+            # Bound scope still forbids locking another tenant's physical row.
+            await lock_graph_nodes_for_update(
+                self.db, [source_id, target_id], agent_id=self.agent_id
+            )
             if self.agent_id:
                 await self.db.execute(
                     "DELETE FROM graph_edge_owners "

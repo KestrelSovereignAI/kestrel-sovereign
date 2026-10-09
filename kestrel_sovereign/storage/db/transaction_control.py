@@ -54,6 +54,58 @@ def _identifier_character(character: str) -> bool:
     return character.isalnum() or character in "_$" or ord(character) >= 128
 
 
+def _quoted_end(sql: str, position: int, *, escapes: bool, postgres: bool) -> int:
+    """Consume a quote token, retaining escape mode across PG continuations.
+
+    PostgreSQL treats newline-separated single-quoted segments as one token:
+    E appears only on its first segment. A separate ordinary string later in
+    the statement does not inherit that mode. Comments are whitespace too.
+    """
+    quote, length = sql[position], len(sql)
+    while True:
+        position += 1
+        while position < length:
+            if sql[position] == quote:
+                position += 1
+                if position < length and sql[position] == quote:
+                    position += 1
+                    continue
+                break
+            if quote == "'" and escapes and sql[position] == "\\":
+                position += 2
+            else:
+                position += 1
+        if not postgres or quote != "'":
+            return position
+        lookahead, newline = position, False
+        while lookahead < length:
+            if sql[lookahead].isspace():
+                newline |= sql[lookahead] in "\r\n"
+                lookahead += 1
+            elif sql.startswith("--", lookahead):
+                lookahead += 2
+                while lookahead < length and sql[lookahead] not in "\r\n":
+                    lookahead += 1
+            elif sql.startswith("/*", lookahead):
+                lookahead += 2
+                depth = 1
+                while lookahead < length and depth:
+                    if sql.startswith("/*", lookahead):
+                        depth += 1
+                        lookahead += 2
+                    elif sql.startswith("*/", lookahead):
+                        depth -= 1
+                        lookahead += 2
+                    else:
+                        newline |= sql[lookahead] in "\r\n"
+                        lookahead += 1
+            else:
+                break
+        if not newline or lookahead >= length or sql[lookahead] != "'":
+            return position
+        position = lookahead
+
+
 def _statement_heads(sql: str, *, postgres: bool, backslash_strings: bool):
     position, length, head = 0, len(sql), True
     while position < length:
@@ -77,19 +129,9 @@ def _statement_heads(sql: str, *, postgres: bool, backslash_strings: bool):
                 else:
                     position += 1
         elif character in "'\"":
-            quote = character
-            position += 1
-            while position < length:
-                if sql[position] == quote:
-                    position += 1
-                    if position < length and sql[position] == quote:
-                        position += 1
-                        continue
-                    break
-                if quote == "'" and backslash_strings and sql[position] == "\\":
-                    position += 2
-                else:
-                    position += 1
+            position = _quoted_end(
+                sql, position, escapes=backslash_strings, postgres=postgres
+            )
             head = False
         elif postgres and character == "$":
             # A tag is recognized only at a token boundary. Identifier scans
@@ -125,18 +167,7 @@ def _statement_heads(sql: str, *, postgres: bool, backslash_strings: bool):
                 and position < length
                 and sql[position] == "'"
             ):
-                position += 1
-                while position < length:
-                    if sql[position] == "\\":
-                        position += 2
-                    elif sql[position] == "'":
-                        position += 1
-                        if position < length and sql[position] == "'":
-                            position += 1
-                        else:
-                            break
-                    else:
-                        position += 1
+                position = _quoted_end(sql, position, escapes=True, postgres=True)
             head = False
         else:
             position += 1
