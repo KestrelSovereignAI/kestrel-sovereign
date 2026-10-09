@@ -1616,6 +1616,16 @@ class CoreInstallGuard:
         # manifest's bounds from core's shape, which is not where they come
         # from (issue #3106).
         self._manifest_bounds: list = []
+        # A THIRD set: one `name==version` per package core's uv.lock pins, so a
+        # feature install can neither upgrade nor downgrade what CI tested
+        # (issue #3502). Derived from core's shape, like core's own pin, because
+        # the lock is the one beside the checkout core is installed from — and
+        # re-derived with it when the batch moves core. `_lock_exclude` names
+        # the manifest's editable entries, whose source the operator declared.
+        self._lock = None
+        self._lock_error: Optional[str] = None
+        self._lock_bounds: list = []
+        self._lock_exclude: frozenset = frozenset()
         # The one file a restore's bounds are written to, created on first use
         # and reused for the life of the guard — see :meth:`_restore_constraints`.
         self._restore_constraint_path: Optional[str] = None
@@ -1645,6 +1655,12 @@ class CoreInstallGuard:
         # another outside its declared window and the run reports success over
         # the violation (issue #3106).
         guard._manifest_bounds = fr.manifest_version_constraints(source_index or {})
+        guard._lock_exclude = frozenset(
+            canonical_package(package)
+            for package, entry in (source_index or {}).items()
+            if getattr(entry, "editable", None)
+        )
+        guard._derive_lock(before)
         return guard
 
     @classmethod
@@ -1674,6 +1690,20 @@ class CoreInstallGuard:
         from kestrel_sovereign import feature_reconcile as fr
 
         return fr.core_install_constraints(shape, self.policy)
+
+    def _derive_lock(self, shape) -> None:
+        """Read core's uv.lock for *shape* and derive the lines that hold it."""
+        from kestrel_sovereign.core_lock import CoreLockError
+
+        try:
+            self._lock = cli._core_lock(shape)
+        except CoreLockError as exc:
+            self._lock, self._lock_error, self._lock_bounds = None, str(exc), []
+            return
+        self._lock_error = None
+        self._lock_bounds = (
+            self._lock.constraint_lines(self._lock_exclude) if self._lock else []
+        )
 
     @property
     def constraints(self) -> list:
