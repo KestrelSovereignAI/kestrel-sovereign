@@ -772,6 +772,7 @@ class ConstitutionMixin:
             self._constitution_audit_pending = (
                 state.bootstrap_pending
                 or state.last_successful_audit_at is None
+                or state.interaction_count >= self.AUDIT_INTERVAL
                 or ConstitutionMixin._constitution_time_audit_due(
                     self._constitution_now(), state.last_successful_audit_at
                 )
@@ -956,8 +957,10 @@ class ConstitutionMixin:
         self._constitution_audit_pending = False
         return True
 
-    async def _begin_explicit_constitution_audit(self) -> bool:
-        """Persist a due marker before an operator-triggered full verifier.
+    async def _begin_explicit_constitution_audit(
+        self, *, reason: str = "explicit_verification"
+    ) -> bool:
+        """Persist a due marker before explicit/future-deadline verification.
 
         If the verifier fails and the subsequent Safe Mode write encounters a
         storage fault, the due marker still forces another full audit on the
@@ -968,7 +971,7 @@ class ConstitutionMixin:
             due_count = max(self._interaction_count, self.AUDIT_INTERVAL)
             persisted = await self._persist_constitution_runtime_state(
                 event_type="audit_started",
-                event_reason="explicit_verification",
+                event_reason=reason,
                 interaction_count=due_count,
             )
             if persisted:
@@ -1011,11 +1014,17 @@ class ConstitutionMixin:
         due = (
             self._constitution_audit_pending
             or self._constitution_state_migration_pending
+            or self._interaction_count >= self.AUDIT_INTERVAL
             or self._last_audit_time <= self._constitution_epoch()
             or ConstitutionMixin._constitution_time_audit_due(now, self._last_audit_time)
         )
         if not due:
             return
+        if self._last_audit_time > now:
+            if not await ConstitutionMixin._begin_explicit_constitution_audit(
+                self, reason="future_deadline_verification"
+            ):
+                return
         if self._constitution_bootstrap_pending:
             governing = await self._get_governing_constitution()
             if governing.startswith("Error:"):
@@ -1060,7 +1069,12 @@ class ConstitutionMixin:
         """Increment, persist, and (when due) perform the full audit."""
         now = ConstitutionMixin._constitution_now(self)
         self._interaction_count += 1
-        if not await ConstitutionMixin._persist_constitution_runtime_state(
+        if self._last_audit_time > now:
+            if not await ConstitutionMixin._begin_explicit_constitution_audit(
+                self, reason="future_deadline_verification"
+            ):
+                return
+        elif not await ConstitutionMixin._persist_constitution_runtime_state(
             self, now=now
         ):
             return
