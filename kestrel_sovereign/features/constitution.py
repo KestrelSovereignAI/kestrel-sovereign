@@ -132,21 +132,39 @@ class ConstitutionFeature(Feature):
     async def initialize(self):
         """Load and parse the constitution."""
         try:
-            # Try to get from agent first to include amendments/anchored version
-            if hasattr(self.agent, '_get_governing_constitution'):
-                text = await self.agent._get_governing_constitution()
-                if text and not text.startswith("Error:"):
-                    self.full_text = text
-                else:
-                    self.full_text = self._read_canonical_constitution()
-            else:
-                self.full_text = self._read_canonical_constitution()
-
-            self._parse_structure()
-            self._generate_summary()
+            error = await self._refresh_governing_text()
+            if error:
+                logger.info("ConstitutionFeature awaiting authoritative anchor: %s", error)
+                return
             logger.info("ConstitutionFeature initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize ConstitutionFeature: {e}")
+
+    async def _refresh_governing_text(self) -> Optional[str]:
+        """Read authoritative content without ever creating an anchor.
+
+        Initialization precedes native bootstrap, so an unavailable governing
+        reader is NOT permission to cache the unrelated packaged constitution.
+        Re-read before serving, also observing signed repairs and amendments.
+        """
+        reader = getattr(self.agent, "_get_governing_constitution", None)
+        if callable(reader):
+            text = await reader(allow_lazy_anchor=False)
+            if not text or text.startswith("Error:"):
+                self.full_text = ""
+                self._parse_structure()
+                self.summary = ""
+                return text or "Error: Governing constitution unavailable."
+        elif not self.full_text:
+            # Standalone document readers have no native agent/anchor.
+            text = self._read_canonical_constitution()
+        else:
+            text = self.full_text
+        if text != self.full_text or not self.summary:
+            self.full_text = text
+            self._parse_structure()
+            self._generate_summary()
+        return None
 
     @staticmethod
     def _read_canonical_constitution() -> str:
@@ -300,6 +318,10 @@ class ConstitutionFeature(Feature):
             # The honesty contract requires a miss to surface as ERROR rather
             # than OK carrying apologetic text.
             return ToolResult.failed(body, data={"kind": kind})
+
+        error = await self._refresh_governing_text()
+        if error:
+            return failed(error, "unavailable")
 
         if article:
             keyword = article.lower()

@@ -29,6 +29,10 @@ async def test_state_and_event_timestamp_binds_preserve_utc_instants(offset):
             bound.append((query, PostgresBackend._strip_tz(params)))
             return 1
 
+        async def fetch_one(self, query, params=()):
+            bound.append((query, PostgresBackend._strip_tz(params)))
+            return (1,)
+
     utc = datetime(2026, 10, 9, 13, 57, tzinfo=timezone.utc)
     local = utc.astimezone(timezone(timedelta(hours=offset)))
     state = ConstitutionRuntimeState(

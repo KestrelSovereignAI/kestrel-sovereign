@@ -67,13 +67,15 @@ def test_both_reanchor_writers_prelock_the_complete_shared_node_set():
         calls = _graph_write_calls(function)
         lock_calls = [entry for entry in calls if entry[1] == "lock_nodes_for_update"]
         add_calls = [entry for entry in calls if entry[1] == "add_node"]
-        assert len(lock_calls) == 1
+        assert len(lock_calls) == (2 if function is ConstitutionMixin.reanchor_constitution else 1)
         assert add_calls
-        assert lock_calls[0][0] < add_calls[0][0]
+        assert lock_calls[-1][0] < add_calls[0][0]
         locked_names = {
-            ast.unparse(element) for element in lock_calls[0][2].args[0].elts
+            ast.unparse(element) for element in lock_calls[-1][2].args[0].elts
         }
         assert locked_names == expected
+        if function is ConstitutionMixin.reanchor_constitution:
+            assert {ast.unparse(element) for element in lock_calls[0][2].args[0].elts} == {"self.agent_id", "new_hash"}
 
 
 def test_governance_helper_prelocks_both_endpoints_before_writing():
@@ -139,6 +141,11 @@ class _FakeFileRows:
             return b"\x00not-a-valid-token", json.dumps({"enc": True})
         return self._anchored, None
 
+    async def fetchall(self, query, params=()):
+        assert "FROM graph_edges" in query and "source_id = ?" in query
+        assert params == (AGENT_DID,)
+        return []
+
 
 def _make_agent(stored_hash="oldhash", safe_mode=False, anchored=ANCHORED_CONSTITUTION):
     """Create a mock agent with ConstitutionMixin methods bound."""
@@ -155,6 +162,7 @@ def _make_agent(stored_hash="oldhash", safe_mode=False, anchored=ANCHORED_CONSTI
     agent._sovereign_trust_root_path = None
 
     node = MagicMock()
+    node.node_type = "agent"
     node.properties = {
         "constitution_hash": stored_hash,
         "sovereign_root_did_document": ROOT_DID_DOCUMENT,
@@ -167,7 +175,7 @@ def _make_agent(stored_hash="oldhash", safe_mode=False, anchored=ANCHORED_CONSTI
     )
     agent.storage.add_node = AsyncMock()
     agent.storage.lock_nodes_for_update = AsyncMock()
-    agent._raw_storage = SimpleNamespace(db=_FakeFileRows(stored_hash, anchored))
+    agent._raw_storage = SimpleNamespace(db=_FakeFileRows(stored_hash, anchored), get_node=agent.storage.get_node)
     # transaction() is an async context manager, not a coroutine — a plain
     # MagicMock provides __aenter__/__aexit__ on its return value.
     agent.storage.transaction = MagicMock()
@@ -863,7 +871,6 @@ async def test_governing_constitution_reads_from_storage_after_reanchor(tmp_path
     """After reanchor, _get_governing_constitution reads from anchored storage, not disk."""
     agent, node = _make_agent(stored_hash="oldhash")
     agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
-    agent.agent_id = "test-agent"
     artifact_path = _write_artifact(tmp_path)
 
     # Step 1: reanchor so node gets the new hash

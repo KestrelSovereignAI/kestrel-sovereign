@@ -447,12 +447,20 @@ async def test_a_neighbours_agent_node_is_never_mistaken_for_this_one(
         runtime_dsn=POSTGRES_URL,
     )
 
-    assert result.error is not None
-    assert "no constitution_hash property" in result.error
+    # The exact target has only a local birth record. Boot's native pending
+    # path retargets that owned SQLite identity, never the neighbour's PG
+    # node. Missing-pointer dry inspection now reports drift; it must neither
+    # borrow the neighbour's anchor nor grant unsigned repair authority.
+    assert result.error is None
+    assert result.target_backend == "sqlite"
+    assert result.drift_unforced is True
+    assert result.reanchored is False
     assert result.old_hash is None
     # The tell: an unbound read reports the neighbour's anchor as this one's.
     assert result.old_hash != other_hash
     assert other_hash not in (result.error or "")
+    assert await _runtime_state(pg, OTHER_DID) == (other_hash, [other_hash])
+    assert not list(agent_dir.glob("*.backup-*"))
 
 
 async def test_overlay_anchor_never_writes_a_neighbours_agent_node(pg, tmp_path):

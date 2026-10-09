@@ -943,6 +943,104 @@ Diagnostic/recovery commands remain available while an audit is pending. Normal
 cognition returns a clear pending/failed response without sending the user's
 turn to an LLM.
 
+### Durable constitutional state and upgrades
+
+Safe Mode, audit deadlines, interaction counters, and first-identity bootstrap
+custody are stored in the primary SQLite or PostgreSQL database. Writes use a
+database revision fence: a stale replica cannot clear another replica's
+restriction or reset its audit-due counter. Only the verified, authorized exit
+path clears a durable restriction; a conflicting writer restricts itself.
+First creation is insert-only. Loaded records (including migrated revision
+zero) use conditional updates and cannot recreate a concurrently deleted row.
+Each recreated row receives a new generation identifier: equal revision
+numbers from different lifetimes cannot authorize a stale Safe Mode exit.
+Every signed anchor mutation advances this fence even after first-anchor
+custody has been consumed, so verification completed against the previous
+constitution cannot authorize an in-flight exit after reanchor. Restrictions,
+successful-audit timestamps and interaction counts remain unchanged. An
+offline signed repair without any runtime row establishes a restricted,
+audit-due record, never new automatic bootstrap permission.
+
+The additive revision migration retains readable schema-version-1 rows, but
+database triggers reject pre-revision writers after upgrade. Retire old
+replicas rather than expecting mixed-version writers to keep operating.
+Legacy inserts without a generation fence are refused as well; existing
+legacy rows remain readable, but deleted state cannot regain an empty epoch.
+Initialization checks existing metadata before installing migration DDL;
+SQLite upgrades reserve the writer slot and recheck before adding columns.
+
+Automatic first anchoring requires a still-pending durable new-identity marker
+and matching generation/revision, revalidated within the native graph
+transaction. In-memory bootstrap custody advances only after graph commit.
+Every native anchor writer (automatic bootstrap, runtime signed reanchor and
+offline signed reanchor, including same-hash repairs) consumes the marker in
+the graph transaction. Live writers publish the resulting fence only after
+commit; neither signed repair nor anchor consumption clears Safe Mode or
+records a successful audit. An outer caller transaction must not publish a
+live fence before committing. Native live
+anchor and state-publication paths refuse ambient transactions before waiting
+for the constitutional state lock or writing
+(including SQLite joined scopes and PostgreSQL savepoints); retry the command
+outside that caller's transaction. Unknown commit-ownership adapters fail
+closed as well. The signed repair's own graph/state unit remains atomic.
+Refused lifecycle/audit transitions retain a volatile Safe Mode restriction
+and mark persistence pending; they do not claim a durable transition. That
+refusal also invalidates an in-flight verified exit or state writer before
+its database commit, so a lock owner cannot erase the new restriction. Writers
+check again after awaited SQL and roll back invalidated state/events; a refusal
+during commit/result delivery retains its volatile restriction and pending
+durability instead of reporting the earlier committed exit as recovery.
+An entry also checks after awaited consent, before replacing a later restriction.
+Initialization, explicit/startup/periodic audits, and recovery notification share
+one whole-transition refusal generation, captured before waiting for its state
+lock. Same-task nesting retains that token; queued entries cannot adopt a later
+refusal, nor can verification or restore adopt one after becoming stale.
+An invalidated restore preserves the newer volatile restriction and pending
+durability; an invalidated audit records no success or older failure over it.
+A restriction during post-commit exit notification retains the historical exit
+event but reports current Safe Mode, not successful recovery.
+Native automatic and signed anchor transactions reserve file resources before
+graph resources, then revalidate and consume custody atomically.
+Both runtime and offline signed repairs compare the exact preflight pointer,
+rights, current/history receipts and governance edges again under those graph
+locks. Rights validation uses that same immutable witness, not a separate edge
+read which could observe a transient deletion. Changed evidence requires fresh
+inspection and authorization; adopting
+a newer custody fence cannot legitimize a previously validated stale repair.
+The marker is single-use; interruption before verification cannot authorize a
+second anchor. The absent successful
+audit timestamp independently keeps the full startup audit due. Consumed
+custody cannot be re-enabled by an ordinary runtime-state write.
+Migrated legacy pending-audit markers have no custody generation and cannot
+authorize automatic anchoring, even after ordinary writes advance their
+revision. An absent anchor in that cohort requires native signed repair.
+Reading a constitution or initializing its display feature never repairs an
+existing identity's deleted anchor. That requires native signed reanchor and
+the normal full integrity verification; an absent anchor is not a fresh boot.
+The public offline repair accepts a missing hash only on the exact correctly
+owned identity. Unsigned inspection reports drift without writing; forced
+repair still verifies the operator-pinned root and exact signed governing hash.
+Existing emancipation receipts and historical governance bytes remain protected;
+ambiguous historical anchors or unreadable rights evidence refuse repair.
+When both pointer and edges are lost, current and historical genesis-audit and
+reanchor receipts still count as rights evidence. Typed historical hashes are
+checked without selecting an unsigned replacement pointer. Every reanchor
+receipt needs a valid destination `new_hash`; its optional `old_hash` cannot
+substitute for a missing or null destination. Missing referenced
+bytes, malformed receipts, conflicting references or excessive evidence fail
+closed; restore the exact prior pointer before attempting signed repair.
+Custody consumption records the transition's current UTC time, not the prior
+bootstrap state's timestamp, and does not count as a successful full audit.
+An unchanged hash/edge set is not an unchanged outcome while first-anchor
+custody remains pending: inspection reports that state, and only signed forced
+repair consumes it. Read-only inspection never installs lifecycle schema.
+The display feature reads the authoritative anchored text before each request;
+pre-anchor initialization never caches unrelated packaged governing text.
+Failure to retrieve application amendments or render mandate constraints
+makes the entire governing display unavailable, not a partially weakened text.
+Adopting a newer lifecycle restriction invalidates older volatile repair proof;
+an exit must verify the adopted restriction before it can clear Safe Mode.
+
 ## 🔄 Next Steps
 
 After getting started:

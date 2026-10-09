@@ -261,6 +261,29 @@ async def test_reanchor_embeds_through_the_persisted_embedding_route(
 
 
 @pytest.mark.asyncio
+async def test_public_missing_pointer_recovery_reindexes_without_deleting_unknown_chunks(tmp_path, constitution_path, monkeypatch):
+    from kestrel_sovereign.storage import AsyncStorage
+
+    _Host(monkeypatch, _fleet_routes)
+    agent_dir, agent_did = await _incept(tmp_path, constitution_path)
+    db_path = agent_dir / "kestrel_prime.db"
+    prior_hash = hashlib.sha256(CONSTITUTION_V1).hexdigest()
+    prior_chunks = _chunks(db_path, prior_hash)
+    async with AsyncStorage(str(db_path), backend="sqlite", agent_id=agent_did) as storage:
+        node = await storage.graph.get_node(agent_did)
+        del node.properties["constitution_hash"]
+        await storage.graph.add_node(node)
+    _persist_fleet_embedding_config(db_path, agent_did)
+    result = await _force_reanchor(tmp_path, agent_dir, constitution_path)
+    assert result.old_hash is None
+    assert result.rag_index and result.rag_index.needs_reindex == 0
+    assert _chunks(db_path, result.new_hash)
+    # No old pointer means no justified deletion target. Restore the new
+    # index, but do not guess which other tenant/history chunks to delete.
+    assert _chunks(db_path, prior_hash) == prior_chunks
+
+
+@pytest.mark.asyncio
 async def test_reanchor_with_no_embedding_service_reports_the_unembedded_count(
     tmp_path, constitution_path, monkeypatch, caplog
 ):

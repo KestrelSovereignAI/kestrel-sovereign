@@ -30,12 +30,112 @@ under that hash holds exactly those bytes. Same argument as the unscoped
 from __future__ import annotations
 
 import logging
+import re
+from copy import deepcopy
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Optional, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 logger = logging.getLogger(__name__)
+
+
+def historical_anchor_hash(
+    properties: Mapping, governed_by_targets: Iterable[str],
+) -> Optional[str]:
+    """Recover evidence, never authority, when the operative pointer is lost.
+
+    Native current/history receipts survive edge/pointer deletion. Inspect
+    their typed hash fields, not arbitrary receipt prose. Without the pointer
+    conflicting, malformed or excessive evidence must fail closed; an
+    operator can restore the exact prior pointer before attempting repair.
+    An intact pointer remains authoritative: old receipt history normally
+    names multiple superseded constitutions and is not a competing pointer.
+    """
+    pointer = properties.get("constitution_hash")
+    if pointer:
+        return pointer
+    candidates: set[str] = set()
+
+    def add(value, *, absent_ok=True):
+        if value is None and absent_ok:
+            return
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("Missing anchor pointer has unreadable historical governance receipt evidence")
+        candidates.add(value)
+
+    targets = tuple(governed_by_targets)
+    if len(targets) > 128:
+        raise ValueError("Missing anchor pointer has excessive historical governance evidence")
+    for target in targets:
+        add(target, absent_ok=False)
+
+    def inspect(receipt, kind):
+        if not isinstance(receipt, Mapping):
+            raise ValueError("Missing anchor pointer has unreadable historical governance receipt evidence")
+        # A reanchor always has a destination. Its optional prior hash cannot
+        # substitute for a missing/null destination and authorize superseded
+        # bytes as the only surviving history. Genesis likewise needs a hash.
+        required = "constitution_hash" if kind == "genesis_audit" else "new_hash"
+        add(receipt.get(required), absent_ok=False)
+        if kind == "constitution_reanchor":
+            old_hash = receipt.get("old_hash")
+            if old_hash != "none":
+                add(old_hash)
+
+    for kind in ("genesis_audit", "constitution_reanchor"):
+        current = properties.get(kind)
+        if current is not None:
+            inspect(current, kind)
+        history = properties.get(kind + "_history")
+        if history is None:
+            continue
+        if not isinstance(history, list) or len(history) > 128:
+            raise ValueError("Missing anchor pointer has unreadable or excessive historical governance receipt evidence")
+        for entry in history:
+            if not isinstance(entry, Mapping):
+                raise ValueError("Missing anchor pointer has unreadable historical governance receipt evidence")
+            inspect(entry.get("receipt"), kind)
+            add(entry.get("superseded_by_constitution_hash"), absent_ok=False)
+    if len(candidates) > 1:
+        raise ValueError("Missing anchor pointer has ambiguous historical governance; restore its exact prior pointer before signed repair")
+    return next(iter(candidates), None)
+
+
+def governance_evidence(properties: Mapping, governed_by_targets: Iterable[str]) -> dict:
+    """Snapshot the exact governing facts validated by signed repair preflight.
+
+    Non-governance metadata is excluded so unrelated updates are preserved.
+    Copies are essential: a caller mutating its graph node must not mutate the
+    comparison witness along with it. This evidence is not signing authority.
+    """
+    return {
+        "properties": deepcopy({key: properties.get(key) for key in (
+            "constitution_hash", "emancipation_contract", "genesis_audit",
+            "genesis_audit_history", "constitution_reanchor", "constitution_reanchor_history",
+        )}),
+        "governed_by_targets": sorted(set(governed_by_targets)),
+    }
+
+
+async def revalidate_governance_evidence(storage, agent_id: str, expected: dict):
+    """Under the writer's graph locks, refuse a changed preflight witness.
+
+    Both native signed writers use this before any governance mutation, inside
+    their owning transaction. A changed pointer/receipt/rights/edge set requires
+    a fresh inspection and authorization, never adoption of a newer CAS fence.
+    """
+    node = await storage.get_node(agent_id)
+    if node is None or node.node_type != "agent":
+        raise RuntimeError("Agent identity disappeared during signed repair")
+    rows = await storage.db.fetchall(
+        "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'",
+        (agent_id,),
+    )
+    if governance_evidence(node.properties, (row[0] for row in rows)) != expected:
+        raise RuntimeError("Signed repair governing evidence changed; reload and reauthorize before repair")
+    return node
 
 
 async def read_anchored_constitution(

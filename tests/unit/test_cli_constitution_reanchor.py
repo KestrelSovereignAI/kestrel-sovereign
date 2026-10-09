@@ -260,6 +260,41 @@ def test_reanchor_unchanged_returns_zero(reanchor_env, capsys):
     assert "already anchored" in out
 
 
+@pytest.mark.parametrize("forced", [False, True])
+def test_reanchor_cli_reports_missing_prior_anchor_without_traceback(reanchor_env, capsys, forced):
+    argv = ["constitution", "reanchor", "--agent-name", "Test"]
+    if forced:
+        argv.append("--force")
+    result = ReanchorResult(
+        agent_name="Test", db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+        canonical_path=Path("/fake/canonical.md"), old_hash=None,
+        new_hash="a" * 64, backup_path=None, drift_unforced=not forced,
+        reanchored=forced,
+    )
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution", side_effect=_stubbed_helper(result)):
+        rc = cmd_constitution(_parse(argv))
+    assert rc == (0 if forced else 1)
+    assert "(none)" in capsys.readouterr().out
+
+
+def test_reanchor_cli_reports_same_hash_pending_custody(reanchor_env, capsys):
+    result = ReanchorResult(
+        agent_name="Test", db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+        canonical_path=Path("/fake/canonical.md"), old_hash="a" * 64,
+        new_hash="a" * 64, backup_path=None, drift_unforced=True,
+        bootstrap_custody_pending=True,
+    )
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution", side_effect=_stubbed_helper(result)):
+        rc = cmd_constitution(_parse(["constitution", "reanchor", "--agent-name", "Test"]))
+    assert rc == 1
+    text = capsys.readouterr().out
+    assert "custody remains pending" in text and "Sovereign-signed artifact" in text
+
+
 def test_reanchor_same_hash_edge_repair_reports_removed(
     reanchor_env, capsys,
 ):

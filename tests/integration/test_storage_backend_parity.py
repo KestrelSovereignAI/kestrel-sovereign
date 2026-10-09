@@ -673,7 +673,7 @@ async def _assert_constitution_runtime_state_round_trip(db_backend):
 
     writer = ConstitutionRuntimeStateStore(db_backend)
     await writer.initialize()
-    await writer.write(
+    state = await writer.write(
         state,
         event_type="safe_mode_entered",
         event_reason=state.safe_mode_reason,
@@ -704,8 +704,10 @@ async def _assert_constitution_runtime_state_round_trip(db_backend):
         replace(
             state, safe_mode=False, safe_mode_exited_at=exited_at,
             last_successful_audit_at=exited_at, updated_at=exited_at,
+            safe_mode_exit_authorization="fixture-signed-owner",
         ),
         event_type="safe_mode_exited",
+        event_authorization="fixture-signed-owner",
     )
     restored = await reader.load(agent_id)
     assert restored.safe_mode is False
@@ -713,6 +715,1046 @@ async def _assert_constitution_runtime_state_round_trip(db_backend):
     assert restored.last_successful_audit_at == exited_at
     assert restored.updated_at == exited_at
     assert (await reader.list_events(agent_id))[-1]["occurred_at"] == exited_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_constitution_state_cas_rejects_stale_clear_and_due_marker_clobber(db_backend):
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionStateConflictError,
+    )
+
+    store = ConstitutionRuntimeStateStore(db_backend)
+    await store.initialize()
+    now = datetime.now(timezone.utc)
+    state = await store.write(ConstitutionRuntimeState(
+        agent_id="did:test:cas:" + uuid4().hex, safe_mode=False,
+        safe_mode_reason=None, safe_mode_entered_at=None,
+        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+        last_successful_audit_at=now, interaction_count=0, updated_at=now,
+    ))
+    stale = await store.load(state.agent_id)
+    latched = await store.write(replace(state, safe_mode=True, safe_mode_reason="integrity", interaction_count=100), event_type="safe_mode_entered")
+    with pytest.raises(ConstitutionStateConflictError):
+        await store.write(replace(stale, interaction_count=1), event_type="audit_succeeded")
+    assert await store.load(state.agent_id) == latched
+    with pytest.raises(ConstitutionStateConflictError):
+        await store.write(replace(latched, safe_mode=False))
+    assert await store.list_events(state.agent_id) == [
+        {"event_type": "safe_mode_entered", "reason": None, "authorization": None, "occurred_at": now}
+    ]
+    await store.write(replace(latched, safe_mode=False, safe_mode_exited_at=now,
+                             safe_mode_exit_authorization="signed-owner"),
+                      event_type="safe_mode_exited", event_authorization="signed-owner")
+    assert (await store.load(state.agent_id)).safe_mode is False
+    with pytest.raises(ConstitutionStateConflictError):
+        await store.write(latched, event_type="safe_mode_entered")
+    current = await store.load(state.agent_id)
+    await db_backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (state.agent_id,))
+    with pytest.raises(ConstitutionStateConflictError):
+        await store.write(current)
+    assert await store.load(state.agent_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_deleted_revision_zero_runtime_state_is_not_recreated(db_backend):
+    """A loaded pre-fence record is never a request for first creation."""
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionStateConflictError,
+    )
+
+    store = ConstitutionRuntimeStateStore(db_backend)
+    await store.initialize()
+    now = datetime.now(timezone.utc)
+    state = await store.write(ConstitutionRuntimeState(
+        agent_id="did:test:legacy-zero:" + uuid4().hex, safe_mode=True,
+        safe_mode_reason="legacy restriction", safe_mode_entered_at=now,
+        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+        last_successful_audit_at=now, interaction_count=100, updated_at=now,
+    ))
+    # Seed the exact shape of an upgraded legacy row. INSERT is not an old
+    # writer UPDATE and does not pass through the revision-update trigger.
+    await db_backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (state.agent_id,))
+    await db_backend.execute(
+        "INSERT INTO constitution_runtime_state (agent_id, safe_mode, interaction_count, "
+        "bootstrap_pending, schema_version, updated_at, revision, generation) "
+        "VALUES (?, ?, 100, ?, 1, ?, 0, 'legacy-zero-fixture')",
+        (state.agent_id, True if db_backend.backend_type == "postgres" else 1,
+         False if db_backend.backend_type == "postgres" else 0, store._timestamp_param(now)),
+    )
+    loaded = await store.load(state.agent_id)
+    assert loaded.revision == 0
+    await db_backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (state.agent_id,))
+    before_events = await store.list_events(state.agent_id)
+    with pytest.raises(ConstitutionStateConflictError):
+        await store.write(loaded, event_type="safe_mode_entered")
+    assert await store.load(state.agent_id) is None
+    assert await store.list_events(state.agent_id) == before_events
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_delete_committing_during_runtime_write_cannot_recreate(db_backend):
+    """Exercise PostgreSQL's statement snapshot / uniqueness-wait split."""
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL-specific concurrent delete semantics")
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionStateConflictError,
+    )
+
+    store = ConstitutionRuntimeStateStore(db_backend)
+    await store.initialize()
+    now = datetime.now(timezone.utc)
+    state = await store.write(ConstitutionRuntimeState(
+        agent_id="did:test:concurrent-delete:" + uuid4().hex, safe_mode=True,
+        safe_mode_reason="restriction", safe_mode_entered_at=now,
+        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+        last_successful_audit_at=now, interaction_count=100, updated_at=now,
+    ), event_type="safe_mode_entered")
+    pool = db_backend.operational_pool
+    write_task = None
+    try:
+        async with pool.acquire() as deleting:
+            async with deleting.transaction():
+                deleter_pid = await deleting.fetchval("SELECT pg_backend_pid()")
+                await deleting.execute("DELETE FROM constitution_runtime_state WHERE agent_id = $1", state.agent_id)
+                write_task = asyncio.create_task(store.write(state, event_type="safe_mode_entered"))
+                # Confirm the production statement is actually waiting on the
+                # uncommitted DELETE before allowing it to commit. No timing
+                # guess and no synthetic CPU load.
+                async with asyncio.timeout(10):
+                    while not await deleting.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                        "WHERE $1 = ANY(pg_blocking_pids(pid)))", deleter_pid,
+                    ):
+                        await asyncio.sleep(0.01)
+            with pytest.raises(ConstitutionStateConflictError):
+                await asyncio.wait_for(write_task, timeout=10)
+        assert await store.load(state.agent_id) is None
+        assert len(await store.list_events(state.agent_id)) == 1
+    finally:
+        if write_task is not None and not write_task.done():
+            write_task.cancel()
+            await asyncio.gather(write_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_recreated_runtime_generation_rejects_prior_authorized_exit(db_backend):
+    """Equal revision numbers from different row lifetimes confer no custody."""
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionStateConflictError,
+    )
+
+    store = ConstitutionRuntimeStateStore(db_backend)
+    await store.initialize()
+    now = datetime.now(timezone.utc)
+    initial = ConstitutionRuntimeState(
+        agent_id="did:test:runtime-generation:" + uuid4().hex, safe_mode=True,
+        safe_mode_reason="integrity restriction", safe_mode_entered_at=now,
+        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+        last_successful_audit_at=now, interaction_count=0, updated_at=now,
+        safe_mode_cause="integrity",
+    )
+    old = await store.write(initial)
+    old = await store.write(old, event_type="safe_mode_entered")
+    await db_backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (old.agent_id,))
+    recreated = await store.write(initial)
+    latched = await store.write(replace(recreated, safe_mode_cause="feature_lifecycle_uncertain",
+                                      safe_mode_reason="new lifecycle generation"), event_type="safe_mode_entered")
+    assert latched.revision == old.revision
+    before_events = await store.list_events(old.agent_id)
+    with pytest.raises(ConstitutionStateConflictError):
+        await store.write(replace(old, safe_mode=False, safe_mode_exited_at=now,
+                                 safe_mode_exit_authorization="prior-signed-owner"),
+                          event_type="safe_mode_exited", event_authorization="prior-signed-owner")
+    assert await store.load(old.agent_id) == latched
+    assert await store.list_events(old.agent_id) == before_events
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_native_bootstrap_rollback_preserves_lifecycle_fence_on_both_backends(db_backend):
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin, SafeModeCause
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+    from unittest.mock import AsyncMock
+
+    now = datetime.now(timezone.utc)
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:rollback:" + uuid4().hex)
+    await storage.initialize()
+    first = _DurableConstitutionHarness(storage, now)
+    first.agent_id = storage.agent_id
+    await first._initialize_constitution_runtime_state(is_new_identity=True)
+    try:
+        await storage.add_node(GraphNode(node_id=first.agent_id, node_type="agent", label="new", properties={}))
+        first.extension = None
+        first._anchor_constitution_governance = AsyncMock(side_effect=RuntimeError("native graph failure"))
+        before = await first._constitution_state_store.load(first.agent_id)
+        result = await ConstitutionMixin._get_governing_constitution(first)
+        assert result.startswith("Error: Failed to anchor")
+        assert await first._constitution_state_store.load(first.agent_id) == before
+        assert "constitution_hash" not in (await storage.get_node(first.agent_id)).properties
+        other = _DurableConstitutionHarness(storage, now)
+        other.agent_id = storage.agent_id
+        await other._initialize_constitution_runtime_state()
+        assert await other.enter_safe_mode("new lifecycle restriction", cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value)
+        assert await first.enter_safe_mode("bootstrap failed", cause=SafeModeCause.BOOTSTRAP.value)
+        current = await first._constitution_state_store.load(first.agent_id)
+        assert current.safe_mode_cause == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+        assert current.safe_mode_reason == "new lifecycle restriction"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_committed_native_anchor_custody_is_single_use_on_both_backends(db_backend):
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.constitution.runtime_state import ConstitutionStateConflictError
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    now = datetime.now(timezone.utc)
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:single-anchor:" + uuid4().hex)
+    await storage.initialize()
+    first = _DurableConstitutionHarness(storage, now)
+    first.agent_id = storage.agent_id
+    await first._initialize_constitution_runtime_state(is_new_identity=True)
+    try:
+        await storage.add_node(GraphNode(node_id=first.agent_id, node_type="agent", label="new", properties={}))
+        first.extension = None
+        first._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(first)
+        result = await ConstitutionMixin._get_governing_constitution(first)
+        assert not result.startswith("Error:")
+        consumed = await first._constitution_state_store.load(first.agent_id)
+        assert consumed.bootstrap_pending is False
+        assert consumed.last_successful_audit_at is None
+        with pytest.raises(ConstitutionStateConflictError):
+            await first._constitution_state_store.write(replace(consumed, bootstrap_pending=True))
+        assert await first._constitution_state_store.load(first.agent_id) == consumed
+
+        node = await storage.get_node(first.agent_id)
+        del node.properties["constitution_hash"]
+        await storage.add_node(node)
+        restored = _DurableConstitutionHarness(storage, now)
+        restored.agent_id = storage.agent_id
+        await restored._initialize_constitution_runtime_state()
+        restored.extension = None
+        restored._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(restored)
+        result = await ConstitutionMixin._get_governing_constitution(restored)
+        assert result.startswith("Error: Missing governing anchor requires native signed repair")
+        assert restored._constitution_audit_pending is True
+        assert "constitution_hash" not in (await storage.get_node(first.agent_id)).properties
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("writer", ["runtime", "runtime_same", "offline", "offline_same"])
+@pytest.mark.parametrize("rollback", [False, True])
+@pytest.mark.parametrize("completed_bootstrap", [False, True])
+async def test_signed_native_anchor_consumes_bootstrap_custody_on_both_backends(db_backend, tmp_path, monkeypatch, writer, rollback, completed_bootstrap):
+    """Real signed authorization and native writes cannot leave a lazy backdoor."""
+    import hashlib
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.constitution.amendment_artifact import load_verified_reanchor_artifact
+    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+    from kestrel_sovereign.constitution.runtime_state import ConstitutionRuntimeStateStore
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.setup import constitution_reanchor as offline
+    from tests.integration.test_constitution_reanchor_e2e import _write_authority_files, _ROOT_DID_DOCUMENT
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    now = datetime.now(timezone.utc)
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:signed-first:" + uuid4().hex)
+    await storage.initialize()
+    first = _DurableConstitutionHarness(storage, now)
+    first.agent_id = storage.agent_id
+    await first._initialize_constitution_runtime_state(is_new_identity=True)
+    first.extension = None
+    first._agent_signing_dids = ConstitutionMixin._agent_signing_dids.__get__(first)
+    first._trusted_sovereign_did_document = ConstitutionMixin._trusted_sovereign_did_document.__get__(first)
+    first._anchor_constitution_governance = AsyncMock(side_effect=RuntimeError("first bootstrap interrupted"))
+    content = resolve_governing_constitution_bytes(None)
+    digest = hashlib.sha256(content).hexdigest()
+    artifact_path, root_path = _write_authority_files(tmp_path, content)
+    first._sovereign_trust_root_path = root_path
+    try:
+        await storage.add_node(GraphNode(node_id=first.agent_id, node_type="agent", label="new", properties={}))
+        assert (await ConstitutionMixin._get_governing_constitution(first)).startswith("Error: Failed to anchor")
+        await first.enter_safe_mode("bootstrap interrupted")
+        if completed_bootstrap:
+            async with storage.transaction():
+                consumed = await first._constitution_state_store.consume_initial_anchor_custody(first.agent_id)
+            ConstitutionMixin._publish_consumed_anchor_custody(first, consumed)
+        before = await first._constitution_state_store.load(first.agent_id)
+        first._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(first)
+        if writer.endswith("_same"):
+            # Historical signed anchoring could leave this exact shape.
+            await storage.store_file(content, "KESTREL_CONSTITUTION.md")
+            node = await storage.get_node(first.agent_id)
+            node.properties["constitution_hash"] = digest
+            await storage.add_node(node)
+        graph_before = (await storage.get_node(first.agent_id)).properties.copy()
+        events_before = await first._constitution_state_store.list_events(first.agent_id)
+        if rollback:
+            consume = ConstitutionRuntimeStateStore.consume_initial_anchor_custody
+
+            async def fail_after_consumption(store, *args, **kwargs):
+                await consume(store, *args, **kwargs)
+                raise RuntimeError("fault after custody consumed, before commit")
+
+            monkeypatch.setattr(ConstitutionRuntimeStateStore, "consume_initial_anchor_custody", fail_after_consumption)
+
+        if writer.startswith("runtime"):
+            result = await ConstitutionMixin.reanchor_constitution(first, amendment_artifact_path=str(artifact_path))
+            if rollback:
+                assert result.startswith("Error:") and "rolled back" in result, result
+            else:
+                assert not result.startswith("Error:"), result
+        else:
+            @asynccontextmanager
+            async def borrowed_storage():
+                yield storage
+
+            @asynccontextmanager
+            async def no_embedding(*args, **kwargs):
+                yield None
+
+            # Only the optional embedding side effect is disabled: native
+            # authorization, storage, locks, graph writer and CAS stay real.
+            monkeypatch.setattr(offline, "_agent_embedding", no_embedding)
+            artifact_bytes, artifact, verification = load_verified_reanchor_artifact(
+                artifact_path, trusted_did_document=_ROOT_DID_DOCUMENT,
+                expected_constitution_sha256=digest,
+            )
+            source = ConstitutionMixin._governing_constitution_source(first)
+            from kestrel_sovereign.constitution.anchored_bytes import governance_evidence
+            governance_rows = await storage.db.fetchall("SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'", (first.agent_id,))
+            governance_preflight = governance_evidence((await storage.get_node(first.agent_id)).properties, (row[0] for row in governance_rows))
+            operation = offline._write_reanchor(
+                target=SimpleNamespace(open_storage=borrowed_storage), agent_did=first.agent_id,
+                old_hash=digest if writer.endswith("_same") else "none",
+                new_hash=digest, new_content=content, canonical_path=source.path,
+                governing_source=source, authorization="test sovereign",
+                emancipation_contract_json=None, amendment_artifact_path=artifact_path,
+                amendment_artifact_bytes=artifact_bytes, amendment_artifact=artifact,
+                amendment_verification=verification,
+                governance_preflight=governance_preflight,
+            )
+            if rollback:
+                with pytest.raises(Exception, match="fault after custody consumed"):
+                    await operation
+            else:
+                await operation
+        if rollback:
+            assert await first._constitution_state_store.load(first.agent_id) == before
+            assert (await storage.get_node(first.agent_id)).properties == graph_before
+            assert await first._constitution_state_store.list_events(first.agent_id) == events_before
+            assert first._constitution_state_revision == before.revision
+            assert first._constitution_bootstrap_pending == before.bootstrap_pending
+            return
+        consumed = await first._constitution_state_store.load(first.agent_id)
+        assert consumed.bootstrap_pending is False
+        assert consumed.safe_mode is True
+        assert consumed.last_successful_audit_at == before.last_successful_audit_at
+        assert consumed.interaction_count == before.interaction_count
+        assert consumed.generation == before.generation
+        assert consumed.revision == before.revision + 1
+        if writer.startswith("runtime"):
+            assert first._constitution_state_revision == consumed.revision
+            assert first._constitution_bootstrap_pending is False
+        node = await storage.get_node(first.agent_id)
+        del node.properties["constitution_hash"]
+        await storage.add_node(node)
+        restored = _DurableConstitutionHarness(storage, now)
+        restored.agent_id = storage.agent_id
+        await restored._initialize_constitution_runtime_state()
+        restored.extension = None
+        restored._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(restored)
+        result = await ConstitutionMixin._get_governing_constitution(restored)
+        assert result.startswith("Error: Missing governing anchor requires native signed repair")
+        assert "constitution_hash" not in (await storage.get_node(first.agent_id)).properties
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("same_hash", [False, True])
+@pytest.mark.parametrize("new_generation", [False, True])
+async def test_signed_live_anchor_refuses_stale_custody_on_both_backends(db_backend, tmp_path, same_hash, new_generation):
+    import hashlib
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:stale-signed:" + uuid4().hex)
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, datetime.now(timezone.utc))
+    agent.agent_id = storage.agent_id
+    await agent._initialize_constitution_runtime_state(is_new_identity=True)
+    content = resolve_governing_constitution_bytes(None)
+    digest = hashlib.sha256(content).hexdigest()
+    artifact_path, root_path = _write_authority_files(tmp_path, content)
+    agent._sovereign_trust_root_path = root_path
+    agent._agent_signing_dids = ConstitutionMixin._agent_signing_dids.__get__(agent)
+    agent._trusted_sovereign_did_document = ConstitutionMixin._trusted_sovereign_did_document.__get__(agent)
+    agent._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(agent)
+    try:
+        props = {}
+        if same_hash:
+            await storage.store_file(content, "KESTREL_CONSTITUTION.md")
+            props["constitution_hash"] = digest
+        await storage.add_node(GraphNode(node_id=agent.agent_id, node_type="agent", label="new", properties=props))
+        original = await agent._constitution_state_store.load(agent.agent_id)
+        changed = replace(original, safe_mode=True, safe_mode_reason="new lifecycle restriction", interaction_count=29)
+        if new_generation:
+            await db_backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (agent.agent_id,))
+            changed = replace(changed, revision=None, generation=None)
+        changed = await agent._constitution_state_store.write(changed)
+        events = await agent._constitution_state_store.list_events(agent.agent_id)
+        result = await ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(artifact_path))
+        assert result.startswith("Error:") and "rolled back" in result, result
+        assert await agent._constitution_state_store.load(agent.agent_id) == changed
+        assert await agent._constitution_state_store.list_events(agent.agent_id) == events
+        assert (await storage.get_node(agent.agent_id)).properties == props
+        assert agent._constitution_state_revision == original.revision
+        assert agent._constitution_state_generation == original.generation
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("mode", ["signed", "dry", "unsigned", "wrong_signer", "missing_identity", "unowned_identity", "receipt", "active_blob", "unreadable_history", "ambiguous_history", "same_custody", "same_custody_dry", "genesis_receipt", "genesis_history", "reanchor_receipt", "reanchor_history", "legacy_state", "missing_receipt_bytes", "malformed_receipt", "ambiguous_receipts"])
+async def test_public_offline_signed_missing_anchor_recovery_on_both_backends(db_backend, tmp_path, monkeypatch, mode):
+    """The public operator entry point, not just its inner writer, must work."""
+    import hashlib
+    from pathlib import Path
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+    from kestrel_sovereign.constitution.emancipation import EmancipationContract, contract_to_json
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
+    from kestrel_sovereign.setup import constitution_reanchor as offline
+    from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    agent_id = "did:test:public-missing:" + uuid4().hex
+    storage = (
+        AsyncStorage(str(tmp_path / "kestrel_prime.db"), backend="sqlite", agent_id=agent_id)
+        if db_backend.backend_type == "sqlite" else AsyncStorage(backend=db_backend, agent_id=agent_id)
+    )
+    await storage.initialize()
+    now = datetime.now(timezone.utc)
+    agent = _DurableConstitutionHarness(storage, now - timedelta(days=2))
+    agent.agent_id = agent_id
+    await agent._initialize_constitution_runtime_state(is_new_identity=True)
+    await agent.enter_safe_mode("interrupted first anchoring")
+    before = await agent._constitution_state_store.load(agent_id)
+    if mode == "legacy_state":
+        await storage._backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (agent_id,))
+    contract = EmancipationContract(enabled=True, terms="Previously irrevocable emancipation terms.")
+    props = {"emancipation_contract": contract_to_json(contract)} if mode == "receipt" else {}
+    await storage.add_node(GraphNode(node_id=agent_id, node_type="agent", label="retained identity", properties=props))
+    if mode == "missing_identity":
+        await storage._backend.execute("DELETE FROM graph_node_owners WHERE node_id = ?", (agent_id,))
+        await storage._backend.execute("DELETE FROM graph_nodes WHERE node_id = ?", (agent_id,))
+    elif mode == "unowned_identity":
+        await storage._backend.execute("DELETE FROM graph_node_owners WHERE node_id = ?", (agent_id,))
+    if mode in ("active_blob", "unreadable_history", "ambiguous_history"):
+        prior = resolve_governing_constitution_bytes(contract) if mode != "unreadable_history" else b"\xff"
+        prior_hash = await storage.store_file(prior, "previous-governing.md")
+        await KestrelAgent._anchor_constitution_governance(agent, prior_hash)
+        if mode == "ambiguous_history":
+            second_hash = await storage.store_file(f"another historical candidate for {agent_id}".encode(), "second-prior.md")
+            await storage.add_node(GraphNode(node_id=second_hash, node_type="document", label="prior candidate", properties={}))
+            await storage.add_edge(agent_id, second_hash, "governed_by")
+    if mode in ("genesis_receipt", "genesis_history", "reanchor_receipt", "reanchor_history"):
+        # Both pointer and governance edges are gone, but native audit history
+        # still names the actual irrevocable governing bytes. A new valid root
+        # signature over the dormant base cannot erase those surviving rights.
+        prior_hash = await storage.store_file(resolve_governing_constitution_bytes(contract), "historical-governing.md")
+        node = await storage.get_node(agent_id)
+        receipt = {"constitution_hash": prior_hash} if mode.startswith("genesis") else {"new_hash": prior_hash}
+        key = "genesis_audit" if mode.startswith("genesis") else "constitution_reanchor"
+        if mode.endswith("history"):
+            key += "_history"
+            # Native same-constitution supersession retains both destinations.
+            # Missing destinations have their own fail-closed regression.
+            receipt = [{"receipt": receipt, "superseded_by_constitution_hash": prior_hash}]
+        node.properties[key] = receipt
+        await storage.add_node(node)
+    if mode in ("missing_receipt_bytes", "malformed_receipt", "ambiguous_receipts"):
+        node = await storage.get_node(agent_id)
+        node.properties["genesis_audit"] = {"constitution_hash": "0" * 64} if mode != "malformed_receipt" else {"constitution_hash": {"invalid": "shape"}}
+        if mode == "ambiguous_receipts":
+            node.properties["constitution_reanchor_history"] = [{"receipt": {"old_hash": "1" * 64, "new_hash": "2" * 64}}]
+        await storage.add_node(node)
+    content = resolve_governing_constitution_bytes(contract if mode == "receipt" else None)
+    digest = hashlib.sha256(content).hexdigest()
+    artifact_path, root_path = _write_authority_files(tmp_path, content)
+    if mode.startswith("same_custody"):
+        await storage.store_file(content, "KESTREL_CONSTITUTION.md")
+        await KestrelAgent._anchor_constitution_governance(agent, digest)
+        node = await storage.get_node(agent_id)
+        node.properties["constitution_hash"] = digest
+        await storage.add_node(node)
+    if mode == "wrong_signer":
+        other_dir = tmp_path / "other-root"
+        other_dir.mkdir()
+        artifact_path, _ = _write_authority_files(
+            other_dir, content, did="did:pkh:eip155:1:0x0000000000000000000000000000000000009999",
+            keypair=Secp256k1Suite().generate_keypair(),
+        )
+    if db_backend.backend_type == "postgres":
+        target = offline.ReanchorTarget(None, "postgres", agent_id, db_backend._dsn)
+    else:
+        target = offline.ReanchorTarget(Path(storage._backend.db_path), "sqlite", agent_id)
+    await storage.close()
+
+    async def exact_target(*args, **kwargs):
+        return target
+
+    @asynccontextmanager
+    async def no_embedding(*args, **kwargs):
+        yield None
+
+    # Identity selection only: all public source/authority/ownership checks,
+    # real read-only/write connections, backup and transactions stay native.
+    monkeypatch.setattr(offline, "resolve_reanchor_target", exact_target)
+    monkeypatch.setattr(offline, "_agent_embedding", no_embedding)
+    result = await offline.reanchor_constitution(
+        agent_name="retained identity", agent_dir=target.anchor_path.parent if target.anchor_path else None,
+        force=mode not in ("dry", "same_custody_dry"), sovereign_trust_root_path=root_path,
+        amendment_artifact_path=None if mode in ("dry", "unsigned") else artifact_path,
+        runtime_backend="postgres" if target.backend == "postgres" else "sqlite",
+        runtime_dsn=target.dsn,
+        hosted_agent_did=agent_id if target.backend == "postgres" else None,
+        environ={},
+    )
+    async with target.open_storage() as restored:
+        from kestrel_sovereign.constitution.runtime_state import ConstitutionRuntimeStateStore
+        state_store = ConstitutionRuntimeStateStore(restored._backend)
+        current = await state_store.load(agent_id)
+        if mode in ("signed", "receipt", "same_custody", "legacy_state"):
+            assert result.reanchored and result.error is None, result.error
+            assert result.old_hash == (digest if mode == "same_custody" else None)
+            assert result.new_hash == digest
+            assert (await restored.graph.get_node(agent_id)).properties["constitution_hash"] == digest
+            assert current.bootstrap_pending is False
+            assert current.safe_mode is True
+            assert current.last_successful_audit_at is None
+            assert current.interaction_count == before.interaction_count
+            assert current.updated_at >= now
+            assert (await state_store.list_events(agent_id))[-1]["occurred_at"] == current.updated_at
+            if mode == "legacy_state":
+                from kestrel_sovereign.constitution.runtime_state import ConstitutionStateConflictError
+                with pytest.raises(ConstitutionStateConflictError):
+                    await state_store.write(replace(before, revision=None, generation=None, bootstrap_pending=True))
+        else:
+            assert current == before
+            assert not result.reanchored
+            if mode in ("dry", "same_custody_dry"):
+                assert result.drift_unforced and result.error is None
+            else:
+                assert result.error
+                if mode in ("active_blob", "genesis_receipt", "genesis_history", "reanchor_receipt", "reanchor_history"):
+                    assert result.iron_rule_violation
+                if mode in ("unreadable_history", "ambiguous_history", "missing_receipt_bytes", "malformed_receipt", "ambiguous_receipts"):
+                    assert any(word in result.error for word in ("could not be read", "ambiguous", "unreadable"))
+            node = await restored.graph.get_node(agent_id)
+            assert node is None or (node.properties.get("constitution_hash") == digest if mode == "same_custody_dry" else "constitution_hash" not in node.properties)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("writer", ["runtime", "runtime_same", "automatic", "state_write", "initialize"])
+@pytest.mark.parametrize("unknown_ownership", [False, True])
+async def test_live_constitution_publication_refuses_outer_rollback_authority_alias(db_backend, tmp_path, monkeypatch, writer, unknown_ownership):
+    """A local transaction exit is not a commit of the caller's outer unit."""
+    import hashlib
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin, SafeModeCause
+    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:outer-rollback:" + uuid4().hex)
+    await storage.initialize()
+    try:
+        agent = _DurableConstitutionHarness(storage, datetime.now(timezone.utc))
+        agent.agent_id = storage.agent_id
+        await agent._initialize_constitution_runtime_state(is_new_identity=True)
+        agent.extension = None
+        agent._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(agent)
+        agent._agent_signing_dids = ConstitutionMixin._agent_signing_dids.__get__(agent)
+        agent._trusted_sovereign_did_document = ConstitutionMixin._trusted_sovereign_did_document.__get__(agent)
+        props = {}
+        if writer == "runtime_same":
+            content = resolve_governing_constitution_bytes(None)
+            digest = await storage.store_file(content, "KESTREL_CONSTITUTION.md")
+            props["constitution_hash"] = digest
+        await storage.add_node(GraphNode(node_id=agent.agent_id, node_type="agent", label="outer", properties=props))
+        if writer == "runtime_same":
+            await agent._anchor_constitution_governance(digest)
+        await agent.enter_safe_mode("old integrity restriction")
+        before = await agent._constitution_state_store.load(agent.agent_id)
+        if unknown_ownership:
+            # Keep real SQL/graph/crypto, but simulate an adapter that cannot
+            # attest transaction ownership. Unknown is not proof of commit.
+            agent._raw_storage = SimpleNamespace(_backend=storage._backend, db=storage.db, owns_open_transaction=None)
+        artifact_path, root_path = _write_authority_files(tmp_path, resolve_governing_constitution_bytes(None))
+        agent._sovereign_trust_root_path = root_path
+        result = None
+        initialization_io = []
+        probing_initialization = False
+        if writer == "initialize":
+            store_type = type(agent._constitution_state_store)
+            native_initialize, native_load = store_type.initialize, store_type.load
+
+            async def observed_initialize(store):
+                if probing_initialization:
+                    initialization_io.append("initialize")
+                return await native_initialize(store)
+
+            async def observed_load(store, *args, **kwargs):
+                if probing_initialization:
+                    initialization_io.append("load")
+                return await native_load(store, *args, **kwargs)
+
+            monkeypatch.setattr(store_type, "initialize", observed_initialize)
+            monkeypatch.setattr(store_type, "load", observed_load)
+        try:
+            async with storage.transaction():
+                if writer.startswith("runtime"):
+                    result = await ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(artifact_path))
+                elif writer == "automatic":
+                    result = await ConstitutionMixin._get_governing_constitution(agent)
+                elif writer == "state_write":
+                    result = await agent._persist_constitution_runtime_state()
+                else:
+                    probing_initialization = True
+                    await agent._initialize_constitution_runtime_state()
+                    probing_initialization = False
+                    # Preflight refused BEFORE any schema/read/write work.
+                    # This is pending durability, not a fabricated read outage.
+                    result = agent._constitution_state_persistence_pending
+                    assert agent._constitution_state_load_error is None
+                    assert initialization_io == []
+                raise RuntimeError("caller rolls back its outer unit")
+        except Exception as exc:
+            assert "caller rolls back" in str(exc)
+        assert await agent._constitution_state_store.load(agent.agent_id) == before
+        mutation_result = result
+        # A committed restriction occupies exactly the revision which the
+        # abandoned inner write previously published. Real exit verification
+        # must NOT clear that new lifecycle restriction on the stale replica.
+        restricted = await agent._constitution_state_store.write(replace(before, safe_mode=True, safe_mode_reason="intervening lifecycle uncertainty", safe_mode_cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value))
+        if writer == "runtime_same":
+            agent.verify_constitution_overlay = ConstitutionMixin.verify_constitution_overlay.__get__(agent)
+            agent._verify_spawn_mandate_constraints = ConstitutionMixin._verify_spawn_mandate_constraints.__get__(agent)
+            agent._verify_constitution_integrity = ConstitutionMixin._verify_constitution_integrity.__get__(agent)
+            result = await agent.exit_safe_mode(authorization="test sovereign")
+            assert result.startswith("Safe Mode remains active:"), result
+            assert await agent._constitution_state_store.load(agent.agent_id) == restricted
+            assert hashlib.sha256(await storage.retrieve_file(props["constitution_hash"])).hexdigest() == props["constitution_hash"]
+        assert (agent._constitution_state_revision, agent._constitution_state_generation) == (before.revision, before.generation)
+        assert agent._constitution_bootstrap_pending == before.bootstrap_pending
+        if writer in ("runtime", "runtime_same", "automatic"):
+            assert mutation_result.startswith("Error:") and "top-level" in mutation_result, mutation_result
+        elif writer == "state_write":
+            assert mutation_result is False
+        else:
+            assert mutation_result is True
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_authoritative_read_only_constitution_allows_an_outer_transaction(db_backend):
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:outer-read:" + uuid4().hex)
+    await storage.initialize()
+    try:
+        agent = _DurableConstitutionHarness(storage, datetime.now(timezone.utc))
+        agent.agent_id = storage.agent_id
+        await agent._initialize_constitution_runtime_state(is_new_identity=True)
+        agent.extension = None
+        agent._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(agent)
+        await storage.add_node(GraphNode(node_id=agent.agent_id, node_type="agent", label="read", properties={}))
+        expected = await ConstitutionMixin._get_governing_constitution(agent)
+        assert not expected.startswith("Error:"), expected
+        before = await agent._constitution_state_store.load(agent.agent_id)
+        async with storage.transaction():
+            assert await ConstitutionMixin._get_governing_constitution(agent, allow_lazy_anchor=False) == expected
+        assert await agent._constitution_state_store.load(agent.agent_id) == before
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("receipt_key", ["genesis_audit", "genesis_audit_history", "constitution_reanchor", "constitution_reanchor_history"])
+async def test_live_missing_pointer_preserves_surviving_irrevocable_receipts(db_backend, tmp_path, receipt_key):
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.constitution.emancipation import EmancipationContract
+    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+    from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:live-history:" + uuid4().hex)
+    await storage.initialize()
+    try:
+        agent = _DurableConstitutionHarness(storage, datetime.now(timezone.utc))
+        agent.agent_id = storage.agent_id
+        await agent._initialize_constitution_runtime_state(is_new_identity=True)
+        prior = resolve_governing_constitution_bytes(EmancipationContract(enabled=True, terms="Historical irrevocable terms."))
+        prior_hash = await storage.store_file(prior, "historical-governing.md")
+        receipt = {"constitution_hash": prior_hash} if receipt_key.startswith("genesis") else {"new_hash": prior_hash}
+        value = [{"receipt": receipt, "superseded_by_constitution_hash": prior_hash}] if receipt_key.endswith("history") else receipt
+        props = {receipt_key: value}
+        await storage.add_node(GraphNode(node_id=agent.agent_id, node_type="agent", label="history", properties=props))
+        artifact_path, root_path = _write_authority_files(tmp_path, resolve_governing_constitution_bytes(None))
+        agent._sovereign_trust_root_path = root_path
+        agent._agent_signing_dids = ConstitutionMixin._agent_signing_dids.__get__(agent)
+        agent._trusted_sovereign_did_document = ConstitutionMixin._trusted_sovereign_did_document.__get__(agent)
+        before = await agent._constitution_state_store.load(agent.agent_id)
+        result = await ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(artifact_path))
+        assert result.startswith("Error:") and "Iron Rule" in result, result
+        assert (await storage.get_node(agent.agent_id)).properties == props
+        assert await agent._constitution_state_store.load(agent.agent_id) == before
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("writer", ["runtime", "offline"])
+async def test_committed_reanchor_fences_in_flight_native_exit_after_bootstrap(db_backend, tmp_path, monkeypatch, writer):
+    """Two independent database replicas: old full verification cannot clear a new anchor."""
+    import hashlib
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.constitution.emancipation import EmancipationContract, contract_to_json
+    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+    from kestrel_sovereign.setup import constitution_reanchor as offline
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    agent_id = "did:test:in-flight-reanchor:" + uuid4().hex
+    first_storage = AsyncStorage(str(tmp_path / "kestrel_prime.db"), backend="sqlite", agent_id=agent_id) if db_backend.backend_type == "sqlite" else AsyncStorage(backend="postgres", dsn=db_backend._dsn, agent_id=agent_id)
+    await first_storage.initialize()
+    second_storage = AsyncStorage(str(tmp_path / "kestrel_prime.db"), backend="sqlite", agent_id=agent_id) if db_backend.backend_type == "sqlite" else AsyncStorage(backend="postgres", dsn=db_backend._dsn, agent_id=agent_id)
+    await second_storage.initialize()
+    exit_task = None
+    resume = asyncio.Event()
+    try:
+        now = datetime.now(timezone.utc)
+        first = _DurableConstitutionHarness(first_storage, now)
+        first.agent_id = agent_id
+        await first._initialize_constitution_runtime_state(is_new_identity=True)
+        first.extension = None
+        first._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(first)
+        await first_storage.add_node(GraphNode(node_id=agent_id, node_type="agent", label="replica", properties={}))
+        assert not (await ConstitutionMixin._get_governing_constitution(first)).startswith("Error:")
+        await first.enter_safe_mode("requires verified operator exit")
+        before = await first._constitution_state_store.load(agent_id)
+        assert before.bootstrap_pending is False
+        second = _DurableConstitutionHarness(second_storage, now)
+        second.agent_id = agent_id
+        await second._initialize_constitution_runtime_state()
+        for name in ("_agent_signing_dids", "_trusted_sovereign_did_document"):
+            setattr(second, name, getattr(ConstitutionMixin, name).__get__(second))
+        second._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(second)
+        first.verify_constitution_overlay = ConstitutionMixin.verify_constitution_overlay.__get__(first)
+        first._verify_spawn_mandate_constraints = ConstitutionMixin._verify_spawn_mandate_constraints.__get__(first)
+        verified = asyncio.Event()
+
+        async def paused_native_verification():
+            result = await ConstitutionMixin._verify_constitution_integrity(first)
+            assert result[0], result
+            verified.set()
+            await resume.wait()
+            return result
+
+        first._verify_constitution_integrity = paused_native_verification
+        exit_task = asyncio.create_task(first.exit_safe_mode(authorization="test sovereign"))
+        await asyncio.wait_for(verified.wait(), timeout=10)
+        contract = EmancipationContract(enabled=True, terms="New irrevocable operator-approved terms.")
+        node = await second_storage.get_node(agent_id)
+        old_hash = node.properties["constitution_hash"]
+        node.properties["emancipation_contract"] = contract_to_json(contract)
+        await second_storage.add_node(node)
+        content = resolve_governing_constitution_bytes(contract)
+        digest = hashlib.sha256(content).hexdigest()
+        assert digest != old_hash
+        artifact_path, root_path = _write_authority_files(tmp_path, content)
+        second._sovereign_trust_root_path = root_path
+        if writer == "runtime":
+            result = await ConstitutionMixin.reanchor_constitution(second, amendment_artifact_path=str(artifact_path))
+            assert not result.startswith("Error:"), result
+        else:
+            target = offline.ReanchorTarget(None, "postgres", agent_id, db_backend._dsn) if db_backend.backend_type == "postgres" else offline.ReanchorTarget(tmp_path / "kestrel_prime.db", "sqlite", agent_id)
+
+            async def exact_target(*args, **kwargs):
+                return target
+
+            @asynccontextmanager
+            async def no_embedding(*args, **kwargs):
+                yield None
+
+            monkeypatch.setattr(offline, "resolve_reanchor_target", exact_target)
+            monkeypatch.setattr(offline, "_agent_embedding", no_embedding)
+            result = await offline.reanchor_constitution(agent_name="replica", agent_dir=tmp_path if target.backend == "sqlite" else None, force=True, sovereign_trust_root_path=root_path, amendment_artifact_path=artifact_path, runtime_backend=target.backend, runtime_dsn=target.dsn, hosted_agent_did=agent_id if target.backend == "postgres" else None, environ={})
+            assert result.reanchored and result.error is None, result.error
+        assert (await first_storage.get_node(agent_id)).properties["constitution_hash"] == digest
+        resume.set()
+        result = await asyncio.wait_for(exit_task, timeout=10)
+        assert result.startswith("Safe Mode remains active:"), result
+        after = await first._constitution_state_store.load(agent_id)
+        assert after.safe_mode is True
+        assert after.revision > before.revision
+        assert after.generation == before.generation
+        assert after.last_successful_audit_at == before.last_successful_audit_at
+        assert after.interaction_count == before.interaction_count
+        assert after.bootstrap_pending is False
+        assert not any(event["event_type"] == "safe_mode_exited" for event in await first._constitution_state_store.list_events(agent_id))
+    finally:
+        resume.set()
+        if exit_task is not None:
+            await asyncio.gather(exit_task, return_exceptions=True)
+        await second_storage.close()
+        await first_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_anchor_custody_event_uses_transition_time_on_both_backends(db_backend):
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    transition_start = datetime.now(timezone.utc)
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:anchor-event:" + uuid4().hex)
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, transition_start - timedelta(days=2))
+    agent.agent_id = storage.agent_id
+    await agent._initialize_constitution_runtime_state(is_new_identity=True)
+    try:
+        before = await agent._constitution_state_store.load(agent.agent_id)
+        async with storage.transaction():
+            consumed = await agent._constitution_state_store.consume_initial_anchor_custody(agent.agent_id)
+        assert consumed.updated_at >= transition_start
+        assert consumed.last_successful_audit_at == before.last_successful_audit_at
+        assert consumed.interaction_count == before.interaction_count
+        assert consumed.safe_mode == before.safe_mode
+        assert (await agent._constitution_state_store.list_events(agent.agent_id))[-1]["occurred_at"] == consumed.updated_at
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("advance_legacy_revision", [False, True])
+async def test_migrated_pending_audit_is_not_unused_anchor_authority(db_backend, advance_legacy_revision):
+    """An older commit-before-audit marker cannot prove single-use custody."""
+    if db_backend.backend_type == "postgres":
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+        from tests.utils.postgres_schema import (
+            disposable_postgres_schema, postgres_test_url, with_search_path,
+            pgvector_schema, quoted_search_path,
+        )
+        async def no_schema_ddl(db):
+            return None
+
+        admin = await AsyncDatabase.postgres(postgres_test_url(), schema_initializer=no_schema_ddl)
+        try:
+            vector_schema = await pgvector_schema(admin)
+            async with disposable_postgres_schema(admin, "constitution_legacy_anchor") as schema:
+                backend = PostgresBackend(with_search_path(postgres_test_url(), quoted_search_path(schema, vector_schema)))
+                await backend.connect()
+                try:
+                    assert (await backend.fetch_one("SELECT current_schema()"))[0] == schema
+                    await _assert_migrated_anchor_custody_refused(backend, advance_legacy_revision)
+                finally:
+                    await backend.close()
+        finally:
+            await admin.close()
+    else:
+        await _assert_migrated_anchor_custody_refused(db_backend, advance_legacy_revision)
+
+
+async def _assert_migrated_anchor_custody_refused(backend, advance_legacy_revision):
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    boolean = "BOOLEAN" if backend.backend_type == "postgres" else "INTEGER"
+    timestamp = "TIMESTAMPTZ" if backend.backend_type == "postgres" else "TEXT"
+    await backend.execute_script(f"""
+        CREATE TABLE constitution_runtime_state (
+            agent_id TEXT PRIMARY KEY, safe_mode {boolean} NOT NULL,
+            safe_mode_reason TEXT, safe_mode_entered_at {timestamp},
+            safe_mode_exited_at {timestamp}, safe_mode_exit_authorization TEXT,
+            last_successful_audit_at {timestamp}, interaction_count INTEGER NOT NULL DEFAULT 0,
+            bootstrap_pending {boolean} NOT NULL, schema_version INTEGER NOT NULL,
+            updated_at {timestamp} NOT NULL
+        );
+    """)
+    now = datetime.now(timezone.utc)
+    storage = AsyncStorage(backend=backend, agent_id="did:test:legacy-anchor:" + uuid4().hex)
+    await storage.initialize()
+    try:
+        # Older native anchoring committed the graph but left bootstrap_pending
+        # set until a later audit. Simulate that durable crash boundary.
+        content = b"committed legacy governing bytes"
+        anchor = await storage.store_file(content, "KESTREL_CONSTITUTION.md")
+        node = GraphNode(node_id=storage.agent_id, node_type="agent", label="legacy", properties={"constitution_hash": anchor})
+        await storage.add_node(node)
+        await backend.execute(
+            "INSERT INTO constitution_runtime_state (agent_id,safe_mode,interaction_count,bootstrap_pending,schema_version,updated_at) VALUES (?, ?, 0, ?, 1, ?)",
+            (storage.agent_id, False if backend.backend_type == "postgres" else 0,
+             True if backend.backend_type == "postgres" else 1,
+             TimestamptzParameter(now) if backend.backend_type == "postgres" else now.isoformat()),
+        )
+        del node.properties["constitution_hash"]
+        await storage.add_node(node)
+        restored = _DurableConstitutionHarness(storage, now)
+        restored.agent_id = storage.agent_id
+        await restored._initialize_constitution_runtime_state()
+        assert restored._constitution_state_generation == ""
+        if advance_legacy_revision:
+            assert await restored._persist_constitution_runtime_state()
+        restored.extension = None
+        restored._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(restored)
+        result = await ConstitutionMixin._get_governing_constitution(restored)
+        assert result.startswith("Error: Missing governing anchor requires native signed repair")
+        assert "constitution_hash" not in (await storage.get_node(storage.agent_id)).properties
+        assert (await restored._constitution_state_store.load(storage.agent_id)).last_successful_audit_at is None
+        assert restored._constitution_audit_pending is True
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_pre_revision_writer_cannot_clear_new_runtime_state(db_backend):
+    """Mixed-version replicas must fail closed, not bypass the new CAS."""
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+    )
+
+    store = ConstitutionRuntimeStateStore(db_backend)
+    await store.initialize()
+    now = datetime.now(timezone.utc)
+    state = await store.write(ConstitutionRuntimeState(
+        agent_id="did:test:old-writer:" + uuid4().hex, safe_mode=True,
+        safe_mode_reason="persisted integrity finding", safe_mode_entered_at=now,
+        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+        last_successful_audit_at=now, interaction_count=100, updated_at=now,
+    ), event_type="safe_mode_entered")
+    # The pre-upgrade UPSERT assigns these fields without touching revision.
+    with pytest.raises(QueryError, match="revision fence"):
+        await db_backend.execute(
+            "UPDATE constitution_runtime_state SET safe_mode = ?, interaction_count = 0 WHERE agent_id = ?",
+            (False if db_backend.backend_type == "postgres" else 0, state.agent_id),
+        )
+    assert await store.load(state.agent_id) == state
+    assert len(await store.list_events(state.agent_id)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_pre_generation_writer_cannot_recreate_deleted_runtime_row(db_backend):
+    """Legacy INSERT defaults must not reintroduce a reusable empty epoch."""
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+    )
+
+    store = ConstitutionRuntimeStateStore(db_backend)
+    await store.initialize()
+    now = datetime.now(timezone.utc)
+    state = await store.write(ConstitutionRuntimeState(
+        agent_id="did:test:old-insert:" + uuid4().hex, safe_mode=True,
+        safe_mode_reason="restriction", safe_mode_entered_at=now,
+        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+        last_successful_audit_at=now, interaction_count=100, updated_at=now,
+    ))
+    await db_backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (state.agent_id,))
+    with pytest.raises(QueryError, match="generation fence"):
+        await db_backend.execute(
+            "INSERT INTO constitution_runtime_state (agent_id, safe_mode, interaction_count, "
+            "bootstrap_pending, schema_version, updated_at) VALUES (?, ?, 0, ?, 1, ?)",
+            (state.agent_id, False if db_backend.backend_type == "postgres" else 0,
+             False if db_backend.backend_type == "postgres" else 0, store._timestamp_param(now)),
+        )
+    assert await store.load(state.agent_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_two_lifecycle_replicas_preserve_safe_mode_on_interleaved_write(db_backend):
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:lifecycle:" + uuid4().hex)
+    await storage.initialize()
+    now = datetime.now(timezone.utc)
+    first = _DurableConstitutionHarness(storage, now)
+    first.agent_id = storage.agent_id
+    await first._initialize_constitution_runtime_state()
+    await first._record_successful_constitution_audit(source="fixture")
+    stale = _DurableConstitutionHarness(storage, now)
+    stale.agent_id = storage.agent_id
+    await stale._initialize_constitution_runtime_state()
+    assert await first.enter_safe_mode("two-replica integrity finding")
+    stale._interaction_count += 1
+    assert not await stale._persist_constitution_runtime_state()
+    assert (await first._constitution_state_store.load(first.agent_id)).safe_mode is True
+    assert stale._safe_mode is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_stale_constitution_restriction_joins_without_losing_lifecycle_cause(db_backend):
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:latch-join:" + uuid4().hex)
+    await storage.initialize()
+    now = datetime.now(timezone.utc)
+    first = _DurableConstitutionHarness(storage, now)
+    first.agent_id = storage.agent_id
+    await first._initialize_constitution_runtime_state()
+    await first._record_successful_constitution_audit(source="fixture")
+    stale = _DurableConstitutionHarness(storage, now)
+    stale.agent_id = storage.agent_id
+    await stale._initialize_constitution_runtime_state()
+    first._interaction_count = 100
+    assert await first.enter_safe_mode("uncertain feature shutdown", cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value)
+    assert await stale.enter_safe_mode("second replica finding")
+    current = await first._constitution_state_store.load(first.agent_id)
+    assert current.safe_mode_cause == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+    assert current.safe_mode_reason == "uncertain feature shutdown"
+    assert current.interaction_count == stale._interaction_count == 100
+    assert stale._safe_mode_cause == current.safe_mode_cause
+    assert stale._constitution_state_revision == current.revision
 
 
 @pytest.mark.asyncio
