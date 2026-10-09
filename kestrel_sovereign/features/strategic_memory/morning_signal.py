@@ -5,14 +5,19 @@ enriched with live GitHub data and the agent's workflow run outcomes.
 """
 
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .blocker_reconcile import describe_last_reconciliation, split_issue_reference
+from .blocker_reconcile import (
+    configured_repos,
+    describe_last_reconciliation,
+    resolve_blocker_reference,
+)
 from .github_integration import (
     GITHUB_SIGNAL_NO_SCAN_REPOS,
     GITHUB_SIGNAL_NO_TOKEN,
     GitHubAuthError,
     fetch_github_signal,
+    get_github_self_repo,
     github_signal_prerequisite,
     short_repo,
 )
@@ -22,6 +27,25 @@ from .workflow_runs import (
     last_success_date,
     render_workflow_runs_section,
 )
+
+
+def _issues_stated_by_ledger(
+    blockers: List[Dict[str, Any]], configured: List[str], self_repo: str
+) -> Set[Tuple[str, int]]:
+    """``(owner/repo, number)`` for each ledger row that states its own issue.
+
+    Read with :func:`resolve_blocker_reference`, as the reconciler reads it;
+    the repository is lowercased because GitHub's names are case-insensitive.
+    A row that cannot be resolved, or whose repository was only inferred, is
+    left out and so hides no live blocked issue: low numbers exist in every
+    scanned repository, and a duplicate line costs less than a dropped blocker.
+    """
+    stated: Set[Tuple[str, int]] = set()
+    for row in blockers:
+        reference = resolve_blocker_reference(row, configured, self_repo)
+        if reference.problem is None and not reference.inferred:
+            stated.add((str(reference.repo).lower(), int(reference.number)))
+    return stated
 
 
 async def generate_morning_signal(
@@ -158,7 +182,10 @@ async def generate_morning_signal(
         all_repos = list(github_data.keys())
         for repo, rd in github_data.items():
             for b in rd.get("blocked_issues", []):
-                live_blocked.append({"repo": short_repo(repo, all_repos), **b})
+                # ``repo`` is for display; ``full_repo`` is what matches.
+                live_blocked.append(
+                    {**b, "repo": short_repo(repo, all_repos), "full_repo": repo}
+                )
 
     if blockers or live_blocked:
         lines.append("")
@@ -170,13 +197,18 @@ async def generate_morning_signal(
             notes = b.get("notes")
             if notes:
                 lines.append(f"  - {notes}")
-        # Add any GitHub-labeled blocked issues not already in YAML. By
-        # number, read through the reference parser: a qualified
-        # ``owner/repo#12`` or an unquoted YAML ``issue: 12`` is still 12.
-        yaml_issues = {split_issue_reference(b.get("issue"))[1] for b in blockers}
-        for lb in live_blocked:
-            if lb["number"] not in yaml_issues:
-                lines.append(f"- [GITHUB] {lb['repo']}#{lb['number']}: {lb['title']}")
+        # Add any GitHub-labeled blocked issues not already in the ledger,
+        # matched by repository and number: ``owner/alpha#77`` must not hide
+        # ``owner/beta#77``.
+        if live_blocked:
+            in_ledger = _issues_stated_by_ledger(
+                blockers, configured_repos(data), get_github_self_repo()
+            )
+            for lb in live_blocked:
+                if (lb["full_repo"].lower(), lb["number"]) not in in_ledger:
+                    lines.append(
+                        f"- [GITHUB] {lb['repo']}#{lb['number']}: {lb['title']}"
+                    )
         if blockers:
             lines.append("")
             lines.append(

@@ -726,37 +726,98 @@ async def test_add_blocker_refuses_a_repo_that_is_not_one(tmp_path):
     assert "not 'owner/repo'" in result.error
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "issue", [f"{SELF_REPO}#77", 77, "#77"], ids=["qualified", "yaml-int", "bare"]
-)
-async def test_a_labelled_blocker_already_in_the_ledger_is_listed_once(issue):
-    """Rows written ``owner/repo#N`` (or an unquoted YAML int) used to miss the
-    number-only de-duplication against GitHub's blocked issues -- the int
-    form raised on ``.replace``."""
-    data = {
-        "morning_signal_config": {"scan_repos": [SELF_REPO]},
-        BLOCKERS_KEY: [{"issue": issue, "title": "ledger row", "severity": "low"}],
-    }
+ALPHA = "owner/alpha"
+BETA = "owner/beta"
+TALON = "KestrelSovereignAI/kestrel-feature-talon"
+
+
+async def _briefing_beside_live_blocked(rows, scan_repos, number=77):
+    """The briefing when every scanned repo has a ``blocked`` issue ``number``.
+
+    Each live issue is titled ``"<owner/repo> labelled"`` so a test can tell
+    which repository's issue was listed.
+    """
+    data = {"morning_signal_config": {"scan_repos": scan_repos}, BLOCKERS_KEY: rows}
     live = {
-        SELF_REPO: {
+        repo: {
             "issue_count": 1,
             "prs": [],
             "comments_24h": 0,
-            "blocked_issues": [{"number": 77, "title": "labelled on GitHub"}],
+            "blocked_issues": [{"number": number, "title": f"{repo} labelled"}],
         }
+        for repo in scan_repos
     }
     with patch(
         "kestrel_sovereign.features.strategic_memory.morning_signal."
         "fetch_github_signal",
         new=AsyncMock(return_value=live),
     ):
-        briefing = await generate_morning_signal(
+        return await generate_morning_signal(
             data, WorkflowRunsNotAssessed("n/a"), blocker_reconciliation=None
         )
 
-    assert "labelled on GitHub" not in briefing
+
+def _listed_live_blockers(briefing):
+    """The repositories whose live blocked issue the briefing listed."""
+    return {
+        line.rsplit(": ", 1)[1].removesuffix(" labelled")
+        for line in briefing.splitlines()
+        if line.startswith("- [GITHUB] ")
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row", "hidden"),
+    [
+        # A row states its issue: it hides that repository's issue, no other.
+        pytest.param({"issue": "owner/alpha#77"}, {ALPHA}, id="owner-repo-hash-n"),
+        pytest.param({"issue": "OWNER/Alpha#77"}, {ALPHA}, id="other-case"),
+        pytest.param({"issue": "#77", "repo": ALPHA}, {ALPHA}, id="declared-repo"),
+        pytest.param({"issue": "alpha#77"}, {ALPHA}, id="scanned-short-name"),
+        pytest.param({"issue": "#77", "repo": "self"}, {SELF_REPO}, id="repo-self"),
+        pytest.param({"issue": "self#77"}, {SELF_REPO}, id="self-hash-n"),
+        pytest.param(
+            {"issue": "kestrel-feature-talon#77", "repo": "kestrel-feature-talon"},
+            {TALON},
+            id="short-repo-and-short-issue",
+        ),
+        pytest.param({"issue": "owner/alpha#78"}, set(), id="other-number"),
+        pytest.param({"issue": "owner/gamma#77"}, set(), id="unscanned-repo"),
+        # A row whose repository is only inferred, or that names none at all,
+        # hides nothing: a bare 77 on this agent is assumed to be home's 77.
+        pytest.param({"issue": "#77"}, set(), id="bare-inferred"),
+        pytest.param({"issue": 77}, set(), id="yaml-int-inferred"),
+        pytest.param(
+            {"issue": "#77", "repo": "the talon repo"}, set(), id="unresolvable"
+        ),
+    ],
+)
+async def test_a_ledger_row_hides_only_the_live_blocker_it_names(row, hidden):
+    """Live blocked issues are matched against ledger rows by repository AND
+    number. Matching by number alone let ``owner/alpha#77`` hide a different
+    project's ``owner/beta#77`` from the briefing."""
+    scan_repos = [*SCAN_REPOS, ALPHA, BETA]
+
+    briefing = await _briefing_beside_live_blocked(
+        [{**row, "title": "ledger row", "severity": "low"}], scan_repos
+    )
+
     assert "ledger row" in briefing
+    assert _listed_live_blockers(briefing) == set(scan_repos) - hidden
+
+
+@pytest.mark.asyncio
+async def test_an_inferred_row_does_not_hide_the_lone_scanned_repositorys_issue():
+    """Even on a single-repository agent a bare number is an assumption -- the
+    reconciler checks GitHub's dates before trusting it -- so the briefing
+    lists the live issue too rather than risk hiding a different one."""
+    briefing = await _briefing_beside_live_blocked(
+        [{"issue": "#77", "title": "ledger row", "severity": "low"}], [SELF_REPO]
+    )
+
+    assert "ledger row" in briefing
+    assert _listed_live_blockers(briefing) == {SELF_REPO}
 
 
 def test_self_repo_comes_from_the_environment_then_dotenv_then_the_default(
