@@ -1906,7 +1906,7 @@ class ConstitutionMixin:
         if not agent_node:
             return "Error: Agent identity node not found."
 
-        old_hash = agent_node.properties.get("constitution_hash", "none")
+        old_hash = agent_node.properties.get("constitution_hash") or "none"
 
         # Resolve the new governing bytes through the SINGLE production resolver
         # (#2463) reading the governing source the periodic audit reads — the
@@ -1969,7 +1969,22 @@ class ConstitutionMixin:
         # bytes would then authorize, erasing the authored terms. Refuse before
         # any crypto or write. Shared with the offline CLI so the two entry
         # points cannot diverge on this.
-        if old_hash != "none":
+        historical_hash = old_hash
+        if old_hash == "none":
+            from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
+
+            db = getattr(getattr(self, "_raw_storage", None), "db", None)
+            if db is None:
+                return "Error: Cannot inspect historical governance without the native storage connection; nothing was written."
+            try:
+                edge_rows = await db.fetchall(
+                    "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'",
+                    (self.agent_id,),
+                )
+                historical_hash = historical_anchor_hash(agent_node.properties, (row[0] for row in edge_rows))
+            except Exception as exc:  # noqa: BLE001 - incomplete history cannot waive rights
+                return f"Error: Cannot inspect historical governance: {exc}; nothing was written."
+        if historical_hash and historical_hash != "none":
             from kestrel_sovereign.constitution.anchored_bytes import (
                 read_anchored_constitution,
             )
@@ -1999,8 +2014,10 @@ class ConstitutionMixin:
                 )
             try:
                 anchored_text, anchored_present = await read_anchored_constitution(
-                    db, old_hash
+                    db, historical_hash
                 )
+                if old_hash == "none" and not anchored_present:
+                    return "Error: Historical governing bytes could not be read; restore the exact prior pointer before signed repair."
             except Exception as exc:  # noqa: BLE001 — a database failure, not a key one
                 # Undecryptable bytes come back as UNREADABLE; anything that
                 # escapes is the storage layer itself failing, and that is a

@@ -30,12 +30,77 @@ under that hash holds exactly those bytes. Same argument as the unscoped
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Optional, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 logger = logging.getLogger(__name__)
+
+
+def historical_anchor_hash(
+    properties: Mapping, governed_by_targets: Iterable[str],
+) -> Optional[str]:
+    """Recover evidence, never authority, when the operative pointer is lost.
+
+    Native current/history receipts survive edge/pointer deletion. Inspect
+    their typed hash fields, not arbitrary receipt prose. Without the pointer
+    conflicting, malformed or excessive evidence must fail closed; an
+    operator can restore the exact prior pointer before attempting repair.
+    An intact pointer remains authoritative: old receipt history normally
+    names multiple superseded constitutions and is not a competing pointer.
+    """
+    pointer = properties.get("constitution_hash")
+    if pointer:
+        return pointer
+    candidates: set[str] = set()
+
+    def add(value, *, absent_ok=True):
+        if value is None and absent_ok:
+            return
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("Missing anchor pointer has unreadable historical governance receipt evidence")
+        candidates.add(value)
+
+    targets = tuple(governed_by_targets)
+    if len(targets) > 128:
+        raise ValueError("Missing anchor pointer has excessive historical governance evidence")
+    for target in targets:
+        add(target, absent_ok=False)
+
+    def inspect(receipt, kind):
+        if not isinstance(receipt, Mapping):
+            raise ValueError("Missing anchor pointer has unreadable historical governance receipt evidence")
+        fields = ("constitution_hash",) if kind == "genesis_audit" else ("old_hash", "new_hash")
+        found = False
+        for field in fields:
+            value = receipt.get(field)
+            if value is None or (field == "old_hash" and value == "none"):
+                continue
+            add(value)
+            found = True
+        if not found:
+            raise ValueError("Missing anchor pointer has unreadable historical governance receipt evidence")
+
+    for kind in ("genesis_audit", "constitution_reanchor"):
+        current = properties.get(kind)
+        if current is not None:
+            inspect(current, kind)
+        history = properties.get(kind + "_history")
+        if history is None:
+            continue
+        if not isinstance(history, list) or len(history) > 128:
+            raise ValueError("Missing anchor pointer has unreadable or excessive historical governance receipt evidence")
+        for entry in history:
+            if not isinstance(entry, Mapping):
+                raise ValueError("Missing anchor pointer has unreadable historical governance receipt evidence")
+            inspect(entry.get("receipt"), kind)
+            add(entry.get("superseded_by_constitution_hash"))
+    if len(candidates) > 1:
+        raise ValueError("Missing anchor pointer has ambiguous historical governance; restore its exact prior pointer before signed repair")
+    return next(iter(candidates), None)
 
 
 async def read_anchored_constitution(

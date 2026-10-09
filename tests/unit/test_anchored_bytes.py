@@ -23,10 +23,44 @@ import json
 import pytest
 
 from kestrel_sovereign.constitution.anchored_bytes import (
+    historical_anchor_hash,
     read_anchored_constitution,
 )
 
 HASH = "a" * 64
+
+
+@pytest.mark.parametrize("key", ["genesis_audit", "genesis_audit_history", "constitution_reanchor", "constitution_reanchor_history"])
+def test_missing_pointer_recovers_only_typed_receipt_evidence(key):
+    receipt = {"constitution_hash": HASH} if key.startswith("genesis") else {"old_hash": "none", "new_hash": HASH}
+    value = [{"receipt": receipt, "superseded_by_constitution_hash": HASH}] if key.endswith("history") else receipt
+    assert historical_anchor_hash({key: value}, ()) == HASH
+    assert historical_anchor_hash({key: value}, (HASH,)) == HASH
+
+
+@pytest.mark.parametrize("properties, targets", [
+    ({"genesis_audit": {}}, ()),
+    ({"genesis_audit": {"constitution_hash": "not-a-hash"}}, ()),
+    ({"genesis_audit_history": {"receipt": {"constitution_hash": HASH}}}, ()),
+    ({"genesis_audit_history": [{}]}, ()),
+    ({"constitution_reanchor": {"old_hash": HASH, "new_hash": "b" * 64}}, ()),
+    ({"constitution_reanchor_history": [{"receipt": {"new_hash": HASH}}] * 129}, ()),
+    ({}, (HASH,) * 129),
+    ({"genesis_audit": {"constitution_hash": HASH}}, ("b" * 64,)),
+])
+def test_missing_pointer_refuses_malformed_ambiguous_or_unbounded_evidence(properties, targets):
+    with pytest.raises(ValueError, match="historical governance"):
+        historical_anchor_hash(properties, targets)
+
+
+def test_history_is_evidence_not_an_unsigned_replacement_pointer():
+    properties = {"genesis_audit": {"constitution_hash": HASH, "prose": "b" * 64}}
+    assert historical_anchor_hash(properties, ()) == HASH
+    assert "constitution_hash" not in properties
+    assert historical_anchor_hash({}, ()) is None
+    properties["constitution_hash"] = "c" * 64
+    # Multiple superseded receipts are normal when a real pointer survives.
+    assert historical_anchor_hash(properties, (HASH, "b" * 64)) == "c" * 64
 
 
 class _Rows:

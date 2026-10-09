@@ -954,6 +954,12 @@ First creation is insert-only. Loaded records (including migrated revision
 zero) use conditional updates and cannot recreate a concurrently deleted row.
 Each recreated row receives a new generation identifier: equal revision
 numbers from different lifetimes cannot authorize a stale Safe Mode exit.
+Every signed anchor mutation advances this fence even after first-anchor
+custody has been consumed, so verification completed against the previous
+constitution cannot authorize an in-flight exit after reanchor. Restrictions,
+successful-audit timestamps and interaction counts remain unchanged. An
+offline signed repair without any runtime row establishes a restricted,
+audit-due record, never new automatic bootstrap permission.
 
 The additive revision migration retains readable schema-version-1 rows, but
 database triggers reject pre-revision writers after upgrade. Retire old
@@ -985,6 +991,11 @@ owned identity. Unsigned inspection reports drift without writing; forced
 repair still verifies the operator-pinned root and exact signed governing hash.
 Existing emancipation receipts and historical governance bytes remain protected;
 ambiguous historical anchors or unreadable rights evidence refuse repair.
+When both pointer and edges are lost, current and historical genesis-audit and
+reanchor receipts still count as rights evidence. Typed historical hashes are
+checked without selecting an unsigned replacement pointer. Missing referenced
+bytes, malformed receipts, conflicting references or excessive evidence fail
+closed; restore the exact prior pointer before attempting signed repair.
 Custody consumption records the transition's current UTC time, not the prior
 bootstrap state's timestamp, and does not count as a successful full audit.
 An unchanged hash/edge set is not an unchanged outcome while first-anchor

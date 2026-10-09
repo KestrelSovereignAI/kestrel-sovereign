@@ -1213,19 +1213,15 @@ async def _read_agent_anchor(
         # in the cohort this guard protects whose governance edge has drifted.
         # See :mod:`kestrel_sovereign.constitution.anchored_bytes`.
         anchored_present = False
-        historical_hash = anchored_hash
-        if not historical_hash and governed_by_targets:
-            candidates = set(governed_by_targets)
-            if len(candidates) != 1:
-                raise ValueError("Missing anchor pointer has ambiguous historical governance; restore its exact prior pointer before signed repair")
-            # Deleting the pointer cannot waive rights still witnessed in the
-            # previous governing bytes. This is historical evidence ONLY,
-            # never an unsigned replacement pointer or governing source.
-            historical_hash = next(iter(candidates))
+        from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
+
+        historical_hash = historical_anchor_hash(agent.properties, governed_by_targets)
         if historical_hash:
             anchored_text, anchored_present = await read_anchored_constitution(
                 storage.db, historical_hash
             )
+            if not anchored_hash and not anchored_present:
+                raise ValueError("Missing anchor pointer's historical governing bytes could not be read; restore its exact prior pointer before signed repair")
         return (
             anchored_hash,
             agent.node_id,

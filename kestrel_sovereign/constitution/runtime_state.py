@@ -427,7 +427,7 @@ class ConstitutionRuntimeStateStore:
         expected_fence: Optional[tuple[Optional[int], Optional[str]]] = None,
         occurred_at: Optional[datetime] = None,
     ) -> Optional[ConstitutionRuntimeState]:
-        """Consume first-anchor permission inside the caller's graph transaction.
+        """Fence every anchor mutation inside the caller's graph transaction.
 
         All native anchor writers use this boundary. It neither clears Safe
         Mode nor certifies an audit. Live callers must supply their loaded
@@ -440,11 +440,28 @@ class ConstitutionRuntimeStateStore:
             or (current.revision, current.generation) != expected_fence
         ):
             raise ConstitutionStateConflictError("initial anchor lifecycle custody changed")
-        if current is None or not current.bootstrap_pending:
-            return None
+        if current is None:
+            # Offline signed repair may precede lifecycle initialization.
+            # Establish a conservative fence in the SAME graph transaction;
+            # otherwise a prepared first-creator could publish reusable
+            # bootstrap authority after this signed anchor commits.
+            now = occurred_at or datetime.now(timezone.utc)
+            reason = "Signed anchor established before runtime state; verified authorized exit required"
+            return await self.write(
+                ConstitutionRuntimeState(
+                    agent_id=agent_id, safe_mode=True, safe_mode_reason=reason,
+                    safe_mode_entered_at=now, safe_mode_exited_at=None,
+                    safe_mode_exit_authorization=None, last_successful_audit_at=None,
+                    interaction_count=0, updated_at=now, bootstrap_pending=False,
+                ),
+                event_type="constitution_anchor_fenced", event_reason=reason,
+            )
         return await self.write(
             replace(current, bootstrap_pending=False, updated_at=occurred_at or datetime.now(timezone.utc)),
-            event_type="initial_anchor_started",
+            # A signed mutation after bootstrap still invalidates any audit
+            # or authorized exit already in flight on another replica. This
+            # is not a successful audit and does not clear its due deadline.
+            event_type="initial_anchor_started" if current.bootstrap_pending else "constitution_anchor_fenced",
         )
 
     async def list_events(self, agent_id: str) -> list[dict]:
