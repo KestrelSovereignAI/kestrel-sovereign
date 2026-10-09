@@ -970,6 +970,9 @@ The transaction consumes that single-use marker with the anchor; interruption
 before verification cannot authorize a second anchor. The absent successful
 audit timestamp independently keeps the full startup audit due. Consumed
 custody cannot be re-enabled by an ordinary runtime-state write.
+Migrated legacy pending-audit markers have no custody generation and cannot
+authorize automatic anchoring, even after ordinary writes advance their
+revision. An absent anchor in that cohort requires native signed repair.
 Reading a constitution or initializing its display feature never repairs an
 existing identity's deleted anchor. That requires native signed reanchor and
 the normal full integrity verification; an absent anchor is not a fresh boot.

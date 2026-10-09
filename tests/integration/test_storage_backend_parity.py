@@ -956,6 +956,91 @@ async def test_committed_native_anchor_custody_is_single_use_on_both_backends(db
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+@pytest.mark.parametrize("advance_legacy_revision", [False, True])
+async def test_migrated_pending_audit_is_not_unused_anchor_authority(db_backend, advance_legacy_revision):
+    """An older commit-before-audit marker cannot prove single-use custody."""
+    if db_backend.backend_type == "postgres":
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+        from tests.utils.postgres_schema import (
+            disposable_postgres_schema, postgres_test_url, with_search_path,
+            pgvector_schema, quoted_search_path,
+        )
+        async def no_schema_ddl(db):
+            return None
+
+        admin = await AsyncDatabase.postgres(postgres_test_url(), schema_initializer=no_schema_ddl)
+        try:
+            vector_schema = await pgvector_schema(admin)
+            async with disposable_postgres_schema(admin, "constitution_legacy_anchor") as schema:
+                backend = PostgresBackend(with_search_path(postgres_test_url(), quoted_search_path(schema, vector_schema)))
+                await backend.connect()
+                try:
+                    assert (await backend.fetch_one("SELECT current_schema()"))[0] == schema
+                    await _assert_migrated_anchor_custody_refused(backend, advance_legacy_revision)
+                finally:
+                    await backend.close()
+        finally:
+            await admin.close()
+    else:
+        await _assert_migrated_anchor_custody_refused(db_backend, advance_legacy_revision)
+
+
+async def _assert_migrated_anchor_custody_refused(backend, advance_legacy_revision):
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    boolean = "BOOLEAN" if backend.backend_type == "postgres" else "INTEGER"
+    timestamp = "TIMESTAMPTZ" if backend.backend_type == "postgres" else "TEXT"
+    await backend.execute_script(f"""
+        CREATE TABLE constitution_runtime_state (
+            agent_id TEXT PRIMARY KEY, safe_mode {boolean} NOT NULL,
+            safe_mode_reason TEXT, safe_mode_entered_at {timestamp},
+            safe_mode_exited_at {timestamp}, safe_mode_exit_authorization TEXT,
+            last_successful_audit_at {timestamp}, interaction_count INTEGER NOT NULL DEFAULT 0,
+            bootstrap_pending {boolean} NOT NULL, schema_version INTEGER NOT NULL,
+            updated_at {timestamp} NOT NULL
+        );
+    """)
+    now = datetime.now(timezone.utc)
+    storage = AsyncStorage(backend=backend, agent_id="did:test:legacy-anchor:" + uuid4().hex)
+    await storage.initialize()
+    try:
+        # Older native anchoring committed the graph but left bootstrap_pending
+        # set until a later audit. Simulate that durable crash boundary.
+        content = b"committed legacy governing bytes"
+        anchor = await storage.store_file(content, "KESTREL_CONSTITUTION.md")
+        node = GraphNode(node_id=storage.agent_id, node_type="agent", label="legacy", properties={"constitution_hash": anchor})
+        await storage.add_node(node)
+        await backend.execute(
+            "INSERT INTO constitution_runtime_state (agent_id,safe_mode,interaction_count,bootstrap_pending,schema_version,updated_at) VALUES (?, ?, 0, ?, 1, ?)",
+            (storage.agent_id, False if backend.backend_type == "postgres" else 0,
+             True if backend.backend_type == "postgres" else 1,
+             TimestamptzParameter(now) if backend.backend_type == "postgres" else now.isoformat()),
+        )
+        del node.properties["constitution_hash"]
+        await storage.add_node(node)
+        restored = _DurableConstitutionHarness(storage, now)
+        restored.agent_id = storage.agent_id
+        await restored._initialize_constitution_runtime_state()
+        assert restored._constitution_state_generation == ""
+        if advance_legacy_revision:
+            assert await restored._persist_constitution_runtime_state()
+        restored.extension = None
+        restored._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(restored)
+        result = await ConstitutionMixin._get_governing_constitution(restored)
+        assert result.startswith("Error: Missing governing anchor requires native signed repair")
+        assert "constitution_hash" not in (await storage.get_node(storage.agent_id)).properties
+        assert (await restored._constitution_state_store.load(storage.agent_id)).last_successful_audit_at is None
+        assert restored._constitution_audit_pending is True
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_pre_revision_writer_cannot_clear_new_runtime_state(db_backend):
     """Mixed-version replicas must fail closed, not bypass the new CAS."""
     from kestrel_sovereign.constitution.runtime_state import (

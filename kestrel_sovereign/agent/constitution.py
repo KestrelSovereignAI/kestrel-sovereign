@@ -2243,6 +2243,9 @@ class ConstitutionMixin:
             if (
                 bootstrap is None
                 or not bootstrap.bootstrap_pending
+                # Legacy pending-audit markers predate atomic consumption;
+                # they cannot prove that anchoring custody remains unused.
+                or not bootstrap.generation
                 or bootstrap.revision != self._constitution_state_revision
                 or bootstrap.generation != self._constitution_state_generation
             ):
@@ -2301,6 +2304,7 @@ class ConstitutionMixin:
                     if (
                         bootstrap is None
                         or not bootstrap.bootstrap_pending
+                        or not bootstrap.generation
                         or bootstrap.revision != self._constitution_state_revision
                         or bootstrap.generation != self._constitution_state_generation
                     ):
