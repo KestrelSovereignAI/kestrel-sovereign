@@ -958,6 +958,8 @@ numbers from different lifetimes cannot authorize a stale Safe Mode exit.
 The additive revision migration retains readable schema-version-1 rows, but
 database triggers reject pre-revision writers after upgrade. Retire old
 replicas rather than expecting mixed-version writers to keep operating.
+Legacy inserts without a generation fence are refused as well; existing
+legacy rows remain readable, but deleted state cannot regain an empty epoch.
 Initialization checks existing metadata before installing migration DDL;
 SQLite upgrades reserve the writer slot and recheck before adding columns.
 

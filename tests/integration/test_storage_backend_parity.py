@@ -780,7 +780,8 @@ async def test_deleted_revision_zero_runtime_state_is_not_recreated(db_backend):
     await db_backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (state.agent_id,))
     await db_backend.execute(
         "INSERT INTO constitution_runtime_state (agent_id, safe_mode, interaction_count, "
-        "bootstrap_pending, schema_version, updated_at, revision) VALUES (?, ?, 100, ?, 1, ?, 0)",
+        "bootstrap_pending, schema_version, updated_at, revision, generation) "
+        "VALUES (?, ?, 100, ?, 1, ?, 0, 'legacy-zero-fixture')",
         (state.agent_id, True if db_backend.backend_type == "postgres" else 1,
          False if db_backend.backend_type == "postgres" else 0, store._timestamp_param(now)),
     )
@@ -935,6 +936,34 @@ async def test_pre_revision_writer_cannot_clear_new_runtime_state(db_backend):
         )
     assert await store.load(state.agent_id) == state
     assert len(await store.list_events(state.agent_id)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_pre_generation_writer_cannot_recreate_deleted_runtime_row(db_backend):
+    """Legacy INSERT defaults must not reintroduce a reusable empty epoch."""
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+    )
+
+    store = ConstitutionRuntimeStateStore(db_backend)
+    await store.initialize()
+    now = datetime.now(timezone.utc)
+    state = await store.write(ConstitutionRuntimeState(
+        agent_id="did:test:old-insert:" + uuid4().hex, safe_mode=True,
+        safe_mode_reason="restriction", safe_mode_entered_at=now,
+        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+        last_successful_audit_at=now, interaction_count=100, updated_at=now,
+    ))
+    await db_backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (state.agent_id,))
+    with pytest.raises(QueryError, match="generation fence"):
+        await db_backend.execute(
+            "INSERT INTO constitution_runtime_state (agent_id, safe_mode, interaction_count, "
+            "bootstrap_pending, schema_version, updated_at) VALUES (?, ?, 0, ?, 1, ?)",
+            (state.agent_id, False if db_backend.backend_type == "postgres" else 0,
+             False if db_backend.backend_type == "postgres" else 0, store._timestamp_param(now)),
+        )
+    assert await store.load(state.agent_id) is None
 
 
 @pytest.mark.asyncio

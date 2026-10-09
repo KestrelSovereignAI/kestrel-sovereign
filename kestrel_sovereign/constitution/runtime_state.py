@@ -156,7 +156,7 @@ class ConstitutionRuntimeStateStore:
         fencing does not execute the new store's CAS statement. Repeated boots
         inspect the catalog, avoiding an unnecessary DDL lock on a live table.
         """
-        trigger = "constitution_runtime_revision_fence_v2"
+        trigger = "constitution_runtime_revision_fence_v3"
         if self._is_postgres:
             existing = await self._backend.fetch_one(
                 "SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass(?) "
@@ -182,22 +182,28 @@ class ConstitutionRuntimeStateStore:
                         f"""
                         CREATE OR REPLACE FUNCTION {trigger}() RETURNS trigger AS $fence$
                         BEGIN
-                            IF NEW.revision <> OLD.revision + 1 OR NEW.generation <> OLD.generation THEN
+                            IF TG_OP = 'INSERT' THEN
+                                IF NEW.generation = '' THEN
+                                    RAISE EXCEPTION 'constitution runtime generation fence refused old writer';
+                                END IF;
+                            ELSIF NEW.revision <> OLD.revision + 1 OR NEW.generation <> OLD.generation THEN
                                 RAISE EXCEPTION 'constitution runtime revision fence refused old writer';
                             END IF;
                             RETURN NEW;
                         END;
                         $fence$ LANGUAGE plpgsql;
-                        CREATE TRIGGER {trigger} BEFORE UPDATE ON constitution_runtime_state
+                        CREATE TRIGGER {trigger} BEFORE INSERT OR UPDATE ON constitution_runtime_state
                         FOR EACH ROW EXECUTE FUNCTION {trigger}();
                         """
                     )
         else:
             existing = await self._backend.fetch_one(
-                "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
-                (trigger,),
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?)",
+                (trigger, f"{trigger}_insert"),
             )
-            if existing is None:
+            # executescript may have been interrupted between CREATEs. Both
+            # fences must exist; the update trigger alone is not completion.
+            if int(existing[0]) != 2:
                 await self._backend.execute_script(
                     f"""
                     CREATE TRIGGER IF NOT EXISTS {trigger}
@@ -205,6 +211,12 @@ class ConstitutionRuntimeStateStore:
                     FOR EACH ROW WHEN NEW.revision <> OLD.revision + 1 OR NEW.generation <> OLD.generation
                     BEGIN
                         SELECT RAISE(ABORT, 'constitution runtime revision fence refused old writer');
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS {trigger}_insert
+                    BEFORE INSERT ON constitution_runtime_state
+                    FOR EACH ROW WHEN NEW.generation = ''
+                    BEGIN
+                        SELECT RAISE(ABORT, 'constitution runtime generation fence refused old writer');
                     END;
                     """
                 )
