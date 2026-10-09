@@ -231,6 +231,18 @@ class Provenance:
         return self.known and self.url is None
 
     @property
+    def is_direct(self) -> bool:
+        """Did this name its source directly? Unknown answers **no** here too.
+
+        The mirror of :attr:`is_from_index`, and not its negation: unknown is
+        neither. Asked to decide whether a package was deliberately linked
+        from a source a version pin would replace. "The metadata would not
+        read" is not evidence of a deliberate link, so it keeps the pin
+        (issue #3502).
+        """
+        return self.known and self.url is not None
+
+    @property
     def editable_path(self) -> Optional[str]:
         """The checkout this is linked to, or None. Unknown is never a path."""
         return self.url if (self.known and self.editable) else None

@@ -1952,6 +1952,44 @@ class TestInstallFeature:
         assert "kestrel-feature-test" not in venv.installed
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_install_is_held_to_core_lock_and_names_it_when_refused(
+        self, mock_registry, monkeypatch, tmp_path
+    ):
+        """The console install carries core's uv.lock pins, as the CLI does.
+
+        A feature needing anthropic 1.x against a lock pinning 0.117.0 is
+        refused rather than moving anthropic, and the response says the lock
+        refused it (#3502).
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        checkout = tmp_path / "core"
+        checkout.mkdir()
+        (checkout / "uv.lock").write_text(
+            'version = 1\nrevision = 3\n\n[[package]]\nname = "anthropic"\n'
+            'version = "0.117.0"\nsource = { registry = "https://pypi.org/simple" }\n',
+            encoding="utf-8",
+        )
+        venv = FakeUv(
+            feature="kestrel-feature-test", core_checkout=str(checkout),
+            feature_requires=">=0.52",
+        )
+        venv.installed["anthropic"] = "0.117.0"
+        venv.package_index["anthropic"] = ["0.117.0", "1.11.0"]
+        venv.installed_requires["kestrel-feature-test"] = ["anthropic>=1"]
+        use_fake_uv(monkeypatch, venv)
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500
+        detail = resp.json()["detail"]
+        assert "No solution found" in detail
+        assert "core's uv.lock" in detail
+        assert "anthropic==0.117.0" in venv.constraint_files[0].splitlines()
+        assert venv.installed["anthropic"] == "0.117.0"
+        assert "kestrel-feature-test" not in venv.installed
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_install_succeeds_when_the_checkout_satisfies_the_feature(
         self, mock_registry, monkeypatch
     ):

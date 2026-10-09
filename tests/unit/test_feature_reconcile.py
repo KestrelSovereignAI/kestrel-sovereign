@@ -1024,6 +1024,20 @@ def test_contract_unreadable_provenance_never_satisfies_a_declared_source():
     assert not fr.core_install_matches(_shape("0.53.0", known=False), policy)
 
 
+def test_contract_unknown_provenance_is_neither_index_nor_direct():
+    """``is_direct`` mirrors ``is_from_index`` and is not its negation (#3502).
+
+    Damaged metadata is no evidence of a deliberate link either, so a caller
+    deciding whether to leave a package unpinned cannot read it as one.
+    """
+    assert fr.Provenance.direct("/src/sdk", editable=True).is_direct
+    assert fr.Provenance.direct("git+https://example.invalid/x", vcs="git").is_direct
+    assert not fr.Provenance.from_index_install().is_direct
+    unknown = fr.Provenance.unknown()
+    assert not unknown.is_direct
+    assert not unknown.is_from_index
+
+
 @pytest.mark.parametrize("path", ["", None, "\x00bad", "relative/../x"])
 def test_contract_a_damaged_editable_path_never_satisfies_a_checkout(path):
     """An editable policy names a specific checkout; anything we cannot resolve

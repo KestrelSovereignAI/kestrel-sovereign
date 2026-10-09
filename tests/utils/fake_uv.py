@@ -285,6 +285,7 @@ class FakeUv:
             # left alone. Nothing to swap.
             if self.feature_install_fails:
                 return self._failed(cmd, f"x Failed to build `{self.feature}`")
+            self._resolve_dependencies(cmd)
             return self._install_feature(cmd)
 
         candidates = [v for v in self._core_candidates(pin) if Version(v) in wanted]
@@ -304,6 +305,7 @@ class FakeUv:
         self.editable.pop(CORE, None)
         if self.feature_install_fails:
             return self._failed(cmd, f"x Failed to build `{self.feature}`")
+        self._resolve_dependencies(cmd)
         return self._install_feature(cmd)
 
     # -- internals -----------------------------------------------------------
@@ -484,6 +486,11 @@ class FakeUv:
             # reinstall drags off their checkouts.
             self._reinstall_sdk_from_index()
         result = self._land_core(cmd, target)
+        if "--no-deps" not in cmd:
+            # A core install resolves core's dependencies as a feature install
+            # resolves the feature's: the automatic restore is an install too,
+            # and it can move a locked package unless the lock holds it (#3502).
+            self._resolve_dependencies(cmd, CORE)
         if self.repair_hangs_after_restore:
             # Killed AFTER the write above. A timeout ends a process; it does
             # not roll back what that process had already done.
@@ -576,6 +583,46 @@ class FakeUv:
         """
         return self._constraint_lines(cmd).get(CORE)
 
+    def _declared_dependencies(self, dist):
+        """``(name, spec)`` for each modelled non-core requirement of *dist*."""
+        for raw in self.requires(dist):
+            if ";" in raw or raw.startswith(CORE):
+                continue  # markers are unmodelled; core has its own handling
+            cut = len(raw)
+            for index, char in enumerate(raw):
+                if char in "<>=!~":
+                    cut = index
+                    break
+            yield raw[:cut], raw[cut:]
+
+    def _resolve_dependencies(self, cmd, dist=None):
+        """Move *dist*'s other dependencies the way a resolve does.
+
+        *dist* defaults to the feature; a core install passes core.
+
+        Modelled only for a package the venv holds AND the index publishes. A
+        dependency that already satisfies its requirement and its constraint
+        line is left alone — unless the command passes ``--upgrade``, which uv
+        applies EAGERLY: every package in the resolution moves to the newest
+        version its constraints allow, not only the one named. That is how a
+        reconcile ``update`` dragged a package past the version core's
+        ``uv.lock`` pins, and why the lock's pins have to ride on the
+        constraints file (#3502).
+        """
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        pins = self._constraint_lines(cmd)
+        for name, spec in self._declared_dependencies(dist or self.feature):
+            if name not in self.installed or name not in self.package_index:
+                continue
+            allowed = SpecifierSet(spec) & SpecifierSet(pins.get(name, ""))
+            if "--upgrade" not in cmd and Version(self.installed[name]) in allowed:
+                continue
+            candidates = [v for v in self.package_index[name] if Version(v) in allowed]
+            if candidates:
+                self.installed[name] = max(candidates, key=Version)
+
     def _requirement_outside_its_pin(self, cmd, dist):
         """A requirement of *dist* that its package's own pin cannot satisfy.
 
@@ -588,15 +635,7 @@ class FakeUv:
         from packaging.version import Version
 
         pins = self._constraint_lines(cmd)
-        for raw in self.requires(dist):
-            if ";" in raw or raw.startswith(CORE):
-                continue  # markers are unmodelled; core has its own handling
-            cut = len(raw)
-            for index, char in enumerate(raw):
-                if char in "<>=!~":
-                    cut = index
-                    break
-            name, spec = raw[:cut], raw[cut:]
+        for name, spec in self._declared_dependencies(dist):
             pin = pins.get(name)
             if pin is None or not spec:
                 continue

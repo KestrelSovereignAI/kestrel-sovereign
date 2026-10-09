@@ -5,17 +5,19 @@ statement of which versions have been tested together. ``uv sync`` honours it,
 and nothing else on the host does: every feature install goes through
 ``uv pip`` (see ``cli_features._extension_install_run``), which never reads the
 lock. Left unconstrained, a feature install resolves a locked package to
-whatever the index has. ``kestrel update``'s reconcile passes ``--upgrade``,
-which lets uv move every package in the resolution, so a host ran
-``anthropic`` 1.11.0 against a lock pinning 0.117.0. The update re-applied it
-each time, right after its own ``uv sync`` had put the locked version back.
+whatever the index has, and ``uv pip install --upgrade`` (the update action of
+``kestrel update``'s reconcile) is eager: it may move every package in the
+resolution, not only the one named. A host ran ``anthropic`` 1.11.0 against a
+lock pinning 0.117.0, re-installed by the update's feature steps right after
+its own ``uv sync`` had put the locked version back.
 
 One reading of the lock serves two purposes:
 
 * :meth:`CoreLock.constraint_lines` gives one ``name==version`` line per locked
   package. Every feature install carries them, so a feature can neither
   upgrade nor downgrade a package the lock pins. A conflict fails the install
-  instead of moving the package.
+  instead of moving the package, and a locked package with no single version
+  for this environment refuses it.
 * :func:`lock_drift` lists every installed package whose version differs from
   the lock. It reports and never repairs.
 
@@ -26,6 +28,8 @@ lock beside it, and then there is nothing to hold or compare.
 
 from __future__ import annotations
 
+import os
+import stat
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,12 +45,15 @@ LOCK_FILENAME = "uv.lock"
 
 
 class CoreLockError(ValueError):
-    """``uv.lock`` exists and cannot be read as a lock.
+    """Core's ``uv.lock`` cannot be used: it will not read, cannot be found, or
+    names no single version here of a package it covers.
 
     Distinct from "there is no lock". A missing lock declares nothing, so there
     is nothing to hold. An unreadable one declares something nobody can
-    recover, and an install that went ahead anyway could not be shown to keep
-    it.
+    recover, and so does one hidden behind core install metadata that will not
+    read. One that leaves a package's version undetermined here cannot hold
+    that package (:meth:`CoreLock.constraint_lines`). An install that went
+    ahead anyway could not be shown to keep it.
     """
 
 
@@ -65,9 +72,11 @@ class CoreLock:
     ``packages`` excludes core itself, which has its own source policy
     (``feature_reconcile.core_install_constraints``), and any entry whose
     resolution markers do not apply here. ``undetermined`` names packages for
-    which more than one locked version applies, or whose version or markers
-    cannot be evaluated. They are not constrained, and the drift report names
-    them, because a guess either way would be a statement the lock never made.
+    which more than one locked version applies, none applies, or whose version
+    or markers cannot be evaluated. They have no version to pin, so an install
+    is refused rather than held to every package but them
+    (:meth:`constraint_lines`), and the drift report names them, because a
+    guess either way would be a statement the lock never made.
     """
 
     path: Path
@@ -77,16 +86,35 @@ class CoreLock:
     def versions(self) -> Dict[str, str]:
         return {package.name: package.version for package in self.packages}
 
+    def names(self) -> Tuple[str, ...]:
+        """Every package this lock covers here: the pinned and the undetermined."""
+        return tuple(package.name for package in self.packages) + self.undetermined
+
     def constraint_lines(self, exclude: Iterable[str] = ()) -> List[str]:
         """``name==version`` for every locked package not in *exclude*.
 
         *exclude* holds canonical names the caller has a deliberate reason to
-        leave free. The host manifest's editable entries are the one such
-        reason: an operator who links a checkout of a locked package has
-        declared its source, and a version pin would make that entry
-        uninstallable. :func:`lock_drift` still reports it.
+        leave free: a locked package someone linked from a checkout or another
+        direct source. A version pin would replace that source rather than
+        keep a tested version. :func:`lock_drift` still reports it.
+
+        Raises :class:`CoreLockError` when an :attr:`undetermined` package is
+        not in *exclude*. It has no version to carry, so the lines would hold
+        every package but that one, and an install held to them would be free
+        to move it: the lines are a whole hold of the lock or none. The drift
+        check never asks for lines, so it still reports what it can compare.
         """
         skip = {canonical_package(name) for name in exclude}
+        unpinnable = [name for name in self.undetermined if name not in skip]
+        if unpinnable:
+            raise CoreLockError(
+                f"{self.path} names no single version for this environment of: "
+                + ", ".join(unpinnable)
+                + ". An install could not hold them at a locked version. Either "
+                "this interpreter or platform is outside the environments the "
+                "lock was resolved for, or its markers or versions do not "
+                "evaluate here"
+            )
         return [
             f"{package.name}=={package.version}"
             for package in self.packages
@@ -111,14 +139,18 @@ class LockCheck:
     """The venv compared against core's lock.
 
     ``lock`` is None when core is installed from somewhere with no lock beside
-    it. ``error`` is set when a lock exists and could not be read. Neither case
-    is drift, and neither is a clean bill: no comparison was made.
+    it. ``error`` is set when the lock could not be read or located
+    (:class:`CoreLockError`). Neither case is drift, and neither is a clean
+    bill: no comparison was made.
     """
 
     lock: Optional[CoreLock] = None
     error: Optional[str] = None
     drift: Tuple[LockDrift, ...] = ()
-    checkout: Optional[Path] = None
+    #: Locked packages that are installed but whose installed metadata names
+    #: no version, so they could not be compared. Named, never counted as a
+    #: match: a damaged dist-info still imports whatever code is beside it.
+    unreadable: Tuple[str, ...] = ()
 
     @property
     def compared(self) -> bool:
@@ -126,7 +158,37 @@ class LockCheck:
 
     @property
     def matches(self) -> bool:
-        return self.compared and not self.drift and not self.lock.undetermined
+        return (
+            self.compared
+            and not self.drift
+            and not self.lock.undetermined
+            and not self.unreadable
+        )
+
+    @property
+    def needs_attention(self) -> bool:
+        """A mismatch, or a lock that exists and could not be compared.
+
+        Not "anything short of a match": a core with no lock beside it has
+        nothing to compare, and that is not something an operator must act on.
+        """
+        return not self.matches and (self.compared or self.error is not None)
+
+    @property
+    def headline(self) -> str:
+        """One line naming which outcome this is."""
+        if self.matches:
+            return (
+                f"venv matches core's uv.lock ({len(self.lock.packages)} "
+                "locked packages)"
+            )
+        if self.drift:
+            return "venv differs from core's uv.lock"
+        if self.compared:
+            return "venv was only partly compared against core's uv.lock"
+        if self.error is not None:
+            return "venv was not compared against core's uv.lock"
+        return "no uv.lock beside the core install, nothing to compare"
 
     def report_lines(self) -> List[str]:
         """Operator-readable lines for every mismatch, plus the one remedy.
@@ -144,12 +206,18 @@ class LockCheck:
                 "uv.lock names no single version for this environment of: "
                 + ", ".join(self.lock.undetermined)
             )
+        if self.unreadable:
+            lines.append(
+                "installed metadata names no version for: "
+                + ", ".join(self.unreadable)
+            )
         if self.drift:
             lines.append(
-                "This venv is not running the versions CI tested. "
+                f"This venv is not running the versions CI tested ({self.lock.path}). "
                 "`kestrel update --no-pull` re-applies the lock (`uv sync`, "
-                "then feature installs held to it); to run other versions, "
-                "move the lock deliberately with `uv lock` and a green CI run."
+                "then feature installs held to it) and restarts onto it. To "
+                "run other versions, move the lock deliberately with `uv lock` "
+                "and a green CI run."
             )
         return lines
 
@@ -161,22 +229,74 @@ def core_lock_checkout(provenance) -> Optional[Path]:
     The lock lives beside the project it locks, so only a core installed from a
     local directory has one: an editable link (the ``uv sync`` workflow), or a
     non-editable install from the same directory. An index wheel, a VCS ref and
-    an archive carry no lock. Unknown provenance names no directory either.
+    an archive carry no lock.
+
+    Raises :class:`CoreLockError` when core's provenance is unknown. Damaged
+    install metadata may hide a checkout with a lock beside it, and answering
+    "no lock" would let every install run unheld on exactly the host whose
+    install is already broken. Whether that directory still holds a lock is
+    :func:`core_lock_path`'s question, not this one's.
     """
-    if provenance is None or not provenance.known or not provenance.url:
+    if provenance is None:
         return None
-    if provenance.vcs or provenance.archive_hash:
+    if not provenance.known:
+        raise CoreLockError(
+            "kestrel-sovereign's install metadata (direct_url.json) would not "
+            "read, so the checkout it was installed from, and the uv.lock "
+            "beside it, cannot be located. Reinstall core so that metadata is "
+            "rewritten: `uv sync --reinstall-package kestrel-sovereign` in "
+            "its checkout"
+        )
+    if not provenance.url or provenance.vcs or provenance.archive_hash:
         return None
     checkout = Path(provenance.url).expanduser()
-    return checkout if checkout.is_dir() else None
+    # A local directory is always an absolute path once its file: URL is
+    # decoded. Anything else is a remote address, with no directory beside it.
+    return checkout if checkout.is_absolute() else None
 
 
 def core_lock_path(checkout: Optional[Path]) -> Optional[Path]:
-    """``<checkout>/uv.lock`` when it exists, else None."""
+    """``<checkout>/uv.lock``, or None when nothing is there.
+
+    None ONLY for an absent path: nothing exists at it, or *checkout* is not a
+    directory and so holds nothing. Whatever else exists there is a lock the
+    host declares, and :func:`read_core_lock` decides whether it reads. A
+    directory, a socket or a dangling link named ``uv.lock`` is not "no lock",
+    and neither is a path whose status the OS refuses
+    (:class:`CoreLockError`): reading any of them as absent let every install
+    run unheld and the drift check report nothing to compare.
+    """
     if checkout is None:
         return None
     path = Path(checkout) / LOCK_FILENAME
-    return path if path.is_file() else None
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise CoreLockError(f"{path}: {exc}") from exc
+    return path
+
+
+def _open_lock(path: Path):
+    """*path* opened for reading, refused unless it is a regular file.
+
+    Checked on the open descriptor, so what is read is what was checked.
+    ``O_NONBLOCK`` because a FIFO named ``uv.lock`` would otherwise block the
+    open until something wrote to it; on a regular file the flag is inert.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise CoreLockError(f"{path}: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise CoreLockError(f"{path}: not a regular file")
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _applies(entry: dict, environment: Optional[Dict[str, str]]) -> Optional[bool]:
@@ -210,9 +330,11 @@ def read_core_lock(
     when the file cannot be read or is not a lock.
     """
     try:
-        with open(path, "rb") as handle:
+        with _open_lock(path) as handle:
             data = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        # tomllib decodes the bytes itself, so a lock that is not UTF-8 raises
+        # UnicodeDecodeError rather than TOMLDecodeError.
         raise CoreLockError(f"{path}: {exc}") from exc
     entries = data.get("package")
     if not isinstance(entries, list):
@@ -220,6 +342,7 @@ def read_core_lock(
 
     applicable: Dict[str, List[str]] = {}
     undetermined = set()
+    forked = set()
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
             raise CoreLockError(f"{path}: a [[package]] entry has no name")
@@ -235,6 +358,7 @@ def read_core_lock(
             undetermined.add(name)
             continue
         if not applies:
+            forked.add(name)
             continue
         version = entry.get("version")
         if not isinstance(version, str) or not version_is_valid(version):
@@ -242,6 +366,11 @@ def read_core_lock(
             continue
         applicable.setdefault(name, []).append(version)
 
+    # uv's forks partition every environment the lock supports, so a package
+    # none of whose forks applies here is one whose markers this reader cannot
+    # evaluate faithfully (a uv conflict fork keyed on an ``extra``, say).
+    # Saying so beats silently neither pinning nor comparing it.
+    undetermined.update(forked - set(applicable))
     packages = []
     for name in sorted(applicable):
         versions = sorted(set(applicable[name]))
@@ -256,28 +385,39 @@ def read_core_lock(
     )
 
 
-def installed_distributions() -> Dict[str, str]:
-    """``{canonical name: version}`` for every distribution this interpreter sees.
+def installed_versions(
+    names: Iterable[str], path: Optional[List[str]] = None,
+) -> Dict[str, Optional[str]]:
+    """``{name: installed version}`` for each of *names* installed on *path*.
 
-    The first distribution found on ``sys.path`` wins, which is the one
-    ``importlib.metadata.version`` and an ``import`` would resolve.
-    ``invalidate_caches`` because the installs this follows ran in subprocesses
-    after the import system cached its directory listings.
+    A name that is not installed is absent from the result. One that is
+    installed but whose metadata names no version (``METADATA`` missing,
+    unreadable, or without a ``Version``) maps to None: it cannot be compared,
+    and leaving it out would read as "not installed".
+
+    *path* defaults to ``sys.path``: the distributions this interpreter
+    imports. The first distribution found wins, which is the one
+    ``importlib.metadata.version`` and an ``import`` would resolve. Looked up
+    by name, which ``importlib.metadata`` matches against the dist-info
+    directory, so a damaged entry is still found. ``invalidate_caches``
+    because the installs this follows ran in subprocesses after the import
+    system cached its directory listings.
     """
     import importlib
     import importlib.metadata as md
 
     importlib.invalidate_caches()
-    found: Dict[str, str] = {}
-    for dist in md.distributions():
+    found: Dict[str, Optional[str]] = {}
+    for name in names:
+        context = {"name": name} if path is None else {"name": name, "path": path}
+        dist = next(iter(md.distributions(**context)), None)
+        if dist is None:
+            continue
         try:
-            name = dist.metadata["Name"]
             version = dist.version
-        except Exception:  # noqa: BLE001 - one damaged dist is not a verdict
-            continue
-        if not name or not version:
-            continue
-        found.setdefault(canonical_package(name), version)
+        except (OSError, ValueError, TypeError, KeyError):
+            version = None
+        found[canonical_package(name)] = version or None
     return found
 
 
@@ -290,11 +430,15 @@ def _same_version(installed: str, locked: str) -> bool:
     return installed == locked
 
 
-def lock_drift(lock: CoreLock, installed: Mapping[str, str]) -> Tuple[LockDrift, ...]:
+def lock_drift(
+    lock: CoreLock, installed: Mapping[str, Optional[str]],
+) -> Tuple[LockDrift, ...]:
     """Every locked package installed at a version other than the locked one.
 
     A locked package that is not installed is not drift: the lock covers every
-    extra and dependency group, and a host installs the ones it uses.
+    extra and dependency group, and a host installs the ones it uses. Nor is
+    one installed with no readable version (None in *installed*): that is
+    :attr:`LockCheck.unreadable`, named apart because nothing was compared.
     """
     drift = []
     for package in lock.packages:
@@ -309,23 +453,41 @@ def load_core_lock(checkout: Optional[Path]) -> Optional[CoreLock]:
     """``<checkout>/uv.lock`` read for this environment, or None when there is none.
 
     Raises :class:`CoreLockError` when the lock exists and cannot be read. The
-    one entry point both the install guard and the drift check use, so the
-    lock an install is held to is the lock the venv is compared against.
+    one reader the install guard and the drift check share, so the lock an
+    install is held to is the lock the venv is compared against.
     """
     path = core_lock_path(checkout)
     return read_core_lock(path) if path is not None else None
 
 
 def check_venv_against_lock(
-    checkout: Optional[Path],
+    read_lock: Callable[[], Optional[CoreLock]],
     *,
-    installed: Callable[[], Mapping[str, str]] = installed_distributions,
+    installed: Optional[
+        Callable[[Iterable[str]], Mapping[str, Optional[str]]]
+    ] = None,
 ) -> LockCheck:
-    """Compare this venv against ``<checkout>/uv.lock``. Reads only."""
+    """Compare the installed versions against the lock *read_lock* returns.
+
+    Reads only, and never repairs. *read_lock* is called here so a lock that
+    exists and cannot be read becomes :attr:`LockCheck.error` rather than an
+    exception at the caller: a health report must still be produced.
+    *installed* is asked for the locked names and defaults to
+    :func:`installed_versions`, this interpreter's own ``sys.path``.
+    """
     try:
-        lock = load_core_lock(checkout)
+        lock = read_lock()
     except CoreLockError as exc:
-        return LockCheck(error=str(exc), checkout=checkout)
+        return LockCheck(error=str(exc))
     if lock is None:
-        return LockCheck(checkout=checkout)
-    return LockCheck(lock=lock, drift=lock_drift(lock, installed()), checkout=checkout)
+        return LockCheck()
+    versions = (installed or installed_versions)(
+        [package.name for package in lock.packages]
+    )
+    unreadable = tuple(
+        package.name for package in lock.packages
+        if package.name in versions and versions[package.name] is None
+    )
+    return LockCheck(
+        lock=lock, drift=lock_drift(lock, versions), unreadable=unreadable,
+    )

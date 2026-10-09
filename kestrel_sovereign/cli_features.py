@@ -308,6 +308,9 @@ def cmd_feature_install(args) -> int:
         bound_note = guard.manifest_bound_note()
         if bound_note:
             print(f"  note: {bound_note}")
+        lock_note = guard.lock_bound_note()
+        if lock_note:
+            print(f"  note: {lock_note}")
         # A failed install can be the very thing that broke the link. An
         # unrepaired core outranks the install failure: the caller must be able
         # to tell "this package did not install" from "the venv's core is not
@@ -741,6 +744,9 @@ def cmd_feature_upgrade(args) -> int:
             bound_note = guard.manifest_bound_note()
             if bound_note:
                 print(f"      note: {bound_note}")
+            lock_note = guard.lock_bound_note()
+            if lock_note:
+                print(f"      note: {lock_note}")
             continue
 
         new_version = _installed_version(name)
@@ -1197,6 +1203,11 @@ def _extension_install_run(
     VERSION; ``reinstall`` is what keeps its SOURCE — the two holes are
     different and need both.
 
+    The same blindness reaches every package core's ``uv.lock`` pins: the
+    resolver is free to move any of them, and uv's ``--upgrade`` is eager, so
+    it does (issue #3502). :meth:`CoreInstallGuard.install_constraints` adds
+    the lock's ``name==version`` lines to the same file for that reason.
+
     ``constraint_path`` names the file those lines are written to, and that
     file is NOT deleted on return. The default — a temporary file, removed —
     is right while the constraints live no longer than the subprocess. A caller
@@ -1380,6 +1391,32 @@ def _core_install_shape():
     )
 
 
+def _core_lock(shape):
+    """Core's ``uv.lock`` for *shape*, read for this environment, or None.
+
+    The lock beside the checkout core is installed from
+    (:func:`~kestrel_sovereign.core_lock.core_lock_checkout`). None when core
+    has no such checkout: an index wheel ships no lock. Raises
+    :class:`~kestrel_sovereign.core_lock.CoreLockError` when the lock exists
+    and cannot be read. Read through ``cli.`` so tests can supply a lock.
+    """
+    from kestrel_sovereign.core_lock import core_lock_checkout, load_core_lock
+
+    return load_core_lock(core_lock_checkout(shape.provenance))
+
+
+def core_lock_check():
+    """Compare this venv against core's ``uv.lock`` (issue #3502). Reads only.
+
+    The check ``kestrel doctor`` and ``kestrel update`` both report, against
+    the same lock the install guard holds feature installs to. Returns a
+    :class:`~kestrel_sovereign.core_lock.LockCheck`; it never repairs.
+    """
+    from kestrel_sovereign.core_lock import check_venv_against_lock
+
+    return check_venv_against_lock(lambda: cli._core_lock(cli._core_install_shape()))
+
+
 @dataclass(frozen=True)
 class RestorePlan:
     """The install that would put core back: what to run, and how it is bounded.
@@ -1405,6 +1442,15 @@ class RestorePlan:
     #: The manifest declares windows and no file could be made to carry them,
     #: so no command was rendered and no install may be performed.
     bounds_unwritable: bool = False
+    #: The ``uv.lock`` beside the checkout core is restored from exists and
+    #: could not be used (it would not read, or names no single version of a
+    #: package here), so no command was rendered and no install may be
+    #: performed: a restore that cannot be held to it could move a package CI
+    #: tested (issue #3502).
+    lock_error: Optional[str] = None
+    #: The sentence naming that lock as a bound on this restore, when it pins
+    #: anything (:func:`_lock_bound_sentence`).
+    lock_note: str = ""
 
 
 @dataclass
@@ -1439,6 +1485,12 @@ class CoreGuardOutcome:
     # is a source here, and the reason nothing is offered is the opposite one
     # — offering it would be offering an unbounded install (issue #3109).
     bounds_unwritable: bool = False
+    # The lock beside the checkout core is restored from could not be used
+    # (it would not read, or names no single version of a package here), so
+    # the restore was refused and no command is offered: one that cannot be
+    # held to the lock could move a package CI tested (issue #3502). The
+    # error text, for the operator to fix first.
+    lock_error: Optional[str] = None
     command: Optional[str] = None
     # Which shell ``command`` is quoted for, captured with it (see
     # :func:`_render_shell`). ``None`` where the platform has only one answer.
@@ -1448,6 +1500,10 @@ class CoreGuardOutcome:
     #: surface that reports a failed restore has to name them (#3106), and the
     #: printed command is one of those surfaces.
     bounds_note: str = ""
+    #: The lock that holds the restore, worded once (:func:`_lock_bound_sentence`).
+    #: Named beside :attr:`bounds_note` for the same reason: a restore refused
+    #: by a locked version is not fixed by moving core (issue #3502).
+    lock_note: str = ""
     output: str = ""  # tail of a failed repair's stderr/stdout
 
     @property
@@ -1477,6 +1533,11 @@ class CoreGuardOutcome:
         the shell when :attr:`shell` says the quoting is specific to one, since
         a command pasted into the other shell is not the command that ran.
         """
+        if self.lock_error is not None:
+            # Fail CLOSED, for the reason the branch below does: the lock binds
+            # this restore and nothing can read it, so every command that could
+            # be rendered here is an install free to move what CI tested.
+            return f"NOT RESTORED — {_lock_bound_sentence(None, self.lock_error, [])}"
         if self.bounds_unwritable:
             # Fail CLOSED. The bounds exist and nothing can carry them, so every
             # command that could be rendered here is an unbounded install — the
@@ -1545,14 +1606,18 @@ class CoreGuardOutcome:
         than the one they just edited, and tells an API caller to run a CLI.
         The fact worth stating is that the line is a snapshot; which command
         produced it is something the reader knows and this does not.
+
+        The lock's pins ride in the same file (issue #3502), so the same is
+        true of them: once the lock has been moved, the file still holds the
+        versions it pinned when the command ran.
         """
-        if not self.bounds_note:
+        notes = " ".join(note for note in (self.bounds_note, self.lock_note) if note)
+        if not notes:
             return ""
         return (
-            f" Note: {self.bounds_note} The command above carries those "
-            "windows as they were when it ran, so once you have changed one, "
-            "re-run the command that reported this rather than pasting the "
-            "line."
+            f" Note: {notes} The command above carries those bounds as they "
+            "were when it ran, so once you have changed one, re-run the "
+            "command that reported this rather than pasting the line."
         )
 
     def describe(self) -> str:
@@ -1571,6 +1636,36 @@ class CoreGuardOutcome:
             lines.append(self.restore_instruction)
             lines.extend(self.output.splitlines()[-3:])
         return "\n".join(lines)
+
+
+def _lock_bound_sentence(lock, error, lines) -> Optional[str]:
+    """The note naming core's ``uv.lock`` as a bound on an install, or None.
+
+    Worded once for both kinds of install the guard holds to a lock (#3502).
+    """
+    if error is not None:
+        return (
+            f"core's uv.lock could not be used ({error}), so the install was "
+            "not run: an install that cannot be held to the lock could move a "
+            "package CI tested. Fix what that names, then re-run."
+        )
+    if not lines:
+        return None
+    return (
+        f"core's uv.lock ({lock.path}) holds {len(lines)} package(s) at their "
+        "locked versions for this install, so it can neither upgrade nor "
+        "downgrade what CI tested. If the conflict names one of them, the "
+        "install needs a version the lock does not pin: move the lock "
+        "deliberately (`uv lock --upgrade-package <name>` and a green CI run)."
+    )
+
+
+def _lock_refusal(pip_args, error) -> subprocess.CompletedProcess:
+    """The failed result of an install refused because its lock could not be used."""
+    return subprocess.CompletedProcess(
+        pip_args, 1, stdout="",
+        stderr=f"refused: core's uv.lock could not be used: {error}",
+    )
 
 
 class CoreInstallGuard:
@@ -1620,15 +1715,22 @@ class CoreInstallGuard:
         # feature install can neither upgrade nor downgrade what CI tested
         # (issue #3502). Derived from core's shape, like core's own pin, because
         # the lock is the one beside the checkout core is installed from — and
-        # re-derived with it when the batch moves core. `_lock_exclude` names
-        # the manifest's editable entries, whose source the operator declared.
+        # re-derived with it when the batch moves core (:meth:`refresh`).
+        # `_manifest_editables` names the manifest's editable entries, whose
+        # source the operator declared and a version pin would replace.
         self._lock = None
         self._lock_error: Optional[str] = None
         self._lock_bounds: list = []
-        self._lock_exclude: frozenset = frozenset()
+        self._manifest_editables: frozenset = frozenset()
+        # The lock note for the last core install, whose lock is its target's
+        # (:meth:`install_core`), not the one feature installs keep.
+        self._core_lock_note: Optional[str] = None
         # The one file a restore's bounds are written to, created on first use
         # and reused for the life of the guard — see :meth:`_restore_constraints`.
         self._restore_constraint_path: Optional[str] = None
+        # The lock a restore is held to, read once for the same reason the file
+        # is made once: see :meth:`_restore_lock`.
+        self._restore_lock_binding: Optional[tuple] = None
 
     @classmethod
     def snapshot(cls, source_index=None):
@@ -1655,10 +1757,10 @@ class CoreInstallGuard:
         # another outside its declared window and the run reports success over
         # the violation (issue #3106).
         guard._manifest_bounds = fr.manifest_version_constraints(source_index or {})
-        guard._lock_exclude = frozenset(
+        guard._manifest_editables = frozenset(
             canonical_package(package)
             for package, entry in (source_index or {}).items()
-            if getattr(entry, "editable", None)
+            if entry.editable
         )
         guard._derive_lock(before)
         return guard
@@ -1692,18 +1794,51 @@ class CoreInstallGuard:
         return fr.core_install_constraints(shape, self.policy)
 
     def _derive_lock(self, shape) -> None:
-        """Read core's uv.lock for *shape* and derive the lines that hold it."""
+        """Read core's uv.lock for *shape*: the lock every feature install keeps."""
+        self._lock, self._lock_error, self._lock_bounds = self._bind_lock(
+            lambda: cli._core_lock(shape)
+        )
+
+    def _bind_lock(self, read_lock):
+        """``(lock, error, lines)`` for the lock *read_lock* returns.
+
+        *error* is set, and *lines* empty, when the lock exists and cannot be
+        read or cannot hold every package it covers here; all three are empty
+        when there is no lock. Two kinds of locked
+        package are left out of *lines*, because a ``==`` pin would replace a
+        source someone chose rather than keep a version CI tested: the
+        manifest's editable entries, and a locked package this venv holds from
+        a source its metadata names (an editable SDK on a dev host). ``uv sync``
+        installs every locked package from the index, so on the update path
+        the second set is exactly what the operator linked by hand. The drift
+        check still reports either one whose version differs from the lock.
+
+        Only a POSITIVELY direct install is left out
+        (:attr:`~kestrel_sovereign.feature_reconcile.Provenance.is_direct`).
+        A ``direct_url.json`` that will not read says nothing about a link, so
+        that package keeps its pin: reading "unknown" as "linked" let a damaged
+        metadata file take a locked package out from under the lock.
+
+        A locked package the lock names no single version of here
+        (:attr:`~kestrel_sovereign.core_lock.CoreLock.undetermined`) is an
+        *error*, not a missing line, unless it is left out for the reasons
+        above: lines that held every package but it would let the install move
+        it (:meth:`~kestrel_sovereign.core_lock.CoreLock.constraint_lines`).
+        """
         from kestrel_sovereign.core_lock import CoreLockError
 
         try:
-            self._lock = cli._core_lock(shape)
+            lock = read_lock()
+            if lock is None:
+                return None, None, []
+            linked = frozenset(
+                name for name in lock.names()
+                if cli._direct_url_provenance(name).is_direct
+            )
+            lines = lock.constraint_lines(self._manifest_editables | linked)
         except CoreLockError as exc:
-            self._lock, self._lock_error, self._lock_bounds = None, str(exc), []
-            return
-        self._lock_error = None
-        self._lock_bounds = (
-            self._lock.constraint_lines(self._lock_exclude) if self._lock else []
-        )
+            return None, str(exc), []
+        return lock, None, lines
 
     @property
     def constraints(self) -> list:
@@ -1747,16 +1882,41 @@ class CoreInstallGuard:
             "one to change."
         )
 
+    def lock_bound_note(self) -> Optional[str]:
+        """The sentence naming core's lock as a bound on a FEATURE install.
+
+        Owned by the guard for the reason :meth:`manifest_bound_note` is: every
+        surface reporting a failed feature install has to say it, or an
+        operator reads a refused resolve as the feature's fault and reaches for
+        an unconstrained install, which is how the lock came to be overrun.
+
+        ``None`` when no lock binds the install.
+        """
+        return _lock_bound_sentence(self._lock, self._lock_error, self._lock_bounds)
+
+    def core_lock_bound_note(self) -> Optional[str]:
+        """The same sentence for the last :meth:`install_core`, whose lock is its target's."""
+        return self._core_lock_note
+
     @property
     def install_constraints(self) -> list:
-        """Every line a guarded install carries: core's pin, then the manifest's.
+        """Every line a guarded install carries: core's pin, the manifest's, the lock's.
 
         The other fact, under its own name. Core's pin bounds core's source and
         version; the manifest's windows bound everything else it declares, and
         an install that has to satisfy one entry must not move another out of
-        its own (issue #3106).
+        its own (issue #3106). The lock's pins hold every package CI installed
+        at the version CI tested (issue #3502): ``uv pip`` never reads the lock,
+        and an eager ``--upgrade`` otherwise moves the whole resolution. A
+        package named by both the manifest and the lock carries both lines; the
+        resolver intersects them, so a window that excludes the locked version
+        fails the install rather than moving the package.
         """
-        return list(self._constraints) + list(self._manifest_bounds)
+        return (
+            list(self._constraints)
+            + list(self._manifest_bounds)
+            + list(self._lock_bounds)
+        )
 
     def run(self, pip_args: list, *, reinstall=None, timeout=None):
         """Install a FEATURE package with core held inside the policy.
@@ -1766,7 +1926,15 @@ class CoreInstallGuard:
         the guard's business because a bare ``--force-reinstall`` in *pip_args*
         would reinstall core from the index straight through the constraint —
         same version, wheel instead of link.
+
+        A lock beside core that cannot be read refuses the install without
+        running anything: there is no way to hold it, and running unheld is the
+        drift the lock exists to prevent (issue #3502). The refusal is a failed
+        result, so every caller reports it the way it reports any failed
+        install, with :meth:`lock_bound_note` saying why.
         """
+        if self._lock_error is not None:
+            return _lock_refusal(pip_args, self._lock_error)
         return self._install(
             pip_args,
             constraints=self.install_constraints or None,
@@ -1774,7 +1942,9 @@ class CoreInstallGuard:
             timeout=timeout,
         )
 
-    def install_core(self, pip_args: list, *, reinstall=None, timeout=None):
+    def install_core(
+        self, pip_args: list, *, reinstall=None, timeout=None, lock_checkout=None,
+    ):
         """Install CORE itself — the operator deliberately moving core's source.
 
         Never constrained against itself, and the constraints for the rest of
@@ -1785,13 +1955,31 @@ class CoreInstallGuard:
         *reinstall* is scoped the same way as :meth:`run`'s, even though core is
         the target here: reinstalling core does not require rebuilding core's
         own dependency tree, and a blanket flag would.
+
+        *lock_checkout* is the checkout core is being installed from, when it
+        is one. Its ``uv.lock`` holds this install the way core's lock holds a
+        feature's (issue #3502): ``uv sync`` installs no extras, so a manifest
+        entry such as ``kestrel-sovereign[observability]`` is where those
+        extras' locked packages arrive, and unheld they resolve to whatever the
+        index has. The TARGET's lock, not the current core's, because that is
+        the lock CI tested this core against. An index install has no lock.
         """
+        from kestrel_sovereign.core_lock import load_core_lock
+
+        lock, error, lines = (None, None, [])
+        if lock_checkout is not None:
+            lock, error, lines = self._bind_lock(
+                lambda: load_core_lock(Path(lock_checkout).expanduser())
+            )
+        self._core_lock_note = _lock_bound_sentence(lock, error, lines)
+        if error is not None:
+            return _lock_refusal(pip_args, error)
         result = self._install(
             pip_args,
             # Never core's own pin — this IS the operator moving core — but the
             # rest of the manifest still binds: a core install must not drag a
             # declared feature outside its window either (issue #3106).
-            constraints=self._manifest_bounds or None,
+            constraints=(list(self._manifest_bounds) + lines) or None,
             reinstall=reinstall,
             timeout=timeout,
         )
@@ -1799,10 +1987,16 @@ class CoreInstallGuard:
         return result
 
     def refresh(self):
-        """Re-read the live core install; re-derive constraints and baseline."""
+        """Re-read the live core install; re-derive constraints and baseline.
+
+        The lock is re-read too: it is the one beside the checkout core is
+        installed from, so a batch that moves core to another checkout holds
+        the rest of its installs to THAT checkout's lock.
+        """
         shape = cli._core_install_shape()
         self._baseline = shape
         self._constraints = self._derive(shape)
+        self._derive_lock(shape)
         return shape
 
     def conforms_now(self) -> bool:
@@ -1942,6 +2136,8 @@ class CoreInstallGuard:
             repaired=False,
             attempted=attempted,
             bounds_unwritable=plan.bounds_unwritable,
+            lock_error=plan.lock_error,
+            lock_note=plan.lock_note,
             command=plan.command,
             shell=plan.shell,
         )
@@ -1983,7 +2179,38 @@ class CoreInstallGuard:
         except Exception:  # noqa: BLE001 - see docstring: never mask the interrupt
             return
 
-    def _restore_constraints(self):
+    def _restore_lock(self):
+        """``(lock, error, lines)`` for the ``uv.lock`` a core restore is held to.
+
+        A restore installs core AND resolves its dependencies, so it moves
+        locked packages exactly as a feature install would. Unheld, the
+        automatic repair after a held feature install is where the lock gets
+        overrun (issue #3502).
+
+        The lock is the restored checkout's: ``policy.editable``. That is the
+        lock CI tested that core against, the reason :meth:`install_core` holds
+        a core install to its target's lock. It is not the lock of the core the
+        venv holds now. That core has drifted, often to an index wheel that has
+        no lock beside it. A restore from the index has no checkout, so no
+        lock, as for :meth:`install_core`.
+
+        Read ONCE per guard, like :meth:`_restore_constraints`'s file. The
+        interrupt path renders the restore and a repair renders and runs it,
+        and two readings would let those describe different installs.
+        """
+        if self._restore_lock_binding is None:
+            if self.policy.editable:
+                from kestrel_sovereign.core_lock import load_core_lock
+
+                checkout = Path(self.policy.editable).expanduser()
+                self._restore_lock_binding = self._bind_lock(
+                    lambda: load_core_lock(checkout)
+                )
+            else:
+                self._restore_lock_binding = (None, None, [])
+        return self._restore_lock_binding
+
+    def _restore_constraints(self, lock_lines):
         """The bounds a core restore carries, and the FILE that carries them.
 
         Returns ``(lines, path)`` — both or neither, from ONE derivation,
@@ -2009,12 +2236,20 @@ class CoreInstallGuard:
         argument is present.
 
         Core's own pin is absent, for the reason :meth:`_repair` gives. What is
-        left is the manifest's windows for everything else, and a manifest that
-        declares none leaves nothing to carry and nothing to name — the printed
-        command is then exactly what it was before, an unbounded install on a
-        host that declared no bounds.
+        left is the manifest's windows for everything else, plus *lock_lines*:
+        the pins of the restored checkout's lock (:meth:`_restore_lock`). With
+        neither, there is nothing to carry and nothing to name, and the printed
+        command is then exactly what it was before: an unbounded install on a
+        host that declared no bounds and has no lock.
+
+        *lock_lines* is a parameter, not read here, so only a caller that has
+        already checked the lock read can supply it: :meth:`_restore_plan`
+        refuses a restore whose lock could not be used before any bounds are
+        written, and a file written without that check would carry the
+        manifest's windows alone and look bounded.
         """
-        if not self._manifest_bounds:
+        lines = list(self._manifest_bounds) + list(lock_lines)
+        if not lines:
             return [], None
         if self._restore_constraint_path is None:
             import tempfile
@@ -2025,7 +2260,7 @@ class CoreInstallGuard:
                     prefix="kestrel-restore-constraints-", suffix=".txt",
                 )
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    _write_constraint_lines(fh, self._manifest_bounds)
+                    _write_constraint_lines(fh, lines)
             except BaseException as exc:
                 # A partial write bounds nothing, and this path is never named
                 # until the write completes — so whatever went wrong, the file
@@ -2043,18 +2278,21 @@ class CoreInstallGuard:
                     # the operator's Ctrl-C — which would turn a full disk into
                     # a silently dropped warning about a core that just moved,
                     # on the one path that needed no filesystem at all before.
-                    return list(self._manifest_bounds), None
+                    return lines, None
                 raise
             self._restore_constraint_path = path
-        return list(self._manifest_bounds), self._restore_constraint_path
+        return lines, self._restore_constraint_path
 
     def _restore_plan(self):
         """The exact install that would put core back — rendered, NOT run.
 
         Returns a :class:`RestorePlan` — the argv, the rendering, and the
         constraints that bound both, so no consumer has to ask for any of it
-        twice. ``bounds_unwritable`` says the rendering was WITHHELD rather
-        than that there was nothing to render.
+        twice. ``bounds_unwritable`` and ``lock_error`` each say the rendering
+        was WITHHELD rather than that there was nothing to render. The bounds
+        are the manifest's windows and the restored checkout's ``uv.lock``
+        (issue #3502), so the restore a held feature install triggers is held
+        the same way.
 
         One derivation with two consumers: :meth:`_repair` runs it, and the
         interrupt path prints it without running anything (issue #2962).
@@ -2096,7 +2334,25 @@ class CoreInstallGuard:
             reinstall = (
                 None if cli._core_install_shape().from_index else CORE_DISTRIBUTION
             )
-        lines, constraint_path = self._restore_constraints()
+        lock, lock_error, lock_lines = self._restore_lock()
+        if lock_error is not None:
+            # The restored checkout's lock binds this install and will not
+            # read. Same rule as :meth:`run` and :meth:`install_core`: an
+            # install that cannot be held to the lock is not performed, and a
+            # command that could not be held to it is not handed over either.
+            # Checked before any bounds are written, so nothing is left on disk
+            # for a command that does not exist.
+            return RestorePlan(
+                pip_args=pip_args,
+                reinstall=reinstall,
+                command="",
+                shell=_render_shell(),
+                constraints=[],
+                constraint_path=None,
+                lock_error=lock_error,
+            )
+        lock_note = _lock_bound_sentence(lock, None, lock_lines) or ""
+        lines, constraint_path = self._restore_constraints(lock_lines)
         if lines and not constraint_path:
             # Bounds exist and nothing carries them. Rendering the command
             # anyway would hand over the unbounded install this whole path
@@ -2109,6 +2365,7 @@ class CoreInstallGuard:
                 constraints=lines,
                 constraint_path=None,
                 bounds_unwritable=True,
+                lock_note=lock_note,
             )
         extra_args = ["-c", constraint_path] if constraint_path else []
         return RestorePlan(
@@ -2120,6 +2377,7 @@ class CoreInstallGuard:
             shell=_render_shell(),
             constraints=lines,
             constraint_path=constraint_path,
+            lock_note=lock_note,
         )
 
     def _repair(self, drift, replaced, *, timeout=None) -> "CoreGuardOutcome":
@@ -2163,6 +2421,20 @@ class CoreInstallGuard:
         # like the install below it, and the drift is already known by now.
         with self._reporting_interrupts(repairing=False):
             plan = self._restore_plan()
+        if plan.lock_error is not None:
+            # The restored checkout's lock could not be used, so this restore
+            # cannot be held to what CI tested. REFUSED, as a feature install
+            # under the same lock is, and reported as a repair that never ran
+            # (issue #3502).
+            return self._outcome(
+                drift=drift,
+                replaced=replaced,
+                repaired=False,
+                attempted=False,
+                lock_error=plan.lock_error,
+                command="",
+                shell=plan.shell,
+            )
         if plan.bounds_unwritable:
             # The manifest's windows exist and nothing can carry them, so this
             # install cannot be performed as declared. Running it anyway is the
@@ -2175,6 +2447,7 @@ class CoreInstallGuard:
                 repaired=False,
                 attempted=False,
                 bounds_unwritable=True,
+                lock_note=plan.lock_note,
                 command="",
                 shell=plan.shell,
             )
@@ -2182,6 +2455,8 @@ class CoreInstallGuard:
         # install exists to put core back. The rest of the manifest still
         # binds: a repair that resolves a dependency outside another entry's
         # declared window has moved it, and this rechecks only core (#3106).
+        # So does the restored checkout's lock: the restore resolves core's
+        # dependencies, and unheld it moves what CI tested (#3502).
         # The plan's OWN file, the one it just rendered, so what an operator
         # pastes is bounded exactly as the automatic attempt was (#3109).
         try:
@@ -2213,6 +2488,7 @@ class CoreInstallGuard:
             replaced=replaced,
             repaired=repaired,
             unresolved=unresolved,
+            lock_note=plan.lock_note,
             command=plan.command,
             shell=plan.shell,
             output="" if repaired else (result.stderr or result.stdout or "").strip(),
@@ -2619,9 +2895,13 @@ def cmd_feature_sync(args) -> int:
         # manifest entry IS the operator deliberately moving core's source.
         # `install_core` re-derives the batch pin from what core became.
         is_core = target == fr.CORE_DISTRIBUTION
-        run = functools.partial(
-            guard.install_core if is_core else guard.run, reinstall=reinstall,
-        )
+        if is_core:
+            run = functools.partial(
+                guard.install_core, reinstall=reinstall,
+                lock_checkout=Path(editable_want).expanduser() if editable_want else None,
+            )
+        else:
+            run = functools.partial(guard.run, reinstall=reinstall)
         result = run(pip_args)
         # Registry-backed packages can fall back to their git URL (mirrors
         # `feature install`) — but ONLY the legacy entry that declares no source
@@ -2667,6 +2947,13 @@ def cmd_feature_sync(args) -> int:
             bound_note = guard.manifest_bound_note()
             if bound_note:
                 print(f"      note: {bound_note}")
+            # A core install is held to its TARGET checkout's lock, not to the
+            # one feature installs keep, so each names the lock that bound it.
+            lock_note = (
+                guard.core_lock_bound_note() if is_core else guard.lock_bound_note()
+            )
+            if lock_note:
+                print(f"      note: {lock_note}")
             # A failed core action stops the batch only when core is ACTUALLY
             # off its declared source. `_resolve_manifest_action` returns
             # `ensure` for a conforming core that declares extras, and a failed

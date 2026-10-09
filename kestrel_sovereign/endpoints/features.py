@@ -514,7 +514,11 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
                     logger.error(
                         f"pip install failed for {package_spec}: {result.stderr}"
                     )
-                    install_error = (500, f"Installation failed: {result.stderr[:500]}")
+                    detail = f"Installation failed: {result.stderr[:500]}"
+                    lock_note = guard.lock_bound_note()
+                    if lock_note:
+                        detail = f"{detail}\nnote: {lock_note}"
+                    install_error = (500, detail)
             except subprocess.TimeoutExpired:
                 install_error = (504, "Installation timed out")
 
