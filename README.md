@@ -952,6 +952,8 @@ restriction or reset its audit-due counter. Only the verified, authorized exit
 path clears a durable restriction; a conflicting writer restricts itself.
 First creation is insert-only. Loaded records (including migrated revision
 zero) use conditional updates and cannot recreate a concurrently deleted row.
+Each recreated row receives a new generation identifier: equal revision
+numbers from different lifetimes cannot authorize a stale Safe Mode exit.
 
 The additive revision migration retains readable schema-version-1 rows, but
 database triggers reject pre-revision writers after upgrade. Retire old
@@ -960,7 +962,8 @@ Initialization checks existing metadata before installing migration DDL;
 SQLite upgrades reserve the writer slot and recheck before adding columns.
 
 Automatic first anchoring requires a still-pending durable new-identity marker
-and matching revision, revalidated within the native graph transaction.
+and matching generation/revision, revalidated within the native graph
+transaction. In-memory bootstrap custody advances only after graph commit.
 Reading a constitution or initializing its display feature never repairs an
 existing identity's deleted anchor. That requires native signed reanchor and
 the normal full integrity verification; an absent anchor is not a fresh boot.

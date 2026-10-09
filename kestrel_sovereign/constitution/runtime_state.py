@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Optional
+from uuid import uuid4
 
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
 from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
@@ -40,6 +41,9 @@ class ConstitutionRuntimeState:
     # None is an explicit first-creation snapshot; loaded legacy revision zero
     # is an existing record and may ONLY be conditionally updated.
     revision: Optional[int] = None
+    # A revision is scoped to one row lifetime. Recreation must not admit a
+    # stale exit whose integer happens to match the new lifetime's revision.
+    generation: Optional[str] = None
 
 
 class ConstitutionStateConflictError(RuntimeError):
@@ -117,7 +121,8 @@ class ConstitutionRuntimeStateStore:
                 schema_version INTEGER NOT NULL,
                 updated_at {timestamp_type} NOT NULL,
                 safe_mode_cause TEXT,
-                revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)
+                revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+                generation TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS constitution_runtime_events (
@@ -141,6 +146,7 @@ class ConstitutionRuntimeStateStore:
         # existing agent into Safe Mode on upgrade.
         await self._migrate_safe_mode_cause_column()
         await self._migrate_column("revision", "INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)")
+        await self._migrate_column("generation", "TEXT NOT NULL DEFAULT ''")
         await self._ensure_revision_fence()
 
     async def _ensure_revision_fence(self) -> None:
@@ -150,7 +156,7 @@ class ConstitutionRuntimeStateStore:
         fencing does not execute the new store's CAS statement. Repeated boots
         inspect the catalog, avoiding an unnecessary DDL lock on a live table.
         """
-        trigger = "constitution_runtime_revision_fence_v1"
+        trigger = "constitution_runtime_revision_fence_v2"
         if self._is_postgres:
             existing = await self._backend.fetch_one(
                 "SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass(?) "
@@ -176,7 +182,7 @@ class ConstitutionRuntimeStateStore:
                         f"""
                         CREATE OR REPLACE FUNCTION {trigger}() RETURNS trigger AS $fence$
                         BEGIN
-                            IF NEW.revision <> OLD.revision + 1 THEN
+                            IF NEW.revision <> OLD.revision + 1 OR NEW.generation <> OLD.generation THEN
                                 RAISE EXCEPTION 'constitution runtime revision fence refused old writer';
                             END IF;
                             RETURN NEW;
@@ -196,7 +202,7 @@ class ConstitutionRuntimeStateStore:
                     f"""
                     CREATE TRIGGER IF NOT EXISTS {trigger}
                     BEFORE UPDATE ON constitution_runtime_state
-                    FOR EACH ROW WHEN NEW.revision <> OLD.revision + 1
+                    FOR EACH ROW WHEN NEW.revision <> OLD.revision + 1 OR NEW.generation <> OLD.generation
                     BEGIN
                         SELECT RAISE(ABORT, 'constitution runtime revision fence refused old writer');
                     END;
@@ -266,7 +272,7 @@ class ConstitutionRuntimeStateStore:
                    safe_mode_entered_at, safe_mode_exited_at,
                    safe_mode_exit_authorization, last_successful_audit_at,
                    interaction_count, bootstrap_pending, schema_version,
-                   updated_at, safe_mode_cause, revision
+                   updated_at, safe_mode_cause, revision, generation
               FROM constitution_runtime_state
              WHERE agent_id = ?
             """,
@@ -291,6 +297,7 @@ class ConstitutionRuntimeStateStore:
             updated_at=self._timestamp_value(row[10]),
             safe_mode_cause=row[11],
             revision=int(row[12]),
+            generation=str(row[13]),
         )
 
     async def write(
@@ -315,6 +322,9 @@ class ConstitutionRuntimeStateStore:
             and state.last_successful_audit_at == state.safe_mode_exited_at
             and not state.safe_mode
         )
+        generation = uuid4().hex if state.revision is None else state.generation
+        if generation is None:
+            raise ConstitutionStateConflictError("loaded constitution state has no generation fence")
         values = (
             state.agent_id,
             self._boolean_param(state.safe_mode),
@@ -339,12 +349,12 @@ class ConstitutionRuntimeStateStore:
                      safe_mode_entered_at, safe_mode_exited_at,
                      safe_mode_exit_authorization, last_successful_audit_at,
                      interaction_count, bootstrap_pending, schema_version,
-                     updated_at, safe_mode_cause, revision)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     updated_at, safe_mode_cause, revision, generation)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(agent_id) DO NOTHING
                     RETURNING revision
                     """,
-                    values,
+                    values + (generation,),
                 )
             else:
                 # UPDATE cannot turn into INSERT after a concurrently deleted
@@ -358,14 +368,14 @@ class ConstitutionRuntimeStateStore:
                         safe_mode_exit_authorization = ?, last_successful_audit_at = ?,
                         interaction_count = ?, bootstrap_pending = ?, schema_version = ?,
                         updated_at = ?, safe_mode_cause = ?, revision = ?
-                    WHERE agent_id = ? AND revision = ?
+                    WHERE agent_id = ? AND revision = ? AND generation = ?
                       AND (NOT safe_mode OR ? OR ?)
                       AND (interaction_count <= ? OR ?)
                       AND (NOT bootstrap_pending OR ? OR ?)
                     RETURNING revision
                     """,
                     values[1:] + (
-                        state.agent_id, state.revision,
+                        state.agent_id, state.revision, generation,
                         self._boolean_param(state.safe_mode), self._boolean_param(authorized_exit),
                         max(0, int(state.interaction_count)),
                         self._boolean_param(authorized_exit or event_type == "audit_succeeded"),
@@ -396,7 +406,7 @@ class ConstitutionRuntimeStateStore:
             raise ConstitutionStateConflictError(
                 "stale constitution state or unauthorized SafeMode clear"
             )
-        return replace(state, revision=int(written[0]))
+        return replace(state, revision=int(written[0]), generation=generation)
 
     async def list_events(self, agent_id: str) -> list[dict]:
         """Return transition history in insertion order (operator/test aid)."""

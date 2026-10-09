@@ -9,7 +9,7 @@ from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing_column", ["revision", "safe_mode_cause"])
+@pytest.mark.parametrize("missing_column", ["revision", "safe_mode_cause", "generation"])
 async def test_independent_sqlite_replicas_upgrade_missing_column_once(
     tmp_path, missing_column
 ):
@@ -19,7 +19,7 @@ async def test_independent_sqlite_replicas_upgrade_missing_column_once(
     await second.connect()
     try:
         await ConstitutionRuntimeStateStore(first).initialize()
-        await first.execute("DROP TRIGGER constitution_runtime_revision_fence_v1")
+        await first.execute("DROP TRIGGER constitution_runtime_revision_fence_v2")
         await first.execute(
             f"ALTER TABLE constitution_runtime_state DROP COLUMN {missing_column}"
         )

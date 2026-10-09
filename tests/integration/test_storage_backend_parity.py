@@ -843,6 +843,75 @@ async def test_postgres_delete_committing_during_runtime_write_cannot_recreate(d
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_recreated_runtime_generation_rejects_prior_authorized_exit(db_backend):
+    """Equal revision numbers from different row lifetimes confer no custody."""
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionStateConflictError,
+    )
+
+    store = ConstitutionRuntimeStateStore(db_backend)
+    await store.initialize()
+    now = datetime.now(timezone.utc)
+    initial = ConstitutionRuntimeState(
+        agent_id="did:test:runtime-generation:" + uuid4().hex, safe_mode=True,
+        safe_mode_reason="integrity restriction", safe_mode_entered_at=now,
+        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+        last_successful_audit_at=now, interaction_count=0, updated_at=now,
+        safe_mode_cause="integrity",
+    )
+    old = await store.write(initial)
+    old = await store.write(old, event_type="safe_mode_entered")
+    await db_backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (old.agent_id,))
+    recreated = await store.write(initial)
+    latched = await store.write(replace(recreated, safe_mode_cause="feature_lifecycle_uncertain",
+                                      safe_mode_reason="new lifecycle generation"), event_type="safe_mode_entered")
+    assert latched.revision == old.revision
+    before_events = await store.list_events(old.agent_id)
+    with pytest.raises(ConstitutionStateConflictError):
+        await store.write(replace(old, safe_mode=False, safe_mode_exited_at=now,
+                                 safe_mode_exit_authorization="prior-signed-owner"),
+                          event_type="safe_mode_exited", event_authorization="prior-signed-owner")
+    assert await store.load(old.agent_id) == latched
+    assert await store.list_events(old.agent_id) == before_events
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_native_bootstrap_rollback_preserves_lifecycle_fence_on_both_backends(db_backend):
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin, SafeModeCause
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+    from unittest.mock import AsyncMock
+
+    now = datetime.now(timezone.utc)
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:rollback:" + uuid4().hex)
+    await storage.initialize()
+    first = _DurableConstitutionHarness(storage, now)
+    first.agent_id = storage.agent_id
+    await first._initialize_constitution_runtime_state(is_new_identity=True)
+    try:
+        await storage.add_node(GraphNode(node_id=first.agent_id, node_type="agent", label="new", properties={}))
+        first.extension = None
+        first._anchor_constitution_governance = AsyncMock(side_effect=RuntimeError("native graph failure"))
+        before = await first._constitution_state_store.load(first.agent_id)
+        result = await ConstitutionMixin._get_governing_constitution(first)
+        assert result.startswith("Error: Failed to anchor")
+        assert await first._constitution_state_store.load(first.agent_id) == before
+        assert "constitution_hash" not in (await storage.get_node(first.agent_id)).properties
+        other = _DurableConstitutionHarness(storage, now)
+        other.agent_id = storage.agent_id
+        await other._initialize_constitution_runtime_state()
+        assert await other.enter_safe_mode("new lifecycle restriction", cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value)
+        assert await first.enter_safe_mode("bootstrap failed", cause=SafeModeCause.BOOTSTRAP.value)
+        current = await first._constitution_state_store.load(first.agent_id)
+        assert current.safe_mode_cause == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+        assert current.safe_mode_reason == "new lifecycle restriction"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_pre_revision_writer_cannot_clear_new_runtime_state(db_backend):
     """Mixed-version replicas must fail closed, not bypass the new CAS."""
     from kestrel_sovereign.constitution.runtime_state import (

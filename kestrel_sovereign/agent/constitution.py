@@ -580,6 +580,7 @@ class ConstitutionMixin:
         self._constitution_state_migration_pending = False
         self._constitution_bootstrap_pending = False
         self._constitution_state_revision = None
+        self._constitution_state_generation = None
         self._constitution_state_load_error = None
         self._constitution_audit_pending = False
         self._constitution_state_persistence_pending = False
@@ -670,6 +671,7 @@ class ConstitutionMixin:
                 else bootstrap_pending
             ),
             revision=getattr(self, "_constitution_state_revision", None),
+            generation=getattr(self, "_constitution_state_generation", None),
         )
 
     async def _initialize_constitution_runtime_state(
@@ -715,6 +717,7 @@ class ConstitutionMixin:
                 event_reason=pending_reason,
             )
             self._constitution_state_revision = persisted_state.revision
+            self._constitution_state_generation = persisted_state.generation
             self._constitution_state_persistence_pending = False
 
         try:
@@ -743,10 +746,12 @@ class ConstitutionMixin:
                     ),
                 )
                 self._constitution_state_revision = persisted_state.revision
+                self._constitution_state_generation = persisted_state.generation
                 await persist_pending_entry(store)
                 return
 
             self._constitution_state_revision = state.revision
+            self._constitution_state_generation = state.generation
             self._safe_mode = state.safe_mode
             self._safe_mode_reason = state.safe_mode_reason
             # UNRECORDED is for rows written before causes were persisted —
@@ -935,6 +940,7 @@ class ConstitutionMixin:
                     snapshot = replace(
                         snapshot,
                         revision=current.revision,
+                        generation=current.generation,
                         last_successful_audit_at=current.last_successful_audit_at,
                         interaction_count=max(
                             snapshot.interaction_count, current.interaction_count
@@ -945,6 +951,7 @@ class ConstitutionMixin:
                         safe_mode_entered_at=current.safe_mode_entered_at if current.safe_mode else snapshot.safe_mode_entered_at,
                     )
             self._constitution_state_revision = persisted_state.revision
+            self._constitution_state_generation = persisted_state.generation
             if event_type == "safe_mode_entered":
                 self._safe_mode_cause = persisted_state.safe_mode_cause
                 self._safe_mode_reason = persisted_state.safe_mode_reason
@@ -2232,6 +2239,7 @@ class ConstitutionMixin:
                 bootstrap is None
                 or not bootstrap.bootstrap_pending
                 or bootstrap.revision != self._constitution_state_revision
+                or bootstrap.generation != self._constitution_state_generation
             ):
                 return "Error: Missing governing anchor requires native signed repair; durable bootstrap custody changed."
             logging.warning("Constitution hash not found. Attempting to load and anchor default.")
@@ -2272,7 +2280,7 @@ class ConstitutionMixin:
                 # One transaction: blob + governance edges + agent pointer
                 # land together or not at all — a partial lazy anchor would
                 # be the same property/edge drift #2617 repairs.
-                async with self.storage.transaction():
+                async with ConstitutionMixin._constitution_state_guard(self), self.storage.transaction():
                     # Reserve the native graph write set, then revalidate the
                     # durable bootstrap marker under the same transaction.
                     initial_hash = hashlib.sha256(constitution_content).hexdigest()
@@ -2289,18 +2297,24 @@ class ConstitutionMixin:
                         bootstrap is None
                         or not bootstrap.bootstrap_pending
                         or bootstrap.revision != self._constitution_state_revision
+                        or bootstrap.generation != self._constitution_state_generation
                     ):
                         raise ValueError("durable new-identity bootstrap custody changed")
                     persisted_state = await store.write(
                         bootstrap, event_type="initial_anchor_started"
                     )
-                    self._constitution_state_revision = persisted_state.revision
                     constitution_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
                     # Mirror inception's governance wiring so the integrity audit's
                     # edge proof (#2463) holds for a lazily-anchored legacy agent.
                     await self._anchor_constitution_governance(constitution_hash)
                     agent_node.properties["constitution_hash"] = constitution_hash
                     await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())
+                # store.write joined the outer graph transaction. Its revision
+                # becomes usable custody only after that transaction commits;
+                # publishing it before commit lets rollback accidentally match
+                # another replica's subsequent lifecycle restriction.
+                self._constitution_state_revision = persisted_state.revision
+                self._constitution_state_generation = persisted_state.generation
                 logging.info(f"Anchored constitution with hash: {constitution_hash}")
             except Exception as e:
                 return f"Error: Failed to anchor constitution: {e}"

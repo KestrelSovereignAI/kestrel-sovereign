@@ -396,6 +396,36 @@ async def _open_durable_harness(db_path, now, *, is_new_identity=False):
 
 
 @pytest.mark.asyncio
+async def test_rolled_back_bootstrap_cannot_overwrite_later_lifecycle_restriction(tmp_path):
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin, SafeModeCause
+    from kestrel_sovereign.storage import GraphNode
+
+    now = datetime(2026, 10, 9, 16, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(tmp_path / "rollback-bootstrap.db", now, is_new_identity=True)
+    try:
+        await storage.add_node(GraphNode(node_id=first.agent_id, node_type="agent", label="new", properties={}))
+        first.extension = None
+        first._anchor_constitution_governance = AsyncMock(side_effect=RuntimeError("native graph failure"))
+        committed_revision = first._constitution_state_revision
+        result = await ConstitutionMixin._get_governing_constitution(first)
+        assert result.startswith("Error: Failed to anchor")
+        assert (await first._constitution_state_store.load(first.agent_id)).revision == committed_revision
+        assert "constitution_hash" not in (await storage.get_node(first.agent_id)).properties
+
+        other = _DurableConstitutionHarness(storage, now)
+        await other._initialize_constitution_runtime_state()
+        assert await other.enter_safe_mode("uncertain lifecycle after graph rollback",
+                                          cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value)
+        assert await first.enter_safe_mode("startup bootstrap failed", cause=SafeModeCause.BOOTSTRAP.value)
+        durable = await first._constitution_state_store.load(first.agent_id)
+        assert durable.safe_mode_cause == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+        assert durable.safe_mode_reason == "uncertain lifecycle after graph rollback"
+        assert first._safe_mode_cause == durable.safe_mode_cause
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("integrity_valid", [True, False])
 async def test_future_persisted_audit_requires_real_startup_verification(tmp_path, integrity_valid):
     now = datetime(2026, 10, 9, 14, tzinfo=timezone.utc)
