@@ -913,6 +913,49 @@ async def test_native_bootstrap_rollback_preserves_lifecycle_fence_on_both_backe
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_committed_native_anchor_custody_is_single_use_on_both_backends(db_backend):
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.constitution.runtime_state import ConstitutionStateConflictError
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from tests.unit.test_constitution_audit import _DurableConstitutionHarness
+
+    now = datetime.now(timezone.utc)
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:single-anchor:" + uuid4().hex)
+    await storage.initialize()
+    first = _DurableConstitutionHarness(storage, now)
+    first.agent_id = storage.agent_id
+    await first._initialize_constitution_runtime_state(is_new_identity=True)
+    try:
+        await storage.add_node(GraphNode(node_id=first.agent_id, node_type="agent", label="new", properties={}))
+        first.extension = None
+        first._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(first)
+        result = await ConstitutionMixin._get_governing_constitution(first)
+        assert not result.startswith("Error:")
+        consumed = await first._constitution_state_store.load(first.agent_id)
+        assert consumed.bootstrap_pending is False
+        assert consumed.last_successful_audit_at is None
+        with pytest.raises(ConstitutionStateConflictError):
+            await first._constitution_state_store.write(replace(consumed, bootstrap_pending=True))
+        assert await first._constitution_state_store.load(first.agent_id) == consumed
+
+        node = await storage.get_node(first.agent_id)
+        del node.properties["constitution_hash"]
+        await storage.add_node(node)
+        restored = _DurableConstitutionHarness(storage, now)
+        restored.agent_id = storage.agent_id
+        await restored._initialize_constitution_runtime_state()
+        restored.extension = None
+        restored._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(restored)
+        result = await ConstitutionMixin._get_governing_constitution(restored)
+        assert result.startswith("Error: Missing governing anchor requires native signed repair")
+        assert restored._constitution_audit_pending is True
+        assert "constitution_hash" not in (await storage.get_node(first.agent_id)).properties
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_pre_revision_writer_cannot_clear_new_runtime_state(db_backend):
     """Mixed-version replicas must fail closed, not bypass the new CAS."""
     from kestrel_sovereign.constitution.runtime_state import (

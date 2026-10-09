@@ -9,6 +9,7 @@ section, and the feature addresses the units the document actually uses.
 
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -21,7 +22,7 @@ DOCS_MIRROR = Path("docs/principles/KESTREL_CONSTITUTION.md")
 
 
 def _feature(text: str = CANONICAL) -> ConstitutionFeature:
-    feature = ConstitutionFeature(Mock())
+    feature = ConstitutionFeature(SimpleNamespace())
     feature.full_text = text
     feature._parse_structure()
     feature._generate_summary()

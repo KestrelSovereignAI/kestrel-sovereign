@@ -384,6 +384,7 @@ class ConstitutionRuntimeStateStore:
                       AND (NOT safe_mode OR ? OR ?)
                       AND (interaction_count <= ? OR ?)
                       AND (NOT bootstrap_pending OR ? OR ?)
+                      AND (bootstrap_pending OR NOT ?)
                     RETURNING revision
                     """,
                     values[1:] + (
@@ -392,7 +393,8 @@ class ConstitutionRuntimeStateStore:
                         max(0, int(state.interaction_count)),
                         self._boolean_param(authorized_exit or event_type == "audit_succeeded"),
                         self._boolean_param(state.bootstrap_pending),
-                        self._boolean_param(authorized_exit or event_type == "audit_succeeded"),
+                        self._boolean_param(authorized_exit or event_type in ("audit_succeeded", "initial_anchor_started")),
+                        self._boolean_param(state.bootstrap_pending),
                     ),
                 )
             if written is not None and event_type is not None:

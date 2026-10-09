@@ -5,6 +5,7 @@ import hashlib
 import os
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
 from enum import Enum
@@ -897,8 +898,6 @@ class ConstitutionMixin:
         # ``state_not_persisted`` and health claimed the recovered write had
         # never persisted. The except path re-sets it if this write fails.
         try:
-            from dataclasses import replace
-
             from kestrel_sovereign.constitution.runtime_state import (
                 ConstitutionStateConflictError,
             )
@@ -937,6 +936,11 @@ class ConstitutionMixin:
                         and current.safe_mode_cause
                         == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
                     )
+                    if preserve_lifecycle:
+                        # A proof about the prior restriction cannot authorize
+                        # the newer generation/revision we are adopting.
+                        self._feature_lifecycle_repair_verified = False
+                        self._feature_lifecycle_integrity_uncertain = True
                     snapshot = replace(
                         snapshot,
                         revision=current.revision,
@@ -1680,6 +1684,7 @@ class ConstitutionMixin:
         if not persisted:
             self._safe_mode_exited_at = old_exited_at
             self._safe_mode_exit_authorization = old_exit_authorization
+            self._feature_lifecycle_repair_verified = False
             return "Safe Mode remains active: constitutional state could not be persisted."
 
         self._safe_mode = False
@@ -2301,7 +2306,8 @@ class ConstitutionMixin:
                     ):
                         raise ValueError("durable new-identity bootstrap custody changed")
                     persisted_state = await store.write(
-                        bootstrap, event_type="initial_anchor_started"
+                        replace(bootstrap, bootstrap_pending=False),
+                        event_type="initial_anchor_started",
                     )
                     constitution_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
                     # Mirror inception's governance wiring so the integrity audit's
@@ -2315,6 +2321,9 @@ class ConstitutionMixin:
                 # another replica's subsequent lifecycle restriction.
                 self._constitution_state_revision = persisted_state.revision
                 self._constitution_state_generation = persisted_state.generation
+                # Initial-anchor custody is single-use; a missing successful
+                # audit timestamp independently keeps the full audit due.
+                self._constitution_bootstrap_pending = False
                 logging.info(f"Anchored constitution with hash: {constitution_hash}")
             except Exception as e:
                 return f"Error: Failed to anchor constitution: {e}"

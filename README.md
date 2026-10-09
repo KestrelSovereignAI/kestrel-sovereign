@@ -966,9 +966,17 @@ SQLite upgrades reserve the writer slot and recheck before adding columns.
 Automatic first anchoring requires a still-pending durable new-identity marker
 and matching generation/revision, revalidated within the native graph
 transaction. In-memory bootstrap custody advances only after graph commit.
+The transaction consumes that single-use marker with the anchor; interruption
+before verification cannot authorize a second anchor. The absent successful
+audit timestamp independently keeps the full startup audit due. Consumed
+custody cannot be re-enabled by an ordinary runtime-state write.
 Reading a constitution or initializing its display feature never repairs an
 existing identity's deleted anchor. That requires native signed reanchor and
 the normal full integrity verification; an absent anchor is not a fresh boot.
+The display feature reads the authoritative anchored text before each request;
+pre-anchor initialization never caches unrelated packaged governing text.
+Adopting a newer lifecycle restriction invalidates older volatile repair proof;
+an exit must verify the adopted restriction before it can clear Safe Mode.
 
 ## 🔄 Next Steps
 
