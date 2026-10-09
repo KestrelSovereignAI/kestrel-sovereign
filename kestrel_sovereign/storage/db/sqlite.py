@@ -26,6 +26,7 @@ from .interface import (
     TransactionError,
 )
 from .write_audit import record_write_query, record_write_script
+from .transaction_control import reject_transaction_control, sqlite_statements
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,18 @@ def _is_sqlite_interrupt(exc: Exception) -> bool:
         isinstance(exc, sqlite3.OperationalError)
         and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT
     )
+
+
+def _owned_script_statements(script: str) -> list[str]:
+    """Split with SQLite's grammar, retaining the outer transaction owner.
+
+    ``executescript`` implicitly commits before executing anything, even when
+    our task owns an open transaction. Use individual complete statements in
+    that case. SQLite's completeness parser handles quoted semicolons and
+    trigger bodies; this is not a split-on-semicolon SQL parser.
+    """
+    reject_transaction_control(script, dialect="sqlite")
+    return sqlite_statements(script)
 
 
 @dataclass
@@ -1165,6 +1178,8 @@ class SQLiteBackend(DatabaseBackend):
 
     async def execute(self, query: str, params: Params = ()) -> int:
         """Execute a write query."""
+        if self.owns_open_transaction:
+            reject_transaction_control(query, dialect="sqlite")
         record_write_query(query)
         conn = self._ensure_connected()
         async with self._write_guard():
@@ -1191,6 +1206,8 @@ class SQLiteBackend(DatabaseBackend):
         """Execute query with multiple parameter sets."""
         if not params_list:
             return 0
+        if self.owns_open_transaction:
+            reject_transaction_control(query, dialect="sqlite")
         record_write_query(query)
         conn = self._ensure_connected()
         async with self._write_guard():
@@ -1251,6 +1268,8 @@ class SQLiteBackend(DatabaseBackend):
         connections remain owned by :meth:`_read_connection` and close there.
         """
         cursor: Optional[aiosqlite.Cursor] = None
+        if self.owns_open_transaction:
+            reject_transaction_control(query, dialect="sqlite")
         cancelled = False
         try:
             cursor = await conn.execute(query, params)
@@ -1373,7 +1392,12 @@ class SQLiteBackend(DatabaseBackend):
         async with self._write_guard():
             with self._write_operation():
                 try:
-                    await conn.executescript(script)
+                    if self._in_transaction:
+                        for statement in _owned_script_statements(script):
+                            cursor = await conn.execute(statement)
+                            await cursor.close()
+                    else:
+                        await conn.executescript(script)
                     if not self._in_transaction:
                         await conn.commit()
                 except asyncio.CancelledError:

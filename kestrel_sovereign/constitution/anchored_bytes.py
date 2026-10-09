@@ -30,6 +30,8 @@ under that hash holds exactly those bytes. Same argument as the unscoped
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import re
 from copy import deepcopy
 from collections.abc import Iterable, Mapping
@@ -39,6 +41,40 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 logger = logging.getLogger(__name__)
+
+
+async def store_verified_governing_file(storage, content: bytes, *, verification) -> str:
+    """Native signed writers may restore this exact verified public blob owner.
+
+    This is a first-party repair primitive inside an owning graph transaction,
+    not a weaker generic file-store claim. The caller has verified its pinned
+    external root and revalidates its governing witness before commit. Existing
+    bytes must decrypt to the exact signed content; corruption is not replaced.
+    """
+    from kestrel_sovereign.constitution.amendment_artifact import AmendmentArtifactVerification
+    from kestrel_sovereign.storage.async_file_store import AsyncFileStore
+
+    digest = hashlib.sha256(content).hexdigest()
+    if (
+        not isinstance(verification, AmendmentArtifactVerification)
+        or verification.ok is not True
+        or verification.constitution_sha256 != digest
+        or storage.owns_open_transaction is not True
+        or not storage.files.agent_id
+    ):
+        raise RuntimeError("governing file restoration requires verified signed content and owned custody")
+    files = storage.files
+    unbound = AsyncFileStore(storage.db)
+    existing = await unbound.retrieve_file(digest)
+    if existing is not None:
+        if existing != content:
+            raise RuntimeError("stored governing file differs from exact signed content")
+        metadata = await unbound.get_file_metadata(digest)
+        await storage.db.execute(
+            files._reference_upsert_sql(),
+            (digest, files.agent_id, "KESTREL_CONSTITUTION.md", json.dumps(metadata) if metadata else None),
+        )
+    return await storage.store_file(content, "KESTREL_CONSTITUTION.md")
 
 
 def historical_anchor_hash(

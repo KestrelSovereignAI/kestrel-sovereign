@@ -5,6 +5,7 @@ import hashlib
 import os
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
@@ -964,6 +965,8 @@ class ConstitutionMixin:
                 try:
                     conflict = None
                     async with store._backend.transaction():
+                        if event_type == "safe_mode_exited":
+                            await ConstitutionMixin._lock_verified_constitution_exit(self)
                         # A transaction-owning task can refuse without waiting
                         # for our state lock. Recheck AFTER the database writer
                         # lock is acquired, never publish over that new latch.
@@ -1753,6 +1756,51 @@ class ConstitutionMixin:
                 self, authorization
             )
 
+    async def _lock_verified_constitution_exit(self):
+        """Retain native governance, blob and ownership custody through exit.
+
+        The earlier diagnostic verification is not authority to clear state:
+        another connection may change graph/file evidence without updating the
+        runtime CAS row. Acquire the canonical graph writer locks, then physical
+        PostgreSQL evidence-row locks, and verify again inside the commit owner.
+        SQLite's owning writer transaction supplies the same serialization.
+        """
+        from kestrel_sovereign.constitution.genesis_audit import (
+            GENESIS_AUDIT_PASSED, validate_completed_genesis_audit,
+        )
+
+        raw = self._raw_storage
+        node = await raw.get_node(self.agent_id)
+        digest = node.properties.get("constitution_hash") if node is not None else None
+        await raw.lock_nodes_for_update([self.agent_id, digest] if digest else [self.agent_id])
+        if raw.db.backend_type == "postgres":
+            await raw.db.fetchall(
+                "SELECT node_id FROM graph_node_owners WHERE node_id = ? AND agent_id = ? FOR UPDATE",
+                (self.agent_id, self.agent_id),
+            )
+            await raw.db.fetchall(
+                "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by' ORDER BY target_id FOR UPDATE",
+                (self.agent_id,),
+            )
+            await raw.db.fetchall(
+                "SELECT target_id FROM graph_edge_owners WHERE source_id = ? AND label = 'governed_by' AND agent_id = ? ORDER BY target_id FOR UPDATE",
+                (self.agent_id, self.agent_id),
+            )
+            if digest:
+                await raw.db.fetchone("SELECT content_hash FROM files WHERE content_hash = ? FOR UPDATE", (digest,))
+                await raw.db.fetchone("SELECT content_hash FROM file_owners WHERE content_hash = ? AND agent_id = ? FOR UPDATE", (digest, self.agent_id))
+        # A different pointer won while we waited for the graph locks. Do not
+        # widen the lock set out of canonical order or adopt its newer proof.
+        fresh = await raw.get_node(self.agent_id)
+        if (fresh.properties.get("constitution_hash") if fresh is not None else None) != digest:
+            raise RuntimeError("Safe Mode exit governing pointer changed during custody acquisition")
+        valid, message = await self._verify_constitution_integrity()
+        if valid is not True:
+            raise RuntimeError("Safe Mode exit locked integrity verification failed: " + message)
+        if fresh is not None and "genesis_audit" in fresh.properties:
+            if validate_completed_genesis_audit(fresh.properties["genesis_audit"], digest) != GENESIS_AUDIT_PASSED:
+                raise RuntimeError("Safe Mode exit requires a passed genesis receipt for its governing bytes")
+
     async def _exit_safe_mode_locked(self, authorization: str = None):
         """Locked implementation of :meth:`exit_safe_mode`."""
         if not ConstitutionMixin._constitution_transition_is_current(self):
@@ -1993,7 +2041,7 @@ class ConstitutionMixin:
         return dids
 
     async def _anchor_constitution_governance(
-        self, constitution_hash: str
+        self, constitution_hash: str, *, verified_targets=None
     ) -> list[str]:
         """Ensure the constitution document node + ``governed_by`` edge exist,
         and that NO other ``governed_by`` edge survives.
@@ -2042,16 +2090,23 @@ class ConstitutionMixin:
             await self.storage.add_edge(
                 self.agent_id, constitution_hash, "governed_by"
             )
-            edges = await self.storage.get_edges_from(self.agent_id)
-            for edge in edges or []:
-                if (
-                    getattr(edge, "label", None) == "governed_by"
-                    and getattr(edge, "target_id", None) != constitution_hash
-                ):
+            if verified_targets is None:
+                edges = await self.storage.get_edges_from(self.agent_id)
+                targets = {
+                    edge.target_id for edge in edges or []
+                    if getattr(edge, "label", None) == "governed_by"
+                }
+            else:
+                # A signed writer's exact unscoped witness was revalidated
+                # under its native graph locks. Include pre-ledger ownerless
+                # edges which a tenant-bound read deliberately cannot see.
+                targets = set(verified_targets)
+            for target in sorted(targets):
+                if target != constitution_hash:
                     await self.storage.delete_edge(
-                        self.agent_id, edge.target_id, "governed_by"
+                        self.agent_id, target, "governed_by"
                     )
-                    pruned.append(edge.target_id)
+                    pruned.append(target)
         if pruned:
             logging.warning(
                 "Pruned %d stale governed_by edge(s) while anchoring %s: %s",
@@ -2273,38 +2328,6 @@ class ConstitutionMixin:
             )
             return f"Error: {exc}"
 
-        if new_hash == old_hash:
-            # The signed artifact for this exact hash verified above, so
-            # converging the governance edges is inside the same
-            # authorization envelope (#2617): re-assert the anchored edge
-            # and prune any dangling governed_by edges left by pre-fix
-            # reanchors, instead of leaving them for the audit to trip on.
-            # The helper runs its edge convergence in one transaction, so a
-            # mid-prune failure rolls back rather than committing a partial
-            # edge set.
-            try:
-                async with ConstitutionMixin._constitution_state_guard(self), self.storage.transaction():
-                    await self.storage.lock_nodes_for_update([self.agent_id, new_hash])
-                    agent_node = await revalidate_governance_evidence(self._raw_storage, self.agent_id, governance_preflight)
-                    pruned = await self._anchor_constitution_governance(new_hash)
-                    consumed = await ConstitutionMixin._consume_initial_anchor_custody(self)
-                ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
-            except Exception as e:
-                return (
-                    f"Error: Governance edge cleanup failed and was rolled "
-                    f"back; no changes were committed: {e}"
-                )
-            stale_pruned = [t for t in (pruned or []) if t != old_hash]
-            if stale_pruned:
-                return (
-                    f"Constitution already anchored to current version. "
-                    f"Hash: {new_hash[:16]}...\n"
-                    f"  Pruned {len(stale_pruned)} stale governed_by "
-                    f"edge(s): "
-                    + ", ".join(f"{t[:16]}..." for t in stale_pruned)
-                )
-            return f"Constitution already anchored to current version. Hash: {new_hash[:16]}..."
-
         from kestrel_sovereign.constitution.genesis_audit import (
             supersede_genesis_audit,
         )
@@ -2322,8 +2345,20 @@ class ConstitutionMixin:
         # could observe it.
         try:
             async with ConstitutionMixin._constitution_state_guard(self), self.storage.transaction():
-                stored_hash = await self.storage.store_file(
-                    constitution_content, "KESTREL_CONSTITUTION.md"
+                from kestrel_sovereign.constitution.anchored_bytes import store_verified_governing_file
+
+                # The full write set is known from the verified bytes. Take
+                # custody and revalidate before writing even a file owner: a
+                # stale authorization must not stage mutations first.
+                artifact_hash = hashlib.sha256(amendment_artifact_bytes).hexdigest()
+                await self.storage.lock_nodes_for_update(
+                    [self.agent_id, artifact_hash, new_hash]
+                )
+                agent_node = await revalidate_governance_evidence(
+                    self._raw_storage, self.agent_id, governance_preflight
+                )
+                stored_hash = await store_verified_governing_file(
+                    self._raw_storage, constitution_content, verification=verification,
                 )
                 artifact_hash = await self.storage.store_file(
                     amendment_artifact_bytes,
@@ -2351,10 +2386,6 @@ class ConstitutionMixin:
                 # The runtime and setup reanchor writers touch these shared
                 # rows in different semantic order. Take the complete set first
                 # so PostgreSQL always observes one canonical lock order.
-                await self.storage.lock_nodes_for_update(
-                    [self.agent_id, artifact_hash, stored_hash]
-                )
-                agent_node = await revalidate_governance_evidence(self._raw_storage, self.agent_id, governance_preflight)
                 await self.storage.add_node(
                     artifact_node,
                     capability=acquire_control_plane_capability(),
@@ -2367,7 +2398,8 @@ class ConstitutionMixin:
                 # old anchor's edge plus any dangling ones (#2617). Its own
                 # transaction scope joins this outer one (same task).
                 pruned_edges = await self._anchor_constitution_governance(
-                    stored_hash
+                    stored_hash,
+                    verified_targets=governance_preflight["governed_by_targets"],
                 )
                 stale_pruned = [
                     t for t in (pruned_edges or []) if t != old_hash
@@ -2379,12 +2411,13 @@ class ConstitutionMixin:
                 # require a fresh audit bound to the new hash. The reanchor
                 # command itself remains available; the next ordinary
                 # cognition turn completes this explicit pending state.
-                supersede_genesis_audit(
-                    agent_node.properties,
-                    constitution_hash=stored_hash,
-                    provenance="runtime:constitution_reanchor",
-                    recorded_at=self._get_timestamp(),
-                )
+                if new_hash != old_hash:
+                    supersede_genesis_audit(
+                        agent_node.properties,
+                        constitution_hash=stored_hash,
+                        provenance="runtime:constitution_reanchor",
+                        recorded_at=self._get_timestamp(),
+                    )
                 supersede_constitution_reanchor(
                     agent_node.properties,
                     receipt={
@@ -2439,8 +2472,16 @@ class ConstitutionMixin:
         stale_note = ""
         if stale_pruned:
             stale_note = (
-                f"\n  Pruned stale governed_by edge(s): "
+                f"\n  Pruned {len(stale_pruned)} stale governed_by edge(s): "
                 + ", ".join(f"{t[:16]}..." for t in stale_pruned)
+            )
+
+        if new_hash == old_hash:
+            return (
+                f"Constitution already anchored to current version. Hash: {new_hash[:16]}...\n"
+                f"  Signed repair restored content/ownership and recorded artifact {artifact_hash[:16]}... "
+                f"signed by {verification.signer}."
+                f"{stale_note}{safe_mode_note}"
             )
 
         return (
@@ -2536,12 +2577,8 @@ class ConstitutionMixin:
                 # land together or not at all — a partial lazy anchor would
                 # be the same property/edge drift #2617 repairs.
                 async with ConstitutionMixin._constitution_state_guard(self), self.storage.transaction():
-                    # All native anchor writers reserve files BEFORE graph
-                    # rows. PostgreSQL uniqueness waits on an uncommitted blob
-                    # must never hold graph locks a signed file writer needs.
-                    constitution_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
-                    # Reserve the native graph write set, then revalidate the
-                    # durable bootstrap marker under the same transaction.
+                    # Match signed repair and exit verification: reserve the
+                    # graph write set before file ownership/blob writes.
                     initial_hash = hashlib.sha256(constitution_content).hexdigest()
                     await self.storage.lock_nodes_for_update(
                         sorted([self.agent_id, initial_hash])
@@ -2560,6 +2597,7 @@ class ConstitutionMixin:
                         or bootstrap.generation != self._constitution_state_generation
                     ):
                         raise ValueError("durable new-identity bootstrap custody changed")
+                    constitution_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
                     persisted_state = await ConstitutionMixin._consume_initial_anchor_custody(self)
                     # Mirror inception's governance wiring so the integrity audit's
                     # edge proof (#2463) holds for a lazily-anchored legacy agent.
@@ -2605,7 +2643,41 @@ class ConstitutionMixin:
         except Exception as e:
             return f"Error: Could not retrieve constitution for hash {constitution_hash}. Reason: {e}"
 
-    async def _persist_governance_receipt_node(self, agent_node: GraphNode) -> None:
+    async def _genesis_publication_witness(self, agent_node: GraphNode) -> dict:
+        """Capture the governing facts before awaiting an independent auditor."""
+        from kestrel_sovereign.constitution.anchored_bytes import governance_evidence
+
+        raw = getattr(self, "_raw_storage", None)
+        rows = await raw.db.fetchall(
+            "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'",
+            (self.agent_id,),
+        ) if raw is not None and getattr(raw, "db", None) is not None else []
+        return {
+            "governance": governance_evidence(agent_node.properties, (row[0] for row in rows)),
+            "runtime_fence": (vars(self).get("_constitution_state_revision"), vars(self).get("_constitution_state_generation")),
+            "refusal_generation": vars(self).get("_constitution_refusal_generation", 0),
+        }
+
+    async def _persist_governance_receipt_node(
+        self, agent_node: GraphNode, *, expected: dict, conversation: Optional[dict] = None,
+    ) -> None:
+        """Translate a rolled-back native publication refusal into audit failure."""
+        from kestrel_sovereign.constitution.genesis_audit import GenesisAuditError
+        from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
+
+        try:
+            await ConstitutionMixin._persist_governance_receipt_node_owned(
+                self, agent_node, expected=expected, conversation=conversation,
+            )
+        except (RuntimeError, QueryError, TransactionError) as exc:
+            # The owning transaction has finished rollback before returning
+            # here. Cancellation and process termination remain BaseException
+            # and must not be translated into an ordinary model refusal.
+            raise GenesisAuditError("Native genesis publication refused: " + str(exc)) from exc
+
+    async def _persist_governance_receipt_node_owned(
+        self, agent_node: GraphNode, *, expected: dict, conversation: Optional[dict] = None,
+    ) -> None:
         """Persist a fresh first-party governance receipt on the agent node.
 
         The genesis-audit receipt is free-text (audit verdict/reasoning) that no
@@ -2623,17 +2695,62 @@ class ConstitutionMixin:
         (degraded/test paths).
         """
         raw = getattr(self, "_raw_storage", None)
-        if raw is not None and hasattr(raw, "add_node"):
-            await raw.add_node(agent_node)
-        else:
-            await self.storage.add_node(
-                agent_node, capability=acquire_control_plane_capability()
-            )
+        db = getattr(raw, "db", None)
+
+        async def write(node):
+            if raw is not None and hasattr(raw, "add_node"):
+                await raw.add_node(node)
+            else:
+                await self.storage.add_node(node, capability=acquire_control_plane_capability())
+            if conversation is not None:
+                await self.privacy_agent.add_conversation(**conversation)
+
+        if db is None:
+            await write(agent_node)
+            return
+
+        from kestrel_sovereign.constitution.anchored_bytes import revalidate_governance_evidence
+        from kestrel_sovereign.constitution.runtime_state import ConstitutionStateConflictError
+
+        ConstitutionMixin._require_owned_constitution_commit(self)
+        committed_state = None
+        async with ConstitutionMixin._constitution_state_guard(self):
+            async with db.transaction():
+                await raw.lock_nodes_for_update(sorted({
+                    self.agent_id,
+                    *expected["governance"]["governed_by_targets"],
+                    agent_node.properties["constitution_hash"],
+                }))
+                fresh = await revalidate_governance_evidence(raw, self.agent_id, expected["governance"])
+                # Merge only this receipt. A pre-auditor graph node is never a
+                # replacement for metadata written during the awaited audit.
+                fresh.properties["genesis_audit"] = deepcopy(agent_node.properties["genesis_audit"])
+                await write(fresh)
+                store = vars(self).get("_constitution_state_store")
+                if "_constitution_state_store" in vars(self):
+                    if store is None:
+                        raise RuntimeError("genesis runtime custody is unavailable")
+                    current = await store.load(self.agent_id)
+                    if current is None or (current.revision, current.generation) != expected["runtime_fence"]:
+                        raise ConstitutionStateConflictError("genesis runtime custody changed")
+                    committed_state = await store.write(
+                        replace(current, updated_at=self._constitution_now()),
+                        event_type="genesis_receipt_written",
+                    )
+                if vars(self).get("_constitution_refusal_generation", 0) != expected["refusal_generation"]:
+                    raise RuntimeError("genesis publication invalidated by an unpersisted restriction")
+            if vars(self).get("_constitution_refusal_generation", 0) != expected["refusal_generation"]:
+                raise RuntimeError("genesis publication invalidated after commit")
+            if committed_state is not None:
+                self._constitution_state_revision = committed_state.revision
+                self._constitution_state_generation = committed_state.generation
 
     async def _persist_genesis_audit_completion(
         self,
         agent_node: GraphNode,
         record: dict,
+        *,
+        expected: dict,
     ) -> None:
         """Atomically persist the node receipt and conversation witness."""
         agent_node.properties["genesis_audit"] = record
@@ -2643,20 +2760,13 @@ class ConstitutionMixin:
             f"{record.get('reasoning', '')}"
         )
 
-        async def _write() -> None:
-            await self._persist_governance_receipt_node(agent_node)
-            await self.privacy_agent.add_conversation(
+        await self._persist_governance_receipt_node(
+            agent_node, expected=expected, conversation=dict(
                 role="system",
                 content=content,
                 metadata={"event": "genesis_audit", "result": record},
-            )
-
-        db = getattr(getattr(self, "_raw_storage", None), "db", None)
-        if db is None:
-            await _write()
-            return
-        async with db.transaction():
-            await _write()
+            ),
+        )
 
     async def _persist_genesis_audit_pending_attempt(
         self,
@@ -2664,6 +2774,7 @@ class ConstitutionMixin:
         *,
         code: str,
         provenance: str,
+        expected: dict,
     ) -> None:
         """Keep an unavailable auditor retryable without leaking diagnostics."""
         from kestrel_sovereign.constitution.genesis_audit import (
@@ -2683,7 +2794,7 @@ class ConstitutionMixin:
         existing["last_error"] = code
         existing["audited"] = False
         agent_node.properties["genesis_audit"] = existing
-        await self._persist_governance_receipt_node(agent_node)
+        await self._persist_governance_receipt_node(agent_node, expected=expected)
 
     async def perform_genesis_audit(
         self,
@@ -2713,6 +2824,7 @@ class ConstitutionMixin:
                 "Genesis audit failed: governing constitution hash is missing."
             )
 
+        expected = await ConstitutionMixin._genesis_publication_witness(self, agent_node)
         existing = agent_node.properties.get("genesis_audit")
         if isinstance(existing, dict):
             status = existing.get("status")
@@ -2740,7 +2852,7 @@ class ConstitutionMixin:
                     }
                 )
                 agent_node.properties["genesis_audit"] = existing
-                await self._persist_governance_receipt_node(agent_node)
+                await self._persist_governance_receipt_node(agent_node, expected=expected)
             if status not in (
                 GENESIS_AUDIT_PENDING,
                 GENESIS_AUDIT_PASSED,
@@ -2767,6 +2879,7 @@ class ConstitutionMixin:
                 agent_node,
                 code="constitution_unavailable",
                 provenance=provenance,
+                expected=expected,
             )
             raise GenesisAuditPendingError("constitution_unavailable")
         constitution_bytes = (
@@ -2779,6 +2892,7 @@ class ConstitutionMixin:
                 agent_node,
                 code="constitution_hash_mismatch",
                 provenance=provenance,
+                expected=expected,
             )
             raise GenesisAuditError(
                 "Genesis audit failed: stored governing bytes do not match "
@@ -2797,10 +2911,11 @@ class ConstitutionMixin:
                 agent_node,
                 code=exc.code,
                 provenance=provenance,
+                expected=expected,
             )
             raise
         except GenesisAuditRejectedError as exc:
-            await self._persist_genesis_audit_completion(agent_node, exc.record)
+            await self._persist_genesis_audit_completion(agent_node, exc.record, expected=expected)
             logging.error(
                 "Genesis audit rejected governing constitution for %s at risk %s",
                 self.agent_id,
@@ -2808,7 +2923,7 @@ class ConstitutionMixin:
             )
             raise
 
-        await self._persist_genesis_audit_completion(agent_node, record)
+        await self._persist_genesis_audit_completion(agent_node, record, expected=expected)
         logging.info(
             "Genesis self-audit passed for %s at risk %s",
             self.agent_id,
@@ -2842,12 +2957,13 @@ class ConstitutionMixin:
                 raise GenesisAuditError(
                     "Genesis audit readiness has no governing constitution hash."
                 )
+            expected = await ConstitutionMixin._genesis_publication_witness(self, agent_node)
             record = pending_genesis_audit(
                 constitution_hash,
                 provenance="runtime:migrated_legacy_identity",
             )
             agent_node.properties["genesis_audit"] = record
-            await self._persist_governance_receipt_node(agent_node)
+            await self._persist_governance_receipt_node(agent_node, expected=expected)
 
         if not isinstance(record, dict):
             raise GenesisAuditError("Genesis audit state is malformed.")

@@ -987,7 +987,7 @@ async def test_runtime_reanchor_rolls_back_on_midprune_failure(
 
     pre = await _snapshot(db_path, creds.agent_did)
 
-    async with AsyncStorage(str(db_path)) as raw_storage:
+    async with AsyncStorage(str(db_path), agent_id=creds.agent_did) as raw_storage:
         storage = PrivacyEnforcingStorage(raw_storage)
         agent = _RuntimeAgentHarness(
             storage, creds.agent_did, trust_root_path, raw_storage
@@ -1014,7 +1014,7 @@ async def test_runtime_reanchor_rolls_back_on_midprune_failure(
 
     # Same command without the injected failure: the identical storage
     # state converges to exactly one governed_by edge on the new anchor.
-    async with AsyncStorage(str(db_path)) as raw_storage:
+    async with AsyncStorage(str(db_path), agent_id=creds.agent_did) as raw_storage:
         storage = PrivacyEnforcingStorage(raw_storage)
         agent = _RuntimeAgentHarness(
             storage, creds.agent_did, trust_root_path, raw_storage
@@ -1056,7 +1056,7 @@ async def test_runtime_unchanged_cleanup_rolls_back_on_midprune_failure(
 
     pre = await _snapshot(db_path, creds.agent_did)
 
-    async with AsyncStorage(str(db_path)) as raw_storage:
+    async with AsyncStorage(str(db_path), agent_id=creds.agent_did) as raw_storage:
         storage = PrivacyEnforcingStorage(raw_storage)
         agent = _RuntimeAgentHarness(
             storage, creds.agent_did, trust_root_path, raw_storage
@@ -1119,7 +1119,7 @@ async def test_runtime_unchanged_cleanup_preserves_document_node(
 
     pre = await _snapshot(db_path, creds.agent_did)
 
-    async with AsyncStorage(str(db_path)) as raw_storage:
+    async with AsyncStorage(str(db_path), agent_id=creds.agent_did) as raw_storage:
         storage = PrivacyEnforcingStorage(raw_storage)
         agent = _RuntimeAgentHarness(
             storage, creds.agent_did, trust_root_path, raw_storage

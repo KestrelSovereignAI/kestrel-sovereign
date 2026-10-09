@@ -44,6 +44,7 @@ from .interface import (
 from .placeholder import sqlite_to_postgres
 from .timestamp import TimestamptzParameter
 from .write_audit import record_write_query, record_write_script
+from .transaction_control import reject_transaction_control
 
 logger = logging.getLogger(__name__)
 
@@ -611,6 +612,8 @@ class PostgresBackend(DatabaseBackend):
     
     def _convert_query(self, query: str) -> str:
         """Convert SQLite-style ? placeholders to PostgreSQL $N style."""
+        if self._current_txn_conn() is not None:
+            reject_transaction_control(query, dialect="postgres")
         converted, _ = sqlite_to_postgres(query)
         return converted
 
@@ -773,6 +776,8 @@ class PostgresBackend(DatabaseBackend):
     
     async def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script."""
+        if self._current_txn_conn() is not None:
+            reject_transaction_control(script, dialect="postgres")
         record_write_script(script)
         pool = self._ensure_connected()
         

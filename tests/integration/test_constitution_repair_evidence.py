@@ -19,6 +19,72 @@ from tests.integration.test_constitution_reanchor_e2e import _write_authority_fi
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+@pytest.mark.parametrize("writer", ["runtime", "offline"])
+@pytest.mark.parametrize("damage", ["blob", "ownership"])
+async def test_same_hash_signed_repair_restores_content_and_new_signer(
+    db_backend, tmp_path, monkeypatch, writer, damage,
+):
+    from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
+
+    identity = "did:test:same-hash-repair:" + uuid4().hex
+    storage = (AsyncStorage(str(tmp_path / "kestrel_prime.db"), backend="sqlite", agent_id=identity)
+               if db_backend.backend_type == "sqlite" else AsyncStorage(backend=db_backend, agent_id=identity))
+    await storage.initialize()
+    try:
+        agent = await _agent(storage)
+        await storage.add_node(GraphNode(node_id=identity, node_type="agent", label="repair", properties={}))
+        content = resolve_governing_constitution_bytes(None)
+        artifact, root = _write_authority_files(tmp_path, content)
+        agent._sovereign_trust_root_path = root
+        result = await ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(artifact))
+        assert not result.startswith("Error:"), result
+        prior = (await storage.get_node(identity)).properties
+        digest = prior["constitution_hash"]
+        if damage == "blob":
+            await storage.db.execute_commit("DELETE FROM files WHERE content_hash = ?", (digest,))
+        else:
+            await storage.db.execute_commit("DELETE FROM file_owners WHERE content_hash = ? AND agent_id = ?", (digest, identity))
+        assert await storage.retrieve_file(digest) is None
+        rotated = tmp_path / "rotated"
+        rotated.mkdir()
+        new_signer = "did:test:rotated-external-root"
+        artifact, root = _write_authority_files(rotated, content, did=new_signer, keypair=Secp256k1Suite().generate_keypair())
+        agent._sovereign_trust_root_path = root
+        if writer == "runtime":
+            result = await ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(artifact))
+            assert not result.startswith("Error:"), result
+        else:
+            target = (offline.ReanchorTarget(tmp_path / "kestrel_prime.db", "sqlite", identity)
+                      if db_backend.backend_type == "sqlite"
+                      else offline.ReanchorTarget(None, "postgres", identity, db_backend._dsn))
+
+            async def exact_target(*args, **kwargs):
+                return target
+
+            @asynccontextmanager
+            async def no_embedding(*args, **kwargs):
+                yield None
+
+            monkeypatch.setattr(offline, "resolve_reanchor_target", exact_target)
+            monkeypatch.setattr(offline, "_agent_embedding", no_embedding)
+            result = await offline.reanchor_constitution(
+                agent_name="same hash repair", agent_dir=tmp_path if target.anchor_path else None,
+                force=True, sovereign_trust_root_path=root, amendment_artifact_path=artifact,
+                runtime_backend=target.backend, runtime_dsn=target.dsn,
+                hosted_agent_did=identity if target.backend == "postgres" else None, environ={},
+            )
+            assert result.error is None, result.error
+        assert await storage.retrieve_file(digest) == content
+        after = (await storage.get_node(identity)).properties
+        assert after["constitution_reanchor"]["signed_artifact_signer"] == new_signer
+        assert after["constitution_reanchor_history"][-1]["receipt"] == prior["constitution_reanchor"]
+        assert after["genesis_audit"] == prior["genesis_audit"]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 @pytest.mark.parametrize("stale_writer", ["offline", "runtime"])
 async def test_signed_repair_rejects_new_rights_after_its_missing_pointer_preflight(
     db_backend, tmp_path, monkeypatch, stale_writer,
@@ -62,7 +128,7 @@ async def test_signed_repair_rejects_new_rights_after_its_missing_pointer_prefli
         monkeypatch.setattr(offline, "resolve_reanchor_target", exact_target)
         monkeypatch.setattr(offline, "_agent_embedding", no_embedding)
         native_write = offline._write_reanchor
-        native_store = storage.store_file
+        native_guard = ConstitutionMixin._constitution_state_guard
 
         async def paused_write(**kwargs):
             if asyncio.current_task() is task:
@@ -72,14 +138,16 @@ async def test_signed_repair_rejects_new_rights_after_its_missing_pointer_prefli
                 await proceed.wait()
             return await native_write(**kwargs)
 
-        async def paused_store(*args, **kwargs):
-            if asyncio.current_task() is task and not waiting.is_set():
+        @asynccontextmanager
+        async def paused_guard(self):
+            if asyncio.current_task() is task:
                 waiting.set()
                 await proceed.wait()
-            return await native_store(*args, **kwargs)
+            async with native_guard(self):
+                yield
 
         monkeypatch.setattr(offline, "_write_reanchor", paused_write)
-        monkeypatch.setattr(storage, "store_file", paused_store)
+        monkeypatch.setattr(ConstitutionMixin, "_constitution_state_guard", paused_guard)
 
         async def repair(artifact, *, contract_path=None):
             return await offline.reanchor_constitution(

@@ -811,20 +811,22 @@ async def test_authorized_verified_exit_is_durable_and_audited(tmp_path):
     db_path = tmp_path / "agent.db"
     entered_at = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
     first, storage = await _open_durable_harness(db_path, entered_at)
-    await first.enter_safe_mode("integrity failure")
-    first._constitution_clock = lambda: entered_at + timedelta(minutes=10)
-    first._verify_constitution_integrity = AsyncMock(
-        return_value=(True, "Constitution integrity verified")
-    )
+    try:
+        await first.enter_safe_mode("integrity failure")
+        first._constitution_clock = lambda: entered_at + timedelta(minutes=10)
+        first._verify_constitution_integrity = AsyncMock(
+            return_value=(True, "Constitution integrity verified")
+        )
 
-    result = await first.exit_safe_mode(authorization="sovereign_api_key")
-    assert "deactivated" in result
-    assert first._safe_mode is False
-    first._verify_constitution_integrity.assert_awaited_once()
-    events = await first._constitution_state_store.list_events(first.agent_id)
-    assert events[-1]["event_type"] == "safe_mode_exited"
-    assert events[-1]["authorization"] == "sovereign_api_key"
-    await storage.close()
+        result = await first.exit_safe_mode(authorization="sovereign_api_key")
+        assert "deactivated" in result
+        assert first._safe_mode is False
+        assert first._verify_constitution_integrity.await_count == 2
+        events = await first._constitution_state_store.list_events(first.agent_id)
+        assert events[-1]["event_type"] == "safe_mode_exited"
+        assert events[-1]["authorization"] == "sovereign_api_key"
+    finally:
+        await storage.close()
 
     restarted, storage = await _open_durable_harness(
         db_path, entered_at + timedelta(minutes=20)

@@ -93,6 +93,43 @@ write. With `--force`, a signed artifact and external root are mandatory. A
 successful write stores the signed artifact and signer/verification details in
 the audit record. Reanchor never exits Safe Mode automatically.
 
+### Native publication and recovery custody
+
+The native runtime and offline signed writers reserve their complete graph
+write set in canonical order before writing file blobs or ownership rows.
+Inside that owning transaction they compare the exact governing pointer,
+rights, receipt/history and edge witness against the facts inspected before
+authorization. A concurrent change requires a fresh inspection and signed
+repair attempt; unrelated identity metadata is preserved, not overwritten.
+
+A signed same-hash repair is still a repair. It restores missing verified
+public constitution content or this agent's file ownership, records the new
+signer and retains the previous reanchor receipt as history. Existing content
+must exactly match the signed bytes; corrupted content is refused. Because
+the governing hash did not change, an existing genesis receipt is preserved
+and the content audit is not repeated merely for key rotation.
+
+Genesis content-audit results are published against their captured governing
+and runtime-state witness. The native publisher merges only the new receipt
+into a freshly locked identity and publishes its new runtime CAS token after
+commit. If the witness changed, cognition reports a blocked genesis audit
+without overwriting the newer governance, rejection or identity metadata.
+
+Safe Mode exit verifies again inside its owning transaction. PostgreSQL holds
+the identity/ownership, governing edges/ownership and constitution file/owner
+rows through the exit commit; SQLite retains its native writer custody.
+An existing genesis receipt must validate as a literal pass, not merely be
+terminal. Failure leaves the durable restriction and exit-event history intact.
+
+All native SQL entry points, including script execution and SQLite diagnostic
+reads, refuse SQL transaction-control commands while an owning transaction is
+open. Callers must use the adapter's transaction context rather than issuing
+`BEGIN`, `COMMIT`, `ROLLBACK`, savepoint commands or `PREPARE` through SQL.
+SQLite scripts in an owned transaction execute statement-by-statement without
+the driver's implicit pre-script commit; trigger bodies and PostgreSQL
+dollar-quoted bodies retain their database semantics. This lexical refusal
+protects the commit boundary; it is not a general SQL authorization parser.
+
 ### Hosted PostgreSQL agents without a local anchor
 
 An embedding host that stores agent identities in PostgreSQL, with no local

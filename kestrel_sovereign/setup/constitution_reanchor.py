@@ -875,6 +875,7 @@ async def reanchor_constitution(
         and not needs_sidecar_backfill
         and not governance_edge_drift
         and not custody_pending
+        and not (force and amendment_artifact_path is not None)
     ):
         return _result(
             old_hash=old_hash,
@@ -1314,9 +1315,21 @@ async def _write_reanchor(
         async with _agent_embedding(
             storage.db, agent_did, needed=old_hash != new_hash,
         ) as embedding, storage.db.transaction():
+            # The digests are known from the externally verified bytes.
+            # Match the runtime writer: complete graph custody and evidence
+            # comparison precede *all* file/ownership writes.
+            artifact_hash = hashlib.sha256(amendment_artifact_bytes).hexdigest()
+            await storage.graph.lock_nodes_for_update(
+                [agent_did, new_hash, artifact_hash]
+            )
+            from kestrel_sovereign.constitution.anchored_bytes import revalidate_governance_evidence
+
+            await revalidate_governance_evidence(storage, agent_did, governance_preflight)
             # 1. File blob (encrypted at rest if KESTREL_DATA_KEY is set).
-            stored_hash = await storage.files.store_file(
-                new_content, "KESTREL_CONSTITUTION.md"
+            from kestrel_sovereign.constitution.anchored_bytes import store_verified_governing_file
+
+            stored_hash = await store_verified_governing_file(
+                storage, new_content, verification=amendment_verification,
             )
             if stored_hash != new_hash:
                 # store_file computes its own SHA256; if it disagrees with
@@ -1343,13 +1356,6 @@ async def _write_reanchor(
             # this setup path writes the document before the artifact. Lock the
             # complete shared set first so semantic order cannot become an
             # opposite PostgreSQL row-lock order.
-            await storage.graph.lock_nodes_for_update(
-                [agent_did, new_hash, artifact_hash]
-            )
-            from kestrel_sovereign.constitution.anchored_bytes import revalidate_governance_evidence
-
-            await revalidate_governance_evidence(storage, agent_did, governance_preflight)
-
             # 2. Document graph node for the new constitution.
             await storage.graph.add_node(
                 GraphNode(
