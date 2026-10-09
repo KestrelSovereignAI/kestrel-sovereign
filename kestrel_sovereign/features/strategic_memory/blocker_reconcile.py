@@ -35,7 +35,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .github_integration import get_github_self_repo, get_github_token, github_api_get
 from .ledger import active_blockers
@@ -171,7 +171,10 @@ def parse_issue_ref(value: object) -> Tuple[Optional[str], Optional[int]]:
 
 
 def configured_repos(strategy_data: Dict[str, Any]) -> List[str]:
-    """The repositories STRATEGY.yaml says this agent scans."""
+    """The repositories STRATEGY.yaml says this agent scans.
+
+    Each once, under the first spelling ``scan_repos`` gives it.
+    """
     if not isinstance(strategy_data, dict):
         return []
     config = strategy_data.get("morning_signal_config", {})
@@ -180,7 +183,24 @@ def configured_repos(strategy_data: Dict[str, Any]) -> List[str]:
     repos = config.get("scan_repos", [])
     if not isinstance(repos, list):
         return []
-    return [str(r).strip() for r in repos if str(r).strip()]
+    return _distinct_repositories(
+        str(r).strip() for r in repos if str(r).strip()
+    )
+
+
+def _distinct_repositories(repos: Iterable[str]) -> List[str]:
+    """``repos`` with each repository once, under its first spelling.
+
+    GitHub's names are case-insensitive, so ``Acme/widgets`` and
+    ``acme/Widgets`` are one repository. Counted as two, a repeated or
+    differently cased ``scan_repos`` entry made ``widgets#46`` ambiguous
+    between a repository and itself, and a bare number ambiguous on an agent
+    that scans one repository (#3542).
+    """
+    seen: Dict[str, str] = {}
+    for repo in repos:
+        seen.setdefault(repo.lower(), repo)
+    return list(seen.values())
 
 
 def normalize_repository(
@@ -218,7 +238,9 @@ def _read_repository(
         return text, []
     if not REPO_NAME_SHAPE.fullmatch(text):
         return None, []
-    named = [r for r in configured if _repository_name(r) == text.lower()]
+    named = _distinct_repositories(
+        r for r in configured if _repository_name(r) == text.lower()
+    )
     if len(named) > 1:
         return None, named
     if named:
@@ -359,6 +381,7 @@ def _infer_repository(
     configured: List[str], self_repo: str
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """``(repo, source, problem)`` for a row that names no repository."""
+    configured = _distinct_repositories(configured)
     if len(configured) == 1:
         # Exactly one configured repository: unqualified is unambiguous.
         return configured[0], REPO_FROM_LONE_SCAN_REPO, None
