@@ -73,16 +73,15 @@ def historical_anchor_hash(
     def inspect(receipt, kind):
         if not isinstance(receipt, Mapping):
             raise ValueError("Missing anchor pointer has unreadable historical governance receipt evidence")
-        fields = ("constitution_hash",) if kind == "genesis_audit" else ("old_hash", "new_hash")
-        found = False
-        for field in fields:
-            value = receipt.get(field)
-            if value is None or (field == "old_hash" and value == "none"):
-                continue
-            add(value)
-            found = True
-        if not found:
-            raise ValueError("Missing anchor pointer has unreadable historical governance receipt evidence")
+        # A reanchor always has a destination. Its optional prior hash cannot
+        # substitute for a missing/null destination and authorize superseded
+        # bytes as the only surviving history. Genesis likewise needs a hash.
+        required = "constitution_hash" if kind == "genesis_audit" else "new_hash"
+        add(receipt.get(required), absent_ok=False)
+        if kind == "constitution_reanchor":
+            old_hash = receipt.get("old_hash")
+            if old_hash != "none":
+                add(old_hash)
 
     for kind in ("genesis_audit", "constitution_reanchor"):
         current = properties.get(kind)

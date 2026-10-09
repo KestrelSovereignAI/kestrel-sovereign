@@ -932,11 +932,21 @@ class ConstitutionMixin:
                                 event_reason=event_reason,
                                 event_authorization=event_authorization,
                             )
+                            # PostgreSQL BEGIN reserves no row writer lock:
+                            # the UPDATE itself may wait while another task
+                            # latches a refusal. Roll its state/event back.
+                            if vars(self).get("_constitution_refusal_generation", 0) != refusal_generation:
+                                raise RuntimeError("constitutional write invalidated by an unpersisted restriction")
                         except ConstitutionStateConflictError as exc:
                             # CAS conflicts have no write/event. Surface the
                             # typed refusal AFTER leaving the empty owning
                             # scope, whose backend otherwise wraps exceptions.
                             conflict = exc
+                    # Commit and connection/lease release are also awaited.
+                    # A refusal there is NOT durable, but must remain latched
+                    # in memory; never publish this earlier write as recovery.
+                    if vars(self).get("_constitution_refusal_generation", 0) != refusal_generation:
+                        raise RuntimeError("constitutional commit publication invalidated by an unpersisted restriction")
                     if conflict is not None:
                         raise conflict
                     break

@@ -986,7 +986,10 @@ closed as well. The signed repair's own graph/state unit remains atomic.
 Refused lifecycle/audit transitions retain a volatile Safe Mode restriction
 and mark persistence pending; they do not claim a durable transition. That
 refusal also invalidates an in-flight verified exit or state writer before
-its database commit, so a lock owner cannot erase the new restriction.
+its database commit, so a lock owner cannot erase the new restriction. Writers
+check again after awaited SQL and roll back invalidated state/events; a refusal
+during commit/result delivery retains its volatile restriction and pending
+durability instead of reporting the earlier committed exit as recovery.
 The marker is single-use; interruption before verification cannot authorize a
 second anchor. The absent successful
 audit timestamp independently keeps the full startup audit due. Consumed
@@ -1004,7 +1007,9 @@ Existing emancipation receipts and historical governance bytes remain protected;
 ambiguous historical anchors or unreadable rights evidence refuse repair.
 When both pointer and edges are lost, current and historical genesis-audit and
 reanchor receipts still count as rights evidence. Typed historical hashes are
-checked without selecting an unsigned replacement pointer. Missing referenced
+checked without selecting an unsigned replacement pointer. Every reanchor
+receipt needs a valid destination `new_hash`; its optional `old_hash` cannot
+substitute for a missing or null destination. Missing referenced
 bytes, malformed receipts, conflicting references or excessive evidence fail
 closed; restore the exact prior pointer before attempting signed repair.
 Custody consumption records the transition's current UTC time, not the prior
