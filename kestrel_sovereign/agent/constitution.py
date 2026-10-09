@@ -722,6 +722,7 @@ class ConstitutionMixin:
             self._constitution_state_persistence_pending = False
 
         try:
+            ConstitutionMixin._require_owned_constitution_commit(self)
             store = ConstitutionRuntimeStateStore(self._raw_storage._backend)
             await store.initialize()
             self._constitution_state_store = store
@@ -902,6 +903,7 @@ class ConstitutionMixin:
                 ConstitutionStateConflictError,
             )
 
+            ConstitutionMixin._require_owned_constitution_commit(self)
             snapshot = self._constitution_state_snapshot(
                 now=now,
                 safe_mode=safe_mode,
@@ -1715,6 +1717,25 @@ class ConstitutionMixin:
                 )
         return "Safe mode deactivated after successful integrity verification."
 
+    def _require_owned_constitution_commit(self):
+        """Do not publish state from a joined scope or released savepoint.
+
+        Native live transitions own their commit, or refuse BEFORE mutation.
+        This covers anchor writers, first-state creation and audit/restriction
+        persistence, not merely the last line publishing an anchor fence.
+        Unknown adapters cannot supply evidence of an owned commit either.
+        """
+        if "_constitution_state_store" not in vars(self):
+            # Existing lightweight pre-runtime mixin consumers have no live
+            # durable lifecycle to publish. Real KestrelAgent always has it.
+            return
+        storage = getattr(self, "_raw_storage", None)
+        if getattr(storage, "owns_open_transaction", None) is not False:
+            raise RuntimeError(
+                "Constitutional mutation requires an owned top-level storage commit; "
+                "retry outside the caller transaction"
+            )
+
     async def _consume_initial_anchor_custody(self):
         """Join an anchor writer's transaction, never mint or adopt a fence."""
         if "_constitution_state_store" not in vars(self):
@@ -1732,6 +1753,7 @@ class ConstitutionMixin:
     def _publish_consumed_anchor_custody(self, state):
         """Publish only a successfully committed anchor transaction's fence."""
         if state is not None:
+            ConstitutionMixin._require_owned_constitution_commit(self)
             self._constitution_state_revision = state.revision
             self._constitution_state_generation = state.generation
             self._constitution_bootstrap_pending = False
@@ -1902,6 +1924,10 @@ class ConstitutionMixin:
         if expected_hash and len(expected_hash) < 8:
             return "Error: Expected hash prefix must be at least 8 characters."
 
+        try:
+            ConstitutionMixin._require_owned_constitution_commit(self)
+        except RuntimeError as exc:
+            return f"Error: {exc}; nothing was written."
         agent_node = await self.storage.get_node(self.agent_id)
         if not agent_node:
             return "Error: Agent identity node not found."
@@ -2282,6 +2308,10 @@ class ConstitutionMixin:
                 self, "_constitution_bootstrap_pending", False
             ):
                 return "Error: Missing governing anchor requires native signed repair; no new-identity bootstrap custody."
+            try:
+                ConstitutionMixin._require_owned_constitution_commit(self)
+            except RuntimeError as exc:
+                return f"Error: {exc}; nothing was written."
             bootstrap = await store.load(self.agent_id)
             if (
                 bootstrap is None

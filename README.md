@@ -976,8 +976,14 @@ Every native anchor writer (automatic bootstrap, runtime signed reanchor and
 offline signed reanchor, including same-hash repairs) consumes the marker in
 the graph transaction. Live writers publish the resulting fence only after
 commit; neither signed repair nor anchor consumption clears Safe Mode or
-records a successful audit. The marker is single-use; interruption
-before verification cannot authorize a second anchor. The absent successful
+records a successful audit. An outer caller transaction must not publish a
+live fence before committing. Native live
+anchor and state-publication paths refuse ambient transactions before writing
+(including SQLite joined scopes and PostgreSQL savepoints); retry the command
+outside that caller's transaction. Unknown commit-ownership adapters fail
+closed as well. The signed repair's own graph/state unit remains atomic.
+The marker is single-use; interruption before verification cannot authorize a
+second anchor. The absent successful
 audit timestamp independently keeps the full startup audit due. Consumed
 custody cannot be re-enabled by an ordinary runtime-state write.
 Migrated legacy pending-audit markers have no custody generation and cannot
