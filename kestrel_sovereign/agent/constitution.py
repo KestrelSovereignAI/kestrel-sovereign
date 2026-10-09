@@ -1775,11 +1775,13 @@ class ConstitutionMixin:
         await raw.lock_nodes_for_update([self.agent_id, digest] if digest else [self.agent_id])
         from kestrel_sovereign.constitution.anchored_bytes import lock_governance_rows
 
-        await lock_governance_rows(raw, self.agent_id)
+        await lock_governance_rows(raw, self.agent_id, required_target=digest)
         if raw.db.backend_type == "postgres":
             if digest:
-                await raw.db.fetchone("SELECT content_hash FROM files WHERE content_hash = ? FOR UPDATE", (digest,))
-                await raw.db.fetchone("SELECT content_hash FROM file_owners WHERE content_hash = ? AND agent_id = ? FOR UPDATE", (digest, self.agent_id))
+                blob = await raw.db.fetchone("SELECT content_hash FROM files WHERE content_hash = ? FOR UPDATE", (digest,))
+                owner = await raw.db.fetchone("SELECT content_hash FROM file_owners WHERE content_hash = ? AND agent_id = ? FOR UPDATE", (digest, self.agent_id))
+                if blob is None or owner is None:
+                    raise RuntimeError("Anchored constitution blob is missing or its ownership custody is absent")
         # A different pointer won while we waited for the graph locks. Do not
         # widen the lock set out of canonical order or adopt its newer proof.
         fresh = await raw.get_node(self.agent_id)
@@ -2365,10 +2367,7 @@ class ConstitutionMixin:
                 )
                 stored_hash = await store_verified_governing_file(
                     self._raw_storage, constitution_content, verification=verification,
-                )
-                artifact_hash = await self.storage.store_file(
-                    amendment_artifact_bytes,
-                    "KESTREL_CONSTITUTION.reanchor.signed.json",
+                    artifact_content=amendment_artifact_bytes,
                 )
 
                 artifact_node = GraphNode(
@@ -2594,6 +2593,19 @@ class ConstitutionMixin:
                         raise ValueError("identity disappeared during bootstrap")
                     if agent_node.properties.get("constitution_hash"):
                         raise ValueError("anchor changed during bootstrap; reload required")
+                    # Bootstrap is for a genuinely new, never-governed identity.
+                    # Existing edges or receipts are historical repair evidence,
+                    # not authority to prune a lost anchor without a signature.
+                    # Refuse before file/CAS writes and before expanding the
+                    # held graph set into stale targets out of canonical order.
+                    from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
+
+                    prior_targets = await self._raw_storage.db.fetchall(
+                        "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'",
+                        (self.agent_id,),
+                    )
+                    if prior_targets or historical_anchor_hash(agent_node.properties, ()):
+                        raise ValueError("prior governance requires native signed repair; bootstrap refused")
                     bootstrap = await store.load(self.agent_id)
                     if (
                         bootstrap is None
@@ -2673,16 +2685,21 @@ class ConstitutionMixin:
 
         try:
             await ConstitutionMixin._persist_governance_receipt_node_owned(
-                self, agent_node, expected=expected, conversation=conversation,
+                self, agent_node, expected=expected,
             )
         except (RuntimeError, QueryError, TransactionError) as exc:
             # The owning transaction has finished rollback before returning
             # here. Cancellation and process termination remain BaseException
             # and must not be translated into an ordinary model refusal.
             raise GenesisAuditError("Native genesis publication refused: " + str(exc)) from exc
+        # Conversation delivery is observational, not the authoritative receipt.
+        # PrivacyAgent's volatile buffers do not participate in SQL rollback;
+        # publish only after the owning commit and all refusal checks succeed.
+        if conversation is not None:
+            await self.privacy_agent.add_conversation(**conversation)
 
     async def _persist_governance_receipt_node_owned(
-        self, agent_node: GraphNode, *, expected: dict, conversation: Optional[dict] = None,
+        self, agent_node: GraphNode, *, expected: dict,
     ) -> None:
         """Persist a fresh first-party governance receipt on the agent node.
 
@@ -2708,8 +2725,6 @@ class ConstitutionMixin:
                 await raw.add_node(node)
             else:
                 await self.storage.add_node(node, capability=acquire_control_plane_capability())
-            if conversation is not None:
-                await self.privacy_agent.add_conversation(**conversation)
 
         if db is None:
             await write(agent_node)
@@ -2758,7 +2773,7 @@ class ConstitutionMixin:
         *,
         expected: dict,
     ) -> None:
-        """Atomically persist the node receipt and conversation witness."""
+        """Commit the authoritative receipt before its conversation notice."""
         agent_node.properties["genesis_audit"] = record
         status = record["status"]
         content = (

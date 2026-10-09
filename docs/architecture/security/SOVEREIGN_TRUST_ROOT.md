@@ -103,6 +103,12 @@ authorization. A concurrent change requires a fresh inspection and signed
 repair attempt; unrelated identity metadata is preserved, not overwritten.
 Native edge deletion and avatar publication participate in the same graph-first
 order; they must not acquire edge/file ownership before reserving graph rows.
+Signed file publication retains both the physical blob and exact tenant owner
+through commit. Restoring a missing owner never copies another tenant's shared
+blob metadata into the new ownership record.
+Both the constitution and its exact detached signed artifact use that same
+byte-validation and ownership-custody path. An absent locking-read result is
+not custody, even if a later ordinary read can see a replacement.
 
 A signed same-hash repair is still a repair. It restores missing verified
 public constitution content or this agent's file ownership, records the new
@@ -120,12 +126,19 @@ and runtime-state witness. The native publisher merges only the new receipt
 into a freshly locked identity and publishes its new runtime CAS token after
 commit. If the witness changed, cognition reports a blocked genesis audit
 without overwriting the newer governance, rejection or identity metadata.
+Conversation notices are delivered only after the authoritative receipt commits;
+volatile privacy buffers cannot retain a success notice from SQL rollback.
+Initial bootstrap refuses any prior governance evidence rather than expanding
+its lock set and pruning history without a signed repair.
 
 Safe Mode exit verifies again inside its owning transaction. PostgreSQL holds
 the identity/ownership, governing edges/ownership and constitution file/owner
 rows through the exit commit; SQLite retains its native writer custody.
 An existing genesis receipt must validate as a literal pass, not merely be
 terminal. Failure leaves the durable restriction and exit-event history intact.
+After a changed-hash repair the public genesis audit/readiness path can complete
+the new hash's pending audit while Safe Mode remains active. Explicit authorized
+exit follows that real audit; repeating a same-hash repair does not reroll it.
 Physical edge locks follow ownership-then-edge order, matching native deletion.
 
 All native SQL entry points, including script execution and SQLite diagnostic
@@ -134,7 +147,8 @@ open. Callers must use the adapter's transaction context rather than issuing
 `BEGIN`, `COMMIT`, `ROLLBACK`, savepoint commands or `PREPARE` through SQL.
 SQLite scripts in an owned transaction execute statement-by-statement without
 the driver's implicit pre-script commit; trigger bodies and PostgreSQL
-dollar-quoted bodies and newline-continued escape strings retain their database
+dollar-quoted and SQL-standard `BEGIN ATOMIC` routine bodies, and
+newline-continued escape strings retain their database
 semantics. This lexical refusal
 protects the commit boundary; it is not a general SQL authorization parser.
 

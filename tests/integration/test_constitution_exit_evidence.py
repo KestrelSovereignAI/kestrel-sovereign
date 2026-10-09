@@ -15,6 +15,168 @@ from kestrel_sovereign.agent.constitution import ConstitutionMixin
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+@pytest.mark.parametrize("evidence", ["identity-owner", "edge", "edge-owner"])
+async def test_exit_requires_actual_governance_witness_custody(
+    db_backend, monkeypatch, evidence
+):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL absent-governance witness replacement")
+    import asyncpg
+
+    identity = "did:test:governance-lock-row:" + uuid4().hex
+    storage = AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    external = await asyncpg.connect(db_backend._dsn)
+    try:
+        agent = await _agent(storage)
+        digest = await storage.store_file(
+            resolve_governing_constitution_bytes(None), "KESTREL_CONSTITUTION.md"
+        )
+        await storage.add_node(
+            GraphNode(
+                node_id=identity,
+                node_type="agent",
+                label="row witness",
+                properties={"constitution_hash": digest},
+            )
+        )
+        await agent._anchor_constitution_governance(digest)
+        await agent.enter_safe_mode("governance custody race")
+        before = await agent._constitution_state_store.load(identity)
+        table, predicate, params = {
+            "identity-owner": (
+                "graph_node_owners",
+                "node_id=$1 AND agent_id=$1",
+                [identity],
+            ),
+            "edge": (
+                "graph_edges",
+                "source_id=$1 AND target_id=$2 AND label='governed_by'",
+                [identity, digest],
+            ),
+            "edge-owner": (
+                "graph_edge_owners",
+                "source_id=$1 AND target_id=$2 AND label='governed_by' AND agent_id=$1",
+                [identity, digest],
+            ),
+        }[evidence]
+        snapshot = await external.fetchrow(
+            f"SELECT * FROM {table} WHERE {predicate}", *params
+        )
+        native_fetch = db_backend.fetch_all
+        reached = []
+
+        async def replaced(query, arguments=()):
+            # Match the physical witness read, not the ownership EXISTS clause
+            # embedded in the preceding complete graph-node reservation.
+            columns_prefix = "node_id" if evidence == "identity-owner" else "target_id"
+            is_witness_read = (
+                query.startswith(f"SELECT node_id FROM {table} ")
+                if evidence == "identity-owner"
+                else query.startswith(f"SELECT {columns_prefix}")
+                and f"FROM {table} " in query
+            )
+            if not reached and is_witness_read and "FOR UPDATE" in query:
+                await external.execute(
+                    f"DELETE FROM {table} WHERE {predicate}", *params
+                )
+                result = await native_fetch(query, arguments)
+                assert result == []
+                columns = list(snapshot.keys())
+                await external.execute(
+                    f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('$' + str(i + 1) for i in range(len(columns)))})",
+                    *snapshot.values(),
+                )
+                reached.append(True)
+                return result
+            return await native_fetch(query, arguments)
+
+        monkeypatch.setattr(db_backend, "fetch_all", replaced)
+        result = await agent.exit_safe_mode(authorization="fixture sovereign")
+        assert reached == [True], result
+        assert result.startswith("Safe Mode remains active:"), result
+        assert await agent._constitution_state_store.load(identity) == before
+    finally:
+        await external.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("evidence", ["file", "file-owner"])
+async def test_exit_refuses_absent_lock_row_even_when_recreated_before_verification(
+    db_backend, monkeypatch, evidence
+):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL absent-row replacement custody")
+    import asyncpg
+
+    identity = "did:test:exit-absent-lock:" + uuid4().hex
+    storage = AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    external = await asyncpg.connect(db_backend._dsn)
+    try:
+        agent = await _agent(storage)
+        digest = await storage.store_file(
+            resolve_governing_constitution_bytes(None), "KESTREL_CONSTITUTION.md"
+        )
+        await storage.add_node(
+            GraphNode(
+                node_id=identity,
+                node_type="agent",
+                label="absent",
+                properties={"constitution_hash": digest},
+            )
+        )
+        await agent._anchor_constitution_governance(digest)
+        await agent.enter_safe_mode("absent-lock race")
+        before = await agent._constitution_state_store.load(identity)
+        table = "files" if evidence == "file" else "file_owners"
+        snapshot = await external.fetchrow(
+            f"SELECT * FROM {table} WHERE content_hash=$1"
+            + (" AND agent_id=$2" if evidence == "file-owner" else ""),
+            *([digest, identity] if evidence == "file-owner" else [digest]),
+        )
+        native_fetch = db_backend.fetch_one
+        reached = []
+
+        async def absent_then_recreated(query, params=()):
+            if not reached and query == (
+                "SELECT content_hash FROM "
+                + table
+                + " WHERE content_hash = ?"
+                + (" AND agent_id = ?" if evidence == "file-owner" else "")
+                + " FOR UPDATE"
+            ):
+                await external.execute(
+                    f"DELETE FROM {table} WHERE content_hash=$1"
+                    + (" AND agent_id=$2" if evidence == "file-owner" else ""),
+                    *params,
+                )
+                result = await native_fetch(query, params)
+                assert result is None
+                columns = list(snapshot.keys())
+                await external.execute(
+                    f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('$' + str(i + 1) for i in range(len(columns)))})",
+                    *snapshot.values(),
+                )
+                reached.append(True)
+                return result
+            return await native_fetch(query, params)
+
+        monkeypatch.setattr(db_backend, "fetch_one", absent_then_recreated)
+        result = await agent.exit_safe_mode(authorization="explicit fixture owner")
+        assert reached == [True]
+        assert result.startswith("Safe Mode remains active:"), result
+        assert agent._safe_mode is True
+        assert await agent._constitution_state_store.load(identity) == before
+    finally:
+        await external.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_exit_takes_edge_owners_before_edge_rows(db_backend, monkeypatch):
     if db_backend.backend_type != "postgres":
         pytest.skip("PostgreSQL independent physical owner/edge lock order")

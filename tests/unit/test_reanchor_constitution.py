@@ -165,11 +165,12 @@ class _FakeFileRows:
     async def execute(self, query, params=()):
         if "INSERT OR IGNORE INTO files " in query:
             digest, name, content, metadata = params
-            assert name == "KESTREL_CONSTITUTION.md"
+            assert name in {"KESTREL_CONSTITUTION.md", "KESTREL_CONSTITUTION.reanchor.signed.json"}
             self.files.setdefault(digest, (content, metadata))
         else:
             assert "INSERT OR IGNORE INTO file_owners" in query, query
-            assert params[1:3] == (AGENT_DID, "KESTREL_CONSTITUTION.md")
+            assert params[1] == AGENT_DID
+            assert params[2] in {"KESTREL_CONSTITUTION.md", "KESTREL_CONSTITUTION.reanchor.signed.json"}
             self.owners.setdefault((params[0], params[1]), params[2:])
 
     async def fetchall(self, query, params=()):
@@ -362,7 +363,8 @@ async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path):
     assert node.properties["constitution_reanchor"]["new_hash"] == FAKE_HASH
     assert node.properties["constitution_reanchor"]["authorization"] == "admin_command"
     assert node.properties["constitution_reanchor"]["expected_hash_prefix"] == FAKE_HASH[:8]
-    assert node.properties["constitution_reanchor"]["signed_artifact_hash"] == FAKE_HASH
+    artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    assert node.properties["constitution_reanchor"]["signed_artifact_hash"] == artifact_hash
     assert node.properties["constitution_reanchor"]["signed_artifact_signer"] == ROOT_DID
     assert node.properties["genesis_audit"] == {
         "status": "pending",
@@ -374,9 +376,10 @@ async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path):
     history = node.properties["genesis_audit_history"]
     assert history[-1]["receipt"] == old_receipt
     assert history[-1]["superseded_by_constitution_hash"] == FAKE_HASH
-    assert agent.storage.store_file.call_count == 1  # Signed artifact only.
+    agent.storage.store_file.assert_not_called()  # Both witnesses use native byte custody.
     restored = await AsyncFileStore(agent._raw_storage.db).retrieve_file(FAKE_HASH)
     assert restored == FAKE_CONSTITUTION
+    assert await AsyncFileStore(agent._raw_storage.db).retrieve_file(artifact_hash) == artifact_path.read_bytes()
     agent.privacy_agent.add_conversation.assert_called_once()
     # First reanchor: nothing to supersede, so no empty history is written.
     assert "constitution_reanchor_history" not in node.properties
@@ -432,7 +435,7 @@ async def test_a_later_reanchor_preserves_the_receipt_it_supersedes(tmp_path):
     assert len(history) == 1
     assert history[0]["receipt"] == prior
     assert history[0]["superseded_by_constitution_hash"] == FAKE_HASH
-    assert history[0]["superseded_by_artifact_hash"] == FAKE_HASH
+    assert history[0]["superseded_by_artifact_hash"] == hashlib.sha256(artifact_path.read_bytes()).hexdigest()
     assert history[0]["provenance"] == "runtime:constitution_reanchor"
 
 
@@ -865,7 +868,9 @@ async def test_reanchor_noop_prunes_dangling_governed_by_edges(tmp_path):
     agent.storage.delete_edge.assert_awaited_once_with(
         AGENT_DID, dangling, "governed_by"
     )
-    assert agent.storage.store_file.await_count == 1
+    agent.storage.store_file.assert_not_called()
+    artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    assert await AsyncFileStore(agent._raw_storage.db).retrieve_file(artifact_hash) == artifact_path.read_bytes()
     assert node.properties["constitution_reanchor"]["signed_artifact_signer"] == ROOT_DID
 
 
@@ -887,7 +892,9 @@ async def test_reanchor_refreshes_signed_provenance_when_already_current(tmp_pat
         )
 
     assert "already anchored" in result.lower()
-    assert agent.storage.store_file.await_count == 1
+    agent.storage.store_file.assert_not_called()
+    artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    assert await AsyncFileStore(agent._raw_storage.db).retrieve_file(artifact_hash) == artifact_path.read_bytes()
     assert node.properties["constitution_reanchor"]["signed_artifact_signer"] == ROOT_DID
 
 

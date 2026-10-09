@@ -43,7 +43,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 logger = logging.getLogger(__name__)
 
 
-async def store_verified_governing_file(storage, content: bytes, *, verification) -> str:
+async def store_verified_governing_file(
+    storage, content: bytes, *, verification, artifact_content: bytes | None = None,
+) -> str:
     """Native signed writers may restore this exact verified public blob owner.
 
     This is a first-party repair primitive inside an owning graph transaction,
@@ -52,8 +54,6 @@ async def store_verified_governing_file(storage, content: bytes, *, verification
     bytes must decrypt to the exact signed content; corruption is not replaced.
     """
     from kestrel_sovereign.constitution.amendment_artifact import AmendmentArtifactVerification
-    from kestrel_sovereign.storage.async_file_store import AsyncFileStore
-
     digest = hashlib.sha256(content).hexdigest()
     if (
         not isinstance(verification, AmendmentArtifactVerification)
@@ -63,6 +63,30 @@ async def store_verified_governing_file(storage, content: bytes, *, verification
         or not storage.files.agent_id
     ):
         raise RuntimeError("governing file restoration requires verified signed content and owned custody")
+    if artifact_content is not None:
+        artifact = json.loads(artifact_content)
+        if (
+            not isinstance(artifact, dict)
+            or artifact.get("constitution_sha256") != digest
+            or artifact.get("signer") != verification.signer
+        ):
+            raise RuntimeError("signed artifact does not describe the verified governing content")
+    await _store_exact_signed_file(storage, content, "KESTREL_CONSTITUTION.md")
+    if artifact_content is not None:
+        # The callers supply the exact detached artifact they verified, not
+        # its serialization rebuilt from a mapping. Both public witnesses use
+        # the same physical-byte and tenant-custody primitive.
+        await _store_exact_signed_file(
+            storage, artifact_content, "KESTREL_CONSTITUTION.reanchor.signed.json",
+        )
+    return digest
+
+
+async def _store_exact_signed_file(storage, content: bytes, name: str) -> None:
+    """Store one already verified public witness under the caller's custody."""
+    from kestrel_sovereign.storage.async_file_store import AsyncFileStore
+
+    digest = hashlib.sha256(content).hexdigest()
     files = storage.files
     unbound = AsyncFileStore(storage.db)
     lock = " FOR UPDATE" if storage.db.backend_type == "postgres" else ""
@@ -73,21 +97,32 @@ async def store_verified_governing_file(storage, content: bytes, *, verification
         # Canonical native storage owns hashing, encryption and size limits.
         # Another creator may win the absent-row race; INSERT ignores that
         # conflict, so lock and validate the ACTUAL winner below, not our input.
-        await unbound.store_file(content, "KESTREL_CONSTITUTION.md")
-        await storage.db.fetchone(
+        await unbound.store_file(content, name)
+        row = await storage.db.fetchone(
             "SELECT content_hash FROM files WHERE content_hash = ?" + lock, (digest,),
         )
+        if row is None:
+            raise RuntimeError("signed file disappeared before physical custody acquisition")
     existing = await unbound.retrieve_file(digest)
     if existing != content:
         raise RuntimeError("stored governing file differs from exact signed content")
-    metadata = await unbound.get_file_metadata(digest)
     # Restore only a missing ownership witness. Existing per-tenant name and
-    # provenance are not replaced by generic metadata on the shared blob.
+    # provenance are not replaced. Shared blob metadata may belong to another
+    # tenant; verified public bytes confer no authority over that provenance.
     await storage.db.execute(
         "INSERT OR IGNORE INTO file_owners (content_hash, agent_id, original_name, metadata) VALUES (?, ?, ?, ?)",
-        (digest, files.agent_id, "KESTREL_CONSTITUTION.md", json.dumps(metadata) if metadata else None),
+        (digest, files.agent_id, name, None),
     )
-    return digest
+    if storage.db.backend_type == "postgres":
+        # Conflict-ignore insertion does not retain an existing owner's row.
+        # Hold that exact tenant witness after the shared blob (the same order
+        # as native exit), or refuse if it disappeared before custody arrived.
+        owner = await storage.db.fetchone(
+            "SELECT content_hash FROM file_owners WHERE content_hash = ? AND agent_id = ? FOR UPDATE",
+            (digest, files.agent_id),
+        )
+        if owner is None:
+            raise RuntimeError("governing file ownership disappeared during publication")
 
 
 def historical_anchor_hash(
@@ -168,25 +203,35 @@ def governance_evidence(properties: Mapping, governed_by_targets: Iterable[str])
     }
 
 
-async def lock_governance_rows(storage, agent_id: str) -> None:
+async def lock_governance_rows(storage, agent_id: str, *, required_target: str | None = None) -> None:
     """After graph reservation, retain the physical governing row witness.
 
     All publishers use ownership-before-edge order, matching native deletion.
     SQLite's owning writer already supplies this physical serialization.
     """
     if storage.db.backend_type == "postgres":
-        await storage.db.fetchall(
+        identity = await storage.db.fetchone(
+            "SELECT node_id FROM graph_nodes WHERE node_id = ? FOR UPDATE", (agent_id,),
+        )
+        identity_owners = await storage.db.fetchall(
             "SELECT node_id FROM graph_node_owners WHERE node_id = ? AND agent_id = ? FOR UPDATE",
             (agent_id, agent_id),
         )
-        await storage.db.fetchall(
-            "SELECT target_id FROM graph_edge_owners WHERE source_id = ? AND label = 'governed_by' ORDER BY target_id, agent_id FOR UPDATE",
+        if identity is None or not identity_owners:
+            raise RuntimeError("Agent identity or its ownership disappeared before governing custody")
+        edge_owners = await storage.db.fetchall(
+            "SELECT target_id, agent_id FROM graph_edge_owners WHERE source_id = ? AND label = 'governed_by' ORDER BY target_id, agent_id FOR UPDATE",
             (agent_id,),
         )
-        await storage.db.fetchall(
+        edges = await storage.db.fetchall(
             "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by' ORDER BY target_id FOR UPDATE",
             (agent_id,),
         )
+        if required_target is not None and (
+            (required_target, agent_id) not in edge_owners
+            or (required_target,) not in edges
+        ):
+            raise RuntimeError("Missing or mis-targeted governed_by edge or ownership custody")
 
 
 async def revalidate_governance_evidence(storage, agent_id: str, expected: dict):

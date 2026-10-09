@@ -24,6 +24,36 @@ from tests.utils.postgres_schema import (
 )
 
 
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_bootstrap_refuses_prior_governance_without_mutation(db_backend):
+    identity, stale = "did:test:bootstrap-history:" + uuid4().hex, "0" * 64
+    storage = AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    try:
+        agent = await _agent(storage)
+        await storage.add_node(
+            GraphNode(
+                node_id=identity, node_type="agent", label="history", properties={}
+            )
+        )
+        await storage.db.execute_commit(
+            "INSERT INTO graph_edges (source_id,target_id,label,properties) VALUES (?,?,'governed_by','{}')",
+            (identity, stale),
+        )
+        before = await agent._constitution_state_store.load(identity)
+        result = await ConstitutionMixin._get_governing_constitution(agent)
+        assert result.startswith("Error:") and "signed repair" in result, result
+        assert await agent._constitution_state_store.load(identity) == before
+        assert (await storage.get_node(identity)).properties == {}
+        assert await storage.db.fetchall(
+            "SELECT target_id FROM graph_edges WHERE source_id=? AND label='governed_by'",
+            (identity,),
+        ) == [(stale,)]
+    finally:
+        await storage.close()
+
+
 @pytest.fixture
 async def fresh_anchor_schema(db_backend):
     if db_backend.backend_type != "postgres":

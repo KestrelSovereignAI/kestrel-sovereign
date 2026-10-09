@@ -23,6 +23,110 @@ from tests.integration.test_constitution_reanchor_e2e import _write_authority_fi
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 @pytest.mark.parametrize("writer", ["runtime", "offline"])
+@pytest.mark.parametrize("damage", ["corrupt", "intact", "missing-owner"])
+async def test_signed_artifact_publication_validates_bytes_and_preserves_owner(
+    db_backend, tmp_path, monkeypatch, writer, damage
+):
+    identity = "did:test:artifact-publication:" + uuid4().hex
+    storage = (
+        AsyncStorage(
+            str(tmp_path / "kestrel_prime.db"), backend="sqlite", agent_id=identity
+        )
+        if db_backend.backend_type == "sqlite"
+        else AsyncStorage(backend=db_backend, agent_id=identity)
+    )
+    await storage.initialize()
+    try:
+        agent = await _agent(storage)
+        await storage.add_node(
+            GraphNode(
+                node_id=identity, node_type="agent", label="artifact", properties={}
+            )
+        )
+        content = resolve_governing_constitution_bytes(None)
+        artifact, root = _write_authority_files(tmp_path, content)
+        agent._sovereign_trust_root_path = root
+        initial = await ConstitutionMixin.reanchor_constitution(
+            agent, amendment_artifact_path=str(artifact)
+        )
+        assert not initial.startswith("Error:"), initial
+        before = (await storage.get_node(identity)).properties
+        digest = before["constitution_reanchor"]["signed_artifact_hash"]
+        expected = artifact.read_bytes()
+        metadata = {"provenance": "retained signed-artifact custody"}
+        await storage.db.execute_commit(
+            "UPDATE file_owners SET original_name=?,metadata=? WHERE content_hash=? AND agent_id=?",
+            ("retained-authority.json", json.dumps(metadata), digest, identity),
+        )
+        if damage == "corrupt":
+            # A conflicting content address exists, but its stored bytes are
+            # not the verified input. Returning the input hash is not proof.
+            await storage.db.execute_commit(
+                "UPDATE files SET content=?,metadata=NULL WHERE content_hash=?",
+                (b"corrupt artifact", digest),
+            )
+        elif damage == "missing-owner":
+            await storage.db.execute_commit(
+                "DELETE FROM file_owners WHERE content_hash=? AND agent_id=?",
+                (digest, identity),
+            )
+        if writer == "runtime":
+            result = await ConstitutionMixin.reanchor_constitution(
+                agent, amendment_artifact_path=str(artifact)
+            )
+            error = result if result.startswith("Error:") else None
+        else:
+            target = (
+                offline.ReanchorTarget(
+                    tmp_path / "kestrel_prime.db", "sqlite", identity
+                )
+                if db_backend.backend_type == "sqlite"
+                else offline.ReanchorTarget(None, "postgres", identity, db_backend._dsn)
+            )
+
+            async def exact_target(*args, **kwargs):
+                return target
+
+            @asynccontextmanager
+            async def no_embedding(*args, **kwargs):
+                yield None
+
+            monkeypatch.setattr(offline, "resolve_reanchor_target", exact_target)
+            monkeypatch.setattr(offline, "_agent_embedding", no_embedding)
+            result = await offline.reanchor_constitution(
+                agent_name="artifact proof",
+                agent_dir=tmp_path if target.anchor_path else None,
+                force=True,
+                sovereign_trust_root_path=root,
+                amendment_artifact_path=artifact,
+                runtime_backend=target.backend,
+                runtime_dsn=target.dsn,
+                hosted_agent_did=identity if target.backend == "postgres" else None,
+                environ={},
+            )
+            error = result.error
+        if damage == "corrupt":
+            assert error is not None, result
+            assert "exact signed content" in error, error
+            assert (await storage.get_node(identity)).properties == before
+        else:
+            assert error is None, error
+            assert await storage.retrieve_file(digest) == expected
+            if damage == "intact":
+                assert await storage.files.get_file_metadata(digest) == metadata
+                assert (
+                    await storage.db.fetchone(
+                        "SELECT original_name FROM file_owners WHERE content_hash=? AND agent_id=?",
+                        (digest, identity),
+                    )
+                )[0] == "retained-authority.json"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("writer", ["runtime", "offline"])
 async def test_signed_repair_refuses_unremovable_foreign_edge(
     db_backend, tmp_path, monkeypatch, writer
 ):

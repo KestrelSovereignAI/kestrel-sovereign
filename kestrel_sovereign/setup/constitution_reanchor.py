@@ -1330,6 +1330,7 @@ async def _write_reanchor(
 
             stored_hash = await store_verified_governing_file(
                 storage, new_content, verification=amendment_verification,
+                artifact_content=amendment_artifact_bytes,
             )
             if stored_hash != new_hash:
                 # store_file computes its own SHA256; if it disagrees with
@@ -1339,10 +1340,6 @@ async def _write_reanchor(
                     f"File store hash mismatch: stored {stored_hash}, expected {new_hash}"
                 )
 
-            artifact_hash = await storage.files.store_file(
-                amendment_artifact_bytes,
-                "KESTREL_CONSTITUTION.reanchor.signed.json",
-            )
             expected_artifact_hash = hashlib.sha256(
                 amendment_artifact_bytes
             ).hexdigest()

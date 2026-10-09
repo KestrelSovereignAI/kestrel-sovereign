@@ -28,6 +28,9 @@ def test_owned_transaction_commands_are_refused(dialect, command, prefix):
         "SELECT E'escaped\\'; COMMIT; still-string';",
         "SELECT 'COMMIT' AS \"BEGIN;END\"; -- ROLLBACK\n SELECT 1;",
         "SELECT 1; /* outer /* COMMIT; */ END; */ SELECT 2;",
+        "CREATE FUNCTION f() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT 1; END; SELECT 2;",
+        "CREATE OR REPLACE FUNCTION f() RETURNS integer BEGIN /* gap */ ATOMIC SELECT CASE WHEN true THEN 1 ELSE 2 END; END;",
+        "CREATE PROCEDURE f() LANGUAGE SQL BEGIN ATOMIC SELECT 'END; COMMIT;'; END;",
     ],
 )
 def test_postgres_body_strings_and_comments_are_not_transaction_commands(sql):
@@ -49,6 +52,9 @@ def test_postgres_body_strings_and_comments_are_not_transaction_commands(sql):
         "SELECT E'a'\n'b\\'x';\nSELECT 'c\\';\nCOMMIT;",
         "SELECT E'a' -- continuation\n'b\\'x'; SELECT 'c\\'; COMMIT;",
         "SELECT E'a' /* newline\n comment */ 'b\\'x'; SELECT 'c\\'; COMMIT;",
+        "CREATE FUNCTION f() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT 1; END; COMMIT;",
+        "CREATE FUNCTION f() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT CASE WHEN true THEN 1 ELSE 2 END; END; ROLLBACK;",
+        "CREATE PROCEDURE f() LANGUAGE SQL BEGIN ATOMIC SELECT 1; END; BEGIN;",
     ],
 )
 def test_postgres_control_after_opaque_body_or_nested_comment_is_refused(sql):

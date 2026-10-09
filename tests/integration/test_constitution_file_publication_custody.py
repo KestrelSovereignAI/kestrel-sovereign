@@ -18,6 +18,173 @@ from tests.integration.test_constitution_reanchor_e2e import _write_authority_fi
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_signed_file_refuses_missing_post_insert_custody(
+    db_backend, tmp_path, monkeypatch
+):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL concurrent absent-row replacement")
+    import asyncpg
+
+    identity = "did:test:post-insert-custody:" + uuid4().hex
+    storage = AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    external = await asyncpg.connect(db_backend._dsn)
+    content = ("signed custody " + uuid4().hex).encode()
+    digest = hashlib.sha256(content).hexdigest()
+    artifact, root = _write_authority_files(tmp_path, content)
+    verification = load_verified_reanchor_artifact(
+        artifact,
+        trusted_did_document=load_sovereign_trust_root(explicit_path=root, environ={}),
+        expected_constitution_sha256=digest,
+    )[2]
+    native_store, native_fetch = AsyncFileStore.store_file, db_backend.fetch_one
+    locking_reads = 0
+    try:
+
+        async def concurrent_winner(files, data, name, *args, **kwargs):
+            if data == content:
+                await external.execute(
+                    "INSERT INTO files (content_hash,original_name,content,metadata) VALUES ($1,'winner',$2,NULL)",
+                    digest,
+                    content,
+                )
+            return await native_store(files, data, name, *args, **kwargs)
+
+        async def removed_then_recreated(query, params=()):
+            nonlocal locking_reads
+            if (
+                query
+                == "SELECT content_hash FROM files WHERE content_hash = ? FOR UPDATE"
+                and params == (digest,)
+            ):
+                locking_reads += 1
+                if locking_reads == 2:
+                    await external.execute(
+                        "DELETE FROM files WHERE content_hash=$1", digest
+                    )
+                    missing = await native_fetch(query, params)
+                    assert missing is None
+                    await external.execute(
+                        "INSERT INTO files (content_hash,original_name,content,metadata) VALUES ($1,'replacement',$2,NULL)",
+                        digest,
+                        content,
+                    )
+                    return missing
+            return await native_fetch(query, params)
+
+        monkeypatch.setattr(AsyncFileStore, "store_file", concurrent_winner)
+        monkeypatch.setattr(db_backend, "fetch_one", removed_then_recreated)
+        with pytest.raises(
+            TransactionError, match="disappeared before physical custody"
+        ):
+            async with storage.transaction():
+                await storage.lock_nodes_for_update([identity, digest])
+                await anchored_bytes.store_verified_governing_file(
+                    storage, content, verification=verification
+                )
+        assert locking_reads == 2
+        assert await storage.retrieve_file(digest) is None
+    finally:
+        await external.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_signed_file_restoration_does_not_disclose_other_owner_metadata(
+    db_backend,
+    tmp_path,
+):
+    identity = "did:test:restored-public-owner:" + uuid4().hex
+    other = "did:test:private-existing-owner:" + uuid4().hex
+    storage = AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    content = ("shared signed public blob " + uuid4().hex).encode()
+    digest = hashlib.sha256(content).hexdigest()
+    artifact, root = _write_authority_files(tmp_path, content)
+    verification = load_verified_reanchor_artifact(
+        artifact,
+        trusted_did_document=load_sovereign_trust_root(explicit_path=root, environ={}),
+        expected_constitution_sha256=digest,
+    )[2]
+    foreign_files = AsyncFileStore(storage.db, agent_id=other)
+    private_metadata = {"private_source": "another tenant's internal document name"}
+    try:
+        await foreign_files.store_file(content, "private-source.md", private_metadata)
+        before_metadata = await foreign_files.get_file_metadata(digest)
+        async with storage.transaction():
+            await storage.lock_nodes_for_update([identity, digest])
+            assert (
+                await anchored_bytes.store_verified_governing_file(
+                    storage,
+                    content,
+                    verification=verification,
+                )
+                == digest
+            )
+        assert await storage.retrieve_file(digest) == content
+        assert await storage.files.get_file_metadata(digest) is None
+        assert await foreign_files.get_file_metadata(digest) == before_metadata
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("mutation", ["delete", "metadata"])
+async def test_signed_file_retains_actual_owner_through_publication(
+    db_backend,
+    tmp_path,
+    mutation,
+):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL physical owner custody")
+    import asyncpg
+
+    identity = "did:test:existing-owner-custody:" + uuid4().hex
+    storage = AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    external = await asyncpg.connect(db_backend._dsn)
+    content = ("signed native owner " + uuid4().hex).encode()
+    digest = hashlib.sha256(content).hexdigest()
+    artifact, root = _write_authority_files(tmp_path, content)
+    verification = load_verified_reanchor_artifact(
+        artifact,
+        trusted_did_document=load_sovereign_trust_root(explicit_path=root, environ={}),
+        expected_constitution_sha256=digest,
+    )[2]
+    statement = (
+        "DELETE FROM file_owners WHERE content_hash=$1 AND agent_id=$2"
+        if mutation == "delete"
+        else "UPDATE file_owners SET metadata='{}' WHERE content_hash=$1 AND agent_id=$2"
+    )
+    try:
+        await storage.store_file(content, "KESTREL_CONSTITUTION.md")
+        await external.execute("SET lock_timeout = '100ms'")
+        async with storage.transaction():
+            await storage.lock_nodes_for_update([identity, digest])
+            assert (
+                await anchored_bytes.store_verified_governing_file(
+                    storage,
+                    content,
+                    verification=verification,
+                )
+                == digest
+            )
+            with pytest.raises(asyncpg.LockNotAvailableError):
+                await external.execute(statement, digest, identity)
+        assert await storage.retrieve_file(digest) == content
+        assert await external.execute(statement, digest, identity) in {
+            "DELETE 1",
+            "UPDATE 1",
+        }
+    finally:
+        await external.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_signed_file_validation_holds_actual_blob_through_publication(
     db_backend,
     tmp_path,

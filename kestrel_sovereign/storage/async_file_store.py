@@ -278,6 +278,15 @@ class AsyncFileStore:
         Returns:
             content_hash (SHA256)
         """
+        # SQLite joins a caller-owned transaction. Validate before reserving
+        # even provisional graph ownership: a caught rejection must stage no
+        # mutation that the outer caller could subsequently commit.
+        if self.agent_id and self.agent_id != agent_id:
+            raise ValueError("A bound file store cannot store another agent's avatar")
+        if len(image_data) > MAX_FILE_SIZE:
+            raise ValueError(
+                f"File size ({len(image_data)} bytes) exceeds maximum allowed size ({MAX_FILE_SIZE} bytes)"
+            )
         metadata = {
             "type": "avatar",
             "avatar_type": avatar_type,

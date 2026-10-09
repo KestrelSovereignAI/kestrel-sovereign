@@ -7,6 +7,35 @@ import pytest
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_native_postgres_sql_standard_body_preserves_outer_custody(db_backend):
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL SQL-standard routine grammar")
+    name = "owned_atomic_" + uuid4().hex
+    definition = f"CREATE FUNCTION {name}() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT CASE WHEN true THEN 1 ELSE 2 END; END;"
+
+    class RollbackProof(Exception):
+        pass
+
+    with pytest.raises(Exception, match="rollback proof") as rolled_back:
+        async with db_backend.transaction():
+            await db_backend.execute_script(definition)
+            assert await db_backend.fetch_val(f"SELECT {name}()") == 1
+            raise RollbackProof("rollback proof")
+    assert isinstance(rolled_back.value.__cause__, RollbackProof)
+    assert (
+        await db_backend.fetch_val("SELECT to_regprocedure(?)", (name + "()",)) is None
+    )
+    # The final routine END must not conceal a following real COMMIT.
+    with pytest.raises(Exception, match="transaction control"):
+        async with db_backend.transaction():
+            await db_backend.execute_script(definition + " COMMIT;")
+    assert (
+        await db_backend.fetch_val("SELECT to_regprocedure(?)", (name + "()",)) is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 @pytest.mark.parametrize(
     "method",
     [

@@ -17,6 +17,43 @@ from tests.integration.test_constitution_refusal_races import _agent
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+@pytest.mark.parametrize("rejection", ["foreign-owner", "oversized"])
+async def test_rejected_avatar_has_no_joined_transaction_side_effects(
+    db_backend, monkeypatch, rejection
+):
+    if db_backend.backend_type != "sqlite":
+        pytest.skip("SQLite joined transaction rejection boundary")
+    from kestrel_sovereign.storage import async_file_store
+
+    identity = "did:test:avatar-rejection:" + uuid4().hex
+    target = (
+        "did:test:avatar-foreign:" + uuid4().hex
+        if rejection == "foreign-owner"
+        else identity
+    )
+    storage = AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    try:
+        if rejection == "oversized":
+            monkeypatch.setattr(async_file_store, "MAX_FILE_SIZE", 1)
+        async with storage.transaction():
+            # A caller may catch a validation error and commit other work.
+            # Native SQLite joins rather than rolling back the nested scope.
+            with pytest.raises(ValueError):
+                await storage.files.store_avatar(b"avatar", target)
+        assert (
+            await storage.db.fetchone(
+                "SELECT node_id FROM graph_node_owners WHERE node_id=? AND agent_id=?",
+                (target, target),
+            )
+            is None
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 @pytest.mark.parametrize("writer", ["runtime", "offline", "bootstrap", "avatar"])
 async def test_postgres_governance_custody_precedes_file_owner_write(
     db_backend,

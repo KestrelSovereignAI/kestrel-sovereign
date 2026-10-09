@@ -108,6 +108,9 @@ def _quoted_end(sql: str, position: int, *, escapes: bool, postgres: bool) -> in
 
 def _statement_heads(sql: str, *, postgres: bool, backslash_strings: bool):
     position, length, head = 0, len(sql), True
+    create_definition, routine_definition = False, False
+    atomic_depth, case_depth = 0, 0
+    previous_word = None
     while position < length:
         character = sql[position]
         if character.isspace() or character == "\ufeff":
@@ -133,6 +136,7 @@ def _statement_heads(sql: str, *, postgres: bool, backslash_strings: bool):
                 sql, position, escapes=backslash_strings, postgres=postgres
             )
             head = False
+            previous_word = None
         elif postgres and character == "$":
             # A tag is recognized only at a token boundary. Identifier scans
             # below consume embedded '$', so foo$tag$ is never a string body.
@@ -149,16 +153,33 @@ def _statement_heads(sql: str, *, postgres: bool, backslash_strings: bool):
             else:
                 position += 1
             head = False
+            previous_word = None
         elif character == ";":
             position += 1
-            head = True
+            if not atomic_depth:
+                head = True
+                create_definition = routine_definition = False
+            previous_word = None
         elif _identifier_character(character):
             start = position
             while position < length and _identifier_character(sql[position]):
                 position += 1
             word = sql[start:position]
+            upper = word.upper()
             if head:
-                yield word.upper()
+                yield upper
+                create_definition = postgres and upper == "CREATE"
+            if create_definition and upper in {"FUNCTION", "PROCEDURE"}:
+                routine_definition = True
+            if routine_definition and upper == "ATOMIC" and previous_word == "BEGIN":
+                atomic_depth += 1
+            elif atomic_depth and upper == "CASE":
+                case_depth += 1
+            elif atomic_depth and upper == "END":
+                if case_depth:
+                    case_depth -= 1
+                else:
+                    atomic_depth -= 1
             # PostgreSQL E'...' always uses backslash escapes, regardless of
             # the ordinary-string setting. Consume it in the same quote path.
             if (
@@ -169,9 +190,11 @@ def _statement_heads(sql: str, *, postgres: bool, backslash_strings: bool):
             ):
                 position = _quoted_end(sql, position, escapes=True, postgres=True)
             head = False
+            previous_word = upper
         else:
             position += 1
             head = False
+            previous_word = None
 
 
 def reject_transaction_control(sql: str, *, dialect: str) -> None:
