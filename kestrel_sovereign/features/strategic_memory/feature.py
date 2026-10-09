@@ -52,7 +52,11 @@ from .blocker_reconcile import (
 )
 from .decision_index import decision_entries, project_decisions
 from .github_integration import get_github_self_repo
-from .issue_selection import describe_exclusion, pick_top_issue
+from .issue_selection import (
+    EXCLUDED_TALON_WORKSPACE_UNCONFIRMED,
+    describe_exclusion,
+    pick_top_issue,
+)
 from .ledger import (
     BLOCKERS_KEY,
     LEDGER_FILENAME,
@@ -78,6 +82,7 @@ from .morning_signal import generate_morning_signal
 from .run_history import RunHistoryUnreadable, read_run_history
 from .session_log import collect_session_log
 from .workflow_runs import assess_workflow_runs
+from .workspace_readiness import TalonWorkspaceProviderOutdated, talon_workspaces
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +135,10 @@ SIGNAL_DISPATCH_REASON_CODES = frozenset(
         # no read that says whether it was), so whether the pick's last run
         # already ended with an unanswered question is unknown (#3398).
         "RUN_HISTORY_UNCONFIRMED",
+        # Talon could not say whether a candidate's repository has a workspace
+        # its dispatch would run in (or its provider has no read that says),
+        # and no other candidate was selected; not "nothing to do" (#3548).
+        "TALON_WORKSPACE_UNCONFIRMED",
     }
 )
 #: The ``reason_code`` a failed ``strategy_reconcile_blockers`` result can
@@ -1416,7 +1425,6 @@ class StrategicMemoryFeature(Feature):
         # PAGE it belongs on, not whether the index should hold a node for it.
         all_ids = section.expected_row_id_list(ledger_data, include_retired=True)
         ledger_all = set(all_ids)
-        ledger_active = section.expected_row_ids(ledger_data, include_retired=False)
         indexed = set(membership)
         # Rows, not ids: two canonical rows sharing an id are two rows, and
         # counting the set would under-report the ledger to the caller.
@@ -1895,15 +1903,46 @@ class StrategicMemoryFeature(Feature):
                     "requirement": exc.requirement,
                 },
             )
+        try:
+            workspaces = talon_workspaces(self.agent)
+        except TalonWorkspaceProviderOutdated as exc:
+            # Without the read, a candidate in a repository nobody has
+            # provisioned a Talon workspace for is started and then fails at
+            # talon_run, unattended (#3548).
+            return ToolResult.partial(
+                confirmation=(
+                    "## Signal Dispatch"
+                    + (" (suggest)" if mode == "suggest" else "")
+                    + f"\nCould not confirm which repositories have a Talon "
+                    f"workspace: {exc}. Nothing was dispatched -- without it, "
+                    "a run could be started for a repository whose workspace "
+                    "Talon then refuses. This is not the same as having "
+                    "nothing to do."
+                ),
+                error=f"Talon workspace readiness is unconfirmed: {exc}",
+                data={
+                    "mode": mode,
+                    "issue": None,
+                    "workflow": workflow_name,
+                    "dispatched": False,
+                    "skipped": [],
+                    "reason_code": "TALON_WORKSPACE_UNCONFIRMED",
+                    "requirement": exc.requirement,
+                },
+            )
         selection: Dict[str, Any] = {}
         issue = await pick_top_issue(
-            self._strategy_data_view(), selection, run_history=run_history
+            self._strategy_data_view(),
+            selection,
+            run_history=run_history,
+            talon_workspaces=workspaces,
         )
         # Candidates passed over because they are not on the allow-list --
         # closed, not agent-ready, in the wrong repository (#3464), an epic or
         # the Sovereign's (#3468) -- because a pull request already works
-        # them (#3317), or because their last Talon run asked a question
-        # nothing since has answered (#3398). Every outcome carries them:
+        # them (#3317), because their last Talon run asked a question
+        # nothing since has answered (#3398), or because Talon has no usable
+        # workspace for their repository (#3548). Every outcome carries them:
         # "skipped #3310 -- PR #3311 open" is what an orchestrator reading the
         # run needs, not a silence, and a suggest run that names each refusal
         # is evidence the gates hold.
@@ -1911,6 +1950,7 @@ class StrategicMemoryFeature(Feature):
             list(selection.get("eligibility_exclusions") or [])
             + list(selection.get("open_pr_exclusions") or [])
             + list(selection.get("run_exclusions") or [])
+            + list(selection.get("workspace_exclusions") or [])
         )
         skipped_text = (
             "\n**Skipped:**\n"
@@ -1921,6 +1961,13 @@ class StrategicMemoryFeature(Feature):
         checked = selection.get("blockers_checked", 0)
         candidates_checked = selection.get("candidates_checked", 0)
         candidates_unreadable = selection.get("candidates_unreadable", 0)
+        workspaces_unconfirmed = sorted(
+            {
+                str(entry.get("repo"))
+                for entry in selection.get("workspace_exclusions") or []
+                if entry.get("reason") == EXCLUDED_TALON_WORKSPACE_UNCONFIRMED
+            }
+        )
         # Each code stays a literal reason_code dict entry: the declared-code
         # drift test scans the source for those literals (#3184).
         unconfirmed: Optional[Dict[str, str]] = None
@@ -1952,6 +1999,18 @@ class StrategicMemoryFeature(Feature):
                 f"post-run activity for {candidates_unreadable} candidate "
                 "issue(s)",
             }
+        elif not issue and workspaces_unconfirmed:
+            # A candidate every other gate passed, withheld because Talon
+            # could not say whether its repository has a workspace (#3548).
+            # It may have been the pick.
+            unconfirmed = {
+                "reason_code": "TALON_WORKSPACE_UNCONFIRMED",
+                "finding": "Could not confirm that Talon has a workspace for "
+                f"{', '.join(workspaces_unconfirmed)} -- its readiness read did "
+                "not answer, so the candidate issue(s) there were withheld.",
+                "error": "Talon could not confirm a workspace for "
+                f"{len(workspaces_unconfirmed)} repository(ies)",
+            }
         if unconfirmed is not None:
             return ToolResult.partial(
                 confirmation=(
@@ -1972,6 +2031,7 @@ class StrategicMemoryFeature(Feature):
                     "blockers_checked": checked,
                     "candidates_checked": candidates_checked,
                     "candidates_unreadable": candidates_unreadable,
+                    "workspaces_unconfirmed": workspaces_unconfirmed,
                 },
             )
         if not issue:

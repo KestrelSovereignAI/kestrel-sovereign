@@ -20,7 +20,7 @@ assigned to the Sovereign).
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from kestrel_sovereign.features.strategic_memory.blocker_reconcile import (
     configured_repos,
@@ -38,6 +38,13 @@ from kestrel_sovereign.features.strategic_memory.run_history import (
     TalonRun,
 )
 from kestrel_sovereign.features.strategic_memory.timestamps import parse_instant
+from kestrel_sovereign.features.strategic_memory.workspace_readiness import (
+    NO_TALON_WORKSPACE,
+    TALON_WORKSPACE_UNUSABLE,
+    TalonWorkspaces,
+    WorkspaceReadiness,
+    WorkspaceReadinessUnreadable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +142,17 @@ EXCLUDED_PR_LINKAGE_UNREADABLE = "pr_linkage_unreadable"
 EXCLUDED_RUN_HISTORY = "run_history"
 EXCLUDED_RUN_HISTORY_UNCONFIRMED = "run_history_unconfirmed"
 
+#: Exclusion reasons reported in ``diagnostics["workspace_exclusions"]`` by
+#: the Talon workspace gate (#3548), which only a candidate every other gate
+#: passed reaches. The first two are Talon's own ``workspace_readiness()``
+#: reasons, reported as given: no workspace is provisioned for the
+#: repository, or Talon would refuse the one there whatever is provisioned.
+#: The third is a read that did not answer. Each withholds the candidate,
+#: because its run could only fail at ``talon_run``.
+EXCLUDED_NO_TALON_WORKSPACE = NO_TALON_WORKSPACE
+EXCLUDED_TALON_WORKSPACE_UNUSABLE = TALON_WORKSPACE_UNUSABLE
+EXCLUDED_TALON_WORKSPACE_UNCONFIRMED = "talon_workspace_unconfirmed"
+
 #: Exclusions that withhold an issue because GitHub could not answer, not
 #: because it answered "busy". Counted as unreadable so an outage renders as
 #: one rather than as nothing to do.
@@ -190,6 +208,7 @@ async def pick_top_issue(
     data: Dict[str, Any],
     diagnostics: Optional[Dict[str, Any]] = None,
     run_history: Optional[RunHistory] = None,
+    talon_workspaces: Optional[TalonWorkspaces] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return the highest-priority eligible issue represented by strategic memory.
 
@@ -222,6 +241,14 @@ async def pick_top_issue(
     nothing on the issue since that authorizes a retry (#3398). ``None``
     means the caller has no Talon registry, so no issue has a last run.
 
+    ``diagnostics["workspace_exclusions"]`` lists every candidate that passed
+    those gates but whose repository Talon reports no usable workspace for,
+    with Talon's ``reason``, ``workspace``, ``next_step`` and ``detail``, or
+    whose readiness ``talon_workspaces`` could not read (#3548). Its run
+    would only fail at ``talon_run``. ``talon_workspaces`` is read once per
+    repository; ``None`` means the caller has no Talon, so no workspace is
+    asked about.
+
     ``candidates_checked`` and ``candidates_unreadable`` do the same for the
     milestone and backlog passes: how many distinct candidates had their PR
     linkage looked up, and how many of those GitHub could not answer for. A
@@ -238,6 +265,7 @@ async def pick_top_issue(
     ineligible = diagnostics.setdefault("eligibility_exclusions", [])
     exclusions = diagnostics.setdefault("open_pr_exclusions", [])
     run_exclusions = diagnostics.setdefault("run_exclusions", [])
+    workspace_exclusions = diagnostics.setdefault("workspace_exclusions", [])
     token = get_github_token()
     if not token:
         logger.info("No GITHUB_TOKEN — cannot pick top issue")
@@ -351,10 +379,48 @@ async def pick_top_issue(
                 )
         return awaiting[key]
 
+    # One readiness read per distinct repository: Talon answers for the
+    # repository's workspace, not for the issue. One exclusion per distinct
+    # (repo, number), like linkage.
+    readiness: Dict[str, Union[WorkspaceReadiness, WorkspaceReadinessUnreadable]] = {}
+    unworkable: Dict[Tuple[str, int], Optional[Dict[str, Any]]] = {}
+
+    async def without_workspace(
+        repo: str, issue_number: int
+    ) -> Optional[Dict[str, Any]]:
+        """The exclusion for a candidate Talon has no usable workspace for.
+
+        Dispatch refuses a repository nobody has provisioned a Talon
+        workspace for, so a run started for it fails at ``talon_run`` in
+        milliseconds, unattended (#3548). The candidate is skipped with
+        Talon's reason instead, and selection moves on. Workspaces are never
+        provisioned here: ``talon_setup_workspace`` stays approval-gated.
+        Asked last, so only a candidate every other gate passed costs a read.
+        """
+        if talon_workspaces is None:
+            return None
+        key = (repo, issue_number)
+        if key not in unworkable:
+            if repo not in readiness:
+                try:
+                    readiness[repo] = await talon_workspaces.readiness(repo)
+                except WorkspaceReadinessUnreadable as exc:
+                    readiness[repo] = exc
+            unworkable[key] = _workspace_exclusion(repo, issue_number, readiness[repo])
+            if unworkable[key] is not None:
+                workspace_exclusions.append(unworkable[key])
+                logger.info(
+                    "Not dispatching %s#%s: %s", repo, issue_number,
+                    describe_exclusion(unworkable[key]),
+                )
+        return unworkable[key]
+
     async def withheld(repo: str, issue_number: int) -> Optional[Dict[str, Any]]:
         """Why an eligible candidate must not be dispatched now, or ``None``."""
-        return await in_flight(repo, issue_number) or await awaiting_new_input(
-            repo, issue_number
+        return (
+            await in_flight(repo, issue_number)
+            or await awaiting_new_input(repo, issue_number)
+            or await without_workspace(repo, issue_number)
         )
 
     # Distinct (repo, number) per milestone/backlog candidate: the same issue
@@ -879,6 +945,37 @@ def _run_exclusion(
     }
 
 
+def _workspace_exclusion(
+    repo: str,
+    issue_number: int,
+    readiness: Union[WorkspaceReadiness, WorkspaceReadinessUnreadable],
+) -> Optional[Dict[str, Any]]:
+    """The exclusion Talon's workspace answer for ``repo`` makes, or ``None``.
+
+    ``readiness`` is a :class:`WorkspaceReadiness`, or the
+    :class:`WorkspaceReadinessUnreadable` its read raised. Only a repository
+    Talon reports provisioned lets the candidate through: an unread answer
+    withholds it too, and is reported as unconfirmed.
+    """
+    if isinstance(readiness, WorkspaceReadiness):
+        if readiness.provisioned:
+            return None
+        return {
+            "repo": repo,
+            "issue_number": issue_number,
+            "reason": readiness.reason,
+            "workspace": readiness.workspace,
+            "next_step": readiness.next_step,
+            "detail": readiness.detail,
+        }
+    return {
+        "repo": repo,
+        "issue_number": issue_number,
+        "reason": EXCLUDED_TALON_WORKSPACE_UNCONFIRMED,
+        "detail": str(readiness),
+    }
+
+
 def _days_since(timestamp: object, now: datetime) -> Optional[int]:
     moment = parse_instant(timestamp)
     if moment is None:
@@ -1003,6 +1100,25 @@ def describe_exclusion(exclusion: Dict[str, Any]) -> str:
         return (
             f"skipped {target} -- GitHub could not say whether an open PR "
             "already works it"
+        )
+    if reason == EXCLUDED_NO_TALON_WORKSPACE:
+        repo = exclusion.get("repo")
+        provision = exclusion.get("next_step") or f"talon_setup_workspace(repo='{repo}')"
+        return (
+            f"skipped {target} -- no Talon workspace is provisioned for {repo}; "
+            f"{provision} provisions one, with approval"
+        )
+    if reason in (EXCLUDED_TALON_WORKSPACE_UNUSABLE, EXCLUDED_TALON_WORKSPACE_UNCONFIRMED):
+        detail = exclusion.get("detail")
+        why = f": {detail}" if detail else ""
+        if reason == EXCLUDED_TALON_WORKSPACE_UNCONFIRMED:
+            return (
+                f"skipped {target} -- Talon could not say whether "
+                f"{exclusion.get('repo')} has a workspace a dispatch would run in{why}"
+            )
+        return (
+            f"skipped {target} -- Talon would refuse its workspace for "
+            f"{exclusion.get('repo')}, and provisioning does not fix that{why}"
         )
     refs = []
     for pr in exclusion.get("pull_requests") or ():
