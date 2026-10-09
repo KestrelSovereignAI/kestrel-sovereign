@@ -37,7 +37,9 @@ class ConstitutionRuntimeState:
     #: be read as an integrity finding (#2920 defect 3).
     safe_mode_cause: Optional[str] = None
     # Optimistic database fencing, independent of wall-clock precision.
-    revision: int = 0
+    # None is an explicit first-creation snapshot; loaded legacy revision zero
+    # is an existing record and may ONLY be conditionally updated.
+    revision: Optional[int] = None
 
 
 class ConstitutionStateConflictError(RuntimeError):
@@ -138,12 +140,7 @@ class ConstitutionRuntimeStateStore:
         # ``_mark_constitution_state_unavailable`` and would put every
         # existing agent into Safe Mode on upgrade.
         await self._migrate_safe_mode_cause_column()
-        if not await self._has_column("revision"):
-            await self._backend.execute(
-                "ALTER TABLE constitution_runtime_state ADD COLUMN "
-                + ("IF NOT EXISTS " if self._is_postgres else "")
-                + "revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)"
-            )
+        await self._migrate_column("revision", "INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)")
         await self._ensure_revision_fence()
 
     async def _ensure_revision_fence(self) -> None:
@@ -217,12 +214,25 @@ class ConstitutionRuntimeStateStore:
         block live state writes. Swallowing every exception also hid a real
         migration failure behind the same silence.
         """
-        if await self._has_safe_mode_cause_column():
+        await self._migrate_column("safe_mode_cause", "TEXT")
+
+    async def _migrate_column(self, name: str, declaration: str) -> None:
+        """Inspect cheaply on normal boots; reserve and recheck on upgrade."""
+        if await self._has_column(name):
             return
-        await self._backend.execute(
-            "ALTER TABLE constitution_runtime_state "
-            "ADD COLUMN safe_mode_cause TEXT"
-        )
+        if self._is_postgres:
+            await self._backend.execute(
+                f"ALTER TABLE constitution_runtime_state ADD COLUMN IF NOT EXISTS {name} {declaration}"
+            )
+        else:
+            # Independent SQLite connections must reserve the writer slot
+            # BEFORE reading the upgrade metadata. Deferred read-then-ALTER
+            # races either duplicate the column or fail to promote a snapshot.
+            async with self._backend.transaction(immediate=True):
+                if not await self._has_column(name):
+                    await self._backend.execute(
+                        f"ALTER TABLE constitution_runtime_state ADD COLUMN {name} {declaration}"
+                    )
 
     async def _has_safe_mode_cause_column(self) -> bool:
         """Whether the column is already present, per the backend's catalog."""
@@ -318,51 +328,51 @@ class ConstitutionRuntimeStateStore:
             self.SCHEMA_VERSION,
             self._timestamp_param(state.updated_at),
             state.safe_mode_cause,
-            state.revision + 1,
-            state.revision,
-            state.agent_id,
-            state.revision,
-            state.revision,
-            self._boolean_param(authorized_exit),
-            self._boolean_param(authorized_exit or event_type == "audit_succeeded"),
-            self._boolean_param(authorized_exit or event_type == "audit_succeeded"),
+            1 if state.revision is None else state.revision + 1,
         )
         async with self._backend.transaction():
-            written = await self._backend.fetch_one(
-                """
-                INSERT INTO constitution_runtime_state
+            if state.revision is None:
+                written = await self._backend.fetch_one(
+                    """
+                    INSERT INTO constitution_runtime_state
                     (agent_id, safe_mode, safe_mode_reason,
                      safe_mode_entered_at, safe_mode_exited_at,
                      safe_mode_exit_authorization, last_successful_audit_at,
                      interaction_count, bootstrap_pending, schema_version,
                      updated_at, safe_mode_cause, revision)
-                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                 WHERE ? = 0 OR EXISTS (
-                     SELECT 1 FROM constitution_runtime_state
-                      WHERE agent_id = ? AND revision = ?
-                 )
-                ON CONFLICT(agent_id) DO UPDATE SET
-                    safe_mode = excluded.safe_mode,
-                    safe_mode_reason = excluded.safe_mode_reason,
-                    safe_mode_entered_at = excluded.safe_mode_entered_at,
-                    safe_mode_exited_at = excluded.safe_mode_exited_at,
-                    safe_mode_exit_authorization = excluded.safe_mode_exit_authorization,
-                    last_successful_audit_at = excluded.last_successful_audit_at,
-                    interaction_count = excluded.interaction_count,
-                    bootstrap_pending = excluded.bootstrap_pending,
-                    schema_version = excluded.schema_version,
-                    updated_at = excluded.updated_at,
-                    safe_mode_cause = excluded.safe_mode_cause,
-                    revision = excluded.revision
-                WHERE constitution_runtime_state.revision = ?
-                  AND (NOT constitution_runtime_state.safe_mode
-                       OR excluded.safe_mode OR ?)
-                  AND (excluded.interaction_count >= constitution_runtime_state.interaction_count OR ?)
-                  AND (NOT constitution_runtime_state.bootstrap_pending OR excluded.bootstrap_pending OR ?)
-                RETURNING revision
-                """,
-                values,
-            )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(agent_id) DO NOTHING
+                    RETURNING revision
+                    """,
+                    values,
+                )
+            else:
+                # UPDATE cannot turn into INSERT after a concurrently deleted
+                # unique row disappears. In PostgreSQL a conditional UPSERT's
+                # initial EXISTS snapshot does not provide that guarantee.
+                written = await self._backend.fetch_one(
+                    """
+                    UPDATE constitution_runtime_state SET
+                        safe_mode = ?, safe_mode_reason = ?,
+                        safe_mode_entered_at = ?, safe_mode_exited_at = ?,
+                        safe_mode_exit_authorization = ?, last_successful_audit_at = ?,
+                        interaction_count = ?, bootstrap_pending = ?, schema_version = ?,
+                        updated_at = ?, safe_mode_cause = ?, revision = ?
+                    WHERE agent_id = ? AND revision = ?
+                      AND (NOT safe_mode OR ? OR ?)
+                      AND (interaction_count <= ? OR ?)
+                      AND (NOT bootstrap_pending OR ? OR ?)
+                    RETURNING revision
+                    """,
+                    values[1:] + (
+                        state.agent_id, state.revision,
+                        self._boolean_param(state.safe_mode), self._boolean_param(authorized_exit),
+                        max(0, int(state.interaction_count)),
+                        self._boolean_param(authorized_exit or event_type == "audit_succeeded"),
+                        self._boolean_param(state.bootstrap_pending),
+                        self._boolean_param(authorized_exit or event_type == "audit_succeeded"),
+                    ),
+                )
             if written is not None and event_type is not None:
                 await self._backend.execute(
                     """

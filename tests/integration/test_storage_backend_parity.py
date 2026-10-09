@@ -759,6 +759,90 @@ async def test_constitution_state_cas_rejects_stale_clear_and_due_marker_clobber
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_deleted_revision_zero_runtime_state_is_not_recreated(db_backend):
+    """A loaded pre-fence record is never a request for first creation."""
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionStateConflictError,
+    )
+
+    store = ConstitutionRuntimeStateStore(db_backend)
+    await store.initialize()
+    now = datetime.now(timezone.utc)
+    state = await store.write(ConstitutionRuntimeState(
+        agent_id="did:test:legacy-zero:" + uuid4().hex, safe_mode=True,
+        safe_mode_reason="legacy restriction", safe_mode_entered_at=now,
+        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+        last_successful_audit_at=now, interaction_count=100, updated_at=now,
+    ))
+    # Seed the exact shape of an upgraded legacy row. INSERT is not an old
+    # writer UPDATE and does not pass through the revision-update trigger.
+    await db_backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (state.agent_id,))
+    await db_backend.execute(
+        "INSERT INTO constitution_runtime_state (agent_id, safe_mode, interaction_count, "
+        "bootstrap_pending, schema_version, updated_at, revision) VALUES (?, ?, 100, ?, 1, ?, 0)",
+        (state.agent_id, True if db_backend.backend_type == "postgres" else 1,
+         False if db_backend.backend_type == "postgres" else 0, store._timestamp_param(now)),
+    )
+    loaded = await store.load(state.agent_id)
+    assert loaded.revision == 0
+    await db_backend.execute("DELETE FROM constitution_runtime_state WHERE agent_id = ?", (state.agent_id,))
+    before_events = await store.list_events(state.agent_id)
+    with pytest.raises(ConstitutionStateConflictError):
+        await store.write(loaded, event_type="safe_mode_entered")
+    assert await store.load(state.agent_id) is None
+    assert await store.list_events(state.agent_id) == before_events
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_delete_committing_during_runtime_write_cannot_recreate(db_backend):
+    """Exercise PostgreSQL's statement snapshot / uniqueness-wait split."""
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL-specific concurrent delete semantics")
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionStateConflictError,
+    )
+
+    store = ConstitutionRuntimeStateStore(db_backend)
+    await store.initialize()
+    now = datetime.now(timezone.utc)
+    state = await store.write(ConstitutionRuntimeState(
+        agent_id="did:test:concurrent-delete:" + uuid4().hex, safe_mode=True,
+        safe_mode_reason="restriction", safe_mode_entered_at=now,
+        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+        last_successful_audit_at=now, interaction_count=100, updated_at=now,
+    ), event_type="safe_mode_entered")
+    pool = db_backend.operational_pool
+    write_task = None
+    try:
+        async with pool.acquire() as deleting:
+            async with deleting.transaction():
+                deleter_pid = await deleting.fetchval("SELECT pg_backend_pid()")
+                await deleting.execute("DELETE FROM constitution_runtime_state WHERE agent_id = $1", state.agent_id)
+                write_task = asyncio.create_task(store.write(state, event_type="safe_mode_entered"))
+                # Confirm the production statement is actually waiting on the
+                # uncommitted DELETE before allowing it to commit. No timing
+                # guess and no synthetic CPU load.
+                async with asyncio.timeout(10):
+                    while not await deleting.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                        "WHERE $1 = ANY(pg_blocking_pids(pid)))", deleter_pid,
+                    ):
+                        await asyncio.sleep(0.01)
+            with pytest.raises(ConstitutionStateConflictError):
+                await asyncio.wait_for(write_task, timeout=10)
+        assert await store.load(state.agent_id) is None
+        assert len(await store.list_events(state.agent_id)) == 1
+    finally:
+        if write_task is not None and not write_task.done():
+            write_task.cancel()
+            await asyncio.gather(write_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_pre_revision_writer_cannot_clear_new_runtime_state(db_backend):
     """Mixed-version replicas must fail closed, not bypass the new CAS."""
     from kestrel_sovereign.constitution.runtime_state import (

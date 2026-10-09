@@ -950,11 +950,14 @@ custody are stored in the primary SQLite or PostgreSQL database. Writes use a
 database revision fence: a stale replica cannot clear another replica's
 restriction or reset its audit-due counter. Only the verified, authorized exit
 path clears a durable restriction; a conflicting writer restricts itself.
+First creation is insert-only. Loaded records (including migrated revision
+zero) use conditional updates and cannot recreate a concurrently deleted row.
 
 The additive revision migration retains readable schema-version-1 rows, but
 database triggers reject pre-revision writers after upgrade. Retire old
 replicas rather than expecting mixed-version writers to keep operating.
-Initialization checks existing metadata before installing migration DDL.
+Initialization checks existing metadata before installing migration DDL;
+SQLite upgrades reserve the writer slot and recheck before adding columns.
 
 Automatic first anchoring requires a still-pending durable new-identity marker
 and matching revision, revalidated within the native graph transaction.

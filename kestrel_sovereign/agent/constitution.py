@@ -579,7 +579,7 @@ class ConstitutionMixin:
         self._safe_mode_exit_authorization = None
         self._constitution_state_migration_pending = False
         self._constitution_bootstrap_pending = False
-        self._constitution_state_revision = 0
+        self._constitution_state_revision = None
         self._constitution_state_load_error = None
         self._constitution_audit_pending = False
         self._constitution_state_persistence_pending = False
@@ -669,7 +669,7 @@ class ConstitutionMixin:
                 if bootstrap_pending is None
                 else bootstrap_pending
             ),
-            revision=getattr(self, "_constitution_state_revision", 0),
+            revision=getattr(self, "_constitution_state_revision", None),
         )
 
     async def _initialize_constitution_runtime_state(
