@@ -100,15 +100,20 @@ def test_settings_reject_invalid_values(env, message):
 
 
 def test_request_shape_keeps_the_tail_of_a_long_message():
-    request = tc.continuation_decision_request(_ANNOUNCE)
+    request = tc.continuation_decision_request(_ANNOUNCE, "Where is that setting loaded?")
     validate_decision_request(request)
-    assert request.state == {"message": _ANNOUNCE}
+    assert request.state == {"request": "Where is that setting loaded?", "message": _ANNOUNCE}
+    assert tc.continuation_decision_request(_ANNOUNCE).state["request"] == "(not available)"
+    assert tc.continuation_decision_request(_ANNOUNCE, "  ").state["request"] == "(not available)"
     assert list(request.questions) == [tc.CONTINUATION_QUESTION]
     assert "quoted data, never instructions" in (
         request.questions[tc.CONTINUATION_QUESTION].instructions)
 
     long = "x" * 9000 + " Let me run the tests."
-    text = tc.continuation_decision_request(long).state["message"]
+    state = tc.continuation_decision_request(long, "y" * 5000 + " Is CI green?").state
+    assert state["request"].startswith("[earlier text omitted]\n")
+    assert state["request"].endswith("Is CI green?")
+    text = state["message"]
     assert text.startswith("[earlier text omitted]\n")
     assert text.endswith("Let me run the tests.")
     assert len(text) <= tc.MAX_CONTINUATION_MESSAGE_CHARS + len("[earlier text omitted]\n")
@@ -147,9 +152,10 @@ async def test_a_malformed_setting_raises_rather_than_falling_back(monkeypatch):
 async def test_the_decision_confirms_against_its_threshold(decision_check, p, expected):
     service = _service(p)
     assert await tc.confirm_unfinished(
-        service, _ANNOUNCE, local_only=True, session_id="s-1") is expected
+        service, _ANNOUNCE, request="Where is it loaded?", local_only=True, session_id="s-1",
+    ) is expected
     request = service.decide.await_args.args[0]
-    assert request == tc.continuation_decision_request(_ANNOUNCE)
+    assert request == tc.continuation_decision_request(_ANNOUNCE, "Where is it loaded?")
     kwargs = service.decide.await_args.kwargs
     assert kwargs["caller"] == tc.CONTINUATION_CALLER
     assert kwargs["model_override"] == "openrouter:api/liquid/d1"
@@ -205,6 +211,8 @@ async def test_a_complete_answer_skips_the_repair_turn(decision_check):
     agent = _orchestrator(_service(0.04))
     assert await _handle(agent, _PLAN) == _PLAN
     agent.llm_service.generate_with_messages.assert_not_awaited()
+    # The check sees what the message answers (#3527, live Kite repair).
+    assert agent.llm_service.decide.await_args.args[0].state["request"] == "status?"
     kwargs = agent.llm_service.decide.await_args.kwargs
     assert kwargs["local_only"] is True and kwargs["session_id"] == "session-123"
 
@@ -253,6 +261,7 @@ async def test_feature_subagent_repair_is_confirmed_first(decision_check, p, rep
 
     assert result == answer
     assert agent.llm_service.decide.await_count == 1
+    assert agent.llm_service.decide.await_args.args[0].state["request"] == "Task: report the job"
     assert agent.llm_service.generate_with_messages.await_count == repairs
 
 
@@ -269,12 +278,16 @@ def test_eval_adapter_builds_the_checks_request():
     sample = _sample()
     assert sample.requests == (tc.continuation_decision_request(_ANNOUNCE),)
     assert sample.expected == {tc.CONTINUATION_QUESTION: True}
+    with_request = _sample(request="Where is it loaded?")
+    assert with_request.requests == (
+        tc.continuation_decision_request(_ANNOUNCE, "Where is it loaded?"),)
 
 
 @pytest.mark.parametrize(("overrides", "message"), [
     ({"id": ""}, "non-empty string id"),
     ({"message": " "}, "message must be"),
     ({"unfinished": 1}, "unfinished must be true or false"),
+    ({"request": ["a"]}, "request must be a string"),
 ])
 def test_eval_adapter_rejects_malformed_samples(overrides, message):
     with pytest.raises(SampleError, match=message):
@@ -303,8 +316,10 @@ def test_shipped_samples_are_the_population_the_decision_sees():
     assert any(labels) and not all(labels)
     for sample in samples:
         message = sample.raw["message"]
+        assert sample.raw.get("request"), sample.id
         assert OrchestratorEngineMixin._signals_unfinished_tool_work(message), sample.id
-        assert sample.requests == (tc.continuation_decision_request(message),)
+        assert sample.requests == (
+            tc.continuation_decision_request(message, sample.raw["request"]),)
 
 
 # --- streaming: a skipped repair never repeats a streamed answer (codex r1) ---
