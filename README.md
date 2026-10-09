@@ -992,8 +992,9 @@ during commit/result delivery retains its volatile restriction and pending
 durability instead of reporting the earlier committed exit as recovery.
 An entry also checks after awaited consent, before replacing a later restriction.
 Initialization, explicit/startup/periodic audits, and recovery notification share
-one whole-transition refusal generation. Same-task nesting retains that token;
-it cannot adopt a newer refusal after verification or restore became stale.
+one whole-transition refusal generation, captured before waiting for its state
+lock. Same-task nesting retains that token; queued entries cannot adopt a later
+refusal, nor can verification or restore adopt one after becoming stale.
 An invalidated restore preserves the newer volatile restriction and pending
 durability; an invalidated audit records no success or older failure over it.
 A restriction during post-commit exit notification retains the historical exit
@@ -1002,7 +1003,9 @@ Native automatic and signed anchor transactions reserve file resources before
 graph resources, then revalidate and consume custody atomically.
 Both runtime and offline signed repairs compare the exact preflight pointer,
 rights, current/history receipts and governance edges again under those graph
-locks. Changed evidence requires fresh inspection and authorization; adopting
+locks. Rights validation uses that same immutable witness, not a separate edge
+read which could observe a transient deletion. Changed evidence requires fresh
+inspection and authorization; adopting
 a newer custody fence cannot legitimize a previously validated stale repair.
 The marker is single-use; interruption before verification cannot authorize a
 second anchor. The absent successful

@@ -613,6 +613,9 @@ class ConstitutionMixin:
         if vars(self).get("_constitution_state_lock_owner") is current_task:
             yield
             return
+        # Waiting is an awaited boundary too. The caller may not adopt a
+        # refusal which arrives while a prior transition holds this lock.
+        entry_generation = vars(self).get("_constitution_refusal_generation", 0)
         # Database owners must never wait behind a state-lock owner which may
         # itself be waiting for that database. Public lifecycle entries record
         # a fail-closed refusal before arriving here; anchor callers also refuse.
@@ -620,7 +623,7 @@ class ConstitutionMixin:
         @asynccontextmanager
         async def own_generation():
             self._constitution_state_lock_owner = current_task
-            self._constitution_transition_generation = vars(self).get("_constitution_refusal_generation", 0)
+            self._constitution_transition_generation = entry_generation
             try:
                 yield
             finally:
@@ -723,6 +726,8 @@ class ConstitutionMixin:
         distinction prevents a crash between node creation and verification
         from turning a new identity into an unsafe legacy auto-anchor.
         """
+        if not ConstitutionMixin._constitution_transition_is_current(self):
+            return
         from kestrel_sovereign.constitution.runtime_state import (
             ConstitutionRuntimeStateStore,
         )
@@ -1166,6 +1171,8 @@ class ConstitutionMixin:
 
     async def _audit_constitution_on_startup_locked(self) -> None:
         """Run a due/migration audit before initialization reports readiness."""
+        if not ConstitutionMixin._constitution_transition_is_current(self):
+            return
         if self._constitution_state_load_error is not None:
             return
         now = self._constitution_now()
@@ -1231,6 +1238,8 @@ class ConstitutionMixin:
 
     async def _maybe_audit_locked(self):
         """Increment, persist, and (when due) perform the full audit."""
+        if not ConstitutionMixin._constitution_transition_is_current(self):
+            return
         now = ConstitutionMixin._constitution_now(self)
         self._interaction_count += 1
         if self._last_audit_time > now:
@@ -2087,7 +2096,6 @@ class ConstitutionMixin:
         if not agent_node:
             return "Error: Agent identity node not found."
 
-        old_hash = agent_node.properties.get("constitution_hash") or "none"
         from kestrel_sovereign.constitution.anchored_bytes import (
             governance_evidence, revalidate_governance_evidence,
         )
@@ -2097,6 +2105,8 @@ class ConstitutionMixin:
             (self.agent_id,),
         )
         governance_preflight = governance_evidence(agent_node.properties, (row[0] for row in governance_rows))
+        validated_properties = governance_preflight["properties"]
+        old_hash = validated_properties.get("constitution_hash") or "none"
 
         # Resolve the new governing bytes through the SINGLE production resolver
         # (#2463) reading the governing source the periodic audit reads — the
@@ -2115,7 +2125,7 @@ class ConstitutionMixin:
 
         try:
             reanchor_contract = contract_from_json(
-                agent_node.properties.get("emancipation_contract")
+                validated_properties.get("emancipation_contract")
             )
         except EmancipationConfigError as e:
             return (
@@ -2163,15 +2173,12 @@ class ConstitutionMixin:
         if old_hash == "none":
             from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
 
-            db = getattr(getattr(self, "_raw_storage", None), "db", None)
-            if db is None:
-                return "Error: Cannot inspect historical governance without the native storage connection; nothing was written."
             try:
-                edge_rows = await db.fetchall(
-                    "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'",
-                    (self.agent_id,),
+                # Validate exactly the immutable witness compared under the
+                # writer's locks, not a second independently observed read.
+                historical_hash = historical_anchor_hash(
+                    validated_properties, governance_preflight["governed_by_targets"],
                 )
-                historical_hash = historical_anchor_hash(agent_node.properties, (row[0] for row in edge_rows))
             except Exception as exc:  # noqa: BLE001 - incomplete history cannot waive rights
                 return f"Error: Cannot inspect historical governance: {exc}; nothing was written."
         if historical_hash and historical_hash != "none":

@@ -120,3 +120,50 @@ async def test_signed_repair_rejects_new_rights_after_its_missing_pointer_prefli
             with suppress(asyncio.CancelledError):
                 await task
         await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_runtime_rights_validation_uses_exact_captured_edge_witness(db_backend, tmp_path, monkeypatch):
+    """A native edge ABA cannot make validation differ from its CAS witness."""
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:edge-witness:" + uuid4().hex)
+    await storage.initialize()
+    try:
+        agent = await _agent(storage)
+        strong = resolve_governing_constitution_bytes(EmancipationContract(enabled=True, terms="Irrevocable edge-only rights."))
+        prior_hash = await storage.store_file(strong, "historical-governing.md")
+        await storage.add_node(GraphNode(node_id=agent.agent_id, node_type="agent", label="edge evidence", properties={}))
+        await agent._anchor_constitution_governance(prior_hash)
+        weak_artifact, root = _write_authority_files(tmp_path, resolve_governing_constitution_bytes(None))
+        agent._sovereign_trust_root_path = root
+        before = await agent._constitution_state_store.load(agent.agent_id)
+        events = await agent._constitution_state_store.list_events(agent.agent_id)
+        properties = (await storage.get_node(agent.agent_id)).properties
+        native_fetch = storage.db.fetchall
+        preflight_reads = 0
+
+        async def changing_edge(sql, params=()):
+            nonlocal preflight_reads
+            if "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'" in sql and storage.owns_open_transaction is False:
+                preflight_reads += 1
+                if preflight_reads == 2:
+                    # Actually remove and restore the physical edge around
+                    # the second native read; no fabricated SQL return rows.
+                    await storage.delete_edge(agent.agent_id, prior_hash, "governed_by")
+                    try:
+                        return await native_fetch(sql, params)
+                    finally:
+                        await storage.add_edge(agent.agent_id, prior_hash, "governed_by")
+            return await native_fetch(sql, params)
+
+        monkeypatch.setattr(storage.db, "fetchall", changing_edge)
+        result = await ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(weak_artifact))
+        assert result.startswith("Error:") and "Iron Rule" in result, result
+        assert preflight_reads == 1
+        assert (await storage.get_node(agent.agent_id)).properties == properties
+        assert await agent._constitution_state_store.load(agent.agent_id) == before
+        assert await agent._constitution_state_store.list_events(agent.agent_id) == events
+        rows = await native_fetch("SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'", (agent.agent_id,))
+        assert [row[0] for row in rows] == [prior_hash]
+    finally:
+        await storage.close()

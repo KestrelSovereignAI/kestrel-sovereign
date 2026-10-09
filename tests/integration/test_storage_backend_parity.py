@@ -1191,7 +1191,9 @@ async def test_public_offline_signed_missing_anchor_recovery_on_both_backends(db
         key = "genesis_audit" if mode.startswith("genesis") else "constitution_reanchor"
         if mode.endswith("history"):
             key += "_history"
-            receipt = [{"receipt": receipt}]
+            # Native same-constitution supersession retains both destinations.
+            # Missing destinations have their own fail-closed regression.
+            receipt = [{"receipt": receipt, "superseded_by_constitution_hash": prior_hash}]
         node.properties[key] = receipt
         await storage.add_node(node)
     if mode in ("missing_receipt_bytes", "malformed_receipt", "ambiguous_receipts"):
@@ -1425,7 +1427,7 @@ async def test_live_missing_pointer_preserves_surviving_irrevocable_receipts(db_
         prior = resolve_governing_constitution_bytes(EmancipationContract(enabled=True, terms="Historical irrevocable terms."))
         prior_hash = await storage.store_file(prior, "historical-governing.md")
         receipt = {"constitution_hash": prior_hash} if receipt_key.startswith("genesis") else {"new_hash": prior_hash}
-        value = [{"receipt": receipt}] if receipt_key.endswith("history") else receipt
+        value = [{"receipt": receipt, "superseded_by_constitution_hash": prior_hash}] if receipt_key.endswith("history") else receipt
         props = {receipt_key: value}
         await storage.add_node(GraphNode(node_id=agent.agent_id, node_type="agent", label="history", properties=props))
         artifact_path, root_path = _write_authority_files(tmp_path, resolve_governing_constitution_bytes(None))

@@ -91,6 +91,69 @@ async def test_restore_cannot_erase_refusal_during_native_read(db_backend, monke
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+@pytest.mark.parametrize("transition", ["entry", "restore", "explicit", "startup", "periodic", "successful", "audit_started"])
+async def test_waiting_transition_cannot_adopt_later_refusal(db_backend, monkeypatch, transition):
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:queued-generation:" + uuid4().hex)
+    await storage.initialize()
+    audit_task = queued_task = None
+    proceed, auditing, queued = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    try:
+        agent, _ = await _ready(storage)
+        native_verify = agent._verify_constitution_integrity
+        native_lock = agent._constitution_state_lock
+
+        class NativeLockObserver:
+            async def __aenter__(self):
+                if asyncio.current_task() is queued_task:
+                    assert native_lock.locked()
+                    queued.set()
+                await native_lock.acquire()
+                return self
+
+            async def __aexit__(self, *args):
+                native_lock.release()
+
+        async def paused_verification():
+            result = await native_verify()
+            if asyncio.current_task() is audit_task:
+                auditing.set()
+                await proceed.wait()
+            return result
+
+        monkeypatch.setattr(agent, "_constitution_state_lock", NativeLockObserver())
+        monkeypatch.setattr(agent, "_verify_constitution_integrity", paused_verification)
+        audit_task = asyncio.create_task(agent._run_explicit_constitution_audit())
+        await asyncio.wait_for(auditing.wait(), 5)
+        invocation = {
+            "entry": lambda: agent.enter_safe_mode("older waiting integrity entry"),
+            "restore": agent._initialize_constitution_runtime_state,
+            "explicit": agent._run_explicit_constitution_audit,
+            "startup": agent._audit_constitution_on_startup,
+            "periodic": agent._maybe_audit,
+            "successful": lambda: agent._record_successful_constitution_audit(source="older waiting success"),
+            "audit_started": agent._begin_explicit_constitution_audit,
+        }[transition]
+        queued_task = asyncio.create_task(invocation())
+        await asyncio.wait_for(queued.wait(), 5)
+        before = await agent._constitution_state_store.load(agent.agent_id)
+        events = await agent._constitution_state_store.list_events(agent.agent_id)
+        await _refuse(agent, storage)
+        proceed.set()
+        await asyncio.wait_for(audit_task, 5)
+        result = await asyncio.wait_for(queued_task, 5)
+        _assert_latched(agent)
+        if transition == "entry":
+            assert result is False
+        assert await agent._constitution_state_store.load(agent.agent_id) == before
+        assert await agent._constitution_state_store.list_events(agent.agent_id) == events
+    finally:
+        await _join(queued_task, proceed)
+        await _join(audit_task, proceed)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 @pytest.mark.parametrize("audit", ["explicit", "startup", "periodic"])
 @pytest.mark.parametrize("valid", [True, False])
 async def test_audit_result_cannot_adopt_a_newer_refusal(db_backend, monkeypatch, audit, valid):
