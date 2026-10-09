@@ -1342,13 +1342,21 @@ def _run_feature_reconcile(
             installed_versions[pkg] = None
         editable_paths[pkg] = cli._editable_install_path(pkg)
 
+    # `--prefer-*` overrides the source map's declarations, so it is applied to
+    # them once, here, and the plan and the guard (step 4) both read the
+    # result. Applied to the plan alone, `--prefer-pypi` planned an index
+    # install of an entry declared editable while core's lock held that
+    # package on its checkout (#3502).
+    source_index = fr.preferred_source_index(
+        source_index, pkg_infos, editable_paths, prefer,
+    )
+
     actions, no_source = fr.plan_reconcile(
         pkg_infos,
         source_index,
         installed_versions,
         editable_paths,
         class_to_pkg,
-        prefer=prefer,
     )
 
     if no_source:
@@ -1385,6 +1393,8 @@ def _run_feature_reconcile(
     # to the SAME source-map policy: reconcile never installs core itself (core
     # classes are bundled, so they are excluded from the plan), so there is no
     # core entry to apply first here — only a policy to hold everything else to.
+    # `source_index` is the one the plan read, `--prefer-*` included, so the
+    # lock holds each package to the source the plan chose for it.
     guard = CoreInstallGuard.snapshot(source_index)
 
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
@@ -1430,6 +1440,9 @@ def _run_feature_reconcile(
             bound_note = guard.manifest_bound_note()
             if bound_note:
                 print(f"      note: {bound_note}")
+            lock_note = guard.lock_bound_note()
+            if lock_note:
+                print(f"      note: {lock_note}")
             if not continue_on_error:
                 print(
                     "• reconcile: FAILED — aborting before restart. "
@@ -1525,6 +1538,19 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool, *, guar
     return True, ""
 
 
+def _report_core_lock() -> None:
+    """Print how the venv compares to core's uv.lock. Never installs anything."""
+    from kestrel_sovereign.cli_features import core_lock_check
+
+    check = core_lock_check()
+    if not check.needs_attention:
+        print(f"• lock: {check.headline}")
+        return
+    print(f"• lock: WARNING — {check.headline}:", file=sys.stderr)
+    for line in check.report_lines():
+        print(f"    {line}", file=sys.stderr)
+
+
 def cmd_update(args) -> int:
     """One-shot ``git pull`` + ``uv pip install -e .`` +
     ``kestrel feature sync`` + ``kestrel restart``.
@@ -1552,6 +1578,10 @@ def cmd_update(args) -> int:
         restart checks again, in a fresh interpreter, against what was
         installed, because a revision can change how the constitution is
         rendered as well as its text.
+      - Feature installs are held to core's ``uv.lock`` (#3502), and before
+        the restart (not on ``--dry-run``) the venv is compared against it.
+        Every mismatch is printed; nothing is repaired and the exit status
+        does not change.
     """
     from kestrel_sovereign.cli_features import core_state_refusal
 
@@ -1916,6 +1946,17 @@ def cmd_update(args) -> int:
             return rc
     else:
         print("• reconcile: skipped (--no-features)")
+
+    # Step 3: compare the venv against core's uv.lock (#3502). REPORTS ONLY.
+    #
+    # The installs above are held to the lock, but a path that bypasses the
+    # guard (a feature's own build step, a manual install between updates) can
+    # still move a locked package, and nothing else says so before the restart
+    # brings the agents up on versions CI never tested together. A mismatch is
+    # printed and the exit status is unchanged: the venv still loads, and which
+    # versions it should run is the operator's decision, not this step's.
+    if not dry_run:
+        _report_core_lock()
 
     # Step 4: kestrel restart.
     if restart:

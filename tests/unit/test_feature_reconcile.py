@@ -450,30 +450,40 @@ def test_plan_no_force_reinstall_for_normal_pypi_update():
     assert a.force_reinstall is False
 
 
+def _plan_preferring(pkg_infos, idx, installed_versions, editable_paths, prefer):
+    """Plan the way ``kestrel update`` does: the preference applied to the index first."""
+    return fr.plan_reconcile(
+        pkg_infos,
+        fr.preferred_source_index(idx, pkg_infos, editable_paths, prefer),
+        installed_versions=installed_versions,
+        editable_paths=editable_paths,
+        class_to_pkg={"VoiceFeature": "kestrel-feature-voice"},
+    )
+
+
 def test_plan_prefer_pypi_overrides_editable():
     pkg_infos = {"kestrel-feature-voice": _voice_info()}
     idx = {"kestrel-feature-voice": fr.SourceEntry(
         package="kestrel-feature-voice", editable="/co/voice")}
-    actions, _ = fr.plan_reconcile(
+    actions, _ = _plan_preferring(
         pkg_infos, idx,
         installed_versions={"kestrel-feature-voice": "0.3.1"},
         editable_paths={"kestrel-feature-voice": "/co/voice"},
-        class_to_pkg={"VoiceFeature": "kestrel-feature-voice"},
         prefer="pypi",
     )
     (a,) = actions
     assert a.mode == "pypi"
+    assert a.force_reinstall is True
 
 
 def test_plan_prefer_source_uses_editable_checkout():
     pkg_infos = {"kestrel-feature-voice": _voice_info()}
     idx = {"kestrel-feature-voice": fr.SourceEntry(
         package="kestrel-feature-voice", pypi=">=0.3")}
-    actions, _ = fr.plan_reconcile(
+    actions, _ = _plan_preferring(
         pkg_infos, idx,
         installed_versions={"kestrel-feature-voice": "0.3.1"},
         editable_paths={"kestrel-feature-voice": "/dev/voice"},
-        class_to_pkg={"VoiceFeature": "kestrel-feature-voice"},
         prefer="source",
     )
     (a,) = actions
@@ -487,16 +497,123 @@ def test_plan_prefer_source_without_checkout_falls_back_to_pypi():
     pkg_infos = {"kestrel-feature-voice": _voice_info()}
     idx = {"kestrel-feature-voice": fr.SourceEntry(
         package="kestrel-feature-voice", pypi=">=0.3")}
-    actions, no_source = fr.plan_reconcile(
+    actions, no_source = _plan_preferring(
         pkg_infos, idx,
         installed_versions={"kestrel-feature-voice": None},
         editable_paths={"kestrel-feature-voice": None},
-        class_to_pkg={"VoiceFeature": "kestrel-feature-voice"},
         prefer="source",
     )
     assert no_source == []
     (a,) = actions
     assert a.mode == "pypi" and a.source == "kestrel-feature-voice>=0.3"
+
+
+# --- preferred_source_index: --prefer-* as a declaration (#3502) ------------
+#
+# The plan and the install guard both read the declarations this returns, so
+# what a preference does is decided here once. Each test names the entry it
+# rewrites and the ones it must leave alone.
+
+VOICE = "kestrel-feature-voice"
+CORE = fr.CORE_DISTRIBUTION
+
+
+def test_no_preference_returns_the_manifest_declarations_unchanged():
+    idx = {
+        VOICE: fr.SourceEntry(package=VOICE, editable="/co/voice"),
+        "kestrel-feature-github": fr.SourceEntry(
+            package="kestrel-feature-github", pypi=">=0.2,<0.3"),
+    }
+
+    effective = fr.preferred_source_index(
+        idx, [VOICE, "kestrel-feature-github"], {VOICE: "/co/voice"}, None,
+    )
+
+    assert effective == idx
+    assert effective is not idx
+
+
+def test_prefer_pypi_declares_an_editable_entry_from_the_index():
+    """The checkout is gone from the declaration; the extras stay with it."""
+    idx = {VOICE: fr.SourceEntry(
+        package=VOICE, editable="/co/voice", extras=["local"])}
+
+    effective = fr.preferred_source_index(idx, [VOICE], {VOICE: "/co/voice"}, "pypi")
+
+    assert effective[VOICE] == fr.SourceEntry(package=VOICE, extras=["local"])
+    assert effective[VOICE].mode == "pypi"
+    assert idx[VOICE].editable == "/co/voice"  # the manifest's own entry is untouched
+
+
+def test_prefer_pypi_keeps_a_declared_index_window():
+    entry = fr.SourceEntry(package=VOICE, pypi=">=0.3,<0.4", extras=["local"])
+
+    effective = fr.preferred_source_index(
+        {VOICE: entry}, [VOICE], {VOICE: "/dev/voice"}, "pypi",
+    )
+
+    assert effective[VOICE] == entry
+
+
+def test_prefer_pypi_declares_an_undeclared_linked_package_from_the_index():
+    """No entry, but the venv links it: the plan installs it from the index, so it is declared so."""
+    effective = fr.preferred_source_index({}, [VOICE], {VOICE: "/dev/voice"}, "pypi")
+
+    assert effective == {VOICE: fr.SourceEntry(package=VOICE)}
+
+
+def test_prefer_source_declares_the_linked_checkout_over_an_index_entry():
+    """The window goes with the index declaration it belonged to."""
+    idx = {VOICE: fr.SourceEntry(package=VOICE, pypi=">=0.3", extras=["local"])}
+
+    effective = fr.preferred_source_index(idx, [VOICE], {VOICE: "/dev/voice"}, "source")
+
+    assert effective[VOICE] == fr.SourceEntry(
+        package=VOICE, editable="/dev/voice", extras=["local"])
+    assert fr.manifest_version_constraints(effective) == []
+
+
+def test_prefer_source_keeps_the_declared_checkout_over_the_linked_one():
+    idx = {VOICE: fr.SourceEntry(package=VOICE, editable="/co/voice")}
+
+    effective = fr.preferred_source_index(idx, [VOICE], {VOICE: "/old/voice"}, "source")
+
+    assert effective[VOICE].editable == "/co/voice"
+
+
+def test_prefer_source_without_a_known_checkout_keeps_the_entry():
+    entry = fr.SourceEntry(package=VOICE, pypi=">=0.3")
+
+    effective = fr.preferred_source_index(
+        {VOICE: entry}, [VOICE, "kestrel-feature-github"],
+        {VOICE: None, "kestrel-feature-github": None}, "source",
+    )
+
+    assert effective == {VOICE: entry}
+
+
+@pytest.mark.parametrize("prefer", ["pypi", "source"])
+def test_a_preference_rewrites_only_the_planned_packages_and_never_core(prefer):
+    """Core's entry is the source policy feature installs hold it to (#2949).
+
+    ``resolve_packages`` never plans core, but the function does not rely on
+    that: a preference for features must not turn core's checkout into an
+    index declaration, which would let a feature install replace it.
+    """
+    core = fr.SourceEntry(package=CORE, editable="/src/kestrel-sovereign")
+    other = fr.SourceEntry(package="kestrel-feature-github", editable="/co/github")
+    idx = {CORE: core, "kestrel-feature-github": other}
+
+    effective = fr.preferred_source_index(
+        idx, [CORE], {CORE: "/src/kestrel-sovereign"}, prefer,
+    )
+
+    assert effective == idx
+
+
+def test_an_unknown_preference_is_refused():
+    with pytest.raises(ValueError, match="unknown source preference 'index'"):
+        fr.preferred_source_index({}, [VOICE], {}, "index")
 
 
 # --- core source policy (#2949) --------------------------------------------

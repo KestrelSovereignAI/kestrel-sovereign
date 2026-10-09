@@ -35,6 +35,9 @@ Checks performed:
   - Every pinned semantic resource still matches its manifest digest. One
     mismatch refuses agent boot wholesale, and a CRLF-smudged checkout breaks
     all of them at once — see ``_check_semantic_registry`` (#2924).
+  - Every package core's ``uv.lock`` pins is installed at the locked version,
+    so the host runs what CI tested. A mismatch is reported, never repaired —
+    see ``_check_core_lock`` (#3502).
 
 This is deliberately minimal. We avoid reaching out to Ollama / OpenAI
 — that's flaky in CI and out of scope for "is the config sane?"
@@ -152,8 +155,27 @@ def diagnose(project_dir: Path) -> DoctorReport:
     _check_postgres_hold_readiness(resolved, project_dir, readings, report)
     _check_legacy_identity_exports(project_dir, report)
     _check_semantic_registry(report)
+    _check_core_lock(report)
 
     return report
+
+
+def _check_core_lock(report: DoctorReport) -> None:
+    """Report every installed package whose version differs from core's uv.lock.
+
+    A warning, not a failure: a drifted venv still boots, and it is running
+    versions CI never tested together, which is what an operator needs told
+    (#3502). The comparison is the one ``kestrel update`` reports after its
+    installs, and it reads the lock the feature-install guard holds installs
+    to. Nothing here installs or repairs.
+    """
+    from kestrel_sovereign.cli_features import core_lock_check
+
+    check = core_lock_check()
+    if check.needs_attention:
+        report.warn.append(f"{check.headline}: " + "; ".join(check.report_lines()))
+    else:
+        report.ok.append(check.headline)
 
 
 def _check_semantic_registry(report: DoctorReport) -> None:

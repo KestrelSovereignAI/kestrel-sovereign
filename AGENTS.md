@@ -375,9 +375,10 @@ What it actually does:
    - With `uv.lock` → `uv sync --active` (refreshes deps from lock + prunes anything not in it).
    - Without `uv.lock` → `uv pip install --python sys.executable -e .`.
    - Targets the venv that owns the running `kestrel` binary even under systemd/cron (`VIRTUAL_ENV` force-set from `sys.prefix`).
-3. **Reconcile** the host venv against `union(all [agents.*].features) + the mandatory features`. The per-agent allowlist is a *filter*, not an *installer*, so reconcile installs any feature class an agent names but the venv lacks, and updates the rest. Update mode per feature comes from the `.kestrel-host-features.toml` source map: `editable = "/path"` → `git pull --ff-only` the checkout; `pypi = ">=x,<y"` → `pip install --upgrade` within the pin. A class no installed package, bundled feature, or registry entry provides is a hard error (no blind fallback). `--no-features` skips this step (and `feature sync`); `--prefer-source` / `--prefer-pypi` bulk-override the mode.
-4. `kestrel feature sync` restores any out-of-tree feature packages (`kestrel-feature-*`) that `uv sync` pruned.
-5. `kestrel restart` brings agents back so they see the new install.
+3. `kestrel feature sync` restores any out-of-tree feature packages (`kestrel-feature-*`) that `uv sync` pruned.
+4. **Reconcile** the host venv against `union(all [agents.*].features) + the mandatory features`. The per-agent allowlist is a *filter*, not an *installer*, so reconcile installs any feature class an agent names but the venv lacks, and updates the rest. Update mode per feature comes from the `.kestrel-host-features.toml` source map: `editable = "/path"` → `git pull --ff-only` the checkout; `pypi = ">=x,<y"` → `pip install --upgrade` within the pin. A class no installed package, bundled feature, or registry entry provides is a hard error (no blind fallback). `--no-features` skips this step (and `feature sync`); `--prefer-source` / `--prefer-pypi` bulk-override the mode.
+5. Compare the venv against core's `uv.lock` and print every installed package whose version differs (report only, #3502). Steps 3 and 4 already hold every feature install to the lock's versions, so a mismatch here means something installed around them.
+6. `kestrel restart` brings agents back so they see the new install.
 
 Any step's failure short-circuits the rest — a half-applied update never reaches the restart phase. Full reference in [`README.md` § Pulling in upstream changes](README.md#pulling-in-upstream-changes-kestrel-update).
 

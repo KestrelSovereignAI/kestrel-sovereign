@@ -16,7 +16,10 @@
 #
 #     kestrel feature sync --capture
 #
-# Copy this file to `.kestrel-host-features.toml` (gitignored) and edit.
+# Copy this file to `.kestrel-host-features.toml` (gitignored) in the project
+# directory (KESTREL_HOME, else the project found from the current directory)
+# and edit. `kestrel feature sync`, `kestrel update` and the host all read it
+# there. A relative `editable` path is relative to this file's directory.
 #
 # This file is also the SOURCE MAP the `kestrel update` reconcile step reads to
 # decide each feature's update mode. Each entry records ONE source:

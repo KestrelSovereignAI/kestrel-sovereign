@@ -229,12 +229,20 @@ class UpdateProfile:
 def _host_feature_manifest() -> Optional[Path]:
     """The host's out-of-tree feature manifest, if present.
 
-    ``kestrel feature sync`` reads ``.kestrel-host-features.toml`` from the host
-    process cwd (the launch/data root). The profile is built in that same
-    process, so resolve it here and pass an ABSOLUTE path to the step so manifest
-    discovery does not depend on the step's own cwd.
+    The project directory's ``.kestrel-host-features.toml``
+    (:func:`~kestrel_sovereign.paths.project_dir`): the one the host reads its
+    feature enablement from and ``kestrel feature sync`` reads by default, not
+    the host process cwd, which a host launched under ``KESTREL_HOME`` need not
+    share (#3502). Resolved here and passed to the step as an ABSOLUTE path so
+    manifest discovery does not depend on the step's own cwd. Not
+    ``.resolve()``d: a relative ``editable`` is relative to the manifest's
+    directory, and following a linked manifest to its target would make the
+    step resolve it beside the target while every other reader resolves it in
+    the project directory.
     """
-    manifest = (Path.cwd() / ".kestrel-host-features.toml").resolve()
+    from kestrel_sovereign.paths import project_dir
+
+    manifest = project_dir() / ".kestrel-host-features.toml"
     return manifest if manifest.exists() else None
 
 
