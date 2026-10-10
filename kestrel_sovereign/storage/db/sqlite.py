@@ -397,6 +397,7 @@ class SQLiteBackend(DatabaseBackend):
         #: Committed-state fingerprint taken when an immutable read began.
         self._cold_read_marker: tuple = ()
         self._connection: Optional[aiosqlite.Connection] = None
+        self._connected_file_identity: Optional[tuple[int, int]] = None
         self._in_transaction = False
         self._transaction_poisoned = False
         self._savepoint_counter = 0
@@ -464,6 +465,24 @@ class SQLiteBackend(DatabaseBackend):
     @property
     def is_connected(self) -> bool:
         return self._connection is not None
+
+    @property
+    def connected_file_identity(self) -> Optional[tuple[int, int]]:
+        """The inode retained at connection acquisition, not a fresh path stat."""
+        return self._connected_file_identity
+
+    def assert_connected_file_still_valid(self) -> None:
+        """Refuse file custody inferred from a replaced pathname or new cwd."""
+        if self._connection is None:
+            raise ConnectionError("SQLite file custody requires a connected backend")
+        if self._resolved_path is None:
+            return
+        try:
+            current = self._resolved_path.lstat()
+        except OSError as exc:
+            raise ConnectionError("SQLite connected database pathname changed; retain recovery evidence") from exc
+        if (current.st_dev, current.st_ino) != self._connected_file_identity:
+            raise ConnectionError("SQLite connected database inode changed; retain recovery evidence")
 
     @property
     def write_connection_unavailable(self) -> bool:
@@ -671,8 +690,17 @@ class SQLiteBackend(DatabaseBackend):
             # existence — "there is nothing here" is an answer it has to be
             # able to give.
             if self.db_path != ":memory:" and not self.cold_read:
-                db_dir = Path(self.db_path).parent
+                db_dir = self._resolved_path.parent
                 db_dir.mkdir(parents=True, exist_ok=True)
+
+            before_identity = None
+            if self._resolved_path is not None:
+                try:
+                    before = self._resolved_path.stat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    before_identity = (before.st_dev, before.st_ino)
 
             if self.cold_read:
                 self._connection = await aiosqlite.connect(
@@ -682,8 +710,15 @@ class SQLiteBackend(DatabaseBackend):
                 )
             else:
                 self._connection = await aiosqlite.connect(
-                    self.db_path, timeout=_SQLITE_BUSY_TIMEOUT_S
+                    str(self._resolved_path) if self._resolved_path is not None else ":memory:",
+                    timeout=_SQLITE_BUSY_TIMEOUT_S,
                 )
+
+            if self._resolved_path is not None:
+                opened = self._resolved_path.stat()
+                self._connected_file_identity = (opened.st_dev, opened.st_ino)
+                if before_identity is not None and before_identity != self._connected_file_identity:
+                    raise ConnectionError("SQLite database inode changed during connection acquisition")
 
             # Enable WAL mode for better concurrency. Skipped for a cold read:
             # setting the journal mode WRITES to the database header, so this
@@ -806,6 +841,7 @@ class SQLiteBackend(DatabaseBackend):
             logger.debug(f"Closed SQLite connection: {self.db_path}")
         finally:
             self._connection = None
+            self._connected_file_identity = None
             self._cancelled_write_drain = None
             self._cancelled_write_drain_started_at = None
             self._cancelled_write_drain_error = None
@@ -847,10 +883,14 @@ class SQLiteBackend(DatabaseBackend):
 
     async def _open_snapshot_read_connection(self) -> aiosqlite.Connection:
         """Open a one-shot connection for committed reads during another task's txn."""
+        self.assert_connected_file_still_valid()
         conn = await aiosqlite.connect(
-            self.db_path, timeout=_SQLITE_BUSY_TIMEOUT_S
+            self._resolved_path.as_uri() + "?mode=rw",
+            uri=True,
+            timeout=_SQLITE_BUSY_TIMEOUT_S,
         )
         try:
+            self.assert_connected_file_still_valid()
             await conn.execute(
                 f"PRAGMA busy_timeout={int(_SQLITE_BUSY_TIMEOUT_S * 1000)}"
             )

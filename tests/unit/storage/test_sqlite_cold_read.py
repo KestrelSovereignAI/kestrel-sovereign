@@ -12,6 +12,7 @@ in opposite directions, and these tests pin both:
     so it would report pre-WAL state as current.
 """
 import sqlite3
+import asyncio
 
 import pytest
 
@@ -32,6 +33,37 @@ def _wal_db(path, *, rows=(("committed",),)):
 
 def _sidecars(path):
     return sorted(p.name for p in path.parent.glob(f"{path.name}-*"))
+
+
+@pytest.mark.asyncio
+async def test_native_connection_and_snapshot_reader_keep_the_original_relative_target(tmp_path, monkeypatch):
+    original_dir = tmp_path / "original"
+    other_dir = tmp_path / "other"
+    original_dir.mkdir()
+    other_dir.mkdir()
+    monkeypatch.chdir(original_dir)
+    backend = SQLiteBackend("authority.db")
+    # Connection acquisition itself must not reinterpret a relative path.
+    monkeypatch.chdir(other_dir)
+    await backend.connect()
+    try:
+        assert (original_dir / "authority.db").is_file()
+        assert not (other_dir / "authority.db").exists()
+        await backend.execute("CREATE TABLE retained (value TEXT)")
+        await backend.execute("INSERT INTO retained VALUES ('original')")
+        with sqlite3.connect(other_dir / "authority.db") as decoy:
+            decoy.execute("CREATE TABLE retained (value TEXT)")
+            decoy.execute("INSERT INTO retained VALUES ('decoy')")
+        async with backend.transaction():
+            await backend.execute("INSERT INTO retained VALUES ('uncommitted')")
+            # A sibling task gets the actual committed native snapshot, not
+            # the new cwd's same-named database or this owner's uncommitted row.
+            rows = await asyncio.create_task(backend.fetch_all("SELECT value FROM retained"))
+            assert rows == [("original",)]
+        backend.assert_connected_file_still_valid()
+    finally:
+        await backend.close()
+        assert backend.connected_file_identity is None
 
 
 @pytest.mark.asyncio

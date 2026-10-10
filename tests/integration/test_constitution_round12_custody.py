@@ -235,10 +235,324 @@ async def test_owned_concurrent_creator_cannot_delete_the_committed_winner(tmp_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("deleted_root", [False, True])
+async def test_external_target_cannot_bypass_current_local_consumed_lifetime(db_backend, tmp_path, monkeypatch, deleted_root):
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async, _born_hybrid_identity_paths
+
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
+    directory = tmp_path / "current-local"
+    slug = "retained-current-" + uuid4().hex
+    kwargs = dict(output_dir=str(directory), is_test_instance=True, identity_method="did:web",
+                  did_web_domain="agents.kestrel-sovereign.test", did_web_slug=slug)
+    first = await create_kestrel_identity_async(**kwargs)
+    original = AsyncStorage(str(directory / "kestrel_prime.db"), backend="sqlite", agent_id=first.agent_did)
+    await original.initialize()
+    try:
+        assert await (await _agent(original)).enter_safe_mode("current local lifetime cannot be bypassed")
+        if deleted_root:
+            await original.db.execute_commit("DELETE FROM graph_nodes WHERE node_id=?", (first.agent_did,))
+        state = await original.db.fetchone("SELECT * FROM constitution_runtime_state WHERE agent_id=?", (first.agent_did,))
+        events = await original.db.fetchall("SELECT * FROM constitution_runtime_events WHERE agent_id=? ORDER BY id", (first.agent_did,))
+    finally:
+        await original.close()
+    for path in _born_hybrid_identity_paths(directory, kwargs["did_web_slug"]):
+        path.unlink()
+    external = AsyncStorage(backend=db_backend, agent_id="did:test:fresh-external:" + uuid4().hex)
+    await external.initialize()
+    try:
+        with pytest.raises(Exception, match="existing identity|constitutional lifetime|birth replay"):
+            await create_kestrel_identity_async(database=external.db, force=True, **kwargs)
+        assert await external.db.fetchone("SELECT node_id FROM graph_nodes WHERE node_id=?", (first.agent_did,)) is None
+        assert not list(directory.glob(slug + "_*"))
+    finally:
+        await external.close()
+    check = AsyncStorage(str(directory / "kestrel_prime.db"), backend="sqlite", agent_id=first.agent_did)
+    await check.initialize()
+    try:
+        assert await check.db.fetchone("SELECT * FROM constitution_runtime_state WHERE agent_id=?", (first.agent_did,)) == state
+        assert await check.db.fetchall("SELECT * FROM constitution_runtime_events WHERE agent_id=? ORDER BY id", (first.agent_did,)) == events
+    finally:
+        await check.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("deleted_root", [False, True])
+async def test_external_publication_rechecks_current_local_lifetime_after_auditor(db_backend, tmp_path, monkeypatch, deleted_root):
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.identity.did_web import build_did
+
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
+    directory = tmp_path / "late-current"
+    directory.mkdir()
+    slug = "late-current-" + uuid4().hex
+    domain = "agents.kestrel-sovereign.test"
+    identity = build_did(domain, [slug])
+    local = AsyncStorage(str(directory / "kestrel_prime.db"), backend="sqlite", agent_id=identity)
+    external = AsyncStorage(backend=db_backend, agent_id="did:test:external:" + uuid4().hex)
+    await local.initialize()
+    await external.initialize()
+    audited = False
+
+    async def auditor(prompt):
+        nonlocal audited
+        # Providers must not hold either database's native writer custody.
+        assert not local.db.owns_open_transaction and not external.db.owns_open_transaction
+        await local.add_node(GraphNode(node_id=identity, node_type="agent", label="Winner", properties={}))
+        assert await (await _agent(local)).enter_safe_mode("late current-local consumed lifetime")
+        if deleted_root:
+            await local.db.execute_commit("DELETE FROM graph_nodes WHERE node_id=?", (identity,))
+        audited = True
+        return {"risk_level": 1, "reasoning": "Synthetic native competing lifetime"}
+
+    try:
+        with pytest.raises(Exception, match="existing identity|constitutional lifetime|birth replay"):
+            await create_kestrel_identity_async(
+                output_dir=str(directory), database=external.db, is_test_instance=True,
+                identity_method="did:web", did_web_domain=domain, did_web_slug=slug,
+                genesis_auditor=auditor,
+            )
+        assert audited
+        assert await external.db.fetchone("SELECT node_id FROM graph_nodes WHERE node_id=?", (identity,)) is None
+        assert await local.db.fetchone("SELECT agent_id FROM constitution_runtime_state WHERE agent_id=?", (identity,)) == (identity,)
+        assert not list(directory.glob(slug + "_*"))
+        assert not list(directory.glob(".inception-*"))
+    finally:
+        await external.close()
+        await local.close()
+
+
+@pytest.mark.asyncio
+async def test_external_same_local_sqlite_target_joins_its_native_publication_custody(tmp_path, monkeypatch):
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
+    directory = tmp_path / "same-local-target"
+    directory.mkdir()
+    db = await AsyncDatabase.sqlite(str(directory / "kestrel_prime.db"))
+    try:
+        result = await create_kestrel_identity_async(
+            output_dir=str(directory), database=db, is_test_instance=True,
+            identity_method="did:web", did_web_domain="agents.kestrel-sovereign.test", did_web_slug="same-target",
+        )
+        assert db._backend.is_connected
+        assert await db.fetchone("SELECT node_id FROM graph_nodes WHERE node_id=?", (result.agent_did,)) == (result.agent_did,)
+        assert (directory / "same-target_did.json").is_file()
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+@pytest.mark.parametrize("stage", ["connect", "schema"])
+async def test_owned_sqlite_initialization_failure_settles_before_cleanup_and_retry(tmp_path, monkeypatch, failure, stage):
+    import asyncio
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
+    directory = tmp_path / "failed-initialization"
+    kwargs = dict(output_dir=str(directory), is_test_instance=True, identity_method="did:web",
+                  did_web_domain="agents.kestrel-sovereign.test", did_web_slug="init-retry")
+    opened = []
+    native_connect, native_schema = SQLiteBackend.connect, AsyncDatabase._init_schema
+    reached, release = asyncio.Event(), asyncio.Event()
+
+    async def capture_connection(backend):
+        await native_connect(backend)
+        opened.append(backend)
+        if stage == "connect":
+            await refuse_initialization()
+
+    async def refuse_initialization():
+        reached.set()
+        if failure == "cancel":
+            await release.wait()
+        raise ConnectionError("native initialization refused")
+
+    async def refuse_schema(db):
+        await refuse_initialization()
+
+    monkeypatch.setattr(SQLiteBackend, "connect", capture_connection)
+    monkeypatch.setattr(AsyncDatabase, "_init_schema", refuse_schema)
+    task = asyncio.create_task(create_kestrel_identity_async(**kwargs))
+    try:
+        await asyncio.wait_for(reached.wait(), 10)
+        if failure == "cancel":
+            task.cancel()
+            task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError if failure == "cancel" else ConnectionError):
+            await asyncio.wait_for(task, 30)
+        assert all(backend._connection is None and not backend.connection_retirement_pending for backend in opened)
+        assert not (directory / "kestrel_prime.db").exists(), "failed initialization stranded its exclusively reserved SQLite inode"
+        assert not list(directory.glob("init-retry_*"))
+        monkeypatch.setattr(AsyncDatabase, "_init_schema", native_schema)
+        monkeypatch.setattr(SQLiteBackend, "connect", native_connect)
+        fresh = await create_kestrel_identity_async(**kwargs)
+        assert fresh.agent_did.endswith(":init-retry")
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for backend in opened:
+            await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_initialization_uncertain_retirement_retains_reserved_inode(tmp_path, monkeypatch):
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.storage.async_database import AsyncDatabase, DatabaseInitializationCleanupError
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+    directory = tmp_path / "uncertain-initialization"
+    opened = []
+    native_close = SQLiteBackend.close
+
+    async def fail_schema(db):
+        opened.append(db._backend)
+        raise RuntimeError("synthetic initialization failure on actual SQLite")
+
+    async def uncertain_close(backend):
+        raise RuntimeError("synthetic close acknowledgement unavailable")
+
+    monkeypatch.setattr(AsyncDatabase, "_init_schema", fail_schema)
+    monkeypatch.setattr(SQLiteBackend, "close", uncertain_close)
+    try:
+        with pytest.raises(DatabaseInitializationCleanupError, match="retain recovery evidence"):
+            await create_kestrel_identity_async(
+                output_dir=str(directory), is_test_instance=True, identity_method="did:web",
+                did_web_domain="agents.kestrel-sovereign.test", did_web_slug="uncertain-init",
+            )
+        assert (directory / "kestrel_prime.db").is_file()
+        assert not list(directory.glob("uncertain-init_*"))
+        assert opened and opened[0]._connection is not None
+    finally:
+        for backend in opened:
+            await native_close(backend)
+            assert backend._connection is None and not backend.connection_retirement_pending
+
+
+@pytest.mark.asyncio
+async def test_owned_initialization_failure_never_unlinks_replacement_inode(tmp_path, monkeypatch):
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    directory = tmp_path / "replaced-initialization"
+    captured = []
+
+    async def replace_before_failure(db):
+        path = directory / "kestrel_prime.db"
+        captured.append(db._backend)
+        path.rename(directory / "retained-original.db")
+        with sqlite3.connect(path) as replacement:
+            replacement.execute("CREATE TABLE retained_winner (value TEXT)")
+            replacement.execute("INSERT INTO retained_winner VALUES ('do not erase')")
+        raise RuntimeError("synthetic initialization failed after replacement")
+
+    monkeypatch.setattr(AsyncDatabase, "_init_schema", replace_before_failure)
+    try:
+        with pytest.raises(RuntimeError, match="lost exclusive creation ownership"):
+            await create_kestrel_identity_async(
+                output_dir=str(directory), is_test_instance=True, identity_method="did:web",
+                did_web_domain="agents.kestrel-sovereign.test", did_web_slug="replaced-init",
+            )
+        with sqlite3.connect(directory / "kestrel_prime.db") as replacement:
+            assert replacement.execute("SELECT value FROM retained_winner").fetchone() == ("do not erase",)
+        assert (directory / "retained-original.db").is_file()
+        assert all(backend._connection is None and not backend.connection_retirement_pending for backend in captured)
+    finally:
+        for backend in captured:
+            await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["prepare", "publication"])
+async def test_owned_failure_retirement_uncertainty_never_erases_database(tmp_path, monkeypatch, stage):
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+    from kestrel_sovereign.constitution import anchored_bytes
+
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
+    directory = tmp_path / "failed-retirement"
+    opened = []
+    native_close = SQLiteBackend.close
+
+    async def fail_audit(prompt):
+        raise RuntimeError("synthetic prepare failure")
+
+    async def fail_publication(*args, **kwargs):
+        raise RuntimeError("synthetic native publication failure")
+
+    async def uncertain_close(backend):
+        opened.append(backend)
+        raise RuntimeError("synthetic retirement acknowledgement unavailable")
+
+    monkeypatch.setattr(SQLiteBackend, "close", uncertain_close)
+    if stage == "publication":
+        monkeypatch.setattr(anchored_bytes, "_store_exact_native_file", fail_publication)
+    try:
+        with pytest.raises(RuntimeError, match="retirement acknowledgement unavailable"):
+            await create_kestrel_identity_async(
+                output_dir=str(directory), is_test_instance=True, identity_method="did:web",
+                did_web_domain="agents.kestrel-sovereign.test", did_web_slug="retired-init",
+                genesis_auditor=fail_audit if stage == "prepare" else None,
+            )
+        assert (directory / "kestrel_prime.db").is_file(), "failed retirement erased a still-owned database"
+        assert opened and opened[-1]._connection is not None
+        assert not list(directory.glob("retired-init_*"))
+        assert not list(directory.glob(".inception-*"))
+    finally:
+        for backend in opened:
+            await native_close(backend)
+            assert backend._connection is None and not backend.connection_retirement_pending
+
+
+@pytest.mark.asyncio
+async def test_native_sqlite_connection_file_custody_rejects_a_replaced_path(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db.interface import ConnectionError as NativeConnectionError
+
+    path = tmp_path / "authority.db"
+    original = await AsyncDatabase.sqlite(str(path))
+    winner = None
+    try:
+        retained = original._backend.connected_file_identity
+        original._backend.assert_connected_file_still_valid()
+        for suffix in ("", "-wal", "-shm"):
+            part = str(path) + suffix
+            if os.path.exists(part):
+                os.rename(part, str(tmp_path / "retained-original.db") + suffix)
+        winner = await AsyncDatabase.sqlite(str(path))
+        assert winner._backend.connected_file_identity != retained
+        with pytest.raises(NativeConnectionError, match="inode changed"):
+            original._backend.assert_connected_file_still_valid()
+        winner._backend.assert_connected_file_still_valid()
+        await winner.close()
+        winner = None
+        digest = sha256(path.read_bytes()).digest()
+        await original.close()
+        assert sha256(path.read_bytes()).digest() == digest
+    finally:
+        if winner is not None:
+            await winner.close()
+        await original.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("evidence", ["symlink", "hardlink", "stranded_wal", "corrupt", "overflow", "valid"])
 async def test_owned_archive_inspection_is_bounded_read_only_and_fail_closed(tmp_path, evidence):
     from pathlib import Path
-    from kestrel_sovereign.inception_service import _assert_archived_inception_lifetimes
+    from kestrel_sovereign.inception_service import _assert_local_inception_lifetimes
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
     archive_path = tmp_path / "kestrel_prime.db.backup-fixture"
@@ -259,10 +573,10 @@ async def test_owned_archive_inspection_is_bounded_read_only_and_fail_closed(tmp
             (tmp_path / f"kestrel_prime.db.backup-{number}").write_bytes(b"must not be opened")
     before = {p.name: (p.lstat().st_ino, p.lstat().st_mtime_ns, sha256(p.read_bytes()).digest()) for p in tmp_path.iterdir()}
     if evidence == "valid":
-        await _assert_archived_inception_lifetimes(Path(tmp_path), "did:test:genuinely-new")
+        await _assert_local_inception_lifetimes(Path(tmp_path), "did:test:genuinely-new")
     else:
         with pytest.raises(Exception, match="regular database|sidecar evidence|not a database|inspection bound"):
-            await _assert_archived_inception_lifetimes(Path(tmp_path), "did:test:genuinely-new")
+            await _assert_local_inception_lifetimes(Path(tmp_path), "did:test:genuinely-new")
     assert {p.name: (p.lstat().st_ino, p.lstat().st_mtime_ns, sha256(p.read_bytes()).digest()) for p in tmp_path.iterdir()} == before
 
 

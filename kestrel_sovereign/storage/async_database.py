@@ -41,7 +41,23 @@ logger = logging.getLogger(__name__)
 _BACKFILL_LOCK_DOMAIN = b"kestrel:schema-backfill-lock:v1\0"
 
 
-async def _close_failed_database_initialization(db: "AsyncDatabase") -> None:
+class DatabaseInitializationCleanupError(ConnectionError):
+    """Initialization failed without proof that its owned resources retired.
+
+    Callers must retain files and other recovery evidence on this exception.
+    An ordinary initialization failure (including cancellation) is delivered
+    only after the factory's connected backend has closed successfully.
+    """
+
+    def __init__(self, initialization_error: BaseException, cleanup_error: BaseException | None = None):
+        super().__init__(
+            "Database initialization cleanup did not complete; retain recovery evidence"
+        )
+        self.initialization_error = initialization_error
+        self.cleanup_error = cleanup_error
+
+
+async def _close_failed_database_initialization(db: "AsyncDatabase", initialization_error: BaseException) -> None:
     """Finish closing an owned backend even if its caller is cancelled again."""
 
     cleanup = asyncio.create_task(
@@ -54,20 +70,17 @@ async def _close_failed_database_initialization(db: "AsyncDatabase") -> None:
         except asyncio.CancelledError:
             cancelled = True
             continue
-        except Exception:  # noqa: BLE001 - inspect and log below
-            # The task is now complete with an error.  Do not let a secondary
-            # close failure replace the schema-initialization failure whose
-            # cleanup brought us here; the final await below records it.
+        except Exception:  # noqa: BLE001 - deliver joined cleanup failure below
+            # Do not let the shield's exception obscure the lifecycle result.
+            # The joined task below distinguishes failed initialization from
+            # uncertain retirement, which must never permit file cleanup.
             continue
     try:
         await cleanup
-    except asyncio.CancelledError:
-        cancelled = True
-    except Exception as close_exc:  # noqa: BLE001 - preserve initialization error
-        logger.warning(
-            "Could not close backend after database initialization failed: %s",
-            close_exc,
-        )
+    except (asyncio.CancelledError, Exception) as close_exc:
+        raise DatabaseInitializationCleanupError(initialization_error, close_exc) from close_exc
+    if db.connection_retirement_pending:
+        raise DatabaseInitializationCleanupError(initialization_error)
     if cancelled:
         raise asyncio.CancelledError()
 
@@ -1141,8 +1154,8 @@ class AsyncDatabase:
             else:
                 async with initialization_guard:
                     await initialize_schema()
-        except BaseException:
-            await _close_failed_database_initialization(db)
+        except BaseException as initialization_error:
+            await _close_failed_database_initialization(db, initialization_error)
             raise
         db._initialized = True
         return db
@@ -1183,6 +1196,11 @@ class AsyncDatabase:
         default one runs DDL the connection cannot execute. The caller must
         call the backend's ``assert_cold_read_still_valid`` before acting on
         what it read.
+
+        Connection acquisition is settled even under repeated cancellation:
+        a worker cannot be abandoned before ownership reaches this factory.
+        Ordinary failures prove retirement; uncertain cleanup raises
+        :class:`DatabaseInitializationCleanupError` instead.
         """
         if cold_read and schema_initializer is None:
             raise ValueError(
@@ -1190,7 +1208,28 @@ class AsyncDatabase:
                 "pass a schema_initializer that issues no DDL"
             )
         backend = SQLiteBackend(db_path, cold_read=cold_read)
-        await backend.connect()
+        db = cls(backend)
+        connect = asyncio.create_task(backend.connect(), name="sqlite-database-initialization")
+        cancelled = False
+        try:
+            while not connect.done():
+                try:
+                    await asyncio.shield(connect)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break  # deliver the joined task's failure below
+            try:
+                connect.result()
+            except BaseException as connect_error:
+                if cancelled:
+                    raise asyncio.CancelledError() from connect_error
+                raise
+            if cancelled:
+                raise asyncio.CancelledError()
+        except BaseException as initialization_error:
+            await _close_failed_database_initialization(db, initialization_error)
+            raise
         db = await cls.from_connected_backend(
             backend, schema_initializer=schema_initializer
         )
