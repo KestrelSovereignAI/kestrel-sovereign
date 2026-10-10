@@ -187,37 +187,43 @@ class TaskManager:
         """Close all stores and release resources.
 
         This must be called during shutdown to prevent thread leaks from
-        aiosqlite connections.
+        aiosqlite connections. Every store is closed even when another fails,
+        and the method returns only when all of them closed (#3558). The
+        stores stay on the manager, so a later call retries every store whose
+        close failed; a store that already closed is closed again harmlessly.
+
+        Raises:
+            Exception: The first store close that failed, with a note naming
+                every other store that failed to close.
+            asyncio.CancelledError: The caller was cancelled. The stores not
+                yet closed stay open for a later call.
         """
         await self.drain_execution_tasks(cancel=True)
 
         # Close all stores in reverse order of initialization
-        if self.feedback_store:
+        stores = (
+            ("feedback_store", self.feedback_store),
+            ("memory_service", self.memory_service),
+            ("observability_store", self.observability_store),
+            ("session_service", self.session_service),
+            ("task_store", self.task_store),
+        )
+        failures: list[tuple[str, Exception]] = []
+        for name, store in stores:
+            if store is None:
+                continue
             try:
-                await self.feedback_store.close()
+                await store.close()
             except Exception as e:
-                logger.debug(f"Error closing feedback_store: {e}")
+                logger.warning("Error closing %s: %s", name, e, exc_info=True)
+                failures.append((name, e))
 
-        if self.memory_service:
-            try:
-                await self.memory_service.close()
-            except Exception as e:
-                logger.debug(f"Error closing memory_service: {e}")
-
-        try:
-            await self.observability_store.close()
-        except Exception as e:
-            logger.debug(f"Error closing observability_store: {e}")
-
-        try:
-            await self.session_service.close()
-        except Exception as e:
-            logger.debug(f"Error closing session_service: {e}")
-
-        try:
-            await self.task_store.close()
-        except Exception as e:
-            logger.debug(f"Error closing task_store: {e}")
+        if failures:
+            first_name, first = failures[0]
+            first.add_note(f"TaskManager could not close {first_name}")
+            for name, error in failures[1:]:
+                first.add_note(f"TaskManager could not close {name} either: {error}")
+            raise first
 
         logger.info("TaskManager closed all stores")
 

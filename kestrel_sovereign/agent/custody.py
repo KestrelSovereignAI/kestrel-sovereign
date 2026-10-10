@@ -27,16 +27,16 @@ from typing import Awaitable, Callable, Collection, Dict, Optional, Tuple
 #: or by returning a :class:`ReleaseOutcome` other than ``RELEASED``. Only a
 #: ``RELEASED`` reported for one of these owners ends a resource's custody.
 #:
-#: Empty until each owner is converted, so for now no resource is ever
-#: released and an agent keeps its serving record until its process exits.
-#: An owner joins only once its own close stops swallowing failures; that it
-#: returned without raising never makes it truthful. The conversions filed so
-#: far are #3558 (``task_manager``), #3559 (``llm_service``) and #3560
-#: (``feature``); every other owner a boot acquires (``storage``,
-#: ``signal_dispatcher``, ``memory_system``, ``sync_service``,
-#: ``heartbeat_runner``, ``resume_monitor``, ``salvage_worker``,
-#: ``background_tasks``) needs its close shown truthful the same way first.
-TRUTHFUL_CLOSE_OWNERS: frozenset[str] = frozenset()
+#: Until every owner a boot acquires from is listed, an agent keeps its serving
+#: record until its process exits. An owner joins only once its own close
+#: stops swallowing failures; that it returned without raising never makes it
+#: truthful. ``task_manager`` joined with #3558. The conversions still filed
+#: are #3559 (``llm_service``) and #3560 (``feature``); every other owner a
+#: boot acquires (``storage``, ``signal_dispatcher``, ``memory_system``,
+#: ``sync_service``, ``heartbeat_runner``, ``resume_monitor``,
+#: ``salvage_worker``, ``background_tasks``) needs its close shown truthful
+#: the same way first.
+TRUTHFUL_CLOSE_OWNERS: frozenset[str] = frozenset({"task_manager"})
 
 #: The owner of every per-feature resource.
 FEATURE_OWNER = "feature"

@@ -440,14 +440,16 @@ file, and every agent also writes a serving record into its data directory
 (#3522). The process removes its record only once the release of every
 resource the agent acquired is confirmed, and a release counts as confirmed
 only from an owner whose close reports a failure instead of logging it and
-returning. No owner qualifies yet (#3558, #3559, #3560), so for now a record
-stays until its process exits. An agent stopped inside a host that keeps
-running therefore still counts as running, as does one whose boot failed. A
-serving record is stale only on proof: it says it was written on this host and
-in this PID namespace, its PID is a positive integer and its start time a
-finite, positive number of seconds, and nothing runs as that PID here or what
-does started at another time. A stale record is ignored, and the next agent to
-boot in that data directory deletes it. No other record is deleted.
+returning. Only the A2A task manager qualifies so far (#3558); the LLM
+service, the features (#3559, #3560) and the agent's other owners do not yet,
+so for now a record stays until its process exits. An agent stopped inside a
+host that keeps running therefore still counts as running, as does one whose
+boot failed. A serving record is stale only on proof: it says it was written
+on this host and in this PID namespace, its PID is a positive integer and its
+start time a finite, positive number of seconds, and nothing runs as that PID
+here or what does started at another time. A stale record is ignored, and the
+next agent to boot in that data directory deletes it. No other record is
+deleted.
 
 An agent whose liveness cannot be established counts as running too: a PID
 file or serving record that cannot be read, or that is missing a field or
