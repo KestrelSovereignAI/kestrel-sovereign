@@ -478,6 +478,9 @@ async def test_owned_initialization_failure_never_unlinks_replacement_inode(tmp_
 @pytest.mark.parametrize("stage", ["prepare", "publication"])
 async def test_owned_failure_retirement_uncertainty_never_erases_database(tmp_path, monkeypatch, stage):
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.constitution.genesis_audit import GenesisAuditPendingError
+    from kestrel_sovereign.storage.async_database import DatabaseRetirementError
+    from kestrel_sovereign.storage.db.interface import TransactionError
     from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
     from kestrel_sovereign.constitution import anchored_bytes
 
@@ -501,12 +504,22 @@ async def test_owned_failure_retirement_uncertainty_never_erases_database(tmp_pa
     if stage == "publication":
         monkeypatch.setattr(anchored_bytes, "_store_exact_native_file", fail_publication)
     try:
-        with pytest.raises(RuntimeError, match="retirement acknowledgement unavailable"):
+        with pytest.raises(DatabaseRetirementError, match="retain recovery evidence") as failure:
             await create_kestrel_identity_async(
                 output_dir=str(directory), is_test_instance=True, identity_method="did:web",
                 did_web_domain="agents.kestrel-sovereign.test", did_web_slug="retired-init",
                 genesis_auditor=fail_audit if stage == "prepare" else None,
             )
+        assert len(opened) == 1, "uncertain retirement must retain its original owner, not retry blindly"
+        assert failure.value.retirement_owner._backend is opened[0]
+        assert isinstance(failure.value.cleanup_error, RuntimeError)
+        assert str(failure.value.cleanup_error) == "synthetic retirement acknowledgement unavailable"
+        assert failure.value.__cause__ is failure.value.cleanup_error
+        operation_type = GenesisAuditPendingError if stage == "prepare" else TransactionError
+        assert isinstance(failure.value.operation_error, operation_type)
+        expected_operation = "synthetic prepare failure" if stage == "prepare" else "synthetic native publication failure"
+        assert isinstance(failure.value.operation_error.__cause__, RuntimeError)
+        assert str(failure.value.operation_error.__cause__) == expected_operation
         assert (directory / "kestrel_prime.db").is_file(), "failed retirement erased a still-owned database"
         assert opened and opened[-1]._connection is not None
         assert not list(directory.glob("retired-init_*"))
