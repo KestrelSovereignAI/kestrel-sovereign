@@ -2,9 +2,11 @@
 Tests for database backend abstraction layer.
 """
 import asyncio
+import logging
 import sqlite3
 import threading
 import time
+import weakref
 from contextlib import suppress
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1611,6 +1613,303 @@ class TestSQLiteBackend:
             (3,),
             (5,),
         ]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_autocommit_read_does_not_interrupt_next_write(
+        self, backend
+    ):
+        """A ``fetch_one`` cancelled between its ``execute`` and ``fetchone``,
+        with no transaction open, does not fail the next write (#3508).
+
+        Outside a transaction the drain's rollback runs no statement, so it
+        cannot clear the drain's interrupt while the abandoned statement is
+        active. Only closing the abandoned cursor lets the write's BEGIN run.
+        """
+        await backend.execute("CREATE TABLE t (value INTEGER NOT NULL)")
+        await backend.execute_many(
+            "INSERT INTO t (value) VALUES (?)", [(1,), (2,), (3,)]
+        )
+        fetch_entered = asyncio.Event()
+        abandoned: list[weakref.ref] = []
+
+        async def hanging_fetchone(cursor):
+            abandoned.append(weakref.ref(cursor))
+            fetch_entered.set()
+            await asyncio.Event().wait()
+
+        read = None
+        try:
+            with patch.object(aiosqlite.Cursor, "fetchone", new=hanging_fetchone):
+                read = asyncio.create_task(
+                    backend.fetch_one("SELECT value FROM t ORDER BY value")
+                )
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    await fetch_entered.wait()
+                read.cancel()
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    while not read.done():
+                        await asyncio.sleep(0)
+            assert not backend._in_transaction
+            # The cancelled read is deliberately not awaited yet: its
+            # exception keeps the abandoned cursor, and its statement, alive.
+            async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                await backend.execute("INSERT INTO t (value) VALUES (4)")
+            assert abandoned[0]() is not None
+            with pytest.raises(asyncio.CancelledError):
+                await read
+        finally:
+            if read is not None:
+                if not read.done():
+                    read.cancel()
+                await asyncio.gather(read, return_exceptions=True)
+
+        assert backend._cancelled_write_drain_error is None
+        assert await backend.fetch_all("SELECT value FROM t ORDER BY value") == [
+            (1,),
+            (2,),
+            (3,),
+            (4,),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_drain_releases_abandoned_read_outside_transaction(
+        self, backend
+    ):
+        """The issue's aiosqlite-level reproduction, through the drain (#3508)."""
+        await backend.execute("CREATE TABLE t (v INTEGER)")
+        await backend.execute_many(
+            "INSERT INTO t VALUES (?)", [(i,) for i in range(5)]
+        )
+        conn = backend._ensure_connected()
+        # An abandoned read, its cursor still referenced, with rows pending.
+        held = await conn.execute("SELECT v FROM t")
+        await held.fetchone()
+        backend._abandoned_read_cursors.add(held)
+
+        # Interrupt, then a rollback that is a no-op in autocommit.
+        backend._handoff_cancelled_write(conn)
+        drain = backend._cancelled_write_drain
+        assert drain is not None
+        async with asyncio.timeout(_HANG_GUARD_SECONDS):
+            await drain
+
+        assert backend._cancelled_write_drain_error is None
+        assert not backend._abandoned_read_cursors
+        # Failed OperationalError('interrupted') before the drain closed it.
+        await conn.execute("INSERT INTO t VALUES (100)")
+        await conn.commit()
+        assert await backend.fetch_val("SELECT COUNT(*) FROM t") == 6
+        assert held is not None
+
+    @pytest.mark.asyncio
+    async def test_drain_treats_closed_and_collected_cursors_as_released(
+        self, backend, caplog
+    ):
+        """Closing a cursor already closed, or forgetting one already
+        collected, is a no-op for the drain (#3508)."""
+        await backend.execute("CREATE TABLE t (v INTEGER)")
+        await backend.execute_many(
+            "INSERT INTO t VALUES (?)", [(i,) for i in range(5)]
+        )
+        conn = backend._ensure_connected()
+        closed = await conn.execute("SELECT v FROM t")
+        await closed.fetchone()
+        await closed.close()
+        collected = await conn.execute("SELECT v FROM t")
+        backend._abandoned_read_cursors.add(closed)
+        backend._abandoned_read_cursors.add(collected)
+        del collected
+        assert set(backend._abandoned_read_cursors) == {closed}
+
+        with caplog.at_level(logging.WARNING, logger=sqlite_backend_module.__name__):
+            backend._handoff_cancelled_write(conn)
+            drain = backend._cancelled_write_drain
+            assert drain is not None
+            async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                await drain
+
+        assert not [
+            record
+            for record in caplog.records
+            if record.name == sqlite_backend_module.__name__
+        ]
+        assert backend._cancelled_write_drain_error is None
+        assert not backend._abandoned_read_cursors
+        await backend.execute("INSERT INTO t VALUES (100)")
+        assert await backend.fetch_val("SELECT COUNT(*) FROM t") == 6
+
+    @pytest.mark.asyncio
+    async def test_drain_retries_failed_cursor_close_before_releasing_writes(
+        self, backend, caplog
+    ):
+        """A failed close is logged, stays recorded, and keeps writes fenced
+        until the drain's retry closes it (#3508)."""
+        await backend.execute("CREATE TABLE t (v INTEGER)")
+        await backend.execute_many(
+            "INSERT INTO t VALUES (?)", [(i,) for i in range(5)]
+        )
+        conn = backend._ensure_connected()
+        held = await conn.execute("SELECT v FROM t")
+        await held.fetchone()
+        backend._abandoned_read_cursors.add(held)
+        real_close = held.close
+        failure = sqlite3.ProgrammingError("simulated cursor close failure")
+        first_close_entered = asyncio.Event()
+        fail_first_close = asyncio.Event()
+        recorded_at_retry: list[bool] = []
+        closes = 0
+
+        async def close_failing_once():
+            nonlocal closes
+            closes += 1
+            if closes == 1:
+                first_close_entered.set()
+                await fail_first_close.wait()
+                raise failure
+            recorded_at_retry.append(held in backend._abandoned_read_cursors)
+            await real_close()
+
+        write = None
+        try:
+            with (
+                patch.object(held, "close", new=close_failing_once),
+                caplog.at_level(
+                    logging.WARNING, logger=sqlite_backend_module.__name__
+                ),
+            ):
+                backend._handoff_cancelled_write(conn)
+                drain = backend._cancelled_write_drain
+                assert drain is not None
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    await first_close_entered.wait()
+                write = asyncio.create_task(
+                    backend.execute("INSERT INTO t VALUES (100)")
+                )
+                fail_first_close.set()
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    await drain
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    await write
+        finally:
+            fail_first_close.set()
+            if write is not None:
+                if not write.done():
+                    write.cancel()
+                await asyncio.gather(write, return_exceptions=True)
+
+        assert closes == 2
+        assert recorded_at_retry == [True]
+        assert [
+            record.exc_info[1]
+            for record in caplog.records
+            if record.name == sqlite_backend_module.__name__
+            and record.exc_info is not None
+        ] == [failure]
+        assert backend._cancelled_write_drain_error is None
+        assert not backend._abandoned_read_cursors
+        assert await backend.fetch_val("SELECT COUNT(*) FROM t") == 6
+
+    @pytest.mark.asyncio
+    async def test_drain_cursor_close_still_failing_at_deadline_latches(
+        self, backend, monkeypatch
+    ):
+        """A close that keeps failing latches at the drain deadline instead
+        of retiring the fence as success (#3508)."""
+        drain_timeout = 0.2
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "_CANCELLED_OPERATION_DRAIN_TIMEOUT_S",
+            drain_timeout,
+        )
+        await backend.execute("CREATE TABLE t (v INTEGER)")
+        await backend.execute_many(
+            "INSERT INTO t VALUES (?)", [(i,) for i in range(5)]
+        )
+        conn = backend._ensure_connected()
+        held = await conn.execute("SELECT v FROM t")
+        await held.fetchone()
+        backend._abandoned_read_cursors.add(held)
+        failure = sqlite3.ProgrammingError("simulated cursor close failure")
+
+        async def always_failing_close():
+            raise failure
+
+        try:
+            with patch.object(held, "close", new=always_failing_close):
+                backend._handoff_cancelled_write(conn)
+                drain = backend._cancelled_write_drain
+                started_at = backend._cancelled_write_drain_started_at
+                assert drain is not None and started_at is not None
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    await drain
+                latched_after = time.monotonic() - started_at
+
+            assert latched_after >= drain_timeout
+            assert backend._cancelled_write_drain_error is failure
+            assert backend.write_connection_requires_reconnect is True
+            assert set(backend._abandoned_read_cursors) == {held}
+            with pytest.raises(
+                ConnectionError, match="cancellation cleanup failed"
+            ):
+                await backend.execute("INSERT INTO t VALUES (100)")
+        finally:
+            await held.close()
+
+    @pytest.mark.asyncio
+    async def test_drain_does_not_retry_cursor_close_failing_during_close(
+        self, tmp_path
+    ):
+        """Once close owns the connection, a failed cursor close ends the
+        drain instead of retrying (#3508)."""
+        backend = SQLiteBackend(str(tmp_path / "close-during-cursor-close.db"))
+        await backend.connect()
+        conn = backend._ensure_connected()
+        held = await conn.execute("SELECT 1 UNION ALL SELECT 2")
+        await held.fetchone()
+        backend._abandoned_read_cursors.add(held)
+        failure = sqlite3.ProgrammingError("simulated cursor close failure")
+        close_entered = asyncio.Event()
+        fail_close = asyncio.Event()
+        closes = 0
+
+        async def close_failing_when_released():
+            nonlocal closes
+            closes += 1
+            close_entered.set()
+            await fail_close.wait()
+            raise failure
+
+        close_task = None
+        drain = None
+        try:
+            with patch.object(held, "close", new=close_failing_when_released):
+                backend._handoff_cancelled_write(conn)
+                drain = backend._cancelled_write_drain
+                assert drain is not None
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    await close_entered.wait()
+                close_task = asyncio.create_task(backend.close())
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    while not backend._closing:
+                        await asyncio.sleep(0)
+                fail_close.set()
+                async with asyncio.timeout(_HANG_GUARD_SECONDS):
+                    await close_task
+
+            assert closes == 1
+            assert drain.done() and not drain.cancelled()
+            assert not backend.is_connected
+        finally:
+            fail_close.set()
+            for task in (drain, close_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (drain, close_task) if task is not None),
+                return_exceptions=True,
+            )
+            if backend.is_connected:
+                await backend.close()
 
     @pytest.mark.asyncio
     async def test_close_fences_late_cancellation_handoff(self, tmp_path):
