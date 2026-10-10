@@ -1325,15 +1325,24 @@ async def record_update_log(db, request_id: str, update_log: str) -> None:
 
 async def record_constitution_checks(
     db, request_id: str, constitution_checks: str,
-) -> None:
+) -> bool:
     """Persist the constitution adoption gate's checks JSON onto the row.
 
     Like :func:`record_update_log`, independent of the lifecycle state: the
     evidence of what the gate compared survives whatever the request becomes.
+    Returns whether the write landed. Unlike the update log, the checks are a
+    precondition of the restart they justify, so a caller must not dispatch
+    one when this returns False or raises (#3522).
     """
-    await db.execute(
+    result = await db.execute(
         "UPDATE restart_requests SET constitution_checks = ? WHERE id = ?",
         (constitution_checks, request_id),
+    )
+    return await _write_landed(
+        db,
+        result,
+        request_id,
+        lambda row: row.constitution_checks == constitution_checks,
     )
 
 

@@ -188,6 +188,15 @@ anchored hash, the governing hash, and the verdict. A completed
 restart therefore shows that the gate ran and what it compared, not only
 that nothing refused it.
 
+Recording a check is a precondition of acting on it. When the write fails,
+the coordinator neither refuses nor restarts: no checkout follows a fetched
+revision's check it could not record, and no restart follows an installed
+code check it could not record. The request stays retryable, with a
+`status_reason` naming the failed write: a plain restart's request keeps its
+`pending` or `approved` status, and an update's returns from `updating` to
+`pending`. The next coordinator tick runs the checks again and records them
+before it refuses or dispatches.
+
 `kestrel update --no-restart` asks which blocking agents are running. A
 process serves an agent however it was launched: `kestrel start` writes a PID
 file, and every agent also writes a serving record into its data directory

@@ -173,6 +173,17 @@ _INSTALLED_CODE_CHECK = "installed_code"
 logger = logging.getLogger(__name__)
 
 
+class _ConstitutionChecksUnrecorded(RuntimeError):
+    """The adoption gate's checks could not be recorded on the request.
+
+    A recorded check is a precondition of the restart it justifies (#3522):
+    without it a completed restart is indistinguishable from one the gate
+    never judged. The request is left retryable rather than dispatched, and
+    rather than refused, since a storage failure says nothing about the
+    constitution.
+    """
+
+
 # Synonyms LLMs reliably reach for that map cleanly onto the canonical
 # enum sets. The middle urgency is ``normal``, but every model defaults to
 # the universal low/medium/high taxonomy — accept ``medium`` rather than
@@ -1434,12 +1445,19 @@ class RestartCoordinatorFeature(Feature):
             # terminally and with the agents named, before claiming. An
             # update_then_restart is judged by its update instead: after the
             # fetch, against the revision it is about to check out, and once
-            # installed, against what it installed.
+            # installed, against what it installed. Either way the check is
+            # recorded before the request is refused or dispatched (#3522).
             if req.operation != "update_then_restart":
                 check, refusal = await self._check_constitution_adoption(
                     stage=_INSTALLED_CODE_CHECK,
                 )
-                await self._record_constitution_checks(req, [check])
+                try:
+                    await self._record_constitution_checks(req, [check])
+                except _ConstitutionChecksUnrecorded as exc:
+                    reason = f"{exc}; left retryable"
+                    await self._leave_retryable_unrecorded(req, reason)
+                    deferred.append({"request_id": req.id, "reason": reason})
+                    continue
                 if refusal is not None:
                     if await self._refuse_restart(req, refusal):
                         refused.append({"request_id": req.id, "reason": refusal})
@@ -1808,19 +1826,65 @@ class RestartCoordinatorFeature(Feature):
     ) -> None:
         """Record the adoption checks of this attempt on the request (#3522).
 
-        Replaces the previous attempt's checks. ``req`` carries them too, so
-        the status events emitted from it report what the gate compared.
+        Replaces the previous attempt's checks. Once they are recorded,
+        ``req`` carries them too, so the status events emitted from it report
+        what the gate compared.
+
+        Raises:
+            _ConstitutionChecksUnrecorded: The write failed or matched no row.
+                The caller must not refuse or dispatch the request on checks
+                it could not record; it leaves the request retryable instead.
         """
-        req.constitution_checks = json.dumps(checks)
+        recorded = json.dumps(checks)
         try:
-            await record_constitution_checks(
-                self._db, req.id, req.constitution_checks,
+            landed = await record_constitution_checks(self._db, req.id, recorded)
+        except Exception as e:
+            # Whatever the storage backend raised: none of it may let a
+            # restart run without its evidence.
+            raise _ConstitutionChecksUnrecorded(
+                f"the constitution adoption checks could not be recorded on "
+                f"the request ({type(e).__name__}: {e})"
+            ) from e
+        if not landed:
+            raise _ConstitutionChecksUnrecorded(
+                "the constitution adoption checks could not be recorded on "
+                "the request (the write matched no row)"
             )
-        except Exception as e:  # pragma: no cover - defensive
+        req.constitution_checks = recorded
+
+    async def _leave_retryable_unrecorded(self, req, reason: str) -> None:
+        """Keep a pending request whose checks went unrecorded in the queue.
+
+        It stays ``pending``/``approved`` with ``reason`` as its status reason,
+        and the next coordinator tick runs the gate again and records it
+        before anything is dispatched. The reason is written best-effort: the
+        storage that refused the checks may refuse it too, and the request is
+        not dispatched either way.
+        """
+        try:
+            noted = await update_status(
+                self._db, req.id,
+                status=req.status,
+                status_reason=reason,
+                expected_current_status=req.status,
+                expected_authority_signature=req.authority_signature,
+            )
+        except Exception as e:
             logger.warning(
-                "restart_coordinator: failed to persist constitution checks "
-                "for %s: %s", req.id, e,
+                "restart_coordinator: could not record why %s was left "
+                "retryable: %s", req.id, e,
             )
+        else:
+            if noted:
+                req.status_reason = reason
+        logger.warning(
+            "restart_coordinator: %s not dispatched: %s", req.id, reason,
+        )
+        # Every deferral is emitted as ``pending``, an ``approved`` row's too,
+        # so the request keeps one deferral bubble.
+        await self._emit_status_event(
+            req, state="pending", deferral_reason=reason,
+        )
 
     async def _refuse_restart(self, req, reason: str) -> bool:
         """Terminally refuse a pending request the adoption gate stopped."""
@@ -2799,12 +2863,14 @@ class RestartCoordinatorFeature(Feature):
             return {"request_id": req.id, "reason": f"refused: {reason}"}
 
         if not update["ok"]:
-            # Fetch/checkout/install failed before any restart. Leave the
+            # Fetch/checkout/install failed before any restart, or the
+            # adoption checks could not be recorded (#3522). Leave the
             # request retryable — the next poll re-runs the idempotent
             # profile — unless sovereign rotation revoked its authority while
             # the update was in flight. That case becomes terminal instead of
             # remaining stranded in the unpolled ``updating`` state.
-            failure_reason = (
+            unrecorded = update.get("constitution_checks_unrecorded")
+            failure_reason = unrecorded or (
                 f"update failed at step {update.get('failed_step')!r}; "
                 "left retryable (see update_log)"
             )
@@ -2821,7 +2887,11 @@ class RestartCoordinatorFeature(Feature):
             return {
                 "request_id": req.id,
                 "reason": (
-                    f"update failed at step {update.get('failed_step')!r}; "
+                    (
+                        "constitution adoption checks could not be recorded; "
+                        if unrecorded
+                        else f"update failed at step {update.get('failed_step')!r}; "
+                    )
                     + (
                         "retryable"
                         if recovered_status == "pending"
@@ -2910,55 +2980,77 @@ class RestartCoordinatorFeature(Feature):
         ok = True
         failed_step: Optional[str] = None
         constitution_refusal: Optional[str] = None
+        # Why this attempt's checks could not be recorded: the request is then
+        # neither refused nor restarted, and the next tick tries again (#3522).
+        checks_unrecorded: Optional[str] = None
+        installed = False
         constitution_checks: List[Dict[str, Any]] = []
-        await self._record_constitution_checks(req, constitution_checks)
-        for step in steps:
-            outcome = await self._run_update_step(step)
-            results.append(outcome)
-            if step.name == "resolve_ref" and outcome.get("ok"):
-                resolved_ref = (outcome.get("stdout_tail") or "").strip()
-            if not outcome.get("ok") and not (
-                step.read_only or step.allow_failure
-            ):
-                ok = False
-                failed_step = step.name
-                break
-            if step.name == "fetch":
-                # The fetch only moved remote-tracking refs. Judge the
-                # revision it fetched before checkout lands it: an agent not
-                # anchored to that revision's constitution would boot into
-                # Safe Mode, and refusing now leaves the checkout as it was
-                # (#3517).
-                check, constitution_refusal = (
+        try:
+            # Clear the previous attempt's checks before this one runs, so the
+            # row never presents them as this attempt's.
+            await self._record_constitution_checks(req, constitution_checks)
+            for step in steps:
+                outcome = await self._run_update_step(step)
+                results.append(outcome)
+                if step.name == "resolve_ref" and outcome.get("ok"):
+                    resolved_ref = (outcome.get("stdout_tail") or "").strip()
+                if not outcome.get("ok") and not (
+                    step.read_only or step.allow_failure
+                ):
+                    ok = False
+                    failed_step = step.name
+                    break
+                if step.name == "fetch":
+                    # The fetch only moved remote-tracking refs. Judge the
+                    # revision it fetched before checkout lands it: an agent
+                    # not anchored to that revision's constitution would boot
+                    # into Safe Mode, and refusing now leaves the checkout as
+                    # it was (#3517).
+                    check, constitution_refusal = (
+                        await self._check_constitution_adoption(
+                            stage=_FETCHED_REVISION_CHECK,
+                            repo_path=req.update_repo_path,
+                            revision="FETCH_HEAD",
+                        )
+                    )
+                    constitution_checks.append(check)
+                    await self._record_constitution_checks(
+                        req, constitution_checks,
+                    )
+                    if constitution_refusal is not None:
+                        ok = False
+                        failed_step = "constitution_adoption"
+                        break
+
+            if ok:
+                installed = True
+                # The check after the fetch ran this host's resolver over the
+                # fetched bytes. A revision can also change how they are
+                # rendered, which only the code just installed can say: judge
+                # it in a fresh interpreter before anything restarts (#3517).
+                check, installed_refusal = (
                     await self._check_constitution_adoption(
-                        stage=_FETCHED_REVISION_CHECK,
-                        repo_path=req.update_repo_path,
-                        revision="FETCH_HEAD",
+                        stage=_INSTALLED_CODE_CHECK,
                     )
                 )
                 constitution_checks.append(check)
                 await self._record_constitution_checks(req, constitution_checks)
-                if constitution_refusal is not None:
+                if installed_refusal is not None:
                     ok = False
                     failed_step = "constitution_adoption"
-                    break
-
-        if ok:
-            # The check after the fetch ran this host's resolver over the
-            # fetched bytes. A revision can also change how they are rendered,
-            # which only the code just installed can say: judge it in a fresh
-            # interpreter before anything restarts (#3517).
-            check, installed_refusal = await self._check_constitution_adoption(
-                stage=_INSTALLED_CODE_CHECK,
-            )
-            constitution_checks.append(check)
-            await self._record_constitution_checks(req, constitution_checks)
-            if installed_refusal is not None:
-                ok = False
-                failed_step = "constitution_adoption"
-                constitution_refusal = (
-                    f"{installed_refusal} The update itself is installed; "
-                    "only the restart was refused."
+                    constitution_refusal = (
+                        f"{installed_refusal} The update itself is installed; "
+                        "only the restart was refused."
+                    )
+        except _ConstitutionChecksUnrecorded as exc:
+            ok = False
+            failed_step = "constitution_checks"
+            constitution_refusal = None
+            checks_unrecorded = f"{exc}; left retryable"
+            if installed:
+                checks_unrecorded += (
+                    ". The update itself is installed; only the restart was "
+                    "deferred."
                 )
 
         if not profile.supports_migrations:
@@ -2989,6 +3081,7 @@ class RestartCoordinatorFeature(Feature):
             "migration": migration,
             "failed_step": failed_step,
             "constitution_refusal": constitution_refusal,
+            "constitution_checks_unrecorded": checks_unrecorded,
         }
 
     async def _run_update_step(self, step) -> Dict[str, Any]:
