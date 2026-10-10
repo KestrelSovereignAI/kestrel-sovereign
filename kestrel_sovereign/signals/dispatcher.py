@@ -2849,11 +2849,19 @@ class SignalDispatcher:
                 *(asyncio.shield(repair) for repair in repairs),
             )
 
+    def _runtime_owner_cleanup_required(self) -> bool:
+        """Keep exact owner protection until retained cognition has joined."""
+        return (
+            bool(self._retained_cognition_control_debt)
+            or self.durable_shutdown_owner_fenced
+            or any(not task.done() for task in self._retained_durable_cognition_tasks)
+        )
+
     def _resident_timer_context(self):
         """A timer belongs to its existing runtime, never an ingress turn."""
         from contextvars import copy_context
 
-        if self._retained_cognition_control_debt or self.durable_shutdown_owner_fenced:
+        if self._runtime_owner_cleanup_required():
             # Do not manufacture live work admission for cleanup metadata.
             # The heartbeat's debt branch permits only the fixed native CAS.
             return copy_context()
@@ -2869,7 +2877,7 @@ class SignalDispatcher:
         Crucially it still creates a future timer: an exception is observable,
         but never changes into a silent end to runtime ownership heartbeats.
         """
-        if self._durable_shutdown and not self.durable_shutdown_owner_fenced:
+        if self._durable_shutdown and not self._runtime_owner_cleanup_required():
             return
         if self._runtime_owner_heartbeat_timer is not None:
             self._runtime_owner_heartbeat_timer.cancel()
@@ -2907,7 +2915,7 @@ class SignalDispatcher:
 
     def _start_runtime_owner_heartbeat(self) -> None:
         self._runtime_owner_heartbeat_timer = None
-        if self._durable_shutdown and not self.durable_shutdown_owner_fenced:
+        if self._durable_shutdown and not self._runtime_owner_cleanup_required():
             return
         task = self._agent._track_background_task(
             self._heartbeat_runtime_owner(),
@@ -2943,12 +2951,12 @@ class SignalDispatcher:
             )
 
     async def _heartbeat_runtime_owner(self) -> None:
-        if self._retained_cognition_control_debt or self.durable_shutdown_owner_fenced:
+        if self._runtime_owner_cleanup_required():
             # Irreversible runtime denial also denies ordinary metadata SQL.
             # Keep only the existing managed owner's cleanup liveness; this
             # fixed path cannot revive a stopped owner or admit cognition.
             async with self._runtime_owner_fence_lock:
-                if self._retained_cognition_control_debt or self.durable_shutdown_owner_fenced:
+                if self._runtime_owner_cleanup_required():
                     await self._retain_runtime_owner_cleanup_liveness()
             return
         # The timer can have queued this coroutine immediately before
@@ -3026,7 +3034,7 @@ class SignalDispatcher:
         if self._runtime_owner_heartbeat_task is task:
             self._runtime_owner_heartbeat_task = None
         if task.cancelled():
-            if not self._durable_shutdown or self.durable_shutdown_owner_fenced:
+            if not self._durable_shutdown or self._runtime_owner_cleanup_required():
                 self._runtime_owner_heartbeat_failures += 1
                 logger.warning(
                     "Durable signal runtime-owner heartbeat was cancelled; "
@@ -3043,11 +3051,11 @@ class SignalDispatcher:
             return
         except Exception:
             logger.exception("Durable signal runtime-owner heartbeat failed")
-            if not self._durable_shutdown or self.durable_shutdown_owner_fenced:
+            if not self._durable_shutdown or self._runtime_owner_cleanup_required():
                 self._runtime_owner_heartbeat_failures += 1
                 self._schedule_runtime_owner_heartbeat(retry=True)
             return
-        if self._durable_shutdown and not self.durable_shutdown_owner_fenced:
+        if self._durable_shutdown and not self._runtime_owner_cleanup_required():
             return
         self._runtime_owner_heartbeat_failures = 0
         self._schedule_runtime_owner_heartbeat()

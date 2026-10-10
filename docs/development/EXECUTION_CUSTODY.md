@@ -209,6 +209,10 @@ general SQL. Idle shutdown can stop its existing owner and close storage after
 ordinary authority has retired. Cancellation-resistant cognition instead keeps
 the original owner live through cleanup-only heartbeat/re-arm until its owned
 work is joined; only then is that owner marked stopped.
+This protection also applies before shutdown and before terminal cleanup debt
+exists: a still-running retained cognition owns the exact existing lease.
+Its heartbeat and timer re-arm must not request live runtime admission after
+revocation, recover deliveries, or admit replacement cognition.
 Ordinary idempotent cognition retains its documented at-least-once
 crash recovery contract; these explicit control outcomes require reconciliation.
 Assistant persistence, response audits (including their hook manager), and
@@ -268,6 +272,12 @@ before ordinary Stop, retry, refusal or provider-error normalization. Source
 closure and transport cleanup select original terminal evidence before later
 cleanup noise; an abandoned stream never becomes a retry recommendation or
 an acknowledged Stop.
+
+Scheduler dispatch classifies every explicit execution-control carrier before
+ordinary task-failure and typed feature/owner/unavailable normalization. Even
+when only a child admission is denied and the outer claim remains live, the
+original executing occurrence stays unresolved; no failed finalization, claim
+clearance, or recurring schedule advancement can acknowledge that effect.
 
 See the [canonical storage contract](../architecture/storage/STORAGE_ARCHITECTURE.md#hosted-execution-custody)
 for installation and limitations. Full independent review, repository/CI gates,

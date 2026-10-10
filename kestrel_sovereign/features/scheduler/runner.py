@@ -41,7 +41,6 @@ from kestrel_sovereign.execution_custody import (
     bind_execution_runtime,
     current_execution_custody,
     require_execution_work,
-    execution_commit_outcome,
     is_execution_control_error,
 )
 from kestrel_sovereign.storage.database_clock import (
@@ -3441,7 +3440,9 @@ class SchedulerRunner:
                                 ) = self._normalise_result(raw, task)
                             except asyncio.CancelledError:
                                 raise
-                            except SchedulerFeatureUnavailable:
+                            except SchedulerFeatureUnavailable as error:
+                                if is_execution_control_error(error):
+                                    raise
                                 # A runtime disable can race preparation/admission.
                                 # It is not a task failure and must not advance this
                                 # occurrence. Leaving the exact claim live prevents a
@@ -3456,6 +3457,8 @@ class SchedulerRunner:
                                 )
                                 return
                             except SchedulerDispatchNotReady as e:
+                                if is_execution_control_error(e):
+                                    raise
                                 # Same deferral contract as above (#2474): nothing
                                 # ran, so no success row, no last_run_at, no cron
                                 # advance. PostgreSQL's effect-start marker still
@@ -3465,6 +3468,8 @@ class SchedulerRunner:
                                 )
                                 return
                             except ScheduledTaskOwnerUnavailable as e:
+                                if is_execution_control_error(e):
+                                    raise
                                 status = "failed"
                                 result_text = str(e)
                                 ran = False
@@ -3475,12 +3480,11 @@ class SchedulerRunner:
                                     e,
                                 )
                             except Exception as e:
-                                if execution_commit_outcome(e) is not None:
+                                if is_execution_control_error(e):
                                     # Keep the pre-dispatch executing marker and
                                     # occurrence identity for reconciliation. A lost
                                     # acknowledgement is not a terminal task failure.
-                                    logger.error("Scheduler effect %s requires commit reconciliation: %s", execution.id, e)
-                                    return
+                                    raise
                                 status = "failed"
                                 result_text = f"{type(e).__name__}: {e}"
                                 logger.error(
