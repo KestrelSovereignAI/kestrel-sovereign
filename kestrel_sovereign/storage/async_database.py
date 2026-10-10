@@ -41,6 +41,16 @@ logger = logging.getLogger(__name__)
 _BACKFILL_LOCK_DOMAIN = b"kestrel:schema-backfill-lock:v1\0"
 
 
+class DatabaseRetirementError(ConnectionError):
+    """Owned database retirement is uncertain; retain its owner and artifacts."""
+
+    def __init__(self, db: "AsyncDatabase", operation_error: BaseException | None, cleanup_error: BaseException | None = None):
+        super().__init__("Database retirement did not complete; retain recovery evidence")
+        self.retirement_owner = db
+        self.operation_error = operation_error
+        self.cleanup_error = cleanup_error
+
+
 class DatabaseInitializationCleanupError(ConnectionError):
     """Initialization failed without proof that its owned resources retired.
 
@@ -49,19 +59,20 @@ class DatabaseInitializationCleanupError(ConnectionError):
     only after the factory's connected backend has closed successfully.
     """
 
-    def __init__(self, initialization_error: BaseException, cleanup_error: BaseException | None = None):
+    def __init__(self, initialization_error: BaseException, cleanup_error: BaseException | None = None, *, retirement_owner: "AsyncDatabase | None" = None):
         super().__init__(
             "Database initialization cleanup did not complete; retain recovery evidence"
         )
         self.initialization_error = initialization_error
         self.cleanup_error = cleanup_error
+        self.retirement_owner = retirement_owner
 
 
-async def _close_failed_database_initialization(db: "AsyncDatabase", initialization_error: BaseException) -> None:
-    """Finish closing an owned backend even if its caller is cancelled again."""
+async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseException | None = None) -> None:
+    """Settle the one owned close through repeated cancellation on every exit."""
 
     cleanup = asyncio.create_task(
-        db.close(), name="failed-database-initialization-cleanup"
+        db.close(), name="owned-database-retirement"
     )
     cancelled = False
     while not cleanup.done():
@@ -78,11 +89,22 @@ async def _close_failed_database_initialization(db: "AsyncDatabase", initializat
     try:
         await cleanup
     except (asyncio.CancelledError, Exception) as close_exc:
-        raise DatabaseInitializationCleanupError(initialization_error, close_exc) from close_exc
+        raise DatabaseRetirementError(db, operation_error, close_exc) from close_exc
     if db.connection_retirement_pending:
-        raise DatabaseInitializationCleanupError(initialization_error)
+        raise DatabaseRetirementError(db, operation_error)
     if cancelled:
         raise asyncio.CancelledError()
+
+
+async def _close_failed_database_initialization(db: "AsyncDatabase", initialization_error: BaseException) -> None:
+    """Retain the initialization failure contract around canonical retirement."""
+    try:
+        await _close_owned_database(db, initialization_error)
+    except DatabaseRetirementError as retirement_error:
+        failure = DatabaseInitializationCleanupError(
+            initialization_error, retirement_error.cleanup_error, retirement_owner=db,
+        )
+        raise failure from retirement_error.cleanup_error
 
 
 #: ``(name, table, columns)`` of the index that makes the #2959 projection worth

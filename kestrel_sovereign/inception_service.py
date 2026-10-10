@@ -525,6 +525,13 @@ async def _inception_publication_custody(db, output_dir: Path, identity: str | N
 
     path = output_dir / "kestrel_prime.db"
     async with AsyncExitStack() as custody:
+        target = None
+        if db.backend_type == "sqlite":
+            from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+            if not isinstance(db._backend, SQLiteBackend):
+                raise ValueError("Cannot prove SQLite target file custody; use authorized recovery")
+            target = db._backend
         retained = None
         if identity is not None:
             await _assert_local_inception_lifetimes(output_dir, identity, include_current=False)
@@ -533,13 +540,9 @@ async def _inception_publication_custody(db, output_dir: Path, identity: str | N
                 if not stat.S_ISREG(retained.st_mode) or retained.st_nlink != 1:
                     raise ValueError("Inception local authority is not an exclusively retained regular database")
                 same_target = False
-                if db.backend_type == "sqlite":
-                    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-
-                    if not isinstance(db._backend, SQLiteBackend):
-                        raise ValueError("Cannot prove SQLite target file custody; use authorized recovery")
-                    db._backend.assert_connected_file_still_valid()
-                    same_target = db._backend.connected_file_identity == (retained.st_dev, retained.st_ino)
+                if target is not None:
+                    target.assert_connected_file_still_valid()
+                    same_target = target.connected_file_identity == (retained.st_dev, retained.st_ino)
                 if not same_target:
                     async def retain_schema(_db):
                         pass
@@ -549,11 +552,15 @@ async def _inception_publication_custody(db, output_dir: Path, identity: str | N
                     await custody.enter_async_context(local.transaction(immediate=True))
                     await _assert_fresh_inception_lifetime(local, identity)
         async with db.transaction(immediate=True):
+            if target is not None:
+                target.assert_connected_file_still_valid()
             if retained is not None:
                 current = path.lstat()
                 if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 or (current.st_dev, current.st_ino) != (retained.st_dev, retained.st_ino):
                     raise ValueError("Inception local authority changed before publication; use authorized recovery")
             yield
+            if target is not None:
+                target.assert_connected_file_still_valid()
             # This still runs BEFORE the target commits. A replaced local
             # authority therefore rolls back the target, never validates it.
             if retained is not None:
@@ -907,8 +914,18 @@ async def create_kestrel_identity_async(
         from kestrel_sovereign.storage import get_default_agent_data_dir
         output_dir = get_default_agent_data_dir()
 
+    owned_database = None
+
+    async def retire_owned_database(operation_error=None):
+        nonlocal owned_database
+        if owned_database is not None:
+            from kestrel_sovereign.storage.async_database import _close_owned_database
+
+            await _close_owned_database(owned_database, operation_error)
+            owned_database = None
+
     async def publish_owned_attempt():
-        nonlocal output_dir
+        nonlocal output_dir, owned_database
         # Determine if we're using external database or creating SQLite
         using_external_db = database is not None
         db_path = None
@@ -980,6 +997,7 @@ async def create_kestrel_identity_async(
                 os.close(descriptor)
             try:
                 db = await AsyncDatabase.sqlite(db_path)
+                owned_database = db
             except DatabaseInitializationCleanupError:
                 # Native retirement was not proved. Preserve even our own
                 # reserved inode until its outstanding resources are recovered.
@@ -1000,6 +1018,7 @@ async def create_kestrel_identity_async(
                 from kestrel_sovereign.storage.async_database import _close_failed_database_initialization
 
                 await _close_failed_database_initialization(db, inspection_error)
+                owned_database = None
                 _cleanup_owned_inception_database(db_path, db_owner)
                 raise
             logger.info(f"Created SQLite database at {db_path}")
@@ -1013,9 +1032,9 @@ async def create_kestrel_identity_async(
                 async with db.transaction(immediate=True):
                     await graph.lock_nodes_for_update([deterministic_did])
                     await _assert_fresh_inception_lifetime(db, deterministic_did)
-            except BaseException:
+            except BaseException as inception_error:
                 if not using_external_db:
-                    await db.close()
+                    await retire_owned_database(inception_error)
                     _cleanup_owned_inception_database(db_path, db_owner)
                 raise
 
@@ -1049,10 +1068,10 @@ async def create_kestrel_identity_async(
                 identity_paths = save_born_hybrid_identity(
                     did_document, hybrid_identity, archival_kp, slug, identity_stage_dir,
                 )
-            except BaseException:
+            except BaseException as inception_error:
                 _discard_identity_staging(identity_stage_dir, staged_identity_paths)
                 if not using_external_db:
-                    await db.close()
+                    await retire_owned_database(inception_error)
                     _cleanup_owned_inception_database(db_path, db_owner)
                 raise
             logging.info(f"Saved born-hybrid keys ({slug}_*) to {output_dir}")
@@ -1074,10 +1093,10 @@ async def create_kestrel_identity_async(
                                          for suffix in (".key.enc", ".pem", ".json")]
                 save_kestrel_identity(did_document, keys, key_id, identity_stage_dir)
                 identity_paths = [p for p in staged_identity_paths if p.exists()]
-            except BaseException:
+            except BaseException as inception_error:
                 _discard_identity_staging(identity_stage_dir, staged_identity_paths)
                 if not using_external_db:
-                    await db.close()
+                    await retire_owned_database(inception_error)
                     _cleanup_owned_inception_database(db_path, db_owner)
                 raise
 
@@ -1262,12 +1281,12 @@ async def create_kestrel_identity_async(
                 label=agent_name,
                 properties=agent_properties
             )
-        except BaseException:
+        except BaseException as inception_error:
             # No native publication has begun. Cancellation and synchronous
             # construction failures have the same rollback-free cleanup boundary.
             try:
                 if not using_external_db:
-                    await db.close()
+                    await retire_owned_database(inception_error)
                     _cleanup_owned_inception_database(db_path, db_owner)
             finally:
                 cleanup_artifacts(identity_paths)
@@ -1320,6 +1339,10 @@ async def create_kestrel_identity_async(
                 await graph.add_edge(
                     agent_node.node_id, constitution_node.node_id, "governed_by"
                 )
+                if db.backend_type == "sqlite":
+                    # Key publication must not admit the displaced open inode
+                    # as the separately supplied target's current pathname.
+                    db._backend.assert_connected_file_still_valid()
                 identity_paths = _publish_staged_identity(
                     identity_paths, Path(output_dir),
                     slug=slug if method == IDENTITY_METHOD_DID_WEB else None,
@@ -1327,7 +1350,7 @@ async def create_kestrel_identity_async(
                 )
                 publication_body_completed = True
 
-        except BaseException:
+        except BaseException as inception_error:
             # Cancellation also rolls back native publication. A commit may have
             # completed before an awaited connection-release error, however: do
             # not erase the keys of an identity that actually reached the graph.
@@ -1345,7 +1368,7 @@ async def create_kestrel_identity_async(
                     logging.exception("Inception publication outcome unreadable; retaining identity artifacts")
             try:
                 if not using_external_db:
-                    await db.close()
+                    await retire_owned_database(inception_error)
                 if cleanup_safe:
                     cleanup_artifacts(identity_paths)
                     if not using_external_db:
@@ -1446,7 +1469,7 @@ async def create_kestrel_identity_async(
         # Close database connection only if we created it (SQLite mode)
         # External databases (PostgreSQL) are managed by the caller
         if not using_external_db:
-            await db.close()
+            await retire_owned_database()
         else:
             logger.info("External database kept open (managed by caller)")
 
@@ -1470,7 +1493,28 @@ async def create_kestrel_identity_async(
 
 
     with exclusive_private_file_lock(Path(output_dir) / ".inception.lock", label="inception", blocking=False):
-        return await publish_owned_attempt()
+        operation_error = None
+        try:
+            return await publish_owned_attempt()
+        except BaseException as exc:
+            operation_error = exc
+            raise
+        finally:
+            # Acquisition, publication, post-commit notices/edges/RAG and close
+            # share one owner. Directory custody cannot release before this
+            # retirement settles. Caller-provided databases are never registered.
+            from kestrel_sovereign.storage.async_database import DatabaseRetirementError
+
+            # An uncertain close already has a joined failed retirement attempt
+            # and carries its owner. Do not replace that evidence by blindly
+            # retrying cleanup (or by masking the initialization failure).
+            own_retirement_uncertain = (
+                owned_database is not None
+                and isinstance(operation_error, (DatabaseRetirementError, DatabaseInitializationCleanupError))
+                and getattr(operation_error, "retirement_owner", None) is owned_database
+            )
+            if not own_retirement_uncertain:
+                await retire_owned_database(operation_error)
 
 
 def create_kestrel_identity(
