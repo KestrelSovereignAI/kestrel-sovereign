@@ -893,7 +893,8 @@ class TestSaveSoulSetsDescription:
         ok = await service.save_soul_md(soul)
 
         assert ok is True
-        assert node.properties["description"] == "A sharp coding companion."
+        assert storage.saved.properties["description"] == "A sharp coding companion."
+        assert node.properties == {}, "Read/cache objects are not mutated by publication"
         assert mock_db.data[("did:pkh:eip155:1:0x123", "description")] == "A sharp coding companion."
 
 
