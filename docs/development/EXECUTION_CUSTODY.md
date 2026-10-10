@@ -182,6 +182,12 @@ settlement as success ACKs. A committed receipt whose terminal CAS no longer
 matches remains explicit cleanup debt: it is not permission to stop the owner
 or manufacture another delivery. No terminal receipt is written while a
 retained route can still perform effects.
+Renewal retirement joins the original child even under repeated cancellation
+of the context body or its closer. Late native commit/control evidence is
+selected before the body's cancellation can bypass receipt settlement. A
+retained ordinary route also classifies failures from its eventual native
+lease release; a committed release whose token no longer matches terminal
+CAS retains exact debt and prevents clean owner retirement.
 Detached ingress completion pins its publication-time custody and rechecks
 before every RPC, including after retry backoff; a replacement runtime cannot
 authorize an old callback. Cause-carried control from a cancelled facade is

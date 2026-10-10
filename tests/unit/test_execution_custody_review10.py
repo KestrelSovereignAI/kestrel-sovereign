@@ -288,6 +288,7 @@ async def test_control_terminalizer_failure_or_cancel_retains_exact_cleanup_debt
     from kestrel_sovereign.signals.dispatcher import SignalDispatcher
     dispatcher = SignalDispatcher.__new__(SignalDispatcher)
     dispatcher._retained_cognition_control_debt = {}
+    dispatcher._retained_durable_cognition_tasks = set()
     dispatcher._retained_durable_cognition_cleanup_tasks = set()
     dispatcher._durable_delivery_owner = "dispatcher:original"
     dispatcher._agent = SimpleNamespace(did="original")

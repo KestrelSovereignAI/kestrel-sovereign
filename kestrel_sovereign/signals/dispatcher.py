@@ -3664,14 +3664,33 @@ class SignalDispatcher:
         task = asyncio.create_task(
             renew(), name=f"durable_cognition_lease_renewal:{delivery.delivery_id}"
         )
+        body_error: BaseException | None = None
         try:
             yield lost
+        except BaseException as error:
+            body_error = error
+            raise
         finally:
+            from kestrel_sovereign._async_ownership import await_owned_task
+
             stop.set()
             if not task.done():
                 task.cancel()
-            with suppress(asyncio.CancelledError):
-                await asyncio.shield(task)
+            # Cancelling the closer cannot abandon a renewal's native commit.
+            # Harvest its original control evidence only after it is terminal.
+            outcome = await await_owned_task(task)
+            child_error = outcome.error
+            if isinstance(child_error, asyncio.CancelledError) and not is_execution_control_error(child_error):
+                child_error = None  # Our requested cancellation of the renewer.
+            renewal_error = lost.result() if lost.done() else None
+            terminal = execution_terminal_error(
+                body_error,
+                renewal_error if isinstance(renewal_error, BaseException) else None,
+                child_error,
+                outcome.cancellation,
+            )
+            if terminal is not None and terminal is not body_error:
+                raise terminal
 
     @staticmethod
     def _legacy_channel_cognition_signal(
@@ -5024,9 +5043,14 @@ class SignalDispatcher:
                 lease_token=delivery.lease_token or "",
                 error="Cognition task settled after durable lease loss",
             )
-        except _DurableDeliveryShuttingDownError:
-            return
-        except Exception:
+        except BaseException as error:
+            if is_execution_control_error(error):
+                await self._terminalize_failed_cognition(delivery, error)
+                raise
+            if isinstance(error, _DurableDeliveryShuttingDownError):
+                return
+            if not isinstance(error, Exception):
+                raise
             logger.exception(
                 "Could not release retained durable cognition lease: delivery=%s",
                 delivery.delivery_id,
@@ -5043,6 +5067,10 @@ class SignalDispatcher:
         """Never terminalize a delivery while its original route can still act."""
         self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, error)
         if routing_task is not None and not routing_task.done():
+            # A late renewal control can replace cancellation of the context
+            # body before the ordinary cancellation handler reaches this route.
+            # Publish debt first, then interrupt and retain the original child.
+            routing_task.cancel()
             self._retain_durable_cognition_task(routing_task, delivery=delivery, control_error=error)
         else:
             await self._terminalize_failed_cognition(delivery, error)
