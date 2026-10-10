@@ -5639,6 +5639,11 @@ class DurableSignalStore(UnifiedStoreBase):
         )
         return sequence
 
+    @staticmethod
+    def runtime_owner_lock_key(agent_id: str) -> str:
+        """One native serialization key for liveness, cleanup and recovery."""
+        return f"durable-signal-runtime-owner:{agent_id}"
+
     async def _lock_runtime_owner_scope(self, *, agent_id: str) -> None:
         """Serialize liveness heartbeats and recovery for one tenant.
 
@@ -5654,7 +5659,7 @@ class DurableSignalStore(UnifiedStoreBase):
         if self.is_postgres:
             await self._backend.fetch_val(
                 "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
-                (f"durable-signal-runtime-owner:{agent_id}",),
+                (self.runtime_owner_lock_key(agent_id),),
             )
             return
         if self._backend.backend_type == "sqlite":

@@ -858,6 +858,7 @@ class SignalDispatcher:
         # for shutdown and test/health inspection.
         self._retained_durable_cognition_tasks: set[asyncio.Task[SignalResult]] = set()
         self._retained_durable_cognition_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._retained_cognition_control_debt: dict[str, tuple[DurableDelivery, BaseException]] = {}
         # Channel ingress ACKs after its selected delivery is durable, not
         # after cognition completes.  These owners make that promise useful
         # after the provider has advanced its cursor: every restarted
@@ -892,6 +893,7 @@ class SignalDispatcher:
         # otherwise a peer can requeue the same cursor delivery while side
         # effects from the original task are still running.
         self._durable_shutdown_owner_fenced = False
+        self._durable_control_cleanup_fenced = False
         self._fenced_durable_shutdown_completion: Optional[asyncio.Task[None]] = None
         self._runtime_owner_fence_lock = asyncio.Lock()
         # What the UI side-channel emit actually did, per signal (#2922).
@@ -1359,6 +1361,12 @@ class SignalDispatcher:
                 guard.operation.cancelling() > 0 or guard.operation.cancelled()
             )
             owner_abandoned_settlement = completed_owner.cancelled()
+            owner_error = (
+                None if owner_abandoned_settlement else completed_owner.exception()
+            )
+            unresolved_control = (
+                owner_error is not None and is_execution_control_error(owner_error)
+            )
             # Race matrix for the single release invariant:
             #
             #   cognition/settlement                  Stop completion
@@ -1374,8 +1382,10 @@ class SignalDispatcher:
             disposition = (
                 RequestCompletionDisposition.ABANDONED
                 if (
-                    (stop_reached_settlement or owner_abandoned_settlement)
-                    and not guard.stop_terminalized
+                    unresolved_control or (
+                        (stop_reached_settlement or owner_abandoned_settlement)
+                        and not guard.stop_terminalized
+                    )
                 )
                 else RequestCompletionDisposition.COMPLETED
             )
@@ -1453,7 +1463,10 @@ class SignalDispatcher:
         timer = self._durable_cognition_drain_timers.pop(consumer_id, None)
         if timer is not None:
             timer.cancel()
-        task = asyncio.create_task(
+        tracker = getattr(self._agent, "_track_runtime_task", None)
+        if not callable(getattr(type(self._agent), "_track_runtime_task", None)):
+            tracker = asyncio.create_task
+        task = tracker(
             self._drain_durable_cognition_consumer(consumer_id),
             name=f"durable_cognition_drain:{consumer_id}:{self._agent.did}",
         )
@@ -1612,7 +1625,9 @@ class SignalDispatcher:
             self._start_durable_cognition_drain(consumer_id)
 
         self._durable_cognition_drain_timers[consumer_id] = (
-            asyncio.get_running_loop().call_later(delay, wake)
+            asyncio.get_running_loop().call_later(
+                delay, wake, context=self._resident_timer_context(),
+            )
         )
 
     async def initialize_durable_delivery(self) -> None:
@@ -2451,7 +2466,7 @@ class SignalDispatcher:
         # wrapper.  Shield the owned teardown so the next caller can either
         # join the same cleanup or retry a genuine cleanup failure.
         await asyncio.shield(completion)
-        return not self._durable_shutdown_owner_fenced
+        return not self.durable_shutdown_owner_fenced
 
     async def wait_for_durable_shutdown_release(self) -> None:
         """Join the eventual owner release after a bounded shutdown fence.
@@ -2542,6 +2557,13 @@ class SignalDispatcher:
             await self._activate_retained_durable_shutdown_fence()
             return
 
+        if self._retained_cognition_control_debt:
+            # A settled route with an unpersisted control outcome still owns
+            # cleanup debt. Do not let shutdown silently retire its liveness.
+            self._durable_control_cleanup_fenced = True
+            self._schedule_runtime_owner_heartbeat()
+        await self._drain_retained_durable_cognition_cleanup_tasks()
+        self._durable_control_cleanup_fenced = False
         await self._stop_runtime_owner_heartbeat()
         await self._release_runtime_owner_after_shutdown(mark_owner_stopped=True)
 
@@ -2604,11 +2626,12 @@ class SignalDispatcher:
         # Once every retained task is terminal, no original cognition can make
         # another external effect. Stop the fence heartbeat before atomically
         # marking the owner stopped, so a delayed heartbeat cannot revive it.
+        await self._drain_retained_durable_cognition_cleanup_tasks()
+        self._durable_control_cleanup_fenced = False
         self._durable_shutdown_owner_fenced = False
         await self._stop_runtime_owner_heartbeat()
         async with self._runtime_owner_fence_lock:
             pass
-        await self._drain_retained_durable_cognition_cleanup_tasks()
         await self._release_runtime_owner_after_shutdown(mark_owner_stopped=True)
 
     async def _release_runtime_owner_after_shutdown(
@@ -2646,6 +2669,12 @@ class SignalDispatcher:
                 *(asyncio.shield(task) for task in tasks),
                 return_exceptions=True,
             )
+        # A failed/cancelled fixed terminalizer is retained debt, not permission
+        # to stop the owner and let ordinary recovery replay its delivery. One
+        # bounded exact-token retry per shutdown attempt; no detached retry loop.
+        for delivery, error in tuple(getattr(self, "_retained_cognition_control_debt", {}).values()):
+            await self._terminalize_failed_cognition(delivery, error)
+            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
 
     async def _drain_outcome_log_tasks(self) -> None:
         """Join every accepted outcome log before releasing shared storage.
@@ -2823,6 +2852,19 @@ class SignalDispatcher:
                 *(asyncio.shield(repair) for repair in repairs),
             )
 
+    def _resident_timer_context(self):
+        """A timer belongs to its existing runtime, never an ingress turn."""
+        from contextvars import copy_context
+
+        if self._retained_cognition_control_debt:
+            # Do not manufacture live work admission for cleanup metadata.
+            # The heartbeat's debt branch permits only the fixed native CAS.
+            return copy_context()
+        factory = getattr(type(self._agent), "_runtime_owner_context", None)
+        if callable(factory):
+            return self._agent._runtime_owner_context()
+        return copy_context()
+
     def _schedule_runtime_owner_heartbeat(self, *, retry: bool = False) -> None:
         """Keep owner liveness separate from delivery lease countdowns.
 
@@ -2830,7 +2872,7 @@ class SignalDispatcher:
         Crucially it still creates a future timer: an exception is observable,
         but never changes into a silent end to runtime ownership heartbeats.
         """
-        if self._durable_shutdown and not self._durable_shutdown_owner_fenced:
+        if self._durable_shutdown and not self.durable_shutdown_owner_fenced:
             return
         if self._runtime_owner_heartbeat_timer is not None:
             self._runtime_owner_heartbeat_timer.cancel()
@@ -2845,7 +2887,8 @@ class SignalDispatcher:
                 * (2 ** min(self._runtime_owner_heartbeat_failures, 3)),
             )
         self._runtime_owner_heartbeat_timer = asyncio.get_running_loop().call_later(
-            interval, self._start_runtime_owner_heartbeat
+            interval, self._start_runtime_owner_heartbeat,
+            context=self._resident_timer_context(),
         )
 
     async def _stop_runtime_owner_heartbeat(self) -> None:
@@ -2867,7 +2910,7 @@ class SignalDispatcher:
 
     def _start_runtime_owner_heartbeat(self) -> None:
         self._runtime_owner_heartbeat_timer = None
-        if self._durable_shutdown and not self._durable_shutdown_owner_fenced:
+        if self._durable_shutdown and not self.durable_shutdown_owner_fenced:
             return
         task = self._agent._track_background_task(
             self._heartbeat_runtime_owner(),
@@ -2877,17 +2920,26 @@ class SignalDispatcher:
         task.add_done_callback(self._finish_runtime_owner_heartbeat)
 
     async def _heartbeat_runtime_owner(self) -> None:
+        if self._retained_cognition_control_debt and self._durable_store.backend.backend_type == "postgres":
+            # Irreversible runtime denial also denies ordinary metadata SQL.
+            # Keep only the existing managed owner's cleanup liveness; this
+            # fixed path cannot revive a stopped owner or admit cognition.
+            async with self._runtime_owner_fence_lock:
+                await self._durable_store.backend.retain_cognition_cleanup_owner(
+                    agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
+                )
+            return
         # The timer can have queued this coroutine immediately before
         # shutdown flips the lifecycle state.  Take the same admission as
         # public APIs so it either completes before teardown or performs no
         # post-close storage work at all.
         if self._durable_shutdown:
-            if not self._durable_shutdown_owner_fenced:
+            if not self.durable_shutdown_owner_fenced:
                 raise _DurableDeliveryShuttingDownError(
                     "Durable signal delivery is shutting down"
                 )
             async with self._runtime_owner_fence_lock:
-                if not self._durable_shutdown_owner_fenced:
+                if not self.durable_shutdown_owner_fenced:
                     return
                 await self._durable_store.heartbeat_runtime_owner(
                     agent_id=self._agent.did,
@@ -2955,7 +3007,7 @@ class SignalDispatcher:
         if self._runtime_owner_heartbeat_task is task:
             self._runtime_owner_heartbeat_task = None
         if task.cancelled():
-            if not self._durable_shutdown or self._durable_shutdown_owner_fenced:
+            if not self._durable_shutdown or self.durable_shutdown_owner_fenced:
                 self._runtime_owner_heartbeat_failures += 1
                 logger.warning(
                     "Durable signal runtime-owner heartbeat was cancelled; "
@@ -2972,11 +3024,11 @@ class SignalDispatcher:
             return
         except Exception:
             logger.exception("Durable signal runtime-owner heartbeat failed")
-            if not self._durable_shutdown or self._durable_shutdown_owner_fenced:
+            if not self._durable_shutdown or self.durable_shutdown_owner_fenced:
                 self._runtime_owner_heartbeat_failures += 1
                 self._schedule_runtime_owner_heartbeat(retry=True)
             return
-        if self._durable_shutdown and not self._durable_shutdown_owner_fenced:
+        if self._durable_shutdown and not self.durable_shutdown_owner_fenced:
             return
         self._runtime_owner_heartbeat_failures = 0
         self._schedule_runtime_owner_heartbeat()
@@ -4541,6 +4593,11 @@ class SignalDispatcher:
                 self._retain_durable_cognition_task(routing_task, delivery=delivery)
             raise
 
+        except Exception as error:
+            if is_execution_control_error(error):
+                await self._terminalize_failed_cognition(delivery, error)
+            raise
+
         if result is None:
             # A cooperative cancellation has no route-level result.  Its
             # exact lease may still be valid, so release it now rather than
@@ -4591,7 +4648,10 @@ class SignalDispatcher:
                     delivery_id=delivery.delivery_id,
                     lease_token=delivery.lease_token or "",
                 )
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                    raise
                 logger.exception(
                     "Could not acknowledge completed durable cognition lease: "
                     "delivery=%s",
@@ -4769,11 +4829,14 @@ class SignalDispatcher:
 
         def completed(completed_task: asyncio.Task[SignalResult]) -> None:
             self._retained_durable_cognition_tasks.discard(completed_task)
+            control_error = None
             try:
                 completed_task.result()
             except asyncio.CancelledError:
                 pass
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    control_error = error
                 # The route's final disposition was already made visible when
                 # retention began.  Harvest this late exception so it cannot
                 # become an unobserved task failure or a second audit row.
@@ -4783,14 +4846,18 @@ class SignalDispatcher:
                     delivery.delivery_id,
                 )
 
-            if self._durable_shutdown:
+            if self._durable_shutdown and control_error is None:
                 # Graceful shutdown marks this managed owner stopped.  A
                 # replacement's owner-aware recovery then owns requeueing;
                 # touching the closing backend from this late callback would
                 # violate the lifecycle admission boundary.
                 return
+            if control_error is not None:
+                if not hasattr(self, "_retained_cognition_control_debt"):
+                    self._retained_cognition_control_debt = {}
+                self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, control_error)
             cleanup = asyncio.create_task(
-                self._release_retained_durable_cognition_task(delivery),
+                self._release_retained_durable_cognition_task(delivery, control_error),
                 name=(
                     "durable_cognition_retained_cleanup:"
                     f"{delivery.delivery_id}"
@@ -4815,10 +4882,14 @@ class SignalDispatcher:
         task.add_done_callback(completed)
 
     async def _release_retained_durable_cognition_task(
-        self, delivery: DurableDelivery
+        self, delivery: DurableDelivery, control_error: BaseException | None = None,
     ) -> None:
         """Requeue one exact retained lease only after its task is terminal."""
 
+        if control_error is not None:
+            await self._terminalize_failed_cognition(delivery, control_error)
+            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+            return
         try:
             released = await self.release_durable_delivery_after_task(
                 consumer_id=delivery.consumer_id,
@@ -4841,6 +4912,43 @@ class SignalDispatcher:
                 delivery.delivery_id,
             )
 
+    async def _terminalize_failed_cognition(
+        self, delivery: DurableDelivery, error: BaseException,
+    ) -> None:
+        """Keep irreversible control evidence non-retryable and non-ACKable."""
+        from kestrel_sovereign._async_ownership import await_owned_task
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+
+        self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, error)
+        task = asyncio.create_task(
+            self._apply_cognition_control_terminal(delivery, error),
+            name=f"durable_cognition_control_terminal:{delivery.delivery_id}",
+        )
+        outcome = await await_owned_task(task)
+        if outcome.error is not None or outcome.cancellation is not None:
+            raise execution_terminal_error(error, outcome.error, outcome.cancellation)
+        self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+
+    async def _apply_cognition_control_terminal(self, delivery, error):
+        reason = f"execution_control_unresolved: {type(error).__name__}: {error}"[:500]
+        backend = self._durable_store.backend
+        if backend.backend_type == "postgres":
+            # Ordinary admission is deliberately still denied. Only the fixed
+            # exact-identity native terminalizer may perform this cleanup CAS.
+            await backend.fail_cognition_delivery(
+                agent_id=self._agent.did, consumer_id=delivery.consumer_id,
+                delivery_id=delivery.delivery_id,
+                owner_id=self._durable_delivery_owner,
+                lease_token=delivery.lease_token or "", error=reason,
+            )
+            self._discard_transient_durable_handoff(delivery.delivery_id)
+        else:
+            await self.release_durable_delivery_after_task(
+                consumer_id=delivery.consumer_id, delivery_id=delivery.delivery_id,
+                lease_token=delivery.lease_token or "", error=reason,
+                terminal=True, terminal_ackable=False,
+            )
+
     @staticmethod
     def _completed_durable_cognition_result(
         task: asyncio.Task[SignalResult],
@@ -4855,6 +4963,8 @@ class SignalDispatcher:
         except asyncio.CancelledError:
             return None
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.exception(
                 "Durable cognition route task failed outside its result contract: "
                 "signal=%s",
@@ -6632,9 +6742,9 @@ class SignalDispatcher:
 
     @property
     def durable_shutdown_owner_fenced(self) -> bool:
-        """Whether shutdown returned while live cognition still owns this lease."""
+        """Whether live cognition or control-cleanup debt still retains its owner."""
 
-        return self._durable_shutdown_owner_fenced
+        return self._durable_shutdown_owner_fenced or getattr(self, "_durable_control_cleanup_fenced", False)
 
     async def _write_outcome_log(
         self,

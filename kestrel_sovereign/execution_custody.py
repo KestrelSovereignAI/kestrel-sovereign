@@ -420,6 +420,7 @@ class _ExecutionForwarder:
         self._source = aiter(stream)
         self._scopes = current_execution_custody(owner)
         self._cleanup_state = _StreamCleanupState(self._scopes)
+        self._source_exhausted = False
         # Task-relative capabilities (notably privacy-lock reentry) are not
         # supplied by copy_context alone. Capture them on the lock owner.
         self._turn_scope = capture_turn_scope(owner)
@@ -459,11 +460,13 @@ class _ExecutionForwarder:
                             item = await anext(self._source)
                         except StopAsyncIteration:
                             require_execution_work(self._runtime_owner)
+                            self._source_exhausted = True
                             return
                         require_execution_work(self._runtime_owner)
                     yield item
             except BaseException as caught:
                 error = caught
+                self._cleanup_state.requested = True
                 raise
             finally:
                 close = getattr(self._source, "aclose", None)
@@ -472,10 +475,16 @@ class _ExecutionForwarder:
                         try:
                             await close()
                         except BaseException as cleanup_error:
+                            self._source_exhausted = False
+                            self._cleanup_state.requested = True
                             raise execution_terminal_error(error, cleanup_error)
 
     async def aclose(self):
-        self._cleanup_state.requested = True
+        # Normal EOF completes this source, not a queued child's independent
+        # conversation turn. Aborted or failed closure still denies children
+        # synchronously before the source owner is cancelled.
+        if not self._source_exhausted:
+            self._cleanup_state.requested = True
         await close_execution_stream(self._runtime_owner, self._iterator, self._scopes)
 
 

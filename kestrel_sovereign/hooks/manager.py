@@ -445,7 +445,10 @@ class HooksManager:
                     if "response_text" in updated_input:
                         input.response_text = updated_input["response_text"]
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as error:
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(error):
+                    raise
                 # FAIL CLOSED for enforcing hooks: a deny-capable hook that times
                 # out must not silently become "allowed" — that turns a block
                 # into a pass (#1723). Enforcement is the CAPTURED turn-start
@@ -466,6 +469,9 @@ class HooksManager:
                 continue
 
             except Exception as e:
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(e):
+                    raise
                 # FAIL CLOSED for enforcing hooks: a crashed deny-capable hook
                 # (e.g. an approval hook whose queue backend raised) must deny,
                 # not allow (#1723). Enforcement is the CAPTURED turn-start

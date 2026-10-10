@@ -1607,6 +1607,9 @@ class AsyncConversationStore:
         try:
             embedding = await service.aembed(content)
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             # Embedding generation must NEVER block message persistence.
             # The retriever falls back to keyword overlap for this row.
             logger.warning(

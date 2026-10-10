@@ -151,7 +151,11 @@ class HeartbeatRunner:
         self._ensure_heartbeat_file()
 
         self._running = True
-        self._task = asyncio.create_task(self._loop())
+        tracker = getattr(self.agent, "_track_runtime_task", None)
+        if callable(getattr(type(self.agent), "_track_runtime_task", None)):
+            self._task = tracker(self._loop(), name="heartbeat-runtime")
+        else:
+            self._task = asyncio.create_task(self._loop())
         logger.info(
             f"Heartbeat started: interval={self.config.interval_seconds}s, "
             f"target={self.config.target}"

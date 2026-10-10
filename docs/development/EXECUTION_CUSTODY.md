@@ -133,6 +133,46 @@ is otherwise live. Closing one stream does not revoke its reusable runtime.
 Provider classification, retry and fallback preserve cause-chained control
 evidence before ordinary failed-invocation accounting.
 
+Normal stream EOF is distinct from an abort: successful source exhaustion does
+not mark already queued, independently admitted child turns cleanup-only. Abort
+or failed close still denies the source and its copied children before unwinding.
+
+First-party resident services have an explicit runtime-lifetime handoff. Their
+creation checks every current admission, and effect loops wait for successful
+READY publication (which checks those admissions again). Supervision, idle
+monitoring, heartbeat, resume monitoring and standalone scheduler loops then
+carry the SAME immutable runtime custody, not the retired request/occurrence
+that cold-booted them. Durable owner-heartbeat timers may protect admitted boot
+work before READY; their rollback ownership remains explicit. No effect child or
+foreign turn receives this handoff: ordinary background tasks still inherit all
+denying ancestors. Revoking the original runtime still denies resident work.
+SDK event-reader callbacks are explicit new inbound events, not continuations
+of the completed boot claim. The registered exact-client handoff joins its
+callback under the same original runtime; owned routing waits for READY. It
+cannot redirect to a replacement client or generation. The now-tracked resume
+observer is infrastructure for restart-idle classification, not permanent user
+work, and its callback preserves cause-chained control failures.
+
+Explicit cognition control errors, including cause-wrapped unknown/committed
+outcomes, must escape the durable result normalizer. Its exact managed delivery
+is terminal FAILED, never ordinary RETRY or terminal-ACKable; a retained route's
+late control outcome uses the same rule. Native terminal cleanup is a fixed
+original agent/consumer/delivery/owner/token CAS on the existing backend, not a
+generic SQL executor or new admission. No new provider cursor acknowledgement
+is inferred. Failed terminal writes remain exact-identity cleanup debt and block
+clean owner release. Cleanup liveness can update only an existing unstopped
+managed owner that still holds a leased cognition, under the canonical recovery
+serialization key; it cannot insert or revive an owner or authorize ordinary
+work. This is live-process debt ownership, not a new guarantee of durable
+terminal evidence while PostgreSQL is unreachable or after process loss.
+Ordinary idempotent cognition retains its documented at-least-once
+crash recovery contract; these explicit control outcomes require reconciliation.
+Assistant persistence, response audits (including their hook manager), and
+conversation embedding fallbacks preserve control evidence instead of allowing
+cancellation, advisory policy or keyword fallback to erase it. A default native
+LLM service reuses storage's initialized PostgreSQL usage database before boot
+consumers; an externally supplied service retains its own host binding.
+
 Scheduler effect markers lock the exact claim first and sample database lease
 time in a separate statement after the row lock is held. Each confirmed renewal
 also supplies a conservative monotonic deadline measured from before renewal

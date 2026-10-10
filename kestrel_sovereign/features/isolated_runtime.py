@@ -13557,9 +13557,31 @@ class ProxyFeature(Feature):
         """
 
         target = self._client if client is None else client
+        resident_context = None
+        if callable(getattr(type(self.agent), "_runtime_owner_context", None)):
+            # Registration follows exact-client publication while every boot
+            # admission is still live. A notification is a NEW inbound source
+            # operation, not a foreign continuation of the turn that booted
+            # the SDK reader. Retain only the same immutable runtime root.
+            resident_context = self.agent._runtime_owner_context()
 
         async def handle_source_event(event: Any, *, source_client: Any = target) -> None:
-            await self._handle_event(event, source_client=source_client)
+            if resident_context is None:
+                await self._handle_event(event, source_client=source_client)
+                return
+
+            async def receive():
+                require_execution_work(self.agent)
+                await self._handle_event(event, source_client=source_client)
+                require_execution_work(self.agent)
+
+            task = asyncio.create_task(
+                receive(), name=f"isolated-source-notification:{self.name}",
+                context=resident_context.copy(),
+            )
+            # The SDK serial reader cannot leave a handler detached on close.
+            # Inbound cognition itself is separately bounded/owned below.
+            await _await_task_until_complete(task, preserve_cancellation=False)
 
         register = (
             getattr(target, "set_event_handler", None)
@@ -13592,11 +13614,16 @@ class ProxyFeature(Feature):
         doubles whose ``_track_background_task`` doesn't return a real Task)."""
         name = f"isolated-feature:{self.name}"
         coro = self._supervise()
-        tracker = getattr(self.agent, "_track_background_task", None)
+        tracker = getattr(self.agent, "_track_runtime_task", None)
+        if not callable(getattr(type(self.agent), "_track_runtime_task", None)):
+            tracker = getattr(self.agent, "_track_background_task", None)
         if callable(tracker):
             try:
                 task = tracker(coro, name=name)
-            except Exception:  # noqa: BLE001
+            except Exception as error:  # noqa: BLE001
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(error):
+                    raise
                 task = None
             if isinstance(task, asyncio.Task):
                 return task
@@ -13635,12 +13662,17 @@ class ProxyFeature(Feature):
             self._idle_monitor_task = None
         coro = self._monitor_idle_runtime()
         name = f"isolated-feature-idle:{self.name}"
-        tracker = getattr(self.agent, "_track_background_task", None)
+        tracker = getattr(self.agent, "_track_runtime_task", None)
+        if not callable(getattr(type(self.agent), "_track_runtime_task", None)):
+            tracker = getattr(self.agent, "_track_background_task", None)
         tracked = None
         if callable(tracker):
             try:
                 tracked = tracker(coro, name=name)
-            except Exception:  # noqa: BLE001 - test doubles may reject tracking
+            except Exception as error:  # noqa: BLE001 - test doubles may reject tracking
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(error):
+                    raise
                 tracked = None
         if isinstance(tracked, asyncio.Task):
             self._idle_monitor_task = tracked
@@ -14580,7 +14612,10 @@ class ProxyFeature(Feature):
                 if retry is not None:
                     self._schedule_event_ingress_retry(source_client, retry)
 
-        task = asyncio.create_task(
+        tracker = getattr(self.agent, "_track_runtime_task", None)
+        if not callable(getattr(type(self.agent), "_track_runtime_task", None)):
+            tracker = asyncio.create_task
+        task = tracker(
             route(), name=f"isolated-event-ingress-route:{self.name}"
         )
         self._event_ingress_tasks.add(task)
@@ -14633,7 +14668,10 @@ class ProxyFeature(Feature):
                             maxsize=_MAX_PENDING_NON_CURSOR_INGRESS_EVENTS
                         ),
                     )
-                    task = asyncio.create_task(
+                    tracker = getattr(self.agent, "_track_runtime_task", None)
+                    if not callable(getattr(type(self.agent), "_track_runtime_task", None)):
+                        tracker = asyncio.create_task
+                    task = tracker(
                         self._route_non_cursor_inbound_events(queue_entry),
                         name=f"isolated-non-cursor-ingress-route:{self.name}",
                     )

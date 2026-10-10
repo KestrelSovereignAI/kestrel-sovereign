@@ -873,6 +873,9 @@ class KestrelAgent(
             raise TypeError("execution_custody must be Core ExecutionCustody")
         self._execution_custody = execution_custody
         require_execution_work(self)
+        # Resident services belong to the immutable runtime, not the short
+        # scheduler/request admission that happened to cause its cold boot.
+        self._runtime_publication_ready = asyncio.Event()
         # Production launchers bind the fleet control store before initialize.
         # Direct construction remains supported for embedding/tests; only an
         # explicit binding activates the durable turn-start admission seam.
@@ -1508,6 +1511,9 @@ class KestrelAgent(
         ] = None
         self._host_authority_boot_expired = False
 
+        self._llm_service_needs_native_usage = (
+            llm_service is None and self._execution_custody is not None
+        )
         self.llm_service = llm_service or LLMService()
         from kestrel_sovereign.agent.operator_signals import OperatorSignalProducer
         self.operator_signal_producer = OperatorSignalProducer(self)
@@ -2193,6 +2199,12 @@ class KestrelAgent(
                 from kestrel_sovereign.execution_custody import require_execution_work
                 require_execution_work(self)
             self._boot_state = new_state
+            ready = getattr(self, "_runtime_publication_ready", None)
+            if isinstance(ready, asyncio.Event):
+                if new_state is BootPhaseState.READY:
+                    ready.set()
+                else:
+                    ready.clear()
 
         try:
             from kestrel_sovereign.execution_custody import bind_execution_runtime
@@ -2607,6 +2619,17 @@ class KestrelAgent(
         # stopped just before storage closes (#3522).
         ctx.on_rollback("background_tasks", self._boot_teardown_background_tasks)
         await self._raw_storage.initialize()
+
+        if getattr(self, "_llm_service_needs_native_usage", False):
+            # A directly supplied pool/DSN is not represented by process env.
+            # Reuse the now-initialized, custody-bound native agent database
+            # before embeddings, boot audits or any provider/accounting call.
+            # It remains storage-owned: LLM retirement must not close it.
+            from kestrel_sovereign.llm.service import LLMService as NativeLLMService
+
+            if isinstance(self.llm_service, NativeLLMService):
+                self.llm_service._init_usage_tracking(usage_db=self._raw_storage.db)
+            self._llm_service_needs_native_usage = False
 
         # Wrap storage with privacy-enforcing layer
         self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
@@ -4094,6 +4117,7 @@ class KestrelAgent(
             on_resume=_on_resume,
             tick_seconds=self._resume_monitor_config.tick_seconds,
             threshold_seconds=self._resume_monitor_config.threshold_seconds,
+            task_factory=self._track_runtime_task,
         )
         if self._resume_monitor_config.enabled:
             await self.resume_monitor.start()
@@ -8185,6 +8209,65 @@ Expected Duration: {expected_duration}
         task._kestrel_started_at = time.monotonic()  # type: ignore[attr-defined]
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def _runtime_owner_context(self):
+        """Original resident context; also used by lifecycle-owned timers.
+
+        Durable owner heartbeat may run before READY to protect admitted boot
+        work. Resident effect loops use `_track_runtime_task`'s READY barrier.
+        """
+        from contextvars import Context
+        from kestrel_sovereign.execution_custody import (
+            ExecutionAuthorityError, ExecutionCustody, _CURRENT_CUSTODY,
+            current_execution_custody, require_execution_work,
+        )
+        require_execution_work(self)
+        scope = self._execution_custody
+        if current_execution_custody() and not isinstance(scope, ExecutionCustody):
+            raise ExecutionAuthorityError("resident handoff requires original runtime custody")
+        context = Context()
+        if isinstance(scope, ExecutionCustody):
+            context.run(_CURRENT_CUSTODY.set, (scope,))
+        return context
+
+    def _track_runtime_task(self, coro, *, name: str) -> asyncio.Task:
+        """Publish an explicit first-party resident owner, never an effect child.
+
+        Creation requires every current admission to be live; READY publication
+        checks them again. Only then does this service run under the original
+        runtime generation. Ordinary `_track_background_task` children retain
+        all denying ancestors and never receive this handoff.
+        """
+        from kestrel_sovereign.execution_custody import require_execution_work
+        try:
+            context = self._runtime_owner_context()
+        except BaseException:
+            coro.close()
+            raise
+        ready = self._runtime_publication_ready
+        started = False
+
+        async def resident():
+            nonlocal started
+            await ready.wait()
+            require_execution_work(self)
+            started = True
+            return await coro
+
+        # Do not inherit a cognition turn's caller, Hold grant or cleanup flag.
+        # This context carries the SAME irreversible original runtime object;
+        # it does not mint a replacement admission or refresh a generation.
+        task = asyncio.create_task(resident(), name=name, context=context)
+        task._kestrel_started_at = time.monotonic()
+        self._background_tasks.add(task)
+
+        def completed(done):
+            self._background_tasks.discard(done)
+            if not started:
+                coro.close()
+
+        task.add_done_callback(completed)
         return task
 
     async def _shutdown_background_tasks(self) -> None:

@@ -2674,6 +2674,14 @@ class StreamingMixin:
         )
         outcome = await await_owned_task(persistence)
         pending_cancellation = outcome.cancellation
+        from kestrel_sovereign.execution_custody import (
+            execution_terminal_error, is_execution_control_error,
+        )
+        terminal = execution_terminal_error(outcome.error, pending_cancellation)
+        if terminal is not None and is_execution_control_error(terminal):
+            # A best-effort checkpoint is not permission to discard explicit
+            # irreversible evidence, nor to start another ordinary SQL metric.
+            raise terminal
         if outcome.error is not None and not isinstance(
             outcome.error,
             asyncio.CancelledError,
@@ -2701,6 +2709,11 @@ class StreamingMixin:
                 pending_cancellation,
             )
             pending_cancellation = telemetry_outcome.cancellation
+            terminal = execution_terminal_error(
+                outcome.error, telemetry_outcome.error, pending_cancellation,
+            )
+            if terminal is not None and is_execution_control_error(terminal):
+                raise terminal
             if (
                 telemetry_outcome.error is not None
                 and not isinstance(telemetry_outcome.error, asyncio.CancelledError)

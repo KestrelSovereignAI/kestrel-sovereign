@@ -351,6 +351,16 @@ class SchedulerFeature(Feature):
             misfire_grace_seconds=self._load_misfire_grace_seconds(),
             max_concurrent_tasks=self._load_max_concurrent_tasks(),
             lease_seconds=self._load_lease_seconds(),
+            runtime_task_factory=(
+                self.agent._track_runtime_task
+                if callable(getattr(type(self.agent), "_track_runtime_task", None))
+                else None
+            ),
+            occurrence_task_factory=(
+                self.agent._track_background_task
+                if callable(getattr(type(self.agent), "_track_background_task", None))
+                else None
+            ),
         )
         await self._runner.start(polling=False)
         logger.info("SchedulerFeature initialized; polling awaits agent readiness")

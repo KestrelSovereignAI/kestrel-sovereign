@@ -1361,3 +1361,76 @@ class PostgresBackend(DatabaseBackend):
                 await _settle_stop_on_connection(
                     connection, generation_id, owner_id, disposition,
                 )
+
+    async def retain_cognition_cleanup_owner(self, *, agent_id: str, owner_id: str) -> bool:
+        """Retain only an existing live managed owner with a leased cognition.
+
+        This cleanup-only metadata operation cannot insert/revive an owner,
+        grant a lease, acknowledge ingress, or reopen ordinary native work.
+        It serializes with canonical owner recovery using its exact key.
+        """
+        from kestrel_sovereign.signals.durable import DurableSignalStore
+        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+
+        if any(type(value) is not str or not value.strip() for value in (agent_id, owner_id)):
+            raise ValueError("cognition cleanup requires exact owner identities")
+        if not owner_id.startswith("dispatcher:"):
+            raise ValueError("cognition cleanup requires its managed owner")
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("cognition cleanup requires the original backend")
+        async with asyncio.timeout(5):
+            async with pool.acquire() as connection:
+                async with connection.transaction():
+                    await connection.fetchval(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        DurableSignalStore.runtime_owner_lock_key(agent_id),
+                    )
+                    result = await connection.execute(
+                        f"UPDATE {DurableSignalStore.RUNTIME_OWNERS} owner "
+                        "SET heartbeat_at = GREATEST(heartbeat_at, clock_timestamp()), "
+                        "updated_at = clock_timestamp() "
+                        "WHERE owner.agent_id = $1 AND owner.owner_id = $2 "
+                        "AND owner.stopped_at IS NULL AND EXISTS ("
+                        f"SELECT 1 FROM {DurableSignalStore.DELIVERIES} delivery "
+                        "WHERE delivery.agent_id = $1 AND delivery.lease_owner = $2 "
+                        "AND delivery.consumer_id = $3 AND delivery.status = 'leased')",
+                        agent_id, owner_id, DURABLE_COGNITION_CONSUMER_ID,
+                    )
+                    return result == "UPDATE 1"
+
+    async def fail_cognition_delivery(
+        self, *, agent_id: str, consumer_id: str, delivery_id: str,
+        owner_id: str, lease_token: str, error: str,
+    ) -> bool:
+        """Terminalize only an existing exact cognition lease after control loss.
+
+        Like Stop settlement, this fixed cleanup operation neither admits work
+        nor exposes an executor. The original owner/token CAS cannot acquire a
+        new lease, acknowledge a provider cursor, or overwrite a successor.
+        """
+        from kestrel_sovereign.signals.durable import DurableSignalStore
+        from kestrel_sovereign.signals.sources.channels import (
+            DURABLE_COGNITION_CONSUMER_ID,
+        )
+
+        identities = (agent_id, consumer_id, delivery_id, owner_id, lease_token, error)
+        if any(type(value) is not str or not value.strip() for value in identities):
+            raise ValueError("cognition terminal custody requires exact identities")
+        if consumer_id != DURABLE_COGNITION_CONSUMER_ID or not owner_id.startswith("dispatcher:"):
+            raise ValueError("cognition terminal custody requires its managed consumer")
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("cognition terminal custody requires the original backend")
+        async with asyncio.timeout(5):
+            async with pool.acquire() as connection:
+                result = await connection.execute(
+                    f"UPDATE {DurableSignalStore.DELIVERIES} "
+                    "SET status = 'failed', next_attempt_at = NULL, "
+                    "lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, "
+                    "last_error = $1, terminal_at = NOW(), updated_at = NOW() "
+                    "WHERE agent_id = $2 AND consumer_id = $3 AND delivery_id = $4 "
+                    "AND status = 'leased' AND lease_owner = $5 AND lease_token = $6",
+                    error, agent_id, consumer_id, delivery_id, owner_id, lease_token,
+                )
+                return result == "UPDATE 1"

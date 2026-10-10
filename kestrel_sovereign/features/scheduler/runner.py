@@ -1117,6 +1117,8 @@ class SchedulerRunner:
             ]
         ] = None,
         authorized_agent_ids_page_size: int = 500,
+        runtime_task_factory=None,
+        occurrence_task_factory=None,
     ):
         try:
             normalized_lease_seconds = int(lease_seconds)
@@ -1186,6 +1188,8 @@ class SchedulerRunner:
         # The one bounded page currently admitted to selection and telemetry.
         self._authorized_agent_ids_page: tuple[str, ...] = ()
         self._executor = executor
+        self._runtime_task_factory = runtime_task_factory or asyncio.create_task
+        self._occurrence_task_factory = occurrence_task_factory or asyncio.create_task
         self._poll_interval = poll_interval
         self._misfire_grace_seconds = max(0, int(misfire_grace_seconds))
         self._max_concurrent_tasks = max(1, int(max_concurrent_tasks))
@@ -1471,10 +1475,10 @@ class SchedulerRunner:
         self._arm_requested_at = arm_requested_at.isoformat()
         self._running = True
         self._runtime_worker_state = "starting"
-        self._task = asyncio.create_task(
+        self._task = self._runtime_task_factory(
             self._supervise_loop(), name="scheduler-supervisor"
         )
-        self._telemetry_task = asyncio.create_task(
+        self._telemetry_task = self._runtime_task_factory(
             self._telemetry_loop(), name="scheduler-runtime-telemetry"
         )
         # Polling ownership exists before the best-effort telemetry task. A
@@ -1922,7 +1926,7 @@ class SchedulerRunner:
     def _admit_occurrence(self, task: ScheduledTask) -> None:
         """Start one due row on its own task and record it as in flight."""
 
-        occurrence = asyncio.create_task(
+        occurrence = self._occurrence_task_factory(
             self._run_occurrence(task), name=f"scheduler-occurrence:{task.id}"
         )
         self._occurrences[task.id] = _AdmittedOccurrence(
