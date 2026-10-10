@@ -217,7 +217,8 @@ async def test_signed_repair_refuses_unremovable_foreign_edge(
 @pytest.mark.parametrize(
     "damage",
     ["blob", "ownership", "intact", "missing-pointer-passed", "missing-pointer-failed", "wrong-pointer-passed", "wrong-pointer-failed",
-     "legacy-current-passed", "legacy-current-failed", "legacy-history-passed", "legacy-history-failed"],
+     "legacy-current-passed", "legacy-current-failed", "legacy-history-passed", "legacy-history-failed",
+     "legacy-current-invalid", "legacy-current-contradictory", "legacy-history-invalid", "legacy-history-contradictory"],
 )
 async def test_same_hash_signed_repair_restores_content_and_new_signer(
     db_backend,
@@ -280,7 +281,12 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
             legacy = {"risk_level": 3 if damage.endswith("failed") else 1,
                       "timestamp": utc_timestamp(), "constitution_hash": digest,
                       "reasoning": "Legacy completed verdict, never reroll"}
-            expected_genesis = normalize_genesis_receipt(legacy, digest)
+            if damage.endswith("invalid"):
+                legacy["completed_at"] = "not an instant"
+            elif damage.endswith("contradictory"):
+                legacy["completed_at"] = "1999-01-01T00:00:00Z"
+            malformed_legacy = damage.endswith(("invalid", "contradictory"))
+            expected_genesis = legacy if malformed_legacy else normalize_genesis_receipt(legacy, digest)
             if damage.startswith("legacy-history-"):
                 other = hashlib.sha256(uuid4().hex.encode()).hexdigest()
                 node.properties["constitution_hash"] = other
@@ -321,11 +327,17 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
             keypair=Secp256k1Suite().generate_keypair(),
         )
         agent._sovereign_trust_root_path = root
+        bad_completion = damage.endswith(("invalid", "contradictory"))
+        before_runtime = await agent._constitution_state_store.load(identity)
+        before_events = await agent._constitution_state_store.list_events(identity)
         if writer == "runtime":
             result = await ConstitutionMixin.reanchor_constitution(
                 agent, amendment_artifact_path=str(artifact)
             )
-            assert not result.startswith("Error:"), result
+            if bad_completion:
+                assert result.startswith("Error:"), result
+            else:
+                assert not result.startswith("Error:"), result
         else:
             target = (
                 offline.ReanchorTarget(
@@ -355,7 +367,15 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
                 hosted_agent_did=identity if target.backend == "postgres" else None,
                 environ={},
             )
-            assert result.error is None, result.error
+            if bad_completion:
+                assert result.error is not None, result
+            else:
+                assert result.error is None, result.error
+        if bad_completion:
+            assert (await storage.get_node(identity)).properties == prior
+            assert await agent._constitution_state_store.load(identity) == before_runtime
+            assert await agent._constitution_state_store.list_events(identity) == before_events
+            return
         assert await storage.retrieve_file(digest) == content
         if damage == "intact":
             assert await storage.files.get_file_metadata(digest) == metadata

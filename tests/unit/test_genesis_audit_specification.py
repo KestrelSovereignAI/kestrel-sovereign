@@ -111,7 +111,7 @@ def test_legacy_failed_receipt_is_not_invalidated_by_a_new_specification():
 
 
 @pytest.mark.parametrize("location", ["current", "history"])
-@pytest.mark.parametrize("damage", ["unknown-status", "legacy-time", "legacy-bool", "legacy-unaudited", "pending-completed"])
+@pytest.mark.parametrize("damage", ["unknown-status", "legacy-time", "legacy-bool", "legacy-unaudited", "legacy-null-audited", "legacy-invalid-completed", "legacy-null-completed", "legacy-contradictory-completed", "pending-completed"])
 def test_matching_malformed_receipt_never_becomes_new_pending_audit(location, damage):
     digest = "matching-governing-hash"
     receipt = {"constitution_hash": digest, "timestamp": "2026-10-09T21:00:00Z", "risk_level": 3}
@@ -123,6 +123,14 @@ def test_matching_malformed_receipt_never_becomes_new_pending_audit(location, da
         receipt["risk_level"] = True
     elif damage == "legacy-unaudited":
         receipt["audited"] = False
+    elif damage == "legacy-null-audited":
+        receipt["audited"] = None
+    elif damage == "legacy-invalid-completed":
+        receipt["completed_at"] = "invalid"
+    elif damage == "legacy-null-completed":
+        receipt["completed_at"] = None
+    elif damage == "legacy-contradictory-completed":
+        receipt["completed_at"] = "2026-10-08T21:00:00Z"
     else:
         receipt.update(status="pending", audited=True)
     properties = {"genesis_audit": receipt} if location == "current" else {

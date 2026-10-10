@@ -64,6 +64,90 @@ async def test_missing_runtime_row_with_history_remains_restricted(db_backend, n
     finally:
         await storage.close()
 
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("new_identity", [False, True])
+async def test_lost_runtime_state_requires_actual_registry_repair(db_backend, tmp_path, new_identity):
+    """Unknown lost state cannot erase an old feature lifecycle repair obligation."""
+    from dataclasses import replace
+
+    from kestrel_sovereign.agent.boot import BootPhaseState
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+    from tests.unit.test_constitution_audit import _seed_exit_governance
+    from tests.unit.test_feature_contribution_runtime import _agent as feature_agent
+
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:lost-registry:" + uuid4().hex)
+    await storage.initialize()
+    original_blob = None
+    digest = hashlib.sha256(resolve_governing_constitution_bytes(None)).hexdigest()
+    try:
+        first = await _agent(storage)
+        await _seed_exit_governance(first, storage)
+        if db_backend.backend_type == "postgres":
+            original_blob = await storage.db.fetchone(
+                "SELECT content, metadata FROM files WHERE content_hash=?", (digest,),
+            )
+            await storage.db.execute_commit(
+                "UPDATE files SET content=?,metadata=NULL WHERE content_hash=?",
+                (resolve_governing_constitution_bytes(None), digest),
+            )
+        assert await first.enter_safe_mode(
+            "unverified registry generation",
+            cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
+        )
+        before = await first._constitution_state_store.load(storage.agent_id)
+        await storage.db.execute_commit(
+            "DELETE FROM constitution_runtime_state WHERE agent_id=?", (storage.agent_id,),
+        )
+        fresh = await _agent(storage, is_new_identity=new_identity)
+        recovered = await fresh._constitution_state_store.load(storage.agent_id)
+        assert recovered.generation != before.generation
+        assert recovered.safe_mode_cause == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+        # A fresh runtime contains a real SDK contribution generation. Corrupt
+        # only its published context projection, not an injected boolean proof.
+        owner = feature_agent(tmp_path)
+        owner.did = storage.agent_id
+        feature = SDKFixtureFeature(owner)
+        runtime = owner._ensure_feature_contribution_runtime()
+        runtime.activate(runtime.prepare_transition((feature,)).only())
+        original = runtime.active_context_clauses()[0]
+        runtime.context_clause_registry._clauses[original.identity] = replace(
+            original, body="foreign registry generation",
+        )
+        fresh.feature_contribution_runtime = runtime
+        fresh._boot_state = BootPhaseState.READY
+        fresh.verify_feature_lifecycle_integrity = KestrelAgent.verify_feature_lifecycle_integrity.__get__(fresh)
+        refusal = await fresh.exit_safe_mode(authorization="explicit synthetic owner")
+        assert "feature lifecycle repair verification failed" in refusal
+        assert (await fresh._constitution_state_store.load(storage.agent_id)).safe_mode is True
+
+        restarted = await _agent(storage, is_new_identity=False)
+        restarted.feature_contribution_runtime = runtime
+        restarted._boot_state = BootPhaseState.READY
+        restarted.verify_feature_lifecycle_integrity = KestrelAgent.verify_feature_lifecycle_integrity.__get__(restarted)
+        assert restarted.verify_feature_lifecycle_integrity() is False
+        refusal = await restarted.exit_safe_mode(authorization="explicit synthetic owner")
+        assert "feature lifecycle repair verification failed" in refusal
+        assert (await restarted._constitution_state_store.load(storage.agent_id)).safe_mode is True
+
+        # Reconstructed canonical projection passes the real side-effect-free
+        # registry validator; only then may full native governance prove exit.
+        runtime.context_clause_registry._clauses[original.identity] = original
+        assert restarted.verify_feature_lifecycle_integrity() is True
+        result = await restarted.exit_safe_mode(authorization="explicit synthetic owner after repair")
+        assert result == "Safe mode deactivated after successful integrity verification."
+        assert (await restarted._constitution_state_store.load(storage.agent_id)).safe_mode is False
+    finally:
+        if original_blob is not None:
+            await storage.db.execute_commit(
+                "UPDATE files SET content=?,metadata=? WHERE content_hash=?",
+                (original_blob[0], original_blob[1], digest),
+            )
+        await storage.close()
+
+
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend

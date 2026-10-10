@@ -17,8 +17,8 @@ from tests.integration.test_constitution_reanchor_e2e import _write_authority_fi
 from tests.unit.test_non_streaming_turn_privacy_span import _turn_agent
 
 
-async def _ready_turn(storage):
-    native = await _agent(storage)
+async def _ready_turn(storage, *, is_new_identity=True):
+    native = await _agent(storage, is_new_identity=is_new_identity)
     content = resolve_governing_constitution_bytes(None)
     digest = await storage.store_file(content, "constitution.md")
 

@@ -66,6 +66,67 @@ class ImmediateOnlyAdapter(SDKAdapter):
             yield
 
 
+class UnknownCustodyAdapter(SDKAdapter):
+    def __init__(self, native, kind, explicit_isolation):
+        super().__init__(native)
+        self.kind = kind
+        self.transaction_options = ("savepoint",) if explicit_isolation else ()
+
+    @property
+    def backend_type(self):
+        return self.kind
+
+    @property
+    def owns_open_transaction(self):
+        raise AttributeError("The installed SDK does not require caller custody")
+
+    @asynccontextmanager
+    async def transaction(self, *, savepoint=False):
+        async with self.native.transaction(savepoint=savepoint):
+            yield
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["sqlite", "sdk-joined"])
+@pytest.mark.parametrize("explicit_isolation", [False, True])
+async def test_unknown_sdk_custody_never_commits_partial_avatar(tmp_path, kind, explicit_isolation):
+    from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+    seed = await AsyncDatabase.sqlite(str(tmp_path / "unknown-sdk.db"))
+
+    async def already_initialized(db):
+        pass
+
+    db = await AsyncDatabase.from_connected_backend(
+        UnknownCustodyAdapter(seed.backend, kind, explicit_isolation),
+        schema_initializer=already_initialized,
+    )
+    identity = "did:test:unknown-sdk-avatar"
+    files = AsyncFileStore(db, agent_id=identity)
+    graph = AsyncGraphStore(db, agent_id=identity)
+    content = b"native unknown-custody avatar"
+    digest = hashlib.sha256(content).hexdigest()
+    avatar_id = files._avatar_node_id(identity, "primary", digest)
+    try:
+        await graph.add_node(GraphNode(node_id=identity, node_type="agent", label="root", properties={}))
+        await graph.add_node(GraphNode(node_id=avatar_id, node_type="avatar", label="old avatar", properties={"retained": True}))
+        await graph.add_edge(identity, avatar_id, "has_avatar", {})
+        await db.execute_commit(
+            "DELETE FROM graph_edge_owners WHERE source_id=? AND target_id=? AND label='has_avatar'",
+            (identity, avatar_id),
+        )
+        before = await graph.get_node(avatar_id)
+        async with db.transaction():
+            with pytest.raises(Exception) as refusal:
+                await files.store_avatar(content, identity)
+            if not explicit_isolation:
+                assert isinstance(refusal.value, NotImplementedError)
+        assert await db.fetchone("SELECT 1 FROM files WHERE content_hash=?", (digest,)) is None
+        assert (await graph.get_node(avatar_id)).properties == before.properties
+    finally:
+        await db.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("adapter", [SDKAdapter, ImmediateOnlyAdapter])
 async def test_sdk_avatar_top_level_commit_rollback_and_nested_refusal(tmp_path, monkeypatch, adapter):

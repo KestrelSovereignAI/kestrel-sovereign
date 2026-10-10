@@ -150,60 +150,82 @@ class ConstitutionRuntimeStateStore:
         await self._ensure_revision_fence()
 
     async def _ensure_revision_fence(self) -> None:
-        """Old binaries cannot overwrite a row without advancing its fence.
+        """Atomically backfill legacy lifetimes and install the writer fence.
 
-        This is enforced in the database because a replica predating revision
-        fencing does not execute the new store's CAS statement. Repeated boots
-        inspect the catalog, avoiding an unnecessary DDL lock on a live table.
+        Normal boots inspect the catalog only. The one-time upgrade reserves
+        native schema/write custody, retires the previous generation guard,
+        assigns each empty legacy generation without changing restriction or
+        audit evidence, and installs its replacement in the same transaction.
+        No committed interval admits an unfenced writer.
         """
-        trigger = "constitution_runtime_revision_fence_v3"
-        if self._is_postgres:
-            existing = await self._backend.fetch_one(
-                "SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass(?) "
-                "AND tgname = ? AND NOT tgisinternal",
-                ("constitution_runtime_state", trigger),
-            )
-            if existing is not None:
-                return
-            # Serialize initial installation only. The catalog recheck after
-            # the advisory lock also handles concurrently starting replicas.
-            async with self._backend.transaction():
-                await self._backend.fetch_one(
-                    "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ?, 0))",
-                    (f":{trigger}",),
-                )
-                existing = await self._backend.fetch_one(
+        trigger = "constitution_runtime_revision_fence_v4"
+
+        async def installed():
+            if self._is_postgres:
+                return await self._backend.fetch_one(
                     "SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass(?) "
                     "AND tgname = ? AND NOT tgisinternal",
                     ("constitution_runtime_state", trigger),
-                )
-                if existing is None:
-                    await self._backend.execute_script(
-                        f"""
-                        CREATE OR REPLACE FUNCTION {trigger}() RETURNS trigger AS $fence$
-                        BEGIN
-                            IF TG_OP = 'INSERT' THEN
-                                IF NEW.generation = '' THEN
-                                    RAISE EXCEPTION 'constitution runtime generation fence refused old writer';
-                                END IF;
-                            ELSIF NEW.revision <> OLD.revision + 1 OR NEW.generation <> OLD.generation THEN
-                                RAISE EXCEPTION 'constitution runtime revision fence refused old writer';
-                            END IF;
-                            RETURN NEW;
-                        END;
-                        $fence$ LANGUAGE plpgsql;
-                        CREATE TRIGGER {trigger} BEFORE INSERT OR UPDATE ON constitution_runtime_state
-                        FOR EACH ROW EXECUTE FUNCTION {trigger}();
-                        """
-                    )
-        else:
-            existing = await self._backend.fetch_one(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?)",
-                (trigger, f"{trigger}_insert"),
+                ) is not None
+            row = await self._backend.fetch_one(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN (?, ?)",
+                (trigger, trigger + "_insert"),
             )
-            # executescript may have been interrupted between CREATEs. Both
-            # fences must exist; the update trigger alone is not completion.
-            if int(existing[0]) != 2:
+            return int(row[0]) == 2
+
+        if await installed():
+            return
+        transaction = self._backend.transaction() if self._is_postgres else self._backend.transaction(immediate=True)
+        async with transaction:
+            if self._is_postgres:
+                await self._backend.fetch_one(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ?, 0))",
+                    (":constitution_runtime_revision_fence",),
+                )
+            if await installed():
+                return
+            if self._is_postgres:
+                await self._backend.execute("LOCK TABLE constitution_runtime_state IN ACCESS EXCLUSIVE MODE")
+                await self._backend.execute("DROP TRIGGER IF EXISTS constitution_runtime_revision_fence_v3 ON constitution_runtime_state")
+            else:
+                await self._backend.execute("DROP TRIGGER IF EXISTS constitution_runtime_revision_fence_v3")
+                await self._backend.execute("DROP TRIGGER IF EXISTS constitution_runtime_revision_fence_v3_insert")
+            await self._backend.execute(
+                "INSERT INTO constitution_runtime_events "
+                "(agent_id,event_type,reason,authorization_detail,occurred_at) "
+                "SELECT agent_id, 'runtime_generation_migrated', "
+                "'Legacy lifetime generation fenced without changing audit or restriction evidence', NULL, ? "
+                "FROM constitution_runtime_state WHERE generation=''",
+                (self._timestamp_param(datetime.now(timezone.utc)),),
+            )
+            # A migrated lifetime is valid CAS/turn evidence, never newly
+            # minted first-identity anchoring authority. Retain that provenance
+            # in its immutable generation even if an old pending bit survives.
+            generation_expression = "'legacy:' || gen_random_uuid()::text" if self._is_postgres else "'legacy:' || lower(hex(randomblob(16)))"
+            await self._backend.execute(
+                f"UPDATE constitution_runtime_state SET generation={generation_expression}, "
+                "revision=revision+1 WHERE generation=''"
+            )
+            if self._is_postgres:
+                await self._backend.execute_script(
+                    f"""
+                    CREATE OR REPLACE FUNCTION {trigger}() RETURNS trigger AS $fence$
+                    BEGIN
+                        IF TG_OP = 'INSERT' THEN
+                            IF NEW.generation = '' THEN
+                                RAISE EXCEPTION 'constitution runtime generation fence refused old writer';
+                            END IF;
+                        ELSIF NEW.revision <> OLD.revision + 1 OR NEW.generation <> OLD.generation THEN
+                            RAISE EXCEPTION 'constitution runtime revision fence refused old writer';
+                        END IF;
+                        RETURN NEW;
+                    END;
+                    $fence$ LANGUAGE plpgsql;
+                    CREATE TRIGGER {trigger} BEFORE INSERT OR UPDATE ON constitution_runtime_state
+                    FOR EACH ROW EXECUTE FUNCTION {trigger}();
+                    """
+                )
+            else:
                 await self._backend.execute_script(
                     f"""
                     CREATE TRIGGER IF NOT EXISTS {trigger}
@@ -354,6 +376,38 @@ class ConstitutionRuntimeStateStore:
         )
         async with self._backend.transaction():
             if state.revision is None:
+                # PostgreSQL first-creation decisions share one native lifetime
+                # lock. SQLite already holds its connection's writer scope.
+                # Check history only after acquiring that custody, never rely
+                # on an earlier optimistic missing-row/history read.
+                if self._is_postgres:
+                    await self._backend.fetch_one(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ?, 0))",
+                        (":constitution_runtime_lifetime:" + state.agent_id,),
+                    )
+                if await self.has_lifetime_history(state.agent_id):
+                    state = replace(
+                        state, safe_mode=True,
+                        safe_mode_reason="Constitution runtime state missing despite surviving transition history; authorized recovery required",
+                        safe_mode_cause="feature_lifecycle_uncertain",
+                        safe_mode_entered_at=state.safe_mode_entered_at or state.updated_at,
+                        safe_mode_exited_at=None, safe_mode_exit_authorization=None,
+                        last_successful_audit_at=None, interaction_count=0,
+                        bootstrap_pending=False,
+                    )
+                    values = (
+                        state.agent_id, self._boolean_param(True), state.safe_mode_reason,
+                        self._timestamp_param(state.safe_mode_entered_at), None, None, None,
+                        0, self._boolean_param(False), self.SCHEMA_VERSION,
+                        self._timestamp_param(state.updated_at), state.safe_mode_cause, 1,
+                    )
+                    event_type = "safe_mode_entered"
+                    event_reason = state.safe_mode_reason
+                    event_authorization = None
+                elif event_type is None:
+                    # Every lifetime leaves surviving evidence, including
+                    # direct store callers that omit an ordinary transition.
+                    event_type = "runtime_lifetime_created"
                 written = await self._backend.fetch_one(
                     """
                     INSERT INTO constitution_runtime_state

@@ -226,10 +226,9 @@ def normalize_genesis_receipt(record: Mapping[str, Any], constitution_hash: str)
             and normalized.get("constitution_hash") == constitution_hash
             and normalized.get("audited") is not False
         ):
-            normalized.update(
-                status=GENESIS_AUDIT_FAILED if risk == 3 else GENESIS_AUDIT_PASSED,
-                completed_at=normalized["timestamp"], audited=True,
-            )
+            normalized["status"] = GENESIS_AUDIT_FAILED if risk == 3 else GENESIS_AUDIT_PASSED
+            normalized.setdefault("completed_at", normalized["timestamp"])
+            normalized.setdefault("audited", True)
             normalized.setdefault("provenance", "runtime:migrated_legacy_receipt")
     validate_completed_genesis_audit(normalized, constitution_hash)
     return normalized

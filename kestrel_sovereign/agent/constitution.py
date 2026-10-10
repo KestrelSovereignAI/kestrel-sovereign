@@ -801,7 +801,11 @@ class ConstitutionMixin:
                     await ConstitutionMixin._enter_safe_mode_locked(
                         self,
                         "Constitution runtime state missing despite surviving transition history; authorized recovery required",
-                        cause=SafeModeCause.STATE_UNAVAILABLE.value,
+                        # Lost state cannot prove the previous restriction's
+                        # cause. Preserve the separate native registry-repair
+                        # obligation rather than allowing a constitution-only
+                        # authorized exit to clear an unknown lifecycle latch.
+                        cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
                     )
                     return
                 self._interaction_count = 0
@@ -1068,7 +1072,8 @@ class ConstitutionMixin:
                     )
             self._constitution_state_revision = persisted_state.revision
             self._constitution_state_generation = persisted_state.generation
-            if event_type == "safe_mode_entered":
+            if event_type == "safe_mode_entered" or (snapshot.revision is None and persisted_state.safe_mode):
+                self._safe_mode = persisted_state.safe_mode
                 self._safe_mode_cause = persisted_state.safe_mode_cause
                 self._safe_mode_reason = persisted_state.safe_mode_reason
                 self._safe_mode_entered_at = persisted_state.safe_mode_entered_at
@@ -1078,6 +1083,11 @@ class ConstitutionMixin:
                     or self._constitution_epoch()
                 )
                 self._constitution_bootstrap_pending = persisted_state.bootstrap_pending
+                if snapshot.revision is None and persisted_state.safe_mode_cause == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value:
+                    self._feature_lifecycle_integrity_uncertain = True
+                    self._feature_lifecycle_repair_verified = False
+                    self._constitution_audit_pending = False
+                    self._constitution_state_migration_pending = False
             # The snapshot is on disk, so whatever earlier failure set this is
             # no longer true. Leaving it set reported ``state_not_persisted``
             # for the rest of the process after one transient write error.
@@ -1097,9 +1107,11 @@ class ConstitutionMixin:
                     # The failed audit transaction is rolled back. Record the
                     # actual integrity restriction in its own owning commit,
                     # not as a fictitious persistence outage or audit success.
-                    await ConstitutionMixin._enter_safe_mode_locked(
+                    restriction_persisted = await ConstitutionMixin._enter_safe_mode_locked(
                         self, str(cause), cause=SafeModeCause.INTEGRITY.value,
                     )
+                    if not restriction_persisted:
+                        self._constitution_state_persistence_pending = True
                     return False
                 if cause.__cause__ is None:
                     break
@@ -1816,6 +1828,19 @@ class ConstitutionMixin:
             )
 
     async def _lock_verified_constitution_exit(self, *, require_genesis=True):
+        """Translate only JSON decoding failures throughout final attestation."""
+        from json import JSONDecodeError
+
+        try:
+            await ConstitutionMixin._attest_constitution_exit_under_native_custody(
+                self, require_genesis=require_genesis,
+            )
+        except JSONDecodeError as exc:
+            raise ConstitutionIntegrityAttestationError(
+                "Malformed native governance metadata during final verification"
+            ) from exc
+
+    async def _attest_constitution_exit_under_native_custody(self, *, require_genesis=True):
         """Retain native governance, blob and ownership custody through exit.
 
         The earlier diagnostic verification is not authority to clear state:
@@ -1846,10 +1871,13 @@ class ConstitutionMixin:
             raise ConstitutionIntegrityAttestationError(str(exc)) from exc
         # A different pointer won while we waited for the graph locks. Do not
         # widen the lock set out of canonical order or adopt its newer proof.
-        fresh = await raw.get_node(self.agent_id)
-        if (fresh.properties.get("constitution_hash") if fresh is not None else None) != digest:
-            raise ConstitutionIntegrityAttestationError("Safe Mode exit governing pointer changed during custody acquisition")
-        valid, message = await self._verify_constitution_integrity()
+        try:
+            fresh = await raw.get_node(self.agent_id)
+            if (fresh.properties.get("constitution_hash") if fresh is not None else None) != digest:
+                raise ConstitutionIntegrityAttestationError("Safe Mode exit governing pointer changed during custody acquisition")
+            valid, message = await self._verify_constitution_integrity()
+        except JSONDecodeError as exc:
+            raise ConstitutionIntegrityAttestationError("Malformed native governance metadata during final verification") from exc
         if valid is not True:
             raise ConstitutionIntegrityAttestationError("Locked integrity verification failed: " + message)
         if require_genesis and fresh is not None and "genesis_audit" in fresh.properties:
@@ -1925,7 +1953,10 @@ class ConstitutionMixin:
             self._safe_mode_exit_authorization = old_exit_authorization
             self._feature_lifecycle_repair_verified = False
             if self._constitution_audit_commit_error:
-                return "Safe Mode remains active: integrity verification refused: " + self._constitution_audit_commit_error
+                result = "Safe Mode remains active: integrity verification refused: " + self._constitution_audit_commit_error
+                if self._constitution_state_persistence_pending:
+                    result += " (replacement restriction could not be persisted; recovery remains pending)."
+                return result
             return "Safe Mode remains active: constitutional state could not be persisted."
 
         self._safe_mode = False
@@ -2632,6 +2663,7 @@ class ConstitutionMixin:
                 # Legacy pending-audit markers predate atomic consumption;
                 # they cannot prove that anchoring custody remains unused.
                 or not bootstrap.generation
+                or bootstrap.generation.startswith("legacy:")
                 or bootstrap.revision != self._constitution_state_revision
                 or bootstrap.generation != self._constitution_state_generation
             ):
@@ -2704,6 +2736,7 @@ class ConstitutionMixin:
                         bootstrap is None
                         or not bootstrap.bootstrap_pending
                         or not bootstrap.generation
+                        or bootstrap.generation.startswith("legacy:")
                         or bootstrap.revision != self._constitution_state_revision
                         or bootstrap.generation != self._constitution_state_generation
                     ):

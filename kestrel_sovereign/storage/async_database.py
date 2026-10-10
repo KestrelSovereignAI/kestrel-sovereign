@@ -3723,14 +3723,17 @@ class AsyncDatabase:
                 if "immediate" not in inspect.signature(self._backend.transaction).parameters:
                     raise NotImplementedError("Backend does not support immediate transactions")
                 options["immediate"] = True
-            if savepoint:
-                if "savepoint" in getattr(self._backend, "transaction_options", ()):
-                    options["savepoint"] = True
-                elif self.owns_open_transaction and self.nested_transaction_strategy != "savepoint":
-                    # SDK transaction() suffices for a top-level rollback
-                    # scope. A joined/unknown nested adapter must refuse before
-                    # writes instead of pretending to supply rollback isolation.
-                    raise NotImplementedError("Backend does not support isolated nested transactions")
+        if savepoint:
+            if "savepoint" in getattr(self._backend, "transaction_options", ()):
+                options["savepoint"] = True
+            elif self.nested_transaction_strategy == "savepoint":
+                # An explicit intrinsic savepoint contract needs no extension
+                # keyword (e.g. the native PostgreSQL adapter).
+                pass
+            elif self.owns_open_transaction is not False:
+                # Unknown optional SDK custody cannot prove a top-level
+                # rollback boundary, regardless of the adapter's type name.
+                raise NotImplementedError("Backend does not support isolated nested transactions with unknown or active caller custody")
         async with self._backend.transaction(**options):
             yield
     

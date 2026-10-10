@@ -183,7 +183,16 @@ lost. Such identities are not pending first-boot targets; offline tools retain
 the runtime target and return a structured refusal, not an uncaught exception.
 Existing-identity restore likewise refuses to treat surviving lifetime history
 as legacy migration: it creates a restricted new generation requiring explicit
-authorized recovery, never an unrestricted automatic audit. Doctrine metadata
+authorized recovery, never an unrestricted automatic audit. Recovery also
+requires the native feature registry's independent repair proof:
+lost runtime state cannot prove that the prior restriction was constitutional
+rather than a quarantined feature lifecycle. Recreating a lifetime checks its
+surviving history inside the native allocation transaction, not only before it.
+The populated-runtime upgrade assigns nonempty immutable `legacy:` generations
+without resetting restrictions, timestamps, counters or pending markers. Those
+generations permit ordinary audited turn admission but cannot authorize a new
+automatic first anchor; an old pending bit is not new-identity authority.
+Doctrine metadata
 writers use native compare-and-swap to preserve concurrent completed receipts.
 Completed same-content genesis receipts survive an incorrect operative pointer
 as well as a missing one. Conflicting completed evidence is refused rather than

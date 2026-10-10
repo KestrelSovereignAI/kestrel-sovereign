@@ -451,13 +451,14 @@ class SQLiteBackend(DatabaseBackend):
 
     @property
     def owns_open_transaction(self) -> bool:
-        """Whether the current task has a transaction open here, which a
-        ``transaction()`` entered now would join rather than commit."""
-        return (
-            self._in_transaction and self._txn_owner is asyncio.current_task()
-            and not self._transaction_poisoned
-            and self._connection is not None and self._connection.in_transaction
-        )
+        """Whether this task still owns the enclosing transaction scope.
+
+        Implicit rollback destroys native write custody, not the caller scope
+        or its writer lock. Keep ownership visible until that scope exits so
+        higher-level lock ordering cannot treat poisoned custody as top-level.
+        SQL operations separately enforce healthy native transaction custody.
+        """
+        return self._in_transaction and self._txn_owner is asyncio.current_task()
 
     @property
     def is_connected(self) -> bool:

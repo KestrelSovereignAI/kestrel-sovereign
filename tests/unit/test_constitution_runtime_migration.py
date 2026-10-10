@@ -19,8 +19,8 @@ async def test_independent_sqlite_replicas_upgrade_missing_column_once(
     await second.connect()
     try:
         await ConstitutionRuntimeStateStore(first).initialize()
-        await first.execute("DROP TRIGGER constitution_runtime_revision_fence_v3")
-        await first.execute("DROP TRIGGER constitution_runtime_revision_fence_v3_insert")
+        await first.execute("DROP TRIGGER constitution_runtime_revision_fence_v4")
+        await first.execute("DROP TRIGGER constitution_runtime_revision_fence_v4_insert")
         await first.execute(
             f"ALTER TABLE constitution_runtime_state DROP COLUMN {missing_column}"
         )
@@ -63,11 +63,11 @@ async def test_interrupted_sqlite_trigger_installation_is_completed(tmp_path):
     await backend.connect()
     try:
         await ConstitutionRuntimeStateStore(backend).initialize()
-        await backend.execute("DROP TRIGGER constitution_runtime_revision_fence_v3_insert")
+        await backend.execute("DROP TRIGGER constitution_runtime_revision_fence_v4_insert")
         await ConstitutionRuntimeStateStore(backend).initialize()
         assert await backend.fetch_one(
             "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?",
-            ("constitution_runtime_revision_fence_v3_insert",),
+            ("constitution_runtime_revision_fence_v4_insert",),
         ) is not None
     finally:
         await backend.close()
