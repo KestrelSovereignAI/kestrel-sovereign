@@ -82,6 +82,12 @@ def execution_terminal_error(*errors: BaseException | None) -> BaseException | N
         # of cancellation. A failed checkpoint is not a successful Stop.
         if isinstance(error, asyncio.CancelledError) and error.__cause__ is not None:
             return error.__cause__
+    if present and isinstance(present[0], GeneratorExit):
+        # GeneratorExit is the source's ordinary close request, not caller
+        # cancellation. A later cancellation while joining that close must
+        # still reach the closer after cleanup settles. Control evidence was
+        # already selected above, so it cannot be demoted by this rule.
+        return next((error for error in present[1:] if not isinstance(error, GeneratorExit)), present[0])
     if present and isinstance(present[0], (asyncio.CancelledError, GeneratorExit)):
         for error in present[1:]:
             if not isinstance(error, (asyncio.CancelledError, GeneratorExit)):

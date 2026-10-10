@@ -15,6 +15,7 @@ from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDispositi
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCommitOutcomeError, ExecutionCustody,
     execution_commit_outcome, is_execution_control_error,
+    execution_terminal_error,
 )
 from tests.unit.test_execution_custody import Authority
 
@@ -32,6 +33,14 @@ def control_error(control, carrier="direct"):
     }[carrier]()
     error.__cause__ = evidence
     return error
+
+
+def test_normal_generator_close_does_not_consume_late_caller_cancellation():
+    cancellation = asyncio.CancelledError("closer cancelled after source close began")
+    assert execution_terminal_error(GeneratorExit(), cancellation) is cancellation
+    for control in ("denied", "unknown", "committed"):
+        evidence = control_error(control)
+        assert execution_terminal_error(GeneratorExit(), cancellation, evidence) is evidence
 
 
 def dispatcher_fixture(error):
