@@ -774,7 +774,7 @@ class PostgresBackend(DatabaseBackend):
                 require_execution_backend("postgres", scopes)
                 self._require_transaction_custody()
                 committing = True
-        except Exception as exc:
+        except BaseException as exc:
             if committing and scopes:
                 raise ExecutionCommitOutcomeError("unknown") from exc
             raise

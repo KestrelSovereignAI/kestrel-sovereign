@@ -3082,13 +3082,20 @@ class TestAsyncDatabase:
         disposal_started = asyncio.Event()
         release_disposal = asyncio.Event()
 
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        # A real non-connecting PostgreSQL engine supplies the native event
+        # surface. Only the disposal acknowledgement is fault-injected.
+        event_engine = create_async_engine("postgresql+asyncpg://disposable@127.0.0.1:1/disposable")
+
         class PendingPostgresEngine:
-            class dialect:
-                name = "postgresql"
+            dialect = event_engine.dialect
+            sync_engine = event_engine.sync_engine
 
             async def dispose(self):
                 disposal_started.set()
                 await release_disposal.wait()
+                await event_engine.dispose()
                 raise RuntimeError("late PostgreSQL dispose failure")
 
         storage = AsyncStorage(str(tmp_path / "postgres-dispose-owner.db"))

@@ -1158,6 +1158,9 @@ def test_without_the_opt_out_the_planted_dotenvs_do_reach_the_server(
     env, cwd, package = _smoke_server_launch(monkeypatch, tmp_path)
     del env[SKIP_DOTENV_ENV]
     server_process_environ(env, cwd)
+    # This control intentionally loads ONLY its planted temporary files. An
+    # outer provider-free gate must not disable that isolated control too.
+    monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
 
     server.load_server_dotenv(package_dir=package)
 

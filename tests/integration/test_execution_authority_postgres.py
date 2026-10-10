@@ -134,7 +134,8 @@ async def test_unlock_loss_does_not_replace_original_cancellation(native_pg, mon
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-async def test_lost_commit_acknowledgement_requires_reconciliation(native_pg, monkeypatch, explicit):
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_lost_commit_acknowledgement_requires_reconciliation(native_pg, monkeypatch, explicit, cancelled):
     from kestrel_sovereign.execution_custody import execution_commit_outcome
 
     backend, _, _ = native_pg
@@ -143,6 +144,8 @@ async def test_lost_commit_acknowledgement_requires_reconciliation(native_pg, mo
     async def lose_ack(transaction, error_type, error, traceback):
         result = await exit_transaction(transaction, error_type, error, traceback)
         if error_type is None:
+            if cancelled:
+                raise asyncio.CancelledError("injected cancelled acknowledgement after native commit")
             raise OSError("injected lost acknowledgement after native commit")
         return result
 
