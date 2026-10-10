@@ -1234,13 +1234,14 @@ async def _read_agent_anchor(
         # See :mod:`kestrel_sovereign.constitution.anchored_bytes`.
         anchored_present = False
         from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash, governance_evidence
+        from kestrel_sovereign.constitution.reanchor_receipt import is_constitution_hash
 
         historical_hash = historical_anchor_hash(agent.properties, governed_by_targets)
         if historical_hash:
             anchored_text, anchored_present = await read_anchored_constitution(
                 storage.db, historical_hash
             )
-            if not anchored_hash and not anchored_present:
+            if not is_constitution_hash(anchored_hash) and not anchored_present:
                 raise ValueError("Missing anchor pointer's historical governing bytes could not be read; restore its exact prior pointer before signed repair")
         return (
             anchored_hash,
@@ -1322,9 +1323,12 @@ async def _write_reanchor(
     rag_index: ConstitutionRagIndex | None = None
     from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
 
-    historical_hash = old_hash or historical_anchor_hash(
+    historical_hash = historical_anchor_hash(
         governance_preflight["properties"], governance_preflight["governed_by_targets"],
     )
+    from kestrel_sovereign.constitution.reanchor_receipt import reanchor_prior_pointer_fields
+
+    prior_pointer_fields = reanchor_prior_pointer_fields(old_hash, historical_hash)
     async with target.open_storage() as storage:
         from kestrel_sovereign.constitution.runtime_state import ConstitutionRuntimeStateStore
 
@@ -1520,7 +1524,7 @@ async def _write_reanchor(
                 agent.properties,
                 receipt={
                     "timestamp": _now_iso(),
-                    "old_hash": old_hash,
+                    **prior_pointer_fields,
                     "new_hash": new_hash,
                     "source_path": str(canonical_path),
                     **governing_source.receipt_fields(),

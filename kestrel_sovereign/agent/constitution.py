@@ -2352,18 +2352,20 @@ class ConstitutionMixin:
         # bytes would then authorize, erasing the authored terms. Refuse before
         # any crypto or write. Shared with the offline CLI so the two entry
         # points cannot diverge on this.
-        historical_hash = old_hash
-        if old_hash == "none":
-            from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
+        from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
+        from kestrel_sovereign.constitution.reanchor_receipt import is_constitution_hash, reanchor_prior_pointer_fields
 
-            try:
-                # Validate exactly the immutable witness compared under the
-                # writer's locks, not a second independently observed read.
-                historical_hash = historical_anchor_hash(
-                    validated_properties, governance_preflight["governed_by_targets"],
-                )
-            except Exception as exc:  # noqa: BLE001 - incomplete history cannot waive rights
-                return f"Error: Cannot inspect historical governance: {exc}; nothing was written."
+        try:
+            # A malformed pointer, like a missing one, cannot make actual
+            # retained contract bytes disappear from the rights check.
+            historical_hash = historical_anchor_hash(
+                validated_properties, governance_preflight["governed_by_targets"],
+            )
+            prior_pointer_fields = reanchor_prior_pointer_fields(
+                validated_properties.get("constitution_hash"), historical_hash,
+            )
+        except Exception as exc:  # noqa: BLE001 - incomplete history cannot waive rights
+            return f"Error: Cannot inspect historical governance: {exc}; nothing was written."
         if historical_hash and historical_hash != "none":
             from kestrel_sovereign.constitution.anchored_bytes import (
                 read_anchored_constitution,
@@ -2396,7 +2398,7 @@ class ConstitutionMixin:
                 anchored_text, anchored_present = await read_anchored_constitution(
                     db, historical_hash
                 )
-                if old_hash == "none" and not anchored_present:
+                if not is_constitution_hash(validated_properties.get("constitution_hash")) and not anchored_present:
                     return "Error: Historical governing bytes could not be read; restore the exact prior pointer before signed repair."
             except Exception as exc:  # noqa: BLE001 — a database failure, not a key one
                 # Undecryptable bytes come back as UNREADABLE; anything that
@@ -2551,7 +2553,7 @@ class ConstitutionMixin:
                     agent_node.properties,
                     receipt={
                         "timestamp": self._get_timestamp(),
-                        "old_hash": old_hash,
+                        **prior_pointer_fields,
                         "new_hash": stored_hash,
                         "path": constitution_path_used,
                         **governing_source.receipt_fields(),

@@ -50,6 +50,7 @@ from kestrel_sdk.payer_policy import (
 from kestrel_sovereign.services.key_resolution import KeyResolutionService
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 logger = logging.getLogger(__name__)
@@ -708,40 +709,20 @@ class FoundationPayerResolver:
                 key). When False, log and return (used by callers that
                 are tolerant of the row being absent).
         """
-        import json
+        from kestrel_sovereign.storage.identity_metadata import merge_identity_metadata_in_database
 
-        rows = await self._db.fetchall(
-            "SELECT properties FROM graph_nodes WHERE node_id = ? LIMIT 1",
-            (agent_did,),
+        # Never replace a stale whole identity snapshot: genesis, signed repair
+        # and their histories can commit while the provider request is awaited.
+        # The shared writer reserves the native row before its fresh read.
+        persisted = await merge_identity_metadata_in_database(
+            self._db, agent_did, {"openrouter_key_hash": key_hash},
         )
-        if not rows:
+        if not persisted:
             if require_row:
                 raise _GraphNodeVanishedError(agent_did)
             logger.error(
                 f"PayerResolver: graph_nodes row not found for agent "
                 f"{agent_did[:30]}...; openrouter_key_hash NOT persisted."
-            )
-            return
-
-        properties_json = rows[0][0]
-        properties = json.loads(properties_json) if properties_json else {}
-        properties["openrouter_key_hash"] = key_hash
-        # AsyncDatabase.execute returns cursor.rowcount on both backends.
-        # If the row was deleted between SELECT above and this UPDATE
-        # (concurrent retirement), rowcount is 0 — that's the same leak
-        # shape as the missing-row case codex round 4 closed at the
-        # SELECT, so treat it the same way.
-        rows_affected = await self._db.execute(
-            "UPDATE graph_nodes SET properties = ? WHERE node_id = ?",
-            (json.dumps(properties), agent_did),
-        )
-        if rows_affected == 0:
-            if require_row:
-                raise _GraphNodeVanishedError(agent_did)
-            logger.error(
-                f"PayerResolver: graph_nodes row vanished between SELECT "
-                f"and UPDATE for agent {agent_did[:30]}...; "
-                "openrouter_key_hash NOT persisted."
             )
 
     def _spec_for(self, resource_class: ResourceClass) -> PayerSpec:

@@ -180,11 +180,14 @@ def historical_anchor_hash(
     names multiple superseded constitutions and is not a competing pointer.
     """
     pointer = properties.get("constitution_hash")
-    from kestrel_sovereign.constitution.reanchor_receipt import validate_constitution_reanchor_evidence
+    from kestrel_sovereign.constitution.reanchor_receipt import is_constitution_hash, validate_constitution_reanchor_evidence
 
     validate_constitution_reanchor_evidence(properties)
-    if pointer:
+    if is_constitution_hash(pointer):
         return pointer
+    malformed_pointer = pointer is not None and pointer != ""
+    if malformed_pointer and (not isinstance(pointer, str) or len(pointer) > 256):
+        raise ValueError("Malformed anchor pointer has unreadable historical governance; restore its exact prior pointer before signed repair")
     candidates: set[str] = set()
 
     def add(value, *, absent_ok=True):
@@ -229,6 +232,8 @@ def historical_anchor_hash(
             add(entry.get("superseded_by_constitution_hash"), absent_ok=False)
     if len(candidates) > 1:
         raise ValueError("Missing anchor pointer has ambiguous historical governance; restore its exact prior pointer before signed repair")
+    if malformed_pointer and not candidates:
+        raise ValueError("Malformed anchor pointer has unreadable historical governance; restore its exact prior pointer before signed repair")
     return next(iter(candidates), None)
 
 

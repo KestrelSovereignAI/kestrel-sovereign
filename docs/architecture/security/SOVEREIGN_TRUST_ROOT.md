@@ -201,6 +201,11 @@ admission, archival, publication and cleanup. Its lock inode is retained after
 release (process death releases the OS lock). An owned database is exclusively
 created before SQLite opens it; failure cleanup refuses replacement/shared
 inodes and never overwrites a database through a following pathname.
+Ownership cleanup also covers the first pathname inspection after successful
+connection acquisition. If that inspection fails, close is settled even under
+repeated cancellation. Missing retirement acknowledgement retains recovery
+evidence and reports both the inspection and cleanup failures; it is not a
+permission to remove a potentially live database.
 
 Genesis receipt history has one shared publication/runtime limit of 128 entries.
 A repair requiring a 129th entry, or encountering already-overflowed or malformed
@@ -215,6 +220,15 @@ evidence before file-owner publication. Repeated same-content repairs cannot
 append a 129th receipt or replace malformed history with an empty list. Legacy
 receipts without artifact hashes remain preserved; recovery never invents a
 signature for old evidence.
+
+A malformed operative pointer is not a typed hash and cannot make retained
+contract bytes disappear from the rights check. Repair requires unambiguous,
+bounded historical hash evidence and readable addressed bytes, followed by
+independent external-root signature verification. A successful new receipt
+records the recovered digest in `old_hash` and preserves the original bounded
+string in `repaired_constitution_pointer` as diagnostic data, never signing
+authority. Missing, contradictory or unreadable evidence refuses without
+publication. Existing malformed receipts are not normalized by this recovery.
 
 Native SQLite resolves its database target once at construction and exposes a
 read-only absolute path. Primary connections, snapshot reads, SQLAlchemy
@@ -246,7 +260,8 @@ Frozen birth replay likewise refuses a migrated pending lifetime rather than
 restoring it as a newly created identity.
 Doctrine metadata
 writers use native compare-and-swap to preserve concurrent completed receipts.
-Bootstrap status, description, rename and overlay metadata writers merge only
+Bootstrap status, description, rename, overlay, payer credential-handle and
+graduation metadata writers merge only
 their own fields into a freshly locked native identity. An old identity read
 cannot replace newer governance, and a failed write does not mutate its read
 object or report a live rename. Runtime genesis audit, turn admission and

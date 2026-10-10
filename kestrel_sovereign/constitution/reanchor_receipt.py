@@ -41,8 +41,26 @@ CONSTITUTION_REANCHOR_HISTORY_KEY = "constitution_reanchor_history"
 MAX_REANCHOR_RECEIPT_HISTORY = 128
 
 
+def is_constitution_hash(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def reanchor_prior_pointer_fields(pointer: Any, historical_hash: str | None) -> dict:
+    """Keep an observed corrupt pointer separate from a typed prior digest.
+
+    Recovery evidence is not signing authority. Both public writers must first
+    inspect readable historical bytes and independently verify the new artifact.
+    Existing malformed receipts are never normalized by this new-event builder.
+    """
+    if pointer is None or pointer == "" or is_constitution_hash(pointer):
+        return {"old_hash": pointer or None}
+    if not isinstance(pointer, str) or len(pointer) > 256 or not is_constitution_hash(historical_hash):
+        raise ValueError("Malformed anchor pointer has unreadable historical governance; restore its exact prior pointer before signed repair")
+    return {"old_hash": historical_hash, "repaired_constitution_pointer": pointer}
+
+
 def _receipt_hash(value: Any, field: str) -> None:
-    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+    if not is_constitution_hash(value):
         raise ValueError(f"Malformed or unreadable historical governance reanchor receipt {field}; existing evidence is preserved")
 
 

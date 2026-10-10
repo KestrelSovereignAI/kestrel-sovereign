@@ -989,10 +989,19 @@ async def create_kestrel_identity_async(
                 # after connection acquisition and failure close have joined.
                 _cleanup_owned_inception_database(db_path, db_owner)
                 raise
-            opened_stat = os.lstat(db_path)
-            if (opened_stat.st_dev, opened_stat.st_ino) != db_owner:
-                await db.close()
-                raise RuntimeError("Inception database changed after exclusive creation; retained for recovery")
+            try:
+                opened_stat = os.lstat(db_path)
+                if (opened_stat.st_dev, opened_stat.st_ino) != db_owner:
+                    raise RuntimeError("Inception database changed after exclusive creation; retained for recovery")
+            except BaseException as inspection_error:
+                # Ownership begins when acquisition succeeds, not when this
+                # fallible pathname inspection returns. Settle close even under
+                # repeated cancellation; uncertain retirement retains evidence.
+                from kestrel_sovereign.storage.async_database import _close_failed_database_initialization
+
+                await _close_failed_database_initialization(db, inspection_error)
+                _cleanup_owned_inception_database(db_path, db_owner)
+                raise
             logger.info(f"Created SQLite database at {db_path}")
         files = AsyncFileStore(db)
         graph = AsyncGraphStore(db)
