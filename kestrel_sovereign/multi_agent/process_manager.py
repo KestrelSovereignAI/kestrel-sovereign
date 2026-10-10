@@ -74,6 +74,52 @@ logger = logging.getLogger(__name__)
 DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS = 120.0
 
 
+def _open_detached_log(log_file: Path) -> int:
+    """Return a child-inheritable append contract, not just a parent CRT flag."""
+    if sys.platform != "win32":
+        return os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+
+    # Popen duplicates the native Windows handle, not its parent CRT append
+    # state. FILE_APPEND_DATA without FILE_WRITE_DATA makes each child write
+    # append in the kernel, including independently opened concurrent handles.
+    # https://learn.microsoft.com/en-us/windows/win32/fileio/file-access-rights-constants
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.CreateFileW(
+        os.fspath(log_file),
+        0x0004 | 0x00100000,  # FILE_APPEND_DATA | SYNCHRONIZE, never FILE_WRITE_DATA
+        0x0001 | 0x0002 | 0x0004,  # share read/write/delete for readers/rotation
+        None,  # non-inheritable; Popen duplicates only its explicit stdio handles
+        4,  # OPEN_ALWAYS: preserve existing bytes
+        0x0080,  # FILE_ATTRIBUTE_NORMAL
+        None,
+    )
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+    except BaseException:
+        kernel.CloseHandle(handle)
+        raise
+    # The CRT descriptor now owns the handle; close via os.close from here on.
+    try:
+        os.set_inheritable(fd, False)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 #: How far a live process's start time may drift from the recorded one and
 #: still be the same process. ``create_time`` is derived from boot time plus
 #: the kernel's clock ticks, so a value can wobble in the last decimals across
@@ -752,11 +798,7 @@ class ProcessManager:
         # we hand the fd to the child. ``buffering=0`` because we hand
         # the raw fd to Popen — Python's own buffering layer doesn't
         # matter here.
-        log_fd = os.open(
-            log_file,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-            0o644,
-        )
+        log_fd = _open_detached_log(log_file)
         try:
             kwargs = dict(
                 cwd=self.project_dir,

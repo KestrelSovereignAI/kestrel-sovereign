@@ -2033,6 +2033,73 @@ class TestSpawnDetached:
     parent and the child's stdout pipe gets EPIPE on subsequent
     writes. This bug hid runtime errors after every restart."""
 
+    @pytest.mark.parametrize("failure", [None, "create", "convert", "inherit"])
+    def test_windows_native_append_handle_ownership(self, tmp_path, monkeypatch, failure):
+        """Append rights survive Popen's handle transfer; failed handoffs close."""
+        import ctypes
+        import os
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from kestrel_sovereign.multi_agent.process_manager import _open_detached_log
+
+        kernel = SimpleNamespace(CreateFileW=Mock(return_value=987), CloseHandle=Mock())
+        converter = Mock(return_value=456)
+        inheritable = Mock()
+        close = Mock()
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(ctypes, "WinDLL", Mock(return_value=kernel), raising=False)
+        monkeypatch.setattr(ctypes, "get_last_error", Mock(return_value=5), raising=False)
+        monkeypatch.setattr(ctypes, "WinError", lambda _error: OSError("create denied"), raising=False)
+        monkeypatch.setitem(sys.modules, "msvcrt", SimpleNamespace(open_osfhandle=converter))
+        monkeypatch.setattr(os, "O_BINARY", 0x8000, raising=False)
+        monkeypatch.setattr(os, "set_inheritable", inheritable)
+        monkeypatch.setattr(os, "close", close)
+        if failure == "create":
+            kernel.CreateFileW.return_value = ctypes.c_void_p(-1).value
+        elif failure == "convert":
+            converter.side_effect = OSError("convert denied")
+        elif failure == "inherit":
+            inheritable.side_effect = OSError("inherit denied")
+
+        if failure is None:
+            assert _open_detached_log(tmp_path / "append.log") == 456
+        else:
+            with pytest.raises(OSError):
+                _open_detached_log(tmp_path / "append.log")
+        args = kernel.CreateFileW.call_args.args
+        assert args[1] == 0x0004 | 0x00100000  # no FILE_WRITE_DATA/GENERIC_WRITE
+        assert args[2:6] == (7, None, 4, 0x80)  # sharing, no inherit, OPEN_ALWAYS
+        if failure == "create":
+            converter.assert_not_called()
+        else:
+            converter.assert_called_once_with(987, os.O_WRONLY | os.O_BINARY)
+        if failure == "convert":
+            kernel.CloseHandle.assert_called_once_with(987)
+        else:
+            kernel.CloseHandle.assert_not_called()
+        if failure == "inherit":
+            close.assert_called_once_with(456)
+        else:
+            close.assert_not_called()
+        if failure not in {"create", "convert"}:
+            inheritable.assert_called_once_with(456, False)
+
+    def test_detached_failed_spawn_closes_parent_log_fd(self, pm, tmp_path):
+        import os
+
+        captured = []
+        def refuse_spawn(_cmd, **kwargs):
+            captured.append(kwargs["stdout"])
+            raise OSError("spawn refused")
+        with patch("subprocess.Popen", side_effect=refuse_spawn):
+            with pytest.raises(OSError, match="spawn refused"):
+                pm._spawn_detached([], {}, tmp_path / "fail.log", tmp_path / "fail.pid")
+        assert len(captured) == 1
+        with pytest.raises(OSError):
+            os.fstat(captured[0])
+        assert not (tmp_path / "fail.pid").exists()
+
     def test_spawn_detached_passes_log_fd_as_stdout(self, pm, tmp_path):
         """Popen must receive an integer fd for stdout (not PIPE, not
         a file object) so the kernel handles writes directly. ``PIPE``

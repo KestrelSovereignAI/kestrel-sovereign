@@ -45,6 +45,9 @@ SUBPROCESS_TIMEOUT_SECONDS = 120
 
 
 @pytest.mark.parametrize("plugin_autoload", [False, True])
+# The outer suite's 60s default must not preempt this probe's own bounded 120s
+# hang guard. Coverage/branch completeness assertions remain unchanged.
+@pytest.mark.timeout(SUBPROCESS_TIMEOUT_SECONDS + 15)
 def test_xdist_worker_can_finalize_coverage_before_lingering_thread_guard(
     tmp_path, plugin_autoload
 ):
