@@ -368,30 +368,33 @@ async def _prepare_interrupted_postgres_source_backfill(
 async def test_schema_bootstrap_is_safe_under_independent_backend_contention(db_backend):
     """Fresh/additive durable and route bootstrap serializes across processes."""
 
-    peer_backend = await _independent_backend(db_backend)
-    try:
-        first = DurableSignalStore(db_backend)
-        second = DurableSignalStore(peer_backend)
-        first_routes = ChannelRouteOwnershipStore(db_backend)
-        second_routes = ChannelRouteOwnershipStore(peer_backend)
-        await asyncio.wait_for(
-            asyncio.gather(
-                first.initialize(), second.initialize(),
-                first_routes.initialize(), second_routes.initialize(),
-            ),
-            timeout=10,
-        )
-        assert await db_backend.fetch_val(
-            "SELECT COUNT(*) FROM durable_signal_event_integrity"
-        ) == 0
-        claim = await first_routes.claim(
-            channel_type="telegram",
-            canonical_route_identity=f"telegram-bot:bootstrap-{uuid4().hex}",
-            agent_id="did:test:bootstrap",
-        )
-        assert claim is not None
-    finally:
-        await peer_backend.close()
+    # Bootstrap assertions concern a fresh ledger, not unrelated receipts
+    # retained by earlier/repeated tests on the shared PostgreSQL database.
+    async with _isolated_durable_schema(db_backend) as db_backend:
+        peer_backend = await _independent_backend(db_backend)
+        try:
+            first = DurableSignalStore(db_backend)
+            second = DurableSignalStore(peer_backend)
+            first_routes = ChannelRouteOwnershipStore(db_backend)
+            second_routes = ChannelRouteOwnershipStore(peer_backend)
+            await asyncio.wait_for(
+                asyncio.gather(
+                    first.initialize(), second.initialize(),
+                    first_routes.initialize(), second_routes.initialize(),
+                ),
+                timeout=10,
+            )
+            assert await db_backend.fetch_val(
+                "SELECT COUNT(*) FROM durable_signal_event_integrity"
+            ) == 0
+            claim = await first_routes.claim(
+                channel_type="telegram",
+                canonical_route_identity=f"telegram-bot:bootstrap-{uuid4().hex}",
+                agent_id="did:test:bootstrap",
+            )
+            assert claim is not None
+        finally:
+            await peer_backend.close()
 
 
 @pytest.mark.asyncio
