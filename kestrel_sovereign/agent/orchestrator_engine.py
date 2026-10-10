@@ -61,7 +61,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     held_transition_reentry_token,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_commit_outcome, is_execution_control_error, require_execution_work
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_terminal_error, is_execution_control_error, require_execution_work
 from kestrel_sovereign.agent.streaming import (
     _DeferredToolBatchCancellation,
     _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
@@ -2443,8 +2443,12 @@ class OrchestratorEngineMixin:
                     )
                     for i, tc in enumerate(batch_tcs)
                 ]
+                primary_error = None
                 try:
                     await asyncio.gather(*children)
+                except BaseException as error:
+                    primary_error = error
+                    raise
                 finally:
                     # gather propagates its first child error without joining
                     # siblings. A batch cannot retire while those siblings
@@ -2452,19 +2456,18 @@ class OrchestratorEngineMixin:
                     for child in children:
                         if not child.done():
                             child.cancel()
-                    uncertain_error = None
+                    terminal_error = primary_error
                     for child in children:
                         outcome = await await_owned_task(child)
-                        if outcome.error is not None:
-                            commit_outcome = execution_commit_outcome(outcome.error)
-                            if commit_outcome is not None and (
-                                uncertain_error is None or commit_outcome == "unknown"
-                            ):
-                                uncertain_error = outcome.error
-                    if uncertain_error is not None:
-                        # The first ordinary failure does not erase a sibling's
-                        # irreversible outcome observed while draining it.
-                        raise uncertain_error
+                        terminal_error = execution_terminal_error(
+                            terminal_error, outcome.error, outcome.cancellation,
+                        )
+                    if terminal_error is not None:
+                        # Join every child, then apply the canonical control
+                        # precedence to the original error AND late outcomes.
+                        # Authority denial is control too, not only commit
+                        # uncertainty; it must never become an acknowledged Stop.
+                        raise terminal_error
 
                 # Append results in original request order
                 for i in range(len(batch_tcs)):

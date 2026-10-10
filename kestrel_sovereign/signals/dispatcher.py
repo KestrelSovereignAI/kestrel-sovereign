@@ -2588,10 +2588,7 @@ class SignalDispatcher:
         # public durable operation: public work is closed, but the retained
         # task's exact owner must remain non-reclaimable while it can act.
         async with self._runtime_owner_fence_lock:
-            await self._durable_store.heartbeat_runtime_owner(
-                agent_id=self._agent.did,
-                owner_id=self._durable_delivery_owner,
-            )
+            await self._retain_runtime_owner_cleanup_liveness()
         self._schedule_runtime_owner_heartbeat()
         await self._release_runtime_owner_after_shutdown(mark_owner_stopped=False)
         if (
@@ -2856,7 +2853,7 @@ class SignalDispatcher:
         """A timer belongs to its existing runtime, never an ingress turn."""
         from contextvars import copy_context
 
-        if self._retained_cognition_control_debt:
+        if self._retained_cognition_control_debt or self.durable_shutdown_owner_fenced:
             # Do not manufacture live work admission for cleanup metadata.
             # The heartbeat's debt branch permits only the fixed native CAS.
             return copy_context()
@@ -2919,15 +2916,27 @@ class SignalDispatcher:
         self._runtime_owner_heartbeat_task = task
         task.add_done_callback(self._finish_runtime_owner_heartbeat)
 
+    async def _retain_runtime_owner_cleanup_liveness(self) -> None:
+        """Refresh only the already-owned shutdown/terminalization metadata."""
+        if self._durable_store.backend.backend_type == "postgres":
+            # False means the original live owner no longer has a leased
+            # cognition. Never insert or revive it to manufacture protection.
+            await self._durable_store.backend.retain_cognition_cleanup_owner(
+                agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
+            )
+        else:
+            await self._durable_store.heartbeat_runtime_owner(
+                agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
+            )
+
     async def _heartbeat_runtime_owner(self) -> None:
-        if self._retained_cognition_control_debt and self._durable_store.backend.backend_type == "postgres":
+        if self._retained_cognition_control_debt or self.durable_shutdown_owner_fenced:
             # Irreversible runtime denial also denies ordinary metadata SQL.
             # Keep only the existing managed owner's cleanup liveness; this
             # fixed path cannot revive a stopped owner or admit cognition.
             async with self._runtime_owner_fence_lock:
-                await self._durable_store.backend.retain_cognition_cleanup_owner(
-                    agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
-                )
+                if self._retained_cognition_control_debt or self.durable_shutdown_owner_fenced:
+                    await self._retain_runtime_owner_cleanup_liveness()
             return
         # The timer can have queued this coroutine immediately before
         # shutdown flips the lifecycle state.  Take the same admission as
@@ -2941,10 +2950,7 @@ class SignalDispatcher:
             async with self._runtime_owner_fence_lock:
                 if not self.durable_shutdown_owner_fenced:
                     return
-                await self._durable_store.heartbeat_runtime_owner(
-                    agent_id=self._agent.did,
-                    owner_id=self._durable_delivery_owner,
-                )
+                await self._retain_runtime_owner_cleanup_liveness()
             return
 
         async with self._admit_durable_operation():

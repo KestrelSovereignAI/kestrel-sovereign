@@ -94,6 +94,11 @@ and irreversible commit evidence. Completed-effect checkpoint failure likewise
 selects terminal evidence across the turn and checkpoint instead of making an
 ordinary turn failure retryable.
 
+Parallel tool joins select terminal evidence across the original error and
+every joined sibling, including a late pure authority denial behind an ordinary
+cancellation. Both ordinary and streaming request cleanup classify that control
+carrier as ABANDONED, not an acknowledged Stop.
+
 Concurrent discovery owns each lazy child: control failure cancels and joins
 all siblings before choosing terminal evidence, including late uncertain commits.
 Tolerant discovery returns only ordinary failures as values. Catalog worker
@@ -197,6 +202,13 @@ managed owner that still holds a leased cognition, under the canonical recovery
 serialization key; it cannot insert or revive an owner or authorize ordinary
 work. This is live-process debt ownership, not a new guarantee of durable
 terminal evidence while PostgreSQL is unreachable or after process loss.
+Runtime retirement also retains fixed original-backend cleanup for unactivated
+initial reservations and exact original raw-handoff owner/token compensation.
+It cannot create an owner, transfer a lease, clear a successor's token, or admit
+general SQL. Idle shutdown can stop its existing owner and close storage after
+ordinary authority has retired. Cancellation-resistant cognition instead keeps
+the original owner live through cleanup-only heartbeat/re-arm until its owned
+work is joined; only then is that owner marked stopped.
 Ordinary idempotent cognition retains its documented at-least-once
 crash recovery contract; these explicit control outcomes require reconciliation.
 Assistant persistence, response audits (including their hook manager), and

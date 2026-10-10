@@ -25,7 +25,7 @@ from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     bind_execution_cleanup, bind_execution_runtime, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
-    execution_commit_outcome, execution_terminal_error, is_execution_control_error,
+    execution_terminal_error, is_execution_control_error,
 )
 from kestrel_sovereign.auth import (
     caller_context_binding_scope,
@@ -428,10 +428,10 @@ def bind_async_invocation(
 
                 async def preserve_failed_effects(error: BaseException) -> None:
                     nonlocal cleanup_abandoned
-                    if execution_commit_outcome(error) is not None:
-                        # An uncertain/committed write can raise before a tool
-                        # returns and marks completion. Retain its exact Stop
-                        # identity; absence of a return is not rollback proof.
+                    if is_execution_control_error(error):
+                        # Authority/commit control can arrive during owned
+                        # cleanup, before a tool marks completion. Retain the
+                        # exact lifecycle identity without acknowledging Stop.
                         cleanup_abandoned = True
                         return
                     state = _current_effect_checkpoint.get()
@@ -868,7 +868,7 @@ def bind_async_generator_invocation(
                 finally:
                     active_error = sys.exception()
                     source_close_error = None
-                    if active_error is not None and execution_commit_outcome(active_error) is not None:
+                    if active_error is not None and is_execution_control_error(active_error):
                         cleanup_abandoned = True
                     try:
                         with _exact_invocation_scope(
@@ -882,7 +882,7 @@ def bind_async_generator_invocation(
                                     await close_iterator()
                             except BaseException as close_error:
                                 source_close_error = close_error
-                                if execution_commit_outcome(close_error) is not None:
+                                if is_execution_control_error(close_error):
                                     cleanup_abandoned = True
                                 raise
                             finally:

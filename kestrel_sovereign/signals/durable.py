@@ -4467,6 +4467,11 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("owner_id", owner_id)
         now = _as_utc(now or self.now_utc())
+        if self.is_postgres:
+            return await self._backend.release_initial_reservations(
+                agent_id=agent_id, owner_id=owner_id, now=now,
+                mark_owner_stopped=mark_owner_stopped,
+            )
         async with self._backend.transaction():
             await self._lock_runtime_owner_scope(agent_id=agent_id)
             released = await self._backend.execute(
@@ -4531,6 +4536,11 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("owner_id", owner_id)
         self._require_nonempty("reservation_token", reservation_token)
         now = _as_utc(now or self.now_utc())
+        if self.is_postgres:
+            return await self._backend.abandon_initial_reservation(
+                agent_id=agent_id, consumer_id=consumer_id, delivery_id=delivery_id,
+                owner_id=owner_id, reservation_token=reservation_token, now=now, reason=reason,
+            )
         async with self._backend.transaction():
             released = await self._backend.execute(
                 f"""

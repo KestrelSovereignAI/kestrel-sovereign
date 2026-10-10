@@ -1362,6 +1362,88 @@ class PostgresBackend(DatabaseBackend):
                     connection, generation_id, owner_id, disposition,
                 )
 
+    async def release_initial_reservations(
+        self, *, agent_id: str, owner_id: str, now: datetime,
+        mark_owner_stopped: bool,
+    ) -> int:
+        """Retire one existing runtime owner without reopening ordinary work.
+
+        Fixed cleanup SQL on the original connected backend: no new owner,
+        lease, claim, provider cursor or arbitrary executor is exposed. The
+        same tenant-wide lock serializes this with canonical recovery.
+        """
+        from kestrel_sovereign.signals.durable import DurableSignalStore
+
+        if any(type(value) is not str or not value.strip() for value in (agent_id, owner_id)):
+            raise ValueError("runtime cleanup requires exact owner identities")
+        if type(mark_owner_stopped) is not bool or not isinstance(now, datetime) or now.tzinfo is None:
+            raise ValueError("runtime cleanup requires a typed disposition and UTC timestamp")
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("runtime cleanup requires the original backend")
+        async with asyncio.timeout(5):
+            async with pool.acquire() as connection:
+                async with connection.transaction():
+                    await connection.fetchval(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        DurableSignalStore.runtime_owner_lock_key(agent_id),
+                    )
+                    existing = await connection.fetchval(
+                        f"SELECT 1 FROM {DurableSignalStore.RUNTIME_OWNERS} "
+                        "WHERE agent_id=$1 AND owner_id=$2 FOR UPDATE",
+                        agent_id, owner_id,
+                    )
+                    if existing is None:
+                        return 0
+                    released = await connection.execute(
+                        f"UPDATE {DurableSignalStore.DELIVERIES} "
+                        "SET status='retry', lease_owner=NULL, lease_token=NULL, "
+                        "lease_expires_at=NULL, next_attempt_at=$3, "
+                        "last_error='initial reservation owner stopped before activation', "
+                        "updated_at=$3 WHERE agent_id=$1 AND lease_owner=$2 "
+                        "AND status='initial_reserved'",
+                        agent_id, owner_id, now,
+                    )
+                    if mark_owner_stopped:
+                        await connection.execute(
+                            f"UPDATE {DurableSignalStore.RUNTIME_OWNERS} "
+                            "SET heartbeat_at=GREATEST(heartbeat_at,$3), "
+                            "stopped_at=COALESCE(stopped_at,$3), updated_at=$3 "
+                            "WHERE agent_id=$1 AND owner_id=$2",
+                            agent_id, owner_id, now,
+                        )
+                    return int(released.rsplit(" ", 1)[-1])
+
+    async def abandon_initial_reservation(
+        self, *, agent_id: str, consumer_id: str, delivery_id: str,
+        owner_id: str, reservation_token: str, now: datetime, reason: str,
+    ) -> bool:
+        """Repair only an existing original raw-handoff owner/token CAS."""
+        from kestrel_sovereign.signals.durable import DurableSignalStore
+
+        identities = (agent_id, consumer_id, delivery_id, owner_id, reservation_token)
+        if any(type(value) is not str or not value.strip() for value in identities):
+            raise ValueError("initial reservation cleanup requires exact identities")
+        if not isinstance(reason, str):
+            raise ValueError("initial reservation cleanup requires a string reason")
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise ValueError("initial reservation cleanup requires a UTC timestamp")
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("initial reservation cleanup requires the original backend")
+        async with asyncio.timeout(5):
+            async with pool.acquire() as connection:
+                result = await connection.execute(
+                    f"UPDATE {DurableSignalStore.DELIVERIES} "
+                    "SET status='retry', lease_owner=NULL, lease_token=NULL, "
+                    "lease_expires_at=NULL, next_attempt_at=$6, last_error=$7, "
+                    "updated_at=$6 WHERE agent_id=$1 AND consumer_id=$2 "
+                    "AND delivery_id=$3 AND lease_owner=$4 AND lease_token=$5 "
+                    "AND status IN ('initial_reserved','leased')",
+                    agent_id, consumer_id, delivery_id, owner_id, reservation_token, now, reason,
+                )
+                return result == "UPDATE 1"
+
     async def retain_cognition_cleanup_owner(self, *, agent_id: str, owner_id: str) -> bool:
         """Retain only an existing live managed owner with a leased cognition.
 
