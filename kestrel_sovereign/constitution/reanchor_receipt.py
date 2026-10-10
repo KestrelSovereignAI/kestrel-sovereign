@@ -43,7 +43,7 @@ MAX_REANCHOR_RECEIPT_HISTORY = 128
 
 def _receipt_hash(value: Any, field: str) -> None:
     if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
-        raise ValueError(f"Malformed historical governance reanchor receipt {field}; existing evidence is preserved")
+        raise ValueError(f"Malformed or unreadable historical governance reanchor receipt {field}; existing evidence is preserved")
 
 
 def validate_constitution_reanchor_receipt(receipt: Any) -> None:
@@ -53,7 +53,7 @@ def validate_constitution_reanchor_receipt(receipt: Any) -> None:
     than fabricating signatures; an optional hash must nevertheless be valid.
     """
     if not isinstance(receipt, Mapping):
-        raise ValueError("Malformed historical governance reanchor receipt; existing evidence is preserved")
+        raise ValueError("Malformed or unreadable historical governance reanchor receipt; existing evidence is preserved")
     _receipt_hash(receipt.get("new_hash"), "new_hash")
     # Offline first-anchor receipts use None; runtime uses the literal none.
     # Both describe absence, never a substitute destination hash.
@@ -67,10 +67,10 @@ def validate_constitution_reanchor_evidence(properties: Mapping[str, Any], *, su
     """One admission rule for complete current/history reads and both writers."""
     history = properties.get(CONSTITUTION_REANCHOR_HISTORY_KEY, [])
     if not isinstance(history, list) or len(history) > MAX_REANCHOR_RECEIPT_HISTORY:
-        raise ValueError("Malformed or unbounded historical governance reanchor history; existing evidence is preserved")
+        raise ValueError("Malformed, unbounded or unreadable historical governance reanchor history; existing evidence is preserved")
     for entry in history:
         if not isinstance(entry, Mapping):
-            raise ValueError("Malformed historical governance reanchor history entry; existing evidence is preserved")
+            raise ValueError("Malformed or unreadable historical governance reanchor history entry; existing evidence is preserved")
         validate_constitution_reanchor_receipt(entry.get("receipt"))
         _receipt_hash(entry.get("superseded_by_constitution_hash"), "superseded_by_constitution_hash")
         if "superseded_by_artifact_hash" in entry:
