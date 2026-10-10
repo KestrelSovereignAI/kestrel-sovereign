@@ -426,9 +426,10 @@ class SQLiteBackend(DatabaseBackend):
         self._cancelled_write_drain_started_at: Optional[float] = None
         self._cancelled_write_drain_error: Optional[Exception] = None
         # A cancelled shared-connection read skips its inline cursor close, so
-        # its statement can stay active. The drain closes the ones still alive
-        # when that statement aborts its rollback. Weak, so recording a cursor
-        # never extends its statement's life.
+        # its statement can stay active and keep the drain's interrupt armed.
+        # Every drain closes the ones still alive, before it retires its fence
+        # and before retrying a rollback such a statement aborted. Weak, so
+        # recording a cursor never extends its statement's life.
         self._abandoned_read_cursors: weakref.WeakSet[aiosqlite.Cursor] = (
             weakref.WeakSet()
         )
@@ -1078,7 +1079,8 @@ class SQLiteBackend(DatabaseBackend):
     async def _drain_cancelled_write(
         self, conn: aiosqlite.Connection, *, started_at: float
     ) -> None:
-        """Interrupt and roll back one cancelled operation, then retire its fence."""
+        """Interrupt and roll back one cancelled operation, release the
+        statements cancelled reads abandoned, then retire its fence."""
         this_task = asyncio.current_task()
         try:
             try:
@@ -1123,7 +1125,8 @@ class SQLiteBackend(DatabaseBackend):
     async def _rollback_cancelled_write(
         self, conn: aiosqlite.Connection, *, started_at: float
     ) -> None:
-        """Roll back for the drain, retrying a rollback its interrupt aborted.
+        """Roll back for the drain and release the statements cancelled reads
+        abandoned, retrying until both converge.
 
         ``sqlite3_interrupt()`` also interrupts every statement started before
         the connection's active-statement count reaches zero, so a ROLLBACK
@@ -1132,25 +1135,43 @@ class SQLiteBackend(DatabaseBackend):
         failure: release the abandoned statements and retry within the drain
         deadline. Any other failure, an interrupt while ``close`` owns the
         connection, or a rollback still interrupted at the deadline raises.
+
+        Outside a transaction the rollback runs no statement, so it cannot
+        clear the interrupt while an abandoned statement is active, and the
+        next write's BEGIN would fail ``interrupted`` (#3508). The release
+        therefore also follows a successful rollback, and the drain converges
+        only once every recorded cursor has closed. A close still failing at
+        the deadline, or once ``close`` owns the connection, raises.
         """
         retry_delay = _CANCELLED_WRITE_ROLLBACK_RETRY_INITIAL_S
+        rolled_back = False
         while True:
-            try:
-                await conn.rollback()
-                return
-            except sqlite3.OperationalError as exc:
+            if not rolled_back:
+                try:
+                    await conn.rollback()
+                except sqlite3.OperationalError as exc:
+                    if (
+                        not _is_sqlite_interrupt(exc)
+                        or self._closing
+                        or self._cancelled_write_drain_remaining(started_at) <= 0
+                    ):
+                        raise
+                    logger.debug(
+                        "SQLite cancellation rollback for %s was interrupted by "
+                        "its drain; retrying after releasing abandoned statements",
+                        self.db_path,
+                    )
+                else:
+                    rolled_back = True
+            close_failure = await self._release_abandoned_statements(conn)
+            if rolled_back:
+                if close_failure is None:
+                    return
                 if (
-                    not _is_sqlite_interrupt(exc)
-                    or self._closing
+                    self._closing
                     or self._cancelled_write_drain_remaining(started_at) <= 0
                 ):
-                    raise
-            logger.debug(
-                "SQLite cancellation rollback for %s was interrupted by its "
-                "drain; retrying after releasing abandoned statements",
-                self.db_path,
-            )
-            await self._release_abandoned_statements(conn)
+                    raise close_failure
             await asyncio.sleep(
                 min(
                     retry_delay,
@@ -1170,21 +1191,36 @@ class SQLiteBackend(DatabaseBackend):
 
     async def _release_abandoned_statements(
         self, conn: aiosqlite.Connection
-    ) -> None:
+    ) -> Optional[Exception]:
         """Reset the statements cancelled reads left active on ``conn``.
 
-        Closes the abandoned read cursors still alive. A read cancelled while
-        its ``execute`` was in flight never received its cursor, and
-        aiosqlite's worker keeps the last result it produced (that cursor)
-        until it completes another operation. Opening and closing a cursor
-        completes one, which releases it.
+        Closes the abandoned read cursors still alive. Closing one already
+        closed is a no-op, and a collected one has left the weak record. A
+        cursor whose close fails stays recorded for the next release to
+        retry, and the last such failure is returned; ``None`` means every
+        recorded cursor closed. A read cancelled while its ``execute`` was in
+        flight never received its cursor, and aiosqlite's worker keeps the
+        last result it produced (that cursor) until it completes another
+        operation. Opening and closing a cursor completes one, which releases
+        it.
         """
-        abandoned = list(self._abandoned_read_cursors)
-        self._abandoned_read_cursors.clear()
-        for cursor in abandoned:
-            await cursor.close()
+        close_failure: Optional[Exception] = None
+        for cursor in list(self._abandoned_read_cursors):
+            try:
+                await cursor.close()
+            except (sqlite3.Error, ValueError) as exc:
+                close_failure = exc
+                logger.warning(
+                    "Could not close a cursor a cancelled read abandoned on "
+                    "%s; it stays recorded for the drain to retry",
+                    self.db_path,
+                    exc_info=True,
+                )
+            else:
+                self._abandoned_read_cursors.discard(cursor)
         released = await conn.cursor()
         await released.close()
+        return close_failure
 
     async def _rollback_after_failure(
         self, conn: aiosqlite.Connection
