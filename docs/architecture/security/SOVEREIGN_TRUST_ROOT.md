@@ -191,7 +191,16 @@ An existing or consumed deterministic identity is refused with its original
 state/history intact. Active or archived key names are also prior-identity
 evidence: a fresh database after another forced birth is not authority to reuse
 an older identity slug. Use authorized recovery for that identity, or a genuinely
-new identity namespace for a new birth.
+new identity namespace for a new birth. Archived databases remain authoritative
+independently of key filenames: native cold reads check their identity and
+lifetime rows without schema writes, and refuse linked, raced, incomplete or
+unreadable evidence. More than 128 archived databases requires authorized
+recovery; inception never discards old authority to fit an inspection bound.
+Creation holds a nonblocking cross-process output-directory lock throughout
+admission, archival, publication and cleanup. Its lock inode is retained after
+release (process death releases the OS lock). An owned database is exclusively
+created before SQLite opens it; failure cleanup refuses replacement/shared
+inodes and never overwrites a database through a following pathname.
 
 Genesis receipt history has one shared publication/runtime limit of 128 entries.
 A repair requiring a 129th entry, or encountering already-overflowed or malformed

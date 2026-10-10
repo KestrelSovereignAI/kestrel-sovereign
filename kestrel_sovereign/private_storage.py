@@ -22,8 +22,8 @@ class PrivateStorageError(RuntimeError):
     """Sensitive local storage cannot be opened with exclusive custody."""
 
 
-def _lock_private_file_descriptor(descriptor: int) -> Any:
-    """Take one blocking cross-process exclusive lock."""
+def _lock_private_file_descriptor(descriptor: int, *, blocking: bool = True) -> Any:
+    """Take one cross-process exclusive lock, optionally refusing contention."""
 
     if os.name == "nt":  # pragma: no cover - exercised on Windows CI
         import ctypes
@@ -43,7 +43,7 @@ def _lock_private_file_descriptor(descriptor: int) -> Any:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         if not kernel32.LockFileEx(
             wintypes.HANDLE(msvcrt.get_osfhandle(descriptor)),
-            0x00000002,  # LOCKFILE_EXCLUSIVE_LOCK
+            0x00000002 | (0 if blocking else 0x00000001),
             0,
             1,
             0,
@@ -54,7 +54,7 @@ def _lock_private_file_descriptor(descriptor: int) -> Any:
 
     import fcntl
 
-    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
     return None
 
 
@@ -288,6 +288,7 @@ def exclusive_private_file_lock(
     path: Path,
     *,
     label: str = "storage",
+    blocking: bool = True,
 ) -> Iterator[None]:
     """Serialize one private-file protocol across processes.
 
@@ -303,7 +304,7 @@ def exclusive_private_file_lock(
         label=f"{label} lock",
     )
     try:
-        token = _lock_private_file_descriptor(descriptor)
+        token = _lock_private_file_descriptor(descriptor, blocking=blocking)
     except OSError as exc:
         os.close(descriptor)
         raise PrivateStorageError(

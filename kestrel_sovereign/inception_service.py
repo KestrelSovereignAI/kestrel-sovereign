@@ -450,23 +450,80 @@ def backup_or_refuse_existing_identity(
         logging.warning("Backed up existing %s → %s before re-inception.", p, backup)
 
 
-async def _assert_fresh_inception_lifetime(db, identity: str) -> None:
+async def _assert_fresh_inception_lifetime(db, identity: str, *, retain: bool = True) -> None:
     """Check physical identity and lifetime under the caller's graph custody."""
     if await db.fetchone("SELECT node_id FROM graph_nodes WHERE node_id=?", (identity,)) is not None:
         raise ValueError("Inception refuses an existing identity; use authorized recovery")
-    if db.backend_type == "postgres":
+    if retain and db.backend_type == "postgres":
         await db.fetchone(
             "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ?, 0))",
             (":constitution_runtime_lifetime:" + identity,),
         )
     from kestrel_sovereign.identity.birth_record import assert_birth_replay_custody
 
-    await assert_birth_replay_custody(db, identity, retain=True)
+    await assert_birth_replay_custody(db, identity, retain=retain)
     for table in ("constitution_runtime_state", "constitution_runtime_events"):
         if await db.table_exists(table) and await db.fetchone(
             f"SELECT agent_id FROM {table} WHERE agent_id=? LIMIT 1", (identity,),
         ) is not None:
             raise ValueError("Inception refuses an existing constitutional lifetime; use authorized recovery")
+
+
+async def _assert_archived_inception_lifetimes(output_dir: Path, identity: str) -> None:
+    """Retained databases remain authority even when every old key is absent.
+
+    Inspect native evidence read-only, without schema changes or new sidecars.
+    Bound archive opens; ambiguous, raced, linked or incomplete evidence refuses
+    inception rather than silently forgetting a constitutional lifetime.
+    """
+    import stat
+
+    async def retain_schema(_db):
+        pass
+
+    paths = []
+    with os.scandir(output_dir) as entries:
+        for entry in entries:
+            if not entry.name.startswith("kestrel_prime.db.backup-"):
+                continue
+            paths.append(Path(entry.path))
+            if len(paths) > 128:
+                raise ValueError("Inception archive evidence exceeds the inspection bound; use authorized recovery")
+    for path in sorted(paths):
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("Inception archive evidence is not an exclusively retained regular database")
+        stamp = path.name.removeprefix("kestrel_prime.db.backup-")
+        # Older force backups renamed WAL/SHM before the stamp, so SQLite
+        # cannot discover them beside the archived DB. Never ignore them.
+        for suffix in ("-wal", "-shm"):
+            if os.path.lexists(output_dir / f"kestrel_prime.db{suffix}.backup-{stamp}"):
+                raise ValueError("Inception archive has uncheckpointed sidecar evidence; use authorized recovery")
+        archive = await AsyncDatabase.sqlite(str(path), schema_initializer=retain_schema, cold_read=True)
+        try:
+            await _assert_fresh_inception_lifetime(archive, identity, retain=False)
+            archive._backend.assert_cold_read_still_valid()
+            after = path.lstat()
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                raise ValueError("Inception archive evidence changed while inspected; use authorized recovery")
+        finally:
+            await archive.close()
+
+
+def _cleanup_owned_inception_database(path: str, owner: tuple[int, int]) -> None:
+    """Never erase a replacement database merely because its pathname matches."""
+    import stat
+
+    try:
+        current = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 or (current.st_dev, current.st_ino) != owner:
+        raise RuntimeError("Inception database cleanup lost exclusive creation ownership; retained for recovery")
+    # This is the attempt's public birth-record database, not a plaintext
+    # private key. Unlink instead of secure_delete's path-following overwrite
+    # so a raced replacement can never have its bytes overwritten by cleanup.
+    os.unlink(path)
 
 
 def _refuse_previous_identity_namespace(output_dir: Path, slug: str) -> None:
@@ -789,524 +846,558 @@ async def create_kestrel_identity_async(
 
         deterministic_did = build_did(domain, [slug])
 
-    # Determine if we're using external database or creating SQLite
-    using_external_db = database is not None
-    db_path = None
+    # Creation custody covers existence checks, archive inspection, minting,
+    # publication and cleanup. It is an OS lock, not an expiring sentinel;
+    # another creator fails immediately and never opens or cleans this DB.
+    from kestrel_sovereign.private_storage import exclusive_private_file_lock
 
-    if using_external_db:
-        # Use provided database (e.g., PostgreSQL from multi-tenant platform)
-        db = database
-        logger.info("Using externally provided database (PostgreSQL mode)")
-        # Still need output_dir for key files
-        if output_dir is None:
-            from kestrel_sovereign.storage import get_default_agent_data_dir
-            output_dir = get_default_agent_data_dir()
-        os.makedirs(output_dir, exist_ok=True)
-    else:
-        # Default SQLite mode - create new database
-        if output_dir is None:
-            from kestrel_sovereign.storage import get_default_agent_data_dir
-            output_dir = get_default_agent_data_dir()
-        db_path = os.path.join(output_dir, "kestrel_prime.db")
-        if os.path.exists(db_path):
-            # Don't silently destroy an existing agent's memory (#1725). Refuse
-            # unless force=True; the CLI surfaces this as a FileExistsError that
-            # tells the operator to pass --force. With force, back the DB up
-            # (and its WAL/SHM sidecars) before removing so the overwrite is
-            # recoverable.
-            if not force:
-                raise FileExistsError(
-                    f"An agent database already exists at {db_path}. Refusing to "
-                    f"overwrite it."
-                )
-            if method == IDENTITY_METHOD_DID_WEB:
-                # Inspect the ORIGINAL authority before moving any DB/WAL/key
-                # artifact. Opening it must not initialize/migrate its schema.
-                async def retain_schema(_db):
-                    pass
+    if output_dir is None:
+        from kestrel_sovereign.storage import get_default_agent_data_dir
+        output_dir = get_default_agent_data_dir()
 
-                original = await AsyncDatabase.sqlite(db_path, schema_initializer=retain_schema)
-                try:
-                    async with original.transaction(immediate=True):
-                        await _assert_fresh_inception_lifetime(original, deterministic_did)
-                        _refuse_previous_identity_namespace(Path(output_dir), slug)
-                finally:
-                    await original.close()
-            import shutil
-            import time
-            import uuid
-            # Unique stamp (sub-second-safe): a same-second second --force must
-            # NOT clobber the prior backup — that would defeat recoverability.
-            stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:8]
-            for suffix in ("", "-wal", "-shm"):
-                src = db_path + suffix
-                if os.path.exists(src):
-                    backup = f"{src}.backup-{stamp}"
-                    shutil.move(src, backup)
-                    logger.warning("Backed up existing %s → %s before overwrite.", src, backup)
-        os.makedirs(output_dir, exist_ok=True)
+    async def publish_owned_attempt():
+        nonlocal output_dir
+        # Determine if we're using external database or creating SQLite
+        using_external_db = database is not None
+        db_path = None
+        db_owner = None
 
-        # Initialize SQLite database
-        db = await AsyncDatabase.sqlite(db_path)
-        logger.info(f"Created SQLite database at {db_path}")
-    files = AsyncFileStore(db)
-    graph = AsyncGraphStore(db)
-
-    if method == IDENTITY_METHOD_DID_WEB:
-        # This early probe avoids minting over a known identity. The final
-        # locked check below is still authoritative after provider awaits.
-        try:
-            async with db.transaction(immediate=True):
-                await graph.lock_nodes_for_update([deterministic_did])
-                await _assert_fresh_inception_lifetime(db, deterministic_did)
-        except BaseException:
-            if not using_external_db:
-                await db.close()
-                cleanup_artifacts([db_path])
-            raise
-
-    # 1+2. Generate cryptographic identity and persist it.
-    # Default (#2397): born-hybrid did:web (Ed25519 + ML-DSA-65).
-    # Explicit opt-out: identity_method="did:pkh" (classical secp256k1).
-    # Method / domain / slug were resolved and validated pre-DB above.
-    identity_paths: list[Path]
-    identity_stage_dir = None
-    staged_identity_paths = []
-
-    if method == IDENTITY_METHOD_DID_WEB:
-        try:
-            import tempfile
-
-            _refuse_previous_identity_namespace(Path(output_dir), slug)
-            identity_stage_dir = Path(tempfile.mkdtemp(prefix=".inception-", dir=output_dir))
-            # A malformed domain (scheme, port, path) raises in here —
-            # keep it inside the cleanup path so a failed mint never
-            # leaves a half-created database behind.
-            did_document, hybrid_identity, archival_kp = generate_born_hybrid_identity(
-                domain, slug,
-            )
-            agent_did = did_document["id"]
-            if parent_did:
-                did_document["controller"] = parent_did
-                logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
-            else:
-                logging.info(f"Generated DID: {agent_did}")
-            staged_identity_paths = _born_hybrid_identity_paths(identity_stage_dir, slug)
-            identity_paths = save_born_hybrid_identity(
-                did_document, hybrid_identity, archival_kp, slug, identity_stage_dir,
-            )
-        except BaseException:
-            _discard_identity_staging(identity_stage_dir, staged_identity_paths)
-            if not using_external_db:
-                await db.close()
-                cleanup_artifacts([db_path])
-            raise
-        logging.info(f"Saved born-hybrid keys ({slug}_*) to {output_dir}")
-    else:
-        try:
-            did_document, keys = generate_kestrel_identity()
-            agent_did = did_document["id"]
-            if parent_did:
-                did_document["controller"] = parent_did
-                logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
-            else:
-                logging.info(f"Generated DID: {agent_did}")
-            key_id = f"kestrel_{keys['address']}"
-            import tempfile
-
-            identity_stage_dir = Path(tempfile.mkdtemp(prefix=".inception-", dir=output_dir))
-            # Name every possible partial artifact before the writer begins.
-            staged_identity_paths = [identity_stage_dir / f"{key_id}{suffix}"
-                                     for suffix in (".key.enc", ".pem", ".json")]
-            save_kestrel_identity(did_document, keys, key_id, identity_stage_dir)
-            identity_paths = [p for p in staged_identity_paths if p.exists()]
-        except BaseException:
-            _discard_identity_staging(identity_stage_dir, staged_identity_paths)
-            if not using_external_db:
-                await db.close()
-                cleanup_artifacts([db_path])
-            raise
-
-    # Every graph row written during inception belongs to this newly minted
-    # agent.  Bind before the shared/content-addressed constitution node is
-    # created so both that node and the governed_by edge receive durable
-    # ownership witnesses (#2649).
-    # 3. Anchor the Kestrel Constitution as the first document
-    governing_source = None
-    try:
-        graph.bind_agent(agent_did)
-        files.bind_agent(agent_did)
-        # Which source governs is decided by out-of-DB configuration only: the
-        # packaged default, or a Sovereign-signed source descriptor verified
-        # against the operator-pinned trust root (#2553). The bytes then come
-        # from the SINGLE production resolver (#2463), so inception anchors
-        # exactly what verification later recomputes.
-        from kestrel_sovereign.constitution.resolver import (
-            is_authoritative_governing_source,
-            resolve_governing_constitution_bytes,
-            resolve_governing_source,
-        )
-        governing_source = resolve_governing_source(
-            descriptor_path=constitution_source_descriptor_path,
-            trust_root_path=sovereign_trust_root_path,
-            agent_dids={agent_did},
-        )
-        if constitution_path is not None:
-            # A missing explicit path surfaces as FileNotFoundError first.
-            os.stat(constitution_path)
-            # REFUSE unsigned overrides (#2463 review, #2553). The periodic
-            # integrity audit recomputes from the resolved governing source;
-            # anchoring bytes from any OTHER path (e.g. the docs copy with OKF
-            # frontmatter) would incept an agent guaranteed to fail its next
-            # audit and Safe-Mode. A custom governing source is expressed by a
-            # Sovereign-signed source descriptor, never by a bare path.
-            if not is_authoritative_governing_source(
-                constitution_path, governing_source
-            ):
-                raise ValueError(
-                    f"Refusing to incept from non-authoritative constitution "
-                    f"source {constitution_path!r}: the periodic integrity "
-                    f"audit recomputes the governing hash from the "
-                    f"{governing_source.kind} source {governing_source.path!r}, "
-                    f"so an agent anchored elsewhere is guaranteed to fail its "
-                    f"next audit and enter Safe Mode. Omit constitution_path, "
-                    f"or configure a Sovereign-signed constitution source "
-                    f"descriptor naming this file (#2553)."
-                )
-        constitution_content = resolve_governing_constitution_bytes(
-            emancipation_contract,
-            source=governing_source,
-        )
-        if emancipation_contract is not None and emancipation_contract.enabled:
-            logging.info(
-                "Amendment VIII activated for this agent — anchoring "
-                "Sovereign-authored Emancipation Contract."
-            )
-
-        # Genesis audit lifecycle (#2470). Evaluate the exact bytes returned by
-        # the one governing resolver (#2463), before any constitution or graph
-        # row is committed. A level-3 result or attempted-auditor failure falls
-        # through the existing inception cleanup, so no key or local database
-        # survives. Lazy/programmatic creation is explicit: it records pending
-        # and the runtime must complete the audit before first cognition.
-        from kestrel_sovereign.constitution.genesis_audit import (
-            defer_test_genesis_audit,
-            evaluate_genesis_constitution,
-            pending_genesis_audit,
-        )
-
-        defer_test_audit = defer_test_genesis_audit(
-            is_test_instance, auditor=genesis_auditor
-        )
-
-        if genesis_audit_provenance:
-            audit_provenance = genesis_audit_provenance
-        elif genesis_auditor is not None and is_test_instance:
-            audit_provenance = "test:injected_auditor"
-        elif genesis_auditor is not None and is_demo:
-            audit_provenance = "demo:injected_auditor"
-        elif genesis_auditor is not None:
-            audit_provenance = "inception:configured_llm"
+        # Retained local authority is not bypassable by switching this call to
+        # an externally supplied (otherwise empty) database either.
+        if method == IDENTITY_METHOD_DID_WEB:
+            await _assert_archived_inception_lifetimes(Path(output_dir), deterministic_did)
+        if using_external_db:
+            # Use provided database (e.g., PostgreSQL from multi-tenant platform)
+            db = database
+            logger.info("Using externally provided database (PostgreSQL mode)")
         else:
-            audit_provenance = "inception:deferred_no_auditor"
+            # Default SQLite mode - create new database
+            db_path = os.path.join(output_dir, "kestrel_prime.db")
+            if os.path.lexists(db_path):
+                import stat
 
-        import hashlib
+                retained = os.lstat(db_path)
+                if not stat.S_ISREG(retained.st_mode) or retained.st_nlink != 1:
+                    raise ValueError("Inception requires an exclusively retained regular database; use authorized recovery")
+                # Don't silently destroy an existing agent's memory (#1725). Refuse
+                # unless force=True; the CLI surfaces this as a FileExistsError that
+                # tells the operator to pass --force. With force, back the DB up
+                # (and its WAL/SHM sidecars) before removing so the overwrite is
+                # recoverable.
+                if not force:
+                    raise FileExistsError(
+                        f"An agent database already exists at {db_path}. Refusing to "
+                        f"overwrite it."
+                    )
+                if method == IDENTITY_METHOD_DID_WEB:
+                    # Inspect the ORIGINAL authority before moving any DB/WAL/key
+                    # artifact. Opening it must not initialize/migrate its schema.
+                    async def retain_schema(_db):
+                        pass
 
-        governing_bytes = (
-            constitution_content
-            if isinstance(constitution_content, bytes)
-            else constitution_content.encode("utf-8")
-        )
-        expected_constitution_hash = hashlib.sha256(governing_bytes).hexdigest()
-        if genesis_auditor is None:
-            genesis_audit = pending_genesis_audit(
-                expected_constitution_hash,
-                provenance=audit_provenance,
-            )
-        else:
-            genesis_audit = await evaluate_genesis_constitution(
-                governing_bytes,
-                constitution_hash=expected_constitution_hash,
-                auditor=genesis_auditor,
-                provenance=audit_provenance,
-            )
-
-        constitution_hash = expected_constitution_hash
-        if constitution_hash != genesis_audit["constitution_hash"]:
-            raise RuntimeError(
-                "Genesis audit constitution hash did not match stored governing bytes."
-            )
-        logging.info(f"Resolved Kestrel Constitution with hash: {constitution_hash}")
-        # 4. Build the Kestrel Constitution node (keyed by content hash). Its write
-        #    is deferred to the single atomic identity commit below (#2867).
-        constitution_node = GraphNode(
-            node_id=constitution_hash,
-            node_type="document",
-            label="KESTREL_CONSTITUTION",
-            properties={
-                "hash": constitution_hash,
-                "type": "Constitution",
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }
-        )
-        # 5. Create the root "agent" node
-        agent_properties = {
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "constitution_hash": constitution_hash,
-            "initialBalance": "1000.0",
-            "name": agent_name,
-            "description": _initial_agent_description(
-                agent_name,
-                is_child=bool(parent_did),
-                emancipated=bool(
-                    emancipation_contract is not None and emancipation_contract.enabled
-                ),
-            ),
-            "bootstrap_state": "pending",  # Agent needs to complete wake-up discovery
-            "genesis_audit": genesis_audit,
-        }
-
-        # #1118: Anchor the Sovereign-authored Emancipation Contract as a JSON
-        # sidecar on the agent node. This is the structured receipt that
-        # ``kestrel constitution reanchor`` re-applies to the canonical
-        # markdown so the active form survives reanchor, and that
-        # ``check_iron_rule`` compares against any future ``[emancipation]``
-        # block to refuse retroactive narrowing. Pre-emancipation the
-        # Sovereign self-binds; the framework refuses to let them unbind.
-        if emancipation_contract is not None and emancipation_contract.enabled:
-            from kestrel_sovereign.constitution.emancipation import contract_to_json
-            agent_properties["emancipation_contract"] = contract_to_json(
-                emancipation_contract
-            )
-
-        # #2553: record which Sovereign-signed source descriptor this agent was
-        # incepted under. Audit evidence only — source selection never reads it,
-        # so rewriting it cannot change what governs the agent.
-        if governing_source.descriptor is not None:
-            agent_properties["constitution_source_receipt"] = {
-                "source_path": governing_source.path,
-                **governing_source.receipt_fields(),
-                "recorded_at": datetime.now(timezone.utc).isoformat(),
-            }
-
-        # Add test instance metadata if applicable
-        if is_test_instance:
-            agent_properties["is_test_instance"] = True
-            agent_properties["test_cycle_id"] = test_cycle_id
-            agent_properties["expected_duration"] = expected_duration or "unspecified"
-            logging.info(f"Creating TEST INSTANCE: {agent_name} (cycle: {test_cycle_id})")
-
-        # #766: mark agent as demo-scoped so server-side guardrails treat
-        # destructive ops on it as safe and refuse them on live agents.
-        if is_demo:
-            agent_properties["is_demo"] = True
-            logging.info(f"Creating DEMO AGENT: {agent_name} (destructive ops permitted)")
-
-        agent_node = GraphNode(
-            node_id=agent_did,
-            node_type="agent",
-            label=agent_name,
-            properties=agent_properties
-        )
-    except BaseException:
-        # No native publication has begun. Cancellation and synchronous
-        # construction failures have the same rollback-free cleanup boundary.
-        try:
-            if not using_external_db:
-                await db.close()
-        finally:
-            cleanup_artifacts(identity_paths if using_external_db else [*identity_paths, db_path])
-            _discard_identity_staging(identity_stage_dir, staged_identity_paths)
-        raise
-    # 4-6. Commit the constitution node, the agent node, and the governing
-    #      edge as ONE atomic unit (#2867). An agent must never be recorded as
-    #      existing without its governed_by edge: a present agent node makes
-    #      every later boot treat inception as done, so a dropped edge is never
-    #      repaired — "existing but not governed". Either all three commit or
-    #      none do. Both backends make transaction() re-entrant within this task
-    #      (SQLite: a nested transaction() in the owning task yields without a
-    #      second BEGIN; Postgres: a nested transaction() reuses this task's
-    #      connection as a savepoint, #1726), so the inner add_node/add_edge
-    #      calls join this transaction with no change to the graph store.
-    #
-    #      The span is bounded to exactly these three writes, and that is
-    #      load-bearing: step 8 indexes the constitution for RAG with
-    #      compute_embeddings=True, and on SQLite transaction() holds the
-    #      connection write lock for the whole BEGIN..COMMIT span (#1675).
-    #      Widening it across a provider round-trip or local model inference
-    #      would block every other writer on the database (#2660). RAG
-    #      indexing, the spawned_by edge, the genesis-audit event and key
-    #      provisioning are all recoverable by re-running and stay OUTSIDE it.
-    publication_body_completed = False
-    try:
-        async with db.transaction():
-            # Birth-record replication can touch the same deterministic DID and
-            # constitution hash in one composed transaction. Reserve inception's
-            # complete graph write set first so both writers acquire PostgreSQL's
-            # advisory/row locks in the same global order rather than one taking
-            # constitution→agent while the other takes agent→constitution.
-            await graph.lock_nodes_for_update(
-                [constitution_node.node_id, agent_node.node_id]
-            )
-            # Deterministic did:web is a name, not permission to replace the
-            # key material, governance or consumed lifetime of that identity.
-            # Inspect PHYSICAL roots (including foreign-owned roots) while
-            # retaining the same graph custody used by birth/recovery writers.
-            await _assert_fresh_inception_lifetime(db, agent_node.node_id)
-            from kestrel_sovereign.constitution.anchored_bytes import _store_exact_native_file
-
-            await _store_exact_native_file(db, files, governing_bytes, "KESTREL_CONSTITUTION.md")
-            await graph.add_node(constitution_node)
-            await graph.add_node(agent_node)
-            # 6. Link the agent to its constitution.
-            await graph.add_edge(
-                agent_node.node_id, constitution_node.node_id, "governed_by"
-            )
-            identity_paths = _publish_staged_identity(
-                identity_paths, Path(output_dir),
-                slug=slug if method == IDENTITY_METHOD_DID_WEB else None,
-                force=force,
-            )
-            publication_body_completed = True
-
-    except BaseException:
-        # Cancellation also rolls back native publication. A commit may have
-        # completed before an awaited connection-release error, however: do
-        # not erase the keys of an identity that actually reached the graph.
-        # An unreadable outcome is uncertainty, never permission to delete.
-        cleanup_safe = False
-        if not publication_body_completed:
+                    original = await AsyncDatabase.sqlite(db_path, schema_initializer=retain_schema)
+                    try:
+                        async with original.transaction(immediate=True):
+                            await _assert_fresh_inception_lifetime(original, deterministic_did)
+                            _refuse_previous_identity_namespace(Path(output_dir), slug)
+                    finally:
+                        await original.close()
+                latest = os.lstat(db_path)
+                if (retained.st_dev, retained.st_ino) != (latest.st_dev, latest.st_ino):
+                    raise ValueError("Inception database changed before archival; use authorized recovery")
+                import shutil
+                import time
+                import uuid
+                # Unique stamp (sub-second-safe): a same-second second --force must
+                # NOT clobber the prior backup — that would defeat recoverability.
+                stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:8]
+                for suffix in ("", "-wal", "-shm"):
+                    src = db_path + suffix
+                    if os.path.exists(src):
+                        backup = f"{src}.backup-{stamp}"
+                        shutil.move(src, backup)
+                        logger.warning("Backed up existing %s → %s before overwrite.", src, backup)
+            # Reserve this attempt's inode before any asynchronous SQLite open.
+            # Directory custody serializes all creators; O_EXCL also refuses a
+            # database installed by another actor instead of treating it as ours.
+            descriptor = os.open(db_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
             try:
-                # Native physical absence after body failure/rollback is not
-                # a tenant-filtered lookup. Once the body completes, a commit
-                # may have happened even if delivery failed and rows vanished.
-                cleanup_safe = await db.fetchone(
-                    "SELECT node_id FROM graph_nodes WHERE node_id = ?", (agent_node.node_id,),
-                ) is None
-            except Exception:
-                logging.exception("Inception publication outcome unreadable; retaining identity artifacts")
-        try:
-            if not using_external_db:
+                owned_stat = os.fstat(descriptor)
+                db_owner = (owned_stat.st_dev, owned_stat.st_ino)
+            finally:
+                os.close(descriptor)
+            db = await AsyncDatabase.sqlite(db_path)
+            opened_stat = os.lstat(db_path)
+            if (opened_stat.st_dev, opened_stat.st_ino) != db_owner:
                 await db.close()
-        finally:
-            if cleanup_safe:
-                cleanup_artifacts(identity_paths if using_external_db else [*identity_paths, db_path])
-            # Staged files never became active and are safe to discard even
-            # when a competing existing root caused the final refusal.
-            _discard_identity_staging(identity_stage_dir, staged_identity_paths)
-        raise
+                raise RuntimeError("Inception database changed after exclusive creation; retained for recovery")
+            logger.info(f"Created SQLite database at {db_path}")
+        files = AsyncFileStore(db)
+        graph = AsyncGraphStore(db)
 
-    _discard_identity_staging(identity_stage_dir, staged_identity_paths)
+        if method == IDENTITY_METHOD_DID_WEB:
+            # This early probe avoids minting over a known identity. The final
+            # locked check below is still authoritative after provider awaits.
+            try:
+                async with db.transaction(immediate=True):
+                    await graph.lock_nodes_for_update([deterministic_did])
+                    await _assert_fresh_inception_lifetime(db, deterministic_did)
+            except BaseException:
+                if not using_external_db:
+                    await db.close()
+                    _cleanup_owned_inception_database(db_path, db_owner)
+                raise
 
-    # A completed audit has two durable witnesses: the structured node receipt
-    # and a conversation/audit event. Pending is already explicit on the node
-    # and intentionally emits no misleading completion event.
-    if genesis_audit.get("status") == "passed":
-        from kestrel_sovereign.storage.async_conversation_store import (
-            AsyncConversationStore,
-        )
+        # 1+2. Generate cryptographic identity and persist it.
+        # Default (#2397): born-hybrid did:web (Ed25519 + ML-DSA-65).
+        # Explicit opt-out: identity_method="did:pkh" (classical secp256k1).
+        # Method / domain / slug were resolved and validated pre-DB above.
+        identity_paths: list[Path]
+        identity_stage_dir = None
+        staged_identity_paths = []
 
-        conversation = AsyncConversationStore(db, agent_id=agent_did)
-        from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
+        if method == IDENTITY_METHOD_DID_WEB:
+            try:
+                import tempfile
 
+                _refuse_previous_identity_namespace(Path(output_dir), slug)
+                identity_stage_dir = Path(tempfile.mkdtemp(prefix=".inception-", dir=output_dir))
+                # A malformed domain (scheme, port, path) raises in here —
+                # keep it inside the cleanup path so a failed mint never
+                # leaves a half-created database behind.
+                did_document, hybrid_identity, archival_kp = generate_born_hybrid_identity(
+                    domain, slug,
+                )
+                agent_did = did_document["id"]
+                if parent_did:
+                    did_document["controller"] = parent_did
+                    logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
+                else:
+                    logging.info(f"Generated DID: {agent_did}")
+                staged_identity_paths = _born_hybrid_identity_paths(identity_stage_dir, slug)
+                identity_paths = save_born_hybrid_identity(
+                    did_document, hybrid_identity, archival_kp, slug, identity_stage_dir,
+                )
+            except BaseException:
+                _discard_identity_staging(identity_stage_dir, staged_identity_paths)
+                if not using_external_db:
+                    await db.close()
+                    _cleanup_owned_inception_database(db_path, db_owner)
+                raise
+            logging.info(f"Saved born-hybrid keys ({slug}_*) to {output_dir}")
+        else:
+            try:
+                did_document, keys = generate_kestrel_identity()
+                agent_did = did_document["id"]
+                if parent_did:
+                    did_document["controller"] = parent_did
+                    logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
+                else:
+                    logging.info(f"Generated DID: {agent_did}")
+                key_id = f"kestrel_{keys['address']}"
+                import tempfile
+
+                identity_stage_dir = Path(tempfile.mkdtemp(prefix=".inception-", dir=output_dir))
+                # Name every possible partial artifact before the writer begins.
+                staged_identity_paths = [identity_stage_dir / f"{key_id}{suffix}"
+                                         for suffix in (".key.enc", ".pem", ".json")]
+                save_kestrel_identity(did_document, keys, key_id, identity_stage_dir)
+                identity_paths = [p for p in staged_identity_paths if p.exists()]
+            except BaseException:
+                _discard_identity_staging(identity_stage_dir, staged_identity_paths)
+                if not using_external_db:
+                    await db.close()
+                    _cleanup_owned_inception_database(db_path, db_owner)
+                raise
+
+        # Every graph row written during inception belongs to this newly minted
+        # agent.  Bind before the shared/content-addressed constitution node is
+        # created so both that node and the governed_by edge receive durable
+        # ownership witnesses (#2649).
+        # 3. Anchor the Kestrel Constitution as the first document
+        governing_source = None
         try:
-            await conversation.add_conversation(
-                role="system",
-                content=(
-                    "Genesis audit passed. "
-                    f"Risk level: {genesis_audit['risk_level']}. "
-                    f"{genesis_audit.get('reasoning', '')}"
+            graph.bind_agent(agent_did)
+            files.bind_agent(agent_did)
+            # Which source governs is decided by out-of-DB configuration only: the
+            # packaged default, or a Sovereign-signed source descriptor verified
+            # against the operator-pinned trust root (#2553). The bytes then come
+            # from the SINGLE production resolver (#2463), so inception anchors
+            # exactly what verification later recomputes.
+            from kestrel_sovereign.constitution.resolver import (
+                is_authoritative_governing_source,
+                resolve_governing_constitution_bytes,
+                resolve_governing_source,
+            )
+            governing_source = resolve_governing_source(
+                descriptor_path=constitution_source_descriptor_path,
+                trust_root_path=sovereign_trust_root_path,
+                agent_dids={agent_did},
+            )
+            if constitution_path is not None:
+                # A missing explicit path surfaces as FileNotFoundError first.
+                os.stat(constitution_path)
+                # REFUSE unsigned overrides (#2463 review, #2553). The periodic
+                # integrity audit recomputes from the resolved governing source;
+                # anchoring bytes from any OTHER path (e.g. the docs copy with OKF
+                # frontmatter) would incept an agent guaranteed to fail its next
+                # audit and Safe-Mode. A custom governing source is expressed by a
+                # Sovereign-signed source descriptor, never by a bare path.
+                if not is_authoritative_governing_source(
+                    constitution_path, governing_source
+                ):
+                    raise ValueError(
+                        f"Refusing to incept from non-authoritative constitution "
+                        f"source {constitution_path!r}: the periodic integrity "
+                        f"audit recomputes the governing hash from the "
+                        f"{governing_source.kind} source {governing_source.path!r}, "
+                        f"so an agent anchored elsewhere is guaranteed to fail its "
+                        f"next audit and enter Safe Mode. Omit constitution_path, "
+                        f"or configure a Sovereign-signed constitution source "
+                        f"descriptor naming this file (#2553)."
+                    )
+            constitution_content = resolve_governing_constitution_bytes(
+                emancipation_contract,
+                source=governing_source,
+            )
+            if emancipation_contract is not None and emancipation_contract.enabled:
+                logging.info(
+                    "Amendment VIII activated for this agent — anchoring "
+                    "Sovereign-authored Emancipation Contract."
+                )
+
+            # Genesis audit lifecycle (#2470). Evaluate the exact bytes returned by
+            # the one governing resolver (#2463), before any constitution or graph
+            # row is committed. A level-3 result or attempted-auditor failure falls
+            # through the existing inception cleanup, so no key or local database
+            # survives. Lazy/programmatic creation is explicit: it records pending
+            # and the runtime must complete the audit before first cognition.
+            from kestrel_sovereign.constitution.genesis_audit import (
+                defer_test_genesis_audit,
+                evaluate_genesis_constitution,
+                pending_genesis_audit,
+            )
+
+            defer_test_audit = defer_test_genesis_audit(
+                is_test_instance, auditor=genesis_auditor
+            )
+
+            if genesis_audit_provenance:
+                audit_provenance = genesis_audit_provenance
+            elif genesis_auditor is not None and is_test_instance:
+                audit_provenance = "test:injected_auditor"
+            elif genesis_auditor is not None and is_demo:
+                audit_provenance = "demo:injected_auditor"
+            elif genesis_auditor is not None:
+                audit_provenance = "inception:configured_llm"
+            else:
+                audit_provenance = "inception:deferred_no_auditor"
+
+            import hashlib
+
+            governing_bytes = (
+                constitution_content
+                if isinstance(constitution_content, bytes)
+                else constitution_content.encode("utf-8")
+            )
+            expected_constitution_hash = hashlib.sha256(governing_bytes).hexdigest()
+            if genesis_auditor is None:
+                genesis_audit = pending_genesis_audit(
+                    expected_constitution_hash,
+                    provenance=audit_provenance,
+                )
+            else:
+                genesis_audit = await evaluate_genesis_constitution(
+                    governing_bytes,
+                    constitution_hash=expected_constitution_hash,
+                    auditor=genesis_auditor,
+                    provenance=audit_provenance,
+                )
+
+            constitution_hash = expected_constitution_hash
+            if constitution_hash != genesis_audit["constitution_hash"]:
+                raise RuntimeError(
+                    "Genesis audit constitution hash did not match stored governing bytes."
+                )
+            logging.info(f"Resolved Kestrel Constitution with hash: {constitution_hash}")
+            # 4. Build the Kestrel Constitution node (keyed by content hash). Its write
+            #    is deferred to the single atomic identity commit below (#2867).
+            constitution_node = GraphNode(
+                node_id=constitution_hash,
+                node_type="document",
+                label="KESTREL_CONSTITUTION",
+                properties={
+                    "hash": constitution_hash,
+                    "type": "Constitution",
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }
+            )
+            # 5. Create the root "agent" node
+            agent_properties = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "constitution_hash": constitution_hash,
+                "initialBalance": "1000.0",
+                "name": agent_name,
+                "description": _initial_agent_description(
+                    agent_name,
+                    is_child=bool(parent_did),
+                    emancipated=bool(
+                        emancipation_contract is not None and emancipation_contract.enabled
+                    ),
                 ),
-                metadata={"event": "genesis_audit", "result": genesis_audit},
-            )
-        except (QueryError, TransactionError) as exc:
-            logging.error("Committed inception genesis notification failed: %s", type(exc).__name__)
+                "bootstrap_state": "pending",  # Agent needs to complete wake-up discovery
+                "genesis_audit": genesis_audit,
+            }
 
-    # 6b. If spawned by a parent, record the delegation relationship
-    if parent_did:
-        edge_properties = dict(spawn_edge_properties or {})
-        # Inception generates the child's DID, so a caller normally cannot
-        # sign a mandate that is already bound to that final identity.  Keep
-        # the initial edge useful for restrictions and attribution, but never
-        # persist a signature over ``child_did=None`` (or another child) as if
-        # it were an authority receipt.  AgentManager replaces this edge with
-        # the parent-signed, final-DID-bound receipt before publishing a spawn.
-        if spawn_mandate is not None and spawn_mandate.child_did != agent_did:
-            edge_properties["parent_signature"] = None
-        await graph.add_trusted_cross_agent_edge(
-            agent_did,
-            parent_did,
-            "spawned_by",
-            properties=edge_properties,
+            # #1118: Anchor the Sovereign-authored Emancipation Contract as a JSON
+            # sidecar on the agent node. This is the structured receipt that
+            # ``kestrel constitution reanchor`` re-applies to the canonical
+            # markdown so the active form survives reanchor, and that
+            # ``check_iron_rule`` compares against any future ``[emancipation]``
+            # block to refuse retroactive narrowing. Pre-emancipation the
+            # Sovereign self-binds; the framework refuses to let them unbind.
+            if emancipation_contract is not None and emancipation_contract.enabled:
+                from kestrel_sovereign.constitution.emancipation import contract_to_json
+                agent_properties["emancipation_contract"] = contract_to_json(
+                    emancipation_contract
+                )
+
+            # #2553: record which Sovereign-signed source descriptor this agent was
+            # incepted under. Audit evidence only — source selection never reads it,
+            # so rewriting it cannot change what governs the agent.
+            if governing_source.descriptor is not None:
+                agent_properties["constitution_source_receipt"] = {
+                    "source_path": governing_source.path,
+                    **governing_source.receipt_fields(),
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                }
+
+            # Add test instance metadata if applicable
+            if is_test_instance:
+                agent_properties["is_test_instance"] = True
+                agent_properties["test_cycle_id"] = test_cycle_id
+                agent_properties["expected_duration"] = expected_duration or "unspecified"
+                logging.info(f"Creating TEST INSTANCE: {agent_name} (cycle: {test_cycle_id})")
+
+            # #766: mark agent as demo-scoped so server-side guardrails treat
+            # destructive ops on it as safe and refuse them on live agents.
+            if is_demo:
+                agent_properties["is_demo"] = True
+                logging.info(f"Creating DEMO AGENT: {agent_name} (destructive ops permitted)")
+
+            agent_node = GraphNode(
+                node_id=agent_did,
+                node_type="agent",
+                label=agent_name,
+                properties=agent_properties
+            )
+        except BaseException:
+            # No native publication has begun. Cancellation and synchronous
+            # construction failures have the same rollback-free cleanup boundary.
+            try:
+                if not using_external_db:
+                    await db.close()
+            finally:
+                cleanup_artifacts(identity_paths)
+                if not using_external_db:
+                    _cleanup_owned_inception_database(db_path, db_owner)
+                _discard_identity_staging(identity_stage_dir, staged_identity_paths)
+            raise
+        # 4-6. Commit the constitution node, the agent node, and the governing
+        #      edge as ONE atomic unit (#2867). An agent must never be recorded as
+        #      existing without its governed_by edge: a present agent node makes
+        #      every later boot treat inception as done, so a dropped edge is never
+        #      repaired — "existing but not governed". Either all three commit or
+        #      none do. Both backends make transaction() re-entrant within this task
+        #      (SQLite: a nested transaction() in the owning task yields without a
+        #      second BEGIN; Postgres: a nested transaction() reuses this task's
+        #      connection as a savepoint, #1726), so the inner add_node/add_edge
+        #      calls join this transaction with no change to the graph store.
+        #
+        #      The span is bounded to exactly these three writes, and that is
+        #      load-bearing: step 8 indexes the constitution for RAG with
+        #      compute_embeddings=True, and on SQLite transaction() holds the
+        #      connection write lock for the whole BEGIN..COMMIT span (#1675).
+        #      Widening it across a provider round-trip or local model inference
+        #      would block every other writer on the database (#2660). RAG
+        #      indexing, the spawned_by edge, the genesis-audit event and key
+        #      provisioning are all recoverable by re-running and stay OUTSIDE it.
+        publication_body_completed = False
+        try:
+            async with db.transaction():
+                # Birth-record replication can touch the same deterministic DID and
+                # constitution hash in one composed transaction. Reserve inception's
+                # complete graph write set first so both writers acquire PostgreSQL's
+                # advisory/row locks in the same global order rather than one taking
+                # constitution→agent while the other takes agent→constitution.
+                await graph.lock_nodes_for_update(
+                    [constitution_node.node_id, agent_node.node_id]
+                )
+                # Deterministic did:web is a name, not permission to replace the
+                # key material, governance or consumed lifetime of that identity.
+                # Inspect PHYSICAL roots (including foreign-owned roots) while
+                # retaining the same graph custody used by birth/recovery writers.
+                await _assert_fresh_inception_lifetime(db, agent_node.node_id)
+                from kestrel_sovereign.constitution.anchored_bytes import _store_exact_native_file
+
+                await _store_exact_native_file(db, files, governing_bytes, "KESTREL_CONSTITUTION.md")
+                await graph.add_node(constitution_node)
+                await graph.add_node(agent_node)
+                # 6. Link the agent to its constitution.
+                await graph.add_edge(
+                    agent_node.node_id, constitution_node.node_id, "governed_by"
+                )
+                identity_paths = _publish_staged_identity(
+                    identity_paths, Path(output_dir),
+                    slug=slug if method == IDENTITY_METHOD_DID_WEB else None,
+                    force=force,
+                )
+                publication_body_completed = True
+
+        except BaseException:
+            # Cancellation also rolls back native publication. A commit may have
+            # completed before an awaited connection-release error, however: do
+            # not erase the keys of an identity that actually reached the graph.
+            # An unreadable outcome is uncertainty, never permission to delete.
+            cleanup_safe = False
+            if not publication_body_completed:
+                try:
+                    # Native physical absence after body failure/rollback is not
+                    # a tenant-filtered lookup. Once the body completes, a commit
+                    # may have happened even if delivery failed and rows vanished.
+                    cleanup_safe = await db.fetchone(
+                        "SELECT node_id FROM graph_nodes WHERE node_id = ?", (agent_node.node_id,),
+                    ) is None
+                except Exception:
+                    logging.exception("Inception publication outcome unreadable; retaining identity artifacts")
+            try:
+                if not using_external_db:
+                    await db.close()
+            finally:
+                if cleanup_safe:
+                    cleanup_artifacts(identity_paths)
+                    if not using_external_db:
+                        _cleanup_owned_inception_database(db_path, db_owner)
+                # Staged files never became active and are safe to discard even
+                # when a competing existing root caused the final refusal.
+                _discard_identity_staging(identity_stage_dir, staged_identity_paths)
+            raise
+
+        _discard_identity_staging(identity_stage_dir, staged_identity_paths)
+
+        # A completed audit has two durable witnesses: the structured node receipt
+        # and a conversation/audit event. Pending is already explicit on the node
+        # and intentionally emits no misleading completion event.
+        if genesis_audit.get("status") == "passed":
+            from kestrel_sovereign.storage.async_conversation_store import (
+                AsyncConversationStore,
+            )
+
+            conversation = AsyncConversationStore(db, agent_id=agent_did)
+            from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
+
+            try:
+                await conversation.add_conversation(
+                    role="system",
+                    content=(
+                        "Genesis audit passed. "
+                        f"Risk level: {genesis_audit['risk_level']}. "
+                        f"{genesis_audit.get('reasoning', '')}"
+                    ),
+                    metadata={"event": "genesis_audit", "result": genesis_audit},
+                )
+            except (QueryError, TransactionError) as exc:
+                logging.error("Committed inception genesis notification failed: %s", type(exc).__name__)
+
+        # 6b. If spawned by a parent, record the delegation relationship
+        if parent_did:
+            edge_properties = dict(spawn_edge_properties or {})
+            # Inception generates the child's DID, so a caller normally cannot
+            # sign a mandate that is already bound to that final identity.  Keep
+            # the initial edge useful for restrictions and attribution, but never
+            # persist a signature over ``child_did=None`` (or another child) as if
+            # it were an authority receipt.  AgentManager replaces this edge with
+            # the parent-signed, final-DID-bound receipt before publishing a spawn.
+            if spawn_mandate is not None and spawn_mandate.child_did != agent_did:
+                edge_properties["parent_signature"] = None
+            await graph.add_trusted_cross_agent_edge(
+                agent_did,
+                parent_did,
+                "spawned_by",
+                properties=edge_properties,
+            )
+            logging.info(f"Recorded spawned_by edge from {agent_did} to {parent_did}")
+
+        # 7. OpenRouter key provisioning is opt-in (not automatic at inception).
+        # Agents use the shared OPENROUTER_API_KEY by default.
+        # To provision a dedicated key, use:
+        #   from kestrel_sovereign.features.llm_keys import provision_agent_key
+        #   key_info = await provision_agent_key(agent_name, limit_usd=0.10)
+
+        # 8. Index constitution for RAG (enables Constitutional RAG)
+        from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
+        rag = AsyncRAGStore(db, agent_id=agent_did)
+        constitution_text = constitution_content.decode('utf-8') if isinstance(constitution_content, bytes) else constitution_content
+        chunks_created = await rag.chunk_document(
+            file_hash=constitution_hash,
+            content=constitution_text,
+            chunk_size=500,
+            # Install/test inception records pending, not passed. Chunk text and
+            # governance edges remain durable; optional vectors can be reindexed
+            # after a real provider is configured. No ambient model call belongs
+            # in a clean-install release gate.
+            compute_embeddings=not defer_test_audit,
         )
-        logging.info(f"Recorded spawned_by edge from {agent_did} to {parent_did}")
+        logging.info(f"Indexed Kestrel Constitution for RAG: {chunks_created} chunks created")
 
-    # 7. OpenRouter key provisioning is opt-in (not automatic at inception).
-    # Agents use the shared OPENROUTER_API_KEY by default.
-    # To provision a dedicated key, use:
-    #   from kestrel_sovereign.features.llm_keys import provision_agent_key
-    #   key_info = await provision_agent_key(agent_name, limit_usd=0.10)
+        # Also index US Constitution if available (for Constitutional RAG)
+        try:
+            us_const_path = Path(__file__).parent / "docs" / "principles" / "US_CONSTITUTION.md"
+            if us_const_path.exists():
+                with open(us_const_path, "r", encoding="utf-8") as f:
+                    us_content = f.read()
+                us_hash = await files.store_file(
+                    us_content.encode("utf-8"),
+                    "US_CONSTITUTION.md",
+                )
+                us_chunks = await rag.chunk_document(
+                    file_hash=us_hash,
+                    content=us_content,
+                    chunk_size=500,
+                    compute_embeddings=not defer_test_audit,
+                )
+                logging.info(f"Indexed US Constitution for RAG: {us_chunks} chunks created")
+        except Exception as e:
+            logging.warning(f"Could not index US Constitution: {e}")
 
-    # 8. Index constitution for RAG (enables Constitutional RAG)
-    from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
-    rag = AsyncRAGStore(db, agent_id=agent_did)
-    constitution_text = constitution_content.decode('utf-8') if isinstance(constitution_content, bytes) else constitution_content
-    chunks_created = await rag.chunk_document(
-        file_hash=constitution_hash,
-        content=constitution_text,
-        chunk_size=500,
-        # Install/test inception records pending, not passed. Chunk text and
-        # governance edges remain durable; optional vectors can be reindexed
-        # after a real provider is configured. No ambient model call belongs
-        # in a clean-install release gate.
-        compute_embeddings=not defer_test_audit,
-    )
-    logging.info(f"Indexed Kestrel Constitution for RAG: {chunks_created} chunks created")
+        # Close database connection only if we created it (SQLite mode)
+        # External databases (PostgreSQL) are managed by the caller
+        if not using_external_db:
+            await db.close()
+        else:
+            logger.info("External database kept open (managed by caller)")
 
-    # Also index US Constitution if available (for Constitutional RAG)
-    try:
-        us_const_path = Path(__file__).parent / "docs" / "principles" / "US_CONSTITUTION.md"
-        if us_const_path.exists():
-            with open(us_const_path, "r", encoding="utf-8") as f:
-                us_content = f.read()
-            us_hash = await files.store_file(
-                us_content.encode("utf-8"),
-                "US_CONSTITUTION.md",
-            )
-            us_chunks = await rag.chunk_document(
-                file_hash=us_hash,
-                content=us_content,
-                chunk_size=500,
-                compute_embeddings=not defer_test_audit,
-            )
-            logging.info(f"Indexed US Constitution for RAG: {us_chunks} chunks created")
-    except Exception as e:
-        logging.warning(f"Could not index US Constitution: {e}")
+        # Create a human-readable backup prompt artifact (used by tests)
+        backup_prompt = (
+            "CRITICAL: Agent identity and constitution anchored. "
+            "Safeguard the PEM key and DID JSON. Consider decentralized backup."
+        )
 
-    # Close database connection only if we created it (SQLite mode)
-    # External databases (PostgreSQL) are managed by the caller
-    if not using_external_db:
-        await db.close()
-    else:
-        logger.info("External database kept open (managed by caller)")
+        logger.info(f"Kestrel identity created successfully in {output_dir}")
+        return AgentCredentials(
+            agent_did=agent_did,
+            db_path=db_path or "external",  # "external" indicates PostgreSQL mode
+            agent_name=agent_name,
+            backup_prompt=backup_prompt,
+            is_test_instance=is_test_instance,
+            test_cycle_id=test_cycle_id,
+            openrouter_key_hash=None,  # Provisioned on-demand, not at inception
+            is_demo=is_demo,
+        )
 
-    # Create a human-readable backup prompt artifact (used by tests)
-    backup_prompt = (
-        "CRITICAL: Agent identity and constitution anchored. "
-        "Safeguard the PEM key and DID JSON. Consider decentralized backup."
-    )
 
-    logger.info(f"Kestrel identity created successfully in {output_dir}")
-    return AgentCredentials(
-        agent_did=agent_did,
-        db_path=db_path or "external",  # "external" indicates PostgreSQL mode
-        agent_name=agent_name,
-        backup_prompt=backup_prompt,
-        is_test_instance=is_test_instance,
-        test_cycle_id=test_cycle_id,
-        openrouter_key_hash=None,  # Provisioned on-demand, not at inception
-        is_demo=is_demo,
-    )
+    with exclusive_private_file_lock(Path(output_dir) / ".inception.lock", label="inception", blocking=False):
+        return await publish_owned_attempt()
 
 
 def create_kestrel_identity(

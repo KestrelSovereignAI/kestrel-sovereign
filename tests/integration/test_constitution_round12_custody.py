@@ -128,7 +128,10 @@ async def test_owned_force_inception_retains_original_lifetime_and_keys(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_owned_force_cannot_reuse_a_lifetime_from_an_archived_database(tmp_path, monkeypatch):
+@pytest.mark.parametrize("remove_keys", [False, True])
+@pytest.mark.parametrize("deleted_root", [False, True])
+@pytest.mark.parametrize("reuse_external", [False, True])
+async def test_owned_force_cannot_reuse_a_lifetime_from_an_archived_database(tmp_path, monkeypatch, remove_keys, deleted_root, reuse_external):
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
 
     monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
@@ -140,15 +143,152 @@ async def test_owned_force_cannot_reuse_a_lifetime_from_an_archived_database(tmp
     await old.initialize()
     try:
         assert await (await _agent(old)).enter_safe_mode("retained archived native lifetime")
+        if deleted_root:
+            await old.db.execute_commit("DELETE FROM graph_nodes WHERE node_id=?", (first.agent_did,))
     finally:
         await old.close()
+    if remove_keys:
+        from kestrel_sovereign.inception_service import _born_hybrid_identity_paths
+
+        for path in _born_hybrid_identity_paths(directory, "old-lifetime"):
+            path.unlink()
     second = await create_kestrel_identity_async(did_web_slug="new-lifetime", force=True, **kwargs)
     assert second.agent_did != first.agent_did
     assert list(directory.glob("kestrel_prime.db.backup-*"))
     before = {p.name: sha256(p.read_bytes()).digest() for p in directory.iterdir() if p.is_file()}
-    with pytest.raises(Exception, match="previous identity"):
-        await create_kestrel_identity_async(did_web_slug="old-lifetime", force=True, **kwargs)
+    external = None
+    if reuse_external:
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        external = await AsyncDatabase.sqlite(str(tmp_path / "fresh-external.db"))
+    try:
+        with pytest.raises(Exception, match="previous identity|existing identity|constitutional lifetime|birth replay"):
+            await create_kestrel_identity_async(did_web_slug="old-lifetime", force=True, database=external, **kwargs)
+        if external is not None:
+            assert await external.fetchone("SELECT node_id FROM graph_nodes WHERE node_id=?", (first.agent_did,)) is None
+    finally:
+        if external is not None:
+            await external.close()
     assert {p.name: sha256(p.read_bytes()).digest() for p in directory.iterdir() if p.is_file()} == before
+
+
+@pytest.mark.asyncio
+async def test_owned_concurrent_creator_cannot_delete_the_committed_winner(tmp_path, monkeypatch):
+    import asyncio
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
+    directory = tmp_path / "concurrent"
+    kwargs = dict(output_dir=str(directory), is_test_instance=True, force=True,
+                  identity_method="did:web", did_web_domain="agents.kestrel-sovereign.test", did_web_slug="one-winner")
+    native_sqlite = AsyncDatabase.sqlite
+    first_opening, release_first, second_opening, winner_done = (asyncio.Event() for _ in range(4))
+    opened = []
+    calls = 0
+
+    async def scheduled_open(path, **options):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_opening.set()
+            await release_first.wait()
+        else:
+            second_opening.set()
+            await winner_done.wait()
+        db = await native_sqlite(path, **options)
+        opened.append(db)
+        return db
+
+    monkeypatch.setattr(AsyncDatabase, "sqlite", scheduled_open)
+    first_task = asyncio.create_task(create_kestrel_identity_async(**kwargs))
+    second_task = second_signal = None
+    try:
+        await asyncio.wait_for(first_opening.wait(), 10)
+        second_task = asyncio.create_task(create_kestrel_identity_async(**kwargs))
+        second_signal = asyncio.create_task(second_opening.wait())
+        await asyncio.wait_for(asyncio.wait([second_task, second_signal], return_when=asyncio.FIRST_COMPLETED), 10)
+        release_first.set()
+        winner = await asyncio.wait_for(first_task, 30)
+        winner_done.set()
+        with pytest.raises(Exception, match="existing identity|inception.*lock|cannot lock"):
+            await asyncio.wait_for(second_task, 30)
+        monkeypatch.setattr(AsyncDatabase, "sqlite", native_sqlite)
+        assert (directory / "kestrel_prime.db").is_file(), "loser erased the winner's native SQLite database"
+        check = await native_sqlite(str(directory / "kestrel_prime.db"))
+        try:
+            assert await check.fetchone("SELECT node_id FROM graph_nodes WHERE node_id=?", (winner.agent_did,)) == (winner.agent_did,)
+            assert await check.fetchone("SELECT target_id FROM graph_edges WHERE source_id=? AND label='governed_by'", (winner.agent_did,))
+        finally:
+            await check.close()
+    finally:
+        release_first.set()
+        winner_done.set()
+        for task in (first_task, second_task, second_signal):
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+        for db in opened:
+            await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", ["symlink", "hardlink", "stranded_wal", "corrupt", "overflow", "valid"])
+async def test_owned_archive_inspection_is_bounded_read_only_and_fail_closed(tmp_path, evidence):
+    from pathlib import Path
+    from kestrel_sovereign.inception_service import _assert_archived_inception_lifetimes
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    archive_path = tmp_path / "kestrel_prime.db.backup-fixture"
+    native = await AsyncDatabase.sqlite(str(archive_path))
+    await native.close()
+    if evidence == "symlink":
+        target = tmp_path / "retained-authority"
+        archive_path.rename(target)
+        archive_path.symlink_to(target)
+    elif evidence == "hardlink":
+        os.link(archive_path, tmp_path / "shared-authority")
+    elif evidence == "stranded_wal":
+        (tmp_path / "kestrel_prime.db-wal.backup-fixture").write_bytes(b"unread committed evidence")
+    elif evidence == "corrupt":
+        archive_path.write_bytes(b"not a database")
+    elif evidence == "overflow":
+        for number in range(128):
+            (tmp_path / f"kestrel_prime.db.backup-{number}").write_bytes(b"must not be opened")
+    before = {p.name: (p.lstat().st_ino, p.lstat().st_mtime_ns, sha256(p.read_bytes()).digest()) for p in tmp_path.iterdir()}
+    if evidence == "valid":
+        await _assert_archived_inception_lifetimes(Path(tmp_path), "did:test:genuinely-new")
+    else:
+        with pytest.raises(Exception, match="regular database|sidecar evidence|not a database|inspection bound"):
+            await _assert_archived_inception_lifetimes(Path(tmp_path), "did:test:genuinely-new")
+    assert {p.name: (p.lstat().st_ino, p.lstat().st_mtime_ns, sha256(p.read_bytes()).digest()) for p in tmp_path.iterdir()} == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link", ["symlink", "hardlink"])
+async def test_owned_force_refuses_linked_existing_database_before_open(tmp_path, link):
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    target = tmp_path / "other-authority.db"
+    native = await AsyncDatabase.sqlite(str(target))
+    await native.close()
+    directory = tmp_path / "birth"
+    directory.mkdir()
+    path = directory / "kestrel_prime.db"
+    if link == "symlink":
+        path.symlink_to(target)
+    else:
+        os.link(target, path)
+    before = (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes())
+    with pytest.raises(ValueError, match="exclusively retained regular database"):
+        await create_kestrel_identity_async(output_dir=str(directory), force=True, is_test_instance=True,
+                                            identity_method="did:web", did_web_domain="agents.kestrel-sovereign.test", did_web_slug="new-linked")
+    assert (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes()) == before
+    assert path.exists()
+    assert not list(directory.glob("*.backup-*"))
 
 
 @pytest.mark.asyncio
