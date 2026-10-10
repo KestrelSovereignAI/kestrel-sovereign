@@ -77,6 +77,8 @@ def test_lingering_non_daemon_thread():
             "pytest",
             str(probe),
             "-p",
+            "pytest_asyncio.plugin",
+            "-p",
             "tests.conftest",
             "-n",
             "2",
