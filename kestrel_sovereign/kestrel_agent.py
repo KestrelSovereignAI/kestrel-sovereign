@@ -1521,7 +1521,11 @@ class KestrelAgent(
         # surface. Real LLMService instances always have attach_to_agent;
         # the invariant is enforced for them and silently waived for fakes.
         if hasattr(self.llm_service, "attach_to_agent"):
-            if isinstance(self.llm_service, LLMService):
+            # Resolve the canonical type independently of the replaceable
+            # construction factory (hosts/tests may supply a callable there).
+            from kestrel_sovereign.llm.service import LLMService as NativeLLMService
+
+            if isinstance(self.llm_service, NativeLLMService):
                 self.llm_service.attach_to_agent(did, execution_custody=self._execution_custody)
             else:
                 self.llm_service.attach_to_agent(did)
