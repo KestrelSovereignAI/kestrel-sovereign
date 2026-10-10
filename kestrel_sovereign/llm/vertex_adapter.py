@@ -11,6 +11,7 @@ Adapter for Google Cloud Vertex AI using the google-genai SDK with support for:
 Uses the new google-genai SDK (not deprecated google-generativeai or google-cloud-aiplatform).
 Authentication via Application Default Credentials (ADC).
 """
+import inspect
 import logging
 import os
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
 from .image_utils import process_images
 from .google_adapter import _normalized_google_genai_usage
+from .handle_closer import client_closes
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +223,41 @@ class VertexAIAdapter(LLMAdapter):
             self._client = genai.Client(**client_kwargs)
 
         return self._client
+
+    async def aclose(self) -> None:
+        """Close the client ``_get_client()`` built, each transport (#3559).
+
+        A call given no client, such as model discovery, builds one this
+        adapter owns. Each of its transports is closed even when another's
+        close fails, and the client is kept, so a later call retries, until
+        every one has closed.
+
+        Raises:
+            Exception: What the first close that failed raised. Its notes name
+                every transport left open.
+        """
+        client = self._client
+        if client is None:
+            return
+        failures: List[tuple[str, Exception]] = []
+        for label, _handle, close in client_closes("client", client):
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as error:  # noqa: BLE001 - every close is tried, then reported
+                failures.append((label, error))
+        if failures:
+            first_label, first = failures[0]
+            first.add_note(f"VertexAIAdapter could not close its {first_label}")
+            for label, error in failures[1:]:
+                first.add_note(
+                    f"VertexAIAdapter could not close its {label} either "
+                    f"({type(error).__name__})"
+                )
+            raise first
+        if self._client is client:
+            self._client = None
 
     def create_messages(
         self,

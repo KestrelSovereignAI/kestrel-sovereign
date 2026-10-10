@@ -16,7 +16,11 @@ from kestrel_sdk.llm import (
 from pydantic import SecretStr
 
 from kestrel_sovereign.llm.remote_backend import BackendType
-from kestrel_sovereign.llm.service import LLMService, LLMServiceError
+from kestrel_sovereign.llm.service import (
+    LLMService,
+    LLMServiceCloseError,
+    LLMServiceError,
+)
 
 
 class FakeRemoteClient:
@@ -212,3 +216,73 @@ async def test_close_prevents_a_renewal_from_rebuilding_the_route(monkeypatch):
     assert service.get_backend_status()["current_backend"] != (
         BackendType.REMOTE_GPU.value
     )
+
+
+class _UnclosableRemoteClient(FakeRemoteClient):
+    """A private route client whose next ``close_failures`` closes raise."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.close_failures = 0
+
+    async def close(self):
+        if self.close_failures:
+            self.close_failures -= 1
+            raise RuntimeError("private transport details")
+        await super().close()
+
+
+@pytest.mark.asyncio
+async def test_a_private_client_that_did_not_close_is_retried_by_close(
+    monkeypatch, caplog
+):
+    """Releasing the route detaches its client even when the close fails.
+
+    The client stays with the service, so ``close()`` retries it and reports
+    it while it still will not close, and never with the transport's own
+    error text (#3559).
+    """
+    private_endpoint = _lease().route.endpoint.get_secret_value()
+    clients: list[_UnclosableRemoteClient] = []
+
+    def _make_client(**kwargs):
+        client = _UnclosableRemoteClient(**kwargs)
+        if kwargs.get("base_url", "").startswith(private_endpoint.rstrip("/")):
+            clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI", _make_client
+    )
+    service = LLMService()
+    await service.activate_inference_lease(
+        _lease(),
+        capabilities=("chat",),
+        touch_lease=_touch_current(service),
+    )
+    [client] = clients
+    client.close_failures = 2
+
+    await service.deactivate_inference_lease("lease-1")
+
+    assert service.get_backend_status()["remote_active"] is False
+    assert client.closed is False
+
+    with pytest.raises(
+        LLMServiceCloseError, match="private inference client lease-1"
+    ) as raised:
+        await service.close()
+
+    assert client.closed is False
+    chain, error = [], raised.value
+    while error is not None:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    assert len(chain) == 2, "nothing from the transport is attached"
+    assert not any("private transport details" in str(e) for e in chain)
+    assert "private transport details" not in caplog.text
+
+    await service.close()
+
+    assert client.closed is True
+

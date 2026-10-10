@@ -67,6 +67,10 @@ async def test_spawn_passes_large_streamreader_limit(monkeypatch, tmp_path):
 
     c = CodexAppServerClient.__new__(CodexAppServerClient)
     c._binary = "/usr/bin/true"
+    c._proc = None
+    c._unexited_procs = []
+    c._reader_task = None
+    c._stderr_task = None
     c._closed_error = None
     c._pending = {}
     c._turn_sinks = {}

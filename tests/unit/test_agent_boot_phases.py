@@ -18,6 +18,7 @@ uses) and assert the #2522 boot-state-machine contract end to end:
 import asyncio
 import contextlib
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -34,6 +35,10 @@ from kestrel_sovereign.a2a.task_manager import TaskManager
 from kestrel_sovereign.agent import custody as custody_module
 from kestrel_sovereign.features.base import Feature as _SovereignFeature
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.llm import codex_app_server
+from kestrel_sovereign.llm import service as llm_service_module
+from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+from kestrel_sovereign.llm.codex_app_server import CodexAppServerClient
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig
 from kestrel_sovereign.spawn.authority_registry import SpawnAuthorityRegistry
 from kestrel_sovereign.spawn.mandate import SpawnMandate
@@ -593,9 +598,9 @@ async def test_clean_boot_reaches_ready(tmp_path):
 # through its serving record, so the record must outlive every resource the
 # agent may still hold. Each resource enters the agent's custody when it is
 # acquired and leaves only when its release is reported by an owner in
-# ``TRUTHFUL_CLOSE_OWNERS``. That list holds only ``task_manager`` (#3558)
-# until the other owners' closes stop swallowing failures (#3559, #3560), so
-# for now the record stays until the process exits.
+# ``TRUTHFUL_CLOSE_OWNERS``. That list holds only ``task_manager`` (#3558) and
+# ``llm_service`` (#3559) until the other owners' closes stop swallowing
+# failures (#3560), so for now the record stays until the process exits.
 # ---------------------------------------------------------------------------
 
 
@@ -737,9 +742,9 @@ async def test_a_booted_agent_records_that_this_process_serves_it(tmp_path):
     """Guards find the agent however it was launched (#3522).
 
     A server started without ``kestrel start`` has no PID file, so the agent
-    records itself as boot begins. Only the task manager's release can be
-    confirmed yet, so stopping the agent keeps the record, which goes stale
-    when the process exits.
+    records itself as boot begins. Only the task manager's and the LLM
+    service's releases can be confirmed yet, so stopping the agent keeps the
+    record, which goes stale when the process exits.
     """
     from kestrel_sovereign.multi_agent.liveness import serving_holder
 
@@ -753,8 +758,12 @@ async def test_a_booted_agent_records_that_this_process_serves_it(tmp_path):
             await _stop(agent)
 
         # Every step ran and reported its resource released, but only the
-        # task manager is trusted to report a failure, so the rest stay held.
-        assert _owners_held(agent) == set(_BOOT_OWNERS) - {"task_manager"}
+        # task manager and the LLM service are trusted to report a failure,
+        # so the rest stay held.
+        assert _owners_held(agent) == set(_BOOT_OWNERS) - {
+            "task_manager",
+            "llm_service",
+        }
         _assert_guards_report_this_process(tmp_path)
     finally:
         await _cleanup(agent)
@@ -1009,6 +1018,199 @@ async def test_a_failed_task_manager_rollback_keeps_the_manager_for_shutdown(
             await _stop(agent)
 
             assert not store.is_connected
+            assert agent._resource_custody().held == ()
+            assert _guard_holder(tmp_path) is None
+    finally:
+        await _cleanup(agent)
+
+
+# ---------------------------------------------------------------------------
+# The real LLMService closes truthfully (#3559)
+#
+# Its close raises when an adapter or client did not close, and keeps that
+# handle so a later close retries it. These add a route to the agent's real
+# LLMService whose real Codex adapter owns an app-server child process. Every
+# other owner is trusted here, and the LLM service only by the real
+# allow-list, so its close alone decides whether custody empties and the
+# serving record goes.
+# ---------------------------------------------------------------------------
+
+#: An app-server that keeps running after its stdin closes, until killed.
+_APP_SERVER_IGNORING_EOF = "import sys, time; sys.stdin.read(); time.sleep(600)"
+
+
+def _trust_every_owner_but_the_llm_service(monkeypatch) -> None:
+    _trust(
+        monkeypatch,
+        (set(_BOOT_OWNERS) - {"llm_service"}) | custody_module.TRUTHFUL_CLOSE_OWNERS,
+    )
+
+
+@contextlib.asynccontextmanager
+async def _codex_route(agent):
+    """Give the agent's LLM service a Codex route owning a live app-server."""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _APP_SERVER_IGNORING_EOF,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        client = CodexAppServerClient(binary="codex-under-test")
+        client._proc = proc
+        adapter = CodexAdapter()
+        adapter._client = client
+        agent.llm_service.providers.append(
+            {
+                "name": "openai:plan",
+                "vendor": "openai",
+                "route": "plan",
+                "adapter": adapter,
+                "client": None,
+                "model": "auto",
+            }
+        )
+        yield SimpleNamespace(adapter=adapter, client=client, proc=proc)
+    finally:
+        if proc.returncode is None:
+            # Past any kill a test patched onto the instance.
+            asyncio.subprocess.Process.kill(proc)
+            await proc.wait()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_llm_adapter_close_keeps_custody_until_a_retry_closes_it(
+    tmp_path, monkeypatch
+):
+    _trust_every_owner_but_the_llm_service(monkeypatch)
+    monkeypatch.setattr(codex_app_server, "CODEX_APP_SERVER_EXIT_GRACE_S", 0.05)
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource():
+            await agent.initialize()
+            async with _codex_route(agent) as route:
+                real_kill = route.proc.kill
+
+                def refuse_kill():
+                    raise PermissionError("injected app-server kill failure")
+
+                monkeypatch.setattr(route.proc, "kill", refuse_kill)
+                await _stop(agent)
+
+                assert route.proc.returncode is None, "the app-server still runs"
+                assert route.adapter._client is route.client, "kept for a retry"
+                assert route.client._proc is route.proc
+                assert _owners_held(agent) == {"llm_service"}
+                _assert_guards_report_this_process(tmp_path)
+
+                monkeypatch.setattr(route.proc, "kill", real_kill)
+                await _stop(agent)
+
+                assert route.proc.returncode is not None
+                assert route.adapter._client is None
+                assert agent._resource_custody().held == ()
+                assert _guard_holder(tmp_path) is None
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_llm_adapter_close_keeps_custody_until_a_retry_finishes_it(
+    tmp_path, monkeypatch
+):
+    """The retry waits for the close the timeout left running, not a new one."""
+    _trust_every_owner_but_the_llm_service(monkeypatch)
+    monkeypatch.setattr(codex_app_server, "CODEX_APP_SERVER_EXIT_GRACE_S", 0.05)
+    stops = []
+    stop_may_proceed = asyncio.Event()
+    real_stop = CodexAppServerClient._stop_process
+
+    async def slow_stop(proc):
+        stops.append(proc)
+        await stop_may_proceed.wait()
+        await real_stop(proc)
+
+    monkeypatch.setattr(CodexAppServerClient, "_stop_process", staticmethod(slow_stop))
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource():
+            await agent.initialize()
+            async with _codex_route(agent) as route:
+                monkeypatch.setattr(llm_service_module, "CLIENT_CLOSE_TIMEOUT", 0.05)
+                await _stop(agent)
+
+                assert route.proc.returncode is None, "the app-server still runs"
+                assert route.adapter._client is route.client
+                assert _owners_held(agent) == {"llm_service"}
+                _assert_guards_report_this_process(tmp_path)
+
+                stop_may_proceed.set()
+                monkeypatch.setattr(llm_service_module, "CLIENT_CLOSE_TIMEOUT", 10.0)
+                await _stop(agent)
+
+                assert stops == [route.proc], "one close, waited for twice"
+                assert route.proc.returncode is not None
+                assert route.adapter._client is None
+                assert agent._resource_custody().held == ()
+                assert _guard_holder(tmp_path) is None
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_google_async_transport_close_keeps_custody_until_a_retry(
+    tmp_path, monkeypatch
+):
+    """``Client.close()`` leaves the transport the Google adapter calls through.
+
+    A real google-genai client: its synchronous transport closes, its
+    asynchronous one fails to, and the agent's custody and serving record
+    stay until a later shutdown closes it.
+    """
+    from google import genai
+
+    from kestrel_sovereign.llm.google_adapter import GoogleAdapter
+
+    _trust_every_owner_but_the_llm_service(monkeypatch)
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource():
+            await agent.initialize()
+            client = genai.Client(api_key="test-key-never-sent")
+            sync = client._api_client._httpx_client
+            async_transport = client._api_client._async_httpx_client
+            real_aclose = async_transport.aclose
+            failures = [OSError("injected async transport close failure")]
+
+            async def aclose():
+                if failures:
+                    raise failures.pop(0)
+                await real_aclose()
+
+            monkeypatch.setattr(async_transport, "aclose", aclose)
+            agent.llm_service.providers.append(
+                {
+                    "name": "google:api",
+                    "vendor": "google",
+                    "route": "api",
+                    "adapter": GoogleAdapter(),
+                    "client": client,
+                    "model": "gemini-test",
+                }
+            )
+
+            await _stop(agent)
+
+            assert sync.is_closed
+            assert not async_transport.is_closed, "the async transport is open"
+            assert _owners_held(agent) == {"llm_service"}
+            _assert_guards_report_this_process(tmp_path)
+
+            await _stop(agent)
+
+            assert async_transport.is_closed
             assert agent._resource_custody().held == ()
             assert _guard_holder(tmp_path) is None
     finally:

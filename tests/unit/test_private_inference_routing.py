@@ -17,6 +17,7 @@ from kestrel_sdk.llm import (
 )
 from pydantic import SecretStr
 
+from kestrel_sovereign.llm.handle_closer import HandleCloser
 from kestrel_sovereign.llm.remote_backend import BackendType, RemoteBackendMixin
 from kestrel_sovereign.llm.service import LLMServiceError
 
@@ -45,6 +46,7 @@ class _Host(RemoteBackendMixin):
         self._last_remote_error = None
         self._remote_route_epoch = 0
         self._remote_route_closed = False
+        self._handle_closer = HandleCloser()
         self._mandate_preference = {"model": None, "vendor": None, "route": None}
 
     def _remote_first_allowed(self, model_override):

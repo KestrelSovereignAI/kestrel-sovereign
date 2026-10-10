@@ -91,6 +91,11 @@ _CODEX_DISABLED_NATIVE_FEATURES = (
 CODEX_APP_SERVER_MAX_FRAME_BYTES = 64 * 1024 * 1024
 CODEX_APP_SERVER_READ_CHUNK_BYTES = 64 * 1024
 
+# ``aclose`` closes the app-server's stdin and waits this long for it to exit
+# before killing it, then waits this long for the killed process to exit.
+CODEX_APP_SERVER_EXIT_GRACE_S = 5.0
+CODEX_APP_SERVER_KILL_WAIT_S = 5.0
+
 # Resolution order for the binary. It ships inside a desktop app bundle
 # and is deliberately NOT on PATH (reference: codex-cli-path), which is
 # why ``which codex`` misleads. An explicit env override wins. The
@@ -263,6 +268,10 @@ class CodexAppServerClient:
         self._binary = binary or resolve_codex_binary()
         self._client_version = client_version
         self._proc: Optional[asyncio.subprocess.Process] = None
+        # Processes no longer in ``_proc`` that were not seen to exit: one
+        # whose stdout ended while it kept running, or one a respawn replaced.
+        # ``aclose`` stops them too (#3559).
+        self._unexited_procs: list[asyncio.subprocess.Process] = []
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._next_id = 1
@@ -484,6 +493,10 @@ class CodexAppServerClient:
             for feature in _CODEX_DISABLED_NATIVE_FEATURES:
                 codex_args.extend(("--disable", feature))
             codex_args.extend(("app-server", "--listen", "stdio://"))
+            # A process still in ``_proc`` is being replaced. Its read loop's
+            # cleanup must run now, not later against the new process.
+            await self._finish_io_tasks()
+            self._forget_proc()
             self._proc = await asyncio.create_subprocess_exec(
                 *codex_args,
                 stdin=asyncio.subprocess.PIPE,
@@ -527,7 +540,8 @@ class CodexAppServerClient:
         try:
             _validated_codex_version(ua)
         except CodexAppServerError:
-            await self.aclose()
+            # ``ensure_started`` holds ``_start_lock`` around the handshake.
+            await self._stop_all_procs()
             raise
         self.notify("initialized")
         # Match kestrel-claw's auth-bridge.ts: after initialize +
@@ -787,27 +801,100 @@ class CodexAppServerClient:
         return out
 
     async def aclose(self) -> None:
-        proc = self._proc
-        if proc is None:
-            return
-        try:
-            if proc.stdin and not proc.stdin.is_closing():
-                proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except (asyncio.TimeoutError, Exception):
+        """Stop every app-server process; return only once each has exited.
+
+        Closing its stdin asks a process to exit, and one still running after
+        ``CODEX_APP_SERVER_EXIT_GRACE_S`` is killed. A process is forgotten
+        only once it has exited, so a close that raised or was cancelled
+        leaves it for a later call to retry (#3559). That includes an earlier
+        process the client stopped tracking in ``_proc`` before it exited.
+        Every process is stopped even when another could not be.
+
+        Raises:
+            TimeoutError: A process was still running
+                ``CODEX_APP_SERVER_KILL_WAIT_S`` after it was killed.
+            OSError: A process could not be killed.
+            Either is the first failure, with a note for each other one.
+        """
+        # Waits for a spawn in progress, so its process is stopped too.
+        async with self._start_lock:
+            await self._stop_all_procs()
+
+    async def _stop_all_procs(self) -> None:
+        """:meth:`aclose`'s body, for a caller already holding ``_start_lock``."""
+        # Every process to stop is taken before the first await: the read
+        # loop may forget the current one into ``_unexited_procs`` meanwhile.
+        current = self._proc
+        targets = list(self._unexited_procs)
+        if current is not None and current not in targets:
+            targets.append(current)
+        failures: list[Exception] = []
+        for proc in targets:
             try:
-                proc.kill()
-            except Exception:
-                pass
-        for t in (self._reader_task, self._stderr_task):
-            if t:
-                t.cancel()
+                await self._stop_process(proc)
+            except Exception as exc:
+                failures.append(exc)
+                continue
+            if proc in self._unexited_procs:
+                self._unexited_procs.remove(proc)
+        if failures:
+            first = failures[0]
+            for other in failures[1:]:
+                first.add_note(
+                    f"another codex app-server process could not be stopped either: {other!r}"
+                )
+            raise first
+        if current is None:
+            return
+        # Let the read loop's own cleanup run now, against this process,
+        # rather than later against whatever process a reconnect spawns.
+        await self._finish_io_tasks()
         self._fail_all(CodexAppServerConnectionClosed("codex app-server closed"))
         self._initialized = False
+        if self._proc is current:
+            self._proc = None
+
+    async def _finish_io_tasks(self) -> None:
+        """Cancel the read loop and stderr drain, and wait for their cleanup."""
+        tasks = {
+            t
+            for t in (self._reader_task, self._stderr_task)
+            if t is not None and t is not asyncio.current_task()
+        }
+        for t in tasks:
+            # A second cancel would interrupt the cleanup the first started.
+            if not t.done() and not t.cancelling():
+                t.cancel()
+        if tasks:
+            # ``wait`` does not forward a cancellation of this task into
+            # them, so their cleanup still runs.
+            await asyncio.wait(tasks)
+
+    def _forget_proc(self) -> None:
+        """Stop tracking ``_proc``, keeping it for ``aclose`` unless it exited."""
+        proc = self._proc
+        if proc is not None and proc.returncode is None:
+            self._unexited_procs.append(proc)
         self._proc = None
+
+    @staticmethod
+    async def _stop_process(proc: asyncio.subprocess.Process) -> None:
+        """Ask ``proc`` to exit, kill it if it does not, and wait for its exit."""
+        if proc.returncode is not None:
+            return
+        if proc.stdin is not None and not proc.stdin.is_closing():
+            proc.stdin.close()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=CODEX_APP_SERVER_EXIT_GRACE_S)
+            return
+        except TimeoutError:
+            pass
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            # It exited between the timeout and the kill.
+            pass
+        await asyncio.wait_for(proc.wait(), timeout=CODEX_APP_SERVER_KILL_WAIT_S)
 
     # ----------------------------------------------------------------- io loops
     async def _drain_stderr(self) -> None:
@@ -986,7 +1073,7 @@ class CodexAppServerClient:
             # same reset for the explicit-shutdown path; mirror it for
             # the involuntary-exit path.
             self._initialized = False
-            self._proc = None
+            self._forget_proc()
 
     def _dispatch(self, msg: dict) -> None:
         mid = msg.get("id")

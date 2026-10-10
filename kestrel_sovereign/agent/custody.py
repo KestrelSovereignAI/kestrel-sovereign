@@ -30,13 +30,13 @@ from typing import Awaitable, Callable, Collection, Dict, Optional, Tuple
 #: Until every owner a boot acquires from is listed, an agent keeps its serving
 #: record until its process exits. An owner joins only once its own close
 #: stops swallowing failures; that it returned without raising never makes it
-#: truthful. ``task_manager`` joined with #3558. The conversions still filed
-#: are #3559 (``llm_service``) and #3560 (``feature``); every other owner a
+#: truthful. ``task_manager`` joined with #3558 and ``llm_service`` with #3559.
+#: The conversion still filed is #3560 (``feature``); every other owner a
 #: boot acquires (``storage``, ``signal_dispatcher``, ``memory_system``,
 #: ``sync_service``, ``heartbeat_runner``, ``resume_monitor``,
 #: ``salvage_worker``, ``background_tasks``) needs its close shown truthful
 #: the same way first.
-TRUTHFUL_CLOSE_OWNERS: frozenset[str] = frozenset({"task_manager"})
+TRUTHFUL_CLOSE_OWNERS: frozenset[str] = frozenset({"task_manager", "llm_service"})
 
 #: The owner of every per-feature resource.
 FEATURE_OWNER = "feature"

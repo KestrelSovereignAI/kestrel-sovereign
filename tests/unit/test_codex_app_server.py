@@ -688,6 +688,10 @@ class TestInvoluntaryExitRecovery:
 
         c = CodexAppServerClient.__new__(CodexAppServerClient)
         c._binary = "/usr/bin/true"  # cheap, exits immediately
+        c._proc = None
+        c._unexited_procs = []
+        c._reader_task = None
+        c._stderr_task = None
         c._closed_error = CodexAppServerError("prior-instance gone")
         c._pending = {}
         c._turn_sinks = {}
@@ -743,6 +747,10 @@ class TestInvoluntaryExitRecovery:
 
         c = CodexAppServerClient.__new__(CodexAppServerClient)
         c._binary = "/usr/bin/true"
+        c._proc = None
+        c._unexited_procs = []
+        c._reader_task = None
+        c._stderr_task = None
         c._closed_error = None
         c._pending = {}
         c._turn_sinks = {}

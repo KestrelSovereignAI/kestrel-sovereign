@@ -66,6 +66,7 @@ from .decision_service import DecisionServiceMixin
 from .modality_recording import ModalityRecordingMixin
 from .decisions.resolve import RouteDecisionState
 from .decisions.config import DecisionRouteConfig
+from .handle_closer import HandleCloser, client_closes
 from kestrel_sovereign.kestrel_config.constants import (
     CLIENT_CLOSE_TIMEOUT,
 )
@@ -109,12 +110,6 @@ class AuditResult(BaseModel):
 
     risk_level: int
     reasoning: str
-
-
-async def _wait_for_close_result(result: Any) -> None:
-    """Await asynchronous close results while accepting synchronous close APIs."""
-    if inspect.isawaitable(result):
-        await asyncio.wait_for(asyncio.shield(result), timeout=CLIENT_CLOSE_TIMEOUT)
 
 
 def _redacted_content_marker(text: Any) -> str:
@@ -260,6 +255,22 @@ def resolve_active_model_selection(llm_service) -> Dict[str, Optional[str]]:
 
 class LLMServiceError(LLMError):
     """Raised when LLM service cannot fulfill a request."""
+
+
+class LLMServiceCloseError(LLMServiceError):
+    """``LLMService.close()`` left at least one handle open (#3559).
+
+    ``failures`` pairs the label of every handle that did not close with what
+    its close raised, in the order they were closed; the first is also the
+    cause. Each handle stays on the service, so a later ``close()`` retries it.
+    """
+
+    def __init__(self, failures: List[tuple[str, BaseException]]) -> None:
+        self.failures = tuple(failures)
+        named = ", ".join(
+            f"{label} ({type(error).__name__})" for label, error in self.failures
+        )
+        super().__init__(f"LLMService could not close {named}")
 
 
 class PolicyDeniedError(LLMServiceError):
@@ -572,6 +583,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         # any activation after that point would rebuild a client nothing will
         # ever close.
         self._remote_route_closed = False
+        # Every adapter, client, and private inference client whose close has
+        # not been confirmed, so a later ``close()`` retries it (#3559).
+        self._handle_closer = HandleCloser()
 
         # Observability store for logging LLM calls (A2A-compatible)
         # Set via set_observability_store() after initialization
@@ -4997,12 +5011,42 @@ No other text or formatting.
 
     # get_streaming_response is provided by StreamingMixin
 
-    async def close(self):
-        """Close all async HTTP clients properly."""
+    async def close(self) -> None:
+        """Close every adapter, client, and database the service holds (#3559).
+
+        Each provider's adapter and client (each transport of a google-genai
+        client), the private inference route, and the usage database are
+        closed independently, so one that fails does not keep the rest open.
+        A close that raised, or did not finish within
+        ``CLIENT_CLOSE_TIMEOUT``, has not released its handle: the handle
+        stays on the service, and a close a timeout left running keeps
+        running, so a later call retries the one and waits for the other. A
+        handle that already closed is closed again harmlessly.
+
+        Raises:
+            LLMServiceCloseError: A handle did not close. It names every one.
+            asyncio.CancelledError: The caller was cancelled. The handles not
+                yet closed stay for a later call.
+        """
         await self.drain_preference_persistence()
         await self.drain_modality_records()
 
+        closer = self._handle_closer
+        failures: List[tuple[str, BaseException]] = []
+        swept: set[int] = set()
+
+        async def close_handle(label: str, handle: Any, close: Callable[[], Any]) -> None:
+            if id(handle) in swept:
+                return
+            swept.add(id(handle))
+            try:
+                await closer.close(label, handle, close, timeout=CLIENT_CLOSE_TIMEOUT)
+            except Exception as e:
+                logger.warning("Could not close %s: %s", label, e, exc_info=True)
+                failures.append((label, e))
+
         for provider in self.providers:
+            name = provider.get("name")
             # Adapter-owned resources (e.g. CodexAdapter's app-server
             # subprocess) — adapters that own external state should
             # expose ``aclose``. The provider's ``client`` slot doesn't
@@ -5010,40 +5054,13 @@ No other text or formatting.
             # path), so consult the adapter directly.
             adapter = provider.get("adapter")
             if adapter is not None and hasattr(adapter, "aclose"):
-                try:
-                    await _wait_for_close_result(adapter.aclose())
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
-                except Exception as e:
-                    logger.warning(
-                        "Error closing %s adapter: %s",
-                        provider.get("name"), e, exc_info=True,
-                    )
+                await close_handle(f"{name} adapter", adapter, adapter.aclose)
 
             client = provider.get("client")
             if client is None:
                 continue
-
-            try:
-                if hasattr(client, "close") and callable(client.close):
-                    # Wrap in shield and timeout to handle cancellation gracefully
-                    try:
-                        await _wait_for_close_result(client.close())
-                    except asyncio.TimeoutError:
-                        logger.debug(f"Timeout closing {provider.get('name')} client")
-                    except asyncio.CancelledError:
-                        logger.debug(f"Cancelled while closing {provider.get('name')} client")
-                elif hasattr(client, "_client") and hasattr(client._client, "aclose"):
-                    try:
-                        await _wait_for_close_result(client._client.aclose())
-                    except (asyncio.TimeoutError, asyncio.CancelledError):
-                        pass
-            except (ConnectionError, OSError) as e:
-                logger.debug(f"Connection error closing {provider.get('name')} client: {e}")
-            except (RuntimeError, AttributeError) as e:
-                logger.warning(f"Error closing {provider.get('name')} client: {e}", exc_info=True)
-            except Exception as e:
-                logger.warning(f"Unexpected error closing {provider.get('name')} client: {e}", exc_info=True)
+            for label, handle, close in client_closes(f"{name} client", client):
+                await close_handle(label, handle, close)
 
         # Stop accepting remote calls and drain them before discarding route
         # credentials. Provider capacity is deliberately NOT released here:
@@ -5053,24 +5070,42 @@ No other text or formatting.
         # the drain that is about to run.
         async with self._remote_route_condition:
             self._remote_route_closed = True
-        if self._remote_lease is not None:
+        lease = self._remote_lease
+        if lease is not None:
             try:
                 await self.deactivate_inference_lease(
-                    self._remote_lease.lease_id,
+                    lease.lease_id,
                     require_active=False,
                 )
-            except LLMServiceError as exc:
+            except Exception as exc:
                 logger.warning(
                     "Private inference route cleanup did not complete during "
                     "LLMService shutdown (%s)",
                     type(exc).__name__,
                 )
+                # Only the type: route errors can carry provider details.
+                failures.append((
+                    f"private inference route {lease.lease_id}",
+                    LLMServiceError(
+                        "private inference route cleanup did not complete "
+                        f"({type(exc).__name__})"
+                    ),
+                ))
 
-        # Close the async usage tracking database
+        # Handles an earlier close left open that are no longer a provider's,
+        # such as a private inference client whose close failed when its
+        # route was released.
+        for label, handle, close in closer.unconfirmed():
+            await close_handle(label, handle, close)
+
         try:
             await self.close_usage_db()
-        except asyncio.CancelledError:
-            logger.debug("Cancelled while closing usage DB")
+        except Exception as e:
+            logger.warning("Could not close the usage database: %s", e, exc_info=True)
+            failures.append(("usage database", e))
+
+        if failures:
+            raise LLMServiceCloseError(failures) from failures[0][1]
 
     # Remote GPU Backend Methods are provided by RemoteBackendMixin
 

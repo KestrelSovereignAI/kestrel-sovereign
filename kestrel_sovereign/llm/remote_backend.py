@@ -57,17 +57,39 @@ class RemoteBackendMixin:
 
     _managed_remote_failure_message = _MANAGED_REMOTE_FAILURE_MESSAGE
 
-    @staticmethod
     async def _close_remote_client(
+        self,
         client: openai.AsyncOpenAI,
         *,
         lease_id: str,
     ) -> None:
-        """Close one route client without surfacing provider secret details."""
+        """Close one route client without surfacing provider secret details.
+
+        The route has already been detached, so a close that fails is logged
+        rather than raised. The client stays with the service's handle closer,
+        which ``LLMService.close()`` retries and reports (#3559).
+        """
+
+        async def close() -> None:
+            failure: str | None = None
+            try:
+                await client.close()
+            # Client implementations may raise transport-specific exceptions
+            # whose text can carry route details. Keep only the type, and
+            # raise outside the handler so the original is not even attached
+            # as the new error's context.
+            except Exception as exc:  # noqa: BLE001
+                failure = type(exc).__name__
+            if failure is not None:
+                raise ConnectionError(
+                    f"private inference client close failed ({failure})"
+                )
 
         try:
-            await asyncio.wait_for(
-                client.close(),
+            await self._handle_closer.close(
+                f"private inference client {lease_id}",
+                client,
+                close,
                 timeout=CLIENT_CLOSE_TIMEOUT,
             )
         except TimeoutError:
@@ -75,13 +97,11 @@ class RemoteBackendMixin:
                 "Timed out closing private inference client for %s",
                 lease_id,
             )
-        # Client implementations may raise transport-specific exceptions.
-        # The route has already been detached, so cleanup remains best-effort.
-        except Exception as exc:  # noqa: BLE001
+        except (ConnectionError, RuntimeError) as exc:
             logger.warning(
-                "Private inference client close failed for %s (%s)",
+                "Private inference client close failed for %s: %s",
                 lease_id,
-                type(exc).__name__,
+                exc,
             )
 
     def switch_backend(self, backend: BackendType, config: Any = None) -> None:

@@ -440,8 +440,8 @@ file, and every agent also writes a serving record into its data directory
 (#3522). The process removes its record only once the release of every
 resource the agent acquired is confirmed, and a release counts as confirmed
 only from an owner whose close reports a failure instead of logging it and
-returning. Only the A2A task manager qualifies so far (#3558); the LLM
-service, the features (#3559, #3560) and the agent's other owners do not yet,
+returning. Only the A2A task manager and the LLM service qualify so far
+(#3558, #3559); the features (#3560) and the agent's other owners do not yet,
 so for now a record stays until its process exits. An agent stopped inside a
 host that keeps running therefore still counts as running, as does one whose
 boot failed. A serving record is stale only on proof: it says it was written

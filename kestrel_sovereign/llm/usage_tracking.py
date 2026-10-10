@@ -628,17 +628,20 @@ class UsageTrackingMixin:
             logger.error(f"Auto-cleanup failed: {e}")
 
     async def close_usage_db(self):
-        """Close the usage tracking database connection."""
+        """Close the usage tracking database connection.
+
+        The database is forgotten only once its close finished. A close that
+        raised keeps it, so a later call retries the close (#3559).
+
+        Raises:
+            Exception: What the database's close raised.
+        """
         if not getattr(self, "_usage_db_owned", True):
             # A host can share one database across many LLM services. Closing
             # any one service must not retire the host's operational pool.
             return
         if self._usage_db:
-            try:
-                await self._usage_db.close()
-                logger.info("Usage tracking database closed.")
-            except Exception as e:
-                logger.debug(f"Error closing usage database: {e}")
-            finally:
-                self._usage_db = None
-                self._db_initialized = False
+            await self._usage_db.close()
+            logger.info("Usage tracking database closed.")
+            self._usage_db = None
+            self._db_initialized = False

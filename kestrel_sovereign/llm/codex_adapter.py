@@ -3727,6 +3727,10 @@ class CodexAdapter(LLMAdapter):
         return None
 
     async def aclose(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
+        """Close the app-server client; keep it if its close fails (#3559)."""
+        client = self._client
+        if client is None:
+            return
+        await client.aclose()
+        if self._client is client:
             self._client = None

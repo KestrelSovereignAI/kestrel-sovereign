@@ -31,6 +31,7 @@ from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.llm.service import (
     BackendType,
     LLMService,
+    LLMServiceCloseError,
     LLMServiceError,
 )
 
@@ -2915,11 +2916,18 @@ class TestBackendLifecycle:
         assert mock_openai_client.close.called
 
     @pytest.mark.asyncio
-    async def test_close_handles_exceptions_gracefully(self, llm_service):
-        """Test that close() handles exceptions during cleanup."""
-        # Add a provider with a broken close method
+    async def test_a_failed_client_close_raises_and_a_retry_closes_it(
+        self, llm_service, mock_openai_client
+    ):
+        """A failed close is reported, and the other clients still close (#3559)."""
+        failures = [ConnectionError("Close failed")]
+
+        async def close_failing_once():
+            if failures:
+                raise failures.pop()
+
         broken_client = AsyncMock()
-        broken_client.close = AsyncMock(side_effect=Exception("Close failed"))
+        broken_client.close = AsyncMock(side_effect=close_failing_once)
 
         llm_service.providers.append({
             "name": "broken",
@@ -2928,8 +2936,16 @@ class TestBackendLifecycle:
             "model": "test",
         })
 
-        # Should not raise
+        with pytest.raises(LLMServiceCloseError, match="broken client") as raised:
+            await llm_service.close()
+
+        assert [label for label, _ in raised.value.failures] == ["broken client"]
+        assert isinstance(raised.value.__cause__, ConnectionError)
+        assert mock_openai_client.close.called, "the other clients still closed"
+
         await llm_service.close()
+
+        assert broken_client.close.await_count == 2
 
     @pytest.mark.asyncio
     async def test_close_usage_db_runs_when_remote_drain_times_out(self, llm_service):
@@ -2939,13 +2955,21 @@ class TestBackendLifecycle:
         )
         llm_service.close_usage_db = AsyncMock()
 
-        await llm_service.close()
+        with pytest.raises(
+            LLMServiceCloseError, match="private inference route lease-1"
+        ) as raised:
+            await llm_service.close()
 
+        # Route errors can carry provider details, so only the type is kept.
+        [(_label, recorded)] = raised.value.failures
+        assert "draining private route" not in str(recorded)
+        assert "LLMServiceError" in str(recorded)
         llm_service.deactivate_inference_lease.assert_awaited_once_with(
             "lease-1",
             require_active=False,
         )
         llm_service.close_usage_db.assert_awaited_once()
+        llm_service._remote_lease = None
 
     @pytest.mark.asyncio
     async def test_close_accepts_sync_provider_close(self, llm_service, caplog):
