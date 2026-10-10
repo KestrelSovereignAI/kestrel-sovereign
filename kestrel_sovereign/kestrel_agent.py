@@ -138,6 +138,7 @@ from kestrel_sovereign.telemetry import (
 )
 
 if TYPE_CHECKING:
+    from kestrel_sovereign.execution_custody import ExecutionCustody
     from kestrel_sovereign.a2a.agent_card import AgentCard
     from kestrel_sovereign.features.peers.directory import (
         PeerDirectoryRouter,
@@ -723,6 +724,7 @@ class KestrelAgent(
         database_url: Optional[str] = None,
         db_backend: Optional[str] = None,
         shared_postgres_advisory_backend: Optional["PostgresBackend"] = None,
+        execution_custody: Optional["ExecutionCustody"] = None,
         allowed_features: Optional[set] = None,
         sync_enabled: Optional[bool] = None,
         payer_policy=None,
@@ -864,6 +866,12 @@ class KestrelAgent(
                 complete maintenance snapshot for the active capability.
         """
         self.did = did
+        from kestrel_sovereign.execution_custody import ExecutionCustody, require_execution_work
+
+        if execution_custody is not None and not isinstance(execution_custody, ExecutionCustody):
+            raise TypeError("execution_custody must be Core ExecutionCustody")
+        self._execution_custody = execution_custody
+        require_execution_work(self)
         # Production launchers bind the fleet control store before initialize.
         # Direct construction remains supported for embedding/tests; only an
         # explicit binding activates the durable turn-start admission seam.
@@ -881,6 +889,8 @@ class KestrelAgent(
         effective_db_backend = db_backend or os.environ.get(
             "KESTREL_DB_BACKEND", "sqlite"
         )
+        if execution_custody is not None and effective_db_backend.lower() != "postgres":
+            raise ValueError("custody-bound hosted runtime requires PostgreSQL")
         if type(isolated_runtime_hosted) is not bool:
             raise TypeError("isolated_runtime_hosted must be a bool")
         if isolated_feature_data_dir is not None and (
@@ -2137,6 +2147,7 @@ class KestrelAgent(
                 else self._explicit_advisory_dsn
             ),
             advisory_backend=self._shared_postgres_advisory_backend,
+            execution_custody=getattr(self, "_execution_custody", None),
         )
 
     async def initialize(self) -> None:
@@ -2173,7 +2184,10 @@ class KestrelAgent(
             self._boot_state = new_state
 
         try:
-            await run_boot_sequence(self._boot_phases(), ctx, _set_state)
+            from kestrel_sovereign.execution_custody import bind_execution_runtime
+
+            with bind_execution_runtime(self):
+                await run_boot_sequence(self._boot_phases(), ctx, _set_state)
         except asyncio.CancelledError as exc:
             if self._host_authority_boot_expired:
                 raise PersistedSpawnMandateExpiredError(
@@ -2543,8 +2557,15 @@ class KestrelAgent(
                 )
                 logging.info(f"Using shared PostgreSQL pool for Kestrel storage (agent: {self.did})")
             else:
+                postgres_backend: Any = "postgres"
+                if getattr(self, "_execution_custody", None) is not None:
+                    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+                    postgres_backend = PostgresBackend(
+                        self._database_url, execution_custody=self._execution_custody,
+                    )
                 self._raw_storage = AsyncStorage(
-                    backend="postgres",
+                    backend=postgres_backend,
                     dsn=self._database_url,
                     agent_id=self.did,
                     llm_service=self.llm_service,

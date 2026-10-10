@@ -681,6 +681,7 @@ class SQLiteBackend(DatabaseBackend):
 
     async def connect(self) -> None:
         """Connect to SQLite database."""
+        require_execution_backend("sqlite")
         if self.connection_retirement_pending:
             raise ConnectionError(
                 "Cannot reconnect SQLite while a previous connection worker "

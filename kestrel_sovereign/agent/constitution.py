@@ -2571,6 +2571,21 @@ class ConstitutionMixin:
                 consumed = await ConstitutionMixin._consume_initial_anchor_custody(self)
             ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
         except Exception as e:
+            from kestrel_sovereign.execution_custody import execution_commit_outcome
+
+            outcome = execution_commit_outcome(e)
+            if outcome is not None:
+                if outcome == "committed":
+                    ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
+                # Never continue cognition using an unreconciled in-memory
+                # anchor. No provider notice or fresh work admission is minted.
+                self._safe_mode = True
+                self._safe_mode_reason = "Reanchor commit requires durable-state reconciliation"
+                return (
+                    f"Error: Reanchor transaction outcome is {outcome}; do not retry "
+                    "the write. Reload and reconcile the durable anchor before "
+                    f"resuming work: {e}"
+                )
             return (
                 f"Error: Reanchor failed mid-write and was rolled back; "
                 f"no changes were committed: {e}"

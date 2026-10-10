@@ -31,6 +31,14 @@ from kestrel_sovereign.features.scheduler.constants import (
     ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
 )
 from kestrel_sovereign.turn_scope import turn_scoped
+from kestrel_sovereign.execution_custody import (
+    AdvisoryExecutionFence,
+    ExecutionAuthorityError,
+    bind_execution_custody,
+    bind_execution_custody_snapshot,
+    current_execution_custody,
+    require_execution_work,
+)
 from kestrel_sovereign.storage.database_clock import (
     database_backend_type as scheduler_database_backend_type,
     database_clock as scheduler_database_clock,
@@ -471,11 +479,17 @@ class _LeaseRenewalState:
 
     lost: asyncio.Event = field(default_factory=asyncio.Event)
     error: Optional[BaseException] = None
+    custody: tuple = ()
 
     def mark_lost(self, error: Optional[BaseException] = None) -> None:
         if self.error is None and error is not None:
             self.error = error
         self.lost.set()
+
+
+_rollout_renewal_state: contextvars.ContextVar[_LeaseRenewalState | None] = contextvars.ContextVar(
+    "scheduler_rollout_renewal_state", default=None,
+)
 
 
 @dataclass
@@ -525,6 +539,7 @@ def get_current_scheduler_execution() -> Optional[SchedulerExecution]:
         return None
     if not scope.active:
         raise SchedulerAuthorityRevoked(scope.execution.id)
+    require_execution_work()
     return scope.execution
 
 
@@ -2364,8 +2379,23 @@ class SchedulerRunner:
             )
             for agent_id in sorted(set(agent_ids))
         )
-        async with advisory_locks(keys, shared=shared):
-            yield
+        renewal_state = _rollout_renewal_state.get()
+
+        def on_loss(_lease):
+            if renewal_state is not None:
+                renewal_state.mark_lost(ExecutionAuthorityError("scheduler advisory session lost"))
+
+        async with advisory_locks(keys, shared=shared, on_loss=on_loss if keys else None) as lease:
+            if shared and lease is not None:
+                with bind_execution_custody(AdvisoryExecutionFence(
+                    lease, owner_live=(
+                        (lambda: not renewal_state.lost.is_set())
+                        if renewal_state is not None else None
+                    ),
+                )):
+                    yield
+            else:
+                yield
 
     @asynccontextmanager
     async def _postgres_rollout_effect_gate(self, agent_id: str):
@@ -3221,6 +3251,7 @@ class SchedulerRunner:
             owner=self._owner_id,
         )
         renewal_state = _LeaseRenewalState()
+        rollout_token = _rollout_renewal_state.set(renewal_state)
         try:
             renewal = asyncio.create_task(
                 self._monitor_lease_renewal(task, renewal_state),
@@ -3228,6 +3259,7 @@ class SchedulerRunner:
             )
         except BaseException:
             self._forget_live_claim(task)
+            _rollout_renewal_state.reset(rollout_token)
             raise
         started = time.monotonic()
         in_preparation = True
@@ -3238,6 +3270,10 @@ class SchedulerRunner:
             # revoke the target between preparation and dispatch. Renewal is
             # already active while this may take time.
             async with self._prepared_execution(execution) as dispatch:
+                # Renewal was started before cold preparation. Capture the
+                # host's original generation now, never reconstruct it from a
+                # later database read or assume task creation inherited it.
+                renewal_state.custody = current_execution_custody()
                 in_preparation = False
                 if renewal_state.lost.is_set():
                     self._log_lease_loss(execution, phase="preparation")
@@ -3454,7 +3490,10 @@ class SchedulerRunner:
                     ran=False,
                 )
         finally:
-            await self._stop_renewal(renewal, task, execution)
+            try:
+                await self._stop_renewal(renewal, task, execution)
+            finally:
+                _rollout_renewal_state.reset(rollout_token)
 
     def _prepared_executor_method(self) -> Optional[Callable[[SchedulerExecution], Any]]:
         """Return a structurally supplied preparation method, if any.
@@ -3524,7 +3563,9 @@ class SchedulerRunner:
     async def _renew_live_claim_once(self, task: ScheduledTask) -> bool:
         """Renew a claim and expose only its bounded live-lease interval."""
 
-        renewed = await self._renew_lease_once(task)
+        state = _rollout_renewal_state.get()
+        with bind_execution_custody_snapshot(state.custody if state is not None else ()):
+            renewed = await self._renew_lease_once(task)
         execution_id = task.claim_execution_id
         if not execution_id:
             return renewed
@@ -3581,7 +3622,10 @@ class SchedulerRunner:
         """
 
         async def invoke_dispatch() -> Any:
-            return await dispatch()
+            require_execution_work()
+            result = await dispatch()
+            require_execution_work()
+            return result
 
         effect = asyncio.create_task(
             invoke_dispatch(), name=f"scheduler-effect:{execution.id}"

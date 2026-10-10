@@ -44,6 +44,7 @@ from kestrel_sovereign.turn_completion import (
     settle_repaired_content,
     turn_completion_repair_prompt,
 )
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, require_execution_work
 
 logger = logging.getLogger(__name__)
 
@@ -410,6 +411,7 @@ class Feature(_SdkFeature):
             return response
         # The pattern is usually a finished answer's plan; confirm it first
         # when the decision check is on (#3527).
+        require_execution_work(self.agent)
         if not await confirm_unfinished(
             self.agent.llm_service, content, request=request, session_id=session_id,
         ):
@@ -419,6 +421,7 @@ class Feature(_SdkFeature):
             "[SUBAGENT %s] Model signaled continuation without tool_calls; issuing one repair turn",
             self.name,
         )
+        require_execution_work(self.agent)
         repaired = await self.agent.llm_service.generate_with_messages(
             messages=self._append_missing_tool_call_repair(messages, content),
             tools=tools if tools else None,
@@ -426,6 +429,7 @@ class Feature(_SdkFeature):
             model_override=model_override,
             invocation_context=_subagent_turn_identity(session_id),
         )
+        require_execution_work(self.agent)
         # A repair that neither calls a tool nor ran one inline either confirms
         # the message was the subagent's answer (keep it, followed by anything
         # the repair adds) or is a new answer. Settled on the response itself,
@@ -1554,6 +1558,7 @@ class Feature(_SdkFeature):
             # binding, so re-resolving deeper in the loop would let a long run
             # start stamping None halfway through and split the band anyway.
             turn_session_id = self._turn_session_id()
+            require_execution_work(self.agent)
             response = await self.agent.llm_service.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
@@ -1566,6 +1571,7 @@ class Feature(_SdkFeature):
                 # so it carries no provider-continuation meaning to collide with.
                 session_id=turn_session_id,
             )
+            require_execution_work(self.agent)
 
             # Log what we got back
             if hasattr(response, 'tool_calls') and response.tool_calls:
@@ -1600,8 +1606,11 @@ class Feature(_SdkFeature):
             envelope: Dict[str, Any] = {"success": True, "result": result}
             if subagent_parts:
                 envelope["parts"] = subagent_parts
+            require_execution_work(self.agent)
             return envelope
 
+        except ExecutionAuthorityError:
+            raise
         except Exception as e:
             logger.error(f"Feature {self.name} subagent execution failed: {e}")
             err_envelope: Dict[str, Any] = {"success": False, "error": str(e)}
@@ -1835,8 +1844,15 @@ class Feature(_SdkFeature):
                 # ``updated_input`` override) — see the comment block
                 # before the DENY/ASK branch.
 
+            require_execution_work(self.agent)
             try:
                 result = await selected_tool.execute(**effective_args)
+                from kestrel_sovereign.agent.invocation import mark_current_invocation_effect_completed
+
+                mark_current_invocation_effect_completed(None)
+                require_execution_work(self.agent)
+            except ExecutionAuthorityError:
+                raise
             except Exception as e:
                 logger.warning(
                     "[SUBAGENT-TOOL] %s raised %s",
@@ -1856,6 +1872,7 @@ class Feature(_SdkFeature):
                 envelope_parts = serialized.get("parts")
                 if isinstance(envelope_parts, list) and envelope_parts:
                     parts_sink.extend(envelope_parts)
+            require_execution_work(self.agent)
             return _shape(effective_args, serialized)
 
     def _compose_subagent_runtime_tools(
@@ -2186,6 +2203,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             # turns don't hit the same "requires a tool_executor"
             # provider error the initial subagent call avoided
             # (codex round 1 P2 on #1461 follow-up).
+            require_execution_work(self.agent)
             response = await self.agent.llm_service.generate_with_messages(
                 messages=messages,
                 tools=tools if tools else None,
@@ -2196,6 +2214,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 # share its provider thread (:func:`_subagent_turn_identity`).
                 invocation_context=_subagent_turn_identity(session_id),
             )
+            require_execution_work(self.agent)
 
             effective_model = (
                 model_override or getattr(response, "model", None) or effective_model
@@ -2292,8 +2311,12 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             tool_result_parts_buffer,
                         )
                         with tool_result_parts_buffer() as pending_parts:
+                            require_execution_work(self.func.__self__.agent)
                             try:
                                 result = await self.func(**kwargs)
+                                require_execution_work(self.func.__self__.agent)
+                            except ExecutionAuthorityError:
+                                raise
                             except Exception as e:
                                 logger.error(f"Error executing tool {self.name}: {e}")
                                 response: Dict[str, Any] = {

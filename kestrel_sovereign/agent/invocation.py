@@ -21,6 +21,10 @@ from urllib.parse import quote, unquote_to_bytes
 import uuid
 
 from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import (
+    bind_execution_cleanup, bind_execution_runtime,
+    current_execution_custody, require_execution_work,
+)
 from kestrel_sovereign.auth import (
     caller_context_binding_scope,
     caller_context_lifetime,
@@ -363,9 +367,15 @@ def bind_async_invocation(
                 provenance=bound.arguments.get("invocation_provenance"),
             ) as invocation_id, caller_context_scope(
                 bound.arguments.get("caller")
-            ):
+            ), bind_execution_runtime(args[0] if args else None):
                 bound.arguments[parameter] = invocation_id
                 lifecycle_owner = args[0] if args else None
+
+                async def invoke_governed():
+                    require_execution_work(lifecycle_owner)
+                    result = await function(*bound.args, **bound.kwargs)
+                    require_execution_work(lifecycle_owner)
+                    return result
                 registered = False
                 cleanup_abandoned = False
                 isolated_operation: asyncio.Task[Any] | None = None
@@ -389,12 +399,31 @@ def bind_async_invocation(
                         None,
                     )
                     if not callable(checkpoint):
-                        return
+                        raise RuntimeError("completed-effect checkpoint is unavailable")
                     await checkpoint(
                         session_id=state.session_id,
                         request_id=invocation_id,
                     )
                     state.checkpointed = True
+
+                async def preserve_failed_effects(error: BaseException) -> None:
+                    nonlocal cleanup_abandoned
+                    state = _current_effect_checkpoint.get()
+                    if state is None or not state.completed or state.checkpointed:
+                        return
+                    try:
+                        with bind_execution_cleanup(lifecycle_owner):
+                            await checkpoint_completed_effects()
+                    except BaseException as checkpoint_error:
+                        # A completed effect without durable anti-repeat
+                        # evidence remains unresolved, not a clean failure.
+                        # Retain the original error and existing exact Stop
+                        # identity; never reopen ordinary work for cleanup.
+                        cleanup_abandoned = True
+                        error.add_note(
+                            "completed-effect checkpoint remains unresolved: "
+                            f"{type(checkpoint_error).__name__}"
+                        )
 
                 if track_request_lifecycle and lifecycle_owner is not None:
                     register = getattr(
@@ -477,7 +506,7 @@ def bind_async_invocation(
                                 from_task=caller_task,
                             ):
                                 if transition_delegation is None:
-                                    return await function(*bound.args, **bound.kwargs)
+                                    return await invoke_governed()
                                 bind_transition_delegation = getattr(
                                     type(lifecycle_owner),
                                     "_bind_committed_feature_transition_delegation",
@@ -492,7 +521,7 @@ def bind_async_invocation(
                                     lifecycle_owner,
                                     transition_delegation,
                                 ):
-                                    return await function(*bound.args, **bound.kwargs)
+                                    return await invoke_governed()
 
                         isolated_operation = asyncio.create_task(
                             run_isolated_operation(),
@@ -593,12 +622,13 @@ def bind_async_invocation(
                                     and child_value != parent_value
                                 ):
                                     variable.set(child_value)
-                    return await function(*bound.args, **bound.kwargs)
-                except (InvocationCancelledError, InvocationSelfFencedError):
+                    return await invoke_governed()
+                except (InvocationCancelledError, InvocationSelfFencedError) as error:
                     # The isolated child cooperatively unwound after Stop or a
                     # lease self-fence. Its cancellation is a successful
                     # lifecycle cleanup, not abandonment. Keep the typed errors
                     # distinct so callers retry only the infrastructure case.
+                    await preserve_failed_effects(error)
                     raise
                 except BaseException as error:
                     if registered:
@@ -641,6 +671,7 @@ def bind_async_invocation(
                             # cancellation predicate is conservatively treated
                             # as failed cleanup.
                             cleanup_abandoned = True
+                    await preserve_failed_effects(error)
                     raise
                 finally:
                     if registered:
@@ -713,6 +744,7 @@ def bind_async_generator_invocation(
             registered = False
             cleanup_abandoned = False
             effect_checkpoint = InvocationEffectCheckpoint()
+            admitted_custody = ()
 
             async def checkpoint_completed_effects() -> None:
                 if (
@@ -727,7 +759,7 @@ def bind_async_generator_invocation(
                     None,
                 )
                 if not callable(checkpoint):
-                    return
+                    raise RuntimeError("completed-effect checkpoint is unavailable")
                 persistence = asyncio.create_task(
                     checkpoint(
                         session_id=effect_checkpoint.session_id,
@@ -784,11 +816,13 @@ def bind_async_generator_invocation(
                             effective_id,
                             effective_provenance,
                             effect_checkpoint,
-                        ), caller_context_binding_scope(caller_binding):
+                        ), caller_context_binding_scope(caller_binding), bind_execution_runtime(lifecycle_owner):
+                            admitted_custody = current_execution_custody(lifecycle_owner)
                             try:
                                 item = await anext(iterator)
                             except StopAsyncIteration:
                                 return
+                            require_execution_work(lifecycle_owner)
                         yield item
                 finally:
                     try:
@@ -796,7 +830,7 @@ def bind_async_generator_invocation(
                             effective_id,
                             effective_provenance,
                             effect_checkpoint,
-                        ), caller_context_binding_scope(caller_binding):
+                        ), caller_context_binding_scope(caller_binding), bind_execution_cleanup(lifecycle_owner, admitted_custody):
                             try:
                                 close_iterator = getattr(iterator, "aclose", None)
                                 if callable(close_iterator):

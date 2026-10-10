@@ -18,7 +18,7 @@ privacy: public
 # Kestrel Storage Architecture
 
 **Status:** Active implementation snapshot
-**Last updated:** 2026-07-26
+**Last updated:** 2026-10-10
 
 This document describes the storage stack that is in the current repository.
 Older versions of this page described a pre-async, pre-SQLAlchemy migration plan;
@@ -76,6 +76,46 @@ degrading quietly. CI and the devcontainer pin `pgvector/pgvector:pg16`.
 
 Application code writes SQLite-style `?` placeholders. The backend layer
 normalizes SQL for PostgreSQL where needed.
+
+### Hosted execution custody
+
+`kestrel_sovereign.execution_custody` carries a host-authored immutable
+companion/DID/owner/runtime-generation binding. The host implements
+`ExecutionFence.require_work()` for synchronous admission checks and
+`lock_and_validate(connection)` for validation on the native mutation's actual
+PostgreSQL connection. Validators lock authority rows before graph/file rows,
+retain those locks through commit, and must not begin or commit a transaction.
+They do not derive authority from telemetry, trace IDs or tool arguments.
+
+Pass the original `ExecutionCustody` to `KestrelAgent(execution_custody=...)` or
+`PostgresBackend.from_pool(..., execution_custody=...)`. It is retained on the
+runtime/backend and combined with ambient admissions, so background tasks and
+foreign turn executors cannot silently become unfenced. Explicit transaction
+membership is fixed at entry; introducing a new admission inside it is refused
+before SQL. Copied children retain irrevocable denial after retirement.
+
+Native `advisory_locks(..., on_loss=...)` yields an `AdvisoryLease` for the exact
+physical session. Physical loss is observed during acquisition and ownership;
+normal release retires the handle without a loss notification. The scheduler
+uses this capability, its existing claim CAS, and captured host generation for
+renewal and effect admission. Replacement locks never repair old admissions.
+No invocation-long transaction or additional authority pool is introduced.
+
+Custody-bound SQLite bootstrap and SQLAlchemy execution are refused, including
+cached sessions/connections. Rollback and close remain available. Hosted stream
+cleanup cannot dispatch cognition/tools or perform general storage writes. The
+native Stop store may settle only an existing exact generation/owner identity
+through its fixed terminal CAS on the same bounded operational pool. Completed
+effects whose ordinary checkpoint cannot be made durable remain in Stop's
+unresolved ledger, not a clean completion. This cannot recall an external
+effect already submitted before authority was lost.
+
+`execution_commit_outcome(error)` distinguishes successful commit followed by
+denial (`committed`) from lost commit acknowledgement (`unknown`), including
+legacy storage exception wrapping. Reanchor reports reconciliation required
+and enters SafeMode; neither outcome is described as rollback or safe to retry.
+This is an opt-in native contract, not evidence that a downstream host has
+installed it or passed live rollout acceptance.
 
 ## SQLAlchemy Layer
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -175,6 +176,42 @@ class _LocalGeneration:
     turn_id: str
     generation: int
     owner_id: str
+
+
+class _TerminalStopDatabase:
+    """Private executor for the fixed exact-identity settlement, never exposed."""
+
+    backend_type = "postgres"
+
+    def __init__(self, connection: Any):
+        self._connection = connection
+
+    @asynccontextmanager
+    async def transaction(self, *, immediate=False):
+        async with self._connection.transaction():
+            yield
+
+    async def execute(self, query, params=()):
+        from kestrel_sovereign.storage.db.placeholder import sqlite_to_postgres
+
+        result = await self._connection.execute(sqlite_to_postgres(query)[0], *params)
+        return int(result.rsplit(" ", 1)[-1])
+
+    async def fetchone(self, query, params=()):
+        from kestrel_sovereign.storage.db.placeholder import sqlite_to_postgres
+
+        row = await self._connection.fetchrow(sqlite_to_postgres(query)[0], *params)
+        return tuple(row.values()) if row is not None else None
+
+
+async def _settle_stop_on_connection(connection, generation_id, owner_id, disposition):
+    """Reuse canonical settlement SQL, with no ordinary work admission."""
+    generation_id = _required_identity(generation_id, "generation identity")
+    owner_id = _required_identity(owner_id, "owner identity")
+    if not isinstance(disposition, RequestCompletionDisposition):
+        raise TypeError("distributed Stop settlement disposition must be typed")
+    store = DistributedInvocationStore(_TerminalStopDatabase(connection))
+    await store._settle_rows(generation_id, owner_id, disposition)
 
 
 class DistributedInvocationStore:
@@ -499,6 +536,18 @@ class DistributedInvocationStore:
         owner_id = _required_identity(owner_id, "owner identity")
         if not isinstance(disposition, RequestCompletionDisposition):
             raise TypeError("distributed Stop settlement disposition must be typed")
+        from kestrel_sovereign.execution_custody import current_execution_custody
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+        backend = getattr(self._db, "backend", None)
+        if isinstance(backend, PostgresBackend) and current_execution_custody(backend):
+            await backend.settle_stop_invocation(generation_id, owner_id, disposition)
+            return
+        await self._settle_rows(generation_id, owner_id, disposition)
+
+    async def _settle_rows(
+        self, generation_id: str, owner_id: str, disposition: RequestCompletionDisposition,
+    ) -> None:
         async with self._db.transaction(immediate=True):
             row = await self._db.fetchone(
                 "SELECT agent_id FROM stop_active_invocations "

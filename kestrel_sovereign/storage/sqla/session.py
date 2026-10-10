@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from kestrel_sovereign.storage.db.interface import ConnectionError
+from kestrel_sovereign.execution_custody import refuse_unfenced_executor
 from kestrel_sovereign.storage.db.sqlite import (
     SQLiteBackend,
     _RetainedAiosqliteCloses,
@@ -113,8 +114,10 @@ class SovereignSqlaSessionFactory:
     just needs ENOUGH of it to drive ``kestrel_sovereign.storage.vector``.
     """
 
-    def __init__(self, engine: Any, *, sqlite_custody=None) -> None:
+    def __init__(self, engine: Any, *, sqlite_custody=None, execution_owner=None) -> None:
+        refuse_unfenced_executor(execution_owner)
         self._engine = engine
+        self._execution_owner = execution_owner
         self._sqlite_custody = sqlite_custody
         # SQLAlchemy's aiosqlite dialect acknowledges ``engine.dispose()``
         # after each driver's ``Connection.close()`` returns, which has the
@@ -141,11 +144,10 @@ class SovereignSqlaSessionFactory:
             event.listen(
                 engine.sync_engine, "connect", self._track_sqlite_connection
             )
-            if sqlite_custody is not None:
-                # Native connection identity fences engine-only consumers too,
-                # including cached checkouts and already yielded connections.
-                for hook in ("do_connect", "connect", "checkout", "before_cursor_execute", "commit"):
-                    event.listen(engine.sync_engine, hook, self._assert_session_connection_available)
+        # Guard cached factories, yielded sessions and retained engine-only
+        # checkouts. Rollback/close deliberately remain available for retirement.
+        for hook in ("do_connect", "connect", "checkout", "before_cursor_execute", "commit"):
+            event.listen(engine.sync_engine, hook, self._assert_session_connection_available)
 
     @property
     def engine(self) -> Any:
@@ -264,6 +266,7 @@ class SovereignSqlaSessionFactory:
 
     def _assert_session_connection_available(self, *args, **kwargs) -> None:
         """Permanently fence new work after factory close begins."""
+        refuse_unfenced_executor(self._execution_owner)
         if self._close_started:
             raise ConnectionError(
                 "SQLAlchemy session factory is closing or closed; "
@@ -583,6 +586,7 @@ def make_session_factory(db: Any) -> SovereignSqlaSessionFactory:
             error message points the way.
         ValueError: If the backend type isn't recognized.
     """
+    refuse_unfenced_executor(getattr(db, "backend", None))
     retirement_owner = getattr(db, _RETIREMENT_OWNER_ATTR, None)
     if isinstance(retirement_owner, SovereignSqlaSessionFactory):
         raise ConnectionError(
@@ -634,7 +638,7 @@ def make_session_factory(db: Any) -> SovereignSqlaSessionFactory:
             engine = create_async_engine(URL.create("sqlite+aiosqlite", database=Path(path).as_uri(), query={"mode": "rw", "uri": "true"}))
         else:
             engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
-        factory = SovereignSqlaSessionFactory(engine, sqlite_custody=custody)
+        factory = SovereignSqlaSessionFactory(engine, sqlite_custody=custody, execution_owner=db.backend)
         try:
             setattr(db, _CACHE_ATTR, factory)
         except Exception:
@@ -667,7 +671,7 @@ def make_session_factory(db: Any) -> SovereignSqlaSessionFactory:
         else:
             sqla_dsn = dsn
         engine = create_async_engine(sqla_dsn)
-        factory = SovereignSqlaSessionFactory(engine)
+        factory = SovereignSqlaSessionFactory(engine, execution_owner=db.backend)
         try:
             setattr(db, _CACHE_ATTR, factory)
         except Exception:

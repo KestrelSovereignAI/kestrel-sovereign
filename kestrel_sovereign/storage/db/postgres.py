@@ -34,6 +34,8 @@ from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
+    ExecutionCustody,
+    ExecutionCommitOutcomeError,
     current_execution_custody,
     lock_execution_authority,
     require_execution_backend,
@@ -204,6 +206,7 @@ class PostgresBackend(DatabaseBackend):
         min_pool_size: int = 2,
         max_pool_size: int = 10,
         advisory_max_pool_size: Optional[int] = None,
+        execution_custody: ExecutionCustody | None = None,
     ):
         """
         Initialize PostgreSQL backend.
@@ -229,6 +232,7 @@ class PostgresBackend(DatabaseBackend):
             )
         
         self._dsn = dsn
+        self._execution_custody = execution_custody
         self._host = host
         self._port = port
         self._database = database
@@ -289,6 +293,7 @@ class PostgresBackend(DatabaseBackend):
         advisory_connect_kwargs: Optional[dict[str, Any]] = None,
         advisory_backend: Optional["PostgresBackend"] = None,
         advisory_max_pool_size: Optional[int] = None,
+        execution_custody: ExecutionCustody | None = None,
     ) -> "PostgresBackend":
         """
         Create a PostgresBackend from an existing asyncpg pool.
@@ -342,6 +347,7 @@ class PostgresBackend(DatabaseBackend):
         # (for example SQLAlchemy session factories). The scheduler-only
         # dedicated advisory pool has its own explicit connection source.
         instance._dsn = None
+        instance._execution_custody = execution_custody
         instance._host = None
         instance._port = 5432
         instance._database = None
@@ -484,6 +490,43 @@ class PostgresBackend(DatabaseBackend):
             return conn
         return None
 
+    def _transaction_custody_context(self) -> contextvars.ContextVar:
+        """Per-backend, owner-task ledger of every admission touching a commit."""
+
+        var = getattr(self, "_txn_custody_var", None)
+        if not isinstance(var, contextvars.ContextVar):
+            var = contextvars.ContextVar("pg_transaction_execution_custody", default=None)
+            self._txn_custody_var = var
+        return var
+
+    def _transaction_custody(self) -> list[ExecutionCustody] | None:
+        entry = self._transaction_custody_context().get()
+        if entry is None or entry[0] is not asyncio.current_task():
+            return None
+        return entry[1]
+
+    def _remember_transaction_custody(self) -> tuple[ExecutionCustody, ...]:
+        current = current_execution_custody(self)
+        retained = self._transaction_custody()
+        if retained is None:
+            return current
+        if any(scope not in retained for scope in current):
+            # Authority must precede every graph/file lock. Adding an
+            # admission after the transaction began would invert that order
+            # and could both deadlock and erase a revoked child at commit.
+            raise ExecutionAuthorityError(
+                "execution admissions cannot be added inside an open transaction"
+            )
+        return tuple(retained)
+
+    async def _lock_transaction_custody(self, connection: Any) -> None:
+        await lock_execution_authority(
+            connection, "postgres", self._remember_transaction_custody(),
+        )
+
+    def _require_transaction_custody(self) -> None:
+        require_execution_backend("postgres", self._remember_transaction_custody())
+
     def _current_operational_lease(self) -> Optional[_OperationalSessionLease]:
         """Return the live operational lease inherited by this task, if any."""
 
@@ -539,6 +582,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def connect(self) -> None:
         """Connect to PostgreSQL and create connection pool."""
+        require_execution_backend("postgres", current_execution_custody(self))
         if self._pool is not None:
             return
         
@@ -630,7 +674,7 @@ class PostgresBackend(DatabaseBackend):
     
     def _ensure_connected(self) -> asyncpg.Pool:
         """Ensure we have an active pool."""
-        require_execution_backend("postgres")
+        require_execution_backend("postgres", current_execution_custody(self))
         if self._pool is None:
             raise ConnectionError("Not connected to database. Call connect() first.")
         return self._pool
@@ -684,7 +728,7 @@ class PostgresBackend(DatabaseBackend):
     
     def _convert_query(self, query: str) -> str:
         """Convert SQLite-style ? placeholders to PostgreSQL $N style."""
-        if self._current_txn_conn() is not None or current_execution_custody():
+        if self._current_txn_conn() is not None or current_execution_custody(self):
             reject_transaction_control(query, dialect="postgres")
         converted, _ = sqlite_to_postgres(query)
         return converted
@@ -698,33 +742,52 @@ class PostgresBackend(DatabaseBackend):
         disclose old-owner data. Never classify authority from a SQL verb.
         """
 
-        if not current_execution_custody():
+        scopes = self._remember_transaction_custody()
+        if not scopes:
             yield executor
             return
-        require_execution_backend("postgres")
+        require_execution_backend("postgres", scopes)
         if self._current_txn_conn() is not None:
-            await lock_execution_authority(executor, "postgres")
+            await lock_execution_authority(executor, "postgres", scopes)
             yield executor
-            require_execution_backend("postgres")
+            self._require_transaction_custody()
             return
         if executor is self._pool:
             async with executor.acquire() as connection:
                 async with self._execution_query_executor(connection) as checked:
                     yield checked
             return
-        async with executor.transaction():
-            await lock_execution_authority(executor, "postgres")
+        async with self._authority_transaction(executor, scopes):
             yield executor
-            require_execution_backend("postgres")
+
+    @asynccontextmanager
+    async def _authority_transaction(
+        self, connection: Any, scopes: tuple[ExecutionCustody, ...],
+    ) -> AsyncIterator[None]:
+        # A failure in the body rolls back. Once the body/precommit checks
+        # finish, a failed commit acknowledgement must instead be reconciled.
+        committing = False
+        try:
+            async with connection.transaction():
+                await lock_execution_authority(connection, "postgres", scopes)
+                yield
+                require_execution_backend("postgres", scopes)
+                self._require_transaction_custody()
+                committing = True
+        except Exception as exc:
+            if committing and scopes:
+                raise ExecutionCommitOutcomeError("unknown") from exc
+            raise
+        self._require_after_authority_commit(scopes)
+
+    @staticmethod
+    def _require_after_authority_commit(scopes: tuple[ExecutionCustody, ...]) -> None:
         # Commit has completed. If loss raced its acknowledgement, denial here
         # does not mean rollback; callers must reconcile their idempotent write.
         try:
-            require_execution_backend("postgres")
+            require_execution_backend("postgres", scopes)
         except ExecutionAuthorityError as exc:
-            raise ExecutionAuthorityError(
-                "execution authority lost after transaction commit; "
-                "the operation may have committed"
-            ) from exc
+            raise ExecutionCommitOutcomeError("committed") from exc
 
     @staticmethod
     def _strip_tz(params: Params) -> Tuple[Any, ...]:
@@ -885,7 +948,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script."""
-        if self._current_txn_conn() is not None or current_execution_custody():
+        if self._current_txn_conn() is not None or current_execution_custody(self):
             reject_transaction_control(script, dialect="postgres")
         record_write_script(script)
         pool = self._ensure_connected()
@@ -1006,9 +1069,9 @@ class PostgresBackend(DatabaseBackend):
         if existing is not None:
             # Nested transaction (same task) - use savepoint on this task's conn.
             async with existing.transaction():
-                await lock_execution_authority(existing, "postgres")
+                await self._lock_transaction_custody(existing)
                 yield
-                require_execution_backend("postgres")
+                self._require_transaction_custody()
             return
 
         operational = self._current_operational_lease()
@@ -1018,29 +1081,35 @@ class PostgresBackend(DatabaseBackend):
                     token = self._txn_conn_var.set(
                         (asyncio.current_task(), operational.connection)
                     )
+                    scopes = list(current_execution_custody(self))
+                    custody_var = self._transaction_custody_context()
+                    custody_token = custody_var.set((asyncio.current_task(), scopes))
                     try:
-                        async with operational.connection.transaction():
-                            await lock_execution_authority(operational.connection, "postgres")
+                        async with self._authority_transaction(operational.connection, tuple(scopes)):
                             yield
-                            require_execution_backend("postgres")
-                        require_execution_backend("postgres")
+                    except ExecutionCommitOutcomeError:
+                        raise
                     except Exception as e:
                         raise TransactionError(f"Transaction failed: {e}") from e
                     finally:
+                        custody_var.reset(custody_token)
                         self._txn_conn_var.reset(token)
                     return
 
         async with pool.acquire() as conn:
             token = self._txn_conn_var.set((asyncio.current_task(), conn))
+            scopes = list(current_execution_custody(self))
+            custody_var = self._transaction_custody_context()
+            custody_token = custody_var.set((asyncio.current_task(), scopes))
             try:
-                async with conn.transaction():
-                    await lock_execution_authority(conn, "postgres")
+                async with self._authority_transaction(conn, tuple(scopes)):
                     yield
-                    require_execution_backend("postgres")
-                require_execution_backend("postgres")
+            except ExecutionCommitOutcomeError:
+                raise
             except Exception as e:
                 raise TransactionError(f"Transaction failed: {e}") from e
             finally:
+                custody_var.reset(custody_token)
                 self._txn_conn_var.reset(token)
 
     @asynccontextmanager
@@ -1146,7 +1215,13 @@ class PostgresBackend(DatabaseBackend):
                             f"SELECT {unlock_function}($1, $2)", namespace, key
                         )
                 except BaseException:
-                    conn.terminate()
+                    # asyncpg may already have detached the pooled proxy
+                    # after loss. Never replace the original loss/cancellation
+                    # with that secondary cleanup error.
+                    try:
+                        conn.terminate()
+                    except asyncpg.InterfaceError:
+                        pass
                     raise
             finally:
                 capability._retire()
@@ -1215,3 +1290,22 @@ class PostgresBackend(DatabaseBackend):
             "SELECT to_regclass(?) IS NOT NULL",
             (table_name,),
         ))
+
+    async def settle_stop_invocation(self, generation_id: str, owner_id: str, disposition: Any) -> None:
+        """Only an existing exact Stop generation/owner may terminalize.
+
+        This fixed native operation is available after work-custody denial.
+        It neither clears the caller's denial nor exposes a connection or
+        generic SQL executor. Ordinary storage/tools remain denied throughout.
+        """
+        from kestrel_sovereign.stop.invocation import _settle_stop_on_connection
+
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("Stop terminal custody requires the original connected backend")
+        # A terminalizer must not wedge shutdown waiting for a saturated pool.
+        async with asyncio.timeout(5):
+            async with pool.acquire() as connection:
+                await _settle_stop_on_connection(
+                    connection, generation_id, owner_id, disposition,
+                )
