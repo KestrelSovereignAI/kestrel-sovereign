@@ -208,16 +208,22 @@ only from an owner whose close reports a failure instead of logging it and
 returning. No owner qualifies yet (#3558, #3559, #3560), so for now a record
 stays until its process exits. An agent stopped inside a host that keeps
 running therefore still counts as running, as does one whose boot failed. A
-record naming a process on this host that has exited is stale and ignored.
+serving record is stale only on proof: it says it was written on this host and
+in this PID namespace, its PID is a positive integer and its start time a
+finite, positive number of seconds, and nothing runs as that PID here or what
+does started at another time. A stale record is ignored, and the next agent to
+boot in that data directory deletes it. No other record is deleted.
 
 An agent whose liveness cannot be established counts as running too: a PID
-file or serving record that cannot be read, a record written on another host
-or in another PID namespace (a container sharing the data directory, including
-one that has since stopped), or a PID whose identity cannot be checked. The
-refusal names the evidence and how to stop the process; a record whose process
-cannot be checked from here is deleted by hand only once nothing serves the
-agent. A server started before this release wrote no serving record and is
-found only by its PID file.
+file or serving record that cannot be read, or that is missing a field or
+holds a value that is not one (a PID that is not a positive integer, a start
+time that is `NaN`, infinite or not a number); a record written on another
+host or in another PID namespace (a container sharing the data directory,
+including one that has since stopped); or a PID whose identity cannot be
+checked. The refusal names the evidence and how to stop the process; a record
+whose process cannot be checked from here is deleted by hand only once nothing
+serves the agent. A server started before this release wrote no serving record
+and is found only by its PID file.
 
 The refusal names each agent, its anchored hash, the governing hash, and the
 adoption steps below. Two findings refuse:

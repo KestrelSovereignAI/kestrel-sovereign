@@ -4211,25 +4211,35 @@ class KestrelAgent(
     # BootContext can unwind them in reverse (LIFO) order on any phase failure.
     # Each reports what it did (#3522): the outcome its owner's close returned
     # (``RELEASED`` when the close returns anything else), ``RETAINED`` when it
-    # kept the resource, and an exception when the close failed. The agent's custody believes ``RELEASED`` only from an
-    # owner that reports a failed close truthfully, so the resource, and the
-    # serving record with it, stays held otherwise. A durable dispatcher is
-    # the deliberate exception to eager handle clearing: a failed owner
-    # release retains both dispatcher and storage so a later lifecycle
-    # shutdown can retry safely. The rollback driver logs failures and
+    # kept the resource, and an exception when the close failed. The agent's
+    # custody believes ``RELEASED`` only from an owner that reports a failed
+    # close truthfully, so the resource, and the serving record with it,
+    # stays held otherwise. A durable dispatcher is the deliberate exception
+    # to eager handle clearing: a dispatcher whose owner release failed, or
+    # is still fenced by live cognition, keeps its handle, and storage stays
+    # open beneath it. A fenced release hands storage close to the agent-owned
+    # continuation shutdown uses; a failed one leaves both for a later
+    # lifecycle shutdown to retry. The rollback driver logs failures and
     # continues with independent resources.
     # ------------------------------------------------------------------
     async def _boot_teardown_storage(self) -> ReleaseOutcome:
         """Close the primary DB connection and drop the privacy layer."""
         # Dispatcher teardown owns a runtime-owner release against this very
-        # backend.  If its retryable release has not succeeded, retaining both
-        # handles is the only safe rollback state: closing here would strand a
-        # live owner or let its completion touch a closed SQLite worker.
+        # backend.  If that release has not finished, retaining both handles
+        # is the only safe rollback state: closing here would strand a live
+        # owner or let its completion touch a closed SQLite worker.
         if getattr(self, "dispatcher", None) is not None:
-            logging.error(
-                "boot rollback: retaining storage because durable dispatcher "
-                "teardown is still incomplete"
-            )
+            if getattr(self, "_durable_shutdown_continuation", None) is not None:
+                logging.warning(
+                    "boot rollback: leaving storage to the durable shutdown "
+                    "continuation, which closes it once the dispatcher's "
+                    "owner release finishes"
+                )
+            else:
+                logging.error(
+                    "boot rollback: retaining storage because durable "
+                    "dispatcher teardown is still incomplete"
+                )
             return ReleaseOutcome.RETAINED
         raw = self._raw_storage
         self._raw_storage = None
@@ -4309,12 +4319,25 @@ class KestrelAgent(
                     exc_info=True,
                 )
 
-        # Only a successfully released dispatcher may lose its public handle.
-        # The following storage rollback can now close the shared backend.
-        self.dispatcher = None
+        outcome = _dispatcher_release_outcome(delivered)
+        fenced = bool(getattr(dispatcher, "durable_shutdown_owner_fenced", False))
+        if outcome is ReleaseOutcome.RELEASED and not fenced:
+            # Only a released dispatcher may lose its public handle. The
+            # following storage rollback can now close the shared backend.
+            self.dispatcher = None
+        elif delivered is False or fenced:
+            # Live cognition still fences its delivery, so the owner is
+            # released later by the dispatcher's own task (#3522). Keep the
+            # handle: storage rollback then keeps the shared backend open
+            # beneath it, and a later shutdown finds the owner to join. The
+            # agent-owned continuation shutdown uses joins that release and
+            # only then closes storage; ``wait_for_shutdown_completion`` joins
+            # the continuation.
+            await self._ensure_durable_shutdown_continuation(dispatcher)
+            outcome = ReleaseOutcome.RETAINED
         if cancelled:
             raise asyncio.CancelledError()
-        return _dispatcher_release_outcome(delivered)
+        return outcome
 
     async def _boot_teardown_features(self) -> ReleaseOutcome:
         """Reverse every feature registration made before the failure, LIFO.

@@ -19,14 +19,19 @@ and new agent overlap, never remove each other's record.
 
 A record is evidence of liveness, never of absence. An agent is stopped only
 when no launcher record and no serving record names a process that may still
-be running. A record whose process cannot be identified from here counts as
-running: one written on another host or in another PID namespace (a container,
-or a machine sharing the data directory under another hostname), one that
-cannot be read, and one naming a PID whose start time cannot be checked.
-Waving a guard past a live agent costs more than a refusal an operator can
-clear (#2995). A record is attributed by hostname and PID namespace only, so
-two machines sharing one data directory under the same hostname cannot be
-told apart.
+be running. A serving record names nothing running only on positive proof
+(:func:`_provably_stale`): it reads, every field it identifies its process by
+parses, it was written on this host and in this PID namespace, and nothing
+runs as its PID here or what does started at another instant. Any other record
+counts as running, and is never deleted: one written on another host or in
+another PID namespace (a container, or a machine sharing the data directory
+under another hostname), one that cannot be read, one missing a field or
+holding a value that is not one (a PID that is not a positive integer, a start
+time that is ``NaN``, infinite or not a number), and one naming a PID whose
+start time cannot be checked. Waving a guard past a live agent costs more than
+a refusal an operator can clear (#2995). A record is attributed by hostname
+and PID namespace only, so two machines sharing one data directory under the
+same hostname cannot be told apart.
 
 Not a port probe. A direct launch listens wherever its operator said, and
 whatever answers on a registered port need not serve this project: the public
@@ -42,7 +47,7 @@ import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 #: Directory under an agent's data directory holding its serving records.
 SERVING_RECORD_DIRNAME = ".serving"
@@ -143,14 +148,47 @@ class ServingRecord:
         self.path.unlink(missing_ok=True)
 
 
-def _remove_stale_records(directory: Path) -> None:
-    """Delete records this host can prove name a process that has exited."""
-    from kestrel_sovereign.multi_agent.process_manager import PidStatus, ProcessManager
+def _record_paths(directory: Path) -> list[Path]:
+    """The serving records in ``directory``, as the guard and the sweep see them.
 
-    for path in directory.glob("*.json"):
-        if _foreign_origin(_read_payload(path)) is not None:
+    Staging files (``.<name>.tmp``) are not records.
+
+    Raises:
+        OSError: ``directory`` exists but cannot be listed.
+    """
+    try:
+        return sorted(
+            Path(entry.path)
+            for entry in os.scandir(directory)
+            if entry.name.endswith(".json") and not entry.name.startswith(".")
+        )
+    except FileNotFoundError:
+        return []
+
+
+def _released(path: Path, payload) -> bool:
+    """Whether a listed record was removed before it could be read.
+
+    A directory entry that is still there but reads as missing (a symbolic
+    link to nothing) was not released: it is a record that cannot be read.
+    """
+    return isinstance(payload, FileNotFoundError) and not os.path.lexists(path)
+
+
+def _remove_stale_records(directory: Path) -> None:
+    """Delete the records :func:`_provably_stale` proves name an exited process.
+
+    A directory that cannot be listed deletes nothing.
+    """
+    try:
+        paths = _record_paths(directory)
+    except OSError:
+        return
+    for path in paths:
+        payload = _read_payload(path)
+        if _released(path, payload):
             continue
-        if ProcessManager.read_pid_record(path).status is PidStatus.STALE:
+        if _provably_stale(path, payload):
             path.unlink(missing_ok=True)
 
 
@@ -158,31 +196,55 @@ def _read_payload(path: Path):
     """The record's JSON object, or the reason it cannot be read."""
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        # ValueError includes JSON with an integer too long to convert.
         return exc
     if not isinstance(payload, dict):
         return ValueError("not a JSON object")
     return payload
 
 
-def _foreign_origin(payload) -> Optional[str]:
-    """Where a record was written, when that is not somewhere this host can probe."""
-    if not _well_formed(payload):
-        return None
-    host, pid_namespace = _here()
-    if payload.get("host") != host:
-        return f"on host {payload.get('host')!r}"
-    if payload.get("pid_namespace") != pid_namespace:
-        return f"in PID namespace {payload.get('pid_namespace')!r}"
-    return None
+@dataclass(frozen=True)
+class _RecordedProcess:
+    """The fields a serving record identifies the process it names by."""
+
+    pid: int
+    started_at: float
+    host: str
+    pid_namespace: Optional[str]
 
 
-def _well_formed(payload) -> bool:
-    return (
-        isinstance(payload, dict)
-        and type(payload.get("pid")) is int
-        and isinstance(payload.get("host"), str)
+def _parse_record(payload: dict[str, Any]) -> Optional[_RecordedProcess]:
+    """Every identifying field of a record, or None unless each one parses.
+
+    ``pid`` and ``started_at`` through the same validators a launcher record
+    is read with (:func:`recorded_pid`, :func:`recorded_start_time`). ``host``
+    is a non-empty string. ``pid_namespace`` must be present, as every record
+    carries it: None where the platform has no PID namespaces, a non-empty
+    namespace name where it does. A record whose own start time could not be
+    read when it was written holds None there, so it never parses: nothing
+    could ever prove it stale.
+    """
+    from kestrel_sovereign.multi_agent.process_manager import (
+        recorded_pid,
+        recorded_start_time,
     )
+
+    if "pid_namespace" not in payload:
+        return None
+    pid = recorded_pid(payload.get("pid"))
+    started_at = recorded_start_time(payload.get("started_at"))
+    host = payload.get("host")
+    pid_namespace = payload["pid_namespace"]
+    if pid is None or started_at is None:
+        return None
+    if not isinstance(host, str) or not host:
+        return None
+    if pid_namespace is not None and (
+        not isinstance(pid_namespace, str) or not pid_namespace
+    ):
+        return None
+    return _RecordedProcess(pid, started_at, host, pid_namespace)
 
 
 def _unprovable(path: Path, evidence: str) -> AgentHolder:
@@ -196,52 +258,80 @@ def _unprovable(path: Path, evidence: str) -> AgentHolder:
     )
 
 
-def _serving_record_holder(path: Path) -> Optional[AgentHolder]:
-    """What one serving record establishes, or None when it names nothing live."""
+def _record_holder(path: Path, payload) -> Optional[AgentHolder]:
+    """What one serving record establishes: None only on proof that it is stale.
+
+    The record must read; every identifying field must parse
+    (:func:`_parse_record`); it must have been written on this host and in
+    this PID namespace, since a PID means a process only in the table it was
+    issued from; and then nothing may run as its PID here, or what does must
+    have started at another instant. Each of those is checked here, once, so
+    the guard (:func:`_serving_record_holder`) and the stale-record sweep
+    (:func:`_remove_stale_records`) cannot disagree. Any record not proven
+    stale comes back as a holder, verified only when the process it names is
+    running and is the one it recorded.
+    """
     from kestrel_sovereign.multi_agent.process_manager import PidStatus, ProcessManager
 
-    payload = _read_payload(path)
     if isinstance(payload, Exception):
-        if isinstance(payload, FileNotFoundError):
-            # Released between listing and reading.
-            return None
         return _unprovable(
             path,
             f"its serving record {path} cannot be read ({payload}), so "
             "whether it is served cannot be told",
         )
-    if not _well_formed(payload):
+    recorded = _parse_record(payload)
+    if recorded is None:
         return _unprovable(
             path,
-            f"{path} is not a serving record this version can read (it "
-            "names no PID or host), so whether it is served cannot be told",
+            f"{path} does not record a valid PID, start time, host and PID "
+            "namespace, so whether its process still serves it cannot be told",
         )
-    origin = _foreign_origin(payload)
-    if origin is not None:
+    host, pid_namespace = _here()
+    if recorded.host != host or recorded.pid_namespace != pid_namespace:
+        where = (
+            f"on host {recorded.host!r}"
+            if recorded.host != host
+            else f"in PID namespace {recorded.pid_namespace!r}"
+        )
         return _unprovable(
             path,
-            f"{path} records PID {payload.get('pid')} serving it {origin}, "
-            "which cannot be checked from here",
+            f"{path} records PID {recorded.pid} serving it {where}, which "
+            "cannot be checked from here",
         )
-    record = ProcessManager.read_pid_record(path)
-    if record.status is PidStatus.LIVE:
+    status, detail = ProcessManager.identify_recorded_process(
+        recorded.pid, recorded.started_at, path.name
+    )
+    if status is PidStatus.STALE:
+        return None
+    if status is PidStatus.LIVE:
+        command = _stop_command(recorded.pid)
         return AgentHolder(
             evidence=(
-                f"PID {record.pid} serves it, started without `kestrel start`; "
-                f"recorded in {path}"
+                f"PID {recorded.pid} serves it, started without `kestrel "
+                f"start`; recorded in {path}"
             ),
-            remedy=f"`{_stop_command(record.pid)}` stops it",
-            command=_stop_command(record.pid),
+            remedy=f"`{command}` stops it",
+            command=command,
         )
-    if record.status in (PidStatus.STALE, PidStatus.ABSENT):
+    return _unprovable(path, f"{detail}; recorded in {path}")
+
+
+def _provably_stale(path: Path, payload) -> bool:
+    """Whether a serving record may be deleted: positive proof it is stale.
+
+    The sweep deletes exactly what this proves. The guard reads the same
+    judgement: :func:`_record_holder` returns None exactly when this is True,
+    and reports every other record as a process that may serve the agent.
+    """
+    return _record_holder(path, payload) is None
+
+
+def _serving_record_holder(path: Path) -> Optional[AgentHolder]:
+    """What one serving record establishes, or None when it names nothing live."""
+    payload = _read_payload(path)
+    if _released(path, payload):
         return None
-    if record.status is PidStatus.UNDECIDABLE:
-        return _unprovable(
-            path,
-            f"{path} records PID {record.pid} serving it, and that process "
-            "exists but its identity cannot be established from here",
-        )
-    return _unprovable(path, f"{record.detail}; recorded in {path}")
+    return _record_holder(path, payload)
 
 
 def serving_holder(data_dir: Path) -> Optional[AgentHolder]:
@@ -252,13 +342,7 @@ def serving_holder(data_dir: Path) -> Optional[AgentHolder]:
     """
     directory = Path(data_dir) / SERVING_RECORD_DIRNAME
     try:
-        paths = sorted(
-            entry.path
-            for entry in os.scandir(directory)
-            if entry.name.endswith(".json") and not entry.name.startswith(".")
-        )
-    except FileNotFoundError:
-        return None
+        paths = _record_paths(directory)
     except OSError as exc:
         return AgentHolder(
             evidence=(
@@ -270,7 +354,7 @@ def serving_holder(data_dir: Path) -> Optional[AgentHolder]:
         )
     holders = [
         holder
-        for holder in (_serving_record_holder(Path(path)) for path in paths)
+        for holder in (_serving_record_holder(path) for path in paths)
         if holder is not None
     ]
     verified = [holder for holder in holders if holder.verified]

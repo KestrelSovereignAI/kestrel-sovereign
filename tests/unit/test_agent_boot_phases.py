@@ -1029,22 +1029,41 @@ async def test_an_abandoned_sync_snapshot_keeps_the_sync_service_held(
 async def test_a_truthful_dispatcher_whose_release_is_unfinished_stays_held(
     tmp_path, monkeypatch, path, reported
 ):
-    """``shutdown_durable_delivery()`` returns False while cognition fences it."""
+    """``shutdown_durable_delivery()`` returns False while cognition fences it.
+
+    A rollback also keeps the storage that unfinished release still uses open
+    and held (#3522).
+    """
     from kestrel_sovereign.signals import SignalDispatcher
 
     _trust(monkeypatch, _BOOT_OWNERS)
+    release_cognition = asyncio.Event()
+
+    async def wait_for_cognition(self):
+        await release_cognition.wait()
+
     agent = _make_agent(tmp_path)
     try:
-        with _boot_holding_every_resource():
+        with _boot_holding_every_resource() as mocks:
             if path == "rollback":
                 with patch.object(
                     SignalDispatcher,
                     "shutdown_durable_delivery",
                     AsyncMock(return_value=reported),
+                ), patch.object(
+                    SignalDispatcher,
+                    "wait_for_durable_shutdown_release",
+                    wait_for_cognition,
                 ), patch.object(agent, PHASE_METHODS[-1], _fail_last_phase):
                     with pytest.raises(RuntimeError, match="every resource"):
                         await agent.initialize()
-                assert _owners_held(agent) == {"signal_dispatcher", "llm_service"}
+                assert agent.dispatcher is not None
+                mocks.storage.close.assert_not_awaited()
+                assert _owners_held(agent) == {
+                    "signal_dispatcher",
+                    "storage",
+                    "llm_service",
+                }
             else:
                 await agent.initialize()
                 with patch.object(
@@ -1056,6 +1075,7 @@ async def test_a_truthful_dispatcher_whose_release_is_unfinished_stays_held(
                 assert _owners_held(agent) == {"signal_dispatcher"}
             _assert_guards_report_this_process(tmp_path)
     finally:
+        release_cognition.set()
         await _cleanup(agent)
 
 
@@ -1454,6 +1474,74 @@ async def test_a_boot_rollback_that_keeps_the_dispatcher_keeps_the_serving_recor
             )
             _assert_guards_report_this_process(tmp_path)
     finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_boot_rollback_keeps_storage_open_beneath_a_fenced_dispatcher(
+    tmp_path, monkeypatch
+):
+    """Rollback keeps a dispatcher fenced by live cognition, and its storage.
+
+    The dispatcher's release returns ``False`` while cognition still owns a
+    delivery (#3522). Rollback keeps its handle, so it does not close the
+    storage that owner still uses, and the guards keep reporting the agent
+    served. Once cognition settles the continuation closes storage, and a
+    later stop releases the record.
+    """
+    from kestrel_sovereign.signals import SignalDispatcher
+
+    _trust(monkeypatch, _BOOT_OWNERS)
+    release_cognition = asyncio.Event()
+    stop = SignalDispatcher.shutdown_durable_delivery
+    calls = 0
+
+    async def fenced_stop(self):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # Live cognition still owns its lease.
+            self._durable_shutdown_owner_fenced = True
+            return False
+        return await stop(self)
+
+    async def wait_for_cognition(self):
+        await release_cognition.wait()
+        self._durable_shutdown_owner_fenced = False
+
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_mocks() as mocks, patch.object(
+            agent, PHASE_METHODS[3], _fail_after_the_dispatcher_starts
+        ), patch.object(
+            SignalDispatcher, "shutdown_durable_delivery", fenced_stop
+        ), patch.object(
+            SignalDispatcher,
+            "wait_for_durable_shutdown_release",
+            wait_for_cognition,
+        ):
+            with pytest.raises(RuntimeError, match="after dispatcher startup"):
+                await agent.initialize()
+
+            assert agent._boot_state is BootPhaseState.FAILED
+            assert agent.dispatcher is not None
+            assert agent._raw_storage is mocks.storage
+            mocks.storage.close.assert_not_awaited()
+            assert {"storage", "signal_dispatcher"} <= set(
+                agent._resource_custody().held
+            )
+            _assert_guards_report_this_process(tmp_path)
+
+            release_cognition.set()
+            await asyncio.wait_for(agent.wait_for_shutdown_completion(), timeout=30)
+            mocks.storage.close.assert_awaited_once()
+
+            await _stop(agent)
+            mocks.storage.close.assert_awaited_once()
+            assert agent._resource_custody().held == ()
+            assert _guard_holder(tmp_path) is None
+    finally:
+        release_cognition.set()
         await _cleanup(agent)
 
 
