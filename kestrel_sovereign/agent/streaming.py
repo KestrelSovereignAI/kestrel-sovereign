@@ -33,6 +33,7 @@ from kestrel_sovereign.agent.invocation import (
 from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.semantic_recall import persistence_dependency_metadata
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
+from kestrel_sovereign.llm.output_ceiling import incomplete_generation
 from kestrel_sovereign.llm.invocation_context import (
     LLMInvocationContext,
     turn_invocation_scope,
@@ -741,18 +742,6 @@ class _PostResponseText(str):
         return obj
 
 
-# #2674 finding 2: the deterministic block a strict (buffered) turn releases
-# when its post-tool continuation LLM call times out. It carries NO route name,
-# duration, raw error, tool argument, or model-generated text — a fixed, safe
-# body so the fail-closed audit path can never resolve to an empty 200. Held as
-# a module constant so the endpoint contract and the regression tests share one
-# string.
-STRICT_AUDIT_CONTINUATION_TIMEOUT_BLOCK = (
-    "⚠️ The response could not be completed: the model did not finish "
-    "after a tool step within the allowed time. No partial or unreviewed "
-    "content was released. Please try again."
-)
-
 # A Stop that lands inside an already-running tool batch cannot erase the fact
 # that the external action completed. Strict audit still forbids persisting the
 # model/tool bytes, so record a fixed host-authored checkpoint instead. It is
@@ -770,6 +759,19 @@ _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA = {
         "details_withheld": True,
     }
 }
+
+# #3552: a tool batch completed, then the model's follow-up call ended without
+# a finished response (silent past its inactivity bound, or stopped at its
+# route's output cap). The turn fails and records no answer, so its partial
+# synthesis never stands in for one, but the action happened. Like the Stop
+# checkpoint above, this fixed host-authored row carries no model or tool
+# bytes, so it is safe under any audit mode, and it keeps the next turn from
+# repeating the action.
+INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT = (
+    "A tool batch completed, but the model did not finish its response "
+    "afterwards, so no answer was recorded. Do not repeat the completed "
+    "action automatically."
+)
 
 
 def _strict_audit_release(final_text: str) -> list:
@@ -1578,6 +1580,18 @@ class StreamingMixin:
         if buffer_audit and isinstance(resolved_context, LLMInvocationContext):
             resolved_context = replace(resolved_context, redact_content=True)
 
+        # #3552: the first call gets the same inactivity bound as every
+        # tool-loop follow-up — one ``LLMCallWatchdog`` code path — so a local
+        # model that never answers cannot hold the turn lock indefinitely. A
+        # trip raises ``LLMCallInactivityTimeout`` out of the turn: a failed
+        # attempt, never an answer.
+        from kestrel_sovereign.agent.orchestrator_engine import LLMCallWatchdog
+        watchdog = LLMCallWatchdog.for_call(
+            self.llm_service,
+            model_override=effective_model,
+            force_local_only=force_local_only,
+        )
+
         # #2530: collect and inject the operator notice LAST, immediately
         # before the provider call it rides on. Collecting DRAINS the
         # producer's pending auto-mode queue and advances its budget/governance
@@ -1590,7 +1604,9 @@ class StreamingMixin:
         # and the window is closed by construction rather than merely guarded.
         # Keep it that way: anything added below this line and above the
         # iteration must be settle-safe.
-        inline_tool_executor = self._make_inline_tool_executor(session_id)
+        inline_tool_executor = self._make_inline_tool_executor(
+            session_id, watchdog=watchdog,
+        )
         operator_turn = await inject_operator_turn(
             self, messages, context_result, session_id, effective_model, force_local_only
         )
@@ -1613,7 +1629,7 @@ class StreamingMixin:
         # construction needs its own guard.
         try:
             operator_stream = operator_turn.watch_stream(
-                self.llm_service.stream_with_tool_detection(
+                watchdog.watch(self.llm_service.stream_with_tool_detection(
                     messages=messages,
                     tools=feature_tools if feature_tools else None,
                     force_local_only=force_local_only,
@@ -1625,7 +1641,7 @@ class StreamingMixin:
                     keep_trailing_system=operator_turn.keep_trailing_system,
                     cancel_token=cancel_token,
                     invocation_context=resolved_context,
-                )
+                ))
             )
         except BaseException as exc:
             await operator_turn.settle_interrupted(exc)
@@ -1828,12 +1844,6 @@ class StreamingMixin:
             tool_response_chunks = []
             tool_events = []
             tool_results: list = []
-            # #2674 finding 2: per-turn channel for a strict continuation-timeout
-            # signal. In advisory mode a follow-up-LLM timeout renders as an ❌
-            # tool card; under an enforcing (buffered) audit that sentinel is
-            # stripped, so the orchestrator sets ``timed_out`` here instead and we
-            # substitute a deterministic safe block below.
-            strict_timeout_state: Dict[str, Any] = {}
             deferred_tool_batch_cancellation: Optional[
                 _DeferredToolBatchCancellation
             ] = None
@@ -1866,50 +1876,66 @@ class StreamingMixin:
                     require_success=checkpointed_batch,
                 )
 
-            async for chunk in self._handle_orchestrator_response_streaming(
-                response=tool_response,
-                feature_tools=feature_tools,
-                system_prompt=system_prompt,
-                force_local_only=force_local_only,
-                effective_model=effective_model,
-                user_message=user_input,
-                tool_events=tool_events,
-                tool_results=tool_results,
-                session_id=session_id,
-                request_id=request_id,
-                images=eager_images or None,
-                invocation_context=resolved_context,
-                buffer_audit=buffer_audit,
-                strict_timeout_state=strict_timeout_state,
-                # #2841: the same budgeted history this turn's FIRST provider
-                # call sent. Without it the post-tool synthesis — the text the
-                # user actually reads — was written from a blank conversation.
-                conversation_history=context_result.messages,
-                # ...and the same rendered last-user bytes it sent, so the
-                # continuation carries THIS turn's memories/RAG too. Kept
-                # separate from ``user_message`` above, which stays raw user
-                # speech for dispatched subagents.
-                continuation_user_content=prompt + lazy_hint,
-            ):
-                if isinstance(chunk, _DeferredToolBatchCancellation):
-                    deferred_tool_batch_cancellation = chunk
-                    # Resume once so the inner async generator reaches its return
-                    # after the marker instead of leaving cleanup to finalization.
-                    continue
-                if isinstance(chunk, ThinkingDelta):
+            try:
+                async for chunk in self._handle_orchestrator_response_streaming(
+                    response=tool_response,
+                    feature_tools=feature_tools,
+                    system_prompt=system_prompt,
+                    force_local_only=force_local_only,
+                    effective_model=effective_model,
+                    user_message=user_input,
+                    tool_events=tool_events,
+                    tool_results=tool_results,
+                    session_id=session_id,
+                    request_id=request_id,
+                    images=eager_images or None,
+                    invocation_context=resolved_context,
+                    buffer_audit=buffer_audit,
+                    # #2841: the same budgeted history this turn's FIRST provider
+                    # call sent. Without it the post-tool synthesis — the text the
+                    # user actually reads — was written from a blank conversation.
+                    conversation_history=context_result.messages,
+                    # ...and the same rendered last-user bytes it sent, so the
+                    # continuation carries THIS turn's memories/RAG too. Kept
+                    # separate from ``user_message`` above, which stays raw user
+                    # speech for dispatched subagents.
+                    continuation_user_content=prompt + lazy_hint,
+                ):
+                    if isinstance(chunk, _DeferredToolBatchCancellation):
+                        deferred_tool_batch_cancellation = chunk
+                        # Resume once so the inner async generator reaches its return
+                        # after the marker instead of leaving cleanup to finalization.
+                        continue
+                    if isinstance(chunk, ThinkingDelta):
+                        if not buffer_audit:
+                            yield _build_thinking_sentinel(chunk)
+                        continue
+                    tool_response_chunks.append(chunk)
                     if not buffer_audit:
-                        yield _build_thinking_sentinel(chunk)
-                    continue
-                tool_response_chunks.append(chunk)
-                if not buffer_audit:
-                    yield chunk
-                # #1256: belt-and-suspenders cancel check at the outer
-                # boundary. The inner orchestrator generator also checks
-                # ``is_request_cancelled`` at iteration boundaries; this
-                # outer break stops accumulating tokens if a cancel
-                # arrives between the inner check and the next yield.
-                if request_id and self.is_request_cancelled(request_id):
-                    break
+                        yield chunk
+                    # #1256: belt-and-suspenders cancel check at the outer
+                    # boundary. The inner orchestrator generator also checks
+                    # ``is_request_cancelled`` at iteration boundaries; this
+                    # outer break stops accumulating tokens if a cancel
+                    # arrives between the inner check and the next yield.
+                    if request_id and self.is_request_cancelled(request_id):
+                        break
+            except Exception as exc:
+                # #3552: a follow-up call that ended unfinished fails the turn.
+                # Its partial synthesis, already streamed live, is never
+                # persisted as an answer; only the completed tool batch is
+                # recorded, as fixed anti-repeat evidence.
+                if incomplete_generation(exc) is None or not tool_batch_completed():
+                    raise
+                await self._persist_assistant_turn_safely(
+                    INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT,
+                    metadata=_STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
+                    session_id=session_id,
+                    request_id=request_id,
+                    response=tool_response,
+                    require_success=True,
+                )
+                raise
             # #2674 finding 2: a strict (buffered) POST-TOOL continuation stopped
             # before its reviewed release withheld every byte and never audited
             # the partial synthesis. Discard the whole withheld buffer (prose,
@@ -1935,22 +1961,6 @@ class StreamingMixin:
                         operation="side-effecting orchestrator tool batch",
                     )
                 return
-            # #2674 finding 2: a strict (buffered) continuation that TIMED OUT
-            # withheld every byte and yielded no reviewable text. Discard the
-            # withheld continuation prose entirely — any partial buffered text or
-            # typed parts are protected, unfinished content the audit should not
-            # release — and replace the REVIEWABLE text with a single
-            # deterministic safe block. It then flows through the SAME buffered
-            # audit → persist → release path as any other turn, so persisted ==
-            # reloaded == released == delivered, the client gets a non-empty safe
-            # body (never a silent empty 200), and no protected marker, tool
-            # argument, or raw error can escape. ``tool_events`` / ``tool_results``
-            # are left intact: the buffered persist drops the whole metadata
-            # envelope (``meta = None`` below) so they never reach the client or
-            # history, while the audit narration check and the STOP-hook payload
-            # keep seeing the real tool activity that actually ran.
-            if buffer_audit and strict_timeout_state.get('timed_out'):
-                tool_response_chunks = [STRICT_AUDIT_CONTINUATION_TIMEOUT_BLOCK]
             # Persist only the post-tool synthesis in ``content``. Any
             # pre-tool prose was already retracted from the SSE client by
             # the ToolCallStarted/revising protocol, so storing it in

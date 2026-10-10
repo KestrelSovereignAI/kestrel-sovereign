@@ -69,6 +69,24 @@ def rate_limited_until(
     )
 
 
+def generation_incomplete() -> ApiHTTPException:
+    """The response an invocation returns when its model did not finish.
+
+    The model stopped at its route's output cap, or went silent past the
+    orchestrator's inactivity bound (#3552), so the turn recorded no answer.
+    The upstream model failed, not this server: ``502 generation_incomplete``.
+    Which cause, and on which route, stays in the operator log.
+    """
+    return ApiHTTPException(
+        status_code=502,
+        code="generation_incomplete",
+        message=(
+            "The model did not finish its response, so no answer was recorded. "
+            "Try again, or choose a different model route."
+        ),
+    )
+
+
 def _default_message(status_code: int) -> str:
     try:
         return HTTPStatus(status_code).phrase

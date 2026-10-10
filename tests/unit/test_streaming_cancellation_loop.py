@@ -1079,12 +1079,15 @@ async def test_orchestrator_loop_timeout_surfaces_failed_marker(monkeypatch):
     )
 
     chunks = []
-    async for chunk in mock_agent._handle_orchestrator_response_streaming(
-        response=first_response, feature_tools=[],
-        system_prompt="sys", force_local_only=False,
-        effective_model="m", user_message="hi",
-    ):
-        chunks.append(chunk)
+    # #3552: the timed-out follow-up is a failed attempt, raised out of the
+    # turn after its error card rather than ending it as if it had answered.
+    with pytest.raises(oe.LLMCallInactivityTimeout):
+        async for chunk in mock_agent._handle_orchestrator_response_streaming(
+            response=first_response, feature_tools=[],
+            system_prompt="sys", force_local_only=False,
+            effective_model="m", user_message="hi",
+        ):
+            chunks.append(chunk)
 
     text = "".join(c for c in chunks if isinstance(c, str))
     # #1659: the follow-up timeout surfaces as a typed error tool sentinel
@@ -1179,12 +1182,13 @@ async def test_orchestrator_loop_timeout_marker_precedes_separator():
         )
 
         chunks = []
-        async for chunk in mock_agent._handle_orchestrator_response_streaming(
-            response=first_response, feature_tools=[],
-            system_prompt="sys", force_local_only=False,
-            effective_model="m", user_message="hi",
-        ):
-            chunks.append(chunk)
+        with pytest.raises(oe.LLMCallInactivityTimeout):
+            async for chunk in mock_agent._handle_orchestrator_response_streaming(
+                response=first_response, feature_tools=[],
+                system_prompt="sys", force_local_only=False,
+                effective_model="m", user_message="hi",
+            ):
+                chunks.append(chunk)
 
         text = "".join(c for c in chunks if isinstance(c, str))
         # No separator should have been emitted (no text chunk arrived

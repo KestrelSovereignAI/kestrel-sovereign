@@ -57,6 +57,11 @@ selection_hints = ["llama3.2", "qwen", "gpt-oss"]
 # dim is forwarded as the Matryoshka `dimensions` param and keys the space.
 # embedding_model = "qwen3-embedding-0.6b"
 # embedding_dim   = 768
+# Output cap sent as `num_predict` on every chat call (#3552). Ollama applies
+# none of its own, so a looping model would otherwise generate until its context
+# is exhausted. A response that stops on this cap fails the attempt rather than
+# being returned as an answer. Default 4096.
+# max_output_tokens = 4096
 
 # --- OpenAI (cloud) — set OPENAI_API_KEY in .env -----------------------------
 [llm.vendors.openai]

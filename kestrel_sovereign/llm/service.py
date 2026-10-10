@@ -2164,7 +2164,10 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         return resolve_active_model_selection(self)
 
     def effective_request_timeout(
-        self, providers: Optional[List[Dict[str, Any]]] = None
+        self,
+        providers: Optional[List[Dict[str, Any]]] = None,
+        *,
+        completion_only: bool = False,
     ) -> Optional[float]:
         """Largest LOCAL provider request timeout (seconds), or None.
 
@@ -2180,9 +2183,16 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         hang-detection of that cloud call to an unrelated local route's timeout.
         Returns None (no lift, keep the default) for empty or mixed sets.
         Falls back to all providers when omitted.
+
+        ``completion_only`` is for a call that returns nothing until it is done
+        (a non-streaming ``generate_with_messages``, #3552). Such a call shows
+        no hang distinct from a long answer, so every candidate's timeout
+        counts, cloud routes included.
         """
         src = providers if providers is not None else (self.providers or [])
-        if not src or any(not p.get("is_local") for p in src):
+        if not src:
+            return None
+        if not completion_only and any(not p.get("is_local") for p in src):
             return None
         best: Optional[float] = None
         for provider in src:

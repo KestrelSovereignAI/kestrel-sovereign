@@ -58,6 +58,7 @@ from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sovereign._async_ownership import await_owned_task
 
 from .adapter import LLMAdapter, LLMResponse, ThinkingDelta, ToolCall
+from .call_progress import report_call_progress
 from .cancellation import CancelToken, await_or_cancelled, raise_if_cancelled
 from kestrel_sdk.llm import (
     ProviderCapabilities,
@@ -3475,6 +3476,8 @@ class CodexAdapter(LLMAdapter):
             cancel_token=cancel_token,
             keep_trailing_system=keep_trailing_system,
         ):
+            # Every turn event is the app-server still answering (#3552).
+            report_call_progress()
             if "final" in ev:
                 content, tool_calls, usage = ev["final"]
                 executed = ev.get("executed") or []

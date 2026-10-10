@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from kestrel_sdk.llm import ToolCallStarted
 
 from .adapter import LLMAdapter, LLMResponse, ThinkingContentSplitter, ThinkingDelta, ToolCall
+from .call_progress import report_call_progress
 from .cancellation import (
     CancelToken,
     anext_or_cancelled,
@@ -120,9 +121,15 @@ async def _anthropic_final_message(client, api_params):
     ``with_retry(client.messages.create, ...)`` it replaces was: nothing has
     been shown to anyone until the final message exists, so a retry cannot
     duplicate visible output.
+
+    Each event read off the stream is reported as call progress (#3552), so
+    an inactivity bound around this call measures provider silence, not the
+    length of the answer.
     """
     async def _once():
         async with client.messages.stream(**api_params) as stream:
+            async for _event in stream:
+                report_call_progress()
             return await stream.get_final_message()
 
     return await with_retry(_once)
