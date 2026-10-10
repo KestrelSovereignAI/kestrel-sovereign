@@ -36,6 +36,7 @@ from kestrel_sovereign.spawn.authority_registry import SpawnAuthorityRegistry
 from kestrel_sovereign.spawn.mandate import SpawnMandate
 from kestrel_sovereign.signals import DurableSignalStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
 
 
 # Phase method names in boot order — the injected-failure matrix patches one
@@ -390,6 +391,7 @@ def _boot_mocks():
         storage.initialize = AsyncMock()
         storage.get_node = AsyncMock(return_value=None)
         storage.add_node = AsyncMock()
+        storage.compare_and_swap_node = AsyncMock(return_value=NodeSwapResult.SWAPPED)
         storage.db = MagicMock()
         storage.close = AsyncMock()
         storage._backend = _durable_backend_double()
