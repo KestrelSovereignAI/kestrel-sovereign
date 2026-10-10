@@ -25,7 +25,7 @@ from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     bind_execution_cleanup, bind_execution_runtime, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
-    execution_commit_outcome, execution_terminal_error,
+    execution_commit_outcome, execution_terminal_error, is_execution_control_error,
 )
 from kestrel_sovereign.auth import (
     caller_context_binding_scope,
@@ -601,6 +601,11 @@ def bind_async_invocation(
                                 )
                             return result
                         except asyncio.CancelledError as error:
+                            # Cancellation is a carrier, not rollback proof.
+                            # Preserve native irreversible/control evidence
+                            # before checkpointing or classifying typed Stop.
+                            if is_execution_control_error(error):
+                                raise
                             # An adapter/tool batch may have returned normally
                             # before cancellation lands at a later await in the
                             # turn.  The mutable checkpoint state is shared with

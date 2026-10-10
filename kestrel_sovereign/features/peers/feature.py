@@ -3634,6 +3634,33 @@ class PeersFeature(Feature):
             )
             return
 
+        # Restored waits are resident work, not children of the cold scheduler
+        # occurrence that happened to boot this runtime. Publish one feature-
+        # owned driver under the original runtime's READY barrier; replay's
+        # supervisors, deferred signal joins and retries inherit that resident
+        # root through the ordinary child tracker. Live question supervisors
+        # still keep their caller's full custody and cannot use this handoff.
+        if callable(getattr(type(agent), "_track_runtime_task", None)):
+            self._track_owned_runtime_task(
+                self._replay_and_sweep_questions(store),
+                name="a2a_question_expiry_sweep",
+            )
+        else:
+            # Legacy standalone hosts have no resident/READY contract. Keep
+            # their synchronous replay and unchanged inherited child custody.
+            await self._replay_questions_safely(store)
+            self._track_owned_background_task(
+                self._hourly_expiry_sweep_loop(store),
+                name="a2a_question_expiry_sweep",
+            )
+
+    async def _replay_and_sweep_questions(self, store) -> None:
+        """Run restored replay and its backstop as one resident service."""
+        await self._replay_questions_safely(store)
+        await self._hourly_expiry_sweep_loop(store)
+
+    async def _replay_questions_safely(self, store) -> None:
+        """Keep ordinary replay failures recoverable without hiding control."""
         try:
             await self._replay_pending_a2a_questions(store)
         except Exception as e:
@@ -3645,18 +3672,6 @@ class PeersFeature(Feature):
                 "resume in-flight questions.",
                 e, exc_info=True,
             )
-
-        # Hourly sweep as a FEATURE-owned background task. Still agent-tracked
-        # (auto-cancelled at full agent shutdown by
-        # ``_shutdown_background_tasks``), but also owned by this feature so
-        # runtime disable / boot rollback / soft disable cancel it via
-        # ``Feature.shutdown()`` — the agent's global reap only fires at full
-        # shutdown, so an agent-only task would keep sweeping after this feature
-        # is torn down (kestrel-sovereign#2522 P1).
-        self._track_owned_background_task(
-            self._hourly_expiry_sweep_loop(store),
-            name="a2a_question_expiry_sweep",
-        )
 
     @execution_work_operation
     async def _replay_pending_a2a_questions(self, store) -> None:

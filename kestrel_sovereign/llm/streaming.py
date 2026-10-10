@@ -1077,8 +1077,19 @@ class StreamingMixin:
             failure = exc
             raise
         finally:
+            if failure is not None and is_execution_control_error(failure):
+                # Explicit control must never invoke ordinary accounting,
+                # even for legacy/unbound consumers with no custody guard.
+                raise failure
             try:
-                with (bind_execution_cleanup(self, admitted_custody) if not completed else bind_execution_custody_snapshot(admitted_custody)):
+                aborted = isinstance(failure, (asyncio.CancelledError, GeneratorExit)) or (
+                    failure is not None and is_execution_control_error(failure)
+                )
+                # An ordinary provider failure does not revoke a live turn's
+                # usage/attempt accounting. Actual cancellation, explicit
+                # close or authority control retains cleanup-only custody;
+                # binding the original snapshot also rejects a lost runtime.
+                with (bind_execution_cleanup(self, admitted_custody) if aborted else bind_execution_custody_snapshot(admitted_custody)):
                     duration_ms = int((time.monotonic() - started) * 1000)
                     if final_response is not None:
                         await self._record_streamed_usage(

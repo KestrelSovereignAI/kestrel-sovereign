@@ -64,8 +64,11 @@ pin canaries, decisions, embeddings and each internal retry after backoff.
 binding original runtime custody and rechecks it before publishing a result.
 Public streams pin the union of every consumer's admission through exceptions,
 fallback and finalization, without leaving a binding installed across a yield.
-Aborted hosted streams finalize under cleanup-only denial; ordinary usage writes
-and billing callbacks cannot run there. Codex transport readers have a neutral
+Cancelled or explicitly closed hosted streams finalize under cleanup-only
+denial; ordinary usage writes and billing callbacks cannot run there. Explicit
+control errors bypass ordinary accounting even for unbound consumers. Ordinary
+provider failures with live original authority still record
+failed-attempt and known partial-usage accounting. Codex transport readers have a neutral
 transport-lifetime context; each tool callback still binds its owning turn.
 Authority errors are not provider failures and must never trigger fallback. The AgentManager
 accepts a trusted per-agent `execution_custody_factory` before construction;
@@ -146,6 +149,14 @@ that cold-booted them. Durable owner-heartbeat timers may protect admitted boot
 work before READY; their rollback ownership remains explicit. No effect child or
 foreign turn receives this handoff: ordinary background tasks still inherit all
 denying ancestors. Revoking the original runtime still denies resident work.
+Cancellation and typed Stop/self-fence carriers preserve cause-chained native
+control evidence before classification: an unknown/committed cognition effect
+is failed, non-ACKable and non-retryable, including retained late completions.
+Peers' restored-question replay and hourly backstop use one feature-owned
+resident driver after READY. Restored subscriptions, deferred terminal-signal
+joins and retries inherit that original runtime root. Live question supervisors
+remain ordinary children of their requesting turn. Feature disable and boot
+rollback still cancel/join exactly the feature's owned tasks.
 SDK event-reader callbacks are explicit new inbound events, not continuations
 of the completed boot claim. The registered exact-client handoff joins its
 callback under the same original runtime; owned routing waits for READY. It

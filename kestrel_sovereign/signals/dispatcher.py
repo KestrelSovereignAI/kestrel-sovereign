@@ -4583,7 +4583,10 @@ class SignalDispatcher:
                     signal=routing_signal,
                     start=start,
                 )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            if is_execution_control_error(error):
+                await self._terminalize_failed_cognition(delivery, error)
+                raise
             if routing_task is not None:
                 # A caller cancellation is not a durable receipt.  Never join
                 # an uncooperative child here: retain it and release the exact
@@ -4832,8 +4835,9 @@ class SignalDispatcher:
             control_error = None
             try:
                 completed_task.result()
-            except asyncio.CancelledError:
-                pass
+            except asyncio.CancelledError as error:
+                if is_execution_control_error(error):
+                    control_error = error
             except Exception as error:
                 if is_execution_control_error(error):
                     control_error = error
@@ -4960,7 +4964,9 @@ class SignalDispatcher:
 
         try:
             return task.result()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            if is_execution_control_error(error):
+                raise
             return None
         except Exception as exc:
             if is_execution_control_error(exc):
@@ -5438,6 +5444,8 @@ class SignalDispatcher:
                         span.set_attribute(KESTREL_TURN_ID, result.turn_id)
                 return result
         except InvocationSelfFencedError as error:
+            if is_execution_control_error(error):
+                raise
             # Losing the distributed owner lease is a fail-closed
             # infrastructure decision, not receipt-backed evidence that an
             # operator requested Stop. Keep durable ingress retryable.
@@ -5450,6 +5458,8 @@ class SignalDispatcher:
                 audit=audit,
             )
         except InvocationCancelledError as error:
+            if is_execution_control_error(error):
+                raise
             # Cooperative Stop is neither a provider failure nor retry
             # authority. Preserve the ordinary route audit while carrying a
             # typed disposition to the durable settlement boundary below.

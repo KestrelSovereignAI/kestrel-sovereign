@@ -109,7 +109,9 @@ async def test_native_cognition_terminal_cas_never_revives_work_or_successor(nat
 
 
 @pytest.mark.parametrize("retained", [False, True])
-async def test_actual_native_cognition_keeps_uncertain_committed_effect_nonretryable(native_pg, retained):
+@pytest.mark.parametrize("carrier", ["direct", "cancel", "stop", "self-fence"])
+@pytest.mark.parametrize("outcome", ["unknown", "committed"])
+async def test_actual_native_cognition_keeps_uncertain_committed_effect_nonretryable(native_pg, retained, carrier, outcome):
     from kestrel_sovereign.signals import (
         DurableConsumerRegistration, OrderedLockManager, SignalDispatcher,
         SignalLogStore, SourceRegistry,
@@ -133,7 +135,14 @@ async def test_actual_native_cognition_keeps_uncertain_committed_effect_nonretry
     entered, release = asyncio.Event(), asyncio.Event()
     calls = 0
     handle = None
-    error = ExecutionCommitOutcomeError("unknown")
+    from kestrel_sovereign.agent.invocation import InvocationCancelledError, InvocationSelfFencedError
+    error = ExecutionCommitOutcomeError(outcome)
+    if carrier != "direct":
+        error_type = {"cancel": asyncio.CancelledError, "stop": InvocationCancelledError,
+                      "self-fence": InvocationSelfFencedError}[carrier]
+        wrapper = error_type("Stop raced irreversible effect")
+        wrapper.__cause__ = error
+        error = wrapper
 
     async def process_input(prompt):
         nonlocal calls
@@ -164,7 +173,7 @@ async def test_actual_native_cognition_keeps_uncertain_committed_effect_nonretry
             await asyncio.sleep(0)
             await dispatcher._drain_retained_durable_cognition_cleanup_tasks()
         else:
-            with pytest.raises(ExecutionCommitOutcomeError) as caught:
+            with pytest.raises(type(error)) as caught:
                 await handle.wait()
             assert caught.value is error
         rows = await dispatcher.list_durable_deliveries()

@@ -867,7 +867,9 @@ class Feature(_SdkFeature):
     # FULL agent shutdown, so without feature ownership a disabled feature's
     # loop keeps running against a torn-down feature.
     # ------------------------------------------------------------------
-    def _track_owned_background_task(self, coro, *, name: str) -> asyncio.Task:
+    def _track_owned_background_task(
+        self, coro, *, name: str, _resident_owner: bool = False,
+    ) -> asyncio.Task:
         """Start an agent-owned background task AND record it for feature
         teardown (#2522 P1).
 
@@ -879,7 +881,12 @@ class Feature(_SdkFeature):
         :meth:`_register_signal_sources` / :meth:`_register_wait_provider`.
         """
         agent = getattr(self, "agent", None)
-        track = getattr(agent, "_track_background_task", None)
+        runtime_track = getattr(type(agent), "_track_runtime_task", None)
+        track = (
+            agent._track_runtime_task
+            if _resident_owner and callable(runtime_track)
+            else getattr(agent, "_track_background_task", None)
+        )
         if not callable(track):
             # The agent owns background-task lifecycle; a feature can't safely
             # start an unreaped task. Fail loudly rather than leak the coroutine.
@@ -907,6 +914,19 @@ class Feature(_SdkFeature):
             )
         )
         return task
+
+    def _track_owned_runtime_task(self, coro, *, name: str) -> asyncio.Task:
+        """Own an explicit resident service through READY and feature teardown.
+
+        Only first-party lifecycle publication uses this handoff. Ordinary
+        effect children continue using `_track_owned_background_task` and keep
+        every caller admission. Core's resident tracker validates creation and
+        carries the same irreversible runtime generation, never a replacement.
+        Legacy standalone agents retain their existing background-task scope.
+        """
+        return self._track_owned_background_task(
+            coro, name=name, _resident_owner=True,
+        )
 
     async def _cancel_owned_background_tasks(self) -> None:
         """Cancel exactly the background tasks this feature started (#2522 P1).
