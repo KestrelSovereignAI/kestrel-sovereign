@@ -16,13 +16,11 @@ from tests.integration.test_constitution_refusal_races import _agent
 
 
 @pytest.mark.asyncio
-@pytest.mark.dual_backend
+@pytest.mark.parametrize("db_backend", ["sqlite"], indirect=True)
 @pytest.mark.parametrize("rejection", ["foreign-owner", "oversized", "unowned-blob", "ownerless-avatar"])
 async def test_rejected_avatar_has_no_joined_transaction_side_effects(
     db_backend, monkeypatch, rejection
 ):
-    if db_backend.backend_type != "sqlite":
-        pytest.skip("SQLite joined transaction rejection boundary")
     from kestrel_sovereign.storage import async_file_store
 
     identity = "did:test:avatar-rejection:" + uuid4().hex

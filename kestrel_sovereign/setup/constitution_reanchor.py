@@ -1328,7 +1328,6 @@ async def _write_reanchor(
     )
     from kestrel_sovereign.constitution.reanchor_receipt import reanchor_prior_pointer_fields
 
-    prior_pointer_fields = reanchor_prior_pointer_fields(old_hash, historical_hash)
     async with target.open_storage() as storage:
         from kestrel_sovereign.constitution.runtime_state import ConstitutionRuntimeStateStore
 
@@ -1353,6 +1352,12 @@ async def _write_reanchor(
             from kestrel_sovereign.constitution.reanchor_receipt import validate_constitution_reanchor_evidence
 
             validate_constitution_reanchor_evidence(agent.properties, superseding=True)
+            # old_hash is a CLI display sentinel ("none" for no anchor).
+            # Receipt evidence must describe the actual freshly locked pointer,
+            # not reinterpret that display string as corrupt stored governance.
+            prior_pointer_fields = reanchor_prior_pointer_fields(
+                agent.properties.get("constitution_hash"), historical_hash,
+            )
             # 1. File blob (encrypted at rest if KESTREL_DATA_KEY is set).
             from kestrel_sovereign.constitution.anchored_bytes import store_verified_governing_file
 

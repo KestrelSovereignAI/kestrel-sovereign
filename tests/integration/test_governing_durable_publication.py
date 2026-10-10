@@ -38,6 +38,32 @@ async def _identity(storage, properties):
     )
 
 
+@pytest.fixture
+async def isolated_publication_backend(db_backend):
+    """Give physical damage cases exclusive tables, not shared tenant rows."""
+    if db_backend.backend_type == "sqlite":
+        yield db_backend
+        return
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+    from tests.utils.postgres_schema import (
+        disposable_postgres_schema, pgvector_schema, postgres_test_url,
+        quoted_search_path, with_search_path,
+    )
+
+    admin = AsyncDatabase(db_backend)
+    vector_schema = await pgvector_schema(admin)
+    async with disposable_postgres_schema(admin, "publication_custody") as schema:
+        backend = PostgresBackend(with_search_path(
+            postgres_test_url(), quoted_search_path(schema, vector_schema),
+        ))
+        try:
+            await backend.connect()
+            yield backend
+        finally:
+            await backend.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 @pytest.mark.parametrize("mode", ["ephemeral", "isolated", "deidentified"])
@@ -78,7 +104,8 @@ async def test_native_signed_same_hash_repair_works_through_real_privacy_wrapper
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 @pytest.mark.parametrize("damage", ["target-owner", "target-row", "blob-owner", "blob-bytes"])
-async def test_integrity_success_rechecks_native_evidence_before_publication(db_backend, damage):
+async def test_integrity_success_rechecks_native_evidence_before_publication(isolated_publication_backend, damage):
+    db_backend = isolated_publication_backend
     storage = AsyncStorage(backend=db_backend, agent_id="did:test:audit-publication:" + uuid4().hex)
     await storage.initialize()
     physical = None
@@ -94,10 +121,7 @@ async def test_integrity_success_rechecks_native_evidence_before_publication(db_
         if damage == "target-owner":
             await storage.db.execute_commit("DELETE FROM graph_node_owners WHERE node_id=? AND agent_id=?", (digest, agent.agent_id))
         elif damage == "target-row":
-            # A single-tenant SQLite database permits deleting this target
-            # without touching unrelated tenants' shared physical rows.
-            if db_backend.backend_type != "sqlite":
-                pytest.skip("physical shared target deletion confined to isolated SQLite")
+            # The isolated schema/database belongs only to this case.
             await storage.db.execute_commit("DELETE FROM graph_nodes WHERE node_id=?", (digest,))
         elif damage == "blob-owner":
             await storage.db.execute_commit("DELETE FROM file_owners WHERE content_hash=? AND agent_id=?", (digest, agent.agent_id))

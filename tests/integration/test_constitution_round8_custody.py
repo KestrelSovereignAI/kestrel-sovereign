@@ -19,7 +19,9 @@ from kestrel_sovereign.constitution.resolver import resolve_governing_constituti
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.async_graph_store import GraphNode
-from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PrivacyEnforcingStorage, PrivacyViolationError,
+)
 from tests.integration.test_constitution_refusal_races import _agent
 
 
@@ -154,8 +156,6 @@ async def test_lost_runtime_state_requires_actual_registry_repair(db_backend, tm
 @pytest.mark.parametrize("writer", ["dispatcher", "anchor", "reanchor"])
 @pytest.mark.parametrize("mode", [PrivacyMode.NORMAL, PrivacyMode.EPHEMERAL])
 async def test_doctrine_snapshot_cannot_erase_actual_completed_genesis(db_backend, tmp_path, monkeypatch, writer, mode):
-    if writer == "reanchor" and mode == PrivacyMode.EPHEMERAL:
-        pytest.skip("Explicit free-text ratification remains denied in volatile mode")
     storage = AsyncStorage(backend=db_backend, agent_id="did:test:doctrine-receipt:" + uuid4().hex)
     await storage.initialize()
     task = None
@@ -174,6 +174,19 @@ async def test_doctrine_snapshot_cannot_erase_actual_completed_genesis(db_backen
                      "_persist_genesis_audit_completion", "_persist_governance_receipt_node"):
             setattr(peer, name, getattr(ConstitutionMixin, name).__get__(peer))
         peer.get_audit_response = AsyncMock(return_value={"risk_level": 3, "reasoning": "Synthetic native rejection"})
+        if writer == "reanchor" and mode == PrivacyMode.EPHEMERAL:
+            with pytest.raises(GenesisAuditRejectedError):
+                await peer.perform_genesis_audit()
+            before = (await storage.get_node(storage.agent_id)).properties
+            assert before["genesis_audit"]["status"] == "failed"
+            with pytest.raises(PrivacyViolationError):
+                await reanchor_doctrine_bundle(
+                    agent, project_root=tmp_path, bootstrap_files=OrderedDict(),
+                    expected_hash=hashlib.sha256(b"").hexdigest(),
+                    authorization="explicit local owner",
+                )
+            assert (await storage.get_node(storage.agent_id)).properties == before
+            return
         native_get = agent.storage.get_node
 
         async def read_before_concurrent_completion(identity):
