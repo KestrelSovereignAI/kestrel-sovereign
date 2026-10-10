@@ -496,7 +496,7 @@ async def assert_birth_replay_custody(db, agent_did: str, *, retain=False) -> No
             "SELECT bootstrap_pending, generation FROM constitution_runtime_state WHERE agent_id = ?" + suffix,
             (agent_did,),
         )
-    if row is not None and (not row[0] or not row[1]):
+    if row is not None and (not row[0] or not row[1] or str(row[1]).startswith("legacy:")):
         raise BirthRecordReplayRefused("Missing runtime identity has a consumed constitutional lifetime; unsigned birth replay is forbidden")
     if await db.table_exists("constitution_runtime_events"):
         # Losing the current row cannot erase the surviving lifetime ledger.

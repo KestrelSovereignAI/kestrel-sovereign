@@ -44,7 +44,10 @@ async def test_implicit_rollback_poison_prevents_escape(tmp_path, cause, surface
                         if cause == "conflict"
                         else "INSERT INTO proof VALUES (2)"
                     )
-                assert backend.owns_open_transaction is False
+                # SQL custody is lost, but this task still owns the enclosing
+                # scope and writer lock until rollback completion/cleanup.
+                assert backend._connection.in_transaction is False
+                assert backend.owns_open_transaction is True
                 if surface != "completion":
                     method = getattr(backend, surface)
                     params = [(3,)] if surface == "execute_many" else ()
@@ -62,6 +65,7 @@ async def test_implicit_rollback_poison_prevents_escape(tmp_path, cause, surface
                         else:
                             await method(query, params)
         assert await backend.fetch_val("SELECT COUNT(*) FROM proof") == 0
+        assert backend.owns_open_transaction is False
         assert await backend.table_exists("escaped") is False
         async with backend.transaction():
             await backend.execute("INSERT INTO proof VALUES (3)")

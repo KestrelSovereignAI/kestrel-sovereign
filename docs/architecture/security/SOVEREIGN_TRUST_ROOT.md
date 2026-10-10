@@ -192,6 +192,8 @@ The populated-runtime upgrade assigns nonempty immutable `legacy:` generations
 without resetting restrictions, timestamps, counters or pending markers. Those
 generations permit ordinary audited turn admission but cannot authorize a new
 automatic first anchor; an old pending bit is not new-identity authority.
+Frozen birth replay likewise refuses a migrated pending lifetime rather than
+restoring it as a newly created identity.
 Doctrine metadata
 writers use native compare-and-swap to preserve concurrent completed receipts.
 Completed same-content genesis receipts survive an incorrect operative pointer

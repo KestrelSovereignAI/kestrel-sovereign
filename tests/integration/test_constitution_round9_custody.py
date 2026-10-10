@@ -190,7 +190,7 @@ async def _isolated_schema(backend):
 @pytest.mark.parametrize("legacy_shape", ["pre-generation", "empty-generation-v3"])
 @pytest.mark.parametrize("restricted", [False, True])
 @pytest.mark.parametrize("legacy_bootstrap", [False, True])
-async def test_populated_runtime_upgrade_fences_generations_without_resetting_evidence(db_backend, legacy_shape, restricted, legacy_bootstrap):
+async def test_populated_runtime_upgrade_fences_generations_without_resetting_evidence(db_backend, tmp_path, legacy_shape, restricted, legacy_bootstrap):
     async with _isolated_schema(db_backend) as backend:
         store = ConstitutionRuntimeStateStore(backend)
         pg = backend.backend_type == "postgres"
@@ -289,6 +289,33 @@ async def test_populated_runtime_upgrade_fences_generations_without_resetting_ev
                 assert (await storage.get_node(identity)).properties == {}
                 assert await store.load(identity) == before
                 assert await store.list_events(identity) == before_events
+                # The actual frozen-birth producer must not reinterpret the
+                # same migrated pending bit as initial-identity authority.
+                from kestrel_sovereign.identity.birth_record import BirthRecordReplayRefused, replicate_birth_record
+                from kestrel_sovereign.storage.db.interface import TransactionError
+
+                source = AsyncStorage(str(tmp_path / "birth.db"), agent_id=identity)
+                await source.initialize()
+                try:
+                    native = await _agent(source)
+                    digest = await source.store_file(resolve_governing_constitution_bytes(None), "constitution.md")
+                    await source.add_node(GraphNode(node_id=identity, node_type="agent", label="frozen birth", properties={"constitution_hash": digest}))
+                    await native._anchor_constitution_governance(digest)
+                    await storage.db.execute_commit("DELETE FROM graph_nodes WHERE node_id=?", (identity,))
+                    with pytest.raises((BirthRecordReplayRefused, TransactionError), match="consumed constitutional lifetime") as refused:
+                        await replicate_birth_record(runtime_db=storage.db, anchor_db=source.db, agent_did=identity)
+                    cause = refused.value
+                    for _ in range(8):
+                        if isinstance(cause, BirthRecordReplayRefused):
+                            break
+                        cause = cause.__cause__
+                        assert cause is not None
+                    assert isinstance(cause, BirthRecordReplayRefused)
+                    assert await storage.get_node(identity) is None
+                    assert await store.load(identity) == before
+                    assert await store.list_events(identity) == before_events
+                finally:
+                    await source.close()
             finally:
                 await storage.close()
         elif not restricted:
