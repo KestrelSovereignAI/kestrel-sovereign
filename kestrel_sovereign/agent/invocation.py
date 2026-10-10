@@ -885,7 +885,7 @@ def bind_async_generator_invocation(
                                 source_close_error = close_error
                                 if is_execution_control_error(close_error):
                                     cleanup_abandoned = True
-                                raise
+                                raise execution_terminal_error(active_error, source_close_error)
                             finally:
                                 try:
                                     await checkpoint_completed_effects()

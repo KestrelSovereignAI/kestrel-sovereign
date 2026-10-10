@@ -2921,9 +2921,22 @@ class SignalDispatcher:
         if self._durable_store.backend.backend_type == "postgres":
             # False means the original live owner no longer has a leased
             # cognition. Never insert or revive it to manufacture protection.
-            await self._durable_store.backend.retain_cognition_cleanup_owner(
+            retained = await self._durable_store.backend.retain_cognition_cleanup_owner(
                 agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
             )
+            if not retained and self._retained_cognition_control_debt:
+                # A zero-row CAS is lost protection, not a healthy heartbeat.
+                # Keep the original debt and expose its terminal evidence; a
+                # timer retry cannot manufacture another owner's authority.
+                from kestrel_sovereign.execution_custody import execution_terminal_error
+                raise execution_terminal_error(*(
+                    error for _, error in self._retained_cognition_control_debt.values()
+                ))
+            if not retained and any(
+                not task.done() for task in self._retained_durable_cognition_tasks
+            ):
+                from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+                raise ExecutionAuthorityError("original retained cognition cleanup owner was lost")
         else:
             await self._durable_store.heartbeat_runtime_owner(
                 agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
@@ -4945,19 +4958,29 @@ class SignalDispatcher:
         if backend.backend_type == "postgres":
             # Ordinary admission is deliberately still denied. Only the fixed
             # exact-identity native terminalizer may perform this cleanup CAS.
-            await backend.fail_cognition_delivery(
+            terminalized = await backend.fail_cognition_delivery(
                 agent_id=self._agent.did, consumer_id=delivery.consumer_id,
                 delivery_id=delivery.delivery_id,
                 owner_id=self._durable_delivery_owner,
                 lease_token=delivery.lease_token or "", error=reason,
             )
+            if not terminalized:
+                note = "original cognition terminalization CAS did not match; cleanup debt remains unresolved"
+                if note not in getattr(error, "__notes__", ()):
+                    error.add_note(note)
+                raise error
             self._discard_transient_durable_handoff(delivery.delivery_id)
         else:
-            await self.release_durable_delivery_after_task(
+            terminalized = await self.release_durable_delivery_after_task(
                 consumer_id=delivery.consumer_id, delivery_id=delivery.delivery_id,
                 lease_token=delivery.lease_token or "", error=reason,
                 terminal=True, terminal_ackable=False,
             )
+            if terminalized is None:
+                note = "original cognition terminalization CAS did not match; cleanup debt remains unresolved"
+                if note not in getattr(error, "__notes__", ()):
+                    error.add_note(note)
+                raise error
 
     @staticmethod
     def _completed_durable_cognition_result(

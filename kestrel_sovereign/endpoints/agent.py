@@ -11,11 +11,12 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 
 from kestrel_sovereign.streams.tap import AgentStreamTap
 from kestrel_sovereign.execution_custody import (
-    execution_work_operation, is_execution_control_error, require_execution_work,
+    execution_terminal_error, execution_work_operation, is_execution_control_error, require_execution_work,
 )
 
 from kestrel_sovereign.kestrel_config.constants import (
@@ -477,8 +478,11 @@ async def invoke_agent(request: Request, http_response: Response):
             try:
                 if callable(await_admission):
                     await await_admission(agent, request_id)
-            except BaseException:
-                agent._cleanup_cancelled_request(request_id)
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    agent._cleanup_cancelled_request(request_id, disposition=RequestCompletionDisposition.ABANDONED)
+                else:
+                    agent._cleanup_cancelled_request(request_id)
                 raise
         else:
             agent._current_request_id = request_id
@@ -534,7 +538,9 @@ async def invoke_agent(request: Request, http_response: Response):
                 bind_operation(agent, request_id, evidence_task)
             try:
                 operation, observation = await evidence_task
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
+                if is_execution_control_error(error):
+                    raise
                 if (
                     owner_task is not None
                     and owner_task.cancelling()
@@ -599,7 +605,9 @@ async def invoke_agent(request: Request, http_response: Response):
         # paths to lose continuity. Reviewer flagged at chat.js:520.
         try:
             effective_session_id = await agent.storage.resolve_session_id(session_id)
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             effective_session_id = session_id  # fall back; never block the request
 
         try:
@@ -624,7 +632,9 @@ async def invoke_agent(request: Request, http_response: Response):
                     "model": None,
                     "provider": None,
                 }
-        except (asyncio.CancelledError, InvocationCancelledError):
+        except (asyncio.CancelledError, InvocationCancelledError) as error:
+            if is_execution_control_error(error):
+                raise
             if callable(request_cancelled) and request_cancelled(request_id) is True:
                 if invocation_was_self_fenced(agent, request_id):
                     raise self_fenced_invocation_http_error(request_id)
@@ -648,12 +658,18 @@ async def invoke_agent(request: Request, http_response: Response):
             "provider": identity.get("provider"),
         }
     except InvocationSelfFencedError as error:
+        if is_execution_control_error(error):
+            raise
         raise self_fenced_invocation_http_error(request_id) from error
     except HoldTurnRefusal as exc:
+        if is_execution_control_error(exc):
+            raise
         raise exc.as_http_exception() from exc
     except HTTPException:
         raise
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         # A retry loop that declined a server-advised wait is not an internal
         # error: the route is rate limited until a known time, and the caller
         # can act on that (#3127). The reset time is the provider's number,
@@ -684,7 +700,11 @@ async def invoke_agent(request: Request, http_response: Response):
         )
     finally:
         if cleanup_agent is not None and cleanup_request_id is not None:
-            cleanup_agent._cleanup_cancelled_request(cleanup_request_id)
+            error = sys.exception()
+            if error is not None and is_execution_control_error(error):
+                cleanup_agent._cleanup_cancelled_request(cleanup_request_id, disposition=RequestCompletionDisposition.ABANDONED)
+            else:
+                cleanup_agent._cleanup_cancelled_request(cleanup_request_id)
 
 
 # Chat attachments (#1662). Images can be sent to the model as vision input
@@ -823,7 +843,7 @@ async def stream_agent_response(request: Request):
     stream_tap_registered = False
     setup_cleanup_complete = False
 
-    def cleanup_unstarted_stream() -> None:
+    def cleanup_unstarted_stream(error: BaseException | None = None) -> None:
         """Undo setup if constructing the response fails before generation."""
         nonlocal setup_cleanup_complete
         if setup_cleanup_complete:
@@ -832,7 +852,12 @@ async def stream_agent_response(request: Request):
         if stream_tap_registered and stream_tap is not None and stream_delivery_id is not None:
             stream_tap.unregister(stream_delivery_id)
         if request_lifecycle_registered and agent is not None and request_id is not None:
-            agent._cleanup_cancelled_request(request_id)
+            if error is not None and is_execution_control_error(error):
+                agent._cleanup_cancelled_request(
+                    request_id, disposition=RequestCompletionDisposition.ABANDONED,
+                )
+            else:
+                agent._cleanup_cancelled_request(request_id)
 
     try:
         data = await _parse_json_body(request)
@@ -901,7 +926,9 @@ async def stream_agent_response(request: Request):
         # heuristic that left auto-load + context-status fragile).
         try:
             effective_session_id = await agent.storage.resolve_session_id(session_id)
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             effective_session_id = session_id  # fall back; never block the stream
 
         async def generate():
@@ -1010,16 +1037,24 @@ async def stream_agent_response(request: Request):
                         else stop_notice
                     )
                     stop_notice_emitted = True
-            except InvocationSelfFencedError:
+            except InvocationSelfFencedError as error:
+                if is_execution_control_error(error):
+                    raise
                 yield self_fenced_notice
-            except InvocationCancelledError:
+            except InvocationCancelledError as error:
+                if is_execution_control_error(error):
+                    raise
                 # A durable public-turn fence can win before the nested stream
                 # has yielded. Its typed unwind is acknowledged Stop even if
                 # nested cleanup already consumed the cancellation marker.
                 yield stop_notice
             except HoldTurnRefusal as exc:
+                if is_execution_control_error(exc):
+                    raise
                 yield exc.wire_json() + "\n"
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 # A request id and exception text can be client-controlled or
                 # contain withheld content.  Keep only a one-way correlation
                 # in the operator log; the client receives the shared safe
@@ -1043,7 +1078,10 @@ async def stream_agent_response(request: Request):
                     )
                     yield agent_stream_error_block(e)
             finally:
+                active_error = sys.exception()
+                control_failed = active_error is not None and is_execution_control_error(active_error)
                 agent_stream_cleanup_failed = False
+                source_cleanup_error = None
                 try:
                     # One producer task owns construction, iteration, and close
                     # of the nested generator. Its join is cancellation-safe
@@ -1051,12 +1089,13 @@ async def stream_agent_response(request: Request):
                     # context.
                     if agent_stream is not None:
                         await agent_stream.aclose()
-                except BaseException:
+                except BaseException as cleanup_error:
+                    source_cleanup_error = cleanup_error
                     agent_stream_cleanup_failed = (
                         agent_stream is not None
                         and agent_stream.cleanup_error is not None
                     )
-                    raise
+                    raise execution_terminal_error(active_error, cleanup_error)
                 else:
                     agent_stream_cleanup_failed = (
                         agent_stream is not None
@@ -1066,10 +1105,12 @@ async def stream_agent_response(request: Request):
                     try:
                         # Signal stream completion for TTS consumers
                         await stream_tap.finish(stream_delivery_id)
+                    except BaseException as tap_error:
+                        raise execution_terminal_error(active_error, source_cleanup_error, tap_error)
                     finally:
                         # A failed nested close is an abandoned lifecycle,
                         # never proof that Stop succeeded.
-                        if agent_stream_cleanup_failed:
+                        if agent_stream_cleanup_failed or control_failed:
                             agent._cleanup_cancelled_request(
                                 request_id,
                                 disposition=(
@@ -1094,16 +1135,20 @@ async def stream_agent_response(request: Request):
             headers=headers,
         )
     except InvocationSelfFencedError as error:
-        cleanup_unstarted_stream()
+        cleanup_unstarted_stream(error)
+        if is_execution_control_error(error):
+            raise
         raise self_fenced_invocation_http_error(request_id) from error
-    except asyncio.CancelledError:
-        cleanup_unstarted_stream()
+    except asyncio.CancelledError as error:
+        cleanup_unstarted_stream(error)
         raise
-    except HTTPException:
-        cleanup_unstarted_stream()
+    except HTTPException as error:
+        cleanup_unstarted_stream(error)
         raise
-    except Exception:
-        cleanup_unstarted_stream()
+    except Exception as error:
+        cleanup_unstarted_stream(error)
+        if is_execution_control_error(error):
+            raise
         logger.error("Error setting up stream")
         raise ApiHTTPException(
             status_code=500,

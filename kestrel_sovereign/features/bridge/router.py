@@ -25,10 +25,12 @@ Usage:
 from functools import lru_cache
 import json
 import logging
+import sys
 import time
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from kestrel_sovereign.rate_limit import limiter
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 from kestrel_sovereign.endpoints.agent_helpers import (
     cancelled_invocation_http_error,
     get_agent,
@@ -78,10 +80,13 @@ async def _register_bridge_request(agent, request_id: str) -> None:
         try:
             if callable(await_admission):
                 await await_admission(agent, request_id)
-        except BaseException:
+        except BaseException as error:
             cleanup = getattr(agent, "_cleanup_cancelled_request", None)
             if callable(cleanup):
-                cleanup(request_id)
+                if is_execution_control_error(error):
+                    cleanup(request_id, disposition=RequestCompletionDisposition.ABANDONED)
+                else:
+                    cleanup(request_id)
             raise
     else:
         agent._current_request_id = request_id
@@ -184,6 +189,8 @@ def get_router() -> APIRouter:
         try:
             await _register_bridge_request(agent, request_id)
         except InvocationSelfFencedError as error:
+            if is_execution_control_error(error):
+                raise
             raise self_fenced_invocation_http_error(request_id) from error
         request_cancelled = getattr(agent, "is_request_cancelled", None)
         try:
@@ -231,12 +238,20 @@ def get_router() -> APIRouter:
                     invocation_provenance=invocation_provenance,
                 )
             except InvocationSelfFencedError as error:
+                if is_execution_control_error(error):
+                    raise
                 raise self_fenced_invocation_http_error(request_id) from error
             except InvocationCancelledError as error:
+                if is_execution_control_error(error):
+                    raise
                 raise stopped_invocation_http_error(request_id) from error
             except HoldTurnRefusal as exc:
+                if is_execution_control_error(exc):
+                    raise
                 raise exc.as_http_exception() from exc
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 # Exception text and tracebacks can contain bridge
                 # message/context content. Keep both client and logs bounded.
                 logger.error("Bridge invoke failed")
@@ -278,7 +293,11 @@ def get_router() -> APIRouter:
         finally:
             cleanup = getattr(agent, "_cleanup_cancelled_request", None)
             if callable(cleanup):
-                cleanup(request_id)
+                error = sys.exception()
+                if error is not None and is_execution_control_error(error):
+                    cleanup(request_id, disposition=RequestCompletionDisposition.ABANDONED)
+                else:
+                    cleanup(request_id)
 
     # ------------------------------------------------------------------
     # POST /api/bridge/stream -- streaming invocation via SSE
@@ -317,6 +336,8 @@ def get_router() -> APIRouter:
         try:
             await _register_bridge_request(agent, request_id)
         except InvocationSelfFencedError as error:
+            if is_execution_control_error(error):
+                raise
             raise self_fenced_invocation_http_error(request_id) from error
         request_lifecycle_registered = True
         request_cancelled = getattr(agent, "is_request_cancelled", None)
@@ -346,13 +367,15 @@ def get_router() -> APIRouter:
                     callable(request_cancelled)
                     and request_cancelled(request_id) is True
                 )
-        except BaseException:
+        except BaseException as error:
             cleanup = getattr(agent, "_cleanup_cancelled_request", None)
             if callable(cleanup):
-                # A terminal setup failure still has an endpoint owner which
-                # performs lifecycle cleanup here. ABANDONED is reserved for
-                # nested work whose cleanup ownership was actually lost.
-                cleanup(request_id)
+                # Control loss is unresolved even when it crosses a setup
+                # write rather than the nested cognition iterator.
+                if is_execution_control_error(error):
+                    cleanup(request_id, disposition=RequestCompletionDisposition.ABANDONED)
+                else:
+                    cleanup(request_id)
             raise
 
         response_body_started = False
@@ -481,16 +504,24 @@ def get_router() -> APIRouter:
                     content_preview=response_text,
                     duration_ms=elapsed_ms,
                 )
-            except InvocationSelfFencedError:
+            except InvocationSelfFencedError as error:
+                if is_execution_control_error(error):
+                    raise
                 yield self_fenced_event()
-            except InvocationCancelledError:
+            except InvocationCancelledError as error:
+                if is_execution_control_error(error):
+                    raise
                 # Durable admission refusal is an acknowledged Stop. The
                 # nested lifecycle may consume its marker before the exception
                 # crosses the owned iterator, so preserve the typed outcome.
                 yield stopped_event()
             except HoldTurnRefusal as exc:
+                if is_execution_control_error(exc):
+                    raise
                 yield f"event: refusal\ndata: {exc.wire_json()}\n\n"
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 # The SSE client gets only the stable safe payload built by
                 # the same shared boundary /api/agent/stream uses.  Logging
                 # also remains content-safe for gateway-provided input.
@@ -505,16 +536,18 @@ def get_router() -> APIRouter:
                 )
                 yield bridge_sse_error_event(e)
             finally:
+                active_error = sys.exception()
+                control_failed = active_error is not None and is_execution_control_error(active_error)
                 agent_stream_cleanup_failed = False
                 try:
                     if agent_stream is not None:
                         await agent_stream.aclose()
-                except BaseException:
+                except BaseException as cleanup_error:
                     agent_stream_cleanup_failed = (
                         agent_stream is not None
                         and agent_stream.cleanup_error is not None
                     )
-                    raise
+                    raise execution_terminal_error(active_error, cleanup_error)
                 else:
                     agent_stream_cleanup_failed = (
                         agent_stream is not None
@@ -526,7 +559,7 @@ def get_router() -> APIRouter:
                     # a cancellation key; each generator releases only its own
                     # registration after nested stream cleanup is terminal.
                     if request_lifecycle_registered:
-                        if agent_stream_cleanup_failed:
+                        if agent_stream_cleanup_failed or control_failed:
                             agent._cleanup_cancelled_request(
                                 request_id,
                                 disposition=(

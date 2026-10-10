@@ -254,6 +254,21 @@ Hosted cleanup preserves failed checkpoints in the existing unresolved ledger
 without reopening general work. SQLAlchemy cached/yielded execution remains
 explicitly unsupported under custody; rollback/close remain available.
 
+An exact cognition terminalization or cleanup-liveness CAS returning no match
+is not proof of successful cleanup. Original control debt remains retained,
+shutdown remains fenced, and successor-owned/retryable deliveries are never
+overwritten. Repeated retries retain bounded diagnostic notes rather than
+manufacturing another owner or acknowledgement. Operator reconciliation is
+required when the original lease can no longer establish terminal state.
+
+The first distributed Stop admission settles control-bearing renewal failures
+as `ABANDONED` before asynchronous cleanup can claim `COMPLETED`. Both native
+HTTP and bridge invocation/streaming routes classify explicit control causes
+before ordinary Stop, retry, refusal or provider-error normalization. Source
+closure and transport cleanup select original terminal evidence before later
+cleanup noise; an abandoned stream never becomes a retry recommendation or
+an acknowledged Stop.
+
 See the [canonical storage contract](../architecture/storage/STORAGE_ARCHITECTURE.md#hosted-execution-custody)
 for installation and limitations. Full independent review, repository/CI gates,
 immutable publication/verification and Frinz generation adoption/live acceptance

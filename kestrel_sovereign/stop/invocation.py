@@ -28,6 +28,7 @@ from kestrel_sovereign.agent.invocation import (
     validate_invocation_id,
 )
 from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sdk.storage.database.interface import TransactionError
 from kestrel_sovereign.storage.database_clock import (
     database_lease_cutoff_sql,
@@ -1176,8 +1177,15 @@ class DistributedInvocationRegistry:
                             generation_id,
                             operation="during admission",
                         )
-                    except InvocationSelfFencedError:
-                        self.complete_soon(agent, turn_id, generation)
+                    except InvocationSelfFencedError as error:
+                        self.complete_soon(
+                            agent, turn_id, generation,
+                            disposition=(
+                                RequestCompletionDisposition.ABANDONED
+                                if is_execution_control_error(error)
+                                else RequestCompletionDisposition.COMPLETED
+                            ),
+                        )
                         raise
                     if generation_id in polled.stop_generation_ids:
                         self.complete_soon(agent, turn_id, generation)
