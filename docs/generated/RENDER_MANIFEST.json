@@ -4501,6 +4501,18 @@
       "type": "Release Notes"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.53.27.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.53.27",
+      "type": "Release Note"
+    },
+    {
       "existing_code_refs": [
         "docker/simpletuner_api.py"
       ],

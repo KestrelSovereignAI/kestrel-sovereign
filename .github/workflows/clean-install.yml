@@ -186,6 +186,12 @@ jobs:
             echo "UVRUN=uv run" >> "$GITHUB_ENV"
           fi
 
+      # Exercise native stdout handles after an actual launcher exits. This
+      # probe uses the installed package (including the wheel axis), no LLM or
+      # pytest, and exact-identity bounded child cleanup on every platform.
+      - name: Verify detached native log custody
+        run: ${{ env.UVRUN }} python tests/unit/test_cli_detached_named_start.py
+
       # QUICKSTART Step 4: run the setup wizard.
       # --quickstart accepts Ollama as the LLM (no API key needed in CI),
       # generates KESTREL_DATA_KEY + KESTREL_API_KEY, writes [llm] into
