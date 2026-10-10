@@ -18,13 +18,14 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Optional, Protocol, Set
 
 from .invocation_context import LLMInvocationContext, turn_invocation_for
-from kestrel_sovereign.execution_custody import execution_work_operation, is_execution_control_error
+from kestrel_sovereign.execution_custody import current_execution_custody, execution_work_operation, is_execution_control_error
+from kestrel_sovereign._async_ownership import await_owned_task
 
 logger = logging.getLogger(__name__)
 
 #: How long a caller waits for its call's telemetry record before the write is
-#: handed to a background task (§8.2). The caller's outcome is never delayed
-#: past this.
+#: handed to a background task for unbound callers (§8.2). Custody-bound
+#: callers cancel a late writer and join its transaction classification.
 USAGE_RECORD_TIMEOUT = 2.0
 
 RecordedModality = Literal["decision", "embedding"]
@@ -81,12 +82,14 @@ class ModalityRecordingMixin:
 
     @execution_work_operation
     async def record_modality_call(self, call: ModalityCall) -> None:
-        """Write ``call`` without letting it alter the caller's outcome.
+        """Record best-effort telemetry without abandoning hosted effects.
 
         The write runs as its own task under ``asyncio.shield``, so cancelling
         the caller does not cancel it. The caller waits at most
         :data:`USAGE_RECORD_TIMEOUT`; a slower write finishes in the
-        background. Nothing raised by the write reaches the caller.
+        background for legacy unbound calls. Under execution custody, timeout
+        or cancellation interrupts and joins the owned writer. Authority and
+        commit uncertainty always reach the invocation before it settles.
         """
 
         task = asyncio.ensure_future(self._write_modality_record(call))
@@ -94,16 +97,25 @@ class ModalityRecordingMixin:
         task.add_done_callback(self._modality_record_done)
         try:
             await asyncio.wait_for(asyncio.shield(task), USAGE_RECORD_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "%s record for %s is late; finishing in the background",
-                call.modality,
-                call.caller or call.model,
-            )
-        except asyncio.CancelledError:
-            # A new cancellation while waiting: the shielded write carries on
-            # by itself, and the cancellation propagates to the caller.
-            raise
+        except (asyncio.TimeoutError, asyncio.CancelledError) as interruption:
+            if current_execution_custody(self):
+                task.cancel()
+                outcome = await await_owned_task(
+                    task,
+                    interruption if isinstance(interruption, asyncio.CancelledError) else None,
+                )
+                if outcome.error is not None and is_execution_control_error(outcome.error):
+                    raise outcome.error
+                if outcome.cancellation is not None:
+                    raise outcome.cancellation
+            elif isinstance(interruption, asyncio.CancelledError):
+                raise
+            else:
+                logger.warning(
+                    "%s record for %s is late; finishing in the background",
+                    call.modality,
+                    call.caller or call.model,
+                )
         except Exception as error:  # noqa: BLE001 - logged by the done callback
             if is_execution_control_error(error):
                 raise

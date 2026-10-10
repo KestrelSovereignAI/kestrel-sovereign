@@ -22,8 +22,6 @@ chat stream where it corrupts the agent's response.
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager
-from kestrel_sovereign._async_ownership import await_owned_task
 from typing import (
     Awaitable,
     Callable,
@@ -55,6 +53,7 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
     bind_execution_cleanup, execution_work_stream, is_execution_control_error,
+    owned_execution_stream as _owned_stream,
 )
 from .adapter import (
     LLMResponse,
@@ -72,23 +71,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-@asynccontextmanager
-async def _owned_stream(owner: Any, stream: AsyncIterator[Any]):
-    """Join every forwarding iterator's close before its caller retires."""
-    iterator = aiter(stream)
-    captured = current_execution_custody(owner)
-    try:
-        yield iterator
-    finally:
-        close = getattr(iterator, "aclose", None)
-        if callable(close):
-            with bind_execution_cleanup(owner, captured):
-                outcome = await await_owned_task(asyncio.create_task(close()))
-                if outcome.error is not None:
-                    raise outcome.error
-                if outcome.cancellation is not None:
-                    raise outcome.cancellation
 
 # v5 typed negotiation (#1983). Routing gates read the adapter's typed
 # ``ProviderCapabilities`` plus its ``contract_features()`` opt-in set instead

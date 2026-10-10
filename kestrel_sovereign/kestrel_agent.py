@@ -2752,18 +2752,20 @@ class KestrelAgent(
         """Phase 2 — A2A stores, observability, and the signal spine. TaskManager + its stores, the observability/feedback sinks, the enablement store, the SignalDispatcher/registries, and the core (always-on) signal sources."""
         # Initialize TaskManager for A2A unified routing
         # All stores use the abstract data layer (SQLite for sovereign, PostgreSQL for multi-tenant)
-        if self._db_backend.lower() == "postgres" and self.pg_pool:
-            # PostgreSQL mode: use PostgreSQL stores with existing pool
+        if self._db_backend.lower() == "postgres":
+            # Reuse storage's guarded native backend in both shared-pool and
+            # DSN-only modes; wrappers must not drop its retained generation.
+            pg_backend = self._raw_storage._backend
             from kestrel_sovereign.a2a.stores.postgres import (
                 PostgresTaskStore, PostgresSessionService,
                 PostgresMemoryService, PostgresObservabilityStore,
                 PostgresFeedbackStore
             )
-            task_store = PostgresTaskStore(self.pg_pool)
-            session_service = PostgresSessionService(self.pg_pool)
-            observability_store = PostgresObservabilityStore(self.pg_pool)
-            memory_service = PostgresMemoryService(self.pg_pool)
-            feedback_store = PostgresFeedbackStore(self.pg_pool)
+            task_store = PostgresTaskStore(backend=pg_backend)
+            session_service = PostgresSessionService(backend=pg_backend)
+            observability_store = PostgresObservabilityStore(backend=pg_backend)
+            memory_service = PostgresMemoryService(backend=pg_backend)
+            feedback_store = PostgresFeedbackStore(backend=pg_backend)
             logging.info(f"Using PostgreSQL A2A stores for agent {self.did}")
         else:
             # SQLite mode: use SQLite stores with file path

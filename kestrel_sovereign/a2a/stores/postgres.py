@@ -21,6 +21,7 @@ layer (kestrel_sovereign.storage.sync) for cloud replication of either.
 import logging
 
 import asyncpg
+from kestrel_sovereign.execution_custody import ExecutionCustody
 
 # Import the PostgresBackend class directly (not the lazy loader function)
 from kestrel_sovereign.storage.db.postgres import PostgresBackend
@@ -59,19 +60,17 @@ class PoolBackendAdapter(PostgresBackend):
     external app_state.pg_pool without creating a new connection pool.
     """
 
-    def __init__(self, pool: asyncpg.Pool):
+    def __init__(self, pool: asyncpg.Pool, *, execution_custody: ExecutionCustody | None = None):
         """
         Initialize with an existing asyncpg connection pool.
 
         Args:
             pool: asyncpg connection pool from external pg_pool
         """
-        # Don't call super().__init__() - we're wrapping an existing pool
-        # Set the pool directly (PostgresBackend checks self._pool)
-        import contextvars
-        self._pool = pool
-        # Per-task transaction connection, matching PostgresBackend (#1726).
-        self._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
+        # Canonical native initialization; no new pool or authority is minted.
+        self.__dict__.update(PostgresBackend.from_pool(
+            pool, execution_custody=execution_custody,
+        ).__dict__)
 
     async def connect(self) -> None:
         """No-op since pool is already connected."""
@@ -88,88 +87,50 @@ class PoolBackendAdapter(PostgresBackend):
 # These classes wrap the unified stores with the pool adapter, exposing the
 # same interface against an existing asyncpg.Pool from app_state.pg_pool.
 
-class PostgresTaskStore(UnifiedTaskStore):
+class _SharedPostgresStore:
+    def __init__(
+        self, pool: asyncpg.Pool | None = None, *,
+        backend: PostgresBackend | None = None,
+        execution_custody: ExecutionCustody | None = None,
+    ):
+        if backend is not None:
+            if pool is not None or execution_custody is not None:
+                raise ValueError("provide either a native backend or a pool/custody")
+            if not isinstance(backend, PostgresBackend):
+                raise TypeError("A2A PostgreSQL stores require a native PostgresBackend")
+        elif pool is not None:
+            backend = PoolBackendAdapter(pool, execution_custody=execution_custody)
+        else:
+            raise ValueError("A2A PostgreSQL stores require a backend or pool")
+        super().__init__(backend)
+
+    async def close(self) -> None:
+        # Storage/host owns the backend; primary storage closes it last.
+        pass
+
+
+class PostgresTaskStore(_SharedPostgresStore, UnifiedTaskStore):
     """PostgreSQL-backed task store for multi-tenant deployment."""
 
-    def __init__(self, pool: asyncpg.Pool):
-        """
-        Initialize with asyncpg connection pool.
 
-        Args:
-            pool: asyncpg connection pool from app_state.pg_pool
-        """
-        backend = PoolBackendAdapter(pool)
-        super().__init__(backend)
-
-
-class PostgresSessionService(UnifiedSessionService):
+class PostgresSessionService(_SharedPostgresStore, UnifiedSessionService):
     """PostgreSQL-backed session service for multi-tenant deployment."""
 
-    def __init__(self, pool: asyncpg.Pool):
-        """
-        Initialize with asyncpg connection pool.
 
-        Args:
-            pool: asyncpg connection pool from app_state.pg_pool
-        """
-        backend = PoolBackendAdapter(pool)
-        super().__init__(backend)
-
-
-class PostgresMemoryService(UnifiedMemoryService):
+class PostgresMemoryService(_SharedPostgresStore, UnifiedMemoryService):
     """PostgreSQL-backed memory with full-text search via tsvector/GIN."""
 
-    def __init__(self, pool: asyncpg.Pool):
-        """
-        Initialize with asyncpg connection pool.
 
-        Args:
-            pool: asyncpg connection pool from app_state.pg_pool
-        """
-        backend = PoolBackendAdapter(pool)
-        super().__init__(backend)
-
-
-class PostgresObservabilityStore(UnifiedObservabilityStore):
+class PostgresObservabilityStore(_SharedPostgresStore, UnifiedObservabilityStore):
     """PostgreSQL-backed observability store."""
 
-    def __init__(self, pool: asyncpg.Pool):
-        """
-        Initialize with asyncpg connection pool.
 
-        Args:
-            pool: asyncpg connection pool from app_state.pg_pool
-        """
-        backend = PoolBackendAdapter(pool)
-        super().__init__(backend)
-
-
-class PostgresOrchestrationStore(UnifiedOrchestrationStore):
+class PostgresOrchestrationStore(_SharedPostgresStore, UnifiedOrchestrationStore):
     """PostgreSQL-backed orchestration store for multi-agent workflows."""
 
-    def __init__(self, pool: asyncpg.Pool):
-        """
-        Initialize with asyncpg connection pool.
 
-        Args:
-            pool: asyncpg connection pool from app_state.pg_pool
-        """
-        backend = PoolBackendAdapter(pool)
-        super().__init__(backend)
-
-
-class PostgresFeedbackStore(UnifiedFeedbackStore):
+class PostgresFeedbackStore(_SharedPostgresStore, UnifiedFeedbackStore):
     """PostgreSQL-backed feedback store for agent self-diagnosis."""
-
-    def __init__(self, pool: asyncpg.Pool):
-        """
-        Initialize with asyncpg connection pool.
-
-        Args:
-            pool: asyncpg connection pool from app_state.pg_pool
-        """
-        backend = PoolBackendAdapter(pool)
-        super().__init__(backend)
 
 
 # =============================================================================

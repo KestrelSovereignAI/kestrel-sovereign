@@ -104,6 +104,17 @@ close failures are classified before terminal invocation settlement. Boot's
 READY transition and deferred readiness likewise retain/check original custody;
 denial unwinds already committed boot phases rather than publishing readiness.
 
+A2A boot reuses the guarded native storage backend, including DSN-only agents;
+individual stores do not own its pool. Inbound verification/authorization and
+peer tools retain the original runtime throughout the operation. Operational
+sessions remember every participating admission until physical release and
+revalidate before publishing even a successfully released result. Hosted usage
+writers are joined through cancellation/timeout; Codex drains late inline-tool
+control evidence before unregistering the turn sink. Scheduler cold preparation
+is already an executing occurrence: uncertain bootstrap cannot advance or replay
+the original schedule. A known feature-unavailable deferral restores only the
+same live claim, never an uncertain occurrence under fresh authority.
+
 Custody-bound durable-signal boot uses transactional creation/repair of its
 exact source-sequence index, retaining generation locks through commit. Unbound
 host maintenance keeps concurrent index DDL. Large preexisting ledgers should

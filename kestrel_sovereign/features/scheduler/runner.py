@@ -42,6 +42,7 @@ from kestrel_sovereign.execution_custody import (
     current_execution_custody,
     require_execution_work,
     execution_commit_outcome,
+    is_execution_control_error,
 )
 from kestrel_sovereign.storage.database_clock import (
     database_backend_type as scheduler_database_backend_type,
@@ -3281,6 +3282,12 @@ class SchedulerRunner:
         started = time.monotonic()
         in_preparation = True
         try:
+            # Cold preparation can itself commit bootstrap effects before
+            # yielding a runtime. Persist the exact occurrence's evidence
+            # BEFORE entering it, in a short transaction which holds no locks
+            # across bootstrap DDL. No replacement admission is needed on loss.
+            if self._prepared_executor_method() is not None:
+                await self._mark_effect_started(task, execution)
             # A prepared executor resolves/cold-starts before the PostgreSQL
             # control-row transaction. AgentManager retains a shared DID
             # execution lease through the eventual effect, so DELETE cannot
@@ -3466,7 +3473,10 @@ class SchedulerRunner:
                     )
         except asyncio.CancelledError:
             raise
-        except SchedulerFeatureUnavailable:
+        except SchedulerFeatureUnavailable as error:
+            if is_execution_control_error(error):
+                logger.error("Scheduler preparation %s requires authority/commit reconciliation: %s", execution.id, error)
+                return
             # Cold preparation can discover that a globally disabled or
             # otherwise unavailable feature was not visible in the host's
             # pre-claim configuration. Preserve the claimed occurrence (and
@@ -3478,8 +3488,16 @@ class SchedulerRunner:
                 execution.id,
                 task.agent_id,
             )
+            # An explicit unavailable-feature verdict is known non-dispatch,
+            # not a lost acknowledgement. Restore the pre-effect claim only
+            # under its original live exact-owner CAS; expiry/loss cannot do so.
+            if self._prepared_executor_method() is not None and not renewal_state.lost.is_set():
+                await self._mark_effect_started(task, execution, preparation_deferred=True)
             return
         except Exception as error:
+            if is_execution_control_error(error):
+                logger.error("Scheduler execution %s requires authority/commit reconciliation: %s", execution.id, error)
+                return
             if not in_preparation:
                 # Database/admission failures remain scheduler infrastructure
                 # failures. Do not disguise one as an ordinary cold-load task
@@ -3637,13 +3655,18 @@ class SchedulerRunner:
             phase,
         )
 
-    async def _mark_effect_started(self, task: ScheduledTask, execution: SchedulerExecution) -> None:
-        """Persist indeterminate effect evidence BEFORE PostgreSQL dispatch.
+    async def _mark_effect_started(
+        self, task: ScheduledTask, execution: SchedulerExecution, *,
+        preparation_deferred: bool = False,
+    ) -> None:
+        """Persist indeterminate evidence BEFORE PostgreSQL preparation/dispatch.
 
         An expired claim alone is not proof that an external effect did not
         happen. Recovery preserves this occurrence's canonical log instead of
         making it executable again. Only exact-owner live finalization may
-        resolve ``executing`` into a known outcome. This is a short ordinary
+        resolve ``executing`` into a known outcome. An explicit unavailable
+        feature can restore ``claimed`` under this same original live CAS.
+        This is a short ordinary
         guarded transaction, not a post-loss work grant or a new receipt table.
         """
         if self._database_backend_type() != "postgres":
@@ -3662,9 +3685,10 @@ class SchedulerRunner:
             if not self._updated(claimed):
                 raise ExecutionAuthorityError("scheduler claim lost before effect evidence")
             marked = await self._db.execute(
-                """UPDATE task_execution_log SET status = 'executing'
-                WHERE id = ? AND task_id = ? AND agent_id = ? AND status = 'claimed'""",
-                (execution.id, task.id, task.agent_id),
+                """UPDATE task_execution_log SET status = ?
+                WHERE id = ? AND task_id = ? AND agent_id = ?
+                  AND status IN ('claimed', 'executing')""",
+                ("claimed" if preparation_deferred else "executing", execution.id, task.id, task.agent_id),
             )
             if not self._updated(marked):
                 raise ExecutionAuthorityError("scheduler effect evidence already resolved or missing")

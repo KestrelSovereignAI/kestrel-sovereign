@@ -355,6 +355,9 @@ async def test_cancel_during_tool_batch_persists_completed_result_before_unwind(
         return await persist_assistant_turn(*args, **kwargs)
 
     agent._persist_assistant_turn_safely = capture_persistence_requirement
+    agent._persist_completed_tool_stop_checkpoint = (
+        OrchestratorEngineMixin._persist_completed_tool_stop_checkpoint.__get__(agent)
+    )
     agent._visible_features_by_tool_name = MagicMock(return_value={})
     agent._known_tool_names = MagicMock(return_value=set())
     agent._handle_orchestrator_response_streaming = (
@@ -432,14 +435,18 @@ async def test_cancel_during_tool_batch_persists_completed_result_before_unwind(
     assert len(assistant_calls) == 1
     assert persistence_requirements == [True]
     assert assistant_calls[0].kwargs["metadata"]["cancelled"] is True
-    assert assistant_calls[0].kwargs["metadata"]["tool_results"] == [
-        {
-            "tool_call_id": "tc1",
-            "name": "send_message",
-            "arguments": {"text": "sent once"},
-            "result": {"success": True},
-        }
-    ]
+    # Cancellation now closes every forwarding layer before unwinding. When
+    # that close interrupts a batch's result marker, the real turn owner uses
+    # its fixed anti-repeat checkpoint, not an unpublished provider envelope.
+    from kestrel_sovereign.agent.streaming import (
+        STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+        _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
+    )
+    assert assistant_calls[0].args[1] == STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT
+    assert assistant_calls[0].kwargs["metadata"] == {
+        **_STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
+        "cancelled": True,
+    }
 
 
 @pytest.mark.asyncio

@@ -704,6 +704,95 @@ async def test_pool_release_failure_preserves_committed_outcome(native_pg, expli
     assert await backend.fetch_val("SELECT value FROM effects") == "committed before release"
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("release", ["error", "cancel", "revoke"])
+async def test_unbound_operational_checkout_retains_participating_admission(native_pg, explicit, release):
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign.execution_custody import execution_commit_outcome
+
+    backend, _, _ = native_pg
+    pool = backend._pool
+    from types import SimpleNamespace
+    from kestrel_sovereign.execution_custody import bind_execution_runtime
+    scope = ExecutionCustody(GenerationFence())
+    owner = SimpleNamespace(_execution_custody=scope)
+
+    class ReleaseBoundaryPool:
+        def __getattr__(self, name):
+            return getattr(pool, name)
+
+        @asynccontextmanager
+        async def acquire(self):
+            async with pool.acquire() as connection:
+                yield connection
+                await asyncio.sleep(0)
+                if release == "revoke":
+                    scope.revoke("retired during pool release")
+            if release == "error":
+                raise OSError("late release failed")
+            if release == "cancel":
+                raise asyncio.CancelledError("late release cancelled")
+
+    backend._pool = ReleaseBoundaryPool()
+    try:
+        with pytest.raises(Exception) as caught:
+            # Shared operational sessions are deliberately unbound at entry.
+            async with backend.operational_session():
+                with bind_execution_runtime(owner):
+                    if explicit:
+                        async with backend.transaction():
+                            await backend.execute("INSERT INTO effects VALUES (1, 'committed')")
+                    else:
+                        await backend.execute("INSERT INTO effects VALUES (1, 'committed')")
+        assert execution_commit_outcome(caught.value) == "committed"
+        with pytest.raises(Exception) as denied:
+            scope.require_work()
+        assert execution_commit_outcome(denied.value) == "committed"
+    finally:
+        backend._pool = pool
+    assert await backend.fetch_val("SELECT value FROM effects") == "committed"
+
+
+@pytest.mark.parametrize("surface", ["query", "batch", "script", "read"])
+async def test_successful_release_revalidates_before_publishing(native_pg, surface):
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign.execution_custody import execution_commit_outcome
+
+    backend, _, _ = native_pg
+    pool = backend._pool
+    from types import SimpleNamespace
+    from kestrel_sovereign.execution_custody import bind_execution_runtime
+    scope = ExecutionCustody(GenerationFence())
+    owner = SimpleNamespace(_execution_custody=scope)
+
+    class RevokingReleasePool:
+        def __getattr__(self, name):
+            return getattr(pool, name)
+
+        @asynccontextmanager
+        async def acquire(self):
+            async with pool.acquire() as connection:
+                yield connection
+                await asyncio.sleep(0)
+                scope.revoke("revoked while resetting physical connection")
+
+    backend._pool = RevokingReleasePool()
+    try:
+        with bind_execution_runtime(owner):
+            with pytest.raises(Exception) as caught:
+                if surface == "batch":
+                    await backend.execute_many("INSERT INTO effects VALUES (?, ?)", [(1, "effect")])
+                elif surface == "script":
+                    await backend.execute_script("INSERT INTO effects VALUES (1, 'effect')")
+                elif surface == "read":
+                    await backend.fetch_val("SELECT generation FROM authority")
+                else:
+                    await backend.execute("INSERT INTO effects VALUES (1, 'effect')")
+            assert execution_commit_outcome(caught.value) == "committed"
+    finally:
+        backend._pool = pool
+
+
 async def test_scheduler_commit_uncertainty_remains_unresolved(native_pg):
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
@@ -746,3 +835,50 @@ async def test_scheduler_commit_uncertainty_remains_unresolved(native_pg):
     assert updated.status.value == "error"
     assert calls == [True]
     assert await backend.fetch_val("SELECT count(*) FROM effects") == 1
+
+
+@pytest.mark.parametrize("outcome", ["denied", "unknown"])
+async def test_scheduler_preparation_control_error_preserves_original_occurrence(native_pg, outcome):
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timedelta, timezone
+    from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask, SCHEDULER_PROTOCOL_VERSION
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    backend, _, _ = native_pg
+    db = AsyncDatabase(backend)
+    prepared, dispatched = [], []
+    agent_id = "did:test:preparation-custody"
+
+    class Executor:
+        @asynccontextmanager
+        async def prepare_scheduled(self, execution):
+            prepared.append(execution.id)
+            if outcome == "unknown":
+                await backend.execute("INSERT INTO effects VALUES (1, 'boot commit')")
+                try:
+                    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+                    raise ExecutionCommitOutcomeError("unknown")
+                except Exception as error:
+                    raise RuntimeError("cold boot acknowledgement lost") from error
+            raise ExecutionAuthorityError("original warm runtime retired")
+            yield lambda: dispatched.append(True)
+
+    runner = SchedulerRunner(db, agent_id, Executor(), owner_id="original-preparation-owner")
+    await runner._ensure_tables()
+    due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    await db.execute("""INSERT INTO scheduled_tasks
+        (id, agent_id, task_name, cron_expression, enabled, next_run_at, created_at, idempotency_key, scheduler_protocol_version)
+        VALUES ('prepare-uncertain', ?, 'effect', '* * * * *', 1, ?, ?, 'preparation-base', ?)""",
+        (agent_id, due, due, SCHEDULER_PROTOCOL_VERSION))
+    task = ScheduledTask.from_row((await runner._due_rows(datetime.now(timezone.utc)))[0])
+    claimed = await runner._claim(task, datetime.now(timezone.utc))
+    await runner._execute_claim(claimed)
+    assert await db.fetchval("SELECT status FROM task_execution_log WHERE task_id='prepare-uncertain'") == "executing"
+    assert await db.fetchone("SELECT claim_execution_id, claim_scheduled_for, next_run_at FROM scheduled_tasks WHERE id='prepare-uncertain'") == (claimed.claim_execution_id, due, due)
+    await db.execute("UPDATE scheduled_tasks SET lease_expires_at = ? WHERE id='prepare-uncertain'", ((datetime.now(timezone.utc)-timedelta(seconds=10)).isoformat(),))
+    replacement = SchedulerRunner(db, agent_id, Executor(), owner_id="replacement-preparation-owner")
+    recovered = ScheduledTask.from_row((await replacement._due_rows(datetime.now(timezone.utc)))[0])
+    assert await replacement._claim(recovered, datetime.now(timezone.utc)) is None
+    assert await db.fetchval("SELECT terminal_status FROM scheduled_tasks WHERE id='prepare-uncertain'") == "unresolved_effect"
+    assert prepared == [claimed.claim_execution_id]
+    assert not dispatched

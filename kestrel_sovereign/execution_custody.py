@@ -10,7 +10,7 @@ has been reset. Causation and telemetry are not consulted for authority.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
@@ -64,6 +64,29 @@ def is_execution_control_error(error: BaseException) -> bool:
             return False
         error = error.__cause__
     return False
+
+
+def execution_terminal_error(*errors: BaseException | None) -> BaseException | None:
+    """Keep irreversible control evidence ahead of cancellation/cleanup noise."""
+    import asyncio
+    present = tuple(error for error in errors if error is not None)
+    for outcome in ("unknown", "committed"):
+        for error in present:
+            if execution_commit_outcome(error) == outcome:
+                return error
+    for error in present:
+        if is_execution_control_error(error):
+            return error
+    for error in present:
+        # OwnedAsyncIterator carries source cleanup debt as the explicit cause
+        # of cancellation. A failed checkpoint is not a successful Stop.
+        if isinstance(error, asyncio.CancelledError) and error.__cause__ is not None:
+            return error.__cause__
+    if present and isinstance(present[0], (asyncio.CancelledError, GeneratorExit)):
+        for error in present[1:]:
+            if not isinstance(error, (asyncio.CancelledError, GeneratorExit)):
+                return error
+    return present[0] if present else None
 
 
 class ExecutionFence(Protocol):
@@ -251,7 +274,9 @@ async def await_execution_work(owner: Any, operation: Callable[[], Awaitable[_Re
             result = await operation()
         except ExecutionAuthorityError:
             raise
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             require_execution_work(owner)
             raise
         require_execution_work(owner)
@@ -274,30 +299,9 @@ def execution_work_stream(function: Callable) -> Callable:
     """
     @wraps(function)
     async def guarded(self, *args, **kwargs) -> AsyncIterator[Any]:
-        captured = current_execution_custody(self)
-        iterator = None
-        try:
-            while True:
-                with bind_execution_custody_snapshot(captured), bind_execution_runtime(self):
-                    captured = current_execution_custody(self)
-                    if iterator is None:
-                        iterator = aiter(function(self, *args, **kwargs))
-                    try:
-                        item = await anext(iterator)
-                    except StopAsyncIteration:
-                        require_execution_work(self)
-                        return
-                    except Exception:
-                        require_execution_work(self)
-                        raise
-                    require_execution_work(self)
+        async with owned_execution_stream(self, function(self, *args, **kwargs)) as iterator:
+            async for item in iterator:
                 yield item
-        finally:
-            if iterator is not None:
-                with bind_execution_cleanup(self, captured):
-                    close = getattr(iterator, "aclose", None)
-                    if callable(close):
-                        await close()
     return guarded
 
 
@@ -328,6 +332,99 @@ def bind_execution_cleanup(
     finally:
         _CLEANUP_ONLY.reset(cleanup_token)
         _CURRENT_CUSTODY.reset(custody_token)
+
+
+class _ExecutionForwarder:
+    """One source task, monotonic consumer custody, and joined closure.
+
+    The source can hold ContextVar tokens across yields: its advances and
+    close always run in the SAME task/context. Consumers never hold those
+    bindings, and later foreign consumers may add but never discard custody.
+    """
+
+    def __init__(self, owner: Any, stream: AsyncIterator[Any]):
+        from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+
+        self._runtime_owner = owner
+        self._source = aiter(stream)
+        self._scopes = current_execution_custody(owner)
+        self._iterator = OwnedAsyncIterator(self._produce, operation="execution-stream-forward")
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        additional = current_execution_custody(self._runtime_owner)
+        self._scopes += tuple(scope for scope in additional if scope not in self._scopes)
+        with _bind_captured_custody(self._scopes):
+            try:
+                item = await anext(self._iterator)
+            except BaseException as error:
+                if not is_execution_control_error(error):
+                    require_execution_work(self._runtime_owner)
+                raise
+            require_execution_work(self._runtime_owner)
+            return item
+
+    async def _produce(self):
+        error = None
+        try:
+            while True:
+                with _bind_captured_custody(self._scopes), bind_execution_runtime(self._runtime_owner):
+                    try:
+                        item = await anext(self._source)
+                    except StopAsyncIteration:
+                        require_execution_work(self._runtime_owner)
+                        return
+                    require_execution_work(self._runtime_owner)
+                yield item
+        except BaseException as caught:
+            error = caught
+            raise
+        finally:
+            close = getattr(self._source, "aclose", None)
+            if callable(close):
+                with bind_execution_cleanup(self._runtime_owner, self._scopes):
+                    try:
+                        await close()
+                    except BaseException as cleanup_error:
+                        raise execution_terminal_error(error, cleanup_error)
+
+    async def aclose(self):
+        await close_execution_stream(self._runtime_owner, self._iterator, self._scopes)
+
+
+async def close_execution_stream(
+    owner: Any, stream: Any, captured: tuple[ExecutionCustody, ...] = (),
+) -> None:
+    """Join an owned source's close despite repeated caller cancellation."""
+    import asyncio
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    close = getattr(stream, "aclose", None)
+    if callable(close):
+        with bind_execution_cleanup(owner, captured):
+            outcome = await await_owned_task(asyncio.create_task(close()))
+            error = execution_terminal_error(outcome.error, outcome.cancellation)
+            if error is not None:
+                raise error
+
+
+@asynccontextmanager
+async def owned_execution_stream(owner: Any, stream: AsyncIterator[Any]):
+    """Own every forwarding layer until the source's terminal classification."""
+    iterator = _ExecutionForwarder(owner, stream)
+    error = None
+    try:
+        yield iterator
+    except BaseException as caught:
+        error = caught
+        raise
+    finally:
+        try:
+            await iterator.aclose()
+        except BaseException as cleanup_error:
+            raise execution_terminal_error(error, cleanup_error)
 
 
 turn_scoped(

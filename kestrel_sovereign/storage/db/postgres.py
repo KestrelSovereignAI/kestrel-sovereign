@@ -72,6 +72,12 @@ _ADVISORY_LOCK_POLL_INTERVAL_S = 0.05
 @dataclass
 class _ExecutionCommitState:
     outcome: str | None = None
+    scopes: tuple[ExecutionCustody, ...] = ()
+
+    def remember(self, scopes: tuple[ExecutionCustody, ...]) -> None:
+        # A shared checkout can begin unbound and participate in several
+        # admitted operations. Retain each admission until physical release.
+        self.scopes += tuple(scope for scope in scopes if scope not in self.scopes)
 
 
 @dataclass
@@ -775,16 +781,25 @@ class PostgresBackend(DatabaseBackend):
         # asyncpg release/reset is awaited after COMMIT. Carry the exact commit
         # state through that await so a release failure cannot imply rollback.
         state = _ExecutionCommitState()
-        scopes = current_execution_custody(self)
+        state.remember(current_execution_custody(self))
         try:
             async with pool.acquire() as connection:
                 yield connection, state
         except BaseException as exc:
-            if state.outcome is not None and execution_commit_outcome(exc) is None:
-                for scope in scopes:
-                    scope.preserve_commit_uncertainty(state.outcome)
-                raise ExecutionCommitOutcomeError(state.outcome) from exc
+            outcome = execution_commit_outcome(exc) or state.outcome
+            if outcome is not None:
+                for scope in state.scopes:
+                    scope.preserve_commit_uncertainty(outcome)
+                if execution_commit_outcome(exc) is None:
+                    raise ExecutionCommitOutcomeError(outcome) from exc
             raise
+        # Release/reset is an awaited part of the operation, not an
+        # authority-free epilogue. Never publish a stale read/RETURNING value
+        # or imply rollback when revocation raced a successful COMMIT/reset.
+        if state.outcome is not None:
+            self._require_after_authority_commit(state.scopes)
+        else:
+            require_execution_backend("postgres", state.scopes)
 
     @asynccontextmanager
     async def _authority_transaction(
@@ -793,6 +808,8 @@ class PostgresBackend(DatabaseBackend):
     ) -> AsyncIterator[None]:
         # A failure in the body rolls back. Once the body/precommit checks
         # finish, a failed commit acknowledgement must instead be reconciled.
+        if commit_state is not None:
+            commit_state.remember(scopes)
         committing = False
         try:
             async with connection.transaction():

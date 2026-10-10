@@ -34,6 +34,11 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.execution_custody import (
+    execution_work_operation,
+    is_execution_control_error,
+    owned_execution_stream,
+)
 from kestrel_sovereign.features.peers.directory import (
     LocalHostPeerDirectory,
     PeerAccessDeniedError,
@@ -272,6 +277,7 @@ class PeersFeature(Feature):
     def promote_tools_on_startup(self) -> bool:
         return True
 
+    @execution_work_operation
     async def initialize(self):
         self._host_url = _discover_host_url()
         self._transport_key = ensure_a2a_transport_key()
@@ -371,6 +377,8 @@ class PeersFeature(Feature):
                 await ensure_a2a_outbound_tasks_table(self._db)
                 self._outbound_route_store_ready = True
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "PeersFeature: failed to ensure "
                     "a2a_outbound_tasks table: %s", exc,
@@ -437,6 +445,7 @@ class PeersFeature(Feature):
         # the first operation that installed this adapter.
         self._peer_router = LocalHostPeerDirectory(
             host_url,
+            execution_custody=getattr(self.agent, "_execution_custody", None),
             transport_key=getattr(self, "_transport_key", ""),
             client_factory=lambda *args, **kwargs: httpx.AsyncClient(
                 *args, **kwargs,
@@ -548,6 +557,7 @@ class PeersFeature(Feature):
             router, LocalHostPeerDirectory,
         )
 
+    @execution_work_operation
     async def _resolve_automatic_peer(
         self, recipient: str,
     ) -> Tuple[PeerDirectoryRouter, PeerRequester, PeerIdentity]:
@@ -578,6 +588,8 @@ class PeersFeature(Feature):
         except PeerDirectoryError:
             raise
         except Exception as exc:  # noqa: BLE001 - provider extension boundary
+            if is_execution_control_error(exc):
+                raise
             logger.exception("Peer router resolution raised unexpectedly")
             raise PeerProtocolError("Peer directory resolution failed") from exc
         if peer is None:
@@ -590,6 +602,7 @@ class PeersFeature(Feature):
             raise PeerSelfTargetError("Cannot route to the requesting agent")
         return router, requester, peer
 
+    @execution_work_operation
     async def _resolve_retained_automatic_peer(
         self,
         recipient: str,
@@ -631,6 +644,8 @@ class PeersFeature(Feature):
         except PeerDirectoryError:
             raise
         except Exception as exc:  # noqa: BLE001 - provider extension boundary
+            if is_execution_control_error(exc):
+                raise
             logger.exception("Peer router stable-identity resolution raised unexpectedly")
             raise PeerProtocolError("Peer directory resolution failed") from exc
         if peer is None:
@@ -695,6 +710,8 @@ class PeersFeature(Feature):
                 "No durable stable identity exists for this peer task"
             ) from exc
         except Exception as exc:  # noqa: BLE001 - database backend boundary
+            if is_execution_control_error(exc):
+                raise
             logger.debug(
                 "outbound_store: retained recipient lookup failed for %s: %s",
                 task_id, exc,
@@ -812,6 +829,8 @@ class PeersFeature(Feature):
             md["sender"] = signing_did
             md["signature"] = block
         except Exception as exc:  # noqa: BLE001 - fail closed at trust boundary
+            if is_execution_control_error(exc):
+                raise
             logger.error(
                 "A2A sign-on-send failed for loaded hybrid identity (%s)",
                 type(exc).__name__,
@@ -873,6 +892,7 @@ class PeersFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!peer stop",
     )
+    @execution_work_operation
     async def stop_peer(
         self,
         recipient: str,
@@ -940,17 +960,23 @@ class PeersFeature(Feature):
 
         try:
             router, requester, peer = await self._resolve_automatic_peer(recipient)
-        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError):
+        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError) as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"stopped": False, "recipient": recipient},
             )
-        except (PeerTransportError, PeerUnavailableError):
+        except (PeerTransportError, PeerUnavailableError) as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 f"Could not reach agent '{recipient}'",
                 data={"stopped": False, "recipient": recipient},
             )
-        except PeerDirectoryError:
+        except PeerDirectoryError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             logger.exception("Peer Stop route resolution failed for %r", recipient)
             return ToolResult.failed(
                 "Peer routing is unavailable",
@@ -987,6 +1013,8 @@ class PeersFeature(Feature):
             try:
                 chain = chain_provider()
             except Exception as error:  # noqa: BLE001 - agent context provider
+                if is_execution_control_error(error):
+                    raise
                 logger.warning(
                     "Could not read peer Stop causation chain: %s",
                     type(error).__name__,
@@ -1016,6 +1044,8 @@ class PeersFeature(Feature):
                 recipient=recipient,
             )
         except OutboundSigningError as error:
+            if is_execution_control_error(error):
+                raise
             return ToolResult.failed(
                 "Peer Stop was not sent because sender authentication failed",
                 data={
@@ -1025,23 +1055,31 @@ class PeersFeature(Feature):
                     "error_code": error.code,
                 },
             )
-        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError):
+        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError) as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"stopped": False, "recipient": recipient},
             )
-        except (PeerTransportError, PeerUnavailableError):
+        except (PeerTransportError, PeerUnavailableError) as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 f"Could not reach agent '{recipient}'",
                 data={"stopped": False, "recipient": recipient},
             )
-        except PeerDirectoryError:
+        except PeerDirectoryError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             logger.exception("Peer Stop dispatch failed for %r", recipient)
             return ToolResult.failed(
                 "Peer Stop dispatch failed",
                 data={"stopped": False, "recipient": recipient},
             )
-        except Exception:  # noqa: BLE001 - peer-router provider boundary
+        except Exception as control_error:  # noqa: BLE001 - peer-router provider boundary
+            if is_execution_control_error(control_error):
+                raise
             logger.exception("Peer Stop dispatch failed for %r", recipient)
             return ToolResult.failed(
                 "Peer Stop dispatch failed",
@@ -1214,7 +1252,9 @@ class PeersFeature(Feature):
             )
             try:
                 return await route_stop(requester, peer, payload)
-            except (PeerTransportError, PeerUnavailableError):
+            except (PeerTransportError, PeerUnavailableError) as control_error:
+                if is_execution_control_error(control_error):
+                    raise
                 if attempt >= PEER_STOP_DELIVERY_ATTEMPTS:
                     raise
                 logger.warning(
@@ -1232,6 +1272,7 @@ class PeersFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!peers"
     )
+    @execution_work_operation
     async def list_peers(self) -> ToolResult:
         """
         Discover available peer agents via the scoped peer directory.
@@ -1240,6 +1281,8 @@ class PeersFeature(Feature):
         try:
             context = self._peer_directory_context()
         except PeerDirectoryConfigurationError as exc:
+            if is_execution_control_error(exc):
+                raise
             return ToolResult.failed(
                 "Peer routing is not configured safely",
                 data={"peers": [], "error": str(exc)},
@@ -1259,7 +1302,9 @@ class PeersFeature(Feature):
         router, requester = context
         try:
             directory = await router.list_peers(requester)
-        except PeerAccessDeniedError:
+        except PeerAccessDeniedError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             # Do not distinguish a denied scope from an empty/unknown peer
             # directory.  In hosted mode either distinction can be used to
             # probe another tenant's namespace.
@@ -1267,18 +1312,24 @@ class PeersFeature(Feature):
                 "Could not list peers in the current authorization scope",
                 data={"peers": [], "error": "Peer directory unavailable"},
             )
-        except PeerTransportError:
+        except PeerTransportError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Could not connect to multi_agent host",
                 data={"peers": [], "error": "Could not connect to multi_agent host"},
             )
         except PeerDirectoryError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error("Failed to list peers: %s", exc)
             return ToolResult.failed(
                 "Could not list peers",
                 data={"peers": [], "error": "Could not list peers"},
             )
-        except Exception:  # noqa: BLE001 - provider extension boundary
+        except Exception as control_error:  # noqa: BLE001 - provider extension boundary
+            if is_execution_control_error(control_error):
+                raise
             logger.exception("Peer router raised unexpectedly while listing peers")
             return ToolResult.failed(
                 "Could not list peers",
@@ -1318,6 +1369,7 @@ class PeersFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!ask"
     )
+    @execution_work_operation
     async def ask_agent(self, agent_name: str, message: str) -> ToolResult:
         """
         Send a message to a peer agent and return their response.
@@ -1330,32 +1382,44 @@ class PeersFeature(Feature):
             router, requester, peer = await self._resolve_automatic_peer(
                 agent_name,
             )
-        except PeerDirectoryConfigurationError:
+        except PeerDirectoryConfigurationError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Not running in a multi_agent environment — no host to proxy through",
                 data={"response": None, "agent": agent_name},
             )
-        except PeerSelfTargetError:
+        except PeerSelfTargetError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Cannot send a message to yourself",
                 data={"response": None, "agent": agent_name},
             )
-        except PeerAccessDeniedError:
+        except PeerAccessDeniedError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"response": None, "agent": agent_name},
             )
-        except PeerNotFoundError:
+        except PeerNotFoundError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"response": None, "agent": agent_name},
             )
-        except PeerTransportError:
+        except PeerTransportError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 f"Could not reach agent '{agent_name}' — multi_agent host unreachable",
                 data={"response": None, "agent": agent_name},
             )
         except PeerDirectoryError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error("Could not resolve peer %r: %s", agent_name, exc)
             return ToolResult.failed(
                 "Peer is not available in the automatic directory",
@@ -1364,33 +1428,45 @@ class PeersFeature(Feature):
 
         try:
             data = await router.invoke(requester, peer, message)
-        except PeerNotFoundError:
+        except PeerNotFoundError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"response": None, "agent": agent_name},
             )
-        except PeerAccessDeniedError:
+        except PeerAccessDeniedError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"response": None, "agent": agent_name},
             )
-        except PeerUnavailableError:
+        except PeerUnavailableError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 f"Agent '{agent_name}' is offline",
                 data={"response": None, "agent": agent_name},
             )
-        except PeerTransportError:
+        except PeerTransportError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 f"Could not reach agent '{agent_name}' — multi_agent host unreachable",
                 data={"response": None, "agent": agent_name},
             )
         except PeerDirectoryError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error("Failed to message peer %r: %s", agent_name, exc)
             return ToolResult.failed(
                 f"Could not message agent '{agent_name}'",
                 data={"response": None, "agent": agent_name},
             )
-        except Exception:  # noqa: BLE001 - provider extension boundary
+        except Exception as control_error:  # noqa: BLE001 - provider extension boundary
+            if is_execution_control_error(control_error):
+                raise
             logger.exception("Peer router raised unexpectedly while invoking %r", agent_name)
             return ToolResult.failed(
                 f"Could not message agent '{agent_name}'",
@@ -1530,6 +1606,8 @@ class PeersFeature(Feature):
                     route_state=route_state,
                 )
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "outbound_store: record failed for task %s → %s: %s",
                     audit_id, recipient, exc,
@@ -1546,6 +1624,8 @@ class PeersFeature(Feature):
             try:
                 chain = chain_provider()
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.debug(
                     "Failed to read causation chain for outbound A2A task: %s",
                     e,
@@ -1592,6 +1672,8 @@ class PeersFeature(Feature):
                 payload, task_id=task_id, sess_id=sess_id, message=message,
             )
         except OutboundSigningError as exc:
+            if is_execution_control_error(exc):
+                raise
             # A loaded hybrid agent is never permitted to shed authentication.
             # Record only a stable, non-secret code, and return before an HTTP
             # client exists so retries cannot reuse an unsigned payload (#2475).
@@ -1616,34 +1698,46 @@ class PeersFeature(Feature):
             router, requester, peer = await self._resolve_automatic_peer(
                 recipient,
             )
-        except PeerDirectoryConfigurationError:
+        except PeerDirectoryConfigurationError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return None, None, None, ToolResult.failed(
                 "Not running in a multi_agent environment — no host to proxy through",
                 data={"sent": False, "recipient": recipient},
             )
-        except PeerSelfTargetError:
+        except PeerSelfTargetError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return None, None, None, ToolResult.failed(
                 "Cannot send an A2A task to yourself",
                 data={"sent": False, "recipient": recipient},
             )
-        except PeerAccessDeniedError:
+        except PeerAccessDeniedError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return None, None, None, ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"sent": False, "recipient": recipient},
             )
-        except PeerNotFoundError:
+        except PeerNotFoundError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             # Use the same response for absent, cross-scope, and ambiguous
             # names so the automatic shortcut is not a namespace oracle.
             return None, None, None, ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"sent": False, "recipient": recipient},
             )
-        except PeerTransportError:
+        except PeerTransportError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return None, None, None, ToolResult.failed(
                 f"Could not reach agent '{recipient}' — multi_agent host unreachable",
                 data={"sent": False, "recipient": recipient},
             )
         except PeerDirectoryError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error("Could not resolve A2A recipient %r: %s", recipient, exc)
             return None, None, None, ToolResult.failed(
                 "Peer is not available in the automatic directory",
@@ -1726,6 +1820,8 @@ class PeersFeature(Feature):
                     error=error,
                 )
             except Exception as exc:  # noqa: BLE001 - audit failure must not mask route error
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "outbound_store: failed to close dispatch %s: %s",
                     task_id,
@@ -1737,25 +1833,33 @@ class PeersFeature(Feature):
             if not isinstance(routed_task, Mapping):
                 raise PeerProtocolError("Peer router returned an invalid task envelope")
             task_data = dict(routed_task)
-        except (PeerNotFoundError, PeerAccessDeniedError):
+        except (PeerNotFoundError, PeerAccessDeniedError) as control_error:
+            if is_execution_control_error(control_error):
+                raise
             await _mark_dispatch_failed("peer_not_in_automatic_directory")
             return None, None, None, ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
-        except PeerUnavailableError:
+        except PeerUnavailableError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             await _mark_dispatch_failed(f"peer_unavailable:{recipient}")
             return None, None, None, ToolResult.failed(
                 f"Agent '{recipient}' is offline or TaskManager unavailable",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
-        except PeerTransportError:
+        except PeerTransportError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             await _mark_dispatch_failed(f"connect_error:{recipient}")
             return None, None, None, ToolResult.failed(
                 f"Could not reach agent '{recipient}'",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except PeerDirectoryError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error("A2A send to %r failed: %s", recipient, exc)
             await _mark_dispatch_failed(f"peer_router_error:{type(exc).__name__}")
             return None, None, None, ToolResult.failed(
@@ -1763,6 +1867,8 @@ class PeersFeature(Feature):
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except Exception as exc:  # noqa: BLE001 - provider extension boundary
+            if is_execution_control_error(exc):
+                raise
             logger.exception("A2A peer router raised unexpectedly for %r", recipient)
             await _mark_dispatch_failed(f"peer_router_error:{type(exc).__name__}")
             return None, None, None, ToolResult.failed(
@@ -1823,6 +1929,8 @@ class PeersFeature(Feature):
                     activate=True,
                 )
             except Exception as exc:  # noqa: BLE001 - storage boundary
+                if is_execution_control_error(exc):
+                    raise
                 logger.error(
                     "Failed to persist peer task-id binding %s -> %s: %s",
                     task_id,
@@ -1870,6 +1978,7 @@ class PeersFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a tell",
     )
+    @execution_work_operation
     async def send_a2a_message(
         self,
         recipient: str,
@@ -1930,6 +2039,7 @@ class PeersFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a ask",
     )
+    @execution_work_operation
     async def send_a2a_question(
         self,
         recipient: str,
@@ -2046,6 +2156,8 @@ class PeersFeature(Feature):
                 deadline=deadline_utc,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Codex round 3 P2d on PR #1453: without a pending row the
             # supervisor's mark_resolved would return False on the
             # terminal frame and silently drop the resumption signal as
@@ -2135,6 +2247,7 @@ class PeersFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a result",
     )
+    @execution_work_operation
     async def get_peer_task_result(
         self,
         recipient: str,
@@ -2154,28 +2267,38 @@ class PeersFeature(Feature):
             router, requester, peer = await self._resolve_retained_automatic_peer(
                 recipient, retained_agent_id,
             )
-        except PeerDirectoryConfigurationError:
+        except PeerDirectoryConfigurationError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Not running in a multi_agent environment — no host "
                 "to proxy through",
                 data={"recipient": recipient, "task_id": task_id},
             )
-        except (PeerNotFoundError, PeerAccessDeniedError):
+        except (PeerNotFoundError, PeerAccessDeniedError) as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"recipient": recipient, "task_id": task_id},
             )
-        except PeerSelfTargetError:
+        except PeerSelfTargetError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"recipient": recipient, "task_id": task_id},
             )
-        except PeerTransportError:
+        except PeerTransportError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 f"Could not reach peer '{recipient}' for task {task_id}",
                 data={"recipient": recipient, "task_id": task_id},
             )
         except PeerDirectoryError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error(
                 "Could not resolve peer task recipient %r: %s", recipient, exc,
             )
@@ -2186,17 +2309,23 @@ class PeersFeature(Feature):
 
         try:
             data = await router.get_a2a_task(requester, peer, task_id)
-        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError):
+        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError) as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"recipient": recipient, "task_id": task_id},
             )
-        except PeerTransportError:
+        except PeerTransportError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 f"Could not reach peer '{recipient}' for task {task_id}",
                 data={"recipient": recipient, "task_id": task_id},
             )
         except PeerDirectoryError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error(
                 "Error fetching peer task %s from %r: %s",
                 task_id, recipient, exc,
@@ -2205,7 +2334,9 @@ class PeersFeature(Feature):
                 f"Error fetching peer task {task_id} from {recipient}",
                 data={"recipient": recipient, "task_id": task_id},
             )
-        except Exception:  # noqa: BLE001 - provider extension boundary
+        except Exception as control_error:  # noqa: BLE001 - provider extension boundary
+            if is_execution_control_error(control_error):
+                raise
             logger.exception(
                 "Peer router raised unexpectedly fetching task %s from %r",
                 task_id, recipient,
@@ -2354,6 +2485,8 @@ class PeersFeature(Feature):
                     terminal_state=current_state,
                 )
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "outbound_store: terminal stamp failed for %s: %s",
                     task_id, exc,
@@ -2385,6 +2518,7 @@ class PeersFeature(Feature):
             },
         )
 
+    @execution_work_operation
     async def cancel_outbound_task(
         self,
         task_id: str,
@@ -2455,22 +2589,30 @@ class PeersFeature(Feature):
                 outbound.recipient,
                 recipient_agent_id,
             )
-        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError):
+        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError) as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"task_id": task_id},
             )
-        except PeerDirectoryConfigurationError:
+        except PeerDirectoryConfigurationError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Peer routing is not configured safely",
                 data={"task_id": task_id},
             )
-        except PeerDirectoryError:
+        except PeerDirectoryError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Could not resolve the durable outbound task recipient",
                 data={"task_id": task_id},
             )
-        except Exception:  # noqa: BLE001 - durable route backend boundary
+        except Exception as control_error:  # noqa: BLE001 - durable route backend boundary
+            if is_execution_control_error(control_error):
+                raise
             logger.exception(
                 "Could not read durable outbound route for task %s", task_id
             )
@@ -2503,31 +2645,43 @@ class PeersFeature(Feature):
                 payload,
             )
         except OutboundSigningError as exc:
+            if is_execution_control_error(exc):
+                raise
             return ToolResult.failed(
                 "Could not authenticate task cancellation",
                 data={"task_id": task_id, "error_type": exc.code},
             )
-        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError):
+        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError) as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Task cancellation is not authorized",
                 data={"task_id": task_id},
             )
-        except PeerTaskConflictError:
+        except PeerTaskConflictError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Task cancellation conflicts with the recipient's terminal state",
                 data={"task_id": task_id, "error_type": "lifecycle_conflict"},
             )
-        except PeerTransportError:
+        except PeerTransportError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Could not reach the task recipient",
                 data={"task_id": task_id},
             )
-        except PeerDirectoryError:
+        except PeerDirectoryError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return ToolResult.failed(
                 "Peer task cancellation failed",
                 data={"task_id": task_id},
             )
-        except Exception:  # noqa: BLE001 - provider extension boundary
+        except Exception as control_error:  # noqa: BLE001 - provider extension boundary
+            if is_execution_control_error(control_error):
+                raise
             logger.exception(
                 "Peer router raised unexpectedly canceling task %s", task_id
             )
@@ -2564,7 +2718,9 @@ class PeersFeature(Feature):
                 task_id=task_id,
                 terminal_state="canceled",
             )
-        except Exception:  # noqa: BLE001 - audit backend boundary
+        except Exception as control_error:  # noqa: BLE001 - audit backend boundary
+            if is_execution_control_error(control_error):
+                raise
             logger.exception(
                 "Cancellation succeeded but its outbound audit stamp failed: %s",
                 task_id,
@@ -2582,7 +2738,9 @@ class PeersFeature(Feature):
                     agent_id=audit_agent_id,
                     task_id=task_id,
                 )
-            except Exception:  # noqa: BLE001 - audit reconciliation boundary
+            except Exception as control_error:  # noqa: BLE001 - audit reconciliation boundary
+                if is_execution_control_error(control_error):
+                    raise
                 logger.exception(
                     "Could not reconcile outbound cancellation audit row: %s",
                     task_id,
@@ -2627,6 +2785,7 @@ class PeersFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a outbound",
     )
+    @execution_work_operation
     async def list_outbound_a2a_tasks(
         self,
         limit: int = 50,
@@ -2659,6 +2818,8 @@ class PeersFeature(Feature):
                 recipient=recipient or None,
             )
         except Exception as exc:  # noqa: BLE001
+            if is_execution_control_error(exc):
+                raise
             return ToolResult.failed(
                 f"Outbound audit query failed: {exc}",
                 data={"rows": [], "count": 0},
@@ -2702,9 +2863,12 @@ class PeersFeature(Feature):
             return None
         try:
             return fn()
-        except Exception:
+        except Exception as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return None
 
+    @execution_work_operation
     async def _supervise_a2a_question(
         self,
         *,
@@ -2756,10 +2920,14 @@ class PeersFeature(Feature):
             PeerNotFoundError,
             PeerAccessDeniedError,
             PeerSelfTargetError,
-        ):
+        ) as control_error:
+            if is_execution_control_error(control_error):
+                raise
             state = "failed"
             reply_text = "Peer task subscription is no longer authorized."
-        except PeerDirectoryConfigurationError:
+        except PeerDirectoryConfigurationError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             state = "failed"
             reply_text = "Peer routing is no longer configured safely."
 
@@ -2781,38 +2949,39 @@ class PeersFeature(Feature):
                 router, requester, peer = await self._resolve_retained_automatic_peer(
                     recipient, recipient_agent_id,
                 )
-                async for subscription_event in router.subscribe_a2a_task(
+                async with owned_execution_stream(self, router.subscribe_a2a_task(
                     requester,
                     peer,
                     task_id,
                     timeout_seconds=remaining,
-                ):
-                    # Resolution alone does not prove the subscription path
-                    # is healthy: a local host can fail immediately while
-                    # opening the stream.  Reset only after the provider has
-                    # yielded an event, so repeated transport failures retain
-                    # the 1/2/5/10-second progression.
-                    backoff_idx = 0
-                    # Codex round 3 P2c on PR #1453: enforce the deadline
-                    # INSIDE the stream loop.  A provider can keep a healthy
-                    # stream open indefinitely, so its transport timeout alone
-                    # is not the deadline guarantee.
-                    if _remaining() <= 0:
-                        break
-                    event_name = subscription_event.event or "message"
-                    data_str = subscription_event.data or ""
-                    if event_name in ("keepalive", "ping"):
-                        continue
-                    if event_name != "status":
-                        continue
-                    parsed = self._parse_sse_status_data(data_str)
-                    if not parsed:
-                        continue
-                    event_state, event_reply = parsed
-                    if event_state in terminal_states:
-                        state = event_state
-                        reply_text = event_reply
-                        break
+                )) as subscription:
+                    async for subscription_event in subscription:
+                        # Resolution alone does not prove the subscription path
+                        # is healthy: a local host can fail immediately while
+                        # opening the stream.  Reset only after the provider has
+                        # yielded an event, so repeated transport failures retain
+                        # the 1/2/5/10-second progression.
+                        backoff_idx = 0
+                        # Codex round 3 P2c on PR #1453: enforce the deadline
+                        # INSIDE the stream loop.  A provider can keep a healthy
+                        # stream open indefinitely, so its transport timeout alone
+                        # is not the deadline guarantee.
+                        if _remaining() <= 0:
+                            break
+                        event_name = subscription_event.event or "message"
+                        data_str = subscription_event.data or ""
+                        if event_name in ("keepalive", "ping"):
+                            continue
+                        if event_name != "status":
+                            continue
+                        parsed = self._parse_sse_status_data(data_str)
+                        if not parsed:
+                            continue
+                        event_state, event_reply = parsed
+                        if event_state in terminal_states:
+                            state = event_state
+                            reply_text = event_reply
+                            break
                 # A cleanly exhausted stream also proves that subscription
                 # setup succeeded, even when the peer emitted no event.
                 backoff_idx = 0
@@ -2820,7 +2989,9 @@ class PeersFeature(Feature):
                 # loop; otherwise reconnect (or exit at the deadline).
                 if state in terminal_states:
                     break
-            except PeerSubscriptionUnavailableError:
+            except PeerSubscriptionUnavailableError as control_error:
+                if is_execution_control_error(control_error):
+                    raise
                 # Hard cut: recipient lacks the subscription surface.  Don't
                 # burn the whole deadline reconnecting to a legacy peer.
                 logger.error(
@@ -2836,7 +3007,9 @@ class PeersFeature(Feature):
                     f"(#1444)."
                 )
                 break
-            except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError):
+            except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError) as control_error:
+                if is_execution_control_error(control_error):
+                    raise
                 # Scope changes and cross-scope probes must not reveal whether
                 # the recipient or task exists.  This sender had a prior task,
                 # so fail its resumption safely rather than retrying a route it
@@ -2844,23 +3017,31 @@ class PeersFeature(Feature):
                 state = "failed"
                 reply_text = "Peer task subscription is no longer authorized."
                 break
-            except PeerDirectoryConfigurationError:
+            except PeerDirectoryConfigurationError as control_error:
+                if is_execution_control_error(control_error):
+                    raise
                 state = "failed"
                 reply_text = "Peer routing is no longer configured safely."
                 break
             except PeerTransportError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "A2A subscription stream for task=%s recipient=%s "
                     "dropped (%s); backing off",
                     task_id, recipient, exc,
                 )
             except PeerDirectoryError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "A2A subscription supervisor for task=%s "
                     "recipient=%s router error: %s",
                     task_id, recipient, exc,
                 )
             except Exception as exc:  # noqa: BLE001 - provider extension boundary
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "A2A subscription supervisor for task=%s "
                     "recipient=%s unexpected router error: %s",
@@ -2893,6 +3074,8 @@ class PeersFeature(Feature):
                 try:
                     was_waiting = await store.mark_expired(task_id)
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(
                         "Failed to mark pending_a2a_question task=%s "
                         "expired: %s. Firing signal anyway — better a "
@@ -2933,6 +3116,8 @@ class PeersFeature(Feature):
             try:
                 was_waiting = await store.mark_resolved(task_id)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "Failed to mark pending_a2a_question task=%s "
                     "resolved: %s. Firing signal anyway — the resumed "
@@ -3045,6 +3230,8 @@ class PeersFeature(Feature):
                     terminal_state=state,
                 )
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "outbound_store: question-answered terminal stamp "
                     "failed for task=%s state=%s: %s",
@@ -3075,6 +3262,8 @@ class PeersFeature(Feature):
             enq = dispatcher.enqueue_signal(signal)
             handle = await enq if hasattr(enq, "__await__") else enq
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(
                 "Failed to enqueue a2a.question_answered for task=%s "
                 "recipient=%s: %s",
@@ -3116,6 +3305,8 @@ class PeersFeature(Feature):
                     on_undelivered=_restore_after_failure,
                 )
             except Exception as e:  # noqa: BLE001
+                if is_execution_control_error(e):
+                    raise
                 # Nothing would ever observe this delivery, so report it as
                 # unfired and let the caller restore the row synchronously.
                 logger.error(
@@ -3148,6 +3339,8 @@ class PeersFeature(Feature):
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - shutdown is best-effort
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "Could not restore pending_a2a_question task=%s to WAITING "
                     "while cancelled mid-delivery: %s", task_id, exc,
@@ -3187,6 +3380,8 @@ class PeersFeature(Feature):
                 reply_text=reply_text,
             )
         except Exception as exc:  # noqa: BLE001
+            if is_execution_control_error(exc):
+                raise
             logger.error(
                 "Failed to restore pending_a2a_question task=%s to WAITING "
                 "after signal enqueue failure: %s",
@@ -3275,6 +3470,8 @@ class PeersFeature(Feature):
                 else:
                     was_waiting = await store.mark_resolved(task_id)
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "Failed to claim restored pending_a2a_question task=%s "
                     "for retry: %s",
@@ -3392,6 +3589,7 @@ class PeersFeature(Feature):
     # injection. 3600s is the Sovereign-decided default.
     EXPIRY_SWEEP_INTERVAL_SECONDS = 3600
 
+    @execution_work_operation
     async def post_all_features_loaded(self, agent):
         """Run startup-replay and start the hourly expiry sweep.
 
@@ -3422,7 +3620,9 @@ class PeersFeature(Feature):
             return
         try:
             context = self._peer_directory_context()
-        except PeerDirectoryConfigurationError:
+        except PeerDirectoryConfigurationError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             logger.error(
                 "Skipping a2a question startup-replay — peer router is "
                 "missing trusted requester context."
@@ -3437,6 +3637,8 @@ class PeersFeature(Feature):
         try:
             await self._replay_pending_a2a_questions(store)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "a2a question startup-replay failed: %s. The hourly "
                 "sweep is still the backstop — operators can still "
@@ -3456,6 +3658,7 @@ class PeersFeature(Feature):
             name="a2a_question_expiry_sweep",
         )
 
+    @execution_work_operation
     async def _replay_pending_a2a_questions(self, store) -> None:
         """Walk every WAITING row at boot. Past-deadline rows get a
         synthetic ``state='expired'`` signal; within-deadline rows get
@@ -3534,6 +3737,7 @@ class PeersFeature(Feature):
             replayed, expired, len(waiting),
         )
 
+    @execution_work_operation
     async def _hourly_expiry_sweep_loop(self, store) -> None:
         """Sweep ``list_waiting_past_deadline`` every hour. For each
         row mark EXPIRED + fire a synthetic ``a2a.question_answered``
@@ -3551,6 +3755,8 @@ class PeersFeature(Feature):
                     try:
                         await self._handle_expired_row(store, row)
                     except Exception as e:
+                        if is_execution_control_error(e):
+                            raise
                         logger.warning(
                             "a2a expiry sweep: failed to expire row "
                             "task=%s: %s",
@@ -3563,6 +3769,8 @@ class PeersFeature(Feature):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "a2a expiry sweep iteration failed: %s. "
                     "Continuing.", e,
@@ -3682,6 +3890,7 @@ class PeersFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a send",
     )
+    @execution_work_operation
     async def send_a2a_task(
         self,
         recipient: str,

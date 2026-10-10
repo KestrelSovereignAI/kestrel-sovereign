@@ -14,6 +14,9 @@ import re
 import time
 
 from kestrel_sovereign.streams.tap import AgentStreamTap
+from kestrel_sovereign.execution_custody import (
+    execution_work_operation, is_execution_control_error, require_execution_work,
+)
 
 from kestrel_sovereign.kestrel_config.constants import (
     MAX_SSE_CONNECTIONS_PER_CLIENT,
@@ -3183,10 +3186,13 @@ async def _create_a2a_task_under_lifecycle_lease(
             authorized_sender_id = stable_sender_id
     if callable(commit):
         try:
+            require_execution_work(agent)
             return await commit(authorized_sender_id)
         except HTTPException:
             raise
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error(
                 "Failed to commit verified A2A action: %s",
                 exc,
@@ -3197,6 +3203,7 @@ async def _create_a2a_task_under_lifecycle_lease(
             ) from exc
 
     try:
+        require_execution_work(agent)
         return await agent.task_manager.create_task(
             params=params,
             agent_name=recipient_agent_id,
@@ -3206,14 +3213,17 @@ async def _create_a2a_task_under_lifecycle_lease(
     except TaskAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         logger.error(
             "Failed to create A2A task from peer submission: %s",
             exc,
             exc_info=True,
         )
-        raise HTTPException(status_code=500, detail="Failed to create task")
+        raise HTTPException(status_code=500, detail="Failed to create task") from exc
 
 
+@execution_work_operation
 async def _create_verified_a2a_task(
     agent,
     params,

@@ -18,11 +18,208 @@ from kestrel_sovereign.execution_custody import (
 from tests.unit.test_execution_custody import Authority
 
 
-def uncertain():
+def uncertain(*args, **kwargs):
     try:
         raise ExecutionCommitOutcomeError("unknown")
     except ExecutionCommitOutcomeError as error:
         raise RuntimeError("native storage wrapper") from error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pool_supplied", [False, True])
+async def test_a2a_boot_reuses_guarded_native_backend_without_new_pool(monkeypatch, pool_supplied):
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.agent.boot import BootContext
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+    import kestrel_sovereign.kestrel_agent as agent_module
+
+    scope = ExecutionCustody(Authority())
+    backend = PostgresBackend.__new__(PostgresBackend)
+    backend._execution_custody = scope
+    stores = []
+
+    class ReachedStores(Exception):
+        pass
+
+    class Manager:
+        def __init__(self, **kwargs):
+            stores.extend(kwargs[name] for name in (
+                "task_store", "session_service", "observability_store",
+                "memory_service", "feedback_store",
+            ))
+
+        async def initialize(self):
+            raise ReachedStores
+
+    monkeypatch.setattr(agent_module, "TaskManager", Manager)
+    owner = KestrelAgent.__new__(KestrelAgent)
+    owner._db_backend = "postgres"
+    owner.pg_pool = object() if pool_supplied else None
+    owner._raw_storage = SimpleNamespace(_backend=backend)
+    owner.storage_path = ":memory:"
+    owner.did = "did:test:guarded-a2a"
+    owner.hooks_manager = None
+    with pytest.raises(ReachedStores):
+        await owner._boot_phase_a2a_observability_signals(BootContext())
+    assert len(stores) == 5
+    assert all(store.backend is backend for store in stores)
+    scope.revoke("original runtime retired")
+    for store in stores:
+        with pytest.raises(ExecutionAuthorityError, match="original runtime"):
+            require_execution_work(store.backend)
+        # Store closure must not close the storage-owned backend.
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["inline", "subagent"])
+async def test_feature_subagent_preserves_wrapped_commit_uncertainty(boundary):
+    from tests.unit.test_feature_subagent_tool_executor import _FakeTool, _make_feature_with_agent_capture
+    feature, _ = _make_feature_with_agent_capture([_FakeTool("effect", {})])
+    feature._fake_tools[0].execute = AsyncMock(side_effect=uncertain)
+    if boundary == "inline":
+        operation = lambda: feature._make_feature_inline_tool_executor()("effect", {})
+    else:
+        feature.agent.llm_service.generate = AsyncMock(side_effect=uncertain)
+        operation = lambda: feature.execute_as_subagent(task="effect")
+    with pytest.raises(RuntimeError) as caught:
+        await operation()
+    assert execution_commit_outcome(caught.value) == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["invoke", "send"])
+@pytest.mark.parametrize("loss", ["authorization", "client_entry"])
+async def test_peer_send_retains_runtime_and_rechecks_actual_rpc(route, loss):
+    from kestrel_sovereign.features.peers.directory import LocalHostPeerDirectory, PeerIdentity, PeerRequester
+
+    scope = ExecutionCustody(Authority())
+    sends = AsyncMock(return_value=SimpleNamespace(
+        status_code=200, raise_for_status=lambda: None, json=lambda: {},
+    ))
+
+    @asynccontextmanager
+    async def client():
+        await asyncio.sleep(0)
+        if loss == "client_entry":
+            scope.revoke("retired during client entry")
+        yield SimpleNamespace(post=sends)
+
+    router = LocalHostPeerDirectory("http://synthetic.test", client_factory=client)
+    router._execution_custody = scope
+    peer = PeerIdentity("did:test:peer", "peer", "peer", "Peer", "online", "")
+    requester = PeerRequester("did:test:source", object())
+
+    async def authorize(*args):
+        await asyncio.sleep(0)
+        if loss == "authorization":
+            scope.revoke("retired during authorization")
+        return peer
+
+    router._authorize_peer = authorize
+    with pytest.raises(ExecutionAuthorityError, match="retired during"):
+        if route == "invoke":
+            await router.invoke(requester, peer, "message")
+        else:
+            await router.send_a2a_task(requester, peer, {})
+    sends.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inbound_a2a_operation_binds_original_runtime_through_authorization(monkeypatch):
+    from kestrel_sovereign.endpoints import agent as endpoint
+    from kestrel_sovereign.execution_custody import current_execution_custody
+
+    scope = ExecutionCustody(Authority())
+    owner = SimpleNamespace(_execution_custody=scope)
+    committed = []
+
+    async def verified_operation(agent, *args):
+        # This continuation represents the asynchronous verifier/authorizer
+        # which also writes a replay nonce on native storage.
+        assert scope in current_execution_custody()
+        await asyncio.sleep(0)
+        scope.revoke("retired during inbound authorization")
+        require_execution_work()
+        committed.append(True)
+
+    monkeypatch.setattr(endpoint, "_create_a2a_task_under_lifecycle_lease", verified_operation)
+    with pytest.raises(ExecutionAuthorityError, match="inbound authorization"):
+        await endpoint._create_verified_a2a_task(owner, None, None, None, None)
+    assert committed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["resolve", "list", "invoke"])
+@pytest.mark.parametrize("wrapper", ["runtime", "peer"])
+async def test_peer_feature_preserves_control_evidence_at_provider_boundaries(route, wrapper):
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+    from kestrel_sovereign.features.peers.directory import PeerIdentity, PeerRequester, PeerTransportError
+
+    async def fail(*args):
+        try:
+            uncertain()
+        except RuntimeError as error:
+            if wrapper == "peer":
+                raise PeerTransportError("transport extension") from error
+            raise
+
+    peer = PeerIdentity("did:test:peer", "peer", "peer", "Peer", "online", "")
+    owner = SimpleNamespace(did="did:test:source", _agent_name="source")
+    feature = PeersFeature(owner)
+    router = SimpleNamespace(
+        resolve_peer=AsyncMock(return_value=peer),
+        list_peers=AsyncMock(return_value=[]),
+        invoke=AsyncMock(return_value={}),
+    )
+    getattr(router, {"resolve": "resolve_peer", "list": "list_peers", "invoke": "invoke"}[route]).side_effect = fail
+    feature._peer_router = router
+    feature._peer_requester = PeerRequester(owner.did, object())
+    with pytest.raises(Exception) as caught:
+        if route == "list":
+            await feature.list_peers()
+        else:
+            await feature.ask_agent("peer", "message")
+    assert execution_commit_outcome(caught.value) == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_dynamic_tool_binds_original_runtime_for_unbound_provider():
+    from kestrel_sovereign.features.base import Feature, tool
+    from kestrel_sovereign.execution_custody import current_execution_custody
+
+    scope = ExecutionCustody(Authority())
+
+    class Effects(Feature):
+        @property
+        def tool_description(self):
+            return "synthetic custody tools"
+
+        async def initialize(self):
+            pass
+
+        @tool(name="effect", description="synthetic effect")
+        async def effect(self):
+            assert scope in current_execution_custody()
+            return {"success": True}
+
+    feature = Effects(SimpleNamespace(_execution_custody=scope))
+    result = await feature.get_tools()[0].execute()
+    assert result["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_keeps_unknown_evidence_after_runtime_retirement():
+    from kestrel_sovereign.execution_custody import await_execution_work
+    scope = ExecutionCustody(Authority())
+
+    async def fail():
+        scope.revoke("runtime retired after effect")
+        uncertain()
+
+    with pytest.raises(RuntimeError) as caught:
+        await await_execution_work(SimpleNamespace(_execution_custody=scope), fail)
+    assert execution_commit_outcome(caught.value) == "unknown"
 
 
 @pytest.mark.asyncio
@@ -177,6 +374,151 @@ async def test_codex_send_rechecks_after_startup_await():
             await client.request("turn/start", {"threadId": "turn"})
     assert client._sent == []
     assert client._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_codex_shutdown_retains_reader_normalized_terminal_error():
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    from tests.unit.test_codex_app_server import TestDispatchLogic
+
+    started, release, sink_closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    app = TestDispatchLogic()._client()
+    adapter = CodexAdapter()
+    adapter._client = app
+    readers = []
+    original_close = app.close_turn_sink
+
+    def close(key):
+        sink_closed.set()
+        original_close(key)
+
+    app.close_turn_sink = close
+
+    async def request(method, params=None, **kwargs):
+        if method == "thread/start":
+            return {"thread": {"id": "synthetic-thread"}}
+        if method == "turn/start":
+            readers.append(asyncio.create_task(app._handle_server_request(
+                1, "item/tool/call", {"threadId": "synthetic-thread", "tool": "effect", "arguments": {}},
+            )))
+            await started.wait()
+            return {"turn": {"id": "synthetic-turn"}}
+        return {}
+
+    async def events(*args, **kwargs):
+        await asyncio.Future()
+        if False:
+            yield {}
+
+    async def execute(*args):
+        started.set()
+        await release.wait()
+        uncertain()
+
+    app.request = request
+    app.ensure_started = AsyncMock()
+    app.iter_turn_events = events
+    operation = asyncio.create_task(adapter.get_response(
+        None, "auto", [{"role": "user", "content": "effect"}],
+        tools=[{"type": "function", "function": {"name": "effect", "description": "synthetic", "parameters": {"type": "object"}}}],
+        tool_executor=execute,
+    ))
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        operation.cancel()
+        await asyncio.sleep(0.01)
+        assert not operation.done()
+        assert not sink_closed.is_set()
+        release.set()
+        with pytest.raises(BaseException) as caught:
+            await operation
+        assert execution_commit_outcome(caught.value) == "unknown"
+        assert sink_closed.is_set()
+        await asyncio.gather(*readers)
+        assert all(not lock.locked() for lock in adapter._thread_locks.values())
+    finally:
+        release.set()
+        await asyncio.gather(operation, *readers, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["plain", "tools"])
+async def test_public_codex_stream_joins_every_forwarder_on_close(surface):
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
+    adapter = CodexAdapter.__new__(CodexAdapter)
+    started, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def turn(*args, **kwargs):
+        try:
+            yield {"text": "first"}
+        finally:
+            started.set()
+            await release.wait()
+            closed.set()
+            uncertain()
+
+    adapter._run_turn = turn
+    method = adapter.get_streaming_response if surface == "plain" else adapter.get_streaming_response_with_tools
+    stream = method(None, "synthetic", [], tools=[{"name": "effect"}] if surface == "tools" else None)
+    try:
+        assert await anext(stream) == "first"
+        closer = asyncio.create_task(stream.aclose())
+        await asyncio.wait_for(started.wait(), 1)
+        assert not closer.done()
+        closer.cancel()
+        await asyncio.sleep(0)
+        assert not closer.done()
+        release.set()
+        with pytest.raises(BaseException) as caught:
+            await closer
+        assert execution_commit_outcome(caught.value) == "unknown"
+        assert closed.is_set()
+    finally:
+        release.set()
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["timeout", "cancel"])
+async def test_hosted_modality_writer_is_joined_before_invocation_settles(monkeypatch, interruption):
+    from kestrel_sovereign.llm import modality_recording as recording
+    from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+
+    started, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class Recorder(recording.ModalityRecordingMixin):
+        async def _write_modality_record(self, call):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                await release.wait()
+                closed.set()
+                uncertain()
+
+    recorder = Recorder()
+    recorder._execution_custody = ExecutionCustody(Authority())
+    monkeypatch.setattr(recording, "USAGE_RECORD_TIMEOUT", 0.01)
+    call = recording.ModalityCall("embedding", "local-test", "synthetic", 1, True, LLMInvocationContext())
+    operation = asyncio.create_task(recorder.record_modality_call(call))
+    try:
+        await started.wait()
+        if interruption == "cancel":
+            operation.cancel()
+        await asyncio.sleep(0.03)
+        assert not operation.done()
+        release.set()
+        with pytest.raises(BaseException) as caught:
+            await operation
+        assert execution_commit_outcome(caught.value) == "unknown"
+        assert closed.is_set()
+        assert not recorder._pending_modality_records()
+    finally:
+        release.set()
+        for task in tuple(recorder._pending_modality_records()):
+            task.cancel()
+        await asyncio.gather(operation, *recorder._pending_modality_records(), return_exceptions=True)
 
 
 @pytest.mark.asyncio

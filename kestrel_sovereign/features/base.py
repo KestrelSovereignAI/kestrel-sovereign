@@ -44,7 +44,7 @@ from kestrel_sovereign.turn_completion import (
     settle_repaired_content,
     turn_completion_repair_prompt,
 )
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, is_execution_control_error, require_execution_work
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_work_operation, is_execution_control_error, require_execution_work
 
 logger = logging.getLogger(__name__)
 
@@ -317,6 +317,7 @@ class Feature(_SdkFeature):
 
     def __init__(self, agent):
         self.agent = agent
+        self._execution_custody = getattr(agent, "_execution_custody", None)
         self.name = self.__class__.__name__
         self.disabled_skills: set = set()
 
@@ -1612,6 +1613,8 @@ class Feature(_SdkFeature):
         except ExecutionAuthorityError:
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Feature {self.name} subagent execution failed: {e}")
             err_envelope: Dict[str, Any] = {"success": False, "error": str(e)}
             # Parts emitted before the failure (e.g. a *_pending card) still
@@ -1687,7 +1690,8 @@ class Feature(_SdkFeature):
 
         async def _exec(name: str, args: Dict[str, Any]):
             with turn_scope.bind():
-                return await self._execute_subagent_tool(
+                require_execution_work(self.agent)
+                result = await self._execute_subagent_tool(
                     tool_name=name,
                     args=args or {},
                     tools_by_name={
@@ -1696,6 +1700,8 @@ class Feature(_SdkFeature):
                     return_with_effective_args=True,
                     parts_sink=parts_sink,
                 )
+                require_execution_work(self.agent)
+                return result
         return _exec
 
     async def _execute_subagent_tool(
@@ -1854,6 +1860,8 @@ class Feature(_SdkFeature):
             except ExecutionAuthorityError:
                 raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "[SUBAGENT-TOOL] %s raised %s",
                     tool_name, e,
@@ -2282,6 +2290,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                         self.func = func
                         self._schema_data = schema_data
                         self.agent_skill = agent_skill
+                        self._execution_custody = getattr(func.__self__.agent, "_execution_custody", None)
 
                     @property
                     def name(self) -> str:
@@ -2297,6 +2306,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             command_prefix=self._schema_data.get("command_prefix")
                         )
 
+                    @execution_work_operation
                     async def execute(self, **kwargs) -> Dict[str, Any]:
                         # #2641: bind a "tool result under construction"
                         # buffer for the duration of the wrapped call.
