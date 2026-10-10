@@ -775,11 +775,14 @@ class PostgresBackend(DatabaseBackend):
         # asyncpg release/reset is awaited after COMMIT. Carry the exact commit
         # state through that await so a release failure cannot imply rollback.
         state = _ExecutionCommitState()
+        scopes = current_execution_custody(self)
         try:
             async with pool.acquire() as connection:
                 yield connection, state
         except BaseException as exc:
             if state.outcome is not None and execution_commit_outcome(exc) is None:
+                for scope in scopes:
+                    scope.preserve_commit_uncertainty(state.outcome)
                 raise ExecutionCommitOutcomeError(state.outcome) from exc
             raise
 
@@ -802,6 +805,8 @@ class PostgresBackend(DatabaseBackend):
                     commit_state.outcome = "unknown"
         except BaseException as exc:
             if committing:
+                for scope in scopes:
+                    scope.preserve_commit_uncertainty("unknown")
                 raise ExecutionCommitOutcomeError("unknown") from exc
             raise
         if commit_state is not None:
@@ -815,6 +820,8 @@ class PostgresBackend(DatabaseBackend):
         try:
             require_execution_backend("postgres", scopes)
         except ExecutionAuthorityError as exc:
+            for scope in scopes:
+                scope.preserve_commit_uncertainty("committed")
             raise ExecutionCommitOutcomeError("committed") from exc
 
     @staticmethod
@@ -901,8 +908,8 @@ class PostgresBackend(DatabaseBackend):
                         async with self._execution_query_executor(conn) as checked:
                             await checked.executemany(pg_query, params_list)
                     else:
-                        async with pool.acquire() as acquired:
-                            async with self._execution_query_executor(acquired) as checked:
+                        async with self._authority_pool_checkout(pool) as (acquired, state):
+                            async with self._execution_query_executor(acquired, state) as checked:
                                 await checked.executemany(pg_query, params_list)
             return len(params_list)  # asyncpg doesn't return affected count
             
@@ -992,8 +999,8 @@ class PostgresBackend(DatabaseBackend):
                         async with self._execution_query_executor(conn) as checked:
                             await checked.execute(script)
                     else:
-                        async with pool.acquire() as acquired:
-                            async with self._execution_query_executor(acquired) as checked:
+                        async with self._authority_pool_checkout(pool) as (acquired, state):
+                            async with self._execution_query_executor(acquired, state) as checked:
                                 await checked.execute(script)
                     
         except Exception as e:

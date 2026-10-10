@@ -98,6 +98,8 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, List, Optional, Protocol
 from zoneinfo import ZoneInfo
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from kestrel_sdk.signals import (
     AttentionPolicy,
     CausationFrame,
@@ -1113,8 +1115,9 @@ class SignalDispatcher:
         _durable_terminal_consumer_id: Optional[str] = None,
     ) -> SignalResult:
         """Awaits the full lifecycle. Used by callers that need the result
-        (scheduler, heartbeat). Always returns a `SignalResult` — failures
-        are encoded as `Status.FAILED` with `error` set, never raised."""
+        (scheduler, heartbeat). Ordinary failures return `Status.FAILED`.
+        Execution-authority loss and uncertain commits remain typed errors
+        so the owning invocation can reconcile instead of retrying effects."""
         start = time.monotonic()
         # Nested public dispatches inherit ContextVars from their caller. A
         # signal emitted by durable cognition is a new source unit and must not
@@ -1178,6 +1181,8 @@ class SignalDispatcher:
         except _DurableDeliveryShuttingDownError:
             return self._durable_shutdown_signal_result(signal, start)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Defensive — every failure path inside _run should already
             # produce a SignalResult. If we land here, log it loudly.
             logger.exception(
@@ -5219,6 +5224,8 @@ class SignalDispatcher:
                 )
 
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.exception(
                     "Handler raised for signal %s (source=%s, mode=%s)",
                     signal.id,
@@ -5381,6 +5388,8 @@ class SignalDispatcher:
                 audit=audit,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Codex round-3 P2: if process_input raises, the audit
             # would otherwise be lost when the outer try/except in
             # `_route_under_locks` calls `_fail` without it. Catch

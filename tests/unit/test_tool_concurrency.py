@@ -150,7 +150,8 @@ class TestMaxConcurrency:
 
 
 @pytest.mark.asyncio
-async def test_parallel_failure_joins_cancellation_resistant_sibling_before_return():
+@pytest.mark.parametrize("uncertain", [False, True])
+async def test_parallel_failure_joins_cancellation_resistant_sibling_before_return(uncertain):
     """Exercise the native batch owner, not a detached gather substitute."""
     entered = asyncio.Event()
     cancelled = asyncio.Event()
@@ -173,6 +174,9 @@ async def test_parallel_failure_joins_cancellation_resistant_sibling_before_retu
                 cancelled.set()
                 await drained.wait()
             finished.append("slow child joined")
+            if uncertain:
+                from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+                raise ExecutionCommitOutcomeError("unknown")
 
     agent = Agent()
     task = asyncio.create_task(agent._execute_tool_batch(
@@ -183,7 +187,8 @@ async def test_parallel_failure_joins_cancellation_resistant_sibling_before_retu
         await asyncio.wait_for(cancelled.wait(), timeout=2)
         assert not task.done()
         drained.set()
-        with pytest.raises(ValueError, match="first child failed"):
+        from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+        with pytest.raises(ExecutionCommitOutcomeError if uncertain else ValueError):
             await task
         assert finished == ["slow child joined"]
     finally:

@@ -11889,6 +11889,11 @@ class ProxyFeature(Feature):
         )
 
     async def call_isolated_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        from kestrel_sovereign.execution_custody import bind_execution_runtime
+        with bind_execution_runtime(self.agent):
+            return await self._call_isolated_tool_owned(name, args)
+
+    async def _call_isolated_tool_owned(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         context = _scheduled_tool_execution_context()
         requested_at = asyncio.get_running_loop().time()
         experienced_wake = False
@@ -12032,6 +12037,8 @@ class ProxyFeature(Feature):
         )
 
         try:
+            from kestrel_sovereign.execution_custody import require_execution_work
+            require_execution_work(self.agent)
             if context is not None:
                 # The context was translated before admission, which can wait
                 # on a config transition or an idle wake.  Re-read authority
@@ -12075,6 +12082,9 @@ class ProxyFeature(Feature):
         except (SchedulerExecutionContextUnavailable, SchedulerAuthorityRevoked):
             raise
         except Exception as exc:  # noqa: BLE001
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(exc):
+                raise
             if context is not None:
                 # No scheduler effect may proceed if the negotiated context was
                 # rejected or the context-aware RPC could not be delivered.

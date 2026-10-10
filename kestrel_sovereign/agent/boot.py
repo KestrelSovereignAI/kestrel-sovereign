@@ -254,6 +254,7 @@ async def run_boot_sequence(
             for resource in phase.retained:
                 ctx.note_retained(resource)
             ctx.logger.debug("boot: committed phase '%s'", phase.name)
+        set_state(BootPhaseState.READY)
     except BaseException as exc:  # noqa: BLE001 - includes CancelledError
         failed_after = ctx.committed_phases[-1] if ctx.committed_phases else "<none>"
         released = await ctx.run_rollback()
@@ -268,4 +269,3 @@ async def run_boot_sequence(
             ctx.retained_resources or "none",
         )
         raise
-    set_state(BootPhaseState.READY)

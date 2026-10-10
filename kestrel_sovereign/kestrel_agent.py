@@ -128,6 +128,7 @@ from kestrel_sovereign.security.input_guardrails import (
     append_security_addendum,
 )
 from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
+from kestrel_sovereign.execution_custody import execution_work_operation
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
@@ -2188,6 +2189,9 @@ class KestrelAgent(
         self._boot_context = ctx
 
         def _set_state(new_state: BootPhaseState) -> None:
+            if new_state is BootPhaseState.READY:
+                from kestrel_sovereign.execution_custody import require_execution_work
+                require_execution_work(self)
             self._boot_state = new_state
 
         try:
@@ -4176,6 +4180,7 @@ class KestrelAgent(
         # the agent, opens the gate, then completes this same hook pass.
         await self._run_or_defer_agent_ready_hooks()
 
+    @execution_work_operation
     async def _notify_agent_ready_hooks(self) -> None:
         """Run the best-effort ready-phase hook once services are usable."""
 
@@ -4186,6 +4191,9 @@ class KestrelAgent(
             try:
                 await ready_hook(self)
             except (Exception, asyncio.CancelledError) as e:
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(e):
+                    raise
                 # Ready hooks are explicitly best-effort.  A hook can await a
                 # child task that was independently cancelled; on modern
                 # Python that outcome is a BaseException and used to cancel
@@ -4205,6 +4213,7 @@ class KestrelAgent(
                     getattr(feature, "name", type(feature).__name__), e,
                 )
 
+    @execution_work_operation
     async def _run_or_defer_agent_ready_hooks(self) -> None:
         """Run ready hooks now, or defer them behind host policy publication."""
 
@@ -4236,6 +4245,7 @@ class KestrelAgent(
             )
         self._agent_readiness_host_owned = True
 
+    @execution_work_operation
     async def complete_deferred_agent_readiness(self) -> None:
         """Complete the server-deferred ready hooks after host publication."""
 

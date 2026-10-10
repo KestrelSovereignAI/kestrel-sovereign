@@ -2025,6 +2025,9 @@ class CodexAdapter(LLMAdapter):
             try:
                 ret = await executor(name, args)
             except Exception as e:
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(e):
+                    raise
                 logger.warning("tool_executor(%s) raised: %s", name, e)
                 err_result = {"success": False, "error": f"{e}"}
                 # Failed inline tool calls must remain observable —
@@ -2100,12 +2103,22 @@ class CodexAdapter(LLMAdapter):
                 ),
             )
 
+        control_error: BaseException | None = None
+
         async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal control_error
             task = asyncio.current_task()
             if active_handlers is not None and task is not None:
                 active_handlers.add(task)
             try:
+                if control_error is not None:
+                    raise control_error
                 return await _handle(params)
+            except BaseException as error:
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(error):
+                    control_error = error
+                raise
             finally:
                 if active_handlers is not None and task is not None:
                     active_handlers.discard(task)
@@ -2923,6 +2936,8 @@ class CodexAdapter(LLMAdapter):
                     "turn has no nameable model for collaborationMode.settings; "
                     "signal not delivered this turn (model=%r).", model,
                 )
+            from kestrel_sovereign.execution_custody import require_execution_work
+            require_execution_work()
             await app.request("turn/start", turn_params, timeout=60)
 
             text_parts: List[str] = []

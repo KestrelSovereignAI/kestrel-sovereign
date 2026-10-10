@@ -31,7 +31,7 @@ from kestrel_sdk.llm.decisions import (
 )
 
 from kestrel_sovereign.config import load_section
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, require_execution_work
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, bind_execution_cleanup, bind_execution_runtime, execution_work_operation, require_execution_work
 
 from .adapter import ReportedUsage
 from .decisions.config import (
@@ -307,6 +307,7 @@ class DecisionServiceMixin:
     # decide (§3.1, §5, §6, §8)
     # ------------------------------------------------------------------
 
+    @execution_work_operation
     async def decide(
         self,
         request: DecisionRequest,
@@ -456,22 +457,27 @@ class DecisionServiceMixin:
         reported = body.get("usage") if isinstance(body, Mapping) else None
         if isinstance(reported, Mapping):
             usage.add(input_tokens=reported.get("input_tokens"), cost=reported.get("cost"))
-        await self.record_modality_call(
-            ModalityCall(
-                modality="decision",
-                provider=str(provider.get("name")),
-                model=model,
-                duration_ms=duration_ms,
-                success=error is None,
-                context=context,
-                error_class=type(error).__name__ if error is not None else None,
-                input_tokens=usage.input_tokens,
-                cost=usage.cost,
-                caller=caller,
-                metadata={
-                    "caller": caller,
-                    "question_count": question_count,
-                    "calibrated": calibrated,
-                },
-            )
-        )
+        with (bind_execution_cleanup(self) if error is not None else bind_execution_runtime(self)):
+            try:
+                await self.record_modality_call(
+                    ModalityCall(
+                        modality="decision",
+                        provider=str(provider.get("name")),
+                        model=model,
+                        duration_ms=duration_ms,
+                        success=error is None,
+                        context=context,
+                        error_class=type(error).__name__ if error is not None else None,
+                        input_tokens=usage.input_tokens,
+                        cost=usage.cost,
+                        caller=caller,
+                        metadata={
+                            "caller": caller,
+                            "question_count": question_count,
+                            "calibrated": calibrated,
+                        },
+                    )
+                )
+            except ExecutionAuthorityError:
+                if error is None:
+                    raise

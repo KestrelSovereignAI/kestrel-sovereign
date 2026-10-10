@@ -61,7 +61,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     held_transition_reentry_token,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, require_execution_work
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_commit_outcome, is_execution_control_error, require_execution_work
 from kestrel_sovereign.agent.streaming import (
     _DeferredToolBatchCancellation,
     _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
@@ -2264,6 +2264,8 @@ class OrchestratorEngineMixin:
                 tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
             return result
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
             return await _failed(
                 str(e),
@@ -2438,8 +2440,19 @@ class OrchestratorEngineMixin:
                     for child in children:
                         if not child.done():
                             child.cancel()
+                    uncertain_error = None
                     for child in children:
-                        await await_owned_task(child)
+                        outcome = await await_owned_task(child)
+                        if outcome.error is not None:
+                            commit_outcome = execution_commit_outcome(outcome.error)
+                            if commit_outcome is not None and (
+                                uncertain_error is None or commit_outcome == "unknown"
+                            ):
+                                uncertain_error = outcome.error
+                    if uncertain_error is not None:
+                        # The first ordinary failure does not erase a sibling's
+                        # irreversible outcome observed while draining it.
+                        raise uncertain_error
 
                 # Append results in original request order
                 for i in range(len(batch_tcs)):

@@ -86,6 +86,23 @@ refuse unreconciled `executing` evidence. Commit uncertainty cannot be normalize
 into a terminal failed execution or clean Stop settlement. PostgreSQL carries
 commit state through pool release/reset (including pinned operational sessions),
 so release failure or cancellation after commit does not claim rollback.
+Single-query, batch and script checkouts all carry that commit state. An
+uncertain/committed outcome also irreversibly latches the original admission:
+even a legacy caller that catches or stringifies the error cannot resume work
+under it. Reconciliation requires a separately trusted new admission, not
+clearing this state or rebinding a replacement lease. Source handlers,
+dispatchers, dynamic/direct tools and provider transport callbacks preserve
+cause-chained execution control errors. Parallel cleanup joins every child and
+preserves any child's commit uncertainty over an ordinary sibling failure.
+
+Provider send and isolated-tool RPC boundaries recheck after startup, traffic,
+lock or wake awaits. Decision/embedding accounting retains the entire original
+operation's scope; aborted accounting cannot spawn ordinary usage writes.
+Every native stream forwarding layer explicitly joins its underlying iterator's
+close under cleanup-only custody, including transport-handler cleanup. EOF and
+close failures are classified before terminal invocation settlement. Boot's
+READY transition and deferred readiness likewise retain/check original custody;
+denial unwinds already committed boot phases rather than publishing readiness.
 
 Custody-bound durable-signal boot uses transactional creation/repair of its
 exact source-sequence index, retaining generation locks through commit. Unbound

@@ -14,6 +14,7 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCustody,
     bind_execution_custody,
+    require_execution_work,
 )
 from kestrel_sovereign.storage.db.postgres import PostgresBackend
 
@@ -654,7 +655,8 @@ async def test_failed_generation_validation_irrevocably_retires_original_admissi
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("operational", [False, True])
 @pytest.mark.parametrize("failure", ["error", "cancel"])
-async def test_pool_release_failure_preserves_committed_outcome(native_pg, explicit, operational, failure):
+@pytest.mark.parametrize("surface", ["query", "batch", "script"])
+async def test_pool_release_failure_preserves_committed_outcome(native_pg, explicit, operational, failure, surface):
     from contextlib import asynccontextmanager
     from kestrel_sovereign.execution_custody import execution_commit_outcome
     backend, _, _ = native_pg
@@ -678,15 +680,25 @@ async def test_pool_release_failure_preserves_committed_outcome(native_pg, expli
         else:
             yield
     try:
+        async def write():
+            if surface == "batch":
+                await backend.execute_many("INSERT INTO effects VALUES (?, ?)", [(1, "committed before release")])
+            elif surface == "script":
+                await backend.execute_script("INSERT INTO effects VALUES (1, 'committed before release')")
+            else:
+                await backend.execute("INSERT INTO effects VALUES (1, 'committed before release')")
         with bind_execution_custody(GenerationFence()):
             with pytest.raises(Exception, match="may have committed") as caught:
                 async with checkout():
                     if explicit:
                         async with backend.transaction():
-                            await backend.execute("INSERT INTO effects VALUES (1, 'committed before release')")
+                            await write()
                     else:
-                        await backend.execute("INSERT INTO effects VALUES (1, 'committed before release')")
+                        await write()
             assert execution_commit_outcome(caught.value) == "committed"
+            with pytest.raises(Exception) as denied:
+                require_execution_work()
+            assert execution_commit_outcome(denied.value) == "committed"
     finally:
         backend._pool = pool
     assert await backend.fetch_val("SELECT value FROM effects") == "committed before release"

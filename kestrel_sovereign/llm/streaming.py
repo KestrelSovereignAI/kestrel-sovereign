@@ -22,6 +22,8 @@ chat stream where it corrupts the agent's response.
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
+from kestrel_sovereign._async_ownership import await_owned_task
 from typing import (
     Awaitable,
     Callable,
@@ -52,7 +54,7 @@ from kestrel_sovereign.llm.retry import common_declined_wait
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
-    bind_execution_cleanup, execution_work_stream,
+    bind_execution_cleanup, execution_work_stream, is_execution_control_error,
 )
 from .adapter import (
     LLMResponse,
@@ -69,6 +71,24 @@ if TYPE_CHECKING:
     from .invocation_context import LLMInvocationContext
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _owned_stream(owner: Any, stream: AsyncIterator[Any]):
+    """Join every forwarding iterator's close before its caller retires."""
+    iterator = aiter(stream)
+    captured = current_execution_custody(owner)
+    try:
+        yield iterator
+    finally:
+        close = getattr(iterator, "aclose", None)
+        if callable(close):
+            with bind_execution_cleanup(owner, captured):
+                outcome = await await_owned_task(asyncio.create_task(close()))
+                if outcome.error is not None:
+                    raise outcome.error
+                if outcome.cancellation is not None:
+                    raise outcome.cancellation
 
 # v5 typed negotiation (#1983). Routing gates read the adapter's typed
 # ``ProviderCapabilities`` plus its ``contract_features()`` opt-in set instead
@@ -858,6 +878,8 @@ class StreamingMixin:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - telemetry is best-effort
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning("Failed to record streamed usage: %s", exc)
             return
 
@@ -891,6 +913,8 @@ class StreamingMixin:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - independent test-fake sink
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning("Failed to track streamed usage: %s", exc)
 
         call_logger = getattr(self, "_log_llm_call", None)
@@ -919,6 +943,8 @@ class StreamingMixin:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - telemetry is best-effort
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning("Failed to log streamed usage: %s", exc)
 
     @execution_work_stream
@@ -987,30 +1013,30 @@ class StreamingMixin:
 
         async def forward(stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
             nonlocal emitted, final_response
-            iterator = aiter(stream)
-            while True:
-                with bind_execution_custody_snapshot(admitted_custody):
-                    require_execution_work(self)
-                    try:
-                        item = await anext(iterator)
-                    except StopAsyncIteration:
+            async with _owned_stream(self, stream) as iterator:
+                while True:
+                    with bind_execution_custody_snapshot(admitted_custody):
                         require_execution_work(self)
-                        return
-                    require_execution_work(self)
-                emitted = True
-                if isinstance(item, LLMResponse):
-                    final_response = item
-                    # Identity must be available before a consumer chooses to
-                    # stop immediately after the terminal protocol event.
-                    self._stamp_response_identity(
-                        item, model=model, provider=provider_name
-                    )
-                    if expose_protocol_events:
-                        yield item
-                    continue
-                if isinstance(item, ToolCallStarted) and not expose_protocol_events:
-                    continue
-                yield item
+                        try:
+                            item = await anext(iterator)
+                        except StopAsyncIteration:
+                            require_execution_work(self)
+                            return
+                        require_execution_work(self)
+                    emitted = True
+                    if isinstance(item, LLMResponse):
+                        final_response = item
+                        # Identity must be available before a consumer chooses to
+                        # stop immediately after the terminal protocol event.
+                        self._stamp_response_identity(
+                            item, model=model, provider=provider_name
+                        )
+                        if expose_protocol_events:
+                            yield item
+                        continue
+                    if isinstance(item, ToolCallStarted) and not expose_protocol_events:
+                        continue
+                    yield item
 
         try:
             require_execution_work(self)
@@ -1024,8 +1050,9 @@ class StreamingMixin:
                         response_format=response_format,
                         **usage_kwargs,
                     )
-                    async for item in forward(stream):
-                        yield item
+                    async with _owned_stream(self, forward(stream)) as forwarded_stream:
+                        async for item in forwarded_stream:
+                            yield item
                 except NotImplementedError:
                     # A dynamic third-party adapter can still expose the SDK
                     # stub.  Falling back is safe only before any output escaped.
@@ -1043,8 +1070,9 @@ class StreamingMixin:
                     response_format=response_format,
                     **common_kwargs,
                 )
-                async for item in forward(stream):
-                    yield item
+                async with _owned_stream(self, forward(stream)) as forwarded_stream:
+                    async for item in forwarded_stream:
+                        yield item
             completed = True
         except BaseException as exc:
             failure = exc
@@ -1184,7 +1212,7 @@ class StreamingMixin:
         resolver = getattr(self, "_resolve_invocation_context", None)
         if resolver is not None:
             invocation_context = resolver(invocation_context)
-        async for item in self._get_streaming_response_frozen(
+        async with _owned_stream(self, self._get_streaming_response_frozen(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             force_local_only=force_local_only,
@@ -1193,8 +1221,9 @@ class StreamingMixin:
             cancel_token=cancel_token,
             invocation_context=invocation_context,
             path="get_streaming_response",
-        ):
-            yield item
+        )) as forwarded_stream:
+            async for item in forwarded_stream:
+                yield item
 
     async def _get_streaming_response_frozen(
         self,
@@ -1273,7 +1302,7 @@ class StreamingMixin:
                     self._adapter_has_usage_stream(adapter)
                 ):
                     if response_format is None or supports_streaming_structured:
-                        async for chunk in self._stream_adapter_with_usage(
+                        async with _owned_stream(self, self._stream_adapter_with_usage(
                             adapter=adapter,
                             client=provider["client"],
                             model=model_to_use,
@@ -1285,8 +1314,9 @@ class StreamingMixin:
                             response_format=response_format,
                             extra_body=provider_cache_body(provider),
                             cancel_token=cancel_token,
-                        ):
-                            yield chunk
+                        )) as forwarded_stream:
+                            async for chunk in forwarded_stream:
+                                yield chunk
                         logger.info(f"Streaming completed from {provider_name}")
                         return
 
@@ -1317,6 +1347,8 @@ class StreamingMixin:
             except ExecutionAuthorityError:
                 raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 require_execution_work(self)
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
@@ -1435,7 +1467,7 @@ class StreamingMixin:
                         system_prompt=system_prompt,
                     )
                     model = self._scrub_auto(model_override) or remote_route.model
-                    async for chunk in self._stream_adapter_with_usage(
+                    async with _owned_stream(self, self._stream_adapter_with_usage(
                         adapter=remote_route.adapter,
                         client=remote_route.client,
                         model=model,
@@ -1449,16 +1481,19 @@ class StreamingMixin:
                         error_message_override=(
                             self._managed_remote_failure_message
                         ),
-                    ):
-                        yield chunk
+                    )) as forwarded_stream:
+                        async for chunk in forwarded_stream:
+                            yield chunk
                 except ExecutionAuthorityError:
                     raise
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     self._raise_managed_remote_failure(exc)
                 return
 
         # Fall back to standard streaming
-        async for chunk in self._get_streaming_response_frozen(
+        async with _owned_stream(self, self._get_streaming_response_frozen(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             force_local_only=force_local_only,
@@ -1467,8 +1502,9 @@ class StreamingMixin:
             cancel_token=cancel_token,
             invocation_context=invocation_context,
             path="generate_stream",
-        ):
-            yield chunk
+        )) as forwarded_stream:
+            async for chunk in forwarded_stream:
+                yield chunk
 
     @execution_work_stream
     async def stream_with_messages(
@@ -1511,7 +1547,7 @@ class StreamingMixin:
             if remote_route is not None:
                 try:
                     model = self._scrub_auto(model_override) or remote_route.model
-                    async for chunk in self._stream_adapter_with_usage(
+                    async with _owned_stream(self, self._stream_adapter_with_usage(
                         adapter=remote_route.adapter,
                         client=remote_route.client,
                         model=model,
@@ -1525,11 +1561,14 @@ class StreamingMixin:
                         error_message_override=(
                             self._managed_remote_failure_message
                         ),
-                    ):
-                        yield chunk
+                    )) as forwarded_stream:
+                        async for chunk in forwarded_stream:
+                            yield chunk
                 except ExecutionAuthorityError:
                     raise
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     self._raise_managed_remote_failure(exc)
                 return
 
@@ -1573,7 +1612,7 @@ class StreamingMixin:
                 if callable(getattr(adapter, "get_streaming_response", None)) or (
                     self._adapter_has_usage_stream(adapter)
                 ):
-                    async for chunk in self._stream_adapter_with_usage(
+                    async with _owned_stream(self, self._stream_adapter_with_usage(
                         adapter=adapter,
                         client=provider["client"],
                         model=model,
@@ -1585,8 +1624,9 @@ class StreamingMixin:
                         extra_body=provider_cache_body(provider),
                         session_id=session_id,
                         cancel_token=cancel_token,
-                    ):
-                        yield chunk
+                    )) as forwarded_stream:
+                        async for chunk in forwarded_stream:
+                            yield chunk
                     return
                 else:
                     # Fallback to non-streaming if adapter doesn't support it
@@ -1610,6 +1650,8 @@ class StreamingMixin:
             except ExecutionAuthorityError:
                 raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 require_execution_work(self)
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
@@ -1850,7 +1892,7 @@ class StreamingMixin:
             if remote_route is not None:
                 try:
                     model = self._scrub_auto(model_override) or remote_route.model
-                    async for item in self._stream_adapter_with_usage(
+                    async with _owned_stream(self, self._stream_adapter_with_usage(
                         adapter=remote_route.adapter,
                         client=remote_route.client,
                         model=model,
@@ -1864,11 +1906,14 @@ class StreamingMixin:
                         error_message_override=(
                             self._managed_remote_failure_message
                         ),
-                    ):
-                        yield item
+                    )) as forwarded_stream:
+                        async for item in forwarded_stream:
+                            yield item
                 except ExecutionAuthorityError:
                     raise
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     self._raise_managed_remote_failure(exc)
                 return
 
@@ -1930,7 +1975,7 @@ class StreamingMixin:
                         and _route_wants_tool_stream_system_prompt(provider)
                         else None
                     )
-                    async for item in self._stream_adapter_with_usage(
+                    async with _owned_stream(self, self._stream_adapter_with_usage(
                         adapter=adapter,
                         client=provider["client"],
                         model=model,
@@ -1946,8 +1991,9 @@ class StreamingMixin:
                         keep_trailing_system=keep_trailing_system,
                         tool_executor=tool_executor,
                         cancel_token=cancel_token,
-                    ):
-                        yield item
+                    )) as forwarded_stream:
+                        async for item in forwarded_stream:
+                            yield item
                     logger.info(f"Streaming with tools completed from {provider_name}")
                     return
                 else:
@@ -1981,7 +2027,7 @@ class StreamingMixin:
                         return
                     else:
                         # No tools, just stream
-                        async for chunk in self._stream_adapter_with_usage(
+                        async with _owned_stream(self, self._stream_adapter_with_usage(
                             adapter=adapter,
                             client=provider["client"],
                             model=model,
@@ -1994,13 +2040,16 @@ class StreamingMixin:
                             session_id=session_id,
                             keep_trailing_system=keep_trailing_system,
                             cancel_token=cancel_token,
-                        ):
-                            yield chunk
+                        )) as forwarded_stream:
+                            async for chunk in forwarded_stream:
+                                yield chunk
                         return
 
             except ExecutionAuthorityError:
                 raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 require_execution_work(self)
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e

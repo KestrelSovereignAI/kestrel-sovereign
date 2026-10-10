@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional
 import numpy as np
 
 from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
-from kestrel_sovereign.execution_custody import await_execution_work, require_execution_work
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, bind_execution_cleanup, bind_execution_runtime, require_execution_work
 
 from .adapter import ReportedUsage
 from .modality_recording import ModalityCall
@@ -643,6 +643,16 @@ class ProviderEmbeddingService:
         payload: Any,
         input_count: int,
     ) -> Any:
+        with bind_execution_runtime(self._recorder or self):
+            return await self._dispatch_owned(operation, method, payload, input_count)
+
+    async def _dispatch_owned(
+        self,
+        operation: str,
+        method: Callable[..., Awaitable[Any]],
+        payload: Any,
+        input_count: int,
+    ) -> Any:
         """Call one adapter embed method and record the dispatch.
 
         The invocation context is frozen before the first await. The record is
@@ -667,17 +677,22 @@ class ProviderEmbeddingService:
             error = exc
             raise
         finally:
-            await recorder.record_modality_call(
-                self._embedding_call(
-                    operation,
-                    input_count,
-                    result=result,
-                    error=error,
-                    usage=usage,
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                    context=context,
-                )
-            )
+            with (bind_execution_cleanup(recorder) if error is not None else bind_execution_runtime(recorder)):
+                try:
+                    await recorder.record_modality_call(
+                        self._embedding_call(
+                            operation,
+                            input_count,
+                            result=result,
+                            error=error,
+                            usage=usage,
+                            duration_ms=int((time.monotonic() - started) * 1000),
+                            context=context,
+                        )
+                    )
+                except ExecutionAuthorityError:
+                    if error is None:
+                        raise
         require_execution_work(recorder)
         return result
 

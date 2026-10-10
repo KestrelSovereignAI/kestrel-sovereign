@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Optional, Protocol, Set
 
 from .invocation_context import LLMInvocationContext, turn_invocation_for
+from kestrel_sovereign.execution_custody import execution_work_operation, is_execution_control_error
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ class ModalityRecordingMixin:
             turn.context, session_id=turn.session_id
         )
 
+    @execution_work_operation
     async def record_modality_call(self, call: ModalityCall) -> None:
         """Write ``call`` without letting it alter the caller's outcome.
 
@@ -102,7 +104,9 @@ class ModalityRecordingMixin:
             # A new cancellation while waiting: the shielded write carries on
             # by itself, and the cancellation propagates to the caller.
             raise
-        except Exception:  # noqa: BLE001 - logged by the done callback
+        except Exception as error:  # noqa: BLE001 - logged by the done callback
+            if is_execution_control_error(error):
+                raise
             pass
 
     def _pending_modality_records(self) -> "Set[asyncio.Task[None]]":
@@ -116,6 +120,7 @@ class ModalityRecordingMixin:
         if exc is not None:
             logger.warning("LLM telemetry record failed: %s", type(exc).__name__)
 
+    @execution_work_operation
     async def _write_modality_record(self, call: ModalityCall) -> None:
         usage_available = call.input_tokens is not None
         if usage_available:

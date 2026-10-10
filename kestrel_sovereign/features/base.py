@@ -44,7 +44,7 @@ from kestrel_sovereign.turn_completion import (
     settle_repaired_content,
     turn_completion_repair_prompt,
 )
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, require_execution_work
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, is_execution_control_error, require_execution_work
 
 logger = logging.getLogger(__name__)
 
@@ -2323,6 +2323,8 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             except ExecutionAuthorityError:
                                 raise
                             except Exception as e:
+                                if is_execution_control_error(e):
+                                    raise
                                 logger.error(f"Error executing tool {self.name}: {e}")
                                 response: Dict[str, Any] = {
                                     "success": False,

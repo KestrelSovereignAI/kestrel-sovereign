@@ -852,6 +852,7 @@ def bind_async_generator_invocation(
                             try:
                                 item = await anext(iterator)
                             except StopAsyncIteration:
+                                require_execution_work(lifecycle_owner)
                                 return
                             require_execution_work(lifecycle_owner)
                         yield item
@@ -869,11 +870,15 @@ def bind_async_generator_invocation(
                                 close_iterator = getattr(iterator, "aclose", None)
                                 if callable(close_iterator):
                                     await close_iterator()
+                            except BaseException as close_error:
+                                if execution_commit_outcome(close_error) is not None:
+                                    cleanup_abandoned = True
+                                raise
                             finally:
                                 try:
                                     await checkpoint_completed_effects()
                                 except BaseException:
-                                    cleanup_abandoned = (
+                                    cleanup_abandoned = cleanup_abandoned or (
                                         effect_checkpoint.completed
                                         and not effect_checkpoint.checkpointed
                                     )

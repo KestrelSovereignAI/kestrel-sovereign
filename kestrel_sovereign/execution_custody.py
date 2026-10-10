@@ -53,6 +53,19 @@ def execution_commit_outcome(error: BaseException) -> str | None:
     return None
 
 
+def is_execution_control_error(error: BaseException) -> bool:
+    """Authority/commit control evidence must not become a tool error string."""
+    seen: set[int] = set()
+    while id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, ExecutionAuthorityError):
+            return True
+        if error.__cause__ is None:
+            return False
+        error = error.__cause__
+    return False
+
+
 class ExecutionFence(Protocol):
     """Trusted host's immutable binding; validation uses the mutation's session.
 
@@ -97,12 +110,21 @@ class ExecutionCustody:
 
     fence: ExecutionFence
     _denial: str | None = field(default=None, init=False)
+    _uncertain_commit: str | None = field(default=None, init=False)
+
+    def preserve_commit_uncertainty(self, outcome: str) -> None:
+        if outcome not in {"committed", "unknown"}:
+            raise ValueError("invalid execution commit outcome")
+        if self._uncertain_commit is None or outcome == "unknown":
+            self._uncertain_commit = outcome
 
     def revoke(self, reason: str) -> None:
         if self._denial is None:
             self._denial = reason or "execution authority revoked"
 
     def require_work(self) -> None:
+        if self._uncertain_commit is not None:
+            raise ExecutionCommitOutcomeError(self._uncertain_commit)
         if self._denial is not None:
             raise ExecutionAuthorityError(self._denial)
         try:

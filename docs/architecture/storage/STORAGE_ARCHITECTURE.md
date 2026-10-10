@@ -114,6 +114,12 @@ effect already submitted before authority was lost.
 denial (`committed`) from lost commit acknowledgement (`unknown`), including
 legacy storage exception wrapping. Reanchor reports reconciliation required
 and enters SafeMode; neither outcome is described as rollback or safe to retry.
+Single-query, batch and script checkouts retain commit state through pool reset
+and release. Such uncertainty irreversibly denies further work in the original
+admission even if a legacy caller catches its error; only trusted reconciliation
+and a new admission can reopen work. Invocation, scheduler source/dispatcher,
+tool and transport boundaries preserve this evidence, and joined parallel
+children cannot discard it in favor of an ordinary sibling error.
 This is an opt-in native contract, not evidence that a downstream host has
 installed it or passed live rollout acceptance.
 
