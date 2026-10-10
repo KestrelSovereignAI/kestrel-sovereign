@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -42,7 +44,10 @@ LINGERING_THREAD_SECONDS = 300.0
 SUBPROCESS_TIMEOUT_SECONDS = 120
 
 
-def test_xdist_worker_can_finalize_coverage_before_lingering_thread_guard(tmp_path):
+@pytest.mark.parametrize("plugin_autoload", [False, True])
+def test_xdist_worker_can_finalize_coverage_before_lingering_thread_guard(
+    tmp_path, plugin_autoload
+):
     """A worker with a live thread must return complete coverage data.
 
     The repository cleanup hook used to call ``os._exit`` directly from
@@ -69,6 +74,15 @@ def test_lingering_non_daemon_thread():
     report = tmp_path / "coverage.json"
     env = os.environ.copy()
     env["COVERAGE_FILE"] = str(tmp_path / ".coverage")
+    # The probe owns its plugin inventory. Use the entry-point names below so
+    # normal autoload recognizes an already loaded plugin instead of registering
+    # the same module twice under different names. Exercise both CI's normal
+    # autoload and the provider-free local gate's explicit loading contract.
+    env.pop("PYTEST_PLUGINS", None)
+    if plugin_autoload:
+        env.pop("PYTEST_DISABLE_PLUGIN_AUTOLOAD", None)
+    else:
+        env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
 
     completed = subprocess.run(
         [
@@ -77,7 +91,11 @@ def test_lingering_non_daemon_thread():
             "pytest",
             str(probe),
             "-p",
-            "pytest_asyncio.plugin",
+            "asyncio",
+            "-p",
+            "xdist",
+            "-p",
+            "pytest_cov",
             "-p",
             "tests.conftest",
             "-n",
