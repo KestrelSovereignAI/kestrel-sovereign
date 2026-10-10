@@ -469,6 +469,18 @@ async def _assert_fresh_inception_lifetime(db, identity: str) -> None:
             raise ValueError("Inception refuses an existing constitutional lifetime; use authorized recovery")
 
 
+def _refuse_previous_identity_namespace(output_dir: Path, slug: str) -> None:
+    """Active or archived key names are recovery evidence, not fresh birth.
+
+    A forced fresh identity with another slug may archive its old database,
+    but a later force must not reuse that old slug through the fresh DB.
+    Refuse symlinks too; never read or delete the old private material.
+    """
+    for path in _born_hybrid_identity_paths(Path(output_dir), slug):
+        if os.path.lexists(path) or next(path.parent.glob(path.name + ".backup-*"), None) is not None:
+            raise FileExistsError("Inception refuses a previous identity key namespace; use authorized recovery")
+
+
 def _publish_staged_identity(paths: list[Path], output_dir: Path, *, slug, force) -> list[Path]:
     """Publish only after the final native refusal checks, before its commit.
 
@@ -807,6 +819,19 @@ async def create_kestrel_identity_async(
                     f"An agent database already exists at {db_path}. Refusing to "
                     f"overwrite it."
                 )
+            if method == IDENTITY_METHOD_DID_WEB:
+                # Inspect the ORIGINAL authority before moving any DB/WAL/key
+                # artifact. Opening it must not initialize/migrate its schema.
+                async def retain_schema(_db):
+                    pass
+
+                original = await AsyncDatabase.sqlite(db_path, schema_initializer=retain_schema)
+                try:
+                    async with original.transaction(immediate=True):
+                        await _assert_fresh_inception_lifetime(original, deterministic_did)
+                        _refuse_previous_identity_namespace(Path(output_dir), slug)
+                finally:
+                    await original.close()
             import shutil
             import time
             import uuid
@@ -852,6 +877,7 @@ async def create_kestrel_identity_async(
         try:
             import tempfile
 
+            _refuse_previous_identity_namespace(Path(output_dir), slug)
             identity_stage_dir = Path(tempfile.mkdtemp(prefix=".inception-", dir=output_dir))
             # A malformed domain (scheme, port, path) raises in here —
             # keep it inside the cleanup path so a failed mint never

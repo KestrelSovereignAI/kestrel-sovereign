@@ -85,6 +85,73 @@ async def test_late_inception_refusal_never_publishes_staged_replacement_keys(db
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("deleted_root", [False, True])
+@pytest.mark.parametrize("remove_keys", [False, True])
+async def test_owned_force_inception_retains_original_lifetime_and_keys(tmp_path, monkeypatch, deleted_root, remove_keys):
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
+    directory = tmp_path / "owned"
+    kwargs = dict(output_dir=str(directory), is_test_instance=True, identity_method="did:web", did_web_domain="agents.kestrel-sovereign.test", did_web_slug="owned-retained")
+    first = await create_kestrel_identity_async(**kwargs)
+    storage = AsyncStorage(str(directory / "kestrel_prime.db"), backend="sqlite", agent_id=first.agent_did)
+    await storage.initialize()
+    try:
+        agent = await _agent(storage)
+        assert await agent.enter_safe_mode("retained native owned lifetime")
+        if deleted_root:
+            await storage.db.execute_commit("DELETE FROM graph_nodes WHERE node_id=?", (first.agent_did,))
+        state = await storage.db.fetchone("SELECT * FROM constitution_runtime_state WHERE agent_id=?", (first.agent_did,))
+        events = await storage.db.fetchall("SELECT * FROM constitution_runtime_events WHERE agent_id=? ORDER BY id", (first.agent_did,))
+    finally:
+        await storage.close()
+    if remove_keys:
+        from kestrel_sovereign.inception_service import _born_hybrid_identity_paths
+
+        for path in _born_hybrid_identity_paths(directory, kwargs["did_web_slug"]):
+            path.unlink()  # only synthetic fixture keys; isolate DB authority
+    original_keys = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file() and p.name != "kestrel_prime.db"}
+    with pytest.raises(Exception, match="existing identity|existing constitutional lifetime|birth|previous identity"):
+        await create_kestrel_identity_async(force=True, **kwargs)
+    assert {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file() and p.name != "kestrel_prime.db"} == original_keys
+    assert not list(directory.glob("*.backup-*"))
+    check = AsyncStorage(str(directory / "kestrel_prime.db"), backend="sqlite", agent_id=first.agent_did)
+    await check.initialize()
+    try:
+        assert await check.db.fetchone("SELECT * FROM constitution_runtime_state WHERE agent_id=?", (first.agent_did,)) == state
+        assert await check.db.fetchall("SELECT * FROM constitution_runtime_events WHERE agent_id=? ORDER BY id", (first.agent_did,)) == events
+        root = await check.db.fetchone("SELECT node_id FROM graph_nodes WHERE node_id=?", (first.agent_did,))
+        assert root == (None if deleted_root else (first.agent_did,))
+    finally:
+        await check.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_force_cannot_reuse_a_lifetime_from_an_archived_database(tmp_path, monkeypatch):
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
+    directory = tmp_path / "chained"
+    kwargs = dict(output_dir=str(directory), is_test_instance=True, identity_method="did:web", did_web_domain="agents.kestrel-sovereign.test")
+    first = await create_kestrel_identity_async(did_web_slug="old-lifetime", **kwargs)
+    old = AsyncStorage(str(directory / "kestrel_prime.db"), backend="sqlite", agent_id=first.agent_did)
+    await old.initialize()
+    try:
+        assert await (await _agent(old)).enter_safe_mode("retained archived native lifetime")
+    finally:
+        await old.close()
+    second = await create_kestrel_identity_async(did_web_slug="new-lifetime", force=True, **kwargs)
+    assert second.agent_did != first.agent_did
+    assert list(directory.glob("kestrel_prime.db.backup-*"))
+    before = {p.name: sha256(p.read_bytes()).digest() for p in directory.iterdir() if p.is_file()}
+    with pytest.raises(Exception, match="previous identity"):
+        await create_kestrel_identity_async(did_web_slug="old-lifetime", force=True, **kwargs)
+    assert {p.name: sha256(p.read_bytes()).digest() for p in directory.iterdir() if p.is_file()} == before
+
+
+@pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_partial_key_publication_restores_original_active_files(db_backend, tmp_path, monkeypatch):
     from kestrel_sovereign.inception_service import create_kestrel_identity_async

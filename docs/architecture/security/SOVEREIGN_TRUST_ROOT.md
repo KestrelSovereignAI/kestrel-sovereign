@@ -185,6 +185,13 @@ directory until final native admission, so even `force` cannot replace active
 keys on a refused birth. A partial filesystem publication restores the original
 active files; an uncertain database commit retains the published keys for
 recovery rather than deleting potentially committed identity material.
+Locally owned SQLite `force` inspects the original database under writer custody
+without initializing its schema, before archiving any database/WAL/key artifact.
+An existing or consumed deterministic identity is refused with its original
+state/history intact. Active or archived key names are also prior-identity
+evidence: a fresh database after another forced birth is not authority to reuse
+an older identity slug. Use authorized recovery for that identity, or a genuinely
+new identity namespace for a new birth.
 
 Genesis receipt history has one shared publication/runtime limit of 128 entries.
 A repair requiring a 129th entry, or encountering already-overflowed or malformed
