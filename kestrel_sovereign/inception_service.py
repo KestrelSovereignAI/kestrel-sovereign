@@ -32,6 +32,7 @@ import argparse
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
     from kestrel_sovereign.constitution.emancipation import EmancipationContract
     from kestrel_sovereign.constitution.genesis_audit import GenesisAuditor
 from datetime import datetime, timezone
@@ -1032,24 +1033,43 @@ async def create_kestrel_identity_async(
     #      would block every other writer on the database (#2660). RAG
     #      indexing, the spawned_by edge, the genesis-audit event and key
     #      provisioning are all recoverable by re-running and stay OUTSIDE it.
-    async with db.transaction():
-        # Birth-record replication can touch the same deterministic DID and
-        # constitution hash in one composed transaction. Reserve inception's
-        # complete graph write set first so both writers acquire PostgreSQL's
-        # advisory/row locks in the same global order rather than one taking
-        # constitution→agent while the other takes agent→constitution.
-        await graph.lock_nodes_for_update(
-            [constitution_node.node_id, agent_node.node_id]
-        )
-        from kestrel_sovereign.constitution.anchored_bytes import _store_exact_native_file
+    try:
+        async with db.transaction():
+            # Birth-record replication can touch the same deterministic DID and
+            # constitution hash in one composed transaction. Reserve inception's
+            # complete graph write set first so both writers acquire PostgreSQL's
+            # advisory/row locks in the same global order rather than one taking
+            # constitution→agent while the other takes agent→constitution.
+            await graph.lock_nodes_for_update(
+                [constitution_node.node_id, agent_node.node_id]
+            )
+            from kestrel_sovereign.constitution.anchored_bytes import _store_exact_native_file
 
-        await _store_exact_native_file(db, files, governing_bytes, "KESTREL_CONSTITUTION.md")
-        await graph.add_node(constitution_node)
-        await graph.add_node(agent_node)
-        # 6. Link the agent to its constitution.
-        await graph.add_edge(
-            agent_node.node_id, constitution_node.node_id, "governed_by"
-        )
+            await _store_exact_native_file(db, files, governing_bytes, "KESTREL_CONSTITUTION.md")
+            await graph.add_node(constitution_node)
+            await graph.add_node(agent_node)
+            # 6. Link the agent to its constitution.
+            await graph.add_edge(
+                agent_node.node_id, constitution_node.node_id, "governed_by"
+            )
+
+    except BaseException:
+        # Cancellation also rolls back native publication. A commit may have
+        # completed before an awaited connection-release error, however: do
+        # not erase the keys of an identity that actually reached the graph.
+        # An unreadable outcome is uncertainty, never permission to delete.
+        cleanup_safe = False
+        try:
+            cleanup_safe = await graph.get_node(agent_node.node_id) is None
+        except Exception:
+            logging.exception("Inception publication outcome unreadable; retaining identity artifacts")
+        try:
+            if not using_external_db:
+                await db.close()
+        finally:
+            if cleanup_safe:
+                cleanup_artifacts(identity_paths if using_external_db else [*identity_paths, db_path])
+        raise
 
     # A completed audit has two durable witnesses: the structured node receipt
     # and a conversation/audit event. Pending is already explicit on the node

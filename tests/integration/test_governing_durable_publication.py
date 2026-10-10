@@ -40,6 +40,43 @@ async def _identity(storage, properties):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+@pytest.mark.parametrize("mode", ["ephemeral", "isolated", "deidentified"])
+async def test_native_signed_same_hash_repair_works_through_real_privacy_wrapper(db_backend, tmp_path, mode):
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:private-repair:" + uuid4().hex)
+    await storage.initialize()
+    try:
+        agent = await _agent(storage)
+        content = resolve_governing_constitution_bytes(None)
+        digest = await storage.store_file(content, "constitution.md")
+        from kestrel_sovereign.constitution.genesis_audit import utc_timestamp
+
+        receipt = {"status": "failed", "risk_level": 3, "audited": True,
+                   "completed_at": utc_timestamp(), "constitution_hash": digest,
+                   "reasoning": "Retain exact completed rejection"}
+        await _identity(storage, {"constitution_hash": digest, "genesis_audit": receipt})
+        await agent._anchor_constitution_governance(digest)
+        await storage.delete_edge(agent.agent_id, digest, "governed_by")
+        wrapper = _privacy(agent, storage, mode)
+        artifact, root = _write_authority_files(tmp_path, content)
+        agent._sovereign_trust_root_path = root
+        result = await ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(artifact))
+        assert not result.startswith("Error:"), result
+        node = await storage.get_node(agent.agent_id)
+        assert node.properties["genesis_audit"] == receipt
+        artifact_hash = node.properties["constitution_reanchor"]["signed_artifact_hash"]
+        assert await storage.retrieve_file(artifact_hash) == artifact.read_bytes()
+        assert (await storage.get_node(artifact_hash)).node_type == "constitution_amendment_artifact"
+        assert [edge.target_id for edge in await storage.get_edges_from(agent.agent_id) if edge.label == "governed_by"] == [digest]
+        # The general feature-facing write remains disallowed: signed repair
+        # does not grant privacy callers permission to author governance.
+        with pytest.raises(Exception):
+            await wrapper.add_node(GraphNode(node_id=uuid4().hex, node_type="constitution_amendment_artifact", label="not authorized", properties={}))
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 @pytest.mark.parametrize("damage", ["target-owner", "target-row", "blob-owner", "blob-bytes"])
 async def test_integrity_success_rechecks_native_evidence_before_publication(db_backend, damage):
     storage = AsyncStorage(backend=db_backend, agent_id="did:test:audit-publication:" + uuid4().hex)
@@ -68,12 +105,64 @@ async def test_integrity_success_rechecks_native_evidence_before_publication(db_
             await storage.db.execute_commit("UPDATE files SET content=?,metadata=NULL WHERE content_hash=?", (b"corrupt after successful diagnostic", digest))
         assert await agent._record_successful_constitution_audit(source="earlier successful diagnostic") is False
         after = await agent._constitution_state_store.load(agent.agent_id)
-        assert after == before
+        assert after.safe_mode is True
+        assert after.safe_mode_cause == "integrity"
+        assert after.last_successful_audit_at == before.last_successful_audit_at
         assert agent._safe_mode is True
         assert not any(e["event_type"] == "audit_succeeded" for e in await agent._constitution_state_store.list_events(agent.agent_id))
     finally:
         if physical is not None:
             await storage.db.execute_commit("UPDATE files SET content=?,metadata=? WHERE content_hash=?", (*physical, digest))
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("surface", ["explicit", "periodic"])
+async def test_final_integrity_refusal_reaches_diagnostics_and_observers(db_backend, monkeypatch, surface):
+    from unittest.mock import AsyncMock
+
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:final-verdict:" + uuid4().hex)
+    await storage.initialize()
+    try:
+        agent = await _agent(storage)
+        content = resolve_governing_constitution_bytes(None)
+        digest = await storage.store_file(content, "constitution.md")
+        await _identity(storage, {"constitution_hash": digest})
+        await agent._anchor_constitution_governance(digest)
+        assert await agent._record_successful_constitution_audit(source="fixture")
+        native_verify = agent._verify_constitution_integrity
+        calls = 0
+
+        async def verify_then_damage():
+            nonlocal calls
+            result = await native_verify()
+            calls += 1
+            if calls == 1:
+                assert result[0] is True
+                await storage.db.execute_commit("DELETE FROM graph_node_owners WHERE node_id=? AND agent_id=?", (digest, agent.agent_id))
+            return result
+
+        monkeypatch.setattr(agent, "_verify_constitution_integrity", verify_then_damage)
+        observer = type("AuditAnchorFeature", (), {})()
+        observer.on_audit_complete = AsyncMock()
+        agent.features["audit"] = observer
+        if surface == "explicit":
+            verdict, message, published = await agent._run_explicit_constitution_audit()
+            assert verdict is False and published is False, (verdict, message, published)
+            assert "ownership custody" in message, message
+            assert agent._constitution_verified is False
+        else:
+            agent._interaction_count = agent.AUDIT_INTERVAL - 1
+            await agent._maybe_audit()
+            observer.on_audit_complete.assert_awaited_once()
+            final = observer.on_audit_complete.call_args.args[0]
+            assert final["is_valid"] is False and "ownership custody" in final["message"], final
+        state = await agent._constitution_state_store.load(agent.agent_id)
+        assert state.safe_mode and state.safe_mode_cause == "integrity"
+        events = await agent._constitution_state_store.list_events(agent.agent_id)
+        assert events[-1]["event_type"] == "safe_mode_entered"
+    finally:
         await storage.close()
 
 

@@ -24,6 +24,7 @@ if the span is widened to cover step 8's embedding work. Both mutants killed.
 """
 
 import contextlib
+import asyncio
 
 import pytest
 
@@ -88,7 +89,7 @@ async def test_constitution_agent_and_edge_all_commit(external_db, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_inception_refuses_corrupt_actual_conflict_winner(external_db, tmp_path):
+async def test_inception_refuses_corrupt_actual_conflict_winner(external_db, tmp_path, monkeypatch):
     """A generic store's returned input hash is not proof of persisted bytes."""
     import hashlib
     from kestrel_sovereign.constitution.resolver import (
@@ -96,6 +97,7 @@ async def test_inception_refuses_corrupt_actual_conflict_winner(external_db, tmp
     )
 
     content = resolve_governing_constitution_bytes(None)
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
     digest = hashlib.sha256(content).hexdigest()
     await external_db.execute_commit(
         "INSERT INTO files (content_hash,original_name,content) VALUES (?,?,?)",
@@ -106,7 +108,10 @@ async def test_inception_refuses_corrupt_actual_conflict_winner(external_db, tmp
         (digest, "did:test:prior-file-owner", "preexisting corruption"),
     )
     with pytest.raises(Exception, match="do not verify"):
-        await _incept(external_db, tmp_path)
+        await _incept(external_db, tmp_path, identity_method="did:web", did_web_domain="agents.kestrel-sovereign.test", did_web_slug="retry-atomic")
+    assert not list(tmp_path.glob("*_*.pem"))
+    assert not list(tmp_path.glob("*_*.json"))
+    assert not list(tmp_path.glob("*_*.key.enc"))
     assert (
         await external_db.fetchall(
             "SELECT node_id FROM graph_nodes WHERE node_type='agent'"
@@ -127,6 +132,154 @@ async def test_inception_refuses_corrupt_actual_conflict_winner(external_db, tmp
             "SELECT content FROM files WHERE content_hash=?", (digest,)
         )
     )[0] == b"not the governing bytes"
+    await external_db.execute_commit("UPDATE files SET content=? WHERE content_hash=?", (content, digest))
+    # The exact explicit born-hybrid slug is reusable after pre-commit failure.
+    credentials = await _incept(external_db, tmp_path, identity_method="did:web", did_web_domain="agents.kestrel-sovereign.test", did_web_slug="retry-atomic")
+    assert credentials.agent_did.endswith(":retry-atomic")
+
+
+@pytest.mark.asyncio
+async def test_owned_database_publication_failure_closes_and_cleans_before_retry(tmp_path, monkeypatch):
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    native_sqlite = AsyncDatabase.sqlite
+    opened = []
+
+    async def database_with_native_refusal(path, **kwargs):
+        db = await native_sqlite(path, **kwargs)
+        opened.append(db)
+        await db.execute_script("CREATE TRIGGER refuse_publication BEFORE INSERT ON files BEGIN SELECT RAISE(ABORT, 'native publication refusal'); END;")
+        return db
+
+    monkeypatch.setattr(AsyncDatabase, "sqlite", database_with_native_refusal)
+    try:
+        with pytest.raises(Exception, match="native publication refusal"):
+            await create_kestrel_identity_async(output_dir=str(tmp_path), is_test_instance=True, identity_method="did:web", did_web_domain="agents.kestrel-sovereign.test", did_web_slug="retry-owned")
+        assert opened[0]._backend._connection is None
+        assert not (tmp_path / "kestrel_prime.db").exists()
+        assert not list(tmp_path.glob("retry-owned_*"))
+        monkeypatch.setattr(AsyncDatabase, "sqlite", native_sqlite)
+        credentials = await create_kestrel_identity_async(output_dir=str(tmp_path), is_test_instance=True, identity_method="did:web", did_web_domain="agents.kestrel-sovereign.test", did_web_slug="retry-owned")
+        assert credentials.agent_did.endswith(":retry-owned")
+    finally:
+        # Counterproofs must not leave old-code failures' worker threads alive.
+        for db in opened:
+            await db.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_native_publication_cleans_owned_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    native_sqlite = AsyncDatabase.sqlite
+    native_add = AsyncGraphStore.add_node
+    opened = []
+    reached = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def capture_database(path, **kwargs):
+        db = await native_sqlite(path, **kwargs)
+        opened.append(db)
+        return db
+
+    async def pause_before_identity(graph, node):
+        if node.node_type == "agent":
+            reached.set()
+            await proceed.wait()
+        return await native_add(graph, node)
+
+    monkeypatch.setattr(AsyncDatabase, "sqlite", capture_database)
+    monkeypatch.setattr(AsyncGraphStore, "add_node", pause_before_identity)
+    task = asyncio.create_task(create_kestrel_identity_async(
+        output_dir=str(tmp_path), is_test_instance=True, identity_method="did:web",
+        did_web_domain="agents.kestrel-sovereign.test", did_web_slug="cancel-owned",
+    ))
+    try:
+        await asyncio.wait_for(reached.wait(), 15)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert opened[0]._backend._connection is None
+        assert not (tmp_path / "kestrel_prime.db").exists()
+        assert not list(tmp_path.glob("cancel-owned_*"))
+        monkeypatch.setattr(AsyncGraphStore, "add_node", native_add)
+        credentials = await create_kestrel_identity_async(
+            output_dir=str(tmp_path), is_test_instance=True, identity_method="did:web",
+            did_web_domain="agents.kestrel-sovereign.test", did_web_slug="cancel-owned",
+        )
+        assert credentials.agent_did.endswith(":cancel-owned")
+    finally:
+        proceed.set()
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        for db in opened:
+            await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owned", [False, True])
+async def test_commit_delivery_error_preserves_committed_identity(
+    external_db, tmp_path, monkeypatch, owned,
+):
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    identity = "did:web:agents.kestrel-sovereign.test:committed-owned"
+    native_sqlite = AsyncDatabase.sqlite
+    opened = []
+
+    def lose_commit_delivery(db):
+        native_transaction = db.transaction
+        lost = False
+
+        @contextlib.asynccontextmanager
+        async def transaction():
+            nonlocal lost
+            async with native_transaction():
+                yield db
+            if not lost and not db.owns_open_transaction and await db.fetchone(
+                "SELECT node_id FROM graph_nodes WHERE node_id=?", (identity,),
+            ) is not None:
+                lost = True
+                raise RuntimeError("committed publication delivery lost")
+
+        db.transaction = transaction
+
+    async def capture_database(path, **kwargs):
+        db = await native_sqlite(path, **kwargs)
+        opened.append(db)
+        lose_commit_delivery(db)
+        return db
+
+    if owned:
+        monkeypatch.setattr(AsyncDatabase, "sqlite", capture_database)
+    else:
+        lose_commit_delivery(external_db)
+    try:
+        with pytest.raises(RuntimeError, match="committed publication delivery lost"):
+            await create_kestrel_identity_async(
+                output_dir=str(tmp_path), is_test_instance=True, identity_method="did:web",
+                did_web_domain="agents.kestrel-sovereign.test", did_web_slug="committed-owned",
+                database=None if owned else external_db,
+            )
+        assert len(list(tmp_path.glob("committed-owned_*"))) == 5
+        if owned:
+            assert opened[0]._backend._connection is None
+            check = await native_sqlite(str(tmp_path / "kestrel_prime.db"))
+        else:
+            assert external_db._backend._connection is not None
+            check = external_db
+        try:
+            node = await AsyncGraphStore(check, agent_id=identity).get_node(identity)
+            assert node is not None
+            assert await check.fetchone(
+                "SELECT target_id FROM graph_edges WHERE source_id=? AND label='governed_by'",
+                (identity,),
+            ) == (node.properties["constitution_hash"],)
+        finally:
+            if owned:
+                await check.close()
+    finally:
+        for db in opened:
+            await db.close()
 
 
 @pytest.mark.asyncio

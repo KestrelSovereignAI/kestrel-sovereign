@@ -220,6 +220,10 @@ def _make_agent(stored_hash=ANCHORED_HASH, safe_mode=False, anchored=ANCHORED_CO
     agent.storage.add_node = AsyncMock()
     agent.storage.lock_nodes_for_update = AsyncMock()
     rows = _FakeFileRows(stored_hash, anchored)
+    async def get_node(*args, **kwargs):
+        return await agent.storage.get_node(*args, **kwargs)
+    async def get_edges_from(*args, **kwargs):
+        return await agent.storage.get_edges_from(*args, **kwargs)
     async def store_file(*args, **kwargs):
         return await agent.storage.store_file(*args, **kwargs)
     async def retrieve_file(*args, **kwargs):
@@ -227,7 +231,10 @@ def _make_agent(stored_hash=ANCHORED_HASH, safe_mode=False, anchored=ANCHORED_CO
     # Explicit protocol fixture for these existing authorization tests. Real
     # transaction/ownership behavior is exercised by the native backend suite.
     agent._raw_storage = SimpleNamespace(
-        db=rows, get_node=agent.storage.get_node,
+        db=rows, get_node=get_node, transaction=rows.transaction,
+        lock_nodes_for_update=agent.storage.lock_nodes_for_update,
+        add_node=agent.storage.add_node, add_edge=agent.storage.add_edge,
+        delete_edge=agent.storage.delete_edge, get_edges_from=get_edges_from,
         files=AsyncFileStore(rows, agent_id=AGENT_DID),
         owns_open_transaction=True, store_file=store_file,
         retrieve_file=retrieve_file,

@@ -3,6 +3,7 @@
 from uuid import uuid4
 import asyncio
 from contextlib import suppress
+from dataclasses import replace
 
 import pytest
 
@@ -11,6 +12,23 @@ from kestrel_sovereign.storage.async_graph_store import GraphNode
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from tests.integration.test_constitution_refusal_races import _agent
 from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+
+async def _assert_integrity_refusal(agent, before):
+    """A rejected exit may record restriction, never authority or success."""
+    current = await agent._constitution_state_store.load(agent.agent_id)
+    assert current.safe_mode is True
+    assert current.safe_mode_cause == "integrity"
+    assert current.revision == before.revision + 1
+    assert current.safe_mode_reason == agent._constitution_audit_commit_error
+    assert replace(
+        current, safe_mode_reason=before.safe_mode_reason,
+        safe_mode_cause=before.safe_mode_cause, revision=before.revision,
+        updated_at=before.updated_at,
+    ) == before
+    events = await agent._constitution_state_store.list_events(agent.agent_id)
+    assert events[-1]["event_type"] == "safe_mode_entered"
+    assert events[-1]["reason"] == current.safe_mode_reason
 
 
 @pytest.mark.asyncio
@@ -144,7 +162,7 @@ async def test_exit_requires_actual_governance_witness_custody(
         result = await agent.exit_safe_mode(authorization="fixture sovereign")
         assert reached == [True], result
         assert result.startswith("Safe Mode remains active:"), result
-        assert await agent._constitution_state_store.load(identity) == before
+        await _assert_integrity_refusal(agent, before)
     finally:
         await external.close()
         await storage.close()
@@ -218,7 +236,7 @@ async def test_exit_refuses_absent_lock_row_even_when_recreated_before_verificat
         assert reached == [True]
         assert result.startswith("Safe Mode remains active:"), result
         assert agent._safe_mode is True
-        assert await agent._constitution_state_store.load(identity) == before
+        await _assert_integrity_refusal(agent, before)
     finally:
         await external.close()
         await storage.close()
@@ -394,18 +412,18 @@ async def test_native_exit_refuses_governing_drift_after_verification(
             ]["event_type"] == "safe_mode_exited"
             return
         assert result.startswith("Safe Mode remains active:"), result
-        assert len(failures) == 1
+        # Native integrity refusal is not a database availability failure.
+        assert failures == []
         expected_reason = {
             "edge": "Missing or mis-targeted governed_by edge",
             "ownership": "Anchored constitution blob is missing",
             "failed_genesis": "requires a passed genesis receipt",
         }[damage]
-        assert expected_reason in str(failures[0]), str(failures[0])
+        assert expected_reason in agent._constitution_audit_commit_error
         assert agent._safe_mode is True
-        assert await agent._constitution_state_store.load(agent.agent_id) == before
-        assert (
-            await agent._constitution_state_store.list_events(agent.agent_id) == events
-        )
+        await _assert_integrity_refusal(agent, before)
+        final_events = await agent._constitution_state_store.list_events(agent.agent_id)
+        assert final_events[:-1] == events
     finally:
         await storage.close()
 

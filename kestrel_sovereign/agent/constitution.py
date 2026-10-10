@@ -1,5 +1,6 @@
 """Constitution verification and integrity checking for Kestrel Agent."""
 import asyncio
+import contextvars
 import logging
 import hashlib
 import os
@@ -33,6 +34,15 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     acquire_control_plane_capability,
 )
 from kestrel_sovereign.paths import PROJECT_ROOT_ENV, runtime_path_env
+
+
+# Task-local, turn-bound evidence. An agent-global cache would let queued or
+# overlapping requests overwrite the authority of the currently admitted turn.
+_CONSTITUTION_ADMISSION = contextvars.ContextVar("kestrel_constitution_admission", default=None)
+
+
+class ConstitutionIntegrityAttestationError(RuntimeError):
+    """The final native integrity proof refused an otherwise positive audit."""
 
 
 class SafeModeCause(str, Enum):
@@ -1058,6 +1068,21 @@ class ConstitutionMixin:
             self._constitution_state_persistence_pending = False
             return True
         except Exception as exc:  # noqa: BLE001 - never continue normally
+            cause = exc
+            for _ in range(8):
+                if isinstance(cause, ConstitutionIntegrityAttestationError):
+                    self._constitution_audit_commit_error = str(cause)
+                    self._constitution_verified = False
+                    # The failed audit transaction is rolled back. Record the
+                    # actual integrity restriction in its own owning commit,
+                    # not as a fictitious persistence outage or audit success.
+                    await ConstitutionMixin._enter_safe_mode_locked(
+                        self, str(cause), cause=SafeModeCause.INTEGRITY.value,
+                    )
+                    return False
+                if cause.__cause__ is None:
+                    break
+                cause = cause.__cause__
             # The write failed, so whatever this call was recording exists
             # only in memory and will not survive a restart. That is a
             # different fact from the store being unreadable, and only the
@@ -1088,6 +1113,7 @@ class ConstitutionMixin:
         self, *, source: str, audited_at: Optional[datetime] = None
     ) -> bool:
         """Locked implementation for successful-audit persistence."""
+        self._constitution_audit_commit_error = None
         now = audited_at or self._constitution_now()
         persisted = await ConstitutionMixin._persist_constitution_runtime_state(
             self,
@@ -1156,8 +1182,12 @@ class ConstitutionMixin:
                 )
                 if not ConstitutionMixin._constitution_transition_is_current(self):
                     return None, "Verification invalidated by an unpersisted restriction", False
-                self._constitution_verified = is_valid
-                return is_valid, message, recorded
+                if not recorded:
+                    final_error = vars(self).get("_constitution_audit_commit_error")
+                    self._constitution_verified = False
+                    return (False if final_error else None), (final_error or "Constitution audit completion was not durably published"), False
+                self._constitution_verified = True
+                return True, message, True
 
             recorded = await ConstitutionMixin._enter_safe_mode_locked(
                 self, message
@@ -1276,9 +1306,12 @@ class ConstitutionMixin:
                 await self.enter_safe_mode(f"Constitution audit failed: {message}")
             else:
                 logging.info(f"Constitution audit passed: {message}")
-                await ConstitutionMixin._record_successful_constitution_audit_locked(
+                recorded = await ConstitutionMixin._record_successful_constitution_audit_locked(
                     self, source="periodic", audited_at=now
                 )
+                if not recorded:
+                    message = vars(self).get("_constitution_audit_commit_error") or "Constitution audit completion was not durably published"
+                    is_valid = False
 
             # Notify audit anchor feature if available
             if not ConstitutionMixin._constitution_transition_is_current(self):
@@ -1780,19 +1813,22 @@ class ConstitutionMixin:
         await raw.lock_nodes_for_update([self.agent_id, digest] if digest else [self.agent_id])
         from kestrel_sovereign.constitution.anchored_bytes import lock_governance_rows, lock_governing_file
 
-        await lock_governance_rows(raw, self.agent_id, required_target=digest)
-        await lock_governing_file(raw, digest)
+        try:
+            await lock_governance_rows(raw, self.agent_id, required_target=digest)
+            await lock_governing_file(raw, digest)
+        except RuntimeError as exc:
+            raise ConstitutionIntegrityAttestationError(str(exc)) from exc
         # A different pointer won while we waited for the graph locks. Do not
         # widen the lock set out of canonical order or adopt its newer proof.
         fresh = await raw.get_node(self.agent_id)
         if (fresh.properties.get("constitution_hash") if fresh is not None else None) != digest:
-            raise RuntimeError("Safe Mode exit governing pointer changed during custody acquisition")
+            raise ConstitutionIntegrityAttestationError("Safe Mode exit governing pointer changed during custody acquisition")
         valid, message = await self._verify_constitution_integrity()
         if valid is not True:
-            raise RuntimeError("Safe Mode exit locked integrity verification failed: " + message)
+            raise ConstitutionIntegrityAttestationError("Locked integrity verification failed: " + message)
         if require_genesis and fresh is not None and "genesis_audit" in fresh.properties:
             if validate_completed_genesis_audit(fresh.properties["genesis_audit"], digest) != GENESIS_AUDIT_PASSED:
-                raise RuntimeError("Safe Mode exit requires a passed genesis receipt for its governing bytes")
+                raise ConstitutionIntegrityAttestationError("Safe Mode exit requires a passed genesis receipt for its governing bytes")
 
     async def _exit_safe_mode_locked(self, authorization: str = None):
         """Locked implementation of :meth:`exit_safe_mode`."""
@@ -2064,27 +2100,30 @@ class ConstitutionMixin:
         metadata (``created_at``) from a constitution that hasn't changed.
         """
         pruned: list[str] = []
-        async with self.storage.transaction():
+        # Governance is a first-party control-plane write, not a volatile
+        # privacy cache mutation. Its caller supplies signed/bootstrap custody.
+        governance_storage = vars(self).get("_raw_storage") or self.storage
+        async with governance_storage.transaction():
             if verified_targets is None:
-                edges = await self.storage.get_edges_from(self.agent_id)
+                edges = await governance_storage.get_edges_from(self.agent_id)
                 targets = {
                     edge.target_id for edge in edges or []
                     if getattr(edge, "label", None) == "governed_by"
                 }
             else:
                 targets = set(verified_targets)
-            await self.storage.lock_nodes_for_update(
+            await governance_storage.lock_nodes_for_update(
                 [self.agent_id, constitution_hash, *targets]
             )
             if verified_targets is None:
-                current_edges = await self.storage.get_edges_from(self.agent_id)
+                current_edges = await governance_storage.get_edges_from(self.agent_id)
                 current_targets = {
                     edge.target_id for edge in current_edges or []
                     if getattr(edge, "label", None) == "governed_by"
                 }
                 if current_targets != targets:
                     raise RuntimeError("governing edges changed during anchor custody acquisition")
-            if await self.storage.get_node(constitution_hash) is None:
+            if await governance_storage.get_node(constitution_hash) is None:
                 constitution_node = GraphNode(
                     node_id=constitution_hash,
                     node_type="document",
@@ -2095,13 +2134,13 @@ class ConstitutionMixin:
                         "created_at": self._get_timestamp(),
                     },
                 )
-                await self.storage.add_node(constitution_node)
-            await self.storage.add_edge(
+                await governance_storage.add_node(constitution_node)
+            await governance_storage.add_edge(
                 self.agent_id, constitution_hash, "governed_by"
             )
             for target in sorted(targets):
                 if target != constitution_hash:
-                    await self.storage.delete_edge(
+                    await governance_storage.delete_edge(
                         self.agent_id, target, "governed_by"
                     )
                     pruned.append(target)
@@ -2155,7 +2194,7 @@ class ConstitutionMixin:
             ConstitutionMixin._require_owned_constitution_commit(self)
         except RuntimeError as exc:
             return f"Error: {exc}; nothing was written."
-        agent_node = await self.storage.get_node(self.agent_id)
+        agent_node = await self._raw_storage.get_node(self.agent_id)
         if not agent_node:
             return "Error: Agent identity node not found."
 
@@ -2352,14 +2391,14 @@ class ConstitutionMixin:
         # very command exists to repair, and a concurrent integrity audit
         # could observe it.
         try:
-            async with ConstitutionMixin._constitution_state_guard(self), self.storage.transaction():
+            async with ConstitutionMixin._constitution_state_guard(self), self._raw_storage.transaction():
                 from kestrel_sovereign.constitution.anchored_bytes import store_verified_governing_file
 
                 # The full write set is known from the verified bytes. Take
                 # custody and revalidate before writing even a file owner: a
                 # stale authorization must not stage mutations first.
                 artifact_hash = hashlib.sha256(amendment_artifact_bytes).hexdigest()
-                await self.storage.lock_nodes_for_update(
+                await self._raw_storage.lock_nodes_for_update(
                     [self.agent_id, artifact_hash, new_hash, *governance_preflight["governed_by_targets"]]
                 )
                 agent_node = await revalidate_governance_evidence(
@@ -2391,7 +2430,7 @@ class ConstitutionMixin:
                 # The runtime and setup reanchor writers touch these shared
                 # rows in different semantic order. Take the complete set first
                 # so PostgreSQL always observes one canonical lock order.
-                await self.storage.add_node(
+                await self._raw_storage.add_node(
                     artifact_node,
                     capability=acquire_control_plane_capability(),
                 )
@@ -2419,13 +2458,12 @@ class ConstitutionMixin:
                 # A lost operative pointer is not a change of governing bytes.
                 # Keep a completed hash-bound rejection as well as a pass when
                 # signed repair restores that same validated historical hash.
-                if new_hash != historical_hash:
-                    supersede_genesis_audit(
-                        agent_node.properties,
-                        constitution_hash=stored_hash,
-                        provenance="runtime:constitution_reanchor",
-                        recorded_at=self._get_timestamp(),
-                    )
+                supersede_genesis_audit(
+                    agent_node.properties,
+                    constitution_hash=stored_hash,
+                    provenance="runtime:constitution_reanchor",
+                    recorded_at=self._get_timestamp(),
+                )
                 supersede_constitution_reanchor(
                     agent_node.properties,
                     receipt={
@@ -2444,7 +2482,7 @@ class ConstitutionMixin:
                     provenance="runtime:constitution_reanchor",
                     recorded_at=self._get_timestamp(),
                 )
-                await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())
+                await self._raw_storage.add_node(agent_node, capability=acquire_control_plane_capability())
                 consumed = await ConstitutionMixin._consume_initial_anchor_custody(self)
             ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
         except Exception as e:
@@ -2523,11 +2561,22 @@ class ConstitutionMixin:
         measure the same governing bytes as production without causing the
         legacy lazy-anchor transaction.
         """
-        agent_node = await self.storage.get_node(self.agent_id)
+        from kestrel_sovereign.agent.turn_lifecycle import _live_turn_binding
+
+        binding = _live_turn_binding(self)
+        admission = _CONSTITUTION_ADMISSION.get()
+        witness = admission if admission and binding and admission[0] is self and admission[1] == binding.turn_id else None
+        reader = self._raw_storage if witness else self.storage
+        agent_node = await reader.get_node(self.agent_id)
         if not agent_node:
             return "Error: Agent's own identity node not found in storage."
 
         constitution_hash = agent_node.properties.get("constitution_hash")
+        if witness and (
+            constitution_hash != witness[2]
+            or agent_node.properties.get("genesis_audit") != witness[3]
+        ):
+            return "Error: Governing constitution changed after this turn's audited admission; retry under current governance."
         if not constitution_hash:
             if not allow_lazy_anchor:
                 return (
@@ -3089,4 +3138,74 @@ class ConstitutionMixin:
                 "The durable genesis-audit receipt is missing or inconsistent. "
                 "No cognition request was sent; inspect the agent's audit state."
             )
+        from kestrel_sovereign.agent.turn_lifecycle import _live_turn_binding
+
+        binding = _live_turn_binding(self)
+        if binding is not None:
+            # The early readiness check does not own turn admission. Reload
+            # native runtime custody AFTER acquiring CONVERSATION, so another
+            # replica's committed restriction or repair cannot be missed.
+            try:
+                async with ConstitutionMixin._constitution_state_guard(self):
+                    store = vars(self).get("_constitution_state_store")
+                    if store is None:
+                        raise RuntimeError("Native constitutional runtime custody is unavailable at turn admission")
+                    state, digest, receipt = await ConstitutionMixin._locked_turn_governance(self, store)
+                    if state is None or not state.generation:
+                        raise RuntimeError("Native constitutional runtime lifetime is missing at turn admission")
+                    if state.safe_mode:
+                        self._safe_mode = True
+                        self._safe_mode_reason = state.safe_mode_reason
+                        self._safe_mode_cause = state.safe_mode_cause or SafeModeCause.UNRECORDED.value
+                        return safe_mode_cognition_block(self, user_input)
+                    if (
+                        (state.revision, state.generation)
+                        != (self._constitution_state_revision, self._constitution_state_generation)
+                        or state.bootstrap_pending
+                        or state.last_successful_audit_at is None
+                        or state.interaction_count >= self.AUDIT_INTERVAL
+                        or ConstitutionMixin._constitution_time_audit_due(self._constitution_now(), state.last_successful_audit_at)
+                    ):
+                        raise RuntimeError("Native constitutional runtime custody changed or requires an integrity audit")
+                    from kestrel_sovereign.constitution.genesis_audit import GENESIS_AUDIT_PASSED, validate_completed_genesis_audit
+                    if not isinstance(receipt, Mapping) or validate_completed_genesis_audit(receipt, digest) != GENESIS_AUDIT_PASSED:
+                        raise RuntimeError("Native governing receipt changed at turn admission")
+                    _CONSTITUTION_ADMISSION.set((self, binding.turn_id, digest, deepcopy(receipt)))
+            except Exception as exc:  # Admission uncertainty must never authorize cognition.
+                self._mark_constitution_state_unavailable(exc)
+                return safe_mode_cognition_block(self, user_input)
         return None
+
+    async def _locked_turn_governance(self, store):
+        """Capture one native runtime/graph snapshot, never mixed revisions.
+
+        Hold graph, governing-file and runtime-row custody in canonical writer
+        order only for this bounded read. No provider/context work runs under
+        these locks; later retrieval is bound to the captured hash and receipt.
+        """
+        from kestrel_sovereign.constitution.anchored_bytes import (
+            lock_governance_rows, lock_governing_file,
+        )
+
+        ConstitutionMixin._require_owned_constitution_commit(self)
+        raw = self._raw_storage
+        async with raw.transaction():
+            node = await raw.get_node(self.agent_id)
+            digest = node.properties.get("constitution_hash") if node else None
+            if not digest:
+                raise RuntimeError("Native governing identity missing at turn admission")
+            await raw.lock_nodes_for_update([self.agent_id, digest])
+            await lock_governance_rows(raw, self.agent_id, required_target=digest)
+            await lock_governing_file(raw, digest)
+            lock = " FOR UPDATE" if raw.db.backend_type == "postgres" else ""
+            if await raw.db.fetchone(
+                "SELECT agent_id FROM constitution_runtime_state WHERE agent_id = ?" + lock,
+                (self.agent_id,),
+            ) is None:
+                raise RuntimeError("Native constitutional runtime lifetime is missing at turn admission")
+            state = await store.load(self.agent_id)
+            fresh = await raw.get_node(self.agent_id)
+            if fresh is None or fresh.properties.get("constitution_hash") != digest:
+                raise RuntimeError("Native governing pointer changed during turn custody acquisition")
+            receipt = deepcopy(fresh.properties.get("genesis_audit"))
+        return state, digest, receipt

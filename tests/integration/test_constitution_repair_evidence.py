@@ -1,6 +1,7 @@
 """Native signed repair must revalidate the governing evidence it authorized."""
 
 import asyncio
+import hashlib
 import json
 from contextlib import asynccontextmanager, suppress
 from uuid import uuid4
@@ -215,7 +216,7 @@ async def test_signed_repair_refuses_unremovable_foreign_edge(
 @pytest.mark.parametrize("writer", ["runtime", "offline"])
 @pytest.mark.parametrize(
     "damage",
-    ["blob", "ownership", "intact", "missing-pointer-passed", "missing-pointer-failed"],
+    ["blob", "ownership", "intact", "missing-pointer-passed", "missing-pointer-failed", "wrong-pointer-passed", "wrong-pointer-failed"],
 )
 async def test_same_hash_signed_repair_restores_content_and_new_signer(
     db_backend,
@@ -251,11 +252,11 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
         assert not result.startswith("Error:"), result
         prior = (await storage.get_node(identity)).properties
         digest = prior["constitution_hash"]
-        if damage.startswith("missing-pointer-"):
+        if damage.startswith(("missing-pointer-", "wrong-pointer-")):
             from kestrel_sovereign.constitution.genesis_audit import utc_timestamp
 
             node = await storage.get_node(identity)
-            status = damage.removeprefix("missing-pointer-")
+            status = damage.rsplit("-", 1)[-1]
             node.properties["genesis_audit"] = {
                 "status": status,
                 "risk_level": 3 if status == "failed" else 1,
@@ -264,7 +265,10 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
                 "constitution_hash": digest,
                 "reasoning": "Retain completed fixture verdict",
             }
-            node.properties.pop("constitution_hash")
+            if damage.startswith("missing-pointer-"):
+                node.properties.pop("constitution_hash")
+            else:
+                node.properties["constitution_hash"] = hashlib.sha256(uuid4().hex.encode()).hexdigest()
             await storage.add_node(node)
             prior = (await storage.get_node(identity)).properties
         metadata = {
@@ -284,7 +288,7 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
                 "DELETE FROM file_owners WHERE content_hash = ? AND agent_id = ?",
                 (digest, identity),
             )
-        if damage == "intact" or damage.startswith("missing-pointer-"):
+        if damage == "intact" or damage.startswith(("missing-pointer-", "wrong-pointer-")):
             assert await storage.retrieve_file(digest) == content
         else:
             assert await storage.retrieve_file(digest) is None

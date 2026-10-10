@@ -157,6 +157,16 @@ Successful ordinary integrity-audit publication likewise repeats verification
 under native custody before resetting the durable audit deadline. Direct and
 streaming requests recheck hash-bound genesis readiness after acquiring their
 turn boundary, so queued requests cannot inherit admission for an older hash.
+Admission also rereads the native runtime revision/generation and restrictions;
+graph, governing-file and runtime-row custody retain a consistent snapshot in
+one bounded native transaction, without holding locks over provider work.
+another replica's committed Safe Mode cannot be hidden by a local flag. A
+task-local witness pairs the admitted turn with its passed governing hash and
+receipt. Later governing-text retrieval refuses a changed pointer or receipt
+instead of supplying a newly repaired but unaudited constitution to cognition.
+Commit-time attestation refusal propagates the final integrity verdict to
+explicit diagnostics and periodic observers; the earlier positive diagnostic
+is not reported as successful publication or mislabeled as a storage outage.
 New-identity bootstrap uses the same exact-native-byte
 publisher as signed repair, only after resolver verification and the durable
 single-use bootstrap fence, so volatile privacy storage cannot consume authority
@@ -168,9 +178,22 @@ cannot claim another tenant's private graph properties; public shared-content
 metadata must pass canonical admission. A missing runtime identity cannot be
 restored from a frozen birth record once its constitutional lifetime was
 consumed. Signed recovery must preserve its existing audit history.
+Surviving runtime events also veto unsigned replay if the current state row is
+lost. Such identities are not pending first-boot targets; offline tools retain
+the runtime target and return a structured refusal, not an uncaught exception.
+Completed same-content genesis receipts survive an incorrect operative pointer
+as well as a missing one. Conflicting completed evidence is refused rather than
+selecting a favorable result. Verified signed repair publishes governance in
+the native control-plane transaction in volatile privacy modes too; ordinary
+feature-facing privacy restrictions remain unchanged.
 Inception uses the same exact-byte native publisher, and a post-commit SQL
 conversation-notice failure does not undo creation or skip remaining completion
-work. Physical lock ordering uses PostgreSQL's canonical `C`
+work. Pre-commit publication failures remove only that attempt's newly minted
+identity artifacts and close/remove its internally created database; an external
+database remains caller-owned, and committed identity artifacts are preserved.
+Cancellation receives the same rollback cleanup. If commit delivery fails or
+its outcome cannot be read, identity keys are retained rather than erased.
+Physical lock ordering uses PostgreSQL's canonical `C`
 collation; target equality does not depend on database locale.
 An existing genesis receipt must validate as a literal pass, not merely be
 terminal. Failure leaves the durable restriction and exit-event history intact.

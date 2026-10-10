@@ -18,10 +18,10 @@ from tests.integration.test_constitution_reanchor_e2e import _write_authority_fi
 from tests.unit.test_constitution_audit import _DurableConstitutionHarness
 
 
-async def _agent(storage):
+async def _agent(storage, *, is_new_identity=True):
     agent = _DurableConstitutionHarness(storage, datetime.now(timezone.utc))
     agent.agent_id = storage.agent_id
-    await agent._initialize_constitution_runtime_state(is_new_identity=True)
+    await agent._initialize_constitution_runtime_state(is_new_identity=is_new_identity)
     agent.extension = None
     for name in (
         "_anchor_constitution_governance", "_agent_signing_dids",

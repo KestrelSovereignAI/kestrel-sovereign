@@ -483,17 +483,30 @@ async def _owned_chunk_count(
     return int(row[0]) if row else 0
 
 
+class BirthRecordReplayRefused(ValueError):
+    """Frozen birth data cannot establish an unused constitutional lifetime."""
+
+
 async def assert_birth_replay_custody(db, agent_did: str, *, retain=False) -> None:
     """An existing runtime lifetime cannot be resurrected from frozen birth data."""
-    if not await db.table_exists("constitution_runtime_state"):
-        return
     suffix = " FOR UPDATE" if retain and db.backend_type == "postgres" else ""
-    row = await db.fetchone(
-        "SELECT bootstrap_pending, generation FROM constitution_runtime_state WHERE agent_id = ?" + suffix,
-        (agent_did,),
-    )
+    row = None
+    if await db.table_exists("constitution_runtime_state"):
+        row = await db.fetchone(
+            "SELECT bootstrap_pending, generation FROM constitution_runtime_state WHERE agent_id = ?" + suffix,
+            (agent_did,),
+        )
     if row is not None and (not row[0] or not row[1]):
-        raise ValueError("Missing runtime identity has a consumed constitutional lifetime; unsigned birth replay is forbidden")
+        raise BirthRecordReplayRefused("Missing runtime identity has a consumed constitutional lifetime; unsigned birth replay is forbidden")
+    if await db.table_exists("constitution_runtime_events"):
+        # Losing the current row cannot erase the surviving lifetime ledger.
+        # With a pending row, only actual consumption events veto first birth;
+        # with no row, ANY surviving event makes a new lifetime unprovable.
+        sql = "SELECT 1 FROM constitution_runtime_events WHERE agent_id = ?"
+        if row is not None:
+            sql += " AND event_type IN ('initial_anchor_started', 'constitution_anchor_fenced', 'audit_succeeded', 'safe_mode_exited', 'legacy_state_migration_required')"
+        if await db.fetchone(sql + " LIMIT 1", (agent_did,)) is not None:
+            raise BirthRecordReplayRefused("Surviving constitutional lifetime history forbids unsigned birth replay")
 
 
 async def replicate_birth_record(

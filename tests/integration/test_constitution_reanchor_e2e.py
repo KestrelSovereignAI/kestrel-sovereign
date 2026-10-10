@@ -996,7 +996,7 @@ async def test_runtime_reanchor_rolls_back_on_midprune_failure(
         async def _failing_delete(source_id, target_id, label):
             raise RuntimeError("injected mid-prune failure")
 
-        storage.delete_edge = _failing_delete
+        raw_storage.delete_edge = _failing_delete
 
         result = await agent.reanchor_constitution(
             amendment_artifact_path=str(artifact_path),
@@ -1071,7 +1071,7 @@ async def test_runtime_unchanged_cleanup_rolls_back_on_midprune_failure(
                 raise RuntimeError("injected mid-prune failure")
             await real_delete(source_id, target_id, label)
 
-        storage.delete_edge = _fail_on_second
+        raw_storage.delete_edge = _fail_on_second
 
         result = await agent.reanchor_constitution(
             amendment_artifact_path=str(artifact_path),

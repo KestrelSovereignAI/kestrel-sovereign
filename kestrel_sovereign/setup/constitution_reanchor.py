@@ -1093,9 +1093,12 @@ async def runtime_record_is_pending(target: ReanchorTarget) -> bool:
         if agent is not None:
             if not is_fabricated_placeholder(agent, target.agent_did):
                 return False
-            from kestrel_sovereign.identity.birth_record import assert_birth_replay_custody
+            from kestrel_sovereign.identity.birth_record import BirthRecordReplayRefused, assert_birth_replay_custody
 
-            await assert_birth_replay_custody(storage.db, target.agent_did)
+            try:
+                await assert_birth_replay_custody(storage.db, target.agent_did)
+            except BirthRecordReplayRefused:
+                return False
             return True
         # The bound read found nothing. Only a physically absent row is
         # pending; an existing one this agent cannot see is ledger damage.
@@ -1107,9 +1110,12 @@ async def runtime_record_is_pending(target: ReanchorTarget) -> bool:
         )
         if physical is not None:
             return False
-        from kestrel_sovereign.identity.birth_record import assert_birth_replay_custody
+        from kestrel_sovereign.identity.birth_record import BirthRecordReplayRefused, assert_birth_replay_custody
 
-        await assert_birth_replay_custody(storage.db, target.agent_did)
+        try:
+            await assert_birth_replay_custody(storage.db, target.agent_did)
+        except BirthRecordReplayRefused:
+            return False
         return True
 
 
@@ -1500,16 +1506,13 @@ async def _write_reanchor(
             if agent is None or agent.node_type != "agent":
                 raise RuntimeError("Agent node disappeared mid-reanchor")
             agent.properties["constitution_hash"] = new_hash
-            if historical_hash != new_hash:
-                from kestrel_sovereign.constitution.genesis_audit import (
-                    supersede_genesis_audit,
-                )
+            from kestrel_sovereign.constitution.genesis_audit import supersede_genesis_audit
 
-                supersede_genesis_audit(
-                    agent.properties,
-                    constitution_hash=new_hash,
-                    provenance="setup:constitution_reanchor",
-                )
+            supersede_genesis_audit(
+                agent.properties,
+                constitution_hash=new_hash,
+                provenance="setup:constitution_reanchor",
+            )
             supersede_constitution_reanchor(
                 agent.properties,
                 receipt={

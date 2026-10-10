@@ -96,6 +96,7 @@ async def test_birth_reserves_ordinary_blob_set_before_any_publication(db_backen
         "destination-bytes",
         "owned-destination-bytes",
         "consumed-lifetime",
+        "lost-consumed-state",
     ],
 )
 async def test_birth_refuses_unproven_native_custody(db_backend, tmp_path, damage):
@@ -169,10 +170,14 @@ async def test_birth_refuses_unproven_native_custody(db_backend, tmp_path, damag
                 "DELETE FROM graph_nodes WHERE node_id=?", (identity,)
             )
             before = await agent._constitution_state_store.load(identity)
+            if damage == "lost-consumed-state":
+                await target.db.execute_commit(
+                    "DELETE FROM constitution_runtime_state WHERE agent_id=?", (identity,)
+                )
 
         with pytest.raises(
             Exception,
-            match="foreign|private|share|hash|verify|consumed|claim|another agent",
+            match="foreign|private|share|hash|verify|consumed|claim|another agent|lifetime history",
         ):
             await replicate_birth_record(
                 runtime_db=target.db, anchor_db=source.db, agent_did=identity
@@ -191,6 +196,9 @@ async def test_birth_refuses_unproven_native_custody(db_backend, tmp_path, damag
             ] == "never disclose"
         if damage == "consumed-lifetime":
             assert await agent._constitution_state_store.load(identity) == before
+        if damage == "lost-consumed-state":
+            assert await agent._constitution_state_store.load(identity) is None
+            assert await agent._constitution_state_store.list_events(identity)
     finally:
         await source.close()
         await target.close()

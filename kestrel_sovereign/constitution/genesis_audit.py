@@ -107,6 +107,31 @@ def supersede_genesis_audit(
     existing = properties.get("genesis_audit")
     history = properties.get("genesis_audit_history")
     history = list(history) if isinstance(history, list) else []
+    # A damaged pointer does not invalidate a receipt about these exact bytes.
+    # Never reroll a terminal result when returning to previously audited
+    # content either. Contradictory durable receipts are not repair authority.
+    matching = []
+    candidates = [existing, *(entry.get("receipt") for entry in history if isinstance(entry, Mapping))]
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping) or candidate.get("constitution_hash") != constitution_hash:
+            continue
+        if candidate.get("status") in (GENESIS_AUDIT_PASSED, GENESIS_AUDIT_FAILED):
+            validate_completed_genesis_audit(candidate, constitution_hash)
+            matching.append(candidate)
+    if matching:
+        if any(candidate != matching[0] for candidate in matching[1:]):
+            raise GenesisAuditError("Ambiguous completed genesis receipts for replacement governing bytes")
+        preserved = deepcopy(matching[0])
+        if existing != preserved and existing is not None:
+            history.append({"receipt": deepcopy(existing), "superseded_at": changed_at,
+                            "superseded_by_constitution_hash": constitution_hash, "provenance": provenance})
+            properties["genesis_audit_history"] = history
+        properties["genesis_audit"] = preserved
+        return preserved
+    if isinstance(existing, Mapping) and existing.get("constitution_hash") == constitution_hash:
+        if existing.get("status") != GENESIS_AUDIT_PENDING:
+            raise GenesisAuditError("Malformed genesis receipt for replacement governing bytes")
+        return existing
     if existing is not None:
         history.append(
             {

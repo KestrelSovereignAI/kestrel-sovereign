@@ -117,6 +117,13 @@ async def _purge_agent(db, agent_did: str = AGENT_DID) -> None:
     the suite would fail in setup having itself created the shape that bricks
     a real agent (learned in #2871).
     """
+    # Each test explicitly seeds a NEW lifetime. Do not retain consumed CAS
+    # state/events from the previous test while deleting its identity rows.
+    for table in ("constitution_runtime_events", "constitution_runtime_state"):
+        if await db.table_exists(table):
+            await db.execute_commit(
+                f"DELETE FROM {table} WHERE agent_id = $1", (agent_did,)
+            )
     owned_files = [
         row[0]
         for row in await db.fetchall(
@@ -1079,6 +1086,32 @@ async def test_a_genuinely_absent_record_is_still_pending(pg, tmp_path):
     )
 
     assert await runtime_record_is_pending(target) is True
+
+
+async def test_consumed_identity_is_not_pending_and_reanchor_returns_structured_refusal(pg, tmp_path, monkeypatch):
+    from kestrel_sovereign.setup.constitution_reanchor import runtime_record_is_pending, resolve_reanchor_target
+
+    await _seed_runtime_agent(CONSTITUTION_V1)
+    agent_dir = tmp_path / "agent_data" / "Consumed"
+    _make_local_anchor(agent_dir, AGENT_DID)
+    canonical = tmp_path / "KESTREL_CONSTITUTION.md"
+    canonical.write_bytes(CONSTITUTION_V2)
+    import kestrel_sovereign.config as config
+
+    monkeypatch.setattr(config, "CONSTITUTION_PATH", str(canonical))
+    artifact, root = _write_authority_files(tmp_path, CONSTITUTION_V2)
+    repaired = await reanchor_constitution(agent_name="Consumed", agent_dir=agent_dir, canonical_path=canonical, force=True, amendment_artifact_path=artifact, sovereign_trust_root_path=root, runtime_backend="postgres", runtime_dsn=POSTGRES_URL)
+    assert repaired.error is None, repaired.error
+    await pg.execute_commit("DELETE FROM graph_nodes WHERE node_id=$1", (AGENT_DID,))
+    state = await pg.fetchone("SELECT revision,generation,bootstrap_pending FROM constitution_runtime_state WHERE agent_id=$1", (AGENT_DID,))
+    assert state is not None and state[2] is False
+    target = await resolve_reanchor_target(agent_dir, backend="postgres", dsn=POSTGRES_URL)
+    assert await runtime_record_is_pending(target) is False
+    inspected = await reanchor_constitution(agent_name="Consumed", agent_dir=agent_dir, canonical_path=canonical, force=False, runtime_backend="postgres", runtime_dsn=POSTGRES_URL)
+    assert inspected.target_backend == "postgres"
+    assert "Restore the correctly owned identity" in inspected.error
+    assert not inspected.reanchored
+    assert await pg.fetchone("SELECT revision,generation,bootstrap_pending FROM constitution_runtime_state WHERE agent_id=$1", (AGENT_DID,)) == state
 
 
 async def test_a_legacy_artifact_row_is_normalised_rather_than_refused(
