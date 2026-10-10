@@ -911,6 +911,42 @@ class TestADispositionBelongsToExactlyOneTask:
     """
 
     @pytest.mark.asyncio
+    async def test_stream_source_child_queues_for_its_own_conversation_turn(
+        self, span_exporter
+    ):
+        from kestrel_sdk.signals import ResourceLock
+
+        agent = _real_agent()
+        seen = _listen(agent)
+        children = []
+        child_entered = asyncio.Event()
+
+        async def child_body(*_a, **_k):
+            child_entered.set()
+            return "child"
+
+        agent._process_input_traced_locked = child_body
+
+        async def body(*_a, **_k):
+            manager = agent._get_lock_manager()
+            assert manager.is_held(ResourceLock.CONVERSATION)
+            # Privacy/turn-session reentry is explicitly carried; a fresh
+            # cognition turn must not inherit the non-reentrant live hold.
+            assert not manager.is_owned_by_current_task(ResourceLock.CONVERSATION)
+            children.append(asyncio.create_task(agent.process_input("wake")))
+            yield "tick"
+            assert not child_entered.is_set()
+
+        assert await _drain(_served_stream(agent, body)) == ["tick"]
+        assert await asyncio.wait_for(children[0], timeout=10) == "child"
+        assert child_entered.is_set()
+        assert [outcome for _turn, outcome in seen] == [
+            TurnOutcome.COMPLETED,
+            TurnOutcome.COMPLETED,
+        ]
+        assert seen[0][0] != seen[1][0]
+
+    @pytest.mark.asyncio
     async def test_a_child_of_a_disconnected_stream_reports_its_own_outcome(
         self, span_exporter
     ):

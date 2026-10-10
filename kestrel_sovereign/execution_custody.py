@@ -373,11 +373,9 @@ class _ExecutionForwarder:
         self._turn_scope = capture_turn_scope(owner)
         import contextvars
         context = contextvars.copy_context()
-        get_lock_manager = getattr(type(owner), "_get_lock_manager", None)
-        manager = get_lock_manager(owner) if callable(get_lock_manager) else None
-        delegate = getattr(manager, "delegate_current_task_ownership", None)
-        if callable(delegate):
-            delegate(context)
+        # The turn/session and privacy-reentry carriers above suffice for
+        # source work. Do not delegate CONVERSATION: ordinary child wakes
+        # must queue for their own turn, not inherit the parent's live hold.
         self._iterator = OwnedAsyncIterator(
             self._produce, operation="execution-stream-forward", owner_context=context,
         )
