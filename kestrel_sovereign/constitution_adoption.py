@@ -21,8 +21,12 @@ governance readings and the same canonical resolver the startup integrity
 audit uses. It reads the agent databases directly, so it never needs the host
 to be up.
 
-What a deploy changes is the *package*. A descriptor-selected external source
-is operator configuration the deploy does not touch, so it is read from disk.
+What a deploy changes is its checkout: the packaged constitution, and any
+descriptor-selected external source that checkout tracks (#3522). Both are
+judged as the incoming revision leaves them. A source outside the checkout is
+operator configuration the deploy does not touch, so it is read from disk. A
+deploy that would replace the descriptor or trust root that *selects* the
+source cannot be judged before it is installed, so it is refused.
 
 Two checks, because the code that renders a constitution is part of what a
 deploy replaces:
@@ -45,14 +49,16 @@ import argparse
 import dataclasses
 import functools
 import json
+import os
 import subprocess
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 from kestrel_sovereign.doctor import (
     ConstitutionAnchorVerdict,
+    DeployedContent,
     DoctorReport,
     _check_constitution_drift,
     _read_agent_governance,
@@ -85,6 +91,13 @@ _SAFE_MODE_STATUSES = frozenset({"mismatch", "audit_failure"})
 _VERDICT_STATUSES = frozenset({"match", "mismatch", "audit_failure", "unverified"})
 
 _GIT_TIMEOUT_SECONDS = 60
+
+#: Tree-entry modes ``git ls-tree`` reports for a directory and a link.
+_GIT_TREE_MODE = b"040000"
+_GIT_SYMLINK_MODE = b"120000"
+
+#: Links one path resolution follows before it is a cycle, as Linux bounds it.
+_MAX_SYMLINKS = 40
 
 #: The module a fresh interpreter runs to check the installed code.
 _FRESH_CHECK_MODULE = "kestrel_sovereign.constitution_adoption"
@@ -164,18 +177,19 @@ def check_constitution_adoption(
     project_dir: Path,
     *,
     agent_names: Iterable[str] | None = None,
-    packaged_constitution: Callable[[], bytes | None] | None = None,
+    deployed_content: DeployedContent | None = None,
     code_label: str = INSTALLED_CODE,
 ) -> ConstitutionAdoptionCheck:
     """Compare each agent's anchored hash with what this process's code produces.
 
     ``agent_names`` limits the check to the agents a restart will boot; None
     means every local agent in the project's multi-agent registry, loaded the
-    way the launcher loads it. ``packaged_constitution`` supplies the packaged
-    constitution a deploy is about to install (see
-    :func:`packaged_constitution_at`); None judges the file on disk. It is
-    called at most once, and only when an agent governed by the package is
-    actually compared.
+    way the launcher loads it. ``deployed_content`` supplies the bytes a
+    deploy is about to leave at a governing path, packaged or external (see
+    :func:`deployed_content_at`); None judges the files on disk. It is asked
+    at most once per path: about a governing source only when an agent that
+    source governs is actually compared, and about the descriptor and trust
+    root of every selected agent that configures a descriptor.
 
     The bytes go through the resolver this process imported. Judging code that
     was installed after that import is :func:`check_installed_constitution_adoption`.
@@ -184,13 +198,20 @@ def check_constitution_adoption(
     agent databases, and the governing source through the canonical resolver.
 
     Raises:
-        ConstitutionAdoptionError: The registry cannot be loaded, or
-            ``packaged_constitution`` could not produce the incoming bytes.
+        ConstitutionAdoptionError: The registry cannot be loaded,
+            ``deployed_content`` could not produce the incoming bytes, or the
+            deploy replaces a descriptor or trust root that selects a selected
+            agent's governing source.
     """
     env = runtime_env(project_dir)
     multi_agent = _load_registry(project_dir, env)
     local = multi_agent.get_local_agents()
     selected = _select(local, agent_names)
+    if deployed_content is not None:
+        deployed_content = _deploy_reader(deployed_content)
+        _refuse_replaced_source_selection(
+            {name: local[name] for name in selected}, env, deployed_content
+        )
     readings = _read_agent_governance(
         multi_agent, project_dir, env, agent_names=frozenset(selected)
     )
@@ -199,11 +220,7 @@ def check_constitution_adoption(
         readings,
         DoctorReport(),
         env,
-        packaged_constitution=(
-            functools.cache(packaged_constitution)
-            if packaged_constitution is not None
-            else None
-        ),
+        deployed_content=deployed_content,
         verdicts=verdicts,
     )
     for name in selected:
@@ -219,6 +236,88 @@ def check_constitution_adoption(
         verdicts=tuple(verdicts[name] for name in selected),
         code_label=code_label,
     )
+
+
+def _deploy_reader(deployed_content: DeployedContent) -> DeployedContent:
+    """``deployed_content``, asked once per path, failing as the gate fails.
+
+    The drift check reads an ``OSError`` or ``ValueError`` as a property of
+    the governing source, and an unreadable unpinned package as a skipped
+    check. A failure to produce what the deploy leaves is neither: nothing
+    has been learned about any agent, so it must refuse.
+    """
+
+    @functools.cache
+    def read(path: Path) -> bytes | None:
+        try:
+            return deployed_content(path)
+        except (OSError, ValueError) as exc:
+            raise ConstitutionAdoptionError(
+                f"cannot tell what the deploy leaves at {path}: {exc}"
+            ) from exc
+
+    return read
+
+
+def _refuse_replaced_source_selection(
+    agents: dict, env: dict, deployed_content: DeployedContent
+) -> None:
+    """Refuse a deploy that replaces what selects an agent's governing source.
+
+    A source descriptor names the governing file and pins its digest; the
+    trust root verifies the descriptor. The resolver reads both from disk, so
+    a deploy that replaces either one changes which bytes govern in a way this
+    check cannot judge before it is installed. A configuration that does not
+    resolve is left to the drift check, which reports it per agent.
+
+    Each file is asked about by every pathname that configures it, as
+    configured: resolving one first would hide a link along it that the deploy
+    retargets, leaving the old file to be judged.
+
+    Raises:
+        ConstitutionAdoptionError: The deploy replaces such a file, or a link
+            or directory along a pathname that configures it.
+    """
+    from kestrel_sovereign.constitution.source_descriptor import (
+        CONSTITUTION_SOURCE_DESCRIPTOR_ENV,
+        ConstitutionSourceError,
+        configured_source_descriptor_path,
+    )
+    from kestrel_sovereign.constitution.trust_root import SOVEREIGN_TRUST_ROOT_ENV
+
+    def configured(*values) -> list[Path]:
+        return [
+            Path(value).expanduser()
+            for value in values
+            if value is not None and str(value).strip()
+        ]
+
+    for name, cfg in agents.items():
+        try:
+            descriptor = configured_source_descriptor_path(
+                explicit_path=cfg.constitution_source_descriptor, environ=env
+            )
+        except ConstitutionSourceError:
+            continue
+        if descriptor is None:
+            continue
+        selecting = [
+            ("source descriptor", path)
+            for path in configured(
+                cfg.constitution_source_descriptor,
+                env.get(CONSTITUTION_SOURCE_DESCRIPTOR_ENV, "").strip(),
+            )
+        ] + [
+            ("trust root", path)
+            for path in configured(env.get(SOVEREIGN_TRUST_ROOT_ENV, "").strip())
+        ]
+        for role, path in selecting:
+            if deployed_content(path) is not None:
+                raise ConstitutionAdoptionError(
+                    f"the deploy replaces {path}, the {role} that selects "
+                    f"{name}'s governing constitution; which bytes would "
+                    "govern cannot be judged before the deploy is installed"
+                )
 
 
 def check_installed_constitution_adoption(
@@ -330,42 +429,141 @@ def _installed_verdicts(
     return verdicts
 
 
-def packaged_constitution_at(repo_path: str | Path, revision: str) -> bytes | None:
-    """The packaged constitution as checking out ``revision`` would leave it.
+def deployed_content_at(repo_path: str | Path, revision: str) -> DeployedContent:
+    """What checking out ``revision`` of ``repo_path`` would leave at a path.
 
-    Returns None when that checkout leaves the file on disk as it is: the
-    checkout at ``repo_path`` does not supply the running package's
-    constitution, or ``revision`` does not change it (so an uncommitted edit
-    the checkout keeps is still what runs). Otherwise the bytes are what
-    checkout writes, with the checkout's own filters applied.
+    The returned function answers for one governing path: the packaged
+    constitution, or a descriptor-selected external file that this checkout
+    tracks (#3522). It returns None when the checkout leaves the file on disk
+    as it is: the path is outside the checkout, or ``revision`` does not
+    change it (so an uncommitted edit the checkout keeps is still what runs).
+    Otherwise the bytes are what checkout writes, with the checkout's own
+    filters applied.
+
+    The path is the one configured, not its resolution: it is resolved here
+    as the resolver resolves it, one component at a time, following every
+    symbolic link on the way. A revision that changes any entry that walk
+    passes through in this checkout changes which file the path names, which
+    cannot be read from the revision as bytes: a link it follows, retargeted
+    or replaced, or a directory it descends replaced by a link or a file. A
+    directory whose contents change still names the same file, judged below.
+
+    The function raises :class:`ConstitutionAdoptionError` when git could not
+    compare or read the revision, including a revision that removes the file
+    or changes such an entry.
+    """
+    repo = Path(repo_path).resolve()
+
+    def tracked(path: Path) -> str | None:
+        try:
+            relpath = path.relative_to(repo).as_posix()
+        except ValueError:
+            return None
+        return None if relpath == "." else relpath
+
+    @functools.cache
+    def entry(tree: str, relpath: str) -> tuple[bytes, bytes] | None:
+        """The mode and object of ``relpath`` in ``tree``, or None if absent."""
+        listed = _git(repo, "ls-tree", "-z", tree, "--", relpath)
+        if listed.returncode != 0:
+            raise ConstitutionAdoptionError(
+                f"cannot read {relpath} at {tree} in {repo}: {_git_detail(listed)}"
+            )
+        wanted = os.fsencode(relpath)
+        for record in listed.stdout.split(b"\0"):
+            meta, _, name = record.partition(b"\t")
+            if name == wanted:
+                mode, _, oid = meta.split(b" ")
+                return mode, oid
+        return None
+
+    def redirects(relpath: str, *, link: bool) -> bool:
+        """Whether the revision changes which file a walk through here names."""
+        before, after = entry("HEAD", relpath), entry(revision, relpath)
+        if before == after:
+            return False
+        if link:
+            return True
+        # A directory stays a directory when only its contents change.
+        return not all(e is None or e[0] == _GIT_TREE_MODE for e in (before, after))
+
+    def content(path: Path) -> bytes | None:
+        resolved, passed = _resolution_walk(Path(path))
+        for location, link in passed:
+            step = tracked(location)
+            if step is not None and redirects(step, link=link):
+                kind = "symbolic link" if link else "directory"
+                raise ConstitutionAdoptionError(
+                    f"{revision} changes the {kind} {step} in {repo}, which "
+                    f"{path} passes through, so which file governs cannot be "
+                    "judged before it is checked out"
+                )
+        relpath = tracked(resolved)
+        if relpath is None:
+            return None
+        incoming = entry(revision, relpath)
+        if incoming == entry("HEAD", relpath):
+            return None
+        if incoming is not None and incoming[0] == _GIT_SYMLINK_MODE:
+            raise ConstitutionAdoptionError(
+                f"{revision} leaves a symbolic link at {relpath} in {repo}, "
+                "so which file governs cannot be judged before it is "
+                "checked out"
+            )
+        shown = _git(repo, "cat-file", "--filters", f"{revision}:{relpath}")
+        if shown.returncode != 0:
+            raise ConstitutionAdoptionError(
+                f"cannot read {relpath} at {revision} in {repo}: "
+                f"{_git_detail(shown)}"
+            )
+        return shown.stdout
+
+    return content
+
+
+def _resolution_walk(path: Path) -> tuple[Path, list[tuple[Path, bool]]]:
+    """Resolve ``path`` as the resolver will, noting every entry it passes.
+
+    Returns the resolved path and, in order, each entry the resolution steps
+    through before it: every symbolic link it follows and every directory it
+    descends, at the entry's own location, with whether it is a link. A
+    resolution of the configured path alone would hide the links it took.
 
     Raises:
-        ConstitutionAdoptionError: git could not compare or read the revision,
-            including a revision that has no packaged constitution at all.
+        ConstitutionAdoptionError: The path names a cycle of links.
+        OSError: A link could not be read.
     """
-    from kestrel_sovereign.constitution.resolver import governing_constitution_path
-
-    repo = Path(repo_path).resolve()
-    packaged = Path(governing_constitution_path()).resolve()
-    try:
-        relpath = packaged.relative_to(repo).as_posix()
-    except ValueError:
-        return None
-
-    compared = _git(repo, "diff", "--quiet", "HEAD", revision, "--", relpath)
-    if compared.returncode == 0:
-        return None
-    if compared.returncode != 1:
-        raise ConstitutionAdoptionError(
-            f"cannot compare {relpath} at {revision} with HEAD in {repo}: "
-            f"{_git_detail(compared)}"
-        )
-    shown = _git(repo, "cat-file", "--filters", f"{revision}:{relpath}")
-    if shown.returncode != 0:
-        raise ConstitutionAdoptionError(
-            f"cannot read {relpath} at {revision} in {repo}: {_git_detail(shown)}"
-        )
-    return shown.stdout
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    current = Path(path.anchor)
+    pending = list(path.parts[1:])
+    passed: list[tuple[Path, bool]] = []
+    links = 0
+    while pending:
+        part = pending.pop(0)
+        if part == "..":
+            current = current.parent
+            continue
+        step = current / part
+        if step.is_symlink():
+            links += 1
+            if links > _MAX_SYMLINKS:
+                raise ConstitutionAdoptionError(
+                    f"{path} follows more than {_MAX_SYMLINKS} symbolic links"
+                )
+            passed.append((step, True))
+            target = Path(os.readlink(step))
+            if target.is_absolute():
+                current = Path(target.anchor)
+                pending[:0] = target.parts[1:]
+            else:
+                pending[:0] = target.parts
+            continue
+        if pending:
+            passed.append((step, False))
+        current = step
+    return current, passed
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -418,9 +616,10 @@ def refusal_lines(check: ConstitutionAdoptionCheck) -> list[str]:
             "governing hash above with the Sovereign key the trust root pins."
         ),
         (
-            "  2. Offline: `kestrel terminate` first (a running agent's "
-            "periodic integrity audit reads the constitution from disk, and "
-            "the Safe Mode it enters persists), install without restarting "
+            "  2. Offline: `kestrel terminate` first, and stop any server "
+            "started without `kestrel start` (a running agent's periodic "
+            "integrity audit reads the constitution from disk, and the Safe "
+            "Mode it enters persists), install without restarting "
             "(`kestrel update --no-restart`), then for each agent run "
             "`kestrel constitution reanchor --agent-name <name> --force "
             "--signed-artifact <artifact> --trust-root <root>`, then "
@@ -452,6 +651,34 @@ def refusal_reason(check: ConstitutionAdoptionCheck) -> str:
         f"would boot agents into constitution Safe Mode ({agents}). A "
         f"Sovereign must reanchor them first; see {ADOPTION_RUNBOOK}."
     )
+
+
+def check_record(
+    check: ConstitutionAdoptionCheck | None, *, error: str = ""
+) -> dict:
+    """What one evaluation of the gate decided, as a restart request records it.
+
+    Every agent's verdict, matching or not, so a passed check is evidence
+    that it ran and what it compared, not only the absence of a refusal
+    (#3522). ``result`` is ``passed`` only when every agent was compared;
+    ``passed_with_unverified`` names a pass over agents whose anchor could
+    not be read. ``check`` None with ``error`` records a gate that could not
+    establish what the code would govern by.
+    """
+    if check is None:
+        return {"result": "unverifiable", "code": "", "error": error, "verdicts": []}
+    if not check.safe:
+        result = "refused"
+    elif check.unverified:
+        result = "passed_with_unverified"
+    else:
+        result = "passed"
+    return {
+        "result": result,
+        "code": check.code_label,
+        "error": "",
+        "verdicts": [dataclasses.asdict(v) for v in check.verdicts],
+    }
 
 
 def unverified_lines(check: ConstitutionAdoptionCheck) -> list[str]:

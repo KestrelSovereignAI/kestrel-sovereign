@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,7 @@ from kestrel_sovereign.features.restart_coordinator.store import (
     insert_request,
     list_requests,
     mark_deferral_started,
+    record_constitution_checks,
     record_update_log,
     resolve_restart_delegation,
     update_status,
@@ -3834,9 +3836,15 @@ async def test_failed_update_emits_each_lifecycle_transition_once(tmp_path):
 
 @pytest.mark.asyncio
 async def test_run_update_records_steps_and_resolved_ref(tmp_path):
-    feat, _ = await _make_feature(tmp_path)
+    feat, backend = await _make_feature(tmp_path)
     profile = get_update_profile("sovereign_local_uv_sync")
+    # A real row: the adoption checks are recorded on it before the update
+    # may proceed (#3522).
+    row = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="update",
+    )
     req = SimpleNamespace(
+        id=row.id,
         update_repo_path=str(tmp_path),
         update_target_ref="main",
         update_allow_migrations=False,
@@ -3868,9 +3876,15 @@ async def test_run_update_records_steps_and_resolved_ref(tmp_path):
 
 @pytest.mark.asyncio
 async def test_run_update_stops_at_first_failing_step(tmp_path):
-    feat, _ = await _make_feature(tmp_path)
+    feat, backend = await _make_feature(tmp_path)
     profile = get_update_profile("sovereign_local_uv_sync")
+    # A real row: the adoption checks are recorded on it before the update
+    # may proceed (#3522).
+    row = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="update",
+    )
     req = SimpleNamespace(
+        id=row.id,
         update_repo_path=str(tmp_path),
         update_target_ref="main",
         update_allow_migrations=False,
@@ -5282,8 +5296,13 @@ async def test_run_update_continues_past_failing_allow_failure_step(tmp_path):
     profile = UpdateProfile(
         name="probe", description="", supports_migrations=False, _build=_build,
     )
+    # A real row: the adoption checks are recorded on it before the update
+    # may proceed (#3522).
+    row = await insert_request(
+        _db, requested_by_agent="did:test:agent", reason="probe",
+    )
     req = SimpleNamespace(
-        id="req-probe",
+        id=row.id,
         update_repo_path=str(tmp_path),
         update_target_ref="v0.31.1",
         update_allow_migrations=False,
@@ -5325,8 +5344,13 @@ async def test_run_update_still_fails_on_mutating_step(tmp_path):
     profile = UpdateProfile(
         name="probe", description="", supports_migrations=False, _build=_build,
     )
+    # A real row: the adoption checks are recorded on it before the update
+    # may proceed (#3522).
+    row = await insert_request(
+        _db, requested_by_agent="did:test:agent", reason="probe",
+    )
     req = SimpleNamespace(
-        id="req-probe",
+        id=row.id,
         update_repo_path=str(tmp_path),
         update_target_ref="main",
         update_allow_migrations=False,
@@ -8135,14 +8159,15 @@ async def test_update_onto_an_unadopted_constitution_is_refused_before_checkout(
     assert [event.state for event in events][-1] == "refused"
 
 
-async def _update_onto_unchanged_text(
+async def _request_update_onto_unchanged_text(
     tmp_path, monkeypatch, adoption_project, *, install,
 ):
-    """Run an update_then_restart whose release leaves the text alone.
+    """Request an update_then_restart whose release leaves the text alone.
 
-    The fetch is real; the other steps are recorded, and ``install`` runs on
-    the installed package when the profile's install step would. Returns
-    ``(result, row, steps_run, spawn, events)``.
+    Returns ``(feat, backend, request_id, ran, step)``: ``step`` stands in
+    for ``_run_update_step``, recording each step's name in ``ran``. The
+    fetch is real; ``install`` runs on the installed package when the
+    profile's install step would, and every other step succeeds.
     """
     from tests.utils.constitution_anchor import (
         PACKAGED_CONSTITUTION_RELPATH,
@@ -8185,7 +8210,23 @@ async def _update_onto_unchanged_text(
             "ok": True, "stdout_tail": "", "stderr_tail": "",
         }
 
-    with patch.object(RestartCoordinatorFeature, "_run_update_step", _step), \
+    return feat, backend, request_id, ran, _step
+
+
+async def _update_onto_unchanged_text(
+    tmp_path, monkeypatch, adoption_project, *, install,
+):
+    """Run an update_then_restart whose release leaves the text alone.
+
+    See :func:`_request_update_onto_unchanged_text`. Returns
+    ``(result, row, steps_run, spawn, events)``.
+    """
+    feat, backend, request_id, ran, step = (
+        await _request_update_onto_unchanged_text(
+            tmp_path, monkeypatch, adoption_project, install=install,
+        )
+    )
+    with patch.object(RestartCoordinatorFeature, "_run_update_step", step), \
             patch.object(
                 RestartCoordinatorFeature, "_spawn_restart_subprocess",
             ) as spawn:
@@ -8244,6 +8285,523 @@ async def test_update_whose_install_keeps_the_anchored_hash_restarts(
     spawn.assert_called_once()
     assert row.status == "executing"
     assert result.data["refused"] == []
+
+
+def _verdicts_by_agent(check):
+    return {
+        verdict["agent"]: (
+            verdict["status"],
+            verdict["anchored_hash"],
+            verdict["governing_hash"],
+        )
+        for verdict in check["verdicts"]
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_restart_records_the_adoption_check_it_passed(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """#3522: a pass is evidence the gate ran, not just the absence of a refusal.
+
+    The request row and its status events carry the check: for every local
+    agent, the anchored hash, the hash the installed code governs by, and
+    the verdict.
+    """
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    _install_constitution(tmp_path, monkeypatch, _ANCHORED_TEXT)
+    seed_anchored_agents(
+        project,
+        {"Emma": sha256(_ANCHORED_TEXT), "Kite": sha256(_ANCHORED_TEXT)},
+    )
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="routine restart")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    spawn.assert_called_once()
+    row = await get_request(backend, request_id)
+    assert row.status == "executing"
+    [check] = row.constitution_checks_list()
+    assert check["stage"] == "installed_code"
+    assert check["result"] == "passed"
+    assert check["code"] == "the installed code"
+    assert check["checked_at"]
+    anchored = sha256(_ANCHORED_TEXT)
+    assert _verdicts_by_agent(check) == {
+        "Emma": ("match", anchored, anchored),
+        "Kite": ("match", anchored, anchored),
+    }
+    assert row.to_public_dict()["constitution_checks"] == [check]
+    events = await list_events_for_request(backend, request_id)
+    executing = [e for e in events if e.state == "executing"]
+    assert executing
+    assert executing[-1].to_public_dict()["payload"]["constitution_checks"] == [
+        check
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_restart_records_the_check_that_refused_it(
+    tmp_path, monkeypatch, adoption_project,
+):
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    _install_constitution(tmp_path, monkeypatch, _AMENDED_TEXT)
+    seed_anchored_agents(
+        project,
+        {"Emma": sha256(_ANCHORED_TEXT), "Kite": sha256(_AMENDED_TEXT)},
+    )
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="ship the merged constitution PR")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    [check] = row.constitution_checks_list()
+    assert check["stage"] == "installed_code"
+    assert check["result"] == "refused"
+    assert _verdicts_by_agent(check) == {
+        "Emma": ("mismatch", sha256(_ANCHORED_TEXT), sha256(_AMENDED_TEXT)),
+        "Kite": ("match", sha256(_AMENDED_TEXT), sha256(_AMENDED_TEXT)),
+    }
+    events = await list_events_for_request(backend, request_id)
+    assert events[-1].state == "refused"
+    assert events[-1].to_public_dict()["payload"]["constitution_checks"] == [check]
+
+
+@pytest.mark.asyncio
+async def test_an_update_records_both_adoption_checks(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """The fetched revision before checkout, then the installed code."""
+    _, sha256 = adoption_project
+
+    _, row, _, spawn, events = await _update_onto_unchanged_text(
+        tmp_path, monkeypatch, adoption_project, install=lambda package: None,
+    )
+
+    spawn.assert_called_once()
+    fetched, installed = row.constitution_checks_list()
+    assert fetched["stage"] == "fetched_revision"
+    assert fetched["code"].startswith("FETCH_HEAD of ")
+    assert installed["stage"] == "installed_code"
+    anchored = sha256(_ANCHORED_TEXT)
+    for check in (fetched, installed):
+        assert check["result"] == "passed"
+        assert _verdicts_by_agent(check) == {
+            "Emma": ("match", anchored, anchored),
+        }
+    executing = [e for e in events if e.state == "executing"]
+    assert executing[-1].to_public_dict()["payload"]["constitution_checks"] == [
+        fetched, installed,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_update_refused_at_the_fetch_records_that_check(
+    tmp_path, monkeypatch, adoption_project,
+):
+    from tests.utils.constitution_anchor import (
+        PACKAGED_CONSTITUTION_RELPATH,
+        commit_constitution,
+        origin_and_clone,
+        seed_anchored_agents,
+    )
+
+    project, sha256 = adoption_project
+    origin, checkout = origin_and_clone(tmp_path, _ANCHORED_TEXT)
+    commit_constitution(origin, _AMENDED_TEXT, "merge the constitution PR")
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(checkout / PACKAGED_CONSTITUTION_RELPATH),
+    )
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="ship the merged constitution PR",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=str(checkout),
+    )
+    request_id = created.data["request"]["id"]
+    real_step = RestartCoordinatorFeature._run_update_step
+
+    async def _step(self, step):
+        if step.name == "fetch":
+            return await real_step(self, step)
+        raise AssertionError(f"{step.name} ran after a refused fetch")
+
+    with patch.object(RestartCoordinatorFeature, "_run_update_step", _step), \
+            patch.object(RestartCoordinatorFeature, "_spawn_restart_subprocess"):
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    [fetched] = row.constitution_checks_list()
+    assert fetched["stage"] == "fetched_revision"
+    assert fetched["result"] == "refused"
+    assert _verdicts_by_agent(fetched) == {
+        "Emma": ("mismatch", sha256(_ANCHORED_TEXT), sha256(_AMENDED_TEXT)),
+    }
+    events = await list_events_for_request(backend, request_id)
+    assert events[-1].state == "refused"
+    assert events[-1].to_public_dict()["payload"]["constitution_checks"] == [
+        fetched
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_unverifiable_check_is_recorded_with_its_error(
+    tmp_path, monkeypatch, adoption_project,
+):
+    project, _ = adoption_project
+    (project / "multi_agent.toml").write_text("[agents\n")
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="routine restart")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    [check] = row.constitution_checks_list()
+    assert check["result"] == "unverifiable"
+    assert check["verdicts"] == []
+    assert "multi-agent configuration is invalid" in check["error"]
+
+
+#: The store write the coordinator records the adoption checks with.
+_CHECKS_WRITE = (
+    "kestrel_sovereign.features.restart_coordinator.feature."
+    "record_constitution_checks"
+)
+
+
+class _FailingChecksWrite:
+    """``record_constitution_checks`` whose chosen calls fail as storage does.
+
+    ``fail_calls`` are 1-based call numbers; every other call writes for real.
+    """
+
+    def __init__(self, *fail_calls: int):
+        from kestrel_sovereign.features.restart_coordinator.store import (
+            record_constitution_checks,
+        )
+
+        self._real = record_constitution_checks
+        self.fail_calls = set(fail_calls)
+        self.calls = 0
+
+    async def __call__(self, db, request_id, constitution_checks):
+        self.calls += 1
+        if self.calls in self.fail_calls:
+            raise sqlite3.OperationalError("database is locked")
+        return await self._real(db, request_id, constitution_checks)
+
+
+async def _sweep_after_reboot(backend, monkeypatch):
+    """The coordinator of the process a dispatched restart booted."""
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.restart_coordinator.feature._PROCESS_BOOT_ID",
+        "the-boot-the-restart-started",
+    )
+    feat = RestartCoordinatorFeature(
+        _make_agent(backend, dispatcher=_CapturingDispatcher())
+    )
+    await feat.initialize()
+    await feat.on_agent_ready()
+    return feat
+
+
+@pytest.mark.asyncio
+async def test_record_constitution_checks_reports_a_write_that_matched_no_row(
+    tmp_path,
+):
+    backend = await _backend(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="routine",
+    )
+
+    assert await record_constitution_checks(backend, req.id, "[]") is True
+    assert await record_constitution_checks(backend, "no-such-request", "[]") is False
+
+
+@pytest.mark.asyncio
+async def test_checks_that_land_on_no_row_are_unrecorded(tmp_path):
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        _ConstitutionChecksUnrecorded,
+    )
+
+    feat, _ = await _make_feature(tmp_path)
+    req = SimpleNamespace(id="no-such-request", constitution_checks="")
+
+    with pytest.raises(_ConstitutionChecksUnrecorded, match="matched no row"):
+        await feat._record_constitution_checks(req, [{"stage": "installed_code"}])
+    assert req.constitution_checks == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("queued_status", ["pending", "approved"])
+async def test_a_restart_whose_checks_cannot_be_recorded_is_not_dispatched(
+    tmp_path, monkeypatch, adoption_project, queued_status,
+):
+    """#3522 ruling: recording the verdict is a precondition of the restart.
+
+    The failed write leaves the request queued as it was, its status reason
+    naming the failure. The next tick checks again, records it, and
+    dispatches; and the completed event the restarted process emits carries
+    what was recorded.
+    """
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    _install_constitution(tmp_path, monkeypatch, _ANCHORED_TEXT)
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="routine restart")
+    request_id = created.data["request"]["id"]
+    await backend.execute(
+        "UPDATE restart_requests SET status = ? WHERE id = ?",
+        (queued_status, request_id),
+    )
+    write = _FailingChecksWrite(1)
+
+    with patch(_CHECKS_WRITE, write), patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        first = await feat.restart_coordinator()
+
+        spawn.assert_not_called()
+        row = await get_request(backend, request_id)
+        assert row.status == queued_status
+        assert row.executing_boot_id == ""
+        assert "could not be recorded" in row.status_reason
+        assert "database is locked" in row.status_reason
+        assert row.constitution_checks_list() == []
+        assert first.data["executed"] == []
+        assert first.data["refused"] == []
+        assert [d["request_id"] for d in first.data["deferred"]] == [request_id]
+        events = await list_events_for_request(backend, request_id)
+        assert events[-1].state == "pending"
+        assert "could not be recorded" in events[-1].to_public_dict()["payload"][
+            "deferral_reason"
+        ]
+
+        second = await feat.restart_coordinator()
+
+    spawn.assert_called_once()
+    assert write.calls == 2
+    assert second.data["executed"] == [{"request_id": request_id}]
+    row = await get_request(backend, request_id)
+    assert row.status == "executing"
+    [check] = row.constitution_checks_list()
+    assert check["stage"] == "installed_code"
+    assert check["result"] == "passed"
+    anchored = sha256(_ANCHORED_TEXT)
+    assert _verdicts_by_agent(check) == {"Emma": ("match", anchored, anchored)}
+
+    await _sweep_after_reboot(backend, monkeypatch)
+
+    assert (await get_request(backend, request_id)).status == "completed"
+    events = await list_events_for_request(backend, request_id)
+    assert events[-1].state == "completed"
+    assert events[-1].to_public_dict()["payload"]["constitution_checks"] == [check]
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_whose_check_cannot_be_recorded_is_not_terminal(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """A storage failure is no verdict: refused only once the check is recorded."""
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    _install_constitution(tmp_path, monkeypatch, _AMENDED_TEXT)
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="ship the merged constitution PR")
+    request_id = created.data["request"]["id"]
+
+    with patch(_CHECKS_WRITE, _FailingChecksWrite(1)), patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        first = await feat.restart_coordinator()
+        row = await get_request(backend, request_id)
+        assert row.status == "pending"
+        assert not row.completed_at
+        assert "could not be recorded" in row.status_reason
+        assert first.data["refused"] == []
+
+        second = await feat.restart_coordinator()
+
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    assert second.data["refused"] == [
+        {"request_id": request_id, "reason": row.status_reason}
+    ]
+    [check] = row.constitution_checks_list()
+    assert check["result"] == "refused"
+    assert _verdicts_by_agent(check) == {
+        "Emma": ("mismatch", sha256(_ANCHORED_TEXT), sha256(_AMENDED_TEXT)),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failing_write",
+    [
+        pytest.param(1, id="clearing-the-last-attempt"),
+        pytest.param(2, id="fetched-revision"),
+        pytest.param(3, id="installed-code"),
+    ],
+)
+async def test_an_update_whose_checks_cannot_be_recorded_is_not_restarted(
+    tmp_path, monkeypatch, adoption_project, failing_write,
+):
+    """#3522 ruling, on the update path: no checkout or restart without them.
+
+    The update writes the checks three times: clearing the last attempt's,
+    after the fetched revision's check (before checkout), and after the
+    installed code's (before the restart). Whichever fails, the request goes
+    back to pending, and the next tick records both checks and restarts.
+    """
+    _, sha256 = adoption_project
+    feat, backend, request_id, ran, step = (
+        await _request_update_onto_unchanged_text(
+            tmp_path, monkeypatch, adoption_project, install=lambda package: None,
+        )
+    )
+    write = _FailingChecksWrite(failing_write)
+
+    with patch(_CHECKS_WRITE, write), \
+            patch.object(RestartCoordinatorFeature, "_run_update_step", step), \
+            patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+        first = await feat.restart_coordinator()
+
+        spawn.assert_not_called()
+        first_attempt = list(ran)
+        row = await get_request(backend, request_id)
+        assert row.status == "pending"
+        assert "could not be recorded" in row.status_reason
+        assert "database is locked" in row.status_reason
+        assert row.update_log_dict()["failed_step"] == "constitution_checks"
+        assert first.data["executed"] == []
+        assert first.data["refused"] == []
+        [deferred] = first.data["deferred"]
+        assert "could not be recorded; retryable" in deferred["reason"]
+        if failing_write == 1:
+            assert first_attempt == []
+        elif failing_write == 2:
+            assert first_attempt == ["fetch"]
+        else:
+            assert "install" in first_attempt
+            assert first_attempt[-1] == "resolve_ref"
+            assert "The update itself is installed" in row.status_reason
+
+        ran.clear()
+        await feat.restart_coordinator()
+
+    spawn.assert_called_once()
+    assert ran[0] == "fetch" and ran[-1] == "resolve_ref"
+    row = await get_request(backend, request_id)
+    assert row.status == "executing"
+    fetched, installed = row.constitution_checks_list()
+    assert [fetched["stage"], installed["stage"]] == [
+        "fetched_revision", "installed_code",
+    ]
+    anchored = sha256(_ANCHORED_TEXT)
+    for check in (fetched, installed):
+        assert check["result"] == "passed"
+        assert _verdicts_by_agent(check) == {"Emma": ("match", anchored, anchored)}
+
+    await _sweep_after_reboot(backend, monkeypatch)
+
+    events = await list_events_for_request(backend, request_id)
+    assert events[-1].state == "completed"
+    assert events[-1].to_public_dict()["payload"]["constitution_checks"] == [
+        fetched, installed,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_update_refusal_whose_check_cannot_be_recorded_is_not_terminal(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """The fetched revision would be refused, but not on an unrecorded check."""
+    from tests.utils.constitution_anchor import (
+        PACKAGED_CONSTITUTION_RELPATH,
+        commit_constitution,
+        origin_and_clone,
+        seed_anchored_agents,
+    )
+
+    project, sha256 = adoption_project
+    origin, checkout = origin_and_clone(tmp_path, _ANCHORED_TEXT)
+    commit_constitution(origin, _AMENDED_TEXT, "merge the constitution PR")
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(checkout / PACKAGED_CONSTITUTION_RELPATH),
+    )
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="ship the merged constitution PR",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=str(checkout),
+    )
+    request_id = created.data["request"]["id"]
+    real_step = RestartCoordinatorFeature._run_update_step
+
+    async def _step(self, step):
+        if step.name == "fetch":
+            return await real_step(self, step)
+        raise AssertionError(f"{step.name} ran after the fetched revision")
+
+    # The second write is the fetched revision's check.
+    with patch(_CHECKS_WRITE, _FailingChecksWrite(2)), \
+            patch.object(RestartCoordinatorFeature, "_run_update_step", _step), \
+            patch.object(RestartCoordinatorFeature, "_spawn_restart_subprocess"):
+        first = await feat.restart_coordinator()
+        row = await get_request(backend, request_id)
+        assert row.status == "pending"
+        assert not row.completed_at
+        assert "could not be recorded" in row.status_reason
+        assert first.data["refused"] == []
+
+        second = await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    assert second.data["refused"] == [
+        {"request_id": request_id, "reason": row.status_reason}
+    ]
+    [fetched] = row.constitution_checks_list()
+    assert fetched["stage"] == "fetched_revision"
+    assert fetched["result"] == "refused"
 
 
 @pytest.mark.asyncio

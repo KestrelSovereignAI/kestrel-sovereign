@@ -1426,15 +1426,12 @@ def cmd_constitution_reanchor(args) -> int:
         return 2
 
     # Pre-flight check: agent must not be running. SQLite WAL locking
-    # would corrupt mid-write. We check the multi_agent's PID file rather
-    # than probing the network — same source-of-truth as `kestrel terminate`.
+    # would corrupt mid-write. We check the launcher's PID files and the
+    # serving record the agent's own process writes rather than probing the
+    # network — the launcher records are `kestrel terminate`'s source of truth.
     holder = _agent_holder(project_dir, args.agent_name, agents[args.agent_name])
     if holder:
-        print(
-            f"error: agent '{args.agent_name}' appears to be running. "
-            f"Run `{holder}` first to avoid DB corruption.",
-            file=sys.stderr,
-        )
+        _report_agent_running(args.agent_name, holder)
         return 2
 
     result = asyncio.run(
@@ -1604,11 +1601,7 @@ def cmd_constitution_anchor_overlay(args) -> int:
 
     holder = _agent_holder(project_dir, args.agent_name, agents[args.agent_name])
     if holder:
-        print(
-            f"error: agent '{args.agent_name}' appears to be running. "
-            f"Run `{holder}` first to avoid DB corruption.",
-            file=sys.stderr,
-        )
+        _report_agent_running(args.agent_name, holder)
         return 2
 
     agent_dir = (project_dir / agents[args.agent_name].data_dir).resolve()
@@ -1802,47 +1795,44 @@ def cmd_migrate_encryption(args) -> int:
     return cli_run(args)
 
 
-def _agent_holder(project_dir, agent_name, agent_cfg) -> Optional[str]:
-    """Which process is holding this agent's database, if any.
+def _agent_holder(project_dir, agent_name, agent_cfg):
+    """Which process is serving this agent, or may be; None when none is.
 
-    Returns the remedy that clears it — the command the caller should print —
-    or None when nothing is holding it.
+    Returns a :class:`~kestrel_sovereign.multi_agent.liveness.AgentHolder`:
+    the evidence, and the remedy the caller should print.
 
-    Two processes can be serving an agent, and only one of them writes an
-    ``agent.pid``. In the default in-process mode ``kestrel start`` writes
-    ONLY ``logs/.host.pid``: every agent runs inside that one host, so a
-    per-agent check finds no file and reports the agent stopped while the
-    host is actively serving its SQLite. That is the #2920 guard failure,
-    measured on a live host — four agents up 22h under one shared PID, all
-    four reported "not running".
+    Two launcher records can name an agent's process, and only one of them is
+    per agent. In the default in-process mode ``kestrel start`` writes ONLY
+    ``logs/.host.pid``: every agent runs inside that one host, so a per-agent
+    check finds no file and reports the agent stopped while the host is
+    actively serving its SQLite. That is the #2920 guard failure, measured on
+    a live host — four agents up 22h under one shared PID, all four reported
+    "not running". A server started without ``kestrel start`` writes neither,
+    and is found by the serving record it writes itself (#3522).
 
-    The remedy differs by mode, which is why this returns the command rather
-    than a bool: ``kestrel terminate <agent>`` cannot terminate an agent that has no
+    The remedy differs by mode, which is why this returns it rather than a
+    bool: ``kestrel terminate <agent>`` cannot terminate an agent that has no
     process of its own, so prescribing it in in-process mode gives an
     operator advice that can never work, and every retry refuses again.
+
+    Liveness that cannot be established counts as running: a guard that
+    waves through a database another process may be holding costs more than
+    a refusal the operator can clear.
     """
-    try:
-        from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+    from kestrel_sovereign.multi_agent.liveness import agent_holder
 
-        resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
-        # The same verified read ``kestrel terminate`` uses, so the guard and the
-        # remedy it prescribes cannot disagree about whether an agent is up.
-        # ``is_running`` counts an undecidable record as running: it names a
-        # process that IS alive, and waving a guard past a live agent is the
-        # failure that costs something (#2995).
-        agent_pid = ProcessManager.agent_pid_file(resolved_dir)
-        if ProcessManager.read_pid_record(agent_pid).is_running:
-            return f"kestrel terminate {agent_name}"
+    return agent_holder(
+        project_dir, agent_name, (project_dir / agent_cfg.data_dir).resolve()
+    )
 
-        host_pid = project_dir / "logs" / ".host.pid"
-        if ProcessManager.read_pid_record(host_pid).is_running:
-            return "kestrel terminate"
 
-        return None
-    except Exception:
-        # If we can't tell, err on the side of letting the user proceed
-        # — they get a clear error from the storage layer if it's locked.
-        return None
+def _report_agent_running(agent_name, holder) -> None:
+    """Refuse to write an agent's database while a process may serve it."""
+    print(
+        f"error: agent '{agent_name}' appears to be running ({holder.evidence}). "
+        f"Stop it first to avoid DB corruption: {holder.remedy}.",
+        file=sys.stderr,
+    )
 
 
 def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:

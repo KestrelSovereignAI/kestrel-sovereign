@@ -14,12 +14,14 @@ system/status bubble in the conversation.
 The payload deliberately mirrors the fields the issue calls out:
 request id, requesting agent, operation, target ref + update profile,
 policy/urgency, current state, and a deferral reason when the coordinator
-defers execution, plus structured blocker age/evidence when it escalates.
+defers execution, plus structured blocker age/evidence when it escalates,
+and every constitution adoption check the request's latest attempt ran
+(#3522).
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .event_store import dedupe_signature
 
@@ -81,8 +83,15 @@ def build_restart_status_event(
         # the payload so chat-history reload can scope the repainted
         # bubble trail to the session being viewed (#1816).
         "origin_session_id": str(getattr(request, "origin_session_id", "")),
+        # What the constitution adoption gate compared, per agent (#3522).
+        "constitution_checks": _constitution_checks(request),
         "dedupe_signature": dedupe_signature(request_id, str(state)),
     }
+
+
+def _constitution_checks(request) -> List[Dict[str, Any]]:
+    checks = getattr(request, "constitution_checks_list", None)
+    return list(checks()) if callable(checks) else []
 
 
 def _opt_str(value: Any) -> Optional[str]:

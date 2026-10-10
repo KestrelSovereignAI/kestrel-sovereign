@@ -30,6 +30,8 @@ from kestrel_sovereign.agent.boot import (
     BootPhase,
     BootPhaseState,
 )
+from kestrel_sovereign.agent import custody as custody_module
+from kestrel_sovereign.features.base import Feature as _SovereignFeature
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig
 from kestrel_sovereign.spawn.authority_registry import SpawnAuthorityRegistry
@@ -571,6 +573,1017 @@ async def test_clean_boot_reaches_ready(tmp_path):
         assert started_when_reconciled == set()
     finally:
         await _cleanup(agent)
+
+
+# ---------------------------------------------------------------------------
+# The serving record stays until every resource's release is confirmed (#3522)
+#
+# A server started without ``kestrel start`` is found by the guards only
+# through its serving record, so the record must outlive every resource the
+# agent may still hold. Each resource enters the agent's custody when it is
+# acquired and leaves only when its release is reported by an owner in
+# ``TRUTHFUL_CLOSE_OWNERS``. That list is empty until the owners' closes stop
+# swallowing failures (#3558, #3559, #3560), so for now the record stays until
+# the process exits.
+# ---------------------------------------------------------------------------
+
+
+def _guard_holder(home):
+    """What the reanchor and ``update --no-restart`` guards read for the agent."""
+    from kestrel_sovereign import cli
+
+    return cli._agent_holder(home, "boot", LocalAgentConfig(data_dir=".", port=8801))
+
+
+def _assert_guards_report_this_process(home) -> None:
+    holder = _guard_holder(home)
+    assert holder is not None, "the guards report the agent stopped"
+    assert holder.verified
+    assert f"PID {os.getpid()} serves it" in holder.evidence
+
+
+class _CustodyFeature(_SovereignFeature):
+    """A loaded feature whose teardown a test can make fail."""
+
+    tool_name = "custody_feature"
+    tool_description = "a feature whose teardown a test controls"
+    #: A failing teardown reports ``RETAINED`` instead of raising.
+    reports_failure = False
+
+    def __init__(self, agent, fails=False):
+        super().__init__(agent)
+        self.fails = fails
+        self.teardowns = 0
+
+    async def initialize(self):
+        return None
+
+    async def shutdown(self):
+        self.teardowns += 1
+        if self.fails and not self.reports_failure:
+            raise RuntimeError(f"{type(self).__name__} cleanup failed")
+        await super().shutdown()
+        if self.fails:
+            return custody_module.ReleaseOutcome.RETAINED
+        return None
+
+
+class _FailingCustodyFeature(_CustodyFeature):
+    tool_name = "failing_custody_feature"
+
+    def __init__(self, agent):
+        super().__init__(agent, fails=True)
+
+
+class _RetainingCustodyFeature(_FailingCustodyFeature):
+    tool_name = "retaining_custody_feature"
+    reports_failure = True
+
+
+#: Every owner a boot under ``_boot_holding_every_resource`` acquires a
+#: resource from. A new kind of resource fails
+#: ``test_these_tests_cover_every_owner_a_boot_acquires`` until it is added
+#: here, and then joins every sweep below.
+_BOOT_OWNERS = (
+    "background_tasks",
+    "feature",
+    "heartbeat_runner",
+    "llm_service",
+    "memory_system",
+    "resume_monitor",
+    "salvage_worker",
+    "signal_dispatcher",
+    "storage",
+    "sync_service",
+    "task_manager",
+)
+
+
+@contextlib.contextmanager
+def _boot_holding_every_resource(features=(_CustodyFeature,)):
+    """``_boot_mocks`` plus the optional resources a boot can acquire.
+
+    A sync worker, the heartbeat runner, and the given features, so that the
+    custody sweeps below cover them too.
+    """
+    from kestrel_sovereign.heartbeat import HeartbeatConfig
+
+    sync_service = MagicMock()
+    sync_service.has_work = True
+    sync_service.is_running = True
+    sync_service.add_remote_target = MagicMock(return_value=True)
+    sync_service.start = AsyncMock()
+    sync_service.stop = AsyncMock()
+    sync_service.force_snapshot = AsyncMock()
+    with _boot_mocks() as mocks, patch.dict(
+        os.environ, {"GCS_BACKUP_BUCKET": "unit-test-bucket"}
+    ), patch(
+        "kestrel_sovereign.storage.sync.service.SyncService",
+        return_value=sync_service,
+    ), patch(
+        "kestrel_sovereign.heartbeat.HeartbeatConfig.from_config",
+        return_value=HeartbeatConfig(enabled=True),
+    ), patch(
+        "kestrel_sovereign.kestrel_agent.discover_features",
+        side_effect=lambda agent, **_kw: [cls(agent) for cls in features],
+    ):
+        yield SimpleNamespace(**vars(mocks), sync_service=sync_service)
+
+
+def _trust(monkeypatch, owners) -> None:
+    """Treat ``owners`` as reporting a failed release truthfully."""
+    monkeypatch.setattr(custody_module, "TRUTHFUL_CLOSE_OWNERS", frozenset(owners))
+
+
+def _owners_held(agent) -> set:
+    custody = agent._resource_custody()
+    return {custody._held[name] for name in custody.held}
+
+
+async def _stop(agent) -> None:
+    await asyncio.wait_for(agent.shutdown(), timeout=30)
+
+
+async def _fail_last_phase(_ctx):
+    raise RuntimeError("injected after every resource was acquired")
+
+
+@pytest.mark.asyncio
+async def test_these_tests_cover_every_owner_a_boot_acquires(tmp_path):
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource():
+            await agent.initialize()
+            assert _owners_held(agent) == set(_BOOT_OWNERS)
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_booted_agent_records_that_this_process_serves_it(tmp_path):
+    """Guards find the agent however it was launched (#3522).
+
+    A server started without ``kestrel start`` has no PID file, so the agent
+    records itself as boot begins. No owner's release can be confirmed yet,
+    so stopping the agent keeps the record, which goes stale when the process
+    exits.
+    """
+    from kestrel_sovereign.multi_agent.liveness import serving_holder
+
+    agent = _make_agent(tmp_path)
+    assert serving_holder(tmp_path) is None
+    try:
+        with _boot_holding_every_resource():
+            await agent.initialize()
+            _assert_guards_report_this_process(tmp_path)
+
+            await _stop(agent)
+
+        # Every step ran and reported its resource released, but no owner is
+        # trusted to report a failure, so each stays held.
+        assert _owners_held(agent) == set(_BOOT_OWNERS)
+        _assert_guards_report_this_process(tmp_path)
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_boot_records_before_reading_and_keeps_its_record(tmp_path):
+    from kestrel_sovereign.multi_agent.liveness import serving_holder
+
+    agent = _make_agent(tmp_path)
+    seen_during_boot = []
+
+    async def fail(_ctx):
+        seen_during_boot.append(serving_holder(tmp_path))
+        raise RuntimeError("injected after storage")
+
+    try:
+        with _boot_mocks():
+            with patch.object(agent, PHASE_METHODS[1], fail):
+                with pytest.raises(RuntimeError, match="injected after storage"):
+                    await agent.initialize()
+
+        [holder] = seen_during_boot
+        assert holder is not None, "recorded before boot reads anything"
+        assert {"storage", "background_tasks"} <= set(
+            agent._resource_custody().held
+        )
+        assert "serving record" in agent._boot_context.retained_resources
+        _assert_guards_report_this_process(tmp_path)
+    finally:
+        await _cleanup(agent)
+
+
+def _one_failing_phase(agent):
+    """A boot of one phase: it records, acquires ``probe``, and fails."""
+
+    async def body(ctx):
+        agent._record_serving()
+
+        async def release_probe():
+            return custody_module.ReleaseOutcome.RELEASED
+
+        ctx.on_rollback("probe", release_probe)
+        raise RuntimeError("injected after acquiring the probe")
+
+    return [BootPhase("probe", body)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trusted", [True, False], ids=["truthful", "unconverted"])
+async def test_a_failed_boot_removes_its_record_only_once_its_rollback_is_confirmed(
+    tmp_path, monkeypatch, trusted
+):
+    """The gate the boot failure path uses, without the rest of a boot."""
+    _trust(monkeypatch, {"probe"} if trusted else ())
+    agent = _make_agent(tmp_path)
+    try:
+        with patch.object(agent, "_boot_phases", lambda: _one_failing_phase(agent)):
+            with pytest.raises(RuntimeError, match="acquiring the probe"):
+                await agent.initialize()
+
+        retained = agent._boot_context.retained_resources
+        if trusted:
+            assert agent._resource_custody().held == ()
+            assert retained == []
+            assert _guard_holder(tmp_path) is None
+        else:
+            assert agent._resource_custody().held == ("probe",)
+            assert retained == ["probe", "serving record"]
+            _assert_guards_report_this_process(tmp_path)
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_stopping_releases_the_record_once_every_owner_is_truthful(
+    tmp_path, monkeypatch
+):
+    """The all-succeed case: every owner trusted, every release confirmed."""
+    _trust(monkeypatch, _BOOT_OWNERS)
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource():
+            await agent.initialize()
+            await _stop(agent)
+
+        assert agent._resource_custody().held == ()
+        assert _guard_holder(tmp_path) is None
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_rollback_releases_the_record_once_every_owner_is_truthful(
+    tmp_path, monkeypatch
+):
+    """The rollback releases what boot opened. The LLM service has no
+    rollback step: stopping the agent after its failed boot closes it, and
+    only then does the record go.
+    """
+    _trust(monkeypatch, _BOOT_OWNERS)
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource():
+            with patch.object(agent, PHASE_METHODS[-1], _fail_last_phase):
+                with pytest.raises(RuntimeError, match="every resource"):
+                    await agent.initialize()
+
+            assert agent._resource_custody().held == ("llm_service",)
+            assert "serving record" in agent._boot_context.retained_resources
+            _assert_guards_report_this_process(tmp_path)
+
+            await _stop(agent)
+
+        assert agent._resource_custody().held == ()
+        assert _guard_holder(tmp_path) is None
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", _BOOT_OWNERS)
+async def test_one_unconverted_owner_keeps_the_record_when_the_agent_stops(
+    tmp_path, monkeypatch, owner
+):
+    """Its release step succeeds, but nothing trusts it to report a failure."""
+    _trust(monkeypatch, set(_BOOT_OWNERS) - {owner})
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource():
+            await agent.initialize()
+            await _stop(agent)
+
+            assert _owners_held(agent) == {owner}
+            _assert_guards_report_this_process(tmp_path)
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", _BOOT_OWNERS)
+async def test_one_unconverted_owner_keeps_the_record_through_a_rollback(
+    tmp_path, monkeypatch, owner
+):
+    _trust(monkeypatch, set(_BOOT_OWNERS) - {owner})
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource():
+            with patch.object(agent, PHASE_METHODS[-1], _fail_last_phase):
+                with pytest.raises(RuntimeError, match="every resource"):
+                    await agent.initialize()
+
+            # The LLM service has no rollback step; stopping the agent closes it.
+            assert _owners_held(agent) == {owner, "llm_service"}
+            assert "serving record" in agent._boot_context.retained_resources
+            _assert_guards_report_this_process(tmp_path)
+
+            await _stop(agent)
+            assert _owners_held(agent) == {owner}
+            _assert_guards_report_this_process(tmp_path)
+    finally:
+        await _cleanup(agent)
+
+
+_RELEASE_STEPS = {
+    "memory_system": lambda mocks: mocks.memory.shutdown,
+    "storage": lambda mocks: mocks.storage.close,
+    "sync_service": lambda mocks: mocks.sync_service.stop,
+    "task_manager": lambda mocks: mocks.task_manager.close,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", sorted(_RELEASE_STEPS))
+async def test_a_truthful_owner_whose_release_raises_keeps_the_record(
+    tmp_path, monkeypatch, owner
+):
+    _trust(monkeypatch, _BOOT_OWNERS)
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource() as mocks:
+            await agent.initialize()
+            _RELEASE_STEPS[owner](mocks).side_effect = RuntimeError(
+                "injected release failure"
+            )
+            await _stop(agent)
+
+            assert _owners_held(agent) == {owner}
+            _assert_guards_report_this_process(tmp_path)
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["stop", "rollback"])
+@pytest.mark.parametrize("owner", sorted(_RELEASE_STEPS))
+async def test_a_truthful_owner_whose_close_reports_retained_keeps_the_record(
+    tmp_path, monkeypatch, owner, path
+):
+    """A close may report a failed release without raising; that is kept."""
+    _trust(monkeypatch, _BOOT_OWNERS)
+    retained = custody_module.ReleaseOutcome.RETAINED
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource() as mocks:
+            if path == "rollback":
+                _RELEASE_STEPS[owner](mocks).return_value = retained
+                with patch.object(agent, PHASE_METHODS[-1], _fail_last_phase):
+                    with pytest.raises(RuntimeError, match="every resource"):
+                        await agent.initialize()
+                assert _owners_held(agent) == {owner, "llm_service"}
+            else:
+                await agent.initialize()
+                _RELEASE_STEPS[owner](mocks).return_value = retained
+            await _stop(agent)
+
+            assert _owners_held(agent) == {owner}
+            _assert_guards_report_this_process(tmp_path)
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_truthful_feature_whose_teardown_reports_retained_keeps_the_record(
+    tmp_path, monkeypatch
+):
+    _trust(monkeypatch, _BOOT_OWNERS)
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource((_RetainingCustodyFeature,)):
+            await agent.initialize()
+            await _stop(agent)
+
+            assert agent._resource_custody().held == (
+                "feature:_RetainingCustodyFeature",
+            )
+            _assert_guards_report_this_process(tmp_path)
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot_hangs", [True, False], ids=["abandoned", "flushed"])
+async def test_an_abandoned_sync_snapshot_keeps_the_sync_service_held(
+    tmp_path, monkeypatch, snapshot_hangs
+):
+    """Work an abandoned snapshot started may outlive the worker's stop."""
+    from kestrel_sovereign import kestrel_agent
+
+    _trust(monkeypatch, _BOOT_OWNERS)
+    release = asyncio.Event()
+
+    async def snapshot():
+        if snapshot_hangs:
+            await release.wait()
+
+    agent = _make_agent(tmp_path)
+    sync_service = MagicMock()
+    sync_service.is_running = True
+    sync_service.force_snapshot = snapshot
+    sync_service.stop = AsyncMock()
+    agent._sync_service = sync_service
+    agent.storage = AsyncMock()
+    custody = agent._resource_custody()
+    custody.acquire("sync_service")
+    custody.acquire("storage")
+    try:
+        with patch.object(kestrel_agent, "KESTREL_SHUTDOWN_TAIL_MIN_STEP_S", 0.05):
+            await asyncio.wait_for(agent._run_durable_shutdown_tail(0.5), timeout=10)
+
+        sync_service.stop.assert_awaited_once()
+        assert custody.held == (("sync_service",) if snapshot_hangs else ())
+    finally:
+        release.set()
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["stop", "rollback"])
+@pytest.mark.parametrize(
+    "reported",
+    [False, custody_module.ReleaseOutcome.RETAINED],
+    ids=["fenced", "reports-retained"],
+)
+async def test_a_truthful_dispatcher_whose_release_is_unfinished_stays_held(
+    tmp_path, monkeypatch, path, reported
+):
+    """``shutdown_durable_delivery()`` returns False while cognition fences it.
+
+    A rollback also keeps the storage that unfinished release still uses open
+    and held (#3522).
+    """
+    from kestrel_sovereign.signals import SignalDispatcher
+
+    _trust(monkeypatch, _BOOT_OWNERS)
+    release_cognition = asyncio.Event()
+
+    async def wait_for_cognition(self):
+        await release_cognition.wait()
+
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource() as mocks:
+            if path == "rollback":
+                with patch.object(
+                    SignalDispatcher,
+                    "shutdown_durable_delivery",
+                    AsyncMock(return_value=reported),
+                ), patch.object(
+                    SignalDispatcher,
+                    "wait_for_durable_shutdown_release",
+                    wait_for_cognition,
+                ), patch.object(agent, PHASE_METHODS[-1], _fail_last_phase):
+                    with pytest.raises(RuntimeError, match="every resource"):
+                        await agent.initialize()
+                assert agent.dispatcher is not None
+                mocks.storage.close.assert_not_awaited()
+                assert _owners_held(agent) == {
+                    "signal_dispatcher",
+                    "storage",
+                    "llm_service",
+                }
+            else:
+                await agent.initialize()
+                with patch.object(
+                    SignalDispatcher,
+                    "shutdown_durable_delivery",
+                    AsyncMock(return_value=reported),
+                ):
+                    await _stop(agent)
+                assert _owners_held(agent) == {"signal_dispatcher"}
+            _assert_guards_report_this_process(tmp_path)
+    finally:
+        release_cognition.set()
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reported",
+    [custody_module.ReleaseOutcome.RETAINED, None],
+    ids=["reports-retained", "returns-nothing"],
+)
+async def test_a_storage_preclose_that_reports_retained_keeps_storage_held(
+    tmp_path, monkeypatch, reported
+):
+    _trust(monkeypatch, _BOOT_OWNERS)
+    agent = _make_agent(tmp_path)
+    storage = AsyncMock()
+    storage.dispose_cached_sqla_factory = AsyncMock(return_value=reported)
+    agent.storage = storage
+    custody = agent._resource_custody()
+    custody.acquire("storage")
+    try:
+        await asyncio.wait_for(agent._run_durable_shutdown_tail(0.5), timeout=10)
+
+        storage.dispose_cached_sqla_factory.assert_awaited_once()
+        storage.close.assert_awaited_once()
+        assert custody.held == (("storage",) if reported is not None else ())
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_fails", [True, False], ids=["close-fails", "closed"])
+async def test_a_standalone_hold_context_is_held_until_its_close_is_confirmed(
+    tmp_path, monkeypatch, close_fails
+):
+    """``python -m kestrel_sovereign.main`` hands the agent its Hold context."""
+    _trust(monkeypatch, {*_BOOT_OWNERS, custody_module.STANDALONE_HOLD_CONTEXT})
+    close = AsyncMock(
+        side_effect=RuntimeError("injected Hold close failure") if close_fails else None
+    )
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource(), patch(
+            "kestrel_sovereign.hold.close_bound_host_context", close
+        ):
+            await agent.initialize()
+            agent._standalone_hold_context = SimpleNamespace()
+            await _stop(agent)
+
+            close.assert_awaited_once()
+            if close_fails:
+                assert agent._resource_custody().held == (
+                    custody_module.STANDALONE_HOLD_CONTEXT,
+                )
+                _assert_guards_report_this_process(tmp_path)
+            else:
+                assert agent._resource_custody().held == ()
+                assert _guard_holder(tmp_path) is None
+    finally:
+        agent._standalone_hold_context = None
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_truthful_feature_whose_teardown_times_out_keeps_the_record(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign import kestrel_agent
+
+    class _Hangs(_CustodyFeature):
+        tool_name = "hanging_custody_feature"
+
+        async def shutdown(self):
+            await asyncio.Event().wait()
+
+    _trust(monkeypatch, _BOOT_OWNERS)
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource((_Hangs,)):
+            await agent.initialize()
+            with patch.object(
+                kestrel_agent, "KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S", 0.2
+            ):
+                await _stop(agent)
+
+            assert agent._resource_custody().held == ("feature:_Hangs",)
+            _assert_guards_report_this_process(tmp_path)
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failing_cls",
+    [_FailingCustodyFeature, _RetainingCustodyFeature],
+    ids=["raises", "reports-retained"],
+)
+async def test_a_failing_feature_rollback_keeps_the_record_and_not_its_neighbour(
+    tmp_path, monkeypatch, failing_cls
+):
+    """Both features are swept; only the failing one stays held.
+
+    It also stays registered, so stopping the agent retries its teardown, and
+    once that succeeds the record goes.
+    """
+    _trust(monkeypatch, _BOOT_OWNERS)
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource((_CustodyFeature, failing_cls)):
+            with patch.object(agent, PHASE_METHODS[-1], _fail_last_phase):
+                with pytest.raises(RuntimeError, match="every resource"):
+                    await agent.initialize()
+
+            assert agent._resource_custody().held == (
+                "llm_service",
+                f"feature:{failing_cls.__name__}",
+            )
+            assert "features" in agent._boot_context.retained_resources
+            [failing] = agent.features.values()
+            assert type(failing) is failing_cls
+            assert failing.teardowns == 1
+            _assert_guards_report_this_process(tmp_path)
+
+            failing.fails = False
+            await _stop(agent)
+
+            assert failing.teardowns == 2
+            assert agent._resource_custody().held == ()
+            assert _guard_holder(tmp_path) is None
+    finally:
+        await _cleanup(agent)
+
+
+def _feature_failing_to_register(stage, failed_teardowns, reports_failure=False):
+    """A feature class whose registration fails at ``stage``.
+
+    Its first ``failed_teardowns`` teardowns fail, by raising or, with
+    ``reports_failure``, by reporting ``RETAINED``. ``instances`` lists every
+    instance made, so a test can reach the one a boot discovered.
+    """
+
+    class _FailsToRegister(_CustodyFeature):
+        tool_name = "fails_to_register"
+        instances: list = []
+
+        def __init__(self, agent):
+            super().__init__(agent)
+            type(self).instances.append(self)
+
+        async def initialize(self):
+            if stage == "initialize":
+                raise RuntimeError("injected registration failure")
+
+        async def on_enable(self):
+            if stage == "on_enable":
+                raise RuntimeError("injected registration failure")
+            await super().on_enable()
+
+        async def shutdown(self):
+            self.fails = self.teardowns < failed_teardowns
+            return await super().shutdown()
+
+    _FailsToRegister.reports_failure = reports_failure
+    return _FailsToRegister
+
+
+def _unreleased(agent) -> list:
+    return [feature for _key, feature in agent._unreleased_feature_registry()]
+
+
+# ``initialize`` fails before the feature reaches ``agent.features``;
+# ``on_enable`` fails after it was added and dropped again.
+_REGISTRATION_STAGES = ("initialize", "on_enable")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reports_failure", [False, True], ids=["raises", "reports-retained"])
+@pytest.mark.parametrize("stage", _REGISTRATION_STAGES)
+@pytest.mark.parametrize(
+    "failed_teardowns",
+    [1, 2],
+    ids=["rollback-retry-succeeds", "stop-retry-succeeds"],
+)
+async def test_a_feature_whose_registration_cleanup_fails_is_retried(
+    tmp_path, monkeypatch, stage, reports_failure, failed_teardowns
+):
+    """Its failed cleanup leaves the feature where rollback and stop find it.
+
+    ``_register_feature`` tears down a feature whose registration failed. When
+    that teardown fails too, the instance used to be dropped, so neither the
+    boot rollback nor a later stop could reach it to retry, and once
+    ``feature`` joins the truthful owners its custody could never end.
+    """
+    _trust(monkeypatch, _BOOT_OWNERS)
+    failing_cls = _feature_failing_to_register(stage, failed_teardowns, reports_failure)
+    agent = _make_agent(tmp_path)
+    resource = f"feature:{failing_cls.__name__}"
+    try:
+        with _boot_holding_every_resource((_CustodyFeature, failing_cls)):
+            with pytest.raises(RuntimeError, match="injected registration failure"):
+                await agent.initialize()
+
+            [failing] = failing_cls.instances
+            # Once while registering, once more in the boot rollback.
+            assert failing.teardowns == 2
+            assert failing not in agent.features.values()
+            if failed_teardowns == 1:
+                assert _unreleased(agent) == []
+                assert resource not in agent._resource_custody().held
+            else:
+                assert _unreleased(agent) == [failing]
+                assert resource in agent._resource_custody().held
+                assert "features" in agent._boot_context.retained_resources
+            _assert_guards_report_this_process(tmp_path)
+
+            await _stop(agent)
+
+            # Stopping retries only a feature whose cleanup has not succeeded.
+            assert failing.teardowns == 1 + failed_teardowns
+            assert _unreleased(agent) == []
+            assert agent._resource_custody().held == ()
+            assert _guard_holder(tmp_path) is None
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", _REGISTRATION_STAGES)
+async def test_a_failed_registration_on_a_running_agent_is_retried_when_it_stops(
+    tmp_path, monkeypatch, stage
+):
+    """No boot rollback runs here, so stopping the agent is the only retry."""
+    _trust(monkeypatch, _BOOT_OWNERS)
+    failing_cls = _feature_failing_to_register(stage, failed_teardowns=1)
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource():
+            await agent.initialize()
+            failing = failing_cls(agent)
+
+            with pytest.raises(RuntimeError, match="injected registration failure"):
+                await agent._register_feature(failing)
+
+            assert failing.teardowns == 1
+            assert failing not in agent.features.values()
+            assert _unreleased(agent) == [failing]
+            assert f"feature:{failing_cls.__name__}" in agent._resource_custody().held
+
+            await _stop(agent)
+
+            assert failing.teardowns == 2
+            assert _unreleased(agent) == []
+            assert agent._resource_custody().held == ()
+            assert _guard_holder(tmp_path) is None
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_feature_whose_unload_fails_is_retried_when_the_agent_stops(
+    tmp_path, monkeypatch
+):
+    """A runtime disable drops the feature, even when its teardown failed."""
+    _trust(monkeypatch, _BOOT_OWNERS)
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource((_FailingCustodyFeature,)):
+            await agent.initialize()
+            [failing] = agent.features.values()
+
+            with pytest.raises(RuntimeError, match="cleanup failed"):
+                await agent._disable_feature(failing.name)
+
+            assert failing.teardowns == 1
+            assert agent.features == {}
+            assert _unreleased(agent) == [failing]
+
+            failing.fails = False
+            await _stop(agent)
+
+            assert failing.teardowns == 2
+            assert _unreleased(agent) == []
+            assert agent._resource_custody().held == ()
+            assert _guard_holder(tmp_path) is None
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_unloading_a_feature_that_is_not_loaded_leaves_its_namesake(tmp_path):
+    """An unload drops only the instance it tears down."""
+    agent = _make_agent(tmp_path)
+    loaded = _CustodyFeature(agent)
+    stray = _CustodyFeature(agent)
+    agent.features = {loaded.name: loaded}
+
+    await agent._unregister_feature_runtime(stray)
+
+    assert agent.features == {loaded.name: loaded}
+    assert stray.teardowns == 1
+
+
+@pytest.mark.asyncio
+async def test_a_truthful_dispatcher_fenced_by_live_cognition_stays_held(
+    tmp_path, monkeypatch
+):
+    """A fenced dispatcher is not released, so neither is the record.
+
+    Its release returns while cognition still owns a delivery lease; the
+    continuation releases it, and storage, once that settles, and then the
+    record goes.
+    """
+    from kestrel_sovereign.signals import SignalDispatcher
+
+    _trust(monkeypatch, _BOOT_OWNERS)
+    release_cognition = asyncio.Event()
+    stop = SignalDispatcher.shutdown_durable_delivery
+    calls = 0
+
+    async def fenced_stop(self):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # Live cognition still owns its lease.
+            self._durable_shutdown_owner_fenced = True
+            return False
+        return await stop(self)
+
+    async def wait_for_cognition(self):
+        await release_cognition.wait()
+        self._durable_shutdown_owner_fenced = False
+
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_holding_every_resource(), patch.object(
+            SignalDispatcher, "shutdown_durable_delivery", fenced_stop
+        ), patch.object(
+            SignalDispatcher,
+            "wait_for_durable_shutdown_release",
+            wait_for_cognition,
+        ):
+            await agent.initialize()
+            await _stop(agent)
+
+            assert {"signal_dispatcher", "storage"} <= set(
+                agent._resource_custody().held
+            )
+            _assert_guards_report_this_process(tmp_path)
+
+            release_cognition.set()
+            await asyncio.wait_for(agent.wait_for_shutdown_completion(), timeout=30)
+            assert agent._resource_custody().held == ()
+            assert _guard_holder(tmp_path) is None
+    finally:
+        release_cognition.set()
+        await _cleanup(agent)
+
+
+async def _fail_after_the_dispatcher_starts(_ctx):
+    raise RuntimeError("injected after dispatcher startup")
+
+
+@pytest.mark.asyncio
+async def test_a_boot_rollback_that_keeps_the_dispatcher_keeps_the_serving_record(
+    tmp_path, monkeypatch
+):
+    """Durable dispatcher teardown fails on both attempts during rollback.
+
+    The rollback keeps the dispatcher and its storage open for a later stop,
+    so even with every owner trusted the record stays and the guards report
+    the agent running.
+    """
+    from kestrel_sovereign.signals import SignalDispatcher
+
+    _trust(monkeypatch, _BOOT_OWNERS)
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_mocks():
+            with patch.object(
+                agent, PHASE_METHODS[3], _fail_after_the_dispatcher_starts
+            ), patch.object(
+                SignalDispatcher,
+                "shutdown_durable_delivery",
+                AsyncMock(side_effect=RuntimeError("injected teardown failure")),
+            ):
+                with pytest.raises(RuntimeError, match="after dispatcher startup"):
+                    await agent.initialize()
+
+            assert agent._boot_state is BootPhaseState.FAILED
+            assert agent.dispatcher is not None
+            assert agent._raw_storage is not None
+            held = set(agent._resource_custody().held)
+            assert {"storage", "signal_dispatcher"} <= held, held
+            retained = agent._boot_context.retained_resources
+            assert {"storage", "signal_dispatcher", "serving record"} <= set(
+                retained
+            )
+            _assert_guards_report_this_process(tmp_path)
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_boot_rollback_keeps_storage_open_beneath_a_fenced_dispatcher(
+    tmp_path, monkeypatch
+):
+    """Rollback keeps a dispatcher fenced by live cognition, and its storage.
+
+    The dispatcher's release returns ``False`` while cognition still owns a
+    delivery (#3522). Rollback keeps its handle, so it does not close the
+    storage that owner still uses, and the guards keep reporting the agent
+    served. Once cognition settles the continuation closes storage, and a
+    later stop releases the record.
+    """
+    from kestrel_sovereign.signals import SignalDispatcher
+
+    _trust(monkeypatch, _BOOT_OWNERS)
+    release_cognition = asyncio.Event()
+    stop = SignalDispatcher.shutdown_durable_delivery
+    calls = 0
+
+    async def fenced_stop(self):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # Live cognition still owns its lease.
+            self._durable_shutdown_owner_fenced = True
+            return False
+        return await stop(self)
+
+    async def wait_for_cognition(self):
+        await release_cognition.wait()
+        self._durable_shutdown_owner_fenced = False
+
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_mocks() as mocks, patch.object(
+            agent, PHASE_METHODS[3], _fail_after_the_dispatcher_starts
+        ), patch.object(
+            SignalDispatcher, "shutdown_durable_delivery", fenced_stop
+        ), patch.object(
+            SignalDispatcher,
+            "wait_for_durable_shutdown_release",
+            wait_for_cognition,
+        ):
+            with pytest.raises(RuntimeError, match="after dispatcher startup"):
+                await agent.initialize()
+
+            assert agent._boot_state is BootPhaseState.FAILED
+            assert agent.dispatcher is not None
+            assert agent._raw_storage is mocks.storage
+            mocks.storage.close.assert_not_awaited()
+            assert {"storage", "signal_dispatcher"} <= set(
+                agent._resource_custody().held
+            )
+            _assert_guards_report_this_process(tmp_path)
+
+            release_cognition.set()
+            await asyncio.wait_for(agent.wait_for_shutdown_completion(), timeout=30)
+            mocks.storage.close.assert_awaited_once()
+
+            await _stop(agent)
+            mocks.storage.close.assert_awaited_once()
+            assert agent._resource_custody().held == ()
+            assert _guard_holder(tmp_path) is None
+    finally:
+        release_cognition.set()
+        await _cleanup(agent)
+
+
+def test_a_symlinked_store_records_in_the_registered_data_dir(tmp_path):
+    """A guard looks in the data directory, not where its database points."""
+    data_dir = tmp_path / "agent_data" / "emma"
+    data_dir.mkdir(parents=True)
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    (volume / "emma.db").touch()
+    (data_dir / "kestrel_prime.db").symlink_to(volume / "emma.db")
+    agent = _make_agent(tmp_path)
+    agent.storage_path = str(data_dir / "kestrel_prime.db")
+
+    assert agent._serving_data_dir() == data_dir.resolve()
+
+
+def test_an_agent_without_an_on_disk_store_records_nothing(tmp_path):
+    agent = _make_agent(tmp_path)
+    agent.storage_path = ":memory:"
+
+    assert agent._serving_data_dir() is None
+    agent._record_serving()
+    assert agent._serving_record is None
+
+
+def test_a_record_that_cannot_be_removed_is_kept_for_a_retry(tmp_path):
+    from kestrel_sovereign.multi_agent.liveness import ServingRecord
+
+    agent = _make_agent(tmp_path)
+    agent._record_serving()
+    record = agent._serving_record
+    assert record is not None
+
+    with patch.object(ServingRecord, "release", side_effect=OSError("read-only")):
+        assert agent._release_serving_record() is False
+    assert agent._serving_record is record
+    _assert_guards_report_this_process(tmp_path)
+
+    assert agent._release_serving_record() is True
+    assert agent._serving_record is None
+    assert _guard_holder(tmp_path) is None
 
 
 @pytest.mark.asyncio

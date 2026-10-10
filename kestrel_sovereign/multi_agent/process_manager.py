@@ -18,6 +18,7 @@ this host.
 import errno
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -79,6 +80,43 @@ DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS = 120.0
 #: reads; a recycled PID is a whole process launch away, never microseconds.
 _PID_START_TIME_TOLERANCE_S = 0.05
 
+#: The largest PID the platform issues: a ``pid_t`` (int32) on POSIX, a DWORD
+#: on Windows.
+_MAX_PID = 2**32 - 1 if sys.platform == "win32" else 2**31 - 1
+
+
+def recorded_pid(value: object) -> Optional[int]:
+    """``value`` as the PID a record names, or None when it is not one.
+
+    A JSON integer from 1 to the largest PID the platform issues. A bool, a
+    float, a string, zero, a negative number or a larger integer is not a
+    PID: probing it would ask the process table about a process no record
+    could have named, and its absence would prove nothing (#3522).
+    """
+    if type(value) is int and 0 < value <= _MAX_PID:
+        return value
+    return None
+
+
+def recorded_start_time(value: object) -> Optional[float]:
+    """``value`` as the start instant a record holds, or None when it is not one.
+
+    A JSON number of seconds since the epoch that is finite and positive. A
+    bool, a string, ``NaN``, an infinity (JSON ``Infinity``, or ``1e400``,
+    which parses as one), an integer too large for a float, zero or a negative
+    number is not: compared with a live process's start time, it would make
+    that process look like another one (#3522).
+    """
+    if type(value) not in (int, float):
+        return None
+    try:
+        start = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(start) or start <= 0:
+        return None
+    return start
+
 
 class PidStatus(str, Enum):
     """What a PID file establishes about the process it names.
@@ -97,9 +135,10 @@ class PidStatus(str, Enum):
     #: Something runs under that number but nothing proves whose it is —
     #: a file written before this format. Never treated as LIVE.
     UNDECIDABLE = "undecidable"
-    #: The file cannot be read or does not contain a PID at all. Distinct
-    #: from UNDECIDABLE, which names a PID that IS running: this establishes
-    #: no process whatsoever, so calling it running would be an invention.
+    #: The file cannot be read, or does not contain a PID and start time it
+    #: could have been written with. Distinct from UNDECIDABLE, which names a
+    #: PID that IS running: this establishes no process whatsoever, so calling
+    #: it running would be an invention, and calling it stale a guess.
     UNREADABLE = "unreadable"
 
 
@@ -425,7 +464,7 @@ class ProcessManager:
                              f"no PID file at {pid_file}")
         try:
             raw = pid_file.read_text().strip()
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             return PidRecord(PidStatus.UNREADABLE, None, None, None,
                              f"cannot read {pid_file}: {exc}")
         if not raw:
@@ -441,13 +480,24 @@ class ProcessManager:
             payload = None
 
         if isinstance(payload, dict):
-            try:
-                pid = int(payload["pid"])
-            except (KeyError, TypeError, ValueError):
+            parsed_pid = recorded_pid(payload.get("pid"))
+            if parsed_pid is None:
                 return PidRecord(PidStatus.UNREADABLE, None, None, None,
                                  f"{pid_file} has no usable pid")
-            start = payload.get("started_at")
-            recorded_start = float(start) if isinstance(start, (int, float)) else None
+            pid = parsed_pid
+            # ``write_pid`` omits ``started_at`` when it cannot be read, so its
+            # absence is a record without an identity, as a legacy file is. A
+            # value that is not a start time, ``null`` included, is a damaged
+            # record: it proves neither that the process is the one recorded
+            # nor that it is not.
+            if "started_at" in payload:
+                recorded_start = recorded_start_time(payload["started_at"])
+                if recorded_start is None:
+                    return PidRecord(
+                        PidStatus.UNREADABLE, None, None, None,
+                        f"{pid_file} records a started_at that is not a "
+                        "finite, positive time",
+                    )
             root = payload.get("root") if isinstance(payload.get("root"), str) else None
             raw_port = payload.get("port")
             port = int(raw_port) if isinstance(raw_port, int) else None
@@ -455,19 +505,40 @@ class ProcessManager:
             # A bare integer, written by a version before this format. The
             # number is real; the identity behind it is simply not recorded.
             try:
-                pid = int(raw)
+                parsed_pid = recorded_pid(int(raw))
             except ValueError:
+                parsed_pid = None
+            if parsed_pid is None:
                 return PidRecord(PidStatus.UNREADABLE, None, None, None,
                                  f"{pid_file} is neither JSON nor a PID")
+            pid = parsed_pid
 
+        status, detail = ProcessManager.identify_recorded_process(
+            pid, recorded_start, pid_file.name
+        )
+        return PidRecord(status, pid, root, port, detail, started_at=recorded_start)
+
+    @staticmethod
+    def identify_recorded_process(
+        pid: int, recorded_start: Optional[float], source: str
+    ) -> tuple[PidStatus, str]:
+        """Whether the process running as ``pid`` here is the one a record names.
+
+        ``pid`` and ``recorded_start`` are what :func:`recorded_pid` and
+        :func:`recorded_start_time` accepted from the record named ``source``;
+        ``recorded_start`` is None when the record holds no start instant.
+
+        STALE only on proof: nothing runs as ``pid``, or what does started at
+        another instant than the one recorded. LIVE when it started at that
+        instant. UNDECIDABLE otherwise: something runs as ``pid`` and nothing
+        proves whose it is, or the process table cannot be read from here.
+        """
         exists, live_start = ProcessManager._probe_process(pid)
         if exists is False:
             # Nothing is running under that number. Whether it once was is not
             # a question this can answer, and does not need to be: there is
             # nothing there to signal or to call running.
-            return PidRecord(PidStatus.STALE, pid, root, port,
-                             f"no process is running as PID {pid}",
-                             started_at=recorded_start)
+            return PidStatus.STALE, f"no process is running as PID {pid}"
 
         if live_start is None:
             # Either something is there but opaque to us (another account, or
@@ -475,33 +546,30 @@ class ProcessManager:
             # undecidable, and undecidable counts as running — a guard that
             # waves through a database another process may be holding costs
             # more than a refusal the operator can clear.
-            return PidRecord(
-                PidStatus.UNDECIDABLE, pid, root, port,
+            return (
+                PidStatus.UNDECIDABLE,
                 f"PID {pid} exists but its identity cannot be established "
                 f"from this process ({'access denied' if exists else 'no probe available'})",
-                started_at=recorded_start,
             )
 
         if recorded_start is None:
             # Legacy file: something IS running as that PID, but nothing
             # recorded says it is ours. Deliberately not called live — the
             # whole point is that a bare integer cannot make that claim.
-            return PidRecord(PidStatus.UNDECIDABLE, pid, root, port,
-                             f"PID {pid} is running, but {pid_file.name} records "
-                             "no instance identity to check it against "
-                             "(written before #2995)")
+            return (
+                PidStatus.UNDECIDABLE,
+                f"PID {pid} is running, but {source} records no instance "
+                "identity to check it against (written before #2995)",
+            )
 
         # Same number AND same start instant: it is the process that was
         # recorded. A recycled PID necessarily started later.
         if abs(live_start - recorded_start) <= _PID_START_TIME_TOLERANCE_S:
-            return PidRecord(PidStatus.LIVE, pid, root, port,
-                             f"PID {pid} is the process recorded here",
-                             started_at=recorded_start)
-        return PidRecord(
-            PidStatus.STALE, pid, root, port,
+            return PidStatus.LIVE, f"PID {pid} is the process recorded here"
+        return (
+            PidStatus.STALE,
             f"PID {pid} belongs to a different process than the one recorded "
-            f"(started {live_start:.3f}, file says {recorded_start:.3f})",
-            started_at=recorded_start,
+            f"(started {live_start:.3f}, {source} says {recorded_start:.3f})",
         )
 
     @staticmethod
