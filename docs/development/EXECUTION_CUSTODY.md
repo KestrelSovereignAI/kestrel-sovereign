@@ -175,6 +175,18 @@ denying ancestors. Revoking the original runtime still denies resident work.
 Cancellation and typed Stop/self-fence carriers preserve cause-chained native
 control evidence before classification: an unknown/committed cognition effect
 is failed, non-ACKable and non-retryable, including retained late completions.
+Renewal loss carries its original exception through cooperative cancellation
+or retained late route completion, rather than reducing control to a reason
+string. Exact-token failure NACKs and fallback releases use the same control
+settlement as success ACKs. A committed receipt whose terminal CAS no longer
+matches remains explicit cleanup debt: it is not permission to stop the owner
+or manufacture another delivery. No terminal receipt is written while a
+retained route can still perform effects.
+Detached ingress completion pins its publication-time custody and rechecks
+before every RPC, including after retry backoff; a replacement runtime cannot
+authorize an old callback. Cause-carried control from a cancelled facade is
+harvested from the original owned operation before shield cancellation can
+erase it, and does not become an ordinary completion retry.
 Peers' restored-question replay and hourly backstop use one feature-owned
 resident driver after READY. Restored subscriptions, deferred terminal-signal
 joins and retries inherit that original runtime root. Newly committed outbound

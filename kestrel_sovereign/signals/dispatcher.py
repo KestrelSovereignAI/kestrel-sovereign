@@ -98,7 +98,7 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, List, Optional, Protocol
 from zoneinfo import ZoneInfo
 
-from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 
 from kestrel_sdk.signals import (
     AttentionPolicy,
@@ -2465,7 +2465,7 @@ class SignalDispatcher:
         # A public caller may be cancelled by the bounded agent shutdown
         # wrapper.  Shield the owned teardown so the next caller can either
         # join the same cleanup or retry a genuine cleanup failure.
-        await asyncio.shield(completion)
+        await self._await_durable_shutdown_completion(completion)
         return not self.durable_shutdown_owner_fenced
 
     async def wait_for_durable_shutdown_release(self) -> None:
@@ -2478,10 +2478,18 @@ class SignalDispatcher:
         """
         completion = self._durable_shutdown_completion
         if completion is not None:
-            await asyncio.shield(completion)
+            await self._await_durable_shutdown_completion(completion)
         fenced = self._fenced_durable_shutdown_completion
         if fenced is not None:
-            await asyncio.shield(fenced)
+            await self._await_durable_shutdown_completion(fenced)
+
+    async def _await_durable_shutdown_completion(self, completion):
+        """Keep retained control ahead of shield's synthetic cancellation."""
+        try:
+            await asyncio.shield(completion)
+        except BaseException as error:
+            debt = tuple(original for _, original in self._retained_cognition_control_debt.values())
+            raise execution_terminal_error(*debt, error)
 
     def _start_durable_shutdown_completion(self) -> asyncio.Task[None]:
         """Close durable admission and return the one owned teardown task.
@@ -2670,6 +2678,10 @@ class SignalDispatcher:
         # to stop the owner and let ordinary recovery replay its delivery. One
         # bounded exact-token retry per shutdown attempt; no detached retry loop.
         for delivery, error in tuple(getattr(self, "_retained_cognition_control_debt", {}).values()):
+            if any(not task.done() for task in self._retained_durable_cognition_tasks):
+                # Renewal loss may publish evidence before a stubborn route
+                # settles. A receipt is not proof that its effects have ended.
+                raise error
             await self._terminalize_failed_cognition(delivery, error)
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
 
@@ -3579,9 +3591,9 @@ class SignalDispatcher:
         """Keep a cursor-owned cognition lease alive until its turn settles."""
 
         stop = asyncio.Event()
-        lost: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        lost: asyncio.Future[str | BaseException] = asyncio.get_running_loop().create_future()
 
-        def report_loss(reason: str) -> None:
+        def report_loss(reason: str | BaseException) -> None:
             if not lost.done():
                 lost.set_result(reason)
 
@@ -3610,7 +3622,12 @@ class SignalDispatcher:
                             delivery_id=delivery.delivery_id,
                             lease_token=delivery.lease_token,
                         )
-                    except Exception:
+                    except BaseException as error:
+                        if is_execution_control_error(error):
+                            report_loss(error)
+                            return
+                        if not isinstance(error, Exception):
+                            raise
                         logger.exception(
                             "Could not renew durable cognition lease: delivery=%s",
                             delivery.delivery_id,
@@ -3632,9 +3649,12 @@ class SignalDispatcher:
                         report_loss("Durable cognition lease ownership was lost")
                         return
                     expires_at = renewed.lease_expires_at
-            except asyncio.CancelledError:
-                raise
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    report_loss(error)
+                    return
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Durable cognition lease renewal task failed: delivery=%s",
                     delivery.delivery_id,
@@ -4440,7 +4460,12 @@ class SignalDispatcher:
                 dispatch_signal=signal,
                 use_live_signal=use_live_signal,
             )
-        except Exception:
+        except BaseException as error:
+            if is_execution_control_error(error):
+                await self._terminalize_failed_cognition(delivery, error)
+                raise
+            if not isinstance(error, Exception):
+                raise
             # A claim without a recoverable canonical caller must never wait
             # for its lease to expire.  Release this exact token before
             # producing the ordinary audited failure so cursor-owning ingress
@@ -4453,7 +4478,12 @@ class SignalDispatcher:
                     error="Durable cognition caller recovery failed",
                     retry_delay=retry_delay,
                 )
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                    raise
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Could not release durable cognition lease after caller recovery failure: "
                     "delivery=%s",
@@ -4476,6 +4506,9 @@ class SignalDispatcher:
         try:
             hold_admission = await get_effective_hold_state(self._agent)
         except HoldStateError as exc:
+            if is_execution_control_error(exc):
+                await self._terminalize_failed_cognition(delivery, exc)
+                raise
             result = self._failure_result(
                 routing_signal,
                 start,
@@ -4487,7 +4520,12 @@ class SignalDispatcher:
                     persisted_event_id=persisted_event_id,
                     delivery=delivery,
                 )
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                    raise
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Could not return durable cognition lease after final Hold "
                     "read failure: delivery=%s",
@@ -4509,7 +4547,12 @@ class SignalDispatcher:
                     persisted_event_id=persisted_event_id,
                     delivery=delivery,
                 )
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                    raise
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Could not return held durable cognition lease: delivery=%s",
                     delivery.delivery_id,
@@ -4518,7 +4561,12 @@ class SignalDispatcher:
             return result
         try:
             await self._begin_durable_cognition_execution(delivery)
-        except Exception as exc:
+        except BaseException as exc:
+            if is_execution_control_error(exc):
+                await self._terminalize_failed_cognition(delivery, exc)
+                raise
+            if not isinstance(exc, Exception):
+                raise
             logger.exception(
                 "Could not commit durable cognition execution phase: delivery=%s",
                 delivery.delivery_id,
@@ -4540,6 +4588,7 @@ class SignalDispatcher:
         routing_task: asyncio.Task[SignalResult] | None = None
         deferred_outcomes: list[_DeferredOutcomeLog] = []
         lease_loss_reason: Optional[str] = None
+        lease_loss_error: BaseException | None = None
         try:
             async with self._renew_durable_cognition_lease(delivery) as lease_lost:
                 # The routing task inherits this task-local collector.  Its
@@ -4582,13 +4631,25 @@ class SignalDispatcher:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if lease_lost in completed:
-                    lease_loss_reason = lease_lost.result()
+                    loss = lease_lost.result()
+                    if isinstance(loss, BaseException):
+                        lease_loss_error = loss
+                        # Publish debt before cancelling the child. Liveness
+                        # cleanup cannot switch back to ordinary admission if
+                        # that child refuses cancellation or returns normally.
+                        self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, loss)
+                        lease_loss_reason = str(loss)
+                    else:
+                        lease_loss_reason = loss
                     if routing_task not in completed:
                         settled = await self._cancel_durable_cognition_routing_task(
                             routing_task,
                             delivery=delivery,
+                            control_error=lease_loss_error,
                         )
                         if not settled:
+                            if lease_loss_error is not None:
+                                raise lease_loss_error
                             result = self._failure_result(
                                 signal,
                                 start,
@@ -4610,10 +4671,19 @@ class SignalDispatcher:
                     signal=routing_signal,
                     start=start,
                 )
+                if lease_loss_error is not None:
+                    raise lease_loss_error
+            # The route may win FIRST_COMPLETED while renewal is unwinding
+            # an in-flight commit. Its owned join can publish control after
+            # that wait; never proceed to ACK/NACK before harvesting it.
+            if lease_lost.done() and isinstance(lease_lost.result(), BaseException):
+                lease_loss_error = execution_terminal_error(lease_loss_error, lease_lost.result())
+                raise lease_loss_error
         except asyncio.CancelledError as error:
+            error = execution_terminal_error(lease_loss_error, error)
             if is_execution_control_error(error):
-                await self._terminalize_failed_cognition(delivery, error)
-                raise
+                await self._settle_cognition_control(delivery, error, routing_task)
+                raise error
             if routing_task is not None:
                 # A caller cancellation is not a durable receipt.  Never join
                 # an uncooperative child here: retain it and release the exact
@@ -4623,10 +4693,11 @@ class SignalDispatcher:
                 self._retain_durable_cognition_task(routing_task, delivery=delivery)
             raise
 
-        except Exception as error:
+        except BaseException as error:
+            error = execution_terminal_error(lease_loss_error, error)
             if is_execution_control_error(error):
-                await self._terminalize_failed_cognition(delivery, error)
-            raise
+                await self._settle_cognition_control(delivery, error, routing_task)
+            raise error
 
         if result is None:
             # A cooperative cancellation has no route-level result.  Its
@@ -4652,7 +4723,12 @@ class SignalDispatcher:
                         lease_token=delivery.lease_token or "",
                         error=failure.error or "Durable cognition routing was cancelled",
                     )
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                    raise
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Could not release durable cognition lease after cancellation: "
                     "delivery=%s",
@@ -4678,9 +4754,11 @@ class SignalDispatcher:
                     delivery_id=delivery.delivery_id,
                     lease_token=delivery.lease_token or "",
                 )
-            except Exception as error:
+            except BaseException as error:
                 if is_execution_control_error(error):
                     await self._terminalize_failed_cognition(delivery, error)
+                    raise
+                if not isinstance(error, Exception):
                     raise
                 logger.exception(
                     "Could not acknowledge completed durable cognition lease: "
@@ -4723,7 +4801,12 @@ class SignalDispatcher:
                     lease_token=delivery.lease_token or "",
                     error="Completed cognition delivery ACK was not accepted",
                 )
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                    raise
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Could not release completed durable cognition after ACK rejection: "
                     "delivery=%s",
@@ -4740,11 +4823,16 @@ class SignalDispatcher:
         if self._hold_prevented_execution(result):
             # A final turn-start Hold check can win after the durable lease
             # transfer. No turn ran, so return the exact token and retry budget.
-            await self._release_cognition_hold_lease(
-                consumer_id=consumer_id,
-                persisted_event_id=persisted_event_id,
-                delivery=delivery,
-            )
+            try:
+                await self._release_cognition_hold_lease(
+                    consumer_id=consumer_id,
+                    persisted_event_id=persisted_event_id,
+                    delivery=delivery,
+                )
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                raise
             self._finalize_deferred_durable_outcome(
                 deferred_outcomes,
                 fallback_signal=routing_signal,
@@ -4760,30 +4848,35 @@ class SignalDispatcher:
             Status.DROPPED_VALIDATION,
             Status.DROPPED_CYCLE,
         }
-        released = await self.nack_durable_delivery(
-            consumer_id=consumer_id,
-            delivery_id=delivery.delivery_id,
-            lease_token=delivery.lease_token or "",
-            error=result.error or f"Cognition delivery returned {result.status.value}",
-            retry_delay=retry_delay,
-            terminal=terminal,
-            terminal_ackable=terminal,
-        )
-        if released is None:
+        try:
+            released = await self.nack_durable_delivery(
+                consumer_id=consumer_id,
+                delivery_id=delivery.delivery_id,
+                lease_token=delivery.lease_token or "",
+                error=result.error or f"Cognition delivery returned {result.status.value}",
+                retry_delay=retry_delay,
+                terminal=terminal,
+                terminal_ackable=terminal,
+            )
             # An ordinary NACK correctly refuses an expired lease.  This
             # dispatcher still owns a live managed token, however, so it can
             # make one narrow owner/token-conditional transition after the
             # route task has settled. Preserve a proven terminal no-op in that
             # same atomic update; never turn it into an ordinary retry/failed
             # row and then tell the provider it may advance its cursor.
-            released = await self.release_durable_delivery_after_task(
-                consumer_id=consumer_id,
-                delivery_id=delivery.delivery_id,
-                lease_token=delivery.lease_token or "",
-                error=result.error or f"Cognition delivery returned {result.status.value}",
-                terminal=terminal,
-                terminal_ackable=terminal,
-            )
+            if released is None:
+                released = await self.release_durable_delivery_after_task(
+                    consumer_id=consumer_id,
+                    delivery_id=delivery.delivery_id,
+                    lease_token=delivery.lease_token or "",
+                    error=result.error or f"Cognition delivery returned {result.status.value}",
+                    terminal=terminal,
+                    terminal_ackable=terminal,
+                )
+        except BaseException as error:
+            if is_execution_control_error(error):
+                await self._terminalize_failed_cognition(delivery, error)
+            raise
         # TERMINAL is an external receipt, not a route-level interpretation.
         # Publish it only after this exact delivery row confirms the durable
         # terminal-ackable state. A lost lease/ownership transfer remains
@@ -4817,6 +4910,7 @@ class SignalDispatcher:
         task: asyncio.Task[SignalResult],
         *,
         delivery: DurableDelivery,
+        control_error: BaseException | None = None,
     ) -> bool:
         """Request cancellation, but never let an uncooperative turn pin ingress.
 
@@ -4833,11 +4927,11 @@ class SignalDispatcher:
                 {task}, timeout=_DURABLE_COGNITION_CANCELLATION_GRACE
             )
         except asyncio.CancelledError:
-            self._retain_durable_cognition_task(task, delivery=delivery)
+            self._retain_durable_cognition_task(task, delivery=delivery, control_error=control_error)
             raise
         if task in completed:
             return True
-        self._retain_durable_cognition_task(task, delivery=delivery)
+        self._retain_durable_cognition_task(task, delivery=delivery, control_error=control_error)
         logger.warning(
             "Durable cognition ignored cancellation after lease loss; retained task: "
             "delivery=%s",
@@ -4850,6 +4944,7 @@ class SignalDispatcher:
         task: asyncio.Task[SignalResult],
         *,
         delivery: DurableDelivery,
+        control_error: BaseException | None = None,
     ) -> None:
         """Own and harvest a route task that outlives its ingress dispatch."""
 
@@ -4859,15 +4954,16 @@ class SignalDispatcher:
 
         def completed(completed_task: asyncio.Task[SignalResult]) -> None:
             self._retained_durable_cognition_tasks.discard(completed_task)
-            control_error = None
+            debt = getattr(self, "_retained_cognition_control_debt", {}).get(delivery.delivery_id)
+            retained_error = execution_terminal_error(control_error, debt[1] if debt else None)
             try:
                 completed_task.result()
             except asyncio.CancelledError as error:
                 if is_execution_control_error(error):
-                    control_error = error
+                    retained_error = execution_terminal_error(retained_error, error)
             except Exception as error:
                 if is_execution_control_error(error):
-                    control_error = error
+                    retained_error = execution_terminal_error(retained_error, error)
                 # The route's final disposition was already made visible when
                 # retention began.  Harvest this late exception so it cannot
                 # become an unobserved task failure or a second audit row.
@@ -4877,18 +4973,18 @@ class SignalDispatcher:
                     delivery.delivery_id,
                 )
 
-            if self._durable_shutdown and control_error is None:
+            if self._durable_shutdown and retained_error is None:
                 # Graceful shutdown marks this managed owner stopped.  A
                 # replacement's owner-aware recovery then owns requeueing;
                 # touching the closing backend from this late callback would
                 # violate the lifecycle admission boundary.
                 return
-            if control_error is not None:
+            if retained_error is not None:
                 if not hasattr(self, "_retained_cognition_control_debt"):
                     self._retained_cognition_control_debt = {}
-                self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, control_error)
+                self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained_error)
             cleanup = asyncio.create_task(
-                self._release_retained_durable_cognition_task(delivery, control_error),
+                self._release_retained_durable_cognition_task(delivery, retained_error),
                 name=(
                     "durable_cognition_retained_cleanup:"
                     f"{delivery.delivery_id}"
@@ -4942,6 +5038,14 @@ class SignalDispatcher:
                 "delivery=%s",
                 delivery.delivery_id,
             )
+
+    async def _settle_cognition_control(self, delivery, error, routing_task):
+        """Never terminalize a delivery while its original route can still act."""
+        self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, error)
+        if routing_task is not None and not routing_task.done():
+            self._retain_durable_cognition_task(routing_task, delivery=delivery, control_error=error)
+        else:
+            await self._terminalize_failed_cognition(delivery, error)
 
     async def _terminalize_failed_cognition(
         self, delivery: DurableDelivery, error: BaseException,

@@ -68,6 +68,8 @@ from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolS
 
 from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
 from kestrel_sovereign.execution_custody import (
+    bind_execution_custody_snapshot,
+    current_execution_custody,
     execution_terminal_error,
     is_execution_control_error,
     require_execution_work,
@@ -15242,6 +15244,7 @@ class ProxyFeature(Feature):
             for client, task in self._event_ack_clients
             if client is source_client and not task.done()
         )
+        captured_custody = current_execution_custody(self.agent)
 
         try:
             capabilities = getattr(source_client, "host_ingress_capabilities", None)
@@ -15253,7 +15256,9 @@ class ProxyFeature(Feature):
                 )
                 return
             call = getattr(source_client, "call_host_ingress", None)
-        except BaseException:  # noqa: BLE001 - untrusted facade stays unacknowledged
+        except BaseException as error:  # noqa: BLE001 - untrusted facade stays unacknowledged
+            if is_execution_control_error(error):
+                raise
             logger.warning(
                 "Inbound event from isolated feature %s could not start completion",
                 self.name,
@@ -15273,7 +15278,14 @@ class ProxyFeature(Feature):
                     # queued completion cannot create a second completion RPC
                     # for the same provider callback.
                     await asyncio.shield(predecessor)
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as error:
+                    if predecessor.done():
+                        try:
+                            predecessor.result()
+                        except BaseException as original:
+                            error = execution_terminal_error(error, original)
+                    if is_execution_control_error(error):
+                        raise error
                     if (
                         asyncio.current_task() is not None
                         and asyncio.current_task().cancelling()
@@ -15283,7 +15295,9 @@ class ProxyFeature(Feature):
                     # lifecycle transition. Recheck the current source below;
                     # if it remains current, this exact callback still needs
                     # its own completion attempt.
-                except BaseException:  # noqa: BLE001 - predecessor already audited
+                except BaseException as error:  # noqa: BLE001 - predecessor already audited
+                    if is_execution_control_error(error):
+                        raise
                     logger.warning(
                         "Prior inbound completion from isolated feature %s failed; "
                         "continuing the queued provider callback",
@@ -15292,6 +15306,7 @@ class ProxyFeature(Feature):
             for attempt in range(_EVENT_INGRESS_ACK_ATTEMPTS):
                 if self._terminal_lifecycle_latched or source_client is not self._client:
                     return
+                require_execution_work(self.agent)
                 settled, result = await self._await_event_ingress_ack_attempt(
                     call, request, source_client
                 )
@@ -15315,8 +15330,14 @@ class ProxyFeature(Feature):
             # fresh process instead of silently losing the update.
             self._fence_event_ingress_ack_source(source_client)
 
+        async def scoped_complete() -> None:
+            # Capture at publication, not each retry: replacing the agent's
+            # runtime slot cannot grant this old callback new authority.
+            with bind_execution_custody_snapshot(captured_custody):
+                await complete()
+
         task = asyncio.create_task(
-            complete(),
+            scoped_complete(),
             name=f"isolated-event-ingress-{kind}:{self.name}",
         )
         self._event_ack_tasks.add(task)
@@ -15346,16 +15367,32 @@ class ProxyFeature(Feature):
     ) -> tuple[bool, Any]:
         """Run one ACK with a bounded owned timeout."""
 
+        require_execution_work(self.agent)
         operation = _create_host_owned_facade_task(
             _maybe_await(call(request.name, request.payload)),
             name=f"isolated-event-ingress-ack-rpc:{self.name}",
         )
+
+        def original_terminal_error(error):
+            # asyncio.shield reconstructs CancelledError for a cancelled
+            # child. Harvest its actual outcome before losing cause-carried
+            # authority evidence to that synthetic cancellation.
+            if operation.done() and not operation.foreign_loop:
+                try:
+                    operation.result()
+                except BaseException as source_error:
+                    return execution_terminal_error(error, source_error)
+            return error
+
         try:
             result = await asyncio.wait_for(
                 operation.shield(), timeout=_EVENT_INGRESS_ACK_TIMEOUT
             )
+            require_execution_work(self.agent)
             return True, result
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as error:
+            if is_execution_control_error(error):
+                raise
             operation.cancel()
             try:
                 await asyncio.wait_for(
@@ -15364,18 +15401,24 @@ class ProxyFeature(Feature):
             except asyncio.TimeoutError:
                 self._retain_terminal_lifecycle_task(operation, source_client)
                 return False, None
-            except BaseException:  # noqa: BLE001 - failed ACK remains retryable
+            except BaseException as error:  # noqa: BLE001 - failed ACK remains retryable
+                error = original_terminal_error(error)
                 _consume_late_lifecycle_task_outcome(operation)
+                if is_execution_control_error(error):
+                    raise error
                 return True, None
             _consume_late_lifecycle_task_outcome(operation)
             return True, None
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            error = original_terminal_error(error)
             operation.cancel()
             if not operation.done():
                 self._retain_terminal_lifecycle_task(operation, source_client)
-            raise
-        except BaseException:  # noqa: BLE001 - producer retries unchanged cursor
+            raise error
+        except BaseException as error:  # noqa: BLE001 - producer retries unchanged cursor
             _consume_late_lifecycle_task_outcome(operation)
+            if is_execution_control_error(error):
+                raise
             return True, None
 
     def _fence_event_ingress_ack_source(self, source_client: Any) -> None:
