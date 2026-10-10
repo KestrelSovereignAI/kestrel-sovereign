@@ -31,6 +31,8 @@ async def test_state_and_event_timestamp_binds_preserve_utc_instants(offset):
 
         async def fetch_one(self, query, params=()):
             bound.append((query, PostgresBackend._strip_tz(params)))
+            if query.startswith("SELECT 1 FROM constitution_runtime_events"):
+                return None
             return (1,)
 
     utc = datetime(2026, 10, 9, 13, 57, tzinfo=timezone.utc)
@@ -50,8 +52,11 @@ async def test_state_and_event_timestamp_binds_preserve_utc_instants(offset):
         state, event_type="safe_mode_exited", event_authorization="signed-owner"
     )
 
-    assert len(bound) == 2
-    state_params, event_params = bound[0][1], bound[1][1]
+    # Allocation now owns a native lifetime lock and rechecks history. Keep
+    # this adapter-binding test focused on the actual timestamp write binds.
+    writes = [(sql, params) for sql, params in bound if sql.lstrip().startswith("INSERT INTO")]
+    assert len(writes) == 2
+    state_params, event_params = writes[0][1], writes[1][1]
     assert state_params[3] == utc - timedelta(minutes=3)
     for value in (state_params[3], state_params[4], state_params[6], state_params[10], event_params[4]):
         assert value.tzinfo == timezone.utc

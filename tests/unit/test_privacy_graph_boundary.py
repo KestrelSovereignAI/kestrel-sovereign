@@ -1184,6 +1184,10 @@ async def test_volatile_reanchor_superseded_receipt_refused_by_wrapper(tmp_path,
     intact."""
     from kestrel_sovereign.constitution.genesis_audit import supersede_genesis_audit
 
+    receipt = {
+        "status": "passed", "risk_level": 1, "constitution_hash": VALID_HASH,
+        "completed_at": _now_iso(), "audited": True,
+    }
     async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
         # Prior stint: an agent node with a completed genesis audit + identity.
         await raw.add_node(GraphNode(
@@ -1191,7 +1195,7 @@ async def test_volatile_reanchor_superseded_receipt_refused_by_wrapper(tmp_path,
             properties={
                 "constitution_hash": VALID_HASH, "created_at": _now_iso(),
                 "name": "Kestrel",
-                "genesis_audit": {"status": "passed", "risk_level": 1},
+                "genesis_audit": receipt,
             },
         ))
         wrapper = PrivacyEnforcingStorage(raw, mode)
@@ -1218,7 +1222,7 @@ async def test_volatile_reanchor_superseded_receipt_refused_by_wrapper(tmp_path,
         # The fresh ``genesis_audit_history`` was only ever added to the rejected
         # copy — it must be absent from the untouched stored node.
         assert "genesis_audit_history" not in after.properties
-        assert after.properties["genesis_audit"] == {"status": "passed", "risk_level": 1}
+        assert after.properties["genesis_audit"] == receipt
 
 
 @pytest.mark.asyncio

@@ -966,8 +966,15 @@ audit-due record, never new automatic bootstrap permission.
 The additive revision migration retains readable schema-version-1 rows, but
 database triggers reject pre-revision writers after upgrade. Retire old
 replicas rather than expecting mixed-version writers to keep operating.
-Legacy inserts without a generation fence are refused as well; existing
-legacy rows remain readable, but deleted state cannot regain an empty epoch.
+Legacy inserts without a generation fence are refused as well. A one-time
+atomic upgrade assigns immutable `legacy:` generations to existing empty
+generations and appends migration evidence without resetting restrictions,
+audit timestamps, counters or pending markers. These generations permit normal
+audited admission but never mint automatic first-identity anchor permission.
+Deleted state cannot regain an empty epoch. Lifetime allocation rechecks
+surviving history inside its native transaction; missing current state with
+history requires explicit recovery and independent native feature-registry
+repair verification, not a constitution-only exit.
 Initialization checks existing metadata before installing migration DDL;
 SQLite upgrades reserve the writer slot and recheck before adding columns.
 
@@ -1001,8 +1008,9 @@ An invalidated restore preserves the newer volatile restriction and pending
 durability; an invalidated audit records no success or older failure over it.
 A restriction during post-commit exit notification retains the historical exit
 event but reports current Safe Mode, not successful recovery.
-Native automatic and signed anchor transactions reserve file resources before
-graph resources, then revalidate and consume custody atomically.
+Native automatic and signed anchor transactions reserve the complete canonical
+graph resources before physical file resources, then revalidate and consume
+custody atomically.
 Both runtime and offline signed repairs compare the exact preflight pointer,
 rights, current/history receipts and governance edges again under those graph
 locks. Rights validation uses that same immutable witness, not a separate edge
@@ -1013,7 +1021,7 @@ The marker is single-use; interruption before verification cannot authorize a
 second anchor. The absent successful
 audit timestamp independently keeps the full startup audit due. Consumed
 custody cannot be re-enabled by an ordinary runtime-state write.
-Migrated legacy pending-audit markers have no custody generation and cannot
+Migrated legacy pending-audit markers have no new-identity custody and cannot
 authorize automatic anchoring, even after ordinary writes advance their
 revision. An absent anchor in that cohort requires native signed repair.
 Reading a constitution or initializing its display feature never repairs an

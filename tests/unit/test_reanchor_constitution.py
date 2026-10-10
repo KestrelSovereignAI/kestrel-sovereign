@@ -6,6 +6,7 @@ import pytest
 import hashlib
 import textwrap
 from copy import deepcopy
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -23,6 +24,7 @@ from kestrel_sovereign.constitution.emancipation import (
     render_amendment_viii,
 )
 from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
+from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 
 
 _SUITE = Secp256k1Suite()
@@ -58,27 +60,29 @@ def test_both_reanchor_writers_prelock_the_complete_shared_node_set():
     expected_names = {
         ConstitutionMixin.reanchor_constitution: {
             "artifact_hash",
-            "stored_hash",
+            "new_hash",
             "self.agent_id",
+            "*governance_preflight['governed_by_targets']",
         },
-        _write_reanchor: {"agent_did", "artifact_hash", "new_hash"},
+        _write_reanchor: {
+            "agent_did", "artifact_hash", "new_hash",
+            "*governance_preflight['governed_by_targets']",
+        },
     }
     for function, expected in expected_names.items():
         calls = _graph_write_calls(function)
         lock_calls = [entry for entry in calls if entry[1] == "lock_nodes_for_update"]
         add_calls = [entry for entry in calls if entry[1] == "add_node"]
-        assert len(lock_calls) == (2 if function is ConstitutionMixin.reanchor_constitution else 1)
+        assert len(lock_calls) == 1
         assert add_calls
         assert lock_calls[-1][0] < add_calls[0][0]
         locked_names = {
             ast.unparse(element) for element in lock_calls[-1][2].args[0].elts
         }
         assert locked_names == expected
-        if function is ConstitutionMixin.reanchor_constitution:
-            assert {ast.unparse(element) for element in lock_calls[0][2].args[0].elts} == {"self.agent_id", "new_hash"}
 
 
-def test_governance_helper_prelocks_both_endpoints_before_writing():
+def test_governance_helper_prelocks_complete_write_set_before_writing():
     """Every caller of the composed helper gets one canonical outer lock set."""
 
     calls = _graph_write_calls(ConstitutionMixin._anchor_constitution_governance)
@@ -89,7 +93,7 @@ def test_governance_helper_prelocks_both_endpoints_before_writing():
     assert lock_calls[0][0] < add_calls[0][0]
     assert {
         ast.unparse(element) for element in lock_calls[0][2].args[0].elts
-    } == {"self.agent_id", "constitution_hash"}
+    } == {"self.agent_id", "constitution_hash", "*targets"}
 
 
 @pytest.fixture(autouse=True)
@@ -105,13 +109,14 @@ def _operator_pinned_root(tmp_path, monkeypatch):
 #: to supply it because the command now reads its own anchored bytes to enforce
 #: the Iron Rule for agents with no structured receipt (#2465).
 ANCHORED_CONSTITUTION = b"# Kestrel Constitution v1\n\nOriginal content.\n"
+ANCHORED_HASH = hashlib.sha256(ANCHORED_CONSTITUTION).hexdigest()
 
 #: Sentinel for "the row is there but this process cannot turn it into text".
 UNREADABLE = object()
 
 
 class _FakeFileRows:
-    """The one query the Iron Rule guard's unbound file read actually issues.
+    """Authorization-only SQL-row fixture for canonical file publication.
 
     The guard reads the anchored constitution through the *ungoverned*
     connection (``AsyncFileStore(db)`` with no ``agent_id``), because an
@@ -124,30 +129,69 @@ class _FakeFileRows:
     """
 
     def __init__(self, content_hash, anchored):
+        self.backend_type = "sqlite"
+        self.owns_open_transaction = True
         self._content_hash = content_hash
         self._anchored = anchored
+        self.files = {}
+        self.owners = {}
+        if anchored is not None:
+            self.files[content_hash] = (
+                (b"\x00not-a-valid-token", json.dumps({"enc": True}))
+                if anchored is UNREADABLE else (anchored, None)
+            )
+
+    @asynccontextmanager
+    async def transaction(self):
+        # Authorization-only protocol fixture; native integration tests prove
+        # transactional custody, actual SQL and rollback on both backends.
+        yield self
 
     async def fetchone(self, query, params=()):
+        if query.startswith("SELECT node_id FROM graph_nodes WHERE node_id = ?"):
+            assert params == (AGENT_DID,)
+            return (AGENT_DID,)
         assert "FROM files" in query, query
         assert "file_owners" not in query, (
             "The Iron Rule guard must read the anchored constitution unbound; "
             f"this query is ownership-scoped: {query}"
         )
-        if self._anchored is None or params[0] != self._content_hash:
+        row = self.files.get(params[0])
+        if row is None:
             return None
-        if self._anchored is UNREADABLE:
-            # Marked encrypted, with bytes no key will open — exactly what a
-            # wrong KESTREL_DATA_KEY produces.
-            return b"\x00not-a-valid-token", json.dumps({"enc": True})
-        return self._anchored, None
+        if query.strip().startswith("SELECT 1"):
+            return (1,)
+        if query.strip().startswith("SELECT content_hash"):
+            return (params[0],)
+        if query.strip().startswith("SELECT metadata"):
+            return (row[1],)
+        return row
+
+    async def execute(self, query, params=()):
+        if "INSERT OR IGNORE INTO files " in query:
+            digest, name, content, metadata = params
+            assert name in {"KESTREL_CONSTITUTION.md", "KESTREL_CONSTITUTION.reanchor.signed.json"}
+            self.files.setdefault(digest, (content, metadata))
+        else:
+            assert "INSERT OR IGNORE INTO file_owners" in query, query
+            assert params[1] == AGENT_DID
+            assert params[2] in {"KESTREL_CONSTITUTION.md", "KESTREL_CONSTITUTION.reanchor.signed.json"}
+            self.owners.setdefault((params[0], params[1]), params[2:])
 
     async def fetchall(self, query, params=()):
+        if query.startswith("SELECT node_id FROM graph_node_owners"):
+            assert params == (AGENT_DID, AGENT_DID)
+            return [(AGENT_DID,)]
+        if query.startswith("SELECT target_id, agent_id FROM graph_edge_owners"):
+            assert params[0] == AGENT_DID
+            return []
         assert "FROM graph_edges" in query and "source_id = ?" in query
-        assert params == (AGENT_DID,)
+        assert params[0] == AGENT_DID
+        assert len(params) in (1, 2)
         return []
 
 
-def _make_agent(stored_hash="oldhash", safe_mode=False, anchored=ANCHORED_CONSTITUTION):
+def _make_agent(stored_hash=ANCHORED_HASH, safe_mode=False, anchored=ANCHORED_CONSTITUTION):
     """Create a mock agent with ConstitutionMixin methods bound."""
     agent = MagicMock(spec=KestrelAgent)
     agent._safe_mode = safe_mode
@@ -175,7 +219,26 @@ def _make_agent(stored_hash="oldhash", safe_mode=False, anchored=ANCHORED_CONSTI
     )
     agent.storage.add_node = AsyncMock()
     agent.storage.lock_nodes_for_update = AsyncMock()
-    agent._raw_storage = SimpleNamespace(db=_FakeFileRows(stored_hash, anchored), get_node=agent.storage.get_node)
+    rows = _FakeFileRows(stored_hash, anchored)
+    async def get_node(*args, **kwargs):
+        return await agent.storage.get_node(*args, **kwargs)
+    async def get_edges_from(*args, **kwargs):
+        return await agent.storage.get_edges_from(*args, **kwargs)
+    async def store_file(*args, **kwargs):
+        return await agent.storage.store_file(*args, **kwargs)
+    async def retrieve_file(*args, **kwargs):
+        return await agent.storage.retrieve_file(*args, **kwargs)
+    # Explicit protocol fixture for these existing authorization tests. Real
+    # transaction/ownership behavior is exercised by the native backend suite.
+    agent._raw_storage = SimpleNamespace(
+        db=rows, get_node=get_node, transaction=rows.transaction,
+        lock_nodes_for_update=agent.storage.lock_nodes_for_update,
+        add_node=agent.storage.add_node, add_edge=agent.storage.add_edge,
+        delete_edge=agent.storage.delete_edge, get_edges_from=get_edges_from,
+        files=AsyncFileStore(rows, agent_id=AGENT_DID),
+        owns_open_transaction=True, store_file=store_file,
+        retrieve_file=retrieve_file,
+    )
     # transaction() is an async context manager, not a coroutine — a plain
     # MagicMock provides __aenter__/__aexit__ on its return value.
     agent.storage.transaction = MagicMock()
@@ -290,13 +353,13 @@ async def test_reanchor_rejects_oversized_artifact_before_storage(tmp_path):
 @pytest.mark.asyncio
 async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path):
     """Re-anchor stores new constitution when expected hash matches."""
-    agent, node = _make_agent(stored_hash="oldhash", safe_mode=False)
+    agent, node = _make_agent(stored_hash=ANCHORED_HASH, safe_mode=False)
     old_receipt = {
         "status": "passed",
         "completed_at": "2026-04-05T00:00:00Z",
         "risk_level": 1,
         "reasoning": "Original governing bytes passed.",
-        "constitution_hash": "oldhash",
+        "constitution_hash": ANCHORED_HASH,
         "provenance": "test:original",
         "audited": True,
     }
@@ -317,11 +380,12 @@ async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path):
     assert FAKE_HASH[:16] in result
     assert "admin_command" in result
     assert node.properties["constitution_hash"] == FAKE_HASH
-    assert node.properties["constitution_reanchor"]["old_hash"] == "oldhash"
+    assert node.properties["constitution_reanchor"]["old_hash"] == ANCHORED_HASH
     assert node.properties["constitution_reanchor"]["new_hash"] == FAKE_HASH
     assert node.properties["constitution_reanchor"]["authorization"] == "admin_command"
     assert node.properties["constitution_reanchor"]["expected_hash_prefix"] == FAKE_HASH[:8]
-    assert node.properties["constitution_reanchor"]["signed_artifact_hash"] == FAKE_HASH
+    artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    assert node.properties["constitution_reanchor"]["signed_artifact_hash"] == artifact_hash
     assert node.properties["constitution_reanchor"]["signed_artifact_signer"] == ROOT_DID
     assert node.properties["genesis_audit"] == {
         "status": "pending",
@@ -333,8 +397,10 @@ async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path):
     history = node.properties["genesis_audit_history"]
     assert history[-1]["receipt"] == old_receipt
     assert history[-1]["superseded_by_constitution_hash"] == FAKE_HASH
-    assert agent.storage.store_file.call_count == 2
-    agent.storage.store_file.assert_any_call(FAKE_CONSTITUTION, "KESTREL_CONSTITUTION.md")
+    agent.storage.store_file.assert_not_called()  # Both witnesses use native byte custody.
+    restored = await AsyncFileStore(agent._raw_storage.db).retrieve_file(FAKE_HASH)
+    assert restored == FAKE_CONSTITUTION
+    assert await AsyncFileStore(agent._raw_storage.db).retrieve_file(artifact_hash) == artifact_path.read_bytes()
     agent.privacy_agent.add_conversation.assert_called_once()
     # First reanchor: nothing to supersede, so no empty history is written.
     assert "constitution_reanchor_history" not in node.properties
@@ -352,18 +418,18 @@ async def test_a_later_reanchor_preserves_the_receipt_it_supersedes(tmp_path):
     different node — until #2893 made that node fleet-shareable and moved the
     per-agent fields off it.
     """
-    agent, node = _make_agent(stored_hash="oldhash", safe_mode=False)
+    agent, node = _make_agent(stored_hash=ANCHORED_HASH, safe_mode=False)
     prior = {
         "timestamp": "2026-04-05T00:00:00Z",
-        "old_hash": "ancienthash",
-        "new_hash": "oldhash",
+        "old_hash": "0" * 64,
+        "new_hash": ANCHORED_HASH,
         "path": "/prior/KESTREL_CONSTITUTION.md",
-        "signed_artifact_hash": "priorartifacthash",
+        "signed_artifact_hash": "1" * 64,
         "signed_artifact_path": "/prior/amendment.json",
         "signed_artifact_signer": ROOT_DID,
         "signed_artifact_verification": "signed by the pinned sovereign root",
         "authorization": "prior_admin",
-        "expected_hash_prefix": "oldhash",
+        "expected_hash_prefix": ANCHORED_HASH,
     }
     node.properties["constitution_reanchor"] = prior
     agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
@@ -390,7 +456,7 @@ async def test_a_later_reanchor_preserves_the_receipt_it_supersedes(tmp_path):
     assert len(history) == 1
     assert history[0]["receipt"] == prior
     assert history[0]["superseded_by_constitution_hash"] == FAKE_HASH
-    assert history[0]["superseded_by_artifact_hash"] == FAKE_HASH
+    assert history[0]["superseded_by_artifact_hash"] == hashlib.sha256(artifact_path.read_bytes()).hexdigest()
     assert history[0]["provenance"] == "runtime:constitution_reanchor"
 
 
@@ -522,18 +588,19 @@ async def test_reanchor_still_succeeds_for_an_emancipated_agent_with_a_receipt(
         )
 
     assert "re-anchored successfully" in result.lower()
-    assert b"SENTINEL-2465" in agent.storage.store_file.call_args_list[0].args[0]
+    restored = await AsyncFileStore(agent._raw_storage.db).retrieve_file(v2_digest)
+    assert b"SENTINEL-2465" in restored
 
 
 @pytest.mark.asyncio
 async def test_reanchor_rejects_unpinned_controller_root(tmp_path, monkeypatch):
     """A controller resolver is discovery, not an operator-pinned authority."""
-    agent, node = _make_agent(stored_hash="oldhash")
+    agent, node = _make_agent(stored_hash=ANCHORED_HASH)
     agent.identity.legacy_did_document = {
         **AGENT_DID_DOCUMENT,
         "controller": ROOT_DID,
     }
-    node.properties = {"constitution_hash": "oldhash"}
+    node.properties = {"constitution_hash": ANCHORED_HASH}
     agent.a2a_did_resolver = lambda did: ROOT_DID_DOCUMENT if did == ROOT_DID else None
     agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
     artifact_path = _write_artifact(tmp_path)
@@ -555,7 +622,7 @@ async def test_reanchor_rejects_unpinned_controller_root(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_reanchor_rejects_wrongly_signed_artifact(tmp_path):
     """Re-anchor refuses artifacts not signed by the trusted Sovereign root key."""
-    agent, _ = _make_agent(stored_hash="oldhash")
+    agent, _ = _make_agent(stored_hash=ANCHORED_HASH)
     other_keypair = _SUITE.generate_keypair()
     artifact_path = _write_artifact(tmp_path, keypair=other_keypair)
 
@@ -575,7 +642,7 @@ async def test_reanchor_rejects_wrongly_signed_artifact(tmp_path):
 @pytest.mark.asyncio
 async def test_reanchor_rejects_agent_owned_signature(tmp_path):
     """An agent-owned legacy key must never authorize its own re-anchor."""
-    agent, _ = _make_agent(stored_hash="oldhash")
+    agent, _ = _make_agent(stored_hash=ANCHORED_HASH)
     artifact_path = _write_artifact(
         tmp_path,
         keypair=AGENT_KEYPAIR,
@@ -599,7 +666,7 @@ async def test_reanchor_rejects_agent_owned_signature(tmp_path):
 @pytest.mark.asyncio
 async def test_reanchor_rejects_self_identity_as_trust_anchor(tmp_path):
     """The agent's DID document is not a Sovereign root trust source."""
-    agent, node = _make_agent(stored_hash="oldhash")
+    agent, node = _make_agent(stored_hash=ANCHORED_HASH)
     node.properties["sovereign_root_did_document"] = AGENT_DID_DOCUMENT
     artifact_path = _write_artifact(
         tmp_path,
@@ -631,7 +698,7 @@ async def test_db_injected_root_and_hash_cannot_authorize_reanchor(tmp_path):
         attacker_did,
         attacker_keypair.public_key,
     )
-    agent, node = _make_agent(stored_hash="attacker-overwrote-this-hash", safe_mode=True)
+    agent, node = _make_agent(stored_hash=FAKE_HASH, anchored=FAKE_CONSTITUTION, safe_mode=True)
     node.properties.update(
         {
             "sovereign_root_did_document": attacker_doc,
@@ -668,7 +735,7 @@ async def test_db_injected_root_and_hash_cannot_authorize_reanchor(tmp_path):
 @pytest.mark.asyncio
 async def test_reanchor_accepts_full_hash(tmp_path):
     """Re-anchor works with full hash, not just prefix."""
-    agent, node = _make_agent(stored_hash="oldhash")
+    agent, node = _make_agent(stored_hash=ANCHORED_HASH)
     agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
     artifact_path = _write_artifact(tmp_path)
 
@@ -688,7 +755,7 @@ async def test_reanchor_accepts_full_hash(tmp_path):
 @pytest.mark.asyncio
 async def test_reanchor_does_not_exit_safe_mode(tmp_path):
     """Re-anchor updates hash but leaves safe mode active."""
-    agent, node = _make_agent(stored_hash="oldhash", safe_mode=True)
+    agent, node = _make_agent(stored_hash=ANCHORED_HASH, safe_mode=True)
     agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
     artifact_path = _write_artifact(tmp_path)
 
@@ -752,16 +819,22 @@ async def test_anchor_governance_prunes_nontarget_governed_by_edges():
 async def test_reanchor_success_prunes_dangling_governed_by_edges(tmp_path):
     """A runtime reanchor removes the old edge AND any dangling edge —
     not just the property-derived old hash (#2617)."""
-    agent, node = _make_agent(stored_hash="oldhash")
+    agent, node = _make_agent(stored_hash=ANCHORED_HASH)
     _bind_real_governance_anchor(agent)
     agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
     dangling = "d" * 64
     agent.storage.get_edges_from = AsyncMock(
         return_value=[
-            _edge("oldhash"),
+            _edge(ANCHORED_HASH),
             _edge(dangling),
             _edge(FAKE_HASH),
         ]
+    )
+    agent._raw_storage.db.fetchall = AsyncMock(
+        side_effect=lambda query, params=(): (
+            [] if "target_id <>" in query
+            else [(ANCHORED_HASH,), (dangling,), (FAKE_HASH,)]
+        )
     )
     artifact_path = _write_artifact(tmp_path)
 
@@ -775,10 +848,10 @@ async def test_reanchor_success_prunes_dangling_governed_by_edges(tmp_path):
         )
 
     assert "re-anchored successfully" in result.lower()
-    assert "pruned stale governed_by edge(s)" in result.lower()
+    assert "pruned 1 stale governed_by edge(s)" in result.lower()
     assert dangling[:16] in result
     deleted = {call.args for call in agent.storage.delete_edge.await_args_list}
-    assert (AGENT_DID, "oldhash", "governed_by") in deleted
+    assert (AGENT_DID, ANCHORED_HASH, "governed_by") in deleted
     assert (AGENT_DID, dangling, "governed_by") in deleted
     assert (AGENT_DID, FAKE_HASH, "governed_by") not in deleted
 
@@ -787,11 +860,17 @@ async def test_reanchor_success_prunes_dangling_governed_by_edges(tmp_path):
 async def test_reanchor_noop_prunes_dangling_governed_by_edges(tmp_path):
     """Already-anchored + verified artifact converges governance edges:
     the one-shot cleanup for DBs carrying pre-fix dangling edges (#2617)."""
-    agent, node = _make_agent(stored_hash=FAKE_HASH)
+    agent, node = _make_agent(stored_hash=FAKE_HASH, anchored=FAKE_CONSTITUTION)
+    agent.storage.store_file.return_value = FAKE_HASH
     _bind_real_governance_anchor(agent)
     dangling = "d" * 64
     agent.storage.get_edges_from = AsyncMock(
         return_value=[_edge(FAKE_HASH), _edge(dangling)]
+    )
+    agent._raw_storage.db.fetchall = AsyncMock(
+        side_effect=lambda query, params=(): (
+            [] if "target_id <>" in query else [(FAKE_HASH,), (dangling,)]
+        )
     )
     artifact_path = _write_artifact(tmp_path)
 
@@ -811,14 +890,18 @@ async def test_reanchor_noop_prunes_dangling_governed_by_edges(tmp_path):
         AGENT_DID, dangling, "governed_by"
     )
     agent.storage.store_file.assert_not_called()
+    artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    assert await AsyncFileStore(agent._raw_storage.db).retrieve_file(artifact_hash) == artifact_path.read_bytes()
+    assert node.properties["constitution_reanchor"]["signed_artifact_signer"] == ROOT_DID
 
 
 # --- Edge cases ---
 
 @pytest.mark.asyncio
-async def test_reanchor_noop_when_already_current(tmp_path):
-    """Re-anchor is a no-op if constitution hasn't changed."""
-    agent, node = _make_agent(stored_hash=FAKE_HASH)
+async def test_reanchor_refreshes_signed_provenance_when_already_current(tmp_path):
+    """Same governing bytes still publish the newly verified signing receipt."""
+    agent, node = _make_agent(stored_hash=FAKE_HASH, anchored=FAKE_CONSTITUTION)
+    agent.storage.store_file.return_value = FAKE_HASH
     artifact_path = _write_artifact(tmp_path)
 
     with patch("builtins.open", create=True) as mock_open:
@@ -831,6 +914,9 @@ async def test_reanchor_noop_when_already_current(tmp_path):
 
     assert "already anchored" in result.lower()
     agent.storage.store_file.assert_not_called()
+    artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    assert await AsyncFileStore(agent._raw_storage.db).retrieve_file(artifact_hash) == artifact_path.read_bytes()
+    assert node.properties["constitution_reanchor"]["signed_artifact_signer"] == ROOT_DID
 
 
 @pytest.mark.asyncio
@@ -869,7 +955,7 @@ async def test_reanchor_fails_when_no_file_on_disk(tmp_path):
 @pytest.mark.asyncio
 async def test_governing_constitution_reads_from_storage_after_reanchor(tmp_path):
     """After reanchor, _get_governing_constitution reads from anchored storage, not disk."""
-    agent, node = _make_agent(stored_hash="oldhash")
+    agent, node = _make_agent(stored_hash=ANCHORED_HASH)
     agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
     artifact_path = _write_artifact(tmp_path)
 
@@ -886,12 +972,12 @@ async def test_governing_constitution_reads_from_storage_after_reanchor(tmp_path
     assert node.properties["constitution_hash"] == FAKE_HASH
 
     # Step 2: _get_governing_constitution should retrieve from storage using the new hash
-    agent.storage.retrieve_file = AsyncMock(return_value=b"stored constitution content")
+    agent.storage.retrieve_file = AsyncMock(return_value=FAKE_CONSTITUTION)
 
     constitution = await agent._get_governing_constitution()
 
     agent.storage.retrieve_file.assert_called_once_with(FAKE_HASH)
-    assert constitution == "stored constitution content"
+    assert constitution == FAKE_CONSTITUTION.decode()
 
 
 @pytest.mark.asyncio
@@ -977,7 +1063,7 @@ async def test_live_reanchor_follows_a_verified_source_descriptor(tmp_path):
 
     assert "re-anchored successfully" in result.lower(), result
     assert f"{external} (external)" in result
-    agent.storage.store_file.assert_any_call(v2_bytes, "KESTREL_CONSTITUTION.md")
+    assert await AsyncFileStore(agent._raw_storage.db).retrieve_file(v2_digest) == v2_bytes
     receipt = node.properties["constitution_reanchor"]
     assert receipt["path"] == str(external)
     assert receipt["source_kind"] == "external"

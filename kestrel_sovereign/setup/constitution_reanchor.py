@@ -875,6 +875,7 @@ async def reanchor_constitution(
         and not needs_sidecar_backfill
         and not governance_edge_drift
         and not custody_pending
+        and not (force and amendment_artifact_path is not None)
     ):
         return _result(
             old_hash=old_hash,
@@ -1090,7 +1091,15 @@ async def runtime_record_is_pending(target: ReanchorTarget) -> bool:
 
         agent = await storage.graph.get_node(target.agent_did)
         if agent is not None:
-            return is_fabricated_placeholder(agent, target.agent_did)
+            if not is_fabricated_placeholder(agent, target.agent_did):
+                return False
+            from kestrel_sovereign.identity.birth_record import BirthRecordReplayRefused, assert_birth_replay_custody
+
+            try:
+                await assert_birth_replay_custody(storage.db, target.agent_did)
+            except BirthRecordReplayRefused:
+                return False
+            return True
         # The bound read found nothing. Only a physically absent row is
         # pending; an existing one this agent cannot see is ledger damage.
         # By ``node_id`` alone, deliberately: a row occupying this DID under
@@ -1099,7 +1108,15 @@ async def runtime_record_is_pending(target: ReanchorTarget) -> bool:
         physical = await storage.db.fetchone(
             "SELECT 1 FROM graph_nodes WHERE node_id = ?", (target.agent_did,)
         )
-        return physical is None
+        if physical is not None:
+            return False
+        from kestrel_sovereign.identity.birth_record import BirthRecordReplayRefused, assert_birth_replay_custody
+
+        try:
+            await assert_birth_replay_custody(storage.db, target.agent_did)
+        except BirthRecordReplayRefused:
+            return False
+        return True
 
 
 async def _initial_anchor_custody_pending(target: ReanchorTarget) -> bool:
@@ -1217,13 +1234,14 @@ async def _read_agent_anchor(
         # See :mod:`kestrel_sovereign.constitution.anchored_bytes`.
         anchored_present = False
         from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash, governance_evidence
+        from kestrel_sovereign.constitution.reanchor_receipt import is_constitution_hash
 
         historical_hash = historical_anchor_hash(agent.properties, governed_by_targets)
         if historical_hash:
             anchored_text, anchored_present = await read_anchored_constitution(
                 storage.db, historical_hash
             )
-            if not anchored_hash and not anchored_present:
+            if not is_constitution_hash(anchored_hash) and not anchored_present:
                 raise ValueError("Missing anchor pointer's historical governing bytes could not be read; restore its exact prior pointer before signed repair")
         return (
             anchored_hash,
@@ -1303,6 +1321,13 @@ async def _write_reanchor(
     the target is a local file, remains untouched and available either way.
     """
     rag_index: ConstitutionRagIndex | None = None
+    from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
+
+    historical_hash = historical_anchor_hash(
+        governance_preflight["properties"], governance_preflight["governed_by_targets"],
+    )
+    from kestrel_sovereign.constitution.reanchor_receipt import reanchor_prior_pointer_fields
+
     async with target.open_storage() as storage:
         from kestrel_sovereign.constitution.runtime_state import ConstitutionRuntimeStateStore
 
@@ -1312,11 +1337,33 @@ async def _write_reanchor(
         storage.graph.bind_agent(agent_did)
         storage.files.bind_agent(agent_did)
         async with _agent_embedding(
-            storage.db, agent_did, needed=old_hash != new_hash,
+            storage.db, agent_did, needed=historical_hash != new_hash,
         ) as embedding, storage.db.transaction():
+            # The digests are known from the externally verified bytes.
+            # Match the runtime writer: complete graph custody and evidence
+            # comparison precede *all* file/ownership writes.
+            artifact_hash = hashlib.sha256(amendment_artifact_bytes).hexdigest()
+            await storage.graph.lock_nodes_for_update(
+                [agent_did, new_hash, artifact_hash, *governance_preflight["governed_by_targets"]]
+            )
+            from kestrel_sovereign.constitution.anchored_bytes import revalidate_governance_evidence
+
+            agent = await revalidate_governance_evidence(storage, agent_did, governance_preflight)
+            from kestrel_sovereign.constitution.reanchor_receipt import validate_constitution_reanchor_evidence
+
+            validate_constitution_reanchor_evidence(agent.properties, superseding=True)
+            # old_hash is a CLI display sentinel ("none" for no anchor).
+            # Receipt evidence must describe the actual freshly locked pointer,
+            # not reinterpret that display string as corrupt stored governance.
+            prior_pointer_fields = reanchor_prior_pointer_fields(
+                agent.properties.get("constitution_hash"), historical_hash,
+            )
             # 1. File blob (encrypted at rest if KESTREL_DATA_KEY is set).
-            stored_hash = await storage.files.store_file(
-                new_content, "KESTREL_CONSTITUTION.md"
+            from kestrel_sovereign.constitution.anchored_bytes import store_verified_governing_file
+
+            stored_hash = await store_verified_governing_file(
+                storage, new_content, verification=amendment_verification,
+                artifact_content=amendment_artifact_bytes,
             )
             if stored_hash != new_hash:
                 # store_file computes its own SHA256; if it disagrees with
@@ -1326,10 +1373,6 @@ async def _write_reanchor(
                     f"File store hash mismatch: stored {stored_hash}, expected {new_hash}"
                 )
 
-            artifact_hash = await storage.files.store_file(
-                amendment_artifact_bytes,
-                "KESTREL_CONSTITUTION.reanchor.signed.json",
-            )
             expected_artifact_hash = hashlib.sha256(
                 amendment_artifact_bytes
             ).hexdigest()
@@ -1343,13 +1386,6 @@ async def _write_reanchor(
             # this setup path writes the document before the artifact. Lock the
             # complete shared set first so semantic order cannot become an
             # opposite PostgreSQL row-lock order.
-            await storage.graph.lock_nodes_for_update(
-                [agent_did, new_hash, artifact_hash]
-            )
-            from kestrel_sovereign.constitution.anchored_bytes import revalidate_governance_evidence
-
-            await revalidate_governance_evidence(storage, agent_did, governance_preflight)
-
             # 2. Document graph node for the new constitution.
             await storage.graph.add_node(
                 GraphNode(
@@ -1400,6 +1436,17 @@ async def _write_reanchor(
                 (agent_did, new_hash),
             )
             stale_edge_targets = sorted({row[0] for row in stale_rows})
+            for stale_target in stale_edge_targets:
+                foreign_owner = await storage.db.fetchone(
+                    "SELECT 1 FROM graph_edge_owners "
+                    "WHERE source_id = ? AND target_id = ? "
+                    "AND label = 'governed_by' AND agent_id <> ?",
+                    (agent_did, stale_target, agent_did),
+                )
+                if foreign_owner:
+                    raise RuntimeError(
+                        "stale governing edges remain outside this agent's ownership"
+                    )
 
             # A physical edge at the correct hash with no ownership witness is
             # invisible to the bound store — it fails integrity proof 2 — and
@@ -1456,6 +1503,8 @@ async def _write_reanchor(
                     storage.db,
                     agent_did=agent_did,
                     embedding=embedding,
+                    # Historical evidence determines whether content changed,
+                    # not authority to delete chunks for a missing pointer.
                     old_hash=old_hash,
                     new_hash=new_hash,
                     content=new_content.decode("utf-8"),
@@ -1469,21 +1518,18 @@ async def _write_reanchor(
             if agent is None or agent.node_type != "agent":
                 raise RuntimeError("Agent node disappeared mid-reanchor")
             agent.properties["constitution_hash"] = new_hash
-            if old_hash != new_hash:
-                from kestrel_sovereign.constitution.genesis_audit import (
-                    supersede_genesis_audit,
-                )
+            from kestrel_sovereign.constitution.genesis_audit import supersede_genesis_audit
 
-                supersede_genesis_audit(
-                    agent.properties,
-                    constitution_hash=new_hash,
-                    provenance="setup:constitution_reanchor",
-                )
+            supersede_genesis_audit(
+                agent.properties,
+                constitution_hash=new_hash,
+                provenance="setup:constitution_reanchor",
+            )
             supersede_constitution_reanchor(
                 agent.properties,
                 receipt={
                     "timestamp": _now_iso(),
-                    "old_hash": old_hash,
+                    **prior_pointer_fields,
                     "new_hash": new_hash,
                     "source_path": str(canonical_path),
                     **governing_source.receipt_fields(),

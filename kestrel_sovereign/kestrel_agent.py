@@ -138,11 +138,15 @@ from kestrel_sovereign.telemetry import (
 )
 
 if TYPE_CHECKING:
+    from kestrel_sovereign.a2a.agent_card import AgentCard
     from kestrel_sovereign.features.peers.directory import (
         PeerDirectoryRouter,
         PeerRequester,
     )
-    from kestrel_sovereign.knowledge.inference import InferenceProfile
+    from kestrel_sovereign.knowledge.inference import InferenceLimits, InferenceProfile
+    from kestrel_sovereign.knowledge.capabilities import SemanticRuntimeCapabilities
+    from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceLimits
+    from kestrel_sovereign.storage import GraphNode
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
 
 # Optional ollama import (not available in remote-only containers)
@@ -3216,11 +3220,30 @@ class KestrelAgent(
         )
         # Trusted control-plane write: agent identity node. The capability
         # admits the durable identity write in a volatile mode (#2672).
-        await self.storage.add_node(
-            agent_node, capability=acquire_control_plane_capability()
+        from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
+
+        created = await self.storage.compare_and_swap_node(
+            self.agent_id, None, agent_node,
+            capability=acquire_control_plane_capability(),
         )
-        logging.info("Agent node created")
-        return agent_node
+        if created == NodeSwapResult.SWAPPED:
+            logging.info("Agent node created")
+            return agent_node
+        # The initial absence was only a snapshot. Another native publisher
+        # may already have anchored this DID and its terminal audit/history.
+        # Never replace that winner with boot's provisional properties.
+        winner = await self.storage.get_node(self.agent_id)
+        if (
+            created == NodeSwapResult.PREDICATE_FAILED
+            and winner is not None
+            and winner.node_type == "agent"
+        ):
+            return winner
+        from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
+
+        raise IdentityReadinessError(
+            "birth_record", cause_type="AgentRootCreationConflict"
+        )
 
     def _refuse_if_birth_record_in_another_database(self) -> None:
         """Refuse to fabricate an agent node when inception's birth record is
@@ -3327,6 +3350,15 @@ class KestrelAgent(
         )
         if not shortfall:
             return
+        if shortfall.identity:
+            from kestrel_sovereign.identity.birth_record import assert_birth_replay_custody
+
+            try:
+                await assert_birth_replay_custody(runtime_db, self.agent_id)
+            except ValueError as exc:
+                raise IdentityReadinessError(
+                    "birth_record", cause_type="BirthRecordReplayRefused"
+                ) from exc
 
         anchor_db = None
         copy_committed = False
@@ -6808,6 +6840,9 @@ Expected Duration: {expected_duration}
                     # authority. The observability feature may replace this
                     # with its dedicated turn-root span in USER_PROMPT_SUBMIT.
                     self.bind_current_turn_span(_otel_span)
+                    genesis_block = await self._genesis_audit_cognition_block(user_input)
+                    if genesis_block is not None:
+                        return genesis_block
                     # A feature/privacy transition can latch Safe Mode while this turn
                     # is queued for the same boundary. Recheck after acquisition so a
                     # request admitted under the prior generation cannot execute over

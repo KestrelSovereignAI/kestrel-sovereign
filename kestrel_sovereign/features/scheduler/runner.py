@@ -2387,6 +2387,10 @@ class SchedulerRunner:
         if self._database_backend_type() != "sqlite":
             return None
         backend = getattr(self._db, "backend", None)
+        from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+        if isinstance(backend, SQLiteBackend):
+            backend.assert_connected_file_still_valid()
         db_path = getattr(backend, "db_path", None)
         if not isinstance(db_path, str) or not db_path or db_path == ":memory:":
             return None
@@ -2396,7 +2400,7 @@ class SchedulerRunner:
         # lock. ``realpath`` also has useful non-strict behavior for a database
         # that has not been created yet (or a broken leaf symlink): it resolves
         # every existing parent and retains the unresolved suffix.
-        canonical = os.path.realpath(os.path.abspath(db_path))
+        canonical = db_path if isinstance(backend, SQLiteBackend) else os.path.realpath(os.path.abspath(db_path))
         digest = hashlib.sha256(
             f"{canonical}\0{agent_id}".encode("utf-8")
         ).hexdigest()
@@ -2441,6 +2445,9 @@ class SchedulerRunner:
             lock.release()
             raise
         try:
+            # Revalidate after a potentially blocking lock acquisition, not
+            # only before deriving the original connected target's sidecar.
+            self._sqlite_rollout_lock_path(agent_id)
             yield
         finally:
             if acquired:

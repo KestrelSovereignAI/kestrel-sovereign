@@ -26,6 +26,7 @@ from .interface import (
     TransactionError,
 )
 from .write_audit import record_write_query, record_write_script
+from .transaction_control import reject_transaction_control, sqlite_statements
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,18 @@ def _is_sqlite_interrupt(exc: Exception) -> bool:
         isinstance(exc, sqlite3.OperationalError)
         and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT
     )
+
+
+def _owned_script_statements(script: str) -> list[str]:
+    """Split with SQLite's grammar, retaining the outer transaction owner.
+
+    ``executescript`` implicitly commits before executing anything, even when
+    our task owns an open transaction. Use individual complete statements in
+    that case. SQLite's completeness parser handles quoted semicolons and
+    trigger bodies; this is not a split-on-semicolon SQL parser.
+    """
+    reject_transaction_control(script, dialect="sqlite")
+    return sqlite_statements(script)
 
 
 @dataclass
@@ -367,7 +380,6 @@ class SQLiteBackend(DatabaseBackend):
                 ``identity.local_anchor``: refuse when sidecars are present,
                 then open ``immutable=1``, which creates none.
         """
-        self.db_path = db_path
         self.cold_read = cold_read
         #: Resolved ONCE, and used for the URI, the sidecar checks and the
         #: change marker alike. SQLite places ``-wal``/``-shm`` beside the
@@ -384,7 +396,10 @@ class SQLiteBackend(DatabaseBackend):
         #: Committed-state fingerprint taken when an immutable read began.
         self._cold_read_marker: tuple = ()
         self._connection: Optional[aiosqlite.Connection] = None
+        self._connected_file_identity: Optional[tuple[int, int]] = None
         self._in_transaction = False
+        self._transaction_poisoned = False
+        self._savepoint_counter = 0
         # Serializes operation *units* on the single shared connection. aiosqlite
         # serializes individual operations, but NOT the execute->commit/rollback
         # pair: without this, two concurrent autocommit writers share one
@@ -431,14 +446,52 @@ class SQLiteBackend(DatabaseBackend):
         return "joined"
 
     @property
+    def transaction_options(self) -> frozenset[str]:
+        """Explicit extensions beyond the SDK's transaction() contract."""
+        return frozenset({"immediate", "savepoint"})
+
+    @property
     def owns_open_transaction(self) -> bool:
-        """Whether the current task has a transaction open here, which a
-        ``transaction()`` entered now would join rather than commit."""
+        """Whether this task still owns the enclosing transaction scope.
+
+        Implicit rollback destroys native write custody, not the caller scope
+        or its writer lock. Keep ownership visible until that scope exits so
+        higher-level lock ordering cannot treat poisoned custody as top-level.
+        SQL operations separately enforce healthy native transaction custody.
+        """
         return self._in_transaction and self._txn_owner is asyncio.current_task()
 
     @property
     def is_connected(self) -> bool:
         return self._connection is not None
+
+    @property
+    def db_path(self) -> str:
+        """Construction-time resolved target, shared by all native consumers.
+
+        Retargeting a connected backend is not supported. In particular a
+        caller cannot rewrite its public path while the connection retains a
+        different inode. Consumers opening siblings also verify file custody.
+        """
+        return ":memory:" if self._resolved_path is None else str(self._resolved_path)
+
+    @property
+    def connected_file_identity(self) -> Optional[tuple[int, int]]:
+        """The inode retained at connection acquisition, not a fresh path stat."""
+        return self._connected_file_identity
+
+    def assert_connected_file_still_valid(self) -> None:
+        """Refuse file custody inferred from a replaced pathname or new cwd."""
+        if self._connection is None:
+            raise ConnectionError("SQLite file custody requires a connected backend")
+        if self._resolved_path is None:
+            return
+        try:
+            current = self._resolved_path.lstat()
+        except OSError as exc:
+            raise ConnectionError("SQLite connected database pathname changed; retain recovery evidence") from exc
+        if (current.st_dev, current.st_ino) != self._connected_file_identity:
+            raise ConnectionError("SQLite connected database inode changed; retain recovery evidence")
 
     @property
     def write_connection_unavailable(self) -> bool:
@@ -646,8 +699,17 @@ class SQLiteBackend(DatabaseBackend):
             # existence — "there is nothing here" is an answer it has to be
             # able to give.
             if self.db_path != ":memory:" and not self.cold_read:
-                db_dir = Path(self.db_path).parent
+                db_dir = self._resolved_path.parent
                 db_dir.mkdir(parents=True, exist_ok=True)
+
+            before_identity = None
+            if self._resolved_path is not None:
+                try:
+                    before = self._resolved_path.stat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    before_identity = (before.st_dev, before.st_ino)
 
             if self.cold_read:
                 self._connection = await aiosqlite.connect(
@@ -657,8 +719,15 @@ class SQLiteBackend(DatabaseBackend):
                 )
             else:
                 self._connection = await aiosqlite.connect(
-                    self.db_path, timeout=_SQLITE_BUSY_TIMEOUT_S
+                    str(self._resolved_path) if self._resolved_path is not None else ":memory:",
+                    timeout=_SQLITE_BUSY_TIMEOUT_S,
                 )
+
+            if self._resolved_path is not None:
+                opened = self._resolved_path.stat()
+                self._connected_file_identity = (opened.st_dev, opened.st_ino)
+                if before_identity is not None and before_identity != self._connected_file_identity:
+                    raise ConnectionError("SQLite database inode changed during connection acquisition")
 
             # Enable WAL mode for better concurrency. Skipped for a cold read:
             # setting the journal mode WRITES to the database header, so this
@@ -781,6 +850,7 @@ class SQLiteBackend(DatabaseBackend):
             logger.debug(f"Closed SQLite connection: {self.db_path}")
         finally:
             self._connection = None
+            self._connected_file_identity = None
             self._cancelled_write_drain = None
             self._cancelled_write_drain_started_at = None
             self._cancelled_write_drain_error = None
@@ -822,10 +892,14 @@ class SQLiteBackend(DatabaseBackend):
 
     async def _open_snapshot_read_connection(self) -> aiosqlite.Connection:
         """Open a one-shot connection for committed reads during another task's txn."""
+        self.assert_connected_file_still_valid()
         conn = await aiosqlite.connect(
-            self.db_path, timeout=_SQLITE_BUSY_TIMEOUT_S
+            self._resolved_path.as_uri() + "?mode=rw",
+            uri=True,
+            timeout=_SQLITE_BUSY_TIMEOUT_S,
         )
         try:
+            self.assert_connected_file_still_valid()
             await conn.execute(
                 f"PRAGMA busy_timeout={int(_SQLITE_BUSY_TIMEOUT_S * 1000)}"
             )
@@ -903,6 +977,7 @@ class SQLiteBackend(DatabaseBackend):
         the independent snapshot path instead.
         """
         if self._txn_owner is not None and self._txn_owner is asyncio.current_task():
+            self._require_native_transaction()
             yield
             return
 
@@ -919,6 +994,13 @@ class SQLiteBackend(DatabaseBackend):
                 self._raise_cancelled_write_drain_error()
                 yield
                 return
+
+    def _require_native_transaction(self) -> None:
+        """Implicit SQLite rollback must never turn an owning scope into autocommit."""
+        if self._in_transaction and self._txn_owner is asyncio.current_task():
+            if self._transaction_poisoned or not self._ensure_connected().in_transaction:
+                self._transaction_poisoned = True
+                raise TransactionError("SQLite owning transaction was rolled back implicitly; scope is poisoned")
 
     @contextmanager
     def _write_operation(self) -> Iterator[None]:
@@ -1201,6 +1283,8 @@ class SQLiteBackend(DatabaseBackend):
 
     async def execute(self, query: str, params: Params = ()) -> int:
         """Execute a write query."""
+        if self.owns_open_transaction:
+            reject_transaction_control(query, dialect="sqlite")
         record_write_query(query)
         conn = self._ensure_connected()
         async with self._write_guard():
@@ -1227,6 +1311,8 @@ class SQLiteBackend(DatabaseBackend):
         """Execute query with multiple parameter sets."""
         if not params_list:
             return 0
+        if self.owns_open_transaction:
+            reject_transaction_control(query, dialect="sqlite")
         record_write_query(query)
         conn = self._ensure_connected()
         async with self._write_guard():
@@ -1287,6 +1373,8 @@ class SQLiteBackend(DatabaseBackend):
         connections remain owned by :meth:`_read_connection` and close there.
         """
         cursor: Optional[aiosqlite.Cursor] = None
+        if self.owns_open_transaction:
+            reject_transaction_control(query, dialect="sqlite")
         cancelled = False
         try:
             cursor = await conn.execute(query, params)
@@ -1409,7 +1497,12 @@ class SQLiteBackend(DatabaseBackend):
         async with self._write_guard():
             with self._write_operation():
                 try:
-                    await conn.executescript(script)
+                    if self._in_transaction:
+                        for statement in _owned_script_statements(script):
+                            cursor = await conn.execute(statement)
+                            await cursor.close()
+                    else:
+                        await conn.executescript(script)
                     if not self._in_transaction:
                         await conn.commit()
                 except asyncio.CancelledError:
@@ -1426,7 +1519,7 @@ class SQLiteBackend(DatabaseBackend):
                     raise
 
     @asynccontextmanager
-    async def transaction(self, *, immediate: bool = False) -> AsyncIterator[None]:
+    async def transaction(self, *, immediate: bool = False, savepoint: bool = False) -> AsyncIterator[None]:
         """Transaction context manager.
 
         ``BEGIN IMMEDIATE`` is reserved for one-time schema migrations that
@@ -1437,10 +1530,29 @@ class SQLiteBackend(DatabaseBackend):
         conn = self._ensure_connected()
 
         if self._in_transaction and self._txn_owner is asyncio.current_task():
-            # Nested transaction in the SAME task — just yield (SQLite doesn't
-            # support savepoints well). A *different* task starting a
-            # transaction falls through and waits on the write lock below.
-            yield
+            self._require_native_transaction()
+            if not savepoint:
+                yield
+                self._require_native_transaction()
+                return
+            # Explicit independently rollback-safe unit inside a joined owner.
+            # Other callers retain the established joined-scope semantics.
+            self._savepoint_counter += 1
+            name = f"kestrel_scope_{self._savepoint_counter}"
+            await conn.execute(f"SAVEPOINT {name}")
+            try:
+                yield
+                self._require_native_transaction()
+                await conn.execute(f"RELEASE SAVEPOINT {name}")
+            except BaseException:
+                if conn.in_transaction and not self._transaction_poisoned:
+                    try:
+                        await conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+                        await conn.execute(f"RELEASE SAVEPOINT {name}")
+                    except BaseException:
+                        self._transaction_poisoned = True
+                        raise
+                raise
             return
 
         # Hold the write lock for the whole BEGIN..COMMIT/ROLLBACK span so the
@@ -1449,10 +1561,12 @@ class SQLiteBackend(DatabaseBackend):
         async with self._write_guard():
             with self._write_operation():
                 self._in_transaction = True
+                self._transaction_poisoned = False
                 self._txn_owner = asyncio.current_task()
                 try:
                     await conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
                     yield
+                    self._require_native_transaction()
                     await conn.commit()
                 except asyncio.CancelledError:
                     self._handoff_cancelled_write(conn)
@@ -1465,6 +1579,7 @@ class SQLiteBackend(DatabaseBackend):
                     raise
                 finally:
                     self._in_transaction = False
+                    self._transaction_poisoned = False
                     self._txn_owner = None
     
     async def table_exists(self, table_name: str) -> bool:

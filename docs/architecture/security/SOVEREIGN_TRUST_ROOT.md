@@ -93,6 +93,241 @@ write. With `--force`, a signed artifact and external root are mandatory. A
 successful write stores the signed artifact and signer/verification details in
 the audit record. Reanchor never exits Safe Mode automatically.
 
+### Native publication and recovery custody
+
+The native runtime and offline signed writers reserve their complete graph
+write set in canonical order before writing file blobs or ownership rows.
+Inside that owning transaction they compare the exact governing pointer,
+rights, receipt/history and edge witness against the facts inspected before
+authorization. A concurrent change requires a fresh inspection and signed
+repair attempt; unrelated identity metadata is preserved, not overwritten.
+Historical plaintext must hash to its addressed digest before it can supply
+legacy emancipation-rights evidence. Readable corrupt bytes are unreadable
+evidence, not permission to treat an active contract as dormant.
+Native edge deletion and avatar publication participate in the same graph-first
+order; they must not acquire edge/file ownership before reserving graph rows.
+Signed file publication retains both the physical blob and exact tenant owner
+through commit. Restoring a missing owner never copies another tenant's shared
+blob metadata into the new ownership record.
+Both the constitution and its exact detached signed artifact use that same
+byte-validation and ownership-custody path. An absent locking-read result is
+not custody, even if a later ordinary read can see a replacement.
+
+A signed same-hash repair is still a repair. It restores missing verified
+public constitution content or this agent's file ownership, records the new
+signer and retains the previous reanchor receipt as history. Existing content
+must exactly match the signed bytes; corrupted content is refused. Because
+the governing hash did not change, an existing genesis receipt is preserved
+and the content audit is not repeated merely for key rotation.
+This also applies when signed repair restores a lost operative pointer from
+unambiguous validated historical evidence: unchanged bytes preserve the exact
+completed receipt, including rejection. Pointer loss is not a new constitution.
+The signed writer retains a physical blob lock while validating those bytes,
+including validating the actual winner of a concurrent absent-row insertion.
+Restoring ownership inserts only a missing witness and preserves existing
+per-agent filenames and provenance metadata.
+
+Genesis content-audit results are published against their captured governing
+and runtime-state witness. The native publisher merges only the new receipt
+into a freshly locked identity and publishes its new runtime CAS token after
+commit. If the witness changed, cognition reports a blocked genesis audit
+without overwriting the newer governance, rejection or identity metadata.
+Conversation notices are delivered only after the authoritative receipt commits;
+volatile privacy buffers cannot retain a success notice from SQL rollback.
+An ordinary SQL notice-delivery failure is reported separately and cannot
+replace the committed audit outcome or cause that hash to be audited again.
+The locking reads must actually return each captured existing edge and the
+current edge's own tenant witness; a later ordinary reread is not a substitute.
+Required-target attestations also retain the actual target node and this
+agent's ownership witness, not just an edge pointing to that target.
+Initial bootstrap refuses any prior governance evidence rather than expanding
+its lock set and pruning history without a signed repair.
+
+Safe Mode exit verifies again inside its owning transaction. PostgreSQL holds
+the identity/ownership, governing edges/ownership and constitution file/owner
+rows through the exit commit; SQLite retains its native writer custody. Both
+backends require actual physical identity and governing-edge ownership rows:
+serialization does not substitute for existence. Exit decrypts and hashes the
+locked tenant-owned native blob; an ISOLATED session cache is not durable
+integrity evidence. Periodic integrity verification, governing-text retrieval
+and genesis input read the bound native store as well, not that cache. A passed
+genesis publication re-attests native bytes inside its commit owner after the
+auditor await; concurrent blob corruption cannot publish a fresh pass.
+Successful ordinary integrity-audit publication likewise repeats verification
+under native custody before resetting the durable audit deadline. Direct and
+streaming requests recheck hash-bound genesis readiness after acquiring their
+turn boundary, so queued requests cannot inherit admission for an older hash.
+Admission also rereads the native runtime revision/generation and restrictions;
+graph, governing-file and runtime-row custody retain a consistent snapshot in
+one bounded native transaction, without holding locks over provider work.
+another replica's committed Safe Mode cannot be hidden by a local flag. A
+task-local witness pairs the admitted turn with its passed governing hash and
+receipt. Later governing-text retrieval refuses a changed pointer or receipt
+instead of supplying a newly repaired but unaudited constitution to cognition.
+Commit-time attestation refusal propagates the final integrity verdict to
+explicit diagnostics and periodic observers; the earlier positive diagnostic
+is not reported as successful publication or mislabeled as a storage outage.
+New-identity bootstrap uses the same exact-native-byte
+publisher as signed repair, only after resolver verification and the durable
+single-use bootstrap fence, so volatile privacy storage cannot consume authority
+without publishing the constitution. Birth-record replication reserves its full
+graph and payload-blob set before file-owner writes, while still publishing
+files before nodes for tenant admission. Source and destination bytes are
+verified, including existing physical conflict winners. Same-named file custody
+cannot claim another tenant's private graph properties; public shared-content
+metadata must pass canonical admission. A missing runtime identity cannot be
+restored from a frozen birth record once its constitutional lifetime was
+consumed. Signed recovery must preserve its existing audit history.
+
+Native inception checks deterministic identity/lifetime custody before minting,
+then checks again after audit/provider awaits. Keys remain in a private staging
+directory until final native admission, so even `force` cannot replace active
+keys on a refused birth. A partial filesystem publication restores the original
+active files; an uncertain database commit retains the published keys for
+recovery rather than deleting potentially committed identity material.
+Locally owned SQLite `force` inspects the original database under writer custody
+without initializing its schema, before archiving any database/WAL/key artifact.
+An existing or consumed deterministic identity is refused with its original
+state/history intact. Active or archived key names are also prior-identity
+evidence: a fresh database after another forced birth is not authority to reuse
+an older identity slug. Use authorized recovery for that identity, or a genuinely
+new identity namespace for a new birth. Archived databases remain authoritative
+independently of key filenames: native cold reads check their identity and
+lifetime rows without schema writes, and refuse linked, raced, incomplete or
+unreadable evidence. More than 128 archived databases requires authorized
+recovery; inception never discards old authority to fit an inspection bound.
+Creation holds a nonblocking cross-process output-directory lock throughout
+admission, archival, publication and cleanup. Its lock inode is retained after
+release (process death releases the OS lock). An owned database is exclusively
+created before SQLite opens it; failure cleanup refuses replacement/shared
+inodes and never overwrites a database through a following pathname.
+Ownership cleanup also covers the first pathname inspection after successful
+connection acquisition. If that inspection fails, close is settled even under
+repeated cancellation. Missing retirement acknowledgement retains recovery
+evidence and reports both the inspection and cleanup failures; it is not a
+permission to remove a potentially live database.
+
+Genesis receipt history has one shared publication/runtime limit of 128 entries.
+A repair requiring a 129th entry, or encountering already-overflowed or malformed
+history, refuses atomically and preserves all existing evidence. Neither runtime
+nor offline repair truncates receipts to make room. Repeating signed repairs is
+not permission to discard earlier content-audit verdicts.
+Reanchor receipt history independently uses the same 128-entry bound. Its
+current receipt, every archived receipt and supersession hash, and the proposed
+archive length are checked by one shared reader/writer rule, including when the
+operative anchor is intact. Both runtime and offline repair validate the locked
+evidence before file-owner publication. Repeated same-content repairs cannot
+append a 129th receipt or replace malformed history with an empty list. Legacy
+receipts without artifact hashes remain preserved; recovery never invents a
+signature for old evidence.
+
+A malformed operative pointer is not a typed hash and cannot make retained
+contract bytes disappear from the rights check. Repair requires unambiguous,
+bounded historical hash evidence and readable addressed bytes, followed by
+independent external-root signature verification. A successful new receipt
+records the recovered digest in `old_hash` and preserves the original bounded
+string in `repaired_constitution_pointer` as diagnostic data, never signing
+authority. Missing, contradictory or unreadable evidence refuses without
+publication. Existing malformed receipts are not normalized by this recovery.
+
+Native SQLite resolves its database target once at construction and exposes a
+read-only absolute path. Primary connections, snapshot reads, SQLAlchemy
+adapters, storage audit/backup sidecars and scheduler rollout locks share that
+target even after the working directory changes. Connected inode custody is
+checked at adapter admission, connection checkout, statement execution and
+commit, and again after a blocking scheduler lock acquisition. Native
+SQLAlchemy connections open in read/write-only URI mode: a removed database is
+not silently recreated. Replacement or missing custody refuses access rather
+than admitting a different database through the old pathname.
+SQLite turn admission and final successful-audit/Safe-Mode-exit attestation reserve
+the writer slot before their first governance read, avoiding stale deferred WAL
+snapshots after unrelated writers commit. No provider work runs in that span.
+Surviving runtime events also veto unsigned replay if the current state row is
+lost. Such identities are not pending first-boot targets; offline tools retain
+the runtime target and return a structured refusal, not an uncaught exception.
+Existing-identity restore likewise refuses to treat surviving lifetime history
+as legacy migration: it creates a restricted new generation requiring explicit
+authorized recovery, never an unrestricted automatic audit. Recovery also
+requires the native feature registry's independent repair proof:
+lost runtime state cannot prove that the prior restriction was constitutional
+rather than a quarantined feature lifecycle. Recreating a lifetime checks its
+surviving history inside the native allocation transaction, not only before it.
+The populated-runtime upgrade assigns nonempty immutable `legacy:` generations
+without resetting restrictions, timestamps, counters or pending markers. Those
+generations permit ordinary audited turn admission but cannot authorize a new
+automatic first anchor; an old pending bit is not new-identity authority.
+Frozen birth replay likewise refuses a migrated pending lifetime rather than
+restoring it as a newly created identity.
+Doctrine metadata
+writers use native compare-and-swap to preserve concurrent completed receipts.
+Bootstrap status, description, rename, overlay, payer credential-handle and
+graduation metadata writers merge only
+their own fields into a freshly locked native identity. An old identity read
+cannot replace newer governance, and a failed write does not mutate its read
+object or report a live rename. Runtime genesis audit, turn admission and
+commit-time exit reconcile matching current and historical terminal receipts
+before granting authority or calling an auditor. A missing or pending current
+receipt cannot reroll a historical rejection; contradictory terminals refuse
+without choosing a favorable result. History validation is bounded.
+Completed same-content genesis receipts survive an incorrect operative pointer
+as well as a missing one. Conflicting completed evidence is refused rather than
+selecting a favorable result. Supported legacy timestamp/risk/hash receipts are
+normalized through the same validator as runtime migration; malformed matching
+current or historical receipts are refused, not silently skipped and rerolled.
+Verified signed repair publishes governance in
+the native control-plane transaction in volatile privacy modes too; ordinary
+feature-facing privacy restrictions remain unchanged.
+Inception uses the same exact-byte native publisher, and a post-commit SQL
+conversation-notice failure does not undo creation or skip remaining completion
+work. Under its owning graph and lifetime custody, inception refuses an existing
+physical identity or any prior constitutional lifetime, including a consumed
+lifetime whose root was deleted. Deterministic DID reuse requires authorized
+recovery, not new key minting over old governance. Pre-commit publication failures remove only that attempt's newly minted
+identity artifacts and close/remove its internally created database; an external
+database remains caller-owned, and committed identity artifacts are preserved.
+Cancellation receives the same rollback cleanup, including while the genesis
+auditor awaits before publication. Inception refuses caller-owned transactions
+before minting. Once its publication body has completed, lost commit delivery is
+uncertain even if the identity or its ownership rows later disappear: minted
+keys are retained, never deleted based on a tenant-filtered absence. If its
+outcome cannot be read, identity keys are retained rather than erased.
+Native SQLite advertises its optional savepoint extension explicitly. Standard
+SDK adapters retain the argument-free top-level transaction contract; adapters
+that only join nested scopes refuse isolated avatar publication before writes.
+Avatar publication retains and verifies the actual decrypted blob and exact
+tenant owner before publishing a graph reference or identity avatar pointer.
+The input digest alone is not evidence that a conflict winner contains the
+image; corruption rolls back isolated publication even when a caller catches
+the refusal and commits its surrounding transaction.
+Physical lock ordering uses PostgreSQL's canonical `C`
+collation; target equality does not depend on database locale.
+An existing genesis receipt must validate as a literal pass, not merely be
+terminal. Failure leaves the durable restriction and exit-event history intact.
+After a changed-hash repair the public genesis audit/readiness path can complete
+the new hash's pending audit while Safe Mode remains active. Explicit authorized
+exit follows that real audit; repeating a same-hash repair does not reroll it.
+Physical edge locks follow ownership-then-edge order, matching native deletion.
+Exit locks only its reserved current governing target, not unrelated stale-edge
+ownership held by cleanup. Other publishers reserve the complete captured set
+and refuse set changes without acquiring new endpoints out of order.
+
+All native SQL entry points, including script execution and SQLite diagnostic
+reads, refuse SQL transaction-control commands while an owning transaction is
+open. Callers must use the adapter's transaction context rather than issuing
+`BEGIN`, `COMMIT`, `ROLLBACK`, savepoint commands or `PREPARE` through SQL.
+SQLite scripts in an owned transaction execute statement-by-statement without
+the driver's implicit pre-script commit; trigger bodies and PostgreSQL
+dollar-quoted and SQL-standard `BEGIN ATOMIC` routine bodies, and
+newline-continued escape strings retain their database
+semantics. This lexical refusal
+protects the commit boundary; it is not a general SQL authorization parser.
+If a conflict policy or trigger implicitly rolls back SQLite's native owner,
+the adapter poisons the scope: subsequent work and successful completion are
+refused rather than escaping into autocommit. Explicit nested savepoint scopes
+make avatar publication independently rollback-safe even if an outer caller
+catches rejection and commits unrelated work. Default nested scopes remain
+joined for compatibility.
+
 ### Hosted PostgreSQL agents without a local anchor
 
 An embedding host that stores agent identities in PostgreSQL, with no local

@@ -235,6 +235,7 @@ class TestOverlayAnchorVerification:
 
     def _node(self, props):
         n = MagicMock()
+        n.node_type = "agent"
         n.properties = dict(props)
         return n
 
@@ -242,6 +243,7 @@ class TestOverlayAnchorVerification:
         storage = MagicMock()
         storage.get_node = AsyncMock(return_value=node)
         storage.add_node = AsyncMock()
+        storage.lock_nodes_for_update = AsyncMock()
         agent.storage = storage
         return storage
 
@@ -337,6 +339,8 @@ class TestOverlayAnchorVerification:
         storage = self._set_storage(agent, node)
         ok, msg = await agent.anchor_constitution_overlay()
         assert ok is True
-        assert node.properties["constitution_overlay_hash"] == sha
+        written = storage.add_node.await_args.args[0]
+        assert written.properties["constitution_overlay_hash"] == sha
+        assert node.properties == {}, "A read/cache snapshot is not mutated before publication"
         storage.add_node.assert_awaited()
         assert agent.constitution_overlay_verified is True

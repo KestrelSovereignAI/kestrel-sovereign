@@ -214,20 +214,13 @@ async def _rename_agent_core_locked(agent, old_name: str, new_name: str) -> Rena
 
     # Update agent node properties
     try:
-        agent_node = await agent.storage.get_node(agent.agent_id)
-        if agent_node:
-            updated_node = copy(agent_node)
-            updated_node.properties = dict(agent_node.properties)
-            updated_node.properties["name"] = new_name
-            updated_node.label = new_name
-            # Trusted control-plane write: the agent identity node. Rename is an
-            # explicit operator identity action, so the capability admits it in a
-            # volatile mode (the durable ``agent_metadata`` name row above is the
-            # matching identity write) (#2672).
-            await agent.storage.add_node(
-                updated_node, capability=acquire_control_plane_capability()
-            )
-            graph_updated = True
+        from kestrel_sovereign.storage.identity_metadata import merge_identity_metadata
+
+        updated_node = await merge_identity_metadata(
+            agent.storage, agent.agent_id, {"name": new_name}, label=new_name,
+            capability=acquire_control_plane_capability(),
+        )
+        graph_updated = updated_node is not None
     except Exception as e:
         logger.error(f"Agent rename failed after metadata write: {e}", exc_info=True)
         return RenameOutcome(

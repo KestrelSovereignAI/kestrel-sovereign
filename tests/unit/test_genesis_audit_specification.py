@@ -87,27 +87,60 @@ async def test_actual_submitted_prompt_is_bound_to_pass_and_rejection_receipts(r
 
 
 def test_legacy_failed_receipt_is_not_invalidated_by_a_new_specification():
+    old_hash = sha256(b"old governing content").hexdigest()
     receipt = {
         "status": "failed",
-        "constitution_hash": "old-content-hash",
+        "constitution_hash": old_hash,
         "completed_at": "2026-10-08T13:16:42Z",
         "risk_level": 3,
         "reasoning": "Historical rejection must remain a rejection.",
         "audited": True,
     }
     original = deepcopy(receipt)
-    assert validate_completed_genesis_audit(receipt, "old-content-hash") == "failed"
+    assert validate_completed_genesis_audit(receipt, old_hash) == "failed"
     assert receipt == original
 
     properties = {"genesis_audit": receipt}
     pending = supersede_genesis_audit(
         properties,
-        constitution_hash="new-content-hash",
+        constitution_hash=sha256(b"new governing content").hexdigest(),
         provenance="test:explicit_reanchor",
     )
     assert properties["genesis_audit_history"][0]["receipt"] == original
     assert pending["status"] == "pending"
     assert pending["audited"] is False
+
+
+@pytest.mark.parametrize("location", ["current", "history"])
+@pytest.mark.parametrize("damage", ["unknown-status", "legacy-time", "legacy-bool", "legacy-unaudited", "legacy-null-audited", "legacy-invalid-completed", "legacy-null-completed", "legacy-contradictory-completed", "pending-completed"])
+def test_matching_malformed_receipt_never_becomes_new_pending_audit(location, damage):
+    digest = "matching-governing-hash"
+    receipt = {"constitution_hash": digest, "timestamp": "2026-10-09T21:00:00Z", "risk_level": 3}
+    if damage == "unknown-status":
+        receipt["status"] = "unknown"
+    elif damage == "legacy-time":
+        receipt["timestamp"] = "invalid"
+    elif damage == "legacy-bool":
+        receipt["risk_level"] = True
+    elif damage == "legacy-unaudited":
+        receipt["audited"] = False
+    elif damage == "legacy-null-audited":
+        receipt["audited"] = None
+    elif damage == "legacy-invalid-completed":
+        receipt["completed_at"] = "invalid"
+    elif damage == "legacy-null-completed":
+        receipt["completed_at"] = None
+    elif damage == "legacy-contradictory-completed":
+        receipt["completed_at"] = "2026-10-08T21:00:00Z"
+    else:
+        receipt.update(status="pending", audited=True)
+    properties = {"genesis_audit": receipt} if location == "current" else {
+        "genesis_audit_history": [{"receipt": receipt}],
+    }
+    before = deepcopy(properties)
+    with pytest.raises(GenesisAuditError):
+        supersede_genesis_audit(properties, constitution_hash=digest, provenance="test:refusal")
+    assert properties == before
 
 
 @pytest.mark.asyncio

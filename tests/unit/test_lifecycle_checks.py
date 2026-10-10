@@ -11,6 +11,7 @@ Meridian hit during the Feb-Mar 2026 incidents:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -298,12 +299,20 @@ def test_identity_check_treats_whitespace_only_env_as_unset(monkeypatch):
 class _Node:
     node_id: str
     properties: dict
+    node_type: str = "agent"
 
 
 class _Storage:
     def __init__(self, node):
         self.node = node
         self.saved = None
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield
+
+    async def lock_nodes_for_update(self, node_ids):
+        pass
 
     async def get_node(self, node_id):
         return self.node if node_id == self.node.node_id else None

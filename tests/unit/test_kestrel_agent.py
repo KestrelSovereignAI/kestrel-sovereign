@@ -20,6 +20,7 @@ from decimal import Decimal
 from kestrel_sovereign.features.peers.directory import PeerRequester
 from kestrel_sovereign.kestrel_agent import KestrelAgent, _load_prompt_file
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
+from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
 from kestrel_sovereign.agent.streaming import (
     StreamingMixin,
     resolve_turn_invocation_context,
@@ -189,6 +190,7 @@ async def _initialize_with_features(
                     mock_storage.initialize = AsyncMock()
                     mock_storage.get_node = AsyncMock(return_value=None)
                     mock_storage.add_node = AsyncMock()
+                    mock_storage.compare_and_swap_node = AsyncMock(return_value=NodeSwapResult.SWAPPED)
                     mock_storage.db = MagicMock()
                     mock_storage._backend = _durable_backend_double()
                     # Hosted feature config is deliberately accessible only
@@ -3261,6 +3263,7 @@ class TestInitialize:
                         mock_storage_instance.initialize = AsyncMock()
                         mock_storage_instance.get_node = AsyncMock(return_value=None)
                         mock_storage_instance.add_node = AsyncMock()
+                        mock_storage_instance.compare_and_swap_node = AsyncMock(return_value=NodeSwapResult.SWAPPED)
                         mock_storage_instance.db = MagicMock()
                         mock_storage_instance._backend = _durable_backend_double()
                         MockStorage.return_value = mock_storage_instance
@@ -3305,6 +3308,7 @@ class TestInitialize:
                         mock_storage_instance.initialize = AsyncMock()
                         mock_storage_instance.get_node = AsyncMock(return_value=None)
                         mock_storage_instance.add_node = AsyncMock()
+                        mock_storage_instance.compare_and_swap_node = AsyncMock(return_value=NodeSwapResult.SWAPPED)
                         mock_storage_instance.db = MagicMock()
                         mock_storage_instance._backend = _durable_backend_double()
                         MockStorage.return_value = mock_storage_instance
@@ -3343,6 +3347,7 @@ class TestInitialize:
                         mock_storage.initialize = AsyncMock()
                         mock_storage.get_node = AsyncMock(return_value=None)
                         mock_storage.add_node = AsyncMock()
+                        mock_storage.compare_and_swap_node = AsyncMock(return_value=NodeSwapResult.SWAPPED)
                         mock_storage.db = MagicMock()
                         mock_storage._backend = _durable_backend_double()
                         MockStorage.return_value = mock_storage
@@ -3382,6 +3387,7 @@ class TestInitialize:
                         mock_storage.initialize = AsyncMock()
                         mock_storage.get_node = AsyncMock(return_value=None)  # No existing node
                         mock_storage.add_node = AsyncMock()
+                        mock_storage.compare_and_swap_node = AsyncMock(return_value=NodeSwapResult.SWAPPED)
                         mock_storage.db = MagicMock()
                         mock_storage._backend = _durable_backend_double()
                         MockStorage.return_value = mock_storage
@@ -3399,9 +3405,12 @@ class TestInitialize:
 
                         await agent.initialize()
 
-                        # Verify add_node was called to create the agent node
-                        mock_storage.add_node.assert_called_once()
-                        call_args = mock_storage.add_node.call_args[0][0]
+                        # New roots are compare-created, never whole-row upserted.
+                        mock_storage.add_node.assert_not_awaited()
+                        mock_storage.compare_and_swap_node.assert_awaited_once()
+                        args = mock_storage.compare_and_swap_node.await_args.args
+                        assert args[:2] == ("did:test:agent123", None)
+                        call_args = args[2]
                         assert call_args.node_id == "did:test:agent123"
                         assert call_args.node_type == "agent"
                         await _shutdown_feature_init_test_agent(agent)
@@ -3440,6 +3449,7 @@ class TestInitialize:
                         mock_storage.initialize = AsyncMock()
                         mock_storage.get_node = AsyncMock(return_value=None)
                         mock_storage.add_node = AsyncMock()
+                        mock_storage.compare_and_swap_node = AsyncMock(return_value=NodeSwapResult.SWAPPED)
                         mock_storage.db = MagicMock()
                         mock_storage._backend = _durable_backend_double()
                         MockStorage.return_value = mock_storage

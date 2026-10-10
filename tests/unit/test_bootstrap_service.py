@@ -6,6 +6,7 @@ Tests the agent wake-up and personality discovery system.
 
 import pytest
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -31,6 +32,13 @@ class _Storage:
     def __init__(self, node):
         self.node = node
         self.saved = None
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield
+
+    async def lock_nodes_for_update(self, node_ids):
+        pass
 
     async def get_node(self, node_id):
         return self.node if node_id == self.node.node_id else None
@@ -810,7 +818,10 @@ class TestPersistAgentDescription:
 
         db = MockDB()
 
-        class _FailingNodeStorage:
+        class _FailingNodeStorage(_Storage):
+            def __init__(self):
+                super().__init__(_GraphNode(node_id="agent-1"))
+
             async def get_node(self, _id):
                 return _GraphNode(node_id="agent-1", properties={"description": "old"})
 
@@ -830,7 +841,10 @@ class TestPersistAgentDescription:
 
         db = MockDB()
 
-        class _NoNodeStorage:
+        class _NoNodeStorage(_Storage):
+            def __init__(self):
+                super().__init__(None)
+
             async def get_node(self, _id):
                 return None
 
@@ -879,7 +893,8 @@ class TestSaveSoulSetsDescription:
         ok = await service.save_soul_md(soul)
 
         assert ok is True
-        assert node.properties["description"] == "A sharp coding companion."
+        assert storage.saved.properties["description"] == "A sharp coding companion."
+        assert node.properties == {}, "Read/cache objects are not mutated by publication"
         assert mock_db.data[("did:pkh:eip155:1:0x123", "description")] == "A sharp coding companion."
 
 

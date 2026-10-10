@@ -1181,6 +1181,10 @@ class StreamingMixin:
                     # canonical turn address exists; a feature-owned turn root may
                     # supersede this optional correlation at USER_PROMPT_SUBMIT.
                     self.bind_current_turn_span(_otel_span)
+                    genesis_block = await self._genesis_audit_cognition_block(user_input)
+                    if genesis_block is not None:
+                        yield genesis_block
+                        return
                     safe_mode_block = safe_mode_cognition_block(self, user_input)
                     if safe_mode_block is not None:
                         # A refusal the agent delivered is a turn that ran to

@@ -6,6 +6,7 @@ POST /api/identity/avatar/generate, and the description field on GET /api/identi
 """
 
 import pytest
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 from io import BytesIO
 from starlette.responses import Response
@@ -27,6 +28,13 @@ class MockStorage:
     def __init__(self):
         self.nodes = {}
         self.files = MockFileStore()
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield
+
+    async def lock_nodes_for_update(self, node_ids):
+        pass
 
     async def get_node(self, node_id):
         return self.nodes.get(node_id)

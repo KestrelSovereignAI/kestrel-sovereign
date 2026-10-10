@@ -483,6 +483,32 @@ async def _owned_chunk_count(
     return int(row[0]) if row else 0
 
 
+class BirthRecordReplayRefused(ValueError):
+    """Frozen birth data cannot establish an unused constitutional lifetime."""
+
+
+async def assert_birth_replay_custody(db, agent_did: str, *, retain=False) -> None:
+    """An existing runtime lifetime cannot be resurrected from frozen birth data."""
+    suffix = " FOR UPDATE" if retain and db.backend_type == "postgres" else ""
+    row = None
+    if await db.table_exists("constitution_runtime_state"):
+        row = await db.fetchone(
+            "SELECT bootstrap_pending, generation FROM constitution_runtime_state WHERE agent_id = ?" + suffix,
+            (agent_did,),
+        )
+    if row is not None and (not row[0] or not row[1] or str(row[1]).startswith("legacy:")):
+        raise BirthRecordReplayRefused("Missing runtime identity has a consumed constitutional lifetime; unsigned birth replay is forbidden")
+    if await db.table_exists("constitution_runtime_events"):
+        # Losing the current row cannot erase the surviving lifetime ledger.
+        # With a pending row, only actual consumption events veto first birth;
+        # with no row, ANY surviving event makes a new lifetime unprovable.
+        sql = "SELECT 1 FROM constitution_runtime_events WHERE agent_id = ?"
+        if row is not None:
+            sql += " AND event_type IN ('initial_anchor_started', 'constitution_anchor_fenced', 'audit_succeeded', 'safe_mode_exited', 'legacy_state_migration_required')"
+        if await db.fetchone(sql + " LIMIT 1", (agent_did,)) is not None:
+            raise BirthRecordReplayRefused("Surviving constitutional lifetime history forbids unsigned birth replay")
+
+
 async def replicate_birth_record(
     *,
     runtime_db: "AsyncDatabase",
@@ -637,6 +663,8 @@ async def replicate_birth_record(
                 "cannot be replicated from it."
             )
         metadata = await anchor_files.get_file_metadata(content_hash) or {}
+        if hashlib.sha256(content).hexdigest() != content_hash:
+            raise ValueError("Birth source bytes do not match their addressed hash")
         chunks = await anchor_rag.read_indexed_chunks(content_hash)
         payloads.append((content_hash, original_name, content, metadata, chunks))
 
@@ -651,13 +679,21 @@ async def replicate_birth_record(
     )
 
     result = ReplicationResult()
-    graph_write_ids = {agent_did, *(node.node_id for node in targets)}
+    graph_write_ids = {agent_did, *(node.node_id for node in targets), *(payload[0] for payload in payloads)}
     for edge in edges:
         graph_write_ids.add(edge.source_id)
         if edge.target_id == agent_did or edge.target_id in copyable:
             graph_write_ids.add(edge.target_id)
 
     async with runtime_db.transaction():
+        # Reserve the COMPLETE graph set before any file/blob/owner write,
+        # matching signed repair, bootstrap, avatar publication and exit.
+        # Publishing file bytes before graph nodes is still required for
+        # tenant admission; that semantic order must not invert custody.
+        await runtime_graph.lock_nodes_for_update(graph_write_ids)
+        current_identity = await runtime_graph.get_node(agent_did)
+        if current_identity is None or is_fabricated_placeholder(current_identity, agent_did):
+            await assert_birth_replay_custody(runtime_db, agent_did, retain=True)
         # Repair what is ABSENT; never overwrite what is present. The anchor is
         # frozen at inception and the runtime node goes on living — a completed
         # genesis audit, a reanchored constitution_hash, an avatar hash — so a
@@ -675,82 +711,19 @@ async def replicate_birth_record(
         # (``owns_content_reference``). Writing nodes first makes the second
         # agent raise "Cannot overwrite a graph node owned by another agent",
         # roll the whole copy back, and never boot.
-        for content_hash, original_name, content, metadata, _chunks in payloads:
-            if await runtime_files.file_exists(content_hash):
-                continue
-            unowned_row = await runtime_db.fetchone(
-                "SELECT 1 FROM files f WHERE f.content_hash = ? AND NOT EXISTS ("
-                "  SELECT 1 FROM file_owners o WHERE o.content_hash = f.content_hash"
-                ")",
-                (content_hash,),
-            )
-            if unowned_row:
-                # The bytes are there with no owner at all, so the owner-scoped
-                # ``file_exists`` cannot see them and ``store_file`` would raise
-                # "Cannot claim an unowned legacy file" on every boot, forever
-                # — the same permanent brick the node adoption below avoids.
-                #
-                # Prove the RUNTIME row before claiming it. The anchor's bytes
-                # hashing to this content_hash says nothing about what the
-                # runtime holds under that id: an ownerless row can predate a
-                # key rotation, in which case adoption "succeeds", the copy
-                # verifies, boot reports complete, and the first read of the
-                # constitution raises DecryptionError long afterwards with
-                # nothing pointing back here.
-                try:
-                    # Unbound on purpose: a bound read is owner-joined, so it
-                    # returns None for an ownerless row by construction and
-                    # could never verify anything.
-                    runtime_bytes = await AsyncFileStore(runtime_db).retrieve_file(
-                        content_hash
-                    )
-                    verified = (
-                        hashlib.sha256(runtime_bytes).hexdigest() == content_hash
-                    )
-                except Exception as exc:
-                    # A row written under a previous KESTREL_DATA_KEY raises
-                    # here rather than returning bytes, so the hash test alone
-                    # would never see it. Same verdict, named properly.
-                    raise ValueError(
-                        f"the runtime database holds an unowned file row for "
-                        f"{content_hash[:12]}… whose bytes cannot be read back "
-                        f"({type(exc).__name__}); refusing to claim it for "
-                        f"{agent_did}."
-                    ) from exc
-                if not verified:
-                    raise ValueError(
-                        f"the runtime database holds an unowned file row for "
-                        f"{content_hash[:12]}… whose bytes do not verify "
-                        "against it; refusing to claim it for "
-                        f"{agent_did}."
-                    )
-                await runtime_db.execute(
-                    _insert_file_owner_sql(runtime_db),
-                    (
-                        content_hash,
-                        agent_did,
-                        original_name or content_hash,
-                        json.dumps(metadata) if metadata else None,
-                    ),
-                )
-                result.files += 1
-                continue
-            # ``enc`` describes how the *source* row was stored. The target
-            # re-encrypts under its own configuration, so carrying the flag
-            # across would mark a plaintext row as encrypted.
-            metadata.pop("enc", None)
-            await runtime_files.store_file(
-                content, original_name or content_hash, metadata=metadata,
-            )
-            result.files += 1
+        from kestrel_sovereign.constitution.anchored_bytes import _store_exact_native_file
 
-        # The transaction composes node creation with ordinary and explicitly
-        # trusted edges. Reserve its complete graph write set once, before its
-        # first graph read/write, so nested add_node/add_edge calls cannot take
-        # overlapping PostgreSQL locks in semantic order and deadlock another
-        # replication. Trusted foreign targets are intentionally omitted: only
-        # their locally-owned source is mutable in this transaction.
-        await runtime_graph.lock_nodes_for_update(graph_write_ids)
+        for content_hash, original_name, content, metadata, _chunks in payloads:
+            already_owned = await runtime_files.file_exists(content_hash)
+            metadata.pop("enc", None)
+            published = await _store_exact_native_file(
+                runtime_db, runtime_files, content, original_name or content_hash,
+                metadata=metadata,
+            )
+            if published != content_hash:
+                raise ValueError("Birth source digest changed during native publication")
+            if not already_owned:
+                result.files += 1
 
         for node in targets:
             if await runtime_graph.get_node(node.node_id) is not None:
@@ -759,30 +732,7 @@ async def replicate_birth_record(
                 "SELECT 1 FROM graph_nodes WHERE node_id = ?", (node.node_id,),
             )
             if existing_row:
-                # The row is there but this agent has no ownership witness for
-                # it, so the bound read cannot see it. ``add_node`` would raise
-                # "Cannot claim or overwrite an unowned graph node" on every
-                # boot, forever. Taking the witness is the repair — but only on
-                # the same proof ``add_node`` itself requires to admit a
-                # co-owner of a shared content node: this agent owns the file
-                # the node addresses. Asserted rather than assumed, because
-                # "the file rows above already prove it" is false whenever the
-                # anchor listed no files.
-                owns_content = await runtime_db.fetchone(
-                    "SELECT 1 FROM file_owners WHERE content_hash = ? AND agent_id = ?",
-                    (node.node_id, agent_did),
-                )
-                if not owns_content:
-                    raise ValueError(
-                        f"{node.node_id[:12]}… exists in the runtime database "
-                        f"with no ownership witness for {agent_did}, and this "
-                        "agent does not own the file it addresses; refusing to "
-                        "claim another tenant's node."
-                    )
-                from kestrel_sovereign.storage.async_graph_store import (
-                    record_graph_node_owner,
-                )
-                await record_graph_node_owner(runtime_db, node.node_id, agent_did)
+                await runtime_graph.adopt_shared_content_node(node)
                 result.nodes += 1
                 continue
             await runtime_graph.add_node(node)

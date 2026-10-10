@@ -644,6 +644,7 @@ def _audited_agent(
     agent.storage = MagicMock()
     agent.storage.get_node = AsyncMock(return_value=node)
     agent.storage.retrieve_file = AsyncMock(return_value=anchored)
+    agent._raw_storage = agent.storage
     agent.storage.get_edges_from = AsyncMock(return_value=[edge])
     agent._verify_constitution_integrity = (
         ConstitutionMixin._verify_constitution_integrity.__get__(agent, KestrelAgent)

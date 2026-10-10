@@ -249,6 +249,11 @@ class AsyncStorage:
             # itself, not merely by convention.
             self._backend = SQLiteBackend(db_path, cold_read=cold_read)
 
+        if isinstance(self._backend, SQLiteBackend):
+            # Audit/backup sidecars and SQLAlchemy must use the same resolved
+            # target as native SQL, including the config constructor path.
+            self.db_path = self._backend.db_path
+
         if _assertion_tenant_capability is not None:
             if type(_assertion_tenant_capability) is not _AssertionTenantCapability:
                 raise TypeError(

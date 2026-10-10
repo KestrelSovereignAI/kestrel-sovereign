@@ -222,8 +222,18 @@ async def test_deferred_audit_refuses_hash_mismatched_storage(tmp_path):
         return_value={"risk_level": 1, "reasoning": "Must not be called."}
     )
     agent.get_audit_response = auditor
-    original_retrieve_file = agent.storage.retrieve_file
-    agent.storage.retrieve_file = AsyncMock(return_value=b"tampered bytes")
+    node = await agent._raw_storage.get_node(agent.agent_id)
+    digest = node.properties["constitution_hash"]
+    physical = await agent._raw_storage.db.fetchone(
+        "SELECT content,metadata FROM files WHERE content_hash=?", (digest,),
+    )
+    await agent._raw_storage.db.execute_commit(
+        "UPDATE files SET content=?,metadata=NULL WHERE content_hash=?",
+        (b"tampered bytes", digest),
+    )
+    service.generate_with_messages = AsyncMock(
+        side_effect=AssertionError("corrupt native governance must not reach cognition")
+    )
     try:
         response = await agent.process_input("PONG")
         assert "GENESIS AUDIT BLOCKED" in response
@@ -235,7 +245,10 @@ async def test_deferred_audit_refuses_hash_mismatched_storage(tmp_path):
             == "constitution_hash_mismatch"
         )
     finally:
-        agent.storage.retrieve_file = original_retrieve_file
+        service.generate_with_messages.assert_not_awaited()
+        await agent._raw_storage.db.execute_commit(
+            "UPDATE files SET content=?,metadata=? WHERE content_hash=?", (*physical, digest),
+        )
         await agent.shutdown()
         await service.close()
 
@@ -536,10 +549,16 @@ async def test_genesis_audit_with_missing_constitution(temp_db, llm_service):
     await agent.initialize()
 
     try:
-        # The audit reads the exact content-addressed bytes, not the augmented
-        # runtime prompt representation.
-        original_retrieve_file = agent.storage.retrieve_file
-        agent.storage.retrieve_file = AsyncMock(return_value=None)
+        # Remove the actual native blob, not the privacy-facing cache reader.
+        node = await agent._raw_storage.get_node(agent.agent_id)
+        digest = node.properties["constitution_hash"]
+        row = await agent._raw_storage.db.fetchone(
+            "SELECT original_name,content,metadata FROM files WHERE content_hash=?", (digest,),
+        )
+        await agent._raw_storage.db.execute_commit(
+            "DELETE FROM files WHERE content_hash=?", (digest,),
+        )
+        agent.get_audit_response = AsyncMock(side_effect=AssertionError("missing native bytes reached auditor"))
 
         # Attempt genesis audit - should FAIL
         with pytest.raises(ValueError) as exc_info:
@@ -548,12 +567,17 @@ async def test_genesis_audit_with_missing_constitution(temp_db, llm_service):
         # Verify error message
         error_message = str(exc_info.value)
         assert "cannot load constitution" in error_message.lower()
+        agent.get_audit_response.assert_not_awaited()
 
         print(f"✅ Genesis audit correctly FAILED with missing constitution")
         print(f"   Error: {error_message[:200]}")
 
-        agent.storage.retrieve_file = original_retrieve_file
     finally:
+        if "row" in locals() and row is not None:
+            await agent._raw_storage.db.execute_commit(
+                "INSERT OR IGNORE INTO files (content_hash,original_name,content,metadata) VALUES (?,?,?,?)",
+                (digest, *row),
+            )
         await agent.shutdown()
 
 

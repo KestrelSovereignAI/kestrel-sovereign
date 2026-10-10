@@ -1882,11 +1882,10 @@ async def test_postgres_factory_forwards_explicit_pool_budget(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_database_factory_preserves_schema_error_when_cleanup_also_fails(
+async def test_database_factory_preserves_both_errors_and_marks_uncertain_cleanup(
     monkeypatch,
-    caplog,
 ):
-    """A secondary close failure cannot replace the initialization defect."""
+    """Both defects remain inspectable; failed close never claims retirement."""
 
     from kestrel_sovereign.storage import async_database as database_module
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -1911,10 +1910,12 @@ async def test_database_factory_preserves_schema_error_when_cleanup_also_fails(
     )
     monkeypatch.setattr(AsyncDatabase, "_init_schema", _fail_schema)
 
-    with pytest.raises(RuntimeError, match="primary schema failure"):
+    with pytest.raises(database_module.DatabaseInitializationCleanupError) as failure:
         await database_module.AsyncDatabase.postgres("postgresql://durable/host")
 
-    assert "cleanup failed" in caplog.text
+    assert str(failure.value.initialization_error) == "primary schema failure"
+    assert str(failure.value.cleanup_error) == "cleanup failed"
+    assert failure.value.__cause__ is failure.value.cleanup_error
 
 
 @pytest.mark.asyncio

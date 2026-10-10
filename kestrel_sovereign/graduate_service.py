@@ -338,19 +338,16 @@ async def graduate_agent(
         now_iso = datetime.now(timezone.utc).isoformat()
         timestamp_suffix = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
-        # Upsert agent with new properties — add_node performs INSERT OR REPLACE
-        # / ON CONFLICT UPDATE based on backend, so this updates in place.
-        updated_agent = GraphNode(
-            node_id=agent_node.node_id,
-            node_type=agent_node.node_type,
-            label=agent_node.label,
-            properties={
-                **agent_node.properties,
-                "is_test_instance": False,
-                "graduated_at": now_iso,
-            },
+        from kestrel_sovereign.storage.identity_metadata import merge_identity_metadata
+
+        # Validation awaited after the original read; only these graduation
+        # fields are ours to change, never a newer governance receipt/history.
+        updated_agent = await merge_identity_metadata(
+            storage, agent_id,
+            {"is_test_instance": False, "graduated_at": now_iso},
         )
-        await storage.graph.add_node(updated_agent)
+        if updated_agent is None:
+            raise GraduationError("Agent identity disappeared before graduation")
 
         # Record the graduation as a lifecycle_event node
         graduation_node_id = f"graduation:{agent_id}:{timestamp_suffix}"

@@ -62,6 +62,9 @@ def _empty_runtime_storage():
     storage = MagicMock()
     storage.get_node = AsyncMock(return_value=None)
     storage.add_node = AsyncMock()
+    from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
+
+    storage.compare_and_swap_node = AsyncMock(return_value=NodeSwapResult.SWAPPED)
     return storage
 
 
@@ -109,7 +112,9 @@ async def test_boot_fabricates_node_for_genuinely_new_agent(tmp_path, hybrid_env
 
     node = await agent._ensure_agent_node_present()
 
-    agent.storage.add_node.assert_awaited_once()
+    agent.storage.add_node.assert_not_awaited()
+    agent.storage.compare_and_swap_node.assert_awaited_once()
+    assert agent.storage.compare_and_swap_node.await_args.args[:2] == (did, None)
     assert node.label == f"Agent {did}"
     assert node.properties["initialBalance"] == "100.0"
 

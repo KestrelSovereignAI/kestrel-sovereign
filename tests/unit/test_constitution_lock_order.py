@@ -17,6 +17,56 @@ from tests.unit.test_constitution_audit import _DurableConstitutionHarness
 
 
 @pytest.mark.asyncio
+async def test_implicit_rollback_keeps_caller_scope_visible_before_state_lock(tmp_path):
+    """Native rollback must not erase a caller's still-held writer lock."""
+    from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
+
+    storage = AsyncStorage(str(tmp_path / "rollback.db"), backend="sqlite", agent_id="did:test:rolled-back:" + uuid4().hex)
+    await storage.initialize()
+    waiter = None
+    waiting = asyncio.Event()
+    try:
+        agent = _DurableConstitutionHarness(storage, datetime.now(timezone.utc))
+        agent.agent_id = storage.agent_id
+        await agent._initialize_constitution_runtime_state(is_new_identity=True)
+        before = await agent._constitution_state_store.load(agent.agent_id)
+        await storage.db.execute_commit("CREATE TABLE rollback_conflict (id INTEGER PRIMARY KEY)")
+        await storage.db.execute_commit("INSERT INTO rollback_conflict VALUES (1)")
+
+        async def competing_state_owner():
+            async with ConstitutionMixin._constitution_state_guard(agent):
+                waiting.set()
+                async with storage.transaction():
+                    return True
+
+        with pytest.raises(TransactionError, match="rolled back implicitly"):
+            async with storage.transaction():
+                waiter = asyncio.create_task(competing_state_owner())
+                await asyncio.wait_for(waiting.wait(), 5)
+                with pytest.raises(QueryError, match="UNIQUE"):
+                    await storage._backend.execute("INSERT OR ROLLBACK INTO rollback_conflict VALUES (1)")
+                assert storage._backend._connection.in_transaction is False
+                # SAME task still holds the writer scope. No task-switching
+                # timeout wrapper may hide its actual ownership relation.
+                try:
+                    async with asyncio.timeout(1):
+                        result = await agent.enter_safe_mode("caller caught implicit rollback")
+                except TimeoutError:
+                    pytest.fail("implicit rollback reopened the state/writer lock inversion")
+                assert result is False
+                assert agent._safe_mode is True and agent._constitution_state_persistence_pending is True
+        assert await asyncio.wait_for(waiter, 5) is True
+        assert await agent._constitution_state_store.load(agent.agent_id) == before
+    finally:
+        if waiter is not None:
+            if not waiter.done():
+                waiter.cancel()
+            with suppress(asyncio.CancelledError):
+                await waiter
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("anchor_writer", ["automatic", "signed_same", "signed_new"])
 @pytest.mark.parametrize("transition", ["entry", "exit", "audit_begin", "audit_record", "audit_run", "periodic"])
 async def test_outer_transaction_refuses_before_constitution_lock_wait(

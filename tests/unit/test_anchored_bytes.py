@@ -19,15 +19,43 @@ so those propagate to it.
 from __future__ import annotations
 
 import json
+import hashlib
 
 import pytest
 
 from kestrel_sovereign.constitution.anchored_bytes import (
+    governance_evidence,
     historical_anchor_hash,
     read_anchored_constitution,
 )
 
 HASH = "a" * 64
+
+
+def test_corrupted_pointer_recovers_only_unambiguous_typed_evidence():
+    properties = {"constitution_hash": "db-writer-replaced-hash", "genesis_audit": {"constitution_hash": HASH}}
+    assert historical_anchor_hash(properties, (HASH,)) == HASH
+    assert properties["constitution_hash"] == "db-writer-replaced-hash"
+    with pytest.raises(ValueError, match="ambiguous historical governance"):
+        historical_anchor_hash(properties, ("b" * 64,))
+
+
+@pytest.mark.parametrize("pointer", ["corrupt", "x" * 257, 7, [HASH], {"digest": HASH}])
+def test_corrupted_pointer_never_becomes_absence_or_hash_prose(pointer):
+    with pytest.raises(ValueError, match="historical governance"):
+        historical_anchor_hash({"constitution_hash": pointer}, ())
+
+
+def test_governance_snapshot_preserves_absence_and_explicit_null_distinctly():
+    absent = governance_evidence({"unrelated": "metadata"}, ())
+    assert absent["properties"] == {}
+    assert historical_anchor_hash(absent["properties"], ()) is None
+    for key in ("constitution_reanchor", "constitution_reanchor_history"):
+        malformed = governance_evidence({key: None}, ())
+        assert malformed["properties"] == {key: None}
+        assert malformed != absent
+        with pytest.raises(ValueError, match="historical governance"):
+            historical_anchor_hash(malformed["properties"], ())
 
 
 @pytest.mark.parametrize("key", ["genesis_audit", "genesis_audit_history", "constitution_reanchor", "constitution_reanchor_history"])
@@ -90,9 +118,16 @@ async def test_a_missing_row_is_absent():
 
 @pytest.mark.asyncio
 async def test_stored_plaintext_comes_back_as_text():
-    rows = _Rows(row=(b"# Kestrel Constitution\n", None))
-    text, present = await read_anchored_constitution(rows, HASH)
+    content = b"# Kestrel Constitution\n"
+    rows = _Rows(row=(content, None))
+    text, present = await read_anchored_constitution(rows, hashlib.sha256(content).hexdigest())
     assert (text, present) == ("# Kestrel Constitution\n", True)
+
+
+@pytest.mark.asyncio
+async def test_readable_plaintext_under_the_wrong_hash_is_unreadable():
+    rows = _Rows(row=(b"readable but not the addressed constitution", None))
+    assert await read_anchored_constitution(rows, HASH) == (None, True)
 
 
 @pytest.mark.asyncio

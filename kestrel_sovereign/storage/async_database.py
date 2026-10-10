@@ -41,11 +41,38 @@ logger = logging.getLogger(__name__)
 _BACKFILL_LOCK_DOMAIN = b"kestrel:schema-backfill-lock:v1\0"
 
 
-async def _close_failed_database_initialization(db: "AsyncDatabase") -> None:
-    """Finish closing an owned backend even if its caller is cancelled again."""
+class DatabaseRetirementError(ConnectionError):
+    """Owned database retirement is uncertain; retain its owner and artifacts."""
+
+    def __init__(self, db: "AsyncDatabase", operation_error: BaseException | None, cleanup_error: BaseException | None = None):
+        super().__init__("Database retirement did not complete; retain recovery evidence")
+        self.retirement_owner = db
+        self.operation_error = operation_error
+        self.cleanup_error = cleanup_error
+
+
+class DatabaseInitializationCleanupError(ConnectionError):
+    """Initialization failed without proof that its owned resources retired.
+
+    Callers must retain files and other recovery evidence on this exception.
+    An ordinary initialization failure (including cancellation) is delivered
+    only after the factory's connected backend has closed successfully.
+    """
+
+    def __init__(self, initialization_error: BaseException, cleanup_error: BaseException | None = None, *, retirement_owner: "AsyncDatabase | None" = None):
+        super().__init__(
+            "Database initialization cleanup did not complete; retain recovery evidence"
+        )
+        self.initialization_error = initialization_error
+        self.cleanup_error = cleanup_error
+        self.retirement_owner = retirement_owner
+
+
+async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseException | None = None) -> None:
+    """Settle the one owned close through repeated cancellation on every exit."""
 
     cleanup = asyncio.create_task(
-        db.close(), name="failed-database-initialization-cleanup"
+        db.close(), name="owned-database-retirement"
     )
     cancelled = False
     while not cleanup.done():
@@ -54,22 +81,30 @@ async def _close_failed_database_initialization(db: "AsyncDatabase") -> None:
         except asyncio.CancelledError:
             cancelled = True
             continue
-        except Exception:  # noqa: BLE001 - inspect and log below
-            # The task is now complete with an error.  Do not let a secondary
-            # close failure replace the schema-initialization failure whose
-            # cleanup brought us here; the final await below records it.
+        except Exception:  # noqa: BLE001 - deliver joined cleanup failure below
+            # Do not let the shield's exception obscure the lifecycle result.
+            # The joined task below distinguishes failed initialization from
+            # uncertain retirement, which must never permit file cleanup.
             continue
     try:
         await cleanup
-    except asyncio.CancelledError:
-        cancelled = True
-    except Exception as close_exc:  # noqa: BLE001 - preserve initialization error
-        logger.warning(
-            "Could not close backend after database initialization failed: %s",
-            close_exc,
-        )
+    except (asyncio.CancelledError, Exception) as close_exc:
+        raise DatabaseRetirementError(db, operation_error, close_exc) from close_exc
+    if db.connection_retirement_pending:
+        raise DatabaseRetirementError(db, operation_error)
     if cancelled:
         raise asyncio.CancelledError()
+
+
+async def _close_failed_database_initialization(db: "AsyncDatabase", initialization_error: BaseException) -> None:
+    """Retain the initialization failure contract around canonical retirement."""
+    try:
+        await _close_owned_database(db, initialization_error)
+    except DatabaseRetirementError as retirement_error:
+        failure = DatabaseInitializationCleanupError(
+            initialization_error, retirement_error.cleanup_error, retirement_owner=db,
+        )
+        raise failure from retirement_error.cleanup_error
 
 
 #: ``(name, table, columns)`` of the index that makes the #2959 projection worth
@@ -1141,8 +1176,8 @@ class AsyncDatabase:
             else:
                 async with initialization_guard:
                     await initialize_schema()
-        except BaseException:
-            await _close_failed_database_initialization(db)
+        except BaseException as initialization_error:
+            await _close_failed_database_initialization(db, initialization_error)
             raise
         db._initialized = True
         return db
@@ -1183,6 +1218,11 @@ class AsyncDatabase:
         default one runs DDL the connection cannot execute. The caller must
         call the backend's ``assert_cold_read_still_valid`` before acting on
         what it read.
+
+        Connection acquisition is settled even under repeated cancellation:
+        a worker cannot be abandoned before ownership reaches this factory.
+        Ordinary failures prove retirement; uncertain cleanup raises
+        :class:`DatabaseInitializationCleanupError` instead.
         """
         if cold_read and schema_initializer is None:
             raise ValueError(
@@ -1190,7 +1230,28 @@ class AsyncDatabase:
                 "pass a schema_initializer that issues no DDL"
             )
         backend = SQLiteBackend(db_path, cold_read=cold_read)
-        await backend.connect()
+        db = cls(backend)
+        connect = asyncio.create_task(backend.connect(), name="sqlite-database-initialization")
+        cancelled = False
+        try:
+            while not connect.done():
+                try:
+                    await asyncio.shield(connect)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break  # deliver the joined task's failure below
+            try:
+                connect.result()
+            except BaseException as connect_error:
+                if cancelled:
+                    raise asyncio.CancelledError() from connect_error
+                raise
+            if cancelled:
+                raise asyncio.CancelledError()
+        except BaseException as initialization_error:
+            await _close_failed_database_initialization(db, initialization_error)
+            raise
         db = await cls.from_connected_backend(
             backend, schema_initializer=schema_initializer
         )
@@ -3703,7 +3764,7 @@ class AsyncDatabase:
         return await self._backend.fetch_val(sql, params)
     
     @asynccontextmanager
-    async def transaction(self, *, immediate: bool = False):
+    async def transaction(self, *, immediate: bool = False, savepoint: bool = False):
         """Transaction context manager with automatic rollback on error.
 
         ``immediate`` asks SQLite for its writer slot at ``BEGIN`` instead of on
@@ -3714,11 +3775,27 @@ class AsyncDatabase:
         PostgreSQL serializes such a unit with a row lock instead (see
         ``ConversationSessionProjection._claim``).
         """
-        if immediate and self.backend_type == "sqlite":
-            async with self._backend.transaction(immediate=True):  # type: ignore[call-arg]
-                yield
-            return
-        async with self._backend.transaction():
+        options = {}
+        if self.backend_type == "sqlite":
+            if immediate:
+                # Older adapters supported only immediate; never send a new
+                # false-valued keyword to an unchanged transaction contract.
+                import inspect
+                if "immediate" not in inspect.signature(self._backend.transaction).parameters:
+                    raise NotImplementedError("Backend does not support immediate transactions")
+                options["immediate"] = True
+        if savepoint:
+            if "savepoint" in getattr(self._backend, "transaction_options", ()):
+                options["savepoint"] = True
+            elif self.nested_transaction_strategy == "savepoint":
+                # An explicit intrinsic savepoint contract needs no extension
+                # keyword (e.g. the native PostgreSQL adapter).
+                pass
+            elif self.owns_open_transaction is not False:
+                # Unknown optional SDK custody cannot prove a top-level
+                # rollback boundary, regardless of the adapter's type name.
+                raise NotImplementedError("Backend does not support isolated nested transactions with unknown or active caller custody")
+        async with self._backend.transaction(**options):
             yield
     
     async def table_exists(self, table_name: str) -> bool:

@@ -141,6 +141,18 @@ class AsyncFileStore:
             prefix = f"{table_alias}." if table_alias else ""
             return f"ORDER BY {prefix}rowid {direction}"
     
+    async def _validate_existing_file_claim(self, content_hash: str, owner: str) -> None:
+        """Check native file admission before any joined-scope publication."""
+        existing = await self.db.fetchone(
+            "SELECT 1 FROM files WHERE content_hash = ?", (content_hash,),
+        )
+        if existing and owner:
+            owner_rows = await self.db.fetchall(
+                "SELECT agent_id FROM file_owners WHERE content_hash = ?", (content_hash,),
+            )
+            if not owner_rows:
+                raise ValueError("Cannot claim an unowned legacy file")
+
     async def store_file(self, content: bytes, original_name: str,
                          metadata: Optional[Dict] = None) -> str:
         """Store a file and return its content hash."""
@@ -158,17 +170,7 @@ class AsyncFileStore:
 
         metadata_json = json.dumps(meta) if meta else None
         async with self.db.transaction():
-            existing = await self.db.fetchone(
-                "SELECT 1 FROM files WHERE content_hash = ?",
-                (content_hash,),
-            )
-            if existing and owner:
-                owner_rows = await self.db.fetchall(
-                    "SELECT agent_id FROM file_owners WHERE content_hash = ?",
-                    (content_hash,),
-                )
-                if not owner_rows:
-                    raise ValueError("Cannot claim an unowned legacy file")
+            await self._validate_existing_file_claim(content_hash, owner)
 
             await self.db.execute(
                 "INSERT OR IGNORE INTO files "
@@ -278,6 +280,15 @@ class AsyncFileStore:
         Returns:
             content_hash (SHA256)
         """
+        # SQLite joins a caller-owned transaction. Validate before reserving
+        # even provisional graph ownership: a caught rejection must stage no
+        # mutation that the outer caller could subsequently commit.
+        if self.agent_id and self.agent_id != agent_id:
+            raise ValueError("A bound file store cannot store another agent's avatar")
+        if len(image_data) > MAX_FILE_SIZE:
+            raise ValueError(
+                f"File size ({len(image_data)} bytes) exceeds maximum allowed size ({MAX_FILE_SIZE} bytes)"
+            )
         metadata = {
             "type": "avatar",
             "avatar_type": avatar_type,
@@ -287,13 +298,9 @@ class AsyncFileStore:
             "created_at": datetime.now(UTC).isoformat()
         }
 
-        async with self.db.transaction():
-            content_hash = await self.store_file(
-                image_data, f"avatar_{avatar_type}.jpg", metadata
-            )
-            avatar_node_id = self._avatar_node_id(
-                agent_id, avatar_type, content_hash
-            )
+        content_hash = hashlib.sha256(image_data).hexdigest()
+        avatar_node_id = self._avatar_node_id(agent_id, avatar_type, content_hash)
+        async with self.db.transaction(savepoint=True):
             graph_metadata = {**metadata, "hash": content_hash}
 
             # Use the canonical graph writer so the node and edge receive
@@ -301,6 +308,11 @@ class AsyncFileStore:
             # rows. The graph id is tenant/type namespaced because identical
             # bytes do not imply shared avatar metadata (#2649).
             graph = AsyncGraphStore(self.db, agent_id=agent_id)
+            await graph.lock_nodes_for_update([agent_id, avatar_node_id])
+            # SQLite's owning writer prevents admission evidence from changing
+            # before store_file. This canonical check also runs in store_file;
+            # it must precede provisional ownership if a caller catches refusal.
+            await self._validate_existing_file_claim(content_hash, self._write_owner(metadata))
             # Some bootstrap/test callers store an avatar before the physical
             # agent root is inserted. The DID is still the canonical self-owner,
             # so reserve that witness; later root creation uses the same owner.
@@ -311,6 +323,24 @@ class AsyncFileStore:
                 agent_id,
                 additional_graph_node_ids=[avatar_node_id],
             )
+            await self.store_file(
+                image_data, f"avatar_{avatar_type}.jpg", metadata
+            )
+            # store_file returns the INPUT digest even on a conflict. Retain
+            # the actual blob and exact owner, then decrypt/compare the winner
+            # before publishing any avatar node, edge or identity pointer.
+            lock = " FOR UPDATE" if self.db.backend_type == "postgres" else ""
+            if await self.db.fetchone(
+                "SELECT content_hash FROM files WHERE content_hash=?" + lock,
+                (content_hash,),
+            ) is None or await self.db.fetchone(
+                "SELECT content_hash FROM file_owners WHERE content_hash=? AND agent_id=?" + lock,
+                (content_hash, agent_id),
+            ) is None:
+                raise ValueError("Avatar publication lacks physical blob ownership")
+            bound_files = self if self.agent_id else AsyncFileStore(self.db, agent_id=agent_id)
+            if await bound_files.retrieve_file(content_hash) != image_data:
+                raise ValueError("Stored avatar bytes do not verify against the input image")
             await graph.add_node(
                 GraphNode(
                     node_id=avatar_node_id,

@@ -22,9 +22,11 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from functools import wraps
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import event
+from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -33,6 +35,7 @@ from sqlalchemy.ext.asyncio import (
 
 from kestrel_sovereign.storage.db.interface import ConnectionError
 from kestrel_sovereign.storage.db.sqlite import (
+    SQLiteBackend,
     _RetainedAiosqliteCloses,
     _aiosqlite_worker_is_alive,
     _close_aiosqlite_connection,
@@ -110,8 +113,9 @@ class SovereignSqlaSessionFactory:
     just needs ENOUGH of it to drive ``kestrel_sovereign.storage.vector``.
     """
 
-    def __init__(self, engine: Any) -> None:
+    def __init__(self, engine: Any, *, sqlite_custody=None) -> None:
         self._engine = engine
+        self._sqlite_custody = sqlite_custody
         # SQLAlchemy's aiosqlite dialect acknowledges ``engine.dispose()``
         # after each driver's ``Connection.close()`` returns, which has the
         # same final-worker-turn gap as our primary SQLite backend.  Track the
@@ -137,6 +141,11 @@ class SovereignSqlaSessionFactory:
             event.listen(
                 engine.sync_engine, "connect", self._track_sqlite_connection
             )
+            if sqlite_custody is not None:
+                # Native connection identity fences engine-only consumers too,
+                # including cached checkouts and already yielded connections.
+                for hook in ("do_connect", "connect", "checkout", "before_cursor_execute", "commit"):
+                    event.listen(engine.sync_engine, hook, self._assert_session_connection_available)
 
     @property
     def engine(self) -> Any:
@@ -253,13 +262,18 @@ class SovereignSqlaSessionFactory:
             if self._close_started:
                 self._begin_sqlite_connection_retirement((connection,))
 
-    def _assert_session_connection_available(self) -> None:
+    def _assert_session_connection_available(self, *args, **kwargs) -> None:
         """Permanently fence new work after factory close begins."""
         if self._close_started:
             raise ConnectionError(
                 "SQLAlchemy session factory is closing or closed; "
                 "new sessions are unavailable"
             )
+        self._assert_sqlite_custody()
+
+    def _assert_sqlite_custody(self, *args, **kwargs) -> None:
+        if self._sqlite_custody is not None:
+            self._sqlite_custody()
 
     @asynccontextmanager
     async def read_session(self):
@@ -582,6 +596,7 @@ def make_session_factory(db: Any) -> SovereignSqlaSessionFactory:
     # ``getattr``, which would otherwise short-circuit this function and
     # return the mock itself instead of a real factory.
     if isinstance(cached, SovereignSqlaSessionFactory):
+        cached._assert_session_connection_available()
         return cached
 
     backend_type = getattr(db, "backend_type", None)
@@ -610,8 +625,16 @@ def make_session_factory(db: Any) -> SovereignSqlaSessionFactory:
                 "the SovereignSqlaSessionFactory directly from a shared "
                 "engine."
             )
-        engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
-        factory = SovereignSqlaSessionFactory(engine)
+        custody = None
+        if isinstance(db.backend, SQLiteBackend):
+            custody = db.backend.assert_connected_file_still_valid
+            custody()
+            # mode=rw never creates a replacement if the retained path
+            # disappears between the custody check and driver acquisition.
+            engine = create_async_engine(URL.create("sqlite+aiosqlite", database=Path(path).as_uri(), query={"mode": "rw", "uri": "true"}))
+        else:
+            engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
+        factory = SovereignSqlaSessionFactory(engine, sqlite_custody=custody)
         try:
             setattr(db, _CACHE_ATTR, factory)
         except Exception:

@@ -95,6 +95,42 @@ def pending_genesis_audit(
     }
 
 
+MAX_GENESIS_RECEIPT_HISTORY = 128
+
+
+def _validated_genesis_history(properties: Mapping[str, Any]) -> list:
+    history = properties.get("genesis_audit_history", [])
+    if not isinstance(history, list) or len(history) > MAX_GENESIS_RECEIPT_HISTORY:
+        raise GenesisAuditError("Malformed or unbounded genesis receipt history; existing evidence is preserved")
+    for entry in history:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("receipt"), Mapping):
+            raise GenesisAuditError("Malformed genesis receipt history entry")
+        digest = entry["receipt"].get("constitution_hash")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise GenesisAuditError("Historical genesis receipt lacks a valid content hash")
+    return history
+
+
+def archive_genesis_receipt(
+    properties: MutableMapping[str, Any], receipt: Mapping[str, Any], *,
+    constitution_hash: str, provenance: str, recorded_at: str | None = None,
+) -> None:
+    """Append without creating history the runtime cannot safely reconcile.
+
+    Refuse populated legacy overflow explicitly, retaining every verdict.
+    Never truncate old receipts or coalesce their distinct provenance.
+    """
+    history = deepcopy(_validated_genesis_history(properties))
+    # Do not append an old malformed current receipt only to make the next
+    # runtime read reject the newly published history.
+    _validated_genesis_history({"genesis_audit_history": [{"receipt": receipt}]})
+    if len(history) >= MAX_GENESIS_RECEIPT_HISTORY:
+        raise GenesisAuditError("Genesis receipt history cannot safely archive another receipt; existing evidence is preserved")
+    history.append({"receipt": deepcopy(receipt), "superseded_at": recorded_at or utc_timestamp(),
+                    "superseded_by_constitution_hash": constitution_hash, "provenance": provenance})
+    properties["genesis_audit_history"] = history
+
+
 def supersede_genesis_audit(
     properties: MutableMapping[str, Any],
     *,
@@ -105,19 +141,37 @@ def supersede_genesis_audit(
     """Preserve the old receipt and require a new audit after reanchor."""
     changed_at = recorded_at or utc_timestamp()
     existing = properties.get("genesis_audit")
-    history = properties.get("genesis_audit_history")
-    history = list(history) if isinstance(history, list) else []
+    history = _validated_genesis_history(properties)
+    # A damaged pointer does not invalidate a receipt about these exact bytes.
+    # Never reroll a terminal result when returning to previously audited
+    # content either. Contradictory durable receipts are not repair authority.
+    matching = []
+    candidates = [existing, *(entry.get("receipt") for entry in history if isinstance(entry, Mapping))]
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping) or candidate.get("constitution_hash") != constitution_hash:
+            continue
+        normalized = normalize_genesis_receipt(candidate, constitution_hash)
+        status = validate_completed_genesis_audit(normalized, constitution_hash)
+        if status is not None:
+            matching.append(normalized)
+        elif normalized.get("audited") is not False:
+            raise GenesisAuditError("Pending genesis receipt claims contradictory audit evidence")
+    if matching:
+        if any(candidate != matching[0] for candidate in matching[1:]):
+            raise GenesisAuditError("Ambiguous completed genesis receipts for replacement governing bytes")
+        preserved = deepcopy(matching[0])
+        if existing != preserved and existing is not None:
+            archive_genesis_receipt(properties, existing, constitution_hash=constitution_hash,
+                                   provenance=provenance, recorded_at=changed_at)
+        properties["genesis_audit"] = preserved
+        return preserved
+    if isinstance(existing, Mapping) and existing.get("constitution_hash") == constitution_hash:
+        if existing.get("status") != GENESIS_AUDIT_PENDING:
+            raise GenesisAuditError("Malformed genesis receipt for replacement governing bytes")
+        return existing
     if existing is not None:
-        history.append(
-            {
-                "receipt": deepcopy(existing),
-                "superseded_at": changed_at,
-                "superseded_by_constitution_hash": constitution_hash,
-                "provenance": provenance,
-            }
-        )
-    if history:
-        properties["genesis_audit_history"] = history
+        archive_genesis_receipt(properties, existing, constitution_hash=constitution_hash,
+                               provenance=provenance, recorded_at=changed_at)
 
     pending = pending_genesis_audit(
         constitution_hash,
@@ -183,6 +237,67 @@ Return JSON with:
 """
 
 
+def reconcile_genesis_receipt(properties: Mapping[str, Any], constitution_hash: str) -> dict[str, Any] | None:
+    """Resolve matching durable evidence before audit or cognition admission.
+
+    Reanchoring through other content never grants a fresh attempt at a
+    completed verdict. Conflicting completions are repair refusals, not votes.
+    This pure check is also used on the locked native turn snapshot.
+    """
+    history = _validated_genesis_history(properties)
+    candidates = []
+    current = properties.get("genesis_audit")
+    if current is not None:
+        if not isinstance(current, Mapping):
+            raise GenesisAuditError("Genesis audit state is malformed.")
+        if current.get("constitution_hash") != constitution_hash:
+            raise GenesisAuditError("Current genesis receipt is bound to different governing bytes")
+        candidates.append(current)
+    for entry in history:
+        receipt = entry["receipt"]
+        if receipt["constitution_hash"] == constitution_hash:
+            candidates.append(receipt)
+    completed = []
+    pending = None
+    for candidate in candidates:
+        normalized = normalize_genesis_receipt(candidate, constitution_hash)
+        if validate_completed_genesis_audit(normalized, constitution_hash) is None:
+            if normalized.get("audited") is not False:
+                raise GenesisAuditError("Pending genesis receipt claims contradictory audit evidence")
+            if candidate is current:
+                pending = normalized
+        else:
+            completed.append(normalized)
+    if completed:
+        if any(receipt != completed[0] for receipt in completed[1:]):
+            raise GenesisAuditError("Ambiguous completed genesis receipts for governing bytes")
+        return deepcopy(completed[0])
+    return pending
+
+
+def normalize_genesis_receipt(record: Mapping[str, Any], constitution_hash: str) -> dict[str, Any]:
+    """Upgrade supported legacy completion evidence without calling an auditor.
+
+    Explicit unaudited evidence is never promoted. Validation of the canonical
+    result also rejects boolean risk levels and malformed completion times.
+    """
+    normalized = deepcopy(dict(record))
+    if normalized.get("status") is None:
+        risk = normalized.get("risk_level")
+        if (
+            normalized.get("timestamp")
+            and type(risk) is int and risk in (1, 2, 3)
+            and normalized.get("constitution_hash") == constitution_hash
+            and normalized.get("audited") is not False
+        ):
+            normalized["status"] = GENESIS_AUDIT_FAILED if risk == 3 else GENESIS_AUDIT_PASSED
+            normalized.setdefault("completed_at", normalized["timestamp"])
+            normalized.setdefault("audited", True)
+            normalized.setdefault("provenance", "runtime:migrated_legacy_receipt")
+    validate_completed_genesis_audit(normalized, constitution_hash)
+    return normalized
+
+
 def validate_completed_genesis_audit(
     record: Mapping[str, Any],
     constitution_hash: str,
@@ -194,6 +309,8 @@ def validate_completed_genesis_audit(
     times use the canonical ISO-8601/RFC-3339 shape emitted by this module,
     with at most microsecond precision and an explicit UTC or numeric offset.
     """
+    if not isinstance(record, Mapping):
+        raise GenesisAuditError("Genesis audit receipt is not a mapping.")
     status = record.get("status")
     if status == GENESIS_AUDIT_PENDING:
         return None
