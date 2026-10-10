@@ -53,6 +53,7 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
     bind_execution_cleanup, execution_work_stream, is_execution_control_error,
+    execution_terminal_error, execution_commit_outcome,
     owned_execution_stream as _owned_stream,
 )
 from .adapter import (
@@ -113,12 +114,16 @@ def _route_capabilities(provider: Any) -> Tuple[ProviderCapabilities, frozenset]
     elif isinstance(raw, dict) and raw:
         try:
             caps = ProviderCapabilities.from_mapping(raw)
-        except Exception:
+        except Exception as execution_error:
+            if is_execution_control_error(execution_error):
+                raise
             caps = None
     if caps is None and adapter is not None:
         try:
             caps = adapter.provider_capabilities()
-        except Exception:
+        except Exception as execution_error:
+            if is_execution_control_error(execution_error):
+                raise
             caps = None
     if not isinstance(caps, ProviderCapabilities):
         caps = ProviderCapabilities()
@@ -126,7 +131,9 @@ def _route_capabilities(provider: Any) -> Tuple[ProviderCapabilities, frozenset]
     if adapter is not None:
         try:
             features = frozenset(adapter.contract_features() or ())
-        except Exception:
+        except Exception as execution_error:
+            if is_execution_control_error(execution_error):
+                raise
             features = frozenset()
     return caps, features
 
@@ -319,6 +326,8 @@ class StreamingMixin:
                 try:
                     await self._resolve_local_auto_routes()
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     logger.warning(
                         "Local-only model discovery failed (continuing with "
                         "provider['model'] as-is): %s", exc,
@@ -328,6 +337,8 @@ class StreamingMixin:
             try:
                 await self.discover_all_models(use_cache=True)
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "Lazy model discovery failed (continuing with "
                     "provider['model'] as-is): %s", exc,
@@ -610,7 +621,9 @@ class StreamingMixin:
         if callable(available_fn):
             try:
                 available = available_fn()
-            except Exception:
+            except Exception as execution_error:
+                if is_execution_control_error(execution_error):
+                    raise
                 available = list(getattr(self, "providers", None) or [])
         else:
             available = list(getattr(self, "providers", None) or [])
@@ -773,7 +786,9 @@ class StreamingMixin:
             return None
         try:
             return extractor(response)
-        except Exception:  # noqa: BLE001 - cost is best-effort
+        except Exception as execution_error:  # noqa: BLE001 - cost is best-effort
+            if is_execution_control_error(execution_error):
+                raise
             return None
 
     @staticmethod
@@ -1035,7 +1050,9 @@ class StreamingMixin:
                     async with _owned_stream(self, forward(stream)) as forwarded_stream:
                         async for item in forwarded_stream:
                             yield item
-                except NotImplementedError:
+                except NotImplementedError as execution_error:
+                    if is_execution_control_error(execution_error):
+                        raise
                     # A dynamic third-party adapter can still expose the SDK
                     # stub.  Falling back is safe only before any output escaped.
                     if emitted:
@@ -1126,8 +1143,23 @@ class StreamingMixin:
                             publish_identity=False,
                             invocation_context=invocation_context,
                         )
-            except ExecutionAuthorityError:
+            except Exception as accounting_error:
                 if completed:
+                    raise execution_terminal_error(failure, accounting_error)
+                if (
+                    is_execution_control_error(failure) if failure is not None else False
+                ) or is_execution_control_error(accounting_error):
+                    terminal = execution_terminal_error(failure, accounting_error)
+                    if (
+                        terminal is failure
+                        or execution_commit_outcome(accounting_error) is not None
+                    ):
+                        raise terminal
+                    # Only ordinary cleanup denial may stay behind an aborted
+                    # body's original error; unknown/committed never does.
+                    if not isinstance(accounting_error, ExecutionAuthorityError):
+                        raise terminal
+                else:
                     raise
                 # Aborted hosted work has cleanup-only authority. Do not turn
                 # usage/billing into ordinary work or hide its original failure.
@@ -1694,7 +1726,9 @@ class StreamingMixin:
         """True when the adapter *family* can accept image input."""
         try:
             caps = adapter.provider_capabilities()
-        except Exception:
+        except Exception as execution_error:
+            if is_execution_control_error(execution_error):
+                raise
             return False
         return bool(getattr(caps, "supports_vision", False))
 
@@ -1711,7 +1745,9 @@ class StreamingMixin:
         try:
             from .model_cache import get_shared_model_cache
             models = get_shared_model_cache().get_any() or []
-        except Exception:
+        except Exception as execution_error:
+            if is_execution_control_error(execution_error):
+                raise
             return None
         # Route names are ``vendor:route`` (e.g. ``openai:api``) but
         # ModelInfo.provider is the bare vendor (``openai``); compare on vendor.

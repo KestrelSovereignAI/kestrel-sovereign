@@ -32,6 +32,7 @@ from kestrel_sdk.llm.decisions import (
 
 from kestrel_sovereign.config import load_section
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, bind_execution_cleanup, bind_execution_runtime, execution_work_operation, require_execution_work, is_execution_control_error, execution_commit_outcome, execution_terminal_error
+from kestrel_sovereign.execution_custody import await_execution_work_group
 
 from .adapter import ReportedUsage
 from .decisions.config import (
@@ -196,8 +197,9 @@ class DecisionServiceMixin:
         """
 
         routes = self._decision_routes()
-        await asyncio.gather(
-            *(self._discover_decision_route(p, force=not use_cache) for p in routes)
+        await await_execution_work_group(
+            self,
+            (lambda p=p: self._discover_decision_route(p, force=not use_cache) for p in routes),
         )
 
     async def _discover_decision_route(self, provider: Dict[str, Any], *, force: bool) -> None:
@@ -288,6 +290,11 @@ class DecisionServiceMixin:
                 raise
             state.canary_stale_since = state.canary_stale_since or time.time()
             logger.warning("Decision pin canary for %s did not complete (%s)", name, type(exc).__name__)
+        except BaseException as exc:
+            # Unlisted native/wrapped errors still reach the unconditional
+            # finalizer. Never mislabel those as a successful canary call.
+            error = exc
+            raise
         else:
             state.pin_status = PinStatus.VERIFIED
             state.pin_reason = None
@@ -380,8 +387,9 @@ class DecisionServiceMixin:
             async with asyncio.timeout(timeout_seconds):
                 cold = [p for p in routes if _route_state(p).needs_discovery]
                 if cold:
-                    await asyncio.gather(
-                        *(self._discover_decision_route(p, force=False) for p in cold)
+                    await await_execution_work_group(
+                        self,
+                        (lambda p=p: self._discover_decision_route(p, force=False) for p in cold),
                     )
                 candidate = select_candidate(
                     routes,

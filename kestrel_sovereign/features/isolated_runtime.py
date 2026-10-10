@@ -67,6 +67,11 @@ from kestrel_sdk.isolated_feature import (
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
 
 from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+    require_execution_work,
+)
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.base import Feature, UIContributions
 from kestrel_sovereign.features.channels.route_ownership import (
@@ -7970,6 +7975,7 @@ class ProxyFeature(Feature):
         """Build and publish a fresh child while holding lifecycle ownership."""
 
         async with self._reload_lock:
+            require_execution_work(self.agent)
             if terminal_generation != self._terminal_lifecycle_generation:
                 raise _TerminalLifecyclePermitRevoked(
                     "isolated feature terminal lifecycle changed during initialize"
@@ -8044,6 +8050,7 @@ class ProxyFeature(Feature):
         venv mutation cannot continue after lifecycle ownership is released.
         """
 
+        require_execution_work(self.agent)
         started = asyncio.get_running_loop().time()
         task = asyncio.create_task(
             asyncio.to_thread(self.ensure_venv),
@@ -8052,6 +8059,7 @@ class ProxyFeature(Feature):
         environment_mutated = await _await_task_until_complete(
             task, preserve_cancellation=False
         )
+        require_execution_work(self.agent)
         self._last_provision_seconds = asyncio.get_running_loop().time() - started
         self._last_cache_hit = not environment_mutated
 
@@ -8200,9 +8208,14 @@ class ProxyFeature(Feature):
         # A terminal cleanup can latch while a detached start awaits.  Do not
         # publish that child behind a sealed gate; retire it before reporting
         # the terminal lifecycle boundary to the caller.
-        if self._terminal_lifecycle_latched:
-            await self._retire_detached_client(client)
+        try:
             self._assert_child_start_allowed()
+        except BaseException as error:
+            try:
+                await self._retire_detached_client(client)
+            except BaseException as cleanup_error:
+                raise execution_terminal_error(error, cleanup_error)
+            raise
         self._publish_client(
             client,
             tools,
@@ -8302,12 +8315,20 @@ class ProxyFeature(Feature):
             ) from exc
         try:
             started = asyncio.get_running_loop().time()
+            self._assert_child_start_allowed()
             await _maybe_await(client.start())
+            self._assert_child_start_allowed()
             self._capture_process_identity(client)
             advertised_tools = await _maybe_await(client.list_tools())
+            self._assert_child_start_allowed()
             self._last_cold_start_seconds = asyncio.get_running_loop().time() - started
         except BaseException as exc:
-            await self._retire_detached_client(client)
+            try:
+                await self._retire_detached_client(client)
+            except BaseException as cleanup_error:
+                raise execution_terminal_error(exc, cleanup_error)
+            if is_execution_control_error(exc):
+                raise
             if isinstance(
                 exc,
                 (
@@ -8346,6 +8367,7 @@ class ProxyFeature(Feature):
         already the single live proxy state.
         """
 
+        self._assert_child_start_allowed()
         self._client = client
         self._tools = tools
         self._idle_ui_contributions = self._ui_contributions_from_capabilities(
@@ -11246,6 +11268,7 @@ class ProxyFeature(Feature):
     def _assert_child_start_allowed(self) -> None:
         """Refuse normal child-lifecycle work after terminal cleanup starts."""
 
+        require_execution_work(self.agent)
         if self._terminal_lifecycle_latched or self._stopping:
             raise _TerminalLifecyclePermitRevoked(
                 f"Cannot continue isolated feature {self.name}: terminal lifecycle "
@@ -12060,6 +12083,7 @@ class ProxyFeature(Feature):
                 result = await _maybe_await(
                     self._client.call_tool(name, args, context=context)
                 )
+            require_execution_work(self.agent)
             from kestrel_sovereign.features.base import is_flat_toolresult_envelope
             if is_flat_toolresult_envelope(result):
                 # Service returned the flat ToolResult envelope. Pass it through
@@ -12337,6 +12361,7 @@ class ProxyFeature(Feature):
         operator-provided prebuilt environment remains immutable while service
         state, temp files, and user-home/XDG writes stay agent scoped.
         """
+        require_execution_work(self.agent)
         runtime_dir = self._feature_runtime_dir()
         self._venv_relocated_this_startup = False
         if self._isolated_runtime_scope is not None:
@@ -12351,6 +12376,7 @@ class ProxyFeature(Feature):
                 else ()
             )
             migration_results: set[tuple[tuple[str, ...], str, str]] = set()
+            require_execution_work(self.agent)
             prepare_isolated_runtime_namespace(
                 self._isolated_runtime_scope,
                 _agent_runtime_owner(self.agent),
@@ -12360,6 +12386,7 @@ class ProxyFeature(Feature):
             )
             self._venv_relocated_this_startup = bool(migration_results)
             if self._released_legacy_runtime_root is not None:
+                require_execution_work(self.agent)
                 self._venv_relocated_this_startup = (
                     migrate_released_hosted_feature_runtime(
                         self._released_legacy_runtime_root,
@@ -12370,6 +12397,7 @@ class ProxyFeature(Feature):
                     )
                     or self._venv_relocated_this_startup
                 )
+            require_execution_work(self.agent)
             prepare_isolated_runtime_namespace(
                 self._isolated_runtime_scope,
                 _agent_runtime_owner(self.agent),
@@ -12415,6 +12443,7 @@ class ProxyFeature(Feature):
             runtime_dir / "cache",
             self._agent_runtime_dir / "channel_link_artifacts",
         ):
+            require_execution_work(self.agent)
             if directory.is_symlink():
                 raise IsolatedRuntimeNamespaceError(
                     "Standalone isolated feature runtime workspace must not "
@@ -12526,6 +12555,7 @@ class ProxyFeature(Feature):
     def _clear_venv_relocation_repair_marker(self) -> None:
         """Clear migration intent only after launch verification and stamping."""
 
+        require_execution_work(self.agent)
         if self._isolated_runtime_scope is None:
             return
         runtime_dir = self._feature_runtime_dir()
@@ -12628,6 +12658,7 @@ class ProxyFeature(Feature):
     def _write_provision_manifest_payload(self, manifest: Dict[str, Any]) -> None:
         """Atomically publish one private Core provisioning manifest."""
 
+        require_execution_work(self.agent)
         path = self._provision_manifest_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(manifest, indent=2).encode("utf-8")
@@ -12645,6 +12676,7 @@ class ProxyFeature(Feature):
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = None
+            require_execution_work(self.agent)
             os.replace(temporary, path)
             path.chmod(_PRIVATE_FILE_MODE)
             if os.name == "posix":
@@ -13090,6 +13122,7 @@ class ProxyFeature(Feature):
     def ensure_venv(self) -> bool:
         """Ensure the runtime environment within one hosted mutation budget."""
 
+        require_execution_work(self.agent)
         if not self._runtime_is_hosted():
             return self._ensure_venv_with_active_budget()
         timeout = _hosted_provisioning_timeout_seconds()
@@ -13102,6 +13135,7 @@ class ProxyFeature(Feature):
     def _ensure_venv_with_active_budget(self) -> bool:
         """Perform preparation under the caller's hosted deadline, if any."""
 
+        require_execution_work(self.agent)
         assert self._venv_path is not None
         python_path = _venv_python(self._venv_path)
 
@@ -13292,20 +13326,27 @@ class ProxyFeature(Feature):
     def _run_provisioning_command(self, cmd: List[str]) -> None:
         """Map expected host provisioning failures to optional quarantine."""
 
+        require_execution_work(self.agent)
         try:
             self._run(cmd)
+            require_execution_work(self.agent)
         except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise IsolatedRuntimePreparationError(
                 "Isolated feature venv provisioning could not be completed."
             ) from exc
 
     def _run(self, cmd: List[str]) -> None:
+        require_execution_work(self.agent)
         if not cmd:
             raise ValueError("Provisioning command must not be empty")
         if not self._runtime_is_hosted():
             if shutil.which(cmd[0]) is None:
                 raise RuntimeError(f"Required executable not found: {cmd[0]}")
+            require_execution_work(self.agent)
             subprocess.run(cmd, check=True)
+            require_execution_work(self.agent)
             return
 
         assert self._venv_path is not None
@@ -13327,6 +13368,7 @@ class ProxyFeature(Feature):
         )
         if timeout <= 0:
             raise subprocess.TimeoutExpired([executable, *cmd[1:]], timeout)
+        require_execution_work(self.agent)
         completed = asyncio.run(
             run_bounded_subprocess(
                 [executable, *cmd[1:]],
@@ -13334,12 +13376,14 @@ class ProxyFeature(Feature):
                 timeout=timeout,
             )
         )
+        require_execution_work(self.agent)
         if completed.timed_out:
             raise subprocess.TimeoutExpired(completed.argv, timeout)
         if completed.returncode != 0:
             raise subprocess.CalledProcessError(completed.returncode, completed.argv)
 
     def _build_client(self, config: Optional[Dict[str, Any]] = None) -> Any:
+        self._assert_child_start_allowed()
         factory = self._client_factory
         if factory is None:
             from kestrel_sdk.isolated_feature import SubprocessIsolatedFeatureClient
@@ -13903,6 +13947,7 @@ class ProxyFeature(Feature):
         refresh_environment_after_wake = False
         async with self._reload_lock:
             if self._client is not None:
+                self._assert_child_start_allowed()
                 return
             if not self._idle_retired:
                 self._assert_child_start_allowed()
@@ -13912,6 +13957,7 @@ class ProxyFeature(Feature):
             reopened = False
             try:
                 await self._close_traffic_gate()
+                self._assert_child_start_allowed()
                 if self._client is None:
                     self._prepare_runtime_workspace()
                     self._venv_path, self._bin_path = self.resolve_runtime_paths()
@@ -13927,6 +13973,7 @@ class ProxyFeature(Feature):
                     if self._is_telegram_runtime():
                         await self._resolve_hosted_telegram_startup_attestation()
                     await self._connect_client()
+                    self._assert_child_start_allowed()
                     self._reload_gen += 1
                     self._idle_wake_count += 1
                     self._last_used_monotonic = asyncio.get_running_loop().time()
@@ -13985,6 +14032,7 @@ class ProxyFeature(Feature):
             backoff = 1.0
             while not self._stopping:
                 await asyncio.sleep(backoff)
+                require_execution_work(self.agent)
                 # A ``set_config`` reload intentionally stops/starts the client;
                 # don't probe (and "restart") a service that is mid-reload.
                 if self._reloading:
@@ -14012,6 +14060,7 @@ class ProxyFeature(Feature):
                         on_started=self._own_health_probe_task,
                         on_late_task=self._retain_terminal_health_probe_task,
                     )
+                    require_execution_work(self.agent)
                     healthy = self._is_healthy_response(health)
                     if healthy:
                         backoff = 1.0
@@ -14023,7 +14072,9 @@ class ProxyFeature(Feature):
                         self.name,
                         _HEALTH_PROBE_TIMEOUT,
                     )
-                except Exception:  # noqa: BLE001 - facade details stay private
+                except Exception as error:  # noqa: BLE001 - facade details stay private
+                    if is_execution_control_error(error):
+                        raise
                     logger.warning(
                         "Isolated feature %s health check failed", self.name
                     )
@@ -14171,6 +14222,7 @@ class ProxyFeature(Feature):
                                     task, client
                                 ),
                             )
+                            require_execution_work(self.agent)
                             self._capture_process_identity(client)
                             self._last_cold_start_seconds = (
                                 asyncio.get_running_loop().time() - started
@@ -14202,7 +14254,11 @@ class ProxyFeature(Feature):
                                 lifecycle_lock_held=True,
                             )
                             break
-                        except Exception:  # noqa: BLE001 - facade details stay private
+                        except Exception as error:  # noqa: BLE001 - facade details stay private
+                            if is_execution_control_error(error):
+                                terminal_unwind = True
+                                self._latch_terminal_lifecycle()
+                                raise
                             logger.warning(
                                 "Isolated feature %s restart failed", self.name
                             )
@@ -14263,6 +14319,7 @@ class ProxyFeature(Feature):
         therefore required before the supervisor may touch a facade.
         """
 
+        require_execution_work(self.agent)
         return (
             not self._stopping
             and not self._terminal_lifecycle_latched

@@ -73,6 +73,14 @@ it also preserves an explicitly bound shared backend and refuses replacing
 that binding. Multi-tenant hosts should use an unbound shared operational pool
 and inject independent per-agent custody through the factory.
 
+Concurrent discovery owns each lazy child: control failure cancels and joins
+all siblings before choosing terminal evidence, including late uncertain commits.
+Tolerant discovery returns only ordinary failures as values. Catalog worker
+threads bind the original turn snapshot, and publication rechecks original
+custody after lifecycle, cache and worker waits. Isolated wake/provision/restart
+also checks the synchronous mutation and child-start boundaries; RPC success
+does not publish a channel result after authority loss.
+
 PostgreSQL scheduler execution records `executing` in the existing exact
 occurrence log before target dispatch. Only exact-owner live finalization
 resolves it into a known outcome. Lease loss, process death or post-dispatch
@@ -116,8 +124,9 @@ the original schedule. A known feature-unavailable deferral restores only the
 same live claim, never an uncertain occurrence under fresh authority.
 
 Stream forwarding captures declaration-site turn capabilities before moving
-execution to its source owner, including privacy-lock reentry and delegated
-conversation-lock ownership. A shared close record reaches that source and its
+execution to its source owner, including privacy-lock reentry and the requested
+session. Conversation ownership is not delegated: child wakes queue for distinct
+turns. A shared close record reaches that source and its
 children before cancellation starts unwinding an actively advancing generator;
 ordinary storage/provider/tool work is then denied, even while runtime custody
 is otherwise live. Closing one stream does not revoke its reusable runtime.

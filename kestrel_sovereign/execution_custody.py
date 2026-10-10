@@ -9,7 +9,7 @@ has been reset. Causation and telemetry are not consulted for authority.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -308,6 +308,58 @@ def execution_work_operation(function: Callable) -> Callable:
     async def guarded(self, *args, **kwargs):
         return await await_execution_work(self, lambda: function(self, *args, **kwargs))
     return guarded
+
+
+async def await_execution_work_group(
+    owner: Any,
+    operations: Iterable[Callable[[], Awaitable[Any]]],
+    *,
+    return_exceptions: bool = False,
+) -> list[Any]:
+    """Own all fan-out children and retain irreversible cleanup evidence.
+
+    Ordinary tolerant discovery may return ordinary failures as values, but
+    control failure and cancellation always cancel/join every sibling. Lazy
+    callables avoid creating undispatched coroutine objects after denial.
+    """
+    import asyncio
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    tasks = []
+
+    async def run(operation):
+        try:
+            return await await_execution_work(owner, operation)
+        except Exception as error:
+            if return_exceptions and not is_execution_control_error(error):
+                return error
+            raise
+
+    try:
+        require_execution_work(owner)
+        for operation in operations:
+            coroutine = run(operation)
+            try:
+                task = asyncio.create_task(coroutine)
+            except BaseException:
+                coroutine.close()
+                raise
+            tasks.append(task)
+        results = list(await asyncio.gather(*tasks))
+        require_execution_work(owner)
+        return results
+    except BaseException as error:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        outcomes = [await await_owned_task(task) for task in tasks]
+        terminal = execution_terminal_error(
+            error,
+            *(outcome.error for outcome in outcomes),
+            *(outcome.cancellation for outcome in outcomes),
+        )
+        assert terminal is not None
+        raise terminal
 
 
 def execution_work_stream(function: Callable) -> Callable:
