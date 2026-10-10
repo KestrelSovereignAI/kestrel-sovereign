@@ -29,6 +29,51 @@ from tests.integration.test_constitution_reanchor_e2e import _write_authority_fi
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 @pytest.mark.parametrize("writer", ["runtime", "offline"])
+async def test_first_signed_anchor_and_repeat_preserve_absent_receipt_fields(db_backend, tmp_path, monkeypatch, writer):
+    from kestrel_sovereign.setup import constitution_reanchor as offline
+    from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
+
+    identity = "did:test:first-reanchor:" + uuid4().hex
+    storage = AsyncStorage(str(tmp_path / "kestrel_prime.db"), backend="sqlite", agent_id=identity) if db_backend.backend_type == "sqlite" else AsyncStorage(backend=db_backend, agent_id=identity)
+    await storage.initialize()
+    try:
+        agent = await _agent(storage)
+        await storage.add_node(GraphNode(node_id=identity, node_type="agent", label="First signed anchor", properties={}))
+        content = resolve_governing_constitution_bytes(None)
+        digest = sha256(content).hexdigest()
+        artifact, root = _write_authority_files(tmp_path, content)
+        agent._sovereign_trust_root_path = root
+        target = offline.ReanchorTarget(tmp_path / "kestrel_prime.db", "sqlite", identity) if db_backend.backend_type == "sqlite" else offline.ReanchorTarget(None, "postgres", identity, db_backend._dsn)
+
+        async def exact_target(*args, **kwargs): return target
+        @asynccontextmanager
+        async def no_embedding(*args, **kwargs): yield None
+        monkeypatch.setattr(offline, "resolve_reanchor_target", exact_target)
+        monkeypatch.setattr(offline, "_agent_embedding", no_embedding)
+        first = None
+        for index in range(2):
+            if writer == "runtime":
+                result = await ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(artifact))
+                assert not result.startswith("Error:"), result
+            else:
+                result = await offline.reanchor_constitution(agent_name="first receipt proof", agent_dir=tmp_path if target.anchor_path else None, force=True, sovereign_trust_root_path=root, amendment_artifact_path=artifact, runtime_backend=target.backend, runtime_dsn=target.dsn, hosted_agent_did=identity if target.backend == "postgres" else None, environ={})
+                assert result.error is None, result.error
+            fresh = (await storage.get_node(identity)).properties
+            assert fresh["constitution_hash"] == digest
+            assert historical_anchor_hash(fresh, ()) == digest
+            assert len(fresh.get("constitution_reanchor_history", [])) == index
+            if index == 0:
+                first = deepcopy(fresh["constitution_reanchor"])
+                assert first["old_hash"] in (None, "none")
+            else:
+                assert fresh["constitution_reanchor_history"][0]["receipt"] == first
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("writer", ["runtime", "offline"])
 @pytest.mark.parametrize("shape", ["not-list", "null-history", "bad-entry", "missing-destination", "bad-current", "null-current", "bad-current-old", "bad-artifact", "bad-supersession", "overflow", "at-limit", "last-slot"])
 async def test_signed_same_hash_repair_preserves_complete_reanchor_evidence(db_backend, tmp_path, monkeypatch, writer, shape):
     from kestrel_sovereign.setup import constitution_reanchor as offline

@@ -24,11 +24,24 @@ import hashlib
 import pytest
 
 from kestrel_sovereign.constitution.anchored_bytes import (
+    governance_evidence,
     historical_anchor_hash,
     read_anchored_constitution,
 )
 
 HASH = "a" * 64
+
+
+def test_governance_snapshot_preserves_absence_and_explicit_null_distinctly():
+    absent = governance_evidence({"unrelated": "metadata"}, ())
+    assert absent["properties"] == {}
+    assert historical_anchor_hash(absent["properties"], ()) is None
+    for key in ("constitution_reanchor", "constitution_reanchor_history"):
+        malformed = governance_evidence({key: None}, ())
+        assert malformed["properties"] == {key: None}
+        assert malformed != absent
+        with pytest.raises(ValueError, match="historical governance"):
+            historical_anchor_hash(malformed["properties"], ())
 
 
 @pytest.mark.parametrize("key", ["genesis_audit", "genesis_audit_history", "constitution_reanchor", "constitution_reanchor_history"])
