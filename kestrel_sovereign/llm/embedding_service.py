@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional
 import numpy as np
 
 from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
+from kestrel_sovereign.execution_custody import await_execution_work, require_execution_work
 
 from .adapter import ReportedUsage
 from .modality_recording import ModalityCall
@@ -651,7 +652,7 @@ class ProviderEmbeddingService:
         kwargs: dict[str, Any] = {"model": self.model, **self._embed_kwargs()}
         recorder = self._recorder
         if recorder is None:
-            return await method(self.client, payload, **kwargs)
+            return await await_execution_work(self, lambda: method(self.client, payload, **kwargs))
 
         context = recorder.snapshot_invocation_context()
         usage = ReportedUsage()
@@ -661,8 +662,7 @@ class ProviderEmbeddingService:
         result: Any = None
         error: Optional[BaseException] = None
         try:
-            result = await method(self.client, payload, **kwargs)
-            return result
+            result = await await_execution_work(recorder, lambda: method(self.client, payload, **kwargs))
         except BaseException as exc:
             error = exc
             raise
@@ -678,6 +678,8 @@ class ProviderEmbeddingService:
                     context=context,
                 )
             )
+        require_execution_work(recorder)
+        return result
 
     def _embedding_call(
         self,
@@ -760,9 +762,9 @@ class ProviderEmbeddingService:
         ]
         if not prepared:
             # Nothing is dispatched for an empty batch, so nothing is recorded.
-            return await self.adapter.aembed_batch(
+            return await await_execution_work(self._recorder or self, lambda: self.adapter.aembed_batch(
                 self.client, prepared, model=self.model, **self._embed_kwargs()
-            )
+            ))
         return await self._dispatch(
             "batch", self.adapter.aembed_batch, prepared, len(prepared)
         )

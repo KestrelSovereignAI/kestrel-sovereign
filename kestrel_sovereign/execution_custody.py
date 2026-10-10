@@ -9,11 +9,12 @@ has been reset. Causation and telemetry are not consulted for authority.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Protocol, TYPE_CHECKING
+from functools import wraps
+from typing import Any, Protocol, TYPE_CHECKING, TypeVar
 
 from kestrel_sovereign.turn_scope import turn_scoped
 from kestrel_sdk.storage.database import TransactionError
@@ -210,6 +211,72 @@ def bind_execution_runtime(owner: Any) -> Iterator[None]:
     """Present retained runtime custody without minting a fresh admission."""
     with _bind_captured_custody(current_execution_custody(owner)):
         yield
+
+
+_Result = TypeVar("_Result")
+
+
+async def await_execution_work(owner: Any, operation: Callable[[], Awaitable[_Result]]) -> _Result:
+    """Dispatch a lazy provider operation under its original runtime custody.
+
+    The callable is evaluated only after admission, and its owned children
+    inherit the same scopes. A failed provider cannot turn authority loss into
+    a recoverable route failure; a successful provider cannot disclose a result
+    after loss. This does not recall an already submitted remote operation.
+    """
+    with bind_execution_runtime(owner):
+        try:
+            result = await operation()
+        except ExecutionAuthorityError:
+            raise
+        except Exception:
+            require_execution_work(owner)
+            raise
+        require_execution_work(owner)
+        return result
+
+
+def execution_work_operation(function: Callable) -> Callable:
+    """Keep finalization and its children inside the original runtime scope."""
+    @wraps(function)
+    async def guarded(self, *args, **kwargs):
+        return await await_execution_work(self, lambda: function(self, *args, **kwargs))
+    return guarded
+
+
+def execution_work_stream(function: Callable) -> Callable:
+    """Monotonic custody across foreign consumers, errors, and fallback.
+
+    Context is installed only during an advance/close, never across yield to
+    the consumer. Every later consumer's admissions join the pinned union.
+    """
+    @wraps(function)
+    async def guarded(self, *args, **kwargs) -> AsyncIterator[Any]:
+        captured = current_execution_custody(self)
+        iterator = None
+        try:
+            while True:
+                with bind_execution_custody_snapshot(captured), bind_execution_runtime(self):
+                    captured = current_execution_custody(self)
+                    if iterator is None:
+                        iterator = aiter(function(self, *args, **kwargs))
+                    try:
+                        item = await anext(iterator)
+                    except StopAsyncIteration:
+                        require_execution_work(self)
+                        return
+                    except Exception:
+                        require_execution_work(self)
+                        raise
+                    require_execution_work(self)
+                yield item
+        finally:
+            if iterator is not None:
+                with bind_execution_cleanup(self, captured):
+                    close = getattr(iterator, "aclose", None)
+                    if callable(close):
+                        await close()
+    return guarded
 
 
 @contextmanager

@@ -649,3 +649,88 @@ async def test_failed_generation_validation_irrevocably_retires_original_admissi
         with pytest.raises(ExecutionAuthorityError, match="generation changed"):
             await backend.execute("INSERT INTO effects VALUES (2, 'revived generation')")
     assert await backend.fetch_val("SELECT count(*) FROM effects") == 0
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("operational", [False, True])
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+async def test_pool_release_failure_preserves_committed_outcome(native_pg, explicit, operational, failure):
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign.execution_custody import execution_commit_outcome
+    backend, _, _ = native_pg
+    pool = backend._pool
+    class ReleaseFailurePool:
+        def __getattr__(self, name):
+            return getattr(pool, name)
+        @asynccontextmanager
+        async def acquire(self):
+            async with pool.acquire() as connection:
+                yield connection
+            if failure == "cancel":
+                raise asyncio.CancelledError("cancelled during pool reset")
+            raise OSError("pool reset acknowledgement lost")
+    backend._pool = ReleaseFailurePool()
+    @asynccontextmanager
+    async def checkout():
+        if operational:
+            async with backend.operational_session():
+                yield
+        else:
+            yield
+    try:
+        with bind_execution_custody(GenerationFence()):
+            with pytest.raises(Exception, match="may have committed") as caught:
+                async with checkout():
+                    if explicit:
+                        async with backend.transaction():
+                            await backend.execute("INSERT INTO effects VALUES (1, 'committed before release')")
+                    else:
+                        await backend.execute("INSERT INTO effects VALUES (1, 'committed before release')")
+            assert execution_commit_outcome(caught.value) == "committed"
+    finally:
+        backend._pool = pool
+    assert await backend.fetch_val("SELECT value FROM effects") == "committed before release"
+
+
+async def test_scheduler_commit_uncertainty_remains_unresolved(native_pg):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask, SCHEDULER_PROTOCOL_VERSION
+    from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    backend, _, _ = native_pg
+    db = AsyncDatabase(backend)
+    agent_id = "did:example:commit-uncertain"
+    calls = []
+    async def effect(name, args):
+        calls.append(True)
+        await backend.execute("INSERT INTO effects VALUES (1, 'committed effect')")
+        try:
+            raise ExecutionCommitOutcomeError("unknown")
+        except Exception as error:
+            raise RuntimeError("wrapped commit uncertainty") from error
+    runner = SchedulerRunner(db, agent_id, effect, owner_id="original-owner")
+    await runner._ensure_tables()
+    due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    await db.execute("""INSERT INTO scheduled_tasks
+        (id, agent_id, task_name, cron_expression, enabled, next_run_at, created_at, idempotency_key, scheduler_protocol_version)
+        VALUES ('uncertain', ?, 'effect', '* * * * *', 1, ?, ?, 'uncertain-base', ?)""", (agent_id, due, due, SCHEDULER_PROTOCOL_VERSION))
+    task = ScheduledTask.from_row((await runner._due_rows(datetime.now(timezone.utc)))[0])
+    claimed = await runner._claim(task, datetime.now(timezone.utc))
+    await runner._execute_claim(claimed)
+    assert await db.fetchval("SELECT status FROM task_execution_log WHERE task_id='uncertain'") == "executing"
+    identity = await db.fetchone("SELECT claim_execution_id, claim_scheduled_for FROM scheduled_tasks WHERE id='uncertain'")
+    owner = SimpleNamespace(did=agent_id, agent_id=agent_id, _raw_storage=SimpleNamespace(db=db), features={})
+    feature = SchedulerFeature(owner)
+    feature._db, feature._agent_id = db, agent_id
+    paused = await feature.schedule_pause("uncertain")
+    assert paused.status.value == "ok"
+    assert await db.fetchone("SELECT claim_execution_id, claim_scheduled_for FROM scheduled_tasks WHERE id='uncertain'") == identity
+    resumed = await feature.schedule_resume("uncertain", acknowledge_ambiguous_effect=True)
+    assert resumed.status.value == "error"
+    assert resumed.data["disabled_reason"] == "unresolved_effect"
+    updated = await feature.schedule_update("uncertain", "*/2 * * * *")
+    assert updated.status.value == "error"
+    assert calls == [True]
+    assert await backend.fetch_val("SELECT count(*) FROM effects") == 1

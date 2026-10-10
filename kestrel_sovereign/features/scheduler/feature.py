@@ -3565,6 +3565,7 @@ class SchedulerFeature(Feature):
 
                 claim_fenced = bool(row[2]) if len(row) > 2 else False
                 rollout_fenced = bool(row[3]) if len(row) > 3 else False
+                unresolved = await self._has_unresolved_execution(task_id)
                 if not row[1] and not claim_fenced and not rollout_fenced:
                     return ToolResult.ok(
                         confirmation=f"Task {task_id} was already paused (no-op)",
@@ -3575,13 +3576,16 @@ class SchedulerFeature(Feature):
                     """
                     UPDATE scheduled_tasks
                     SET enabled = 0, lease_owner = NULL, lease_expires_at = NULL,
-                        claim_token = NULL, claim_execution_id = NULL,
-                        claim_scheduled_for = NULL, scheduler_claim_fenced = 0,
+                        claim_token = NULL,
+                        claim_execution_id = CASE WHEN ? = 1 THEN claim_execution_id ELSE NULL END,
+                        claim_scheduled_for = CASE WHEN ? = 1 THEN claim_scheduled_for ELSE NULL END,
+                        terminal_status = CASE WHEN ? = 1 THEN 'unresolved_effect' ELSE terminal_status END,
+                        scheduler_claim_fenced = 0,
                         scheduler_rollout_fenced = 0,
                         scheduler_rollout_fenced_at = NULL
                     WHERE id = ? AND agent_id = ?
                     """,
-                    (task_id, self._agent_id),
+                    (int(unresolved), int(unresolved), int(unresolved), task_id, self._agent_id),
                 )
                 if not self._scheduler_mutation_wrote(paused):
                     return ToolResult.failed("Failed to pause scheduled task")
@@ -3663,6 +3667,11 @@ class SchedulerFeature(Feature):
                 run_at = row[4] if len(row) > 4 else None
                 timezone_name = row[5] if len(row) > 5 and row[5] else "UTC"
                 terminal_status = row[6] if len(row) > 6 else None
+                if terminal_status == "unresolved_effect" or await self._has_unresolved_execution(task_id):
+                    return ToolResult.failed(
+                        f"Task {task_id} has an unresolved dispatched effect; reconcile its execution log before resuming",
+                        data={"task_id": task_id, "disabled_reason": "unresolved_effect", "recoverable": False},
+                    )
                 if terminal_status == "invalid_idempotency_key":
                     return ToolResult.failed(
                         f"Task {task_id} has an invalid persisted idempotency key; "
@@ -3862,6 +3871,11 @@ class SchedulerFeature(Feature):
                     )
 
                 old_cron = row[0]
+                if await self._has_unresolved_execution(task_id):
+                    return ToolResult.failed(
+                        f"Task {task_id} has an unresolved dispatched effect; reconcile it before changing its occurrence",
+                        data={"task_id": task_id, "disabled_reason": "unresolved_effect"},
+                    )
                 claim_fenced = bool(row[4]) if len(row) > 4 else False
                 rollout_fenced = bool(row[5]) if len(row) > 5 else False
                 if rollout_fenced:
@@ -3951,6 +3965,14 @@ class SchedulerFeature(Feature):
                 "next_run_at": next_run_at,
             },
         )
+
+    async def _has_unresolved_execution(self, task_id: str) -> bool:
+        if self._database_backend_type() not in {"postgres", "sqlite"}:
+            return False
+        return bool(await self._db.fetchone(
+            "SELECT id FROM task_execution_log WHERE task_id = ? AND agent_id = ? AND status = 'executing' LIMIT 1",
+            (task_id, self._agent_id),
+        ))
 
     async def _cancel_claimed_executions(
         self,

@@ -3367,6 +3367,8 @@ class CodexAdapter(LLMAdapter):
         preserved so the streaming.py harness-owned check still kicks
         in (#1429 contract).
         """
+        from kestrel_sovereign.execution_custody import require_execution_work
+        require_execution_work()
         if tools:
             # See docstring: tool-bearing turns are outside the safe
             # retry envelope today. Delegate straight through.
@@ -3386,6 +3388,7 @@ class CodexAdapter(LLMAdapter):
 
         MAX_ATTEMPTS = 2
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            require_execution_work()
             events_yielded = 0
             try:
                 async for ev in self._run_turn(

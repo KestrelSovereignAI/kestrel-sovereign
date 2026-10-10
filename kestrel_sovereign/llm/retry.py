@@ -10,6 +10,7 @@ import math
 import random
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Iterable, Optional, TypeVar
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work
 
 logger = logging.getLogger(__name__)
 
@@ -508,7 +509,9 @@ async def with_retry(
 
     while True:
         try:
-            return await func(*args, **kwargs)
+            return await await_execution_work(None, lambda: func(*args, **kwargs))
+        except ExecutionAuthorityError:
+            raise
         except Exception as e:
             if not is_retryable_error(e):
                 raise

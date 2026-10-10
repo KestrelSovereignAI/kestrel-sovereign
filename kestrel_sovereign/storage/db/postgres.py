@@ -27,7 +27,7 @@ import contextvars
 import logging
 from collections.abc import Callable, Sequence as SequenceABC
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
@@ -36,6 +36,7 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCustody,
     ExecutionCommitOutcomeError,
+    execution_commit_outcome,
     current_execution_custody,
     lock_execution_authority,
     require_execution_backend,
@@ -69,12 +70,18 @@ _ADVISORY_LOCK_POLL_INTERVAL_S = 0.05
 
 
 @dataclass
+class _ExecutionCommitState:
+    outcome: str | None = None
+
+
+@dataclass
 class _OperationalSessionLease:
     """One pool connection shared only by a context and its owned children."""
 
     connection: Any
     lock: asyncio.Lock
     active: bool = True
+    commit_state: _ExecutionCommitState = field(default_factory=_ExecutionCommitState)
 
 
 class AdvisoryLease:
@@ -734,7 +741,7 @@ class PostgresBackend(DatabaseBackend):
         return converted
 
     @asynccontextmanager
-    async def _execution_query_executor(self, executor: Any) -> AsyncIterator[Any]:
+    async def _execution_query_executor(self, executor: Any, commit_state: _ExecutionCommitState | None = None) -> AsyncIterator[Any]:
         """Fence every native SQL surface on its own transaction/session.
 
         Unfenced callers retain their normal autocommit path. A fenced read is
@@ -753,16 +760,33 @@ class PostgresBackend(DatabaseBackend):
             self._require_transaction_custody()
             return
         if executor is self._pool:
-            async with executor.acquire() as connection:
-                async with self._execution_query_executor(connection) as checked:
+            async with self._authority_pool_checkout(executor) as (connection, state):
+                async with self._execution_query_executor(connection, state) as checked:
                     yield checked
             return
-        async with self._authority_transaction(executor, scopes):
+        operational = self._current_operational_lease()
+        if commit_state is None and operational is not None and executor is operational.connection:
+            commit_state = operational.commit_state
+        async with self._authority_transaction(executor, scopes, commit_state):
             yield executor
+
+    @asynccontextmanager
+    async def _authority_pool_checkout(self, pool: Any) -> AsyncIterator[tuple[Any, _ExecutionCommitState]]:
+        # asyncpg release/reset is awaited after COMMIT. Carry the exact commit
+        # state through that await so a release failure cannot imply rollback.
+        state = _ExecutionCommitState()
+        try:
+            async with pool.acquire() as connection:
+                yield connection, state
+        except BaseException as exc:
+            if state.outcome is not None and execution_commit_outcome(exc) is None:
+                raise ExecutionCommitOutcomeError(state.outcome) from exc
+            raise
 
     @asynccontextmanager
     async def _authority_transaction(
         self, connection: Any, scopes: tuple[ExecutionCustody, ...],
+        commit_state: _ExecutionCommitState | None = None,
     ) -> AsyncIterator[None]:
         # A failure in the body rolls back. Once the body/precommit checks
         # finish, a failed commit acknowledgement must instead be reconciled.
@@ -774,10 +798,14 @@ class PostgresBackend(DatabaseBackend):
                 require_execution_backend("postgres", scopes)
                 self._require_transaction_custody()
                 committing = True
+                if commit_state is not None:
+                    commit_state.outcome = "unknown"
         except BaseException as exc:
             if committing:
                 raise ExecutionCommitOutcomeError("unknown") from exc
             raise
+        if commit_state is not None:
+            commit_state.outcome = "committed"
         self._require_after_authority_commit(scopes)
 
     @staticmethod
@@ -1039,12 +1067,12 @@ class PostgresBackend(DatabaseBackend):
             return
 
         pool = self._ensure_connected()
-        async with pool.acquire() as conn:
+        async with self._authority_pool_checkout(pool) as (conn, commit_state):
             await self._verify_operational_cluster_identity(
                 conn,
                 expected_cluster_identity,
             )
-            lease = _OperationalSessionLease(conn, asyncio.Lock())
+            lease = _OperationalSessionLease(conn, asyncio.Lock(), commit_state=commit_state)
             token = self._operational_conn_var.set(lease)
             try:
                 yield
@@ -1085,7 +1113,7 @@ class PostgresBackend(DatabaseBackend):
                     custody_var = self._transaction_custody_context()
                     custody_token = custody_var.set((asyncio.current_task(), scopes))
                     try:
-                        async with self._authority_transaction(operational.connection, tuple(scopes)):
+                        async with self._authority_transaction(operational.connection, tuple(scopes), operational.commit_state):
                             yield
                     except ExecutionCommitOutcomeError:
                         raise
@@ -1096,13 +1124,13 @@ class PostgresBackend(DatabaseBackend):
                         self._txn_conn_var.reset(token)
                     return
 
-        async with pool.acquire() as conn:
+        async with self._authority_pool_checkout(pool) as (conn, commit_state):
             token = self._txn_conn_var.set((asyncio.current_task(), conn))
             scopes = list(current_execution_custody(self))
             custody_var = self._transaction_custody_context()
             custody_token = custody_var.set((asyncio.current_task(), scopes))
             try:
-                async with self._authority_transaction(conn, tuple(scopes)):
+                async with self._authority_transaction(conn, tuple(scopes), commit_state):
                     yield
             except ExecutionCommitOutcomeError:
                 raise

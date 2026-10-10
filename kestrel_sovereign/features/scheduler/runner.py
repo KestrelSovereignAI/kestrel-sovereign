@@ -41,6 +41,7 @@ from kestrel_sovereign.execution_custody import (
     bind_execution_runtime,
     current_execution_custody,
     require_execution_work,
+    execution_commit_outcome,
 )
 from kestrel_sovereign.storage.database_clock import (
     database_backend_type as scheduler_database_backend_type,
@@ -2786,12 +2787,17 @@ class SchedulerRunner:
                 token,
                 execution_id,
             )
+        identity_update = (
+            "claim_execution_id = claim_execution_id, claim_scheduled_for = claim_scheduled_for,"
+            if status == "executing"
+            else "claim_execution_id = NULL, claim_scheduled_for = NULL,"
+        )
         updated = await self._db.execute(
             f"""
             UPDATE scheduled_tasks
             SET enabled = 0, scheduler_claim_fenced = 0,
                 lease_owner = NULL, lease_expires_at = NULL, claim_token = NULL,
-                claim_execution_id = NULL, claim_scheduled_for = NULL,
+                {identity_update}
                 terminal_status = ?,
                 terminal_at = {terminal_at}
             WHERE id = ? AND agent_id = ? AND lease_owner = ?
@@ -3419,6 +3425,12 @@ class SchedulerRunner:
                                 e,
                             )
                         except Exception as e:
+                            if execution_commit_outcome(e) is not None:
+                                # Keep the pre-dispatch executing marker and
+                                # occurrence identity for reconciliation. A lost
+                                # acknowledgement is not a terminal task failure.
+                                logger.error("Scheduler effect %s requires commit reconciliation: %s", execution.id, e)
+                                return
                             status = "failed"
                             result_text = f"{type(e).__name__}: {e}"
                             logger.error(

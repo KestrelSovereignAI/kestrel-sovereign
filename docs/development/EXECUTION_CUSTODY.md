@@ -58,8 +58,16 @@ normal advisory retirement. Cleanup does not grant new cognition/tool/storage
 authority; terminal identity/token CAS needs its own explicit native custody.
 
 The native provider service retains the owning agent's runtime custody and
-checks each adapter attempt and streamed chunk. Authority errors are not
-provider failures and must never trigger provider fallback. The AgentManager
+checks each adapter attempt and streamed chunk, including decision discovery,
+pin canaries, decisions, embeddings and each internal retry after backoff.
+`await_execution_work(owner, operation)` evaluates a lazy operation only after
+binding original runtime custody and rechecks it before publishing a result.
+Public streams pin the union of every consumer's admission through exceptions,
+fallback and finalization, without leaving a binding installed across a yield.
+Aborted hosted streams finalize under cleanup-only denial; ordinary usage writes
+and billing callbacks cannot run there. Codex transport readers have a neutral
+transport-lifetime context; each tool callback still binds its owning turn.
+Authority errors are not provider failures and must never trigger fallback. The AgentManager
 accepts a trusted per-agent `execution_custody_factory` before construction;
 it also preserves an explicitly bound shared backend and refuses replacing
 that binding. Multi-tenant hosts should use an unbound shared operational pool
@@ -73,6 +81,11 @@ uncertainty does not authorize replay: recovery disables the schedule with
 reconciliation. This deliberately trades automatic retry for duplicate-effect
 safety; a supplied idempotency key alone is not proof of destination deduplication.
 Renewal retains the original resolved runtime and exact advisory effect handle.
+Pause retains unresolved occurrence identity, and resume/definition changes
+refuse unreconciled `executing` evidence. Commit uncertainty cannot be normalized
+into a terminal failed execution or clean Stop settlement. PostgreSQL carries
+commit state through pool release/reset (including pinned operational sessions),
+so release failure or cancellation after commit does not claim rollback.
 
 Custody-bound durable-signal boot uses transactional creation/repair of its
 exact source-sequence index, retaining generation locks through commit. Unbound

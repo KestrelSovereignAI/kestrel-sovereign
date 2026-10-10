@@ -71,7 +71,7 @@ from kestrel_sovereign.kestrel_config.constants import (
 )
 from kestrel_sovereign.config import load_config, load_section
 from kestrel_sovereign import telemetry
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, require_execution_work
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, require_execution_work, execution_work_operation
 
 logger = logging.getLogger(__name__)
 
@@ -3595,6 +3595,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             usage = raw.get("usage")
         return provider_usage_cost(usage)
 
+    @execution_work_operation
     async def _finalize_invocation(
         self,
         response: Any,
@@ -3835,36 +3836,53 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
     ) -> Any:
         """Await and finalize one provider call, successful or failed."""
 
-        started = time.monotonic()
         try:
+            require_execution_work(self)
+        except ExecutionAuthorityError:
+            if inspect.iscoroutine(attempt):
+                attempt.close()
+            raise
+        with bind_execution_runtime(self):
+            started = time.monotonic()
             try:
-                require_execution_work(self)
-            except ExecutionAuthorityError:
-                if inspect.iscoroutine(attempt):
-                    attempt.close()
-                raise
-            with bind_execution_runtime(self):
                 response = await attempt
                 require_execution_work(self)
-        except ExecutionAuthorityError:
-            raise
-        except asyncio.CancelledError:
-            # No usage evidence exists on a non-streaming cancelled call.  Keep
-            # the historical cancellation contract and do not fabricate a row.
-            raise
-        except Exception as exc:
-            require_execution_work(self)
-            await self._finalize_failed_invocation(
+            except ExecutionAuthorityError:
+                raise
+            except asyncio.CancelledError:
+                # No usage evidence exists on a non-streaming cancelled call.  Keep
+                # the historical cancellation contract and do not fabricate a row.
+                raise
+            except Exception as exc:
+                require_execution_work(self)
+                await self._finalize_failed_invocation(
+                    provider_name,
+                    model,
+                    path=path,
+                    invocation_context=invocation_context,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    error=(
+                        LLMServiceError(error_message_override)
+                        if error_message_override is not None
+                        else exc
+                    ),
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    tools=tools,
+                    response_format=response_format,
+                    force_local_only=force_local_only,
+                    metadata=metadata,
+                    tools_used=tools_used,
+                )
+                raise
+
+            await self._finalize_successful_invocation(
+                response,
                 provider_name,
                 model,
                 path=path,
                 invocation_context=invocation_context,
                 duration_ms=int((time.monotonic() - started) * 1000),
-                error=(
-                    LLMServiceError(error_message_override)
-                    if error_message_override is not None
-                    else exc
-                ),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 tools=tools,
@@ -3872,28 +3890,12 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 force_local_only=force_local_only,
                 metadata=metadata,
                 tools_used=tools_used,
+                publish_identity=publish_identity,
             )
-            raise
+            require_execution_work(self)
+            return response
 
-        await self._finalize_successful_invocation(
-            response,
-            provider_name,
-            model,
-            path=path,
-            invocation_context=invocation_context,
-            duration_ms=int((time.monotonic() - started) * 1000),
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            tools=tools,
-            response_format=response_format,
-            force_local_only=force_local_only,
-            metadata=metadata,
-            tools_used=tools_used,
-            publish_identity=publish_identity,
-        )
-        require_execution_work(self)
-        return response
-
+    @execution_work_operation
     async def _log_llm_call(
         self,
         provider: str,
@@ -4120,6 +4122,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 for name in accepted_optional:
                     meter_kwargs[name] = optional_values[name]
                 try:
+                    require_execution_work(self)
                     await metering_callback(**meter_kwargs)
                 except asyncio.CancelledError:
                     raise

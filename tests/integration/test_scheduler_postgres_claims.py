@@ -662,7 +662,15 @@ async def test_postgres_scheduled_mutator_does_not_deadlock_rollout_admission(
         ) == (False, None)
         assert await db.fetchone(
             "SELECT status FROM task_execution_log WHERE task_id = ?", (task_id,)
-        ) == ("cancelled",)
+        ) == ("executing",)
+        unresolved = await db.fetchone(
+            "SELECT terminal_status, claim_execution_id, claim_scheduled_for FROM scheduled_tasks WHERE id = ?", (task_id,)
+        )
+        assert unresolved[0] == "unresolved_effect"
+        assert unresolved[1] and unresolved[2]
+        resume = await mutation_feature.schedule_resume(task_id)
+        assert resume.status.value == "error"
+        assert resume.data["disabled_reason"] == "unresolved_effect"
     finally:
         if tick is not None and not tick.done():
             tick.cancel()

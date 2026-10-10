@@ -31,6 +31,7 @@ from kestrel_sdk.llm.decisions import (
 )
 
 from kestrel_sovereign.config import load_section
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, require_execution_work
 
 from .adapter import ReportedUsage
 from .decisions.config import (
@@ -206,8 +207,10 @@ class DecisionServiceMixin:
             if not force and not state.needs_discovery:
                 return
             try:
-                discovered = await provider["adapter"].list_decision_models(provider.get("client"))
+                discovered = await await_execution_work(self, lambda: provider["adapter"].list_decision_models(provider.get("client")))
             except asyncio.CancelledError:
+                raise
+            except ExecutionAuthorityError:
                 raise
             except Exception as exc:  # noqa: BLE001 - any discovery failure marks the route stale
                 state.record_discovery_failure()
@@ -251,10 +254,13 @@ class DecisionServiceMixin:
         error: Optional[BaseException] = None
         try:
             async with asyncio.timeout(timeout):
-                body = await provider["adapter"].adecide(
+                body = await await_execution_work(self, lambda: provider["adapter"].adecide(
                     provider.get("client"), pin, CANARY_REQUEST, timeout=timeout
-                )
+                ))
             normalize_response(CANARY_REQUEST, body)
+        except ExecutionAuthorityError as exc:
+            error = exc
+            raise
         except asyncio.CancelledError as exc:
             error = exc
             state.canary_stale_since = state.canary_stale_since or time.time()
@@ -327,6 +333,7 @@ class DecisionServiceMixin:
         ``DecisionResult.thresholds`` is always keyed by question id.
         """
 
+        require_execution_work(self)
         if not isinstance(caller, str) or not caller:
             raise ValueError("decide() requires a non-empty caller id")
         if timeout_seconds <= 0:
@@ -380,12 +387,12 @@ class DecisionServiceMixin:
                 provider = candidate.provider
                 dispatched = True
                 started = time.monotonic()
-                body = await provider["adapter"].adecide(
+                body = await await_execution_work(self, lambda: provider["adapter"].adecide(
                     provider.get("client"),
                     candidate.info.id,
                     snapshot,
                     timeout=timeout_seconds,
-                )
+                ))
                 normalized = normalize_response(snapshot, body)
         except TimeoutError as exc:
             error = exc
@@ -409,6 +416,7 @@ class DecisionServiceMixin:
                     context=context,
                 )
 
+        require_execution_work(self)
         provider = candidate.provider
         return DecisionResult(
             answers=normalized.answers,

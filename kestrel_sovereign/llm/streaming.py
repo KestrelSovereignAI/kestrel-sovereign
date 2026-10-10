@@ -52,6 +52,7 @@ from kestrel_sovereign.llm.retry import common_declined_wait
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
+    bind_execution_cleanup, execution_work_stream,
 )
 from .adapter import (
     LLMResponse,
@@ -822,6 +823,7 @@ class StreamingMixin:
         arrived). Tokens were still consumed/billed by the provider, so the
         usage is recorded; the metadata flag lets telemetry tell it apart.
         """
+        require_execution_work(self)
         if not isinstance(response, LLMResponse):
             return
         metadata = {"streamed": True, "path": path}
@@ -885,6 +887,7 @@ class StreamingMixin:
                     tokens=total_tokens,
                     **cache_usage,
                 )
+                require_execution_work(self)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - independent test-fake sink
@@ -892,6 +895,7 @@ class StreamingMixin:
 
         call_logger = getattr(self, "_log_llm_call", None)
         if call_logger is not None:
+            require_execution_work(self)
             try:
                 await call_logger(
                     provider=provider_name,
@@ -917,6 +921,7 @@ class StreamingMixin:
             except Exception as exc:  # noqa: BLE001 - telemetry is best-effort
                 logger.warning("Failed to log streamed usage: %s", exc)
 
+    @execution_work_stream
     async def _stream_adapter_with_usage(
         self,
         *,
@@ -1045,70 +1050,77 @@ class StreamingMixin:
             failure = exc
             raise
         finally:
-            duration_ms = int((time.monotonic() - started) * 1000)
-            if final_response is not None:
-                await self._record_streamed_usage(
-                    final_response,
-                    model,
-                    provider_name,
-                    duration_ms=duration_ms,
-                    path=path,
-                    # The terminal response was stamped before it was exposed.
-                    publish_identity=False,
-                    invocation_context=invocation_context,
-                )
-            elif usage_sink:
-                # Preserve the existing partial-usage billing behavior.  The
-                # metadata makes clear that the stream itself did not finish.
-                await self._record_streamed_usage(
-                    LLMResponse(
-                        input_tokens=usage_sink.get("input_tokens"),
-                        output_tokens=usage_sink.get("output_tokens"),
-                        cache_creation_input_tokens=usage_sink.get(
-                            "cache_creation_input_tokens"
-                        ),
-                        cache_read_input_tokens=usage_sink.get(
-                            "cache_read_input_tokens"
-                        ),
-                    ),
-                    model,
-                    provider_name,
-                    duration_ms=duration_ms,
-                    partial=True,
-                    path=path,
-                    publish_identity=False,
-                    invocation_context=invocation_context,
-                )
-            elif completed:
-                await self._record_streamed_usage(
-                    LLMResponse(),
-                    model,
-                    provider_name,
-                    duration_ms=duration_ms,
-                    path=path,
-                    usage_available=False,
-                    publish_identity=True,
-                    invocation_context=invocation_context,
-                )
-            elif failure is not None and not isinstance(
-                failure, (asyncio.CancelledError, GeneratorExit)
-            ):
-                await self._record_streamed_usage(
-                    LLMResponse(),
-                    model,
-                    provider_name,
-                    duration_ms=duration_ms,
-                    path=path,
-                    success=False,
-                    error_message=(
-                        error_message_override
-                        if error_message_override is not None
-                        else str(failure)
-                    ),
-                    usage_available=False,
-                    publish_identity=False,
-                    invocation_context=invocation_context,
-                )
+            try:
+                with (bind_execution_cleanup(self, admitted_custody) if not completed else bind_execution_custody_snapshot(admitted_custody)):
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    if final_response is not None:
+                        await self._record_streamed_usage(
+                            final_response,
+                            model,
+                            provider_name,
+                            duration_ms=duration_ms,
+                            path=path,
+                            # The terminal response was stamped before it was exposed.
+                            publish_identity=False,
+                            invocation_context=invocation_context,
+                        )
+                    elif usage_sink:
+                        # Preserve the existing partial-usage billing behavior.  The
+                        # metadata makes clear that the stream itself did not finish.
+                        await self._record_streamed_usage(
+                            LLMResponse(
+                                input_tokens=usage_sink.get("input_tokens"),
+                                output_tokens=usage_sink.get("output_tokens"),
+                                cache_creation_input_tokens=usage_sink.get(
+                                    "cache_creation_input_tokens"
+                                ),
+                                cache_read_input_tokens=usage_sink.get(
+                                    "cache_read_input_tokens"
+                                ),
+                            ),
+                            model,
+                            provider_name,
+                            duration_ms=duration_ms,
+                            partial=True,
+                            path=path,
+                            publish_identity=False,
+                            invocation_context=invocation_context,
+                        )
+                    elif completed:
+                        await self._record_streamed_usage(
+                            LLMResponse(),
+                            model,
+                            provider_name,
+                            duration_ms=duration_ms,
+                            path=path,
+                            usage_available=False,
+                            publish_identity=True,
+                            invocation_context=invocation_context,
+                        )
+                    elif failure is not None and not isinstance(
+                        failure, (asyncio.CancelledError, GeneratorExit)
+                    ):
+                        await self._record_streamed_usage(
+                            LLMResponse(),
+                            model,
+                            provider_name,
+                            duration_ms=duration_ms,
+                            path=path,
+                            success=False,
+                            error_message=(
+                                error_message_override
+                                if error_message_override is not None
+                                else str(failure)
+                            ),
+                            usage_available=False,
+                            publish_identity=False,
+                            invocation_context=invocation_context,
+                        )
+            except ExecutionAuthorityError:
+                if completed:
+                    raise
+                # Aborted hosted work has cleanup-only authority. Do not turn
+                # usage/billing into ordinary work or hide its original failure.
 
     async def _run_stream_fallback_attempt(
         self,
@@ -1155,6 +1167,7 @@ class StreamingMixin:
             )
         return response
 
+    @execution_work_stream
     async def get_streaming_response(
         self,
         system_prompt: str,
@@ -1375,6 +1388,7 @@ class StreamingMixin:
         aggregate.declined_wait = common_declined_wait(route_errors)
         raise aggregate
 
+    @execution_work_stream
     async def generate_stream(
         self,
         *,
@@ -1456,6 +1470,7 @@ class StreamingMixin:
         ):
             yield chunk
 
+    @execution_work_stream
     async def stream_with_messages(
         self,
         *,
@@ -1737,6 +1752,7 @@ class StreamingMixin:
             return messages
         return adapter.attach_images_to_last_user_message(messages, images)
 
+    @execution_work_stream
     async def stream_with_tool_detection(
         self,
         *,

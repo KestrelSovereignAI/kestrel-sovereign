@@ -33,6 +33,7 @@ Server→client requests come in two flavors:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -502,8 +503,11 @@ class CodexAppServerClient:
         # kestrel.
         self._closed_error = None
         self._stderr_tail = []
-        self._reader_task = asyncio.create_task(self._read_loop())
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
+        # The transport outlives individual occurrences. Per-turn handlers
+        # rebind their captured turn; the reader must not inherit the first
+        # occurrence's eventually retired authority/caller/lock contexts.
+        self._reader_task = asyncio.create_task(self._read_loop(), context=contextvars.Context())
+        self._stderr_task = asyncio.create_task(self._drain_stderr(), context=contextvars.Context())
 
     async def _handshake(
         self,

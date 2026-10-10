@@ -16,6 +16,7 @@ from contextvars import ContextVar, copy_context
 from functools import wraps
 import hashlib
 import inspect
+import sys
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Mapping, TypeVar
 from urllib.parse import quote, unquote_to_bytes
 import uuid
@@ -24,6 +25,7 @@ from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     bind_execution_cleanup, bind_execution_runtime, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
+    execution_commit_outcome,
 )
 from kestrel_sovereign.auth import (
     caller_context_binding_scope,
@@ -426,6 +428,12 @@ def bind_async_invocation(
 
                 async def preserve_failed_effects(error: BaseException) -> None:
                     nonlocal cleanup_abandoned
+                    if execution_commit_outcome(error) is not None:
+                        # An uncertain/committed write can raise before a tool
+                        # returns and marks completion. Retain its exact Stop
+                        # identity; absence of a return is not rollback proof.
+                        cleanup_abandoned = True
+                        return
                     state = _current_effect_checkpoint.get()
                     if state is None or not state.completed or state.checkpointed:
                         return
@@ -808,8 +816,10 @@ def bind_async_generator_invocation(
                     None,
                 )
                 if callable(register):
-                    register(lifecycle_owner, effective_id)
-                    registered = True
+                    with bind_execution_runtime(lifecycle_owner):
+                        admitted_custody = current_execution_custody(lifecycle_owner)
+                        register(lifecycle_owner, effective_id)
+                        registered = True
             iterator = None
             with caller_context_lifetime(
                 bound.arguments.get("caller")
@@ -821,14 +831,16 @@ def bind_async_generator_invocation(
                             "await_durable_request_admission",
                             None,
                         )
-                        if callable(await_admission) and not await await_admission(
-                            lifecycle_owner, effective_id
-                        ):
-                            raise InvocationCancelledError(
-                                "streaming invocation was stopped before durable "
-                                "admission "
-                                f"({invocation_log_correlation(effective_id)})"
-                            )
+                        with bind_execution_custody_snapshot(admitted_custody), bind_execution_runtime(lifecycle_owner):
+                            if callable(await_admission) and not await await_admission(
+                                lifecycle_owner, effective_id
+                            ):
+                                raise InvocationCancelledError(
+                                    "streaming invocation was stopped before durable "
+                                    "admission "
+                                    f"({invocation_log_correlation(effective_id)})"
+                                )
+                            require_execution_work(lifecycle_owner)
                     iterator = function(*bound.args, **bound.kwargs)
                     while True:
                         with _exact_invocation_scope(
@@ -844,6 +856,9 @@ def bind_async_generator_invocation(
                             require_execution_work(lifecycle_owner)
                         yield item
                 finally:
+                    active_error = sys.exception()
+                    if active_error is not None and execution_commit_outcome(active_error) is not None:
+                        cleanup_abandoned = True
                     try:
                         with _exact_invocation_scope(
                             effective_id,
