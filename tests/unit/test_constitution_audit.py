@@ -386,13 +386,25 @@ async def test_durable_first_identity_marker_allows_native_initial_anchor(tmp_pa
 async def _open_durable_harness(db_path, now, *, is_new_identity=False):
     from kestrel_sovereign.storage import AsyncStorage
 
-    storage = AsyncStorage(str(db_path))
+    storage = AsyncStorage(str(db_path), agent_id="did:web:test:durable-constitution")
     await storage.initialize()
     harness = _DurableConstitutionHarness(storage, now)
     await harness._initialize_constitution_runtime_state(
         is_new_identity=is_new_identity
     )
     return harness, storage
+
+
+async def _seed_exit_governance(agent, storage):
+    """A successful native exit needs actual owned identity/edge/blob rows."""
+    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+    from kestrel_sovereign.storage import GraphNode
+
+    digest = await storage.store_file(resolve_governing_constitution_bytes(None), "constitution.md")
+    await storage.add_node(GraphNode(
+        node_id=agent.agent_id, node_type="agent", label="native exit", properties={"constitution_hash": digest},
+    ))
+    await KestrelAgent._anchor_constitution_governance(agent, digest)
 
 
 @pytest.mark.asyncio
@@ -812,6 +824,7 @@ async def test_authorized_verified_exit_is_durable_and_audited(tmp_path):
     entered_at = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
     first, storage = await _open_durable_harness(db_path, entered_at)
     try:
+        await _seed_exit_governance(first, storage)
         await first.enter_safe_mode("integrity failure")
         first._constitution_clock = lambda: entered_at + timedelta(minutes=10)
         first._verify_constitution_integrity = AsyncMock(
@@ -849,6 +862,7 @@ async def test_verified_exit_completes_bootstrap_and_latches_later_deletion(
     first, storage = await _open_durable_harness(
         db_path, now, is_new_identity=True
     )
+    await _seed_exit_governance(first, storage)
     await first.enter_safe_mode("first bootstrap verification failed")
     first._verify_constitution_integrity = AsyncMock(
         return_value=(True, "Constitution integrity verified")
@@ -859,6 +873,7 @@ async def test_verified_exit_completes_bootstrap_and_latches_later_deletion(
     assert first._constitution_bootstrap_pending is False
     persisted = await first._constitution_state_store.load(first.agent_id)
     assert persisted.bootstrap_pending is False
+    await storage.db.execute_commit("DELETE FROM graph_nodes WHERE node_id=?", (first.agent_id,))
     await storage.close()
 
     # A missing identity node after that completed recovery is deletion, not a
@@ -907,6 +922,7 @@ async def test_exit_requires_feature_lifecycle_repair_verification(tmp_path):
     db_path = tmp_path / "agent.db"
     now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
     agent, storage = await _open_durable_harness(db_path, now)
+    await _seed_exit_governance(agent, storage)
     await agent.enter_safe_mode(
         "feature contribution quarantine failed",
         cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
@@ -1386,6 +1402,9 @@ def _verifier_agent(constitution_bytes: bytes, anchor: str | None):
     agent.storage = MagicMock()
     agent.storage.get_node = AsyncMock(return_value=node)
     agent.storage.retrieve_file = AsyncMock(return_value=constitution_bytes)
+    # This authorization-only protocol fixture has no separate privacy cache.
+    # Native integration tests cover a divergent facade/raw byte reader.
+    agent._raw_storage = agent.storage
     agent.storage.get_edges_from = AsyncMock(return_value=[edge])
 
     agent._verify_constitution_integrity = (

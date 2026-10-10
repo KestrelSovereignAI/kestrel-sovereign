@@ -77,9 +77,24 @@ async def test_exit_cannot_use_isolated_cache_as_durable_attestation(
                     "DELETE FROM files WHERE content_hash=?", (digest,)
                 )
         assert await wrapper.retrieve_file(digest) == content
+        # The locked authority check and the ordinary diagnostic are distinct
+        # paths; neither may use the facade's valid session bytes as proof.
+        from kestrel_sovereign.storage.db.interface import TransactionError
+
+        with pytest.raises((RuntimeError, TransactionError)):
+            async with storage.transaction():
+                await ConstitutionMixin._lock_verified_constitution_exit(agent)
+        assert await agent._constitution_state_store.load(agent.agent_id) == before
+        valid, _ = await agent._verify_constitution_integrity()
+        assert valid is False
+        assert "Native governing bytes do not match the anchored hash" in (
+            await ConstitutionMixin._get_governing_constitution(agent)
+        )
         result = await agent.exit_safe_mode(authorization="fixture sovereign")
         assert result.startswith("Safe Mode remains active:"), result
-        assert await agent._constitution_state_store.load(agent.agent_id) == before
+        assert (
+            await agent._constitution_state_store.load(agent.agent_id)
+        ).safe_mode is True
     finally:
         if physical is not None:
             await storage.db.execute_commit(
@@ -140,6 +155,70 @@ async def test_genesis_refuses_ownership_removed_during_actual_auditor_await(
         )
         assert record.get("status") != "passed"
     finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("when", ["before-auditor", "during-auditor"])
+async def test_genesis_cannot_attest_cached_bytes_over_corrupt_native_blob(
+    db_backend, when
+):
+    storage = AsyncStorage(
+        backend=db_backend, agent_id="did:test:cached-genesis:" + uuid4().hex
+    )
+    await storage.initialize()
+    physical = None
+    try:
+        agent = await _agent(storage)
+        wrapper = _privacy(agent, storage, "isolated")
+        for name in (
+            "_persist_governance_receipt_node",
+            "_persist_genesis_audit_completion",
+            "_persist_genesis_audit_pending_attempt",
+            "perform_genesis_audit",
+        ):
+            setattr(agent, name, getattr(ConstitutionMixin, name).__get__(agent))
+        content = resolve_governing_constitution_bytes(None)
+        digest = await storage.store_file(content, "constitution.md")
+        await wrapper.store_file(content, "cached.md")
+        physical = await storage.db.fetchone(
+            "SELECT content,metadata FROM files WHERE content_hash=?", (digest,)
+        )
+        await _identity(storage, {"constitution_hash": digest})
+        await agent._anchor_constitution_governance(digest)
+        calls = []
+
+        async def corrupt():
+            await storage.db.execute_commit(
+                "UPDATE files SET content=?,metadata=NULL WHERE content_hash=?",
+                (b"corrupt native governance", digest),
+            )
+
+        async def auditor(prompt):
+            calls.append(prompt)
+            assert storage.owns_open_transaction is False
+            await corrupt()
+            return {
+                "risk_level": 1,
+                "reasoning": "Synthetic auditor; real native corruption",
+            }
+
+        agent.get_audit_response = auditor
+        if when == "before-auditor":
+            await corrupt()
+        with pytest.raises(GenesisAuditError):
+            await agent.perform_genesis_audit()
+        assert len(calls) == (1 if when == "during-auditor" else 0)
+        assert (await storage.get_node(agent.agent_id)).properties.get(
+            "genesis_audit", {}
+        ).get("status") != "passed"
+    finally:
+        if physical is not None:
+            await storage.db.execute_commit(
+                "UPDATE files SET content=?,metadata=? WHERE content_hash=?",
+                (*physical, digest),
+            )
         await storage.close()
 
 

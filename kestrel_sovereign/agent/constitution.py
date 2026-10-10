@@ -1333,7 +1333,7 @@ class ConstitutionMixin:
         # it (this decrypts through the storage layer), reject None/decrypt
         # failures, and confirm SHA-256(plaintext) == anchor.
         try:
-            stored_bytes = await self.storage.retrieve_file(stored_hash)
+            stored_bytes = await self._raw_storage.retrieve_file(stored_hash)
         except Exception as e:  # noqa: BLE001 — decrypt/IO failure = integrity failure
             logging.critical(
                 "CONSTITUTION INTEGRITY: cannot retrieve/decrypt anchored blob "
@@ -2650,7 +2650,9 @@ class ConstitutionMixin:
                 return f"Error: Failed to anchor constitution: {e}"
 
         try:
-            constitution_bytes = await self.storage.retrieve_file(constitution_hash)
+            constitution_bytes = await self._raw_storage.retrieve_file(constitution_hash)
+            if not isinstance(constitution_bytes, bytes) or hashlib.sha256(constitution_bytes).hexdigest() != constitution_hash:
+                raise RuntimeError("Native governing bytes do not match the anchored hash")
             constitution_text = constitution_bytes.decode('utf-8')
             if self.extension:
                 amendments = self.extension.get_constitution_amendments()
@@ -2768,6 +2770,14 @@ class ConstitutionMixin:
                     raw, self.agent_id, expected["governance"],
                     required_target=agent_node.properties["constitution_hash"],
                 )
+                if agent_node.properties["genesis_audit"].get("status") == "passed":
+                    from kestrel_sovereign.constitution.anchored_bytes import lock_governing_file
+
+                    # A provider await can outlive native blob corruption or
+                    # ownership loss without changing graph/CAS evidence.
+                    # Cache bytes and the pre-auditor read cannot authorize a
+                    # passed receipt for unreadable current durable content.
+                    await lock_governing_file(raw, agent_node.properties["constitution_hash"])
                 # Merge only this receipt. A pre-auditor graph node is never a
                 # replacement for metadata written during the awaited audit.
                 fresh.properties["genesis_audit"] = deepcopy(agent_node.properties["genesis_audit"])
@@ -2917,7 +2927,7 @@ class ConstitutionMixin:
         # prompt path may append runtime-only extension/mandate constraints;
         # those are not part of this content-addressed governing receipt.
         try:
-            constitution = await self.storage.retrieve_file(constitution_hash)
+            constitution = await self._raw_storage.retrieve_file(constitution_hash)
         except Exception:
             constitution = None
         if not isinstance(constitution, (bytes, str)):

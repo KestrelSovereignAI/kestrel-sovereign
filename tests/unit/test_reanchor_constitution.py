@@ -146,6 +146,9 @@ class _FakeFileRows:
         yield self
 
     async def fetchone(self, query, params=()):
+        if query.startswith("SELECT node_id FROM graph_nodes WHERE node_id = ?"):
+            assert params == (AGENT_DID,)
+            return (AGENT_DID,)
         assert "FROM files" in query, query
         assert "file_owners" not in query, (
             "The Iron Rule guard must read the anchored constitution unbound; "
@@ -174,6 +177,12 @@ class _FakeFileRows:
             self.owners.setdefault((params[0], params[1]), params[2:])
 
     async def fetchall(self, query, params=()):
+        if query.startswith("SELECT node_id FROM graph_node_owners"):
+            assert params == (AGENT_DID, AGENT_DID)
+            return [(AGENT_DID,)]
+        if query.startswith("SELECT target_id, agent_id FROM graph_edge_owners"):
+            assert params[0] == AGENT_DID
+            return []
         assert "FROM graph_edges" in query and "source_id = ?" in query
         assert params[0] == AGENT_DID
         assert len(params) in (1, 2)
@@ -211,12 +220,15 @@ def _make_agent(stored_hash="oldhash", safe_mode=False, anchored=ANCHORED_CONSTI
     rows = _FakeFileRows(stored_hash, anchored)
     async def store_file(*args, **kwargs):
         return await agent.storage.store_file(*args, **kwargs)
+    async def retrieve_file(*args, **kwargs):
+        return await agent.storage.retrieve_file(*args, **kwargs)
     # Explicit protocol fixture for these existing authorization tests. Real
     # transaction/ownership behavior is exercised by the native backend suite.
     agent._raw_storage = SimpleNamespace(
         db=rows, get_node=agent.storage.get_node,
         files=AsyncFileStore(rows, agent_id=AGENT_DID),
         owns_open_transaction=True, store_file=store_file,
+        retrieve_file=retrieve_file,
     )
     # transaction() is an async context manager, not a coroutine — a plain
     # MagicMock provides __aenter__/__aexit__ on its return value.
@@ -951,12 +963,12 @@ async def test_governing_constitution_reads_from_storage_after_reanchor(tmp_path
     assert node.properties["constitution_hash"] == FAKE_HASH
 
     # Step 2: _get_governing_constitution should retrieve from storage using the new hash
-    agent.storage.retrieve_file = AsyncMock(return_value=b"stored constitution content")
+    agent.storage.retrieve_file = AsyncMock(return_value=FAKE_CONSTITUTION)
 
     constitution = await agent._get_governing_constitution()
 
     agent.storage.retrieve_file.assert_called_once_with(FAKE_HASH)
-    assert constitution == "stored constitution content"
+    assert constitution == FAKE_CONSTITUTION.decode()
 
 
 @pytest.mark.asyncio

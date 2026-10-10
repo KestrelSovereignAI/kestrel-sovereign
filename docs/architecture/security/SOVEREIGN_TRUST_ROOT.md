@@ -144,7 +144,11 @@ rows through the exit commit; SQLite retains its native writer custody. Both
 backends require actual physical identity and governing-edge ownership rows:
 serialization does not substitute for existence. Exit decrypts and hashes the
 locked tenant-owned native blob; an ISOLATED session cache is not durable
-integrity evidence. New-identity bootstrap uses the same exact-native-byte
+integrity evidence. Periodic integrity verification, governing-text retrieval
+and genesis input read the bound native store as well, not that cache. A passed
+genesis publication re-attests native bytes inside its commit owner after the
+auditor await; concurrent blob corruption cannot publish a fresh pass.
+New-identity bootstrap uses the same exact-native-byte
 publisher as signed repair, only after resolver verification and the durable
 single-use bootstrap fence, so volatile privacy storage cannot consume authority
 without publishing the constitution. Birth-record replication reserves its full
