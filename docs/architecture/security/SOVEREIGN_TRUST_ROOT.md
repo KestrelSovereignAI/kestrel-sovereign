@@ -200,16 +200,24 @@ before it refuses or dispatches.
 `kestrel update --no-restart` asks which blocking agents are running. A
 process serves an agent however it was launched: `kestrel start` writes a PID
 file, and every agent also writes a serving record into its data directory
-(`.serving/`) as it boots and removes it once it has shut down, so a server
-started with `python -m kestrel_sovereign.server` or a container entrypoint is
-found too (#3522). An agent whose liveness cannot be established counts as
-running: a PID file or serving record that cannot be read, a record written on
-another host or in another PID namespace (a container sharing the data
-directory), or a PID whose identity cannot be checked. The refusal names the
-evidence and how to stop the process; a record whose process cannot be
-checked from here is deleted by hand only once nothing serves the agent. A
-server started before this release wrote no serving record and is found only
-by its PID file.
+(`.serving/`) as it boots, so a server started with
+`python -m kestrel_sovereign.server` or a container entrypoint is found too
+(#3522). The process removes its record only once the release of every
+resource the agent acquired is confirmed, and a release counts as confirmed
+only from an owner whose close reports a failure instead of logging it and
+returning. No owner qualifies yet (#3558, #3559, #3560), so for now a record
+stays until its process exits. An agent stopped inside a host that keeps
+running therefore still counts as running, as does one whose boot failed. A
+record naming a process on this host that has exited is stale and ignored.
+
+An agent whose liveness cannot be established counts as running too: a PID
+file or serving record that cannot be read, a record written on another host
+or in another PID namespace (a container sharing the data directory, including
+one that has since stopped), or a PID whose identity cannot be checked. The
+refusal names the evidence and how to stop the process; a record whose process
+cannot be checked from here is deleted by hand only once nothing serves the
+agent. A server started before this release wrote no serving record and is
+found only by its PID file.
 
 The refusal names each agent, its anchored hash, the governing hash, and the
 adoption steps below. Two findings refuse:

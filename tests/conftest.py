@@ -131,8 +131,39 @@ def pytest_collection_modifyitems(config, items):
     _cleanup_collection_modifyitems(config, items)
 
 
+def _require_pytest_asyncio(config) -> None:
+    """Refuse to start a run that cannot execute the suite's async tests.
+
+    ``asyncio_mode = "auto"`` and the async fixtures assume pytest-asyncio.
+    Without it, ``PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`` and no ``-p asyncio``,
+    the run passed every sync test and stopped at the first async fixture,
+    reading as a gate result over the files it never reached.
+
+    Raises:
+        pytest.UsageError: pytest-asyncio is not installed or not registered.
+    """
+    try:
+        import pytest_asyncio.plugin
+    except ImportError:
+        pass
+    else:
+        if config.pluginmanager.is_registered(pytest_asyncio.plugin):
+            return
+    hint = (
+        " PYTEST_DISABLE_PLUGIN_AUTOLOAD is set, so name the plugins the run "
+        "needs: -p asyncio -p anyio (and -p xdist for -n)."
+        if os.environ.get("PYTEST_DISABLE_PLUGIN_AUTOLOAD")
+        else ""
+    )
+    raise pytest.UsageError(
+        "The Kestrel test suite requires the pytest-asyncio plugin, which is "
+        f"not loaded.{hint}"
+    )
+
+
 def pytest_configure(config):
     """Configure pytest with all plugins and load .env for skipif conditions."""
+    _require_pytest_asyncio(config)
     REFUSAL_RECORDER.install()
     # The allow-list's third root: an explicit --basetemp may lie outside the
     # system temporary directory, and every tmp_path lives below it.

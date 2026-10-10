@@ -10,10 +10,12 @@ replace the constitution beneath it and its next integrity audit put it in
 Safe Mode, and an offline reanchor could write a database it was serving.
 
 So the process serving an agent records itself. Every ``KestrelAgent`` writes
-a :class:`ServingRecord` into its data directory as it boots and removes it
-once it has shut down. There is one file per agent instance, so two holders of
-one directory, or an in-process restart whose old and new agent overlap, never
-remove each other's record.
+a :class:`ServingRecord` into its data directory as it boots, and removes it
+only once every resource it acquired has a confirmed release (see
+:mod:`kestrel_sovereign.agent.custody`); until then the record outlives the
+agent and goes stale when its process exits. There is one file per agent
+instance, so two holders of one directory, or an in-process restart whose old
+and new agent overlap, never remove each other's record.
 
 A record is evidence of liveness, never of absence. An agent is stopped only
 when no launcher record and no serving record names a process that may still
