@@ -425,7 +425,7 @@ class ProcessManager:
                              f"no PID file at {pid_file}")
         try:
             raw = pid_file.read_text().strip()
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             return PidRecord(PidStatus.UNREADABLE, None, None, None,
                              f"cannot read {pid_file}: {exc}")
         if not raw:
@@ -443,7 +443,7 @@ class ProcessManager:
         if isinstance(payload, dict):
             try:
                 pid = int(payload["pid"])
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, OverflowError):
                 return PidRecord(PidStatus.UNREADABLE, None, None, None,
                                  f"{pid_file} has no usable pid")
             start = payload.get("started_at")

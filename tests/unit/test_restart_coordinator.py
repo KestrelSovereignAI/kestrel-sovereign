@@ -3837,6 +3837,7 @@ async def test_run_update_records_steps_and_resolved_ref(tmp_path):
     feat, _ = await _make_feature(tmp_path)
     profile = get_update_profile("sovereign_local_uv_sync")
     req = SimpleNamespace(
+        id="req-update",
         update_repo_path=str(tmp_path),
         update_target_ref="main",
         update_allow_migrations=False,
@@ -3871,6 +3872,7 @@ async def test_run_update_stops_at_first_failing_step(tmp_path):
     feat, _ = await _make_feature(tmp_path)
     profile = get_update_profile("sovereign_local_uv_sync")
     req = SimpleNamespace(
+        id="req-update",
         update_repo_path=str(tmp_path),
         update_target_ref="main",
         update_allow_migrations=False,
@@ -8244,6 +8246,208 @@ async def test_update_whose_install_keeps_the_anchored_hash_restarts(
     spawn.assert_called_once()
     assert row.status == "executing"
     assert result.data["refused"] == []
+
+
+def _verdicts_by_agent(check):
+    return {
+        verdict["agent"]: (
+            verdict["status"],
+            verdict["anchored_hash"],
+            verdict["governing_hash"],
+        )
+        for verdict in check["verdicts"]
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_restart_records_the_adoption_check_it_passed(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """#3522: a pass is evidence the gate ran, not just the absence of a refusal.
+
+    The request row and its status events carry the check: for every local
+    agent, the anchored hash, the hash the installed code governs by, and
+    the verdict.
+    """
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    _install_constitution(tmp_path, monkeypatch, _ANCHORED_TEXT)
+    seed_anchored_agents(
+        project,
+        {"Emma": sha256(_ANCHORED_TEXT), "Kite": sha256(_ANCHORED_TEXT)},
+    )
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="routine restart")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    spawn.assert_called_once()
+    row = await get_request(backend, request_id)
+    assert row.status == "executing"
+    [check] = row.constitution_checks_list()
+    assert check["stage"] == "installed_code"
+    assert check["result"] == "passed"
+    assert check["code"] == "the installed code"
+    assert check["checked_at"]
+    anchored = sha256(_ANCHORED_TEXT)
+    assert _verdicts_by_agent(check) == {
+        "Emma": ("match", anchored, anchored),
+        "Kite": ("match", anchored, anchored),
+    }
+    assert row.to_public_dict()["constitution_checks"] == [check]
+    events = await list_events_for_request(backend, request_id)
+    executing = [e for e in events if e.state == "executing"]
+    assert executing
+    assert executing[-1].to_public_dict()["payload"]["constitution_checks"] == [
+        check
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_restart_records_the_check_that_refused_it(
+    tmp_path, monkeypatch, adoption_project,
+):
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    _install_constitution(tmp_path, monkeypatch, _AMENDED_TEXT)
+    seed_anchored_agents(
+        project,
+        {"Emma": sha256(_ANCHORED_TEXT), "Kite": sha256(_AMENDED_TEXT)},
+    )
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="ship the merged constitution PR")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    [check] = row.constitution_checks_list()
+    assert check["stage"] == "installed_code"
+    assert check["result"] == "refused"
+    assert _verdicts_by_agent(check) == {
+        "Emma": ("mismatch", sha256(_ANCHORED_TEXT), sha256(_AMENDED_TEXT)),
+        "Kite": ("match", sha256(_AMENDED_TEXT), sha256(_AMENDED_TEXT)),
+    }
+    events = await list_events_for_request(backend, request_id)
+    assert events[-1].state == "refused"
+    assert events[-1].to_public_dict()["payload"]["constitution_checks"] == [check]
+
+
+@pytest.mark.asyncio
+async def test_an_update_records_both_adoption_checks(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """The fetched revision before checkout, then the installed code."""
+    _, sha256 = adoption_project
+
+    _, row, _, spawn, events = await _update_onto_unchanged_text(
+        tmp_path, monkeypatch, adoption_project, install=lambda package: None,
+    )
+
+    spawn.assert_called_once()
+    fetched, installed = row.constitution_checks_list()
+    assert fetched["stage"] == "fetched_revision"
+    assert fetched["code"].startswith("FETCH_HEAD of ")
+    assert installed["stage"] == "installed_code"
+    anchored = sha256(_ANCHORED_TEXT)
+    for check in (fetched, installed):
+        assert check["result"] == "passed"
+        assert _verdicts_by_agent(check) == {
+            "Emma": ("match", anchored, anchored),
+        }
+    executing = [e for e in events if e.state == "executing"]
+    assert executing[-1].to_public_dict()["payload"]["constitution_checks"] == [
+        fetched, installed,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_update_refused_at_the_fetch_records_that_check(
+    tmp_path, monkeypatch, adoption_project,
+):
+    from tests.utils.constitution_anchor import (
+        PACKAGED_CONSTITUTION_RELPATH,
+        commit_constitution,
+        origin_and_clone,
+        seed_anchored_agents,
+    )
+
+    project, sha256 = adoption_project
+    origin, checkout = origin_and_clone(tmp_path, _ANCHORED_TEXT)
+    commit_constitution(origin, _AMENDED_TEXT, "merge the constitution PR")
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(checkout / PACKAGED_CONSTITUTION_RELPATH),
+    )
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="ship the merged constitution PR",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=str(checkout),
+    )
+    request_id = created.data["request"]["id"]
+    real_step = RestartCoordinatorFeature._run_update_step
+
+    async def _step(self, step):
+        if step.name == "fetch":
+            return await real_step(self, step)
+        raise AssertionError(f"{step.name} ran after a refused fetch")
+
+    with patch.object(RestartCoordinatorFeature, "_run_update_step", _step), \
+            patch.object(RestartCoordinatorFeature, "_spawn_restart_subprocess"):
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    [fetched] = row.constitution_checks_list()
+    assert fetched["stage"] == "fetched_revision"
+    assert fetched["result"] == "refused"
+    assert _verdicts_by_agent(fetched) == {
+        "Emma": ("mismatch", sha256(_ANCHORED_TEXT), sha256(_AMENDED_TEXT)),
+    }
+    events = await list_events_for_request(backend, request_id)
+    assert events[-1].state == "refused"
+    assert events[-1].to_public_dict()["payload"]["constitution_checks"] == [
+        fetched
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_unverifiable_check_is_recorded_with_its_error(
+    tmp_path, monkeypatch, adoption_project,
+):
+    project, _ = adoption_project
+    (project / "multi_agent.toml").write_text("[agents\n")
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="routine restart")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    [check] = row.constitution_checks_list()
+    assert check["result"] == "unverifiable"
+    assert check["verdicts"] == []
+    assert "multi-agent configuration is invalid" in check["error"]
 
 
 @pytest.mark.asyncio

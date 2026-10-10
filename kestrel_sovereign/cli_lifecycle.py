@@ -28,12 +28,13 @@ from kestrel_sovereign.constitution_adoption import (
     ConstitutionAdoptionError,
     check_constitution_adoption,
     check_installed_constitution_adoption,
+    deployed_content_at,
     local_agents,
-    packaged_constitution_at,
     refusal_lines,
     unverified_lines,
 )
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
+from kestrel_sovereign.multi_agent.liveness import AgentHolder
 from kestrel_sovereign.multi_agent.process_manager import (
     DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
     PidStatus,
@@ -658,7 +659,7 @@ def _constitution_adoption_gate(
     code_label: str,
     allow_safe_mode: bool,
     refuse: bool = True,
-    running: Optional[Callable[[Optional[list[str]]], dict[str, str]]] = None,
+    running: Optional[Callable[[Optional[list[str]]], dict[str, AgentHolder]]] = None,
     command: str = "restart",
     untouched: str = "nothing was changed",
 ) -> int:
@@ -762,14 +763,15 @@ def _constitution_adoption_gate(
 
 
 def _report_running(
-    running: Optional[Callable[[Optional[list[str]]], dict[str, str]]],
+    running: Optional[Callable[[Optional[list[str]]], dict[str, AgentHolder]]],
     agent_names: Optional[list[str]],
 ) -> bool:
     """Whether a live process serves any of these agents, printing each one.
 
-    ``running`` maps agent names (None: every local agent) to the command that
-    stops each served one. A registry it cannot read counts as running: an
-    install must not guess that nothing would read what it changes.
+    ``running`` maps agent names (None: every local agent) to what serves
+    each served one (see :func:`_running_agents`). A registry it cannot read
+    counts as running: an install must not guess that nothing would read what
+    it changes.
     """
     if running is None:
         return False
@@ -778,19 +780,24 @@ def _report_running(
     except ConstitutionAdoptionError as exc:
         print(f"  cannot tell which agents are running: {exc}", file=sys.stderr)
         return True
-    for agent, remedy in holders.items():
-        print(f"  {agent} is running (`{remedy}` stops it).", file=sys.stderr)
+    for agent, holder in holders.items():
+        state = "is running" if holder.verified else "may be running"
+        print(
+            f"  {agent} {state} ({holder.evidence}); {holder.remedy}.",
+            file=sys.stderr,
+        )
     return bool(holders)
 
 
 def _running_agents(
     project_dir: Path, agent_names: Optional[list[str]]
-) -> dict[str, str]:
-    """Which of these agents a live process serves, with the command that stops it.
+) -> dict[str, AgentHolder]:
+    """Which of these agents a live process serves, or may serve, and how to stop it.
 
     ``agent_names`` None means every local agent. The registry is the one the
     adoption check judged; liveness is ``cli._agent_holder``, the same read
-    the reanchor guard and ``kestrel terminate`` use.
+    the reanchor guard uses. It finds a server however it was launched, and
+    an agent whose liveness cannot be established counts as running (#3522).
 
     Raises:
         ConstitutionAdoptionError: The registry cannot be loaded.
@@ -1081,16 +1088,20 @@ def _pull_target_revision(project_dir: Path) -> Optional[str]:
         raise _GitFailedError(f"git not available: {exc}") from exc
 
 
-def _incoming_packaged_constitution(checkout: Path, *, fetch: bool):
-    """A loader for the packaged constitution the update's pull will install.
+def _incoming_content(checkout: Path, *, fetch: bool):
+    """What the update's pull will leave at each governing constitution path.
 
-    Fetches first (unless ``fetch`` is False, for a dry run that mutates
-    nothing and so reads the remote-tracking refs as last fetched), then asks
-    git for the constitution at the revision the pull lands on. Only called
-    when an agent is actually compared, so a host with no agents does no git
-    work for this.
+    The packaged constitution, and any descriptor-selected external file the
+    checkout tracks (#3522). Fetches first (unless ``fetch`` is False, for a
+    dry run that mutates nothing and so reads the remote-tracking refs as last
+    fetched), then asks git for the file at the revision the pull lands on.
+    The fetch and the revision are resolved once, on the first question, which
+    is only asked when an agent is actually compared, so a host with no agents
+    does no git work for this.
     """
-    def load() -> Optional[bytes]:
+    resolved: list = []
+
+    def revision_content():
         if fetch:
             rc, out = cli._run_git_fetch(checkout)
             if rc != 0:
@@ -1105,7 +1116,13 @@ def _incoming_packaged_constitution(checkout: Path, *, fetch: bool):
             print("• constitution: the pull brings no new revision")
             return None
         print(f"• constitution: checking incoming revision {revision[:12]}")
-        return packaged_constitution_at(checkout, revision)
+        return deployed_content_at(checkout, revision)
+
+    def load(path: Path) -> Optional[bytes]:
+        if not resolved:
+            resolved.append(revision_content())
+        content = resolved[0]
+        return None if content is None else content(path)
 
     return load
 
@@ -1650,7 +1667,7 @@ def cmd_update(args) -> int:
     package_changing = pull or install or features
     judged = None if package_changing or not target else [target]
     incoming = (
-        _incoming_packaged_constitution(source_checkout, fetch=not dry_run)
+        _incoming_content(source_checkout, fetch=not dry_run)
         if pulling
         else None
     )
@@ -1664,7 +1681,7 @@ def cmd_update(args) -> int:
         lambda: check_constitution_adoption(
             project_dir,
             agent_names=judged,
-            packaged_constitution=incoming,
+            deployed_content=incoming,
             code_label=code_label,
         ),
         code_label=code_label,

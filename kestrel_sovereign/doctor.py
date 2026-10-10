@@ -2368,27 +2368,24 @@ class ConstitutionAnchorVerdict:
     detail: str = ""
 
 
-#: Supplies the packaged constitution's raw bytes as they will be after a
-#: deploy, or None when the deploy leaves the file on disk as it is. Called
-#: only when an agent governed by the package is actually compared.
-PackagedConstitution = Callable[[], "bytes | None"]
+#: Supplies the raw bytes a deploy will leave at a governing constitution
+#: path, or None when the deploy leaves that file as it is on disk. Asked
+#: about a path only when an agent that path governs is actually compared.
+DeployedContent = Callable[[Path], "bytes | None"]
 
 
 def _deployed_content(
-    governing_source, packaged_constitution: PackagedConstitution | None
+    governing_source, deployed_content: DeployedContent | None
 ) -> bytes | None:
     """The bytes a deploy will put at this source, when it changes them.
 
-    A deploy replaces the *package*. A descriptor-selected external file is
-    operator configuration the deploy does not touch, so it is read from disk.
+    Whatever the source's kind: a deploy replaces the packaged constitution,
+    and also any descriptor-selected external file its checkout tracks
+    (#3522). A file the deploy does not touch is read from disk.
     """
-    from kestrel_sovereign.constitution.source_descriptor import (
-        SOURCE_KIND_PACKAGE,
-    )
-
-    if packaged_constitution is None or governing_source.kind != SOURCE_KIND_PACKAGE:
+    if deployed_content is None:
         return None
-    return packaged_constitution()
+    return deployed_content(Path(governing_source.path))
 
 
 def _record_verdict(
@@ -2414,7 +2411,7 @@ def _check_constitution_drift(
     report: DoctorReport,
     env: dict | None = None,
     *,
-    packaged_constitution: PackagedConstitution | None = None,
+    deployed_content: DeployedContent | None = None,
     verdicts: dict[str, ConstitutionAnchorVerdict] | None = None,
 ) -> None:
     """Compare each agent's anchored constitution_hash against the on-disk file.
@@ -2449,9 +2446,9 @@ def _check_constitution_drift(
     signature. Only the unpinned packaged default, which no descriptor chose,
     is reported as a skipped check when it cannot be read.
 
-    ``packaged_constitution`` judges the agents against the packaged
-    constitution a deploy is about to install instead of the one on disk
-    (#3517). ``verdicts``, when given, receives one
+    ``deployed_content`` judges the agents against the governing sources a
+    deploy is about to install instead of the files on disk (#3517, #3522).
+    ``verdicts``, when given, receives one
     :class:`ConstitutionAnchorVerdict` per agent. The report lines are the same
     either way.
 
@@ -2482,7 +2479,7 @@ def _check_constitution_drift(
         # unreadable package hide every descriptor-governed agent's own
         # verification and drift findings, about files the package is not.
         governing_source, source_problem = _readable_governing_source(
-            reading, report, env, packaged_constitution
+            reading, report, env, deployed_content
         )
         if governing_source is None:
             _record_verdict(
@@ -2588,7 +2585,7 @@ def _check_constitution_drift(
                     contract,
                     source=governing_source,
                     content=_deployed_content(
-                        governing_source, packaged_constitution
+                        governing_source, deployed_content
                     ),
                 )
             ).hexdigest()
@@ -2642,7 +2639,7 @@ def _readable_governing_source(
     reading: _AgentGovernance,
     report: DoctorReport,
     env: dict | None,
-    packaged_constitution: PackagedConstitution | None = None,
+    deployed_content: DeployedContent | None = None,
 ):
     """The source that governs this agent, once it is known to be usable.
 
@@ -2652,8 +2649,8 @@ def _readable_governing_source(
     signed bytes. Returns ``(GoverningSource, None)``, or ``(None, reason)``
     after reporting why the agent cannot use it.
 
-    ``packaged_constitution`` tests the packaged bytes a deploy will install
-    rather than the file on disk (#3517).
+    ``deployed_content`` tests the bytes a deploy will install rather than the
+    file on disk (#3517, #3522).
 
     An unreadable packaged default is the same fact for every agent it
     governs, so its warning is reported once.
@@ -2674,7 +2671,7 @@ def _readable_governing_source(
         )
         resolve_governing_constitution_bytes(
             source=governing_source,
-            content=_deployed_content(governing_source, packaged_constitution),
+            content=_deployed_content(governing_source, deployed_content),
         )
     except (OSError, ValueError) as exc:
         if not _fail_unusable_governing_source(

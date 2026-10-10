@@ -574,6 +574,81 @@ async def test_clean_boot_reaches_ready(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_booted_agent_records_that_this_process_serves_it(tmp_path):
+    """Guards find the agent however it was launched (#3522).
+
+    A server started without ``kestrel start`` has no PID file, so the agent
+    records itself as boot begins, and removes the record once a shutdown
+    completes.
+    """
+    from kestrel_sovereign.multi_agent.liveness import serving_holder
+
+    agent = _make_agent(tmp_path)
+    assert serving_holder(tmp_path) is None
+    try:
+        with _boot_mocks():
+            await agent.initialize()
+            holder = serving_holder(tmp_path)
+            assert holder is not None
+            assert f"PID {os.getpid()} serves it" in holder.evidence
+
+            await agent.shutdown()
+
+        assert serving_holder(tmp_path) is None
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_boot_removes_its_serving_record(tmp_path):
+    from kestrel_sovereign.multi_agent.liveness import serving_holder
+
+    agent = _make_agent(tmp_path)
+    seen_during_boot = []
+
+    async def fail(_ctx):
+        seen_during_boot.append(serving_holder(tmp_path))
+        raise RuntimeError("injected after storage")
+
+    try:
+        with _boot_mocks():
+            with patch.object(agent, PHASE_METHODS[1], fail):
+                with pytest.raises(RuntimeError, match="injected after storage"):
+                    await agent.initialize()
+
+        [holder] = seen_during_boot
+        assert holder is not None, "recorded before boot reads anything"
+        assert serving_holder(tmp_path) is None
+    finally:
+        await _cleanup(agent)
+
+
+def test_a_symlinked_store_records_in_the_registered_data_dir(tmp_path):
+    """A guard looks in the data directory, not where its database points."""
+    data_dir = tmp_path / "agent_data" / "emma"
+    data_dir.mkdir(parents=True)
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    (volume / "emma.db").touch()
+    (data_dir / "kestrel_prime.db").symlink_to(volume / "emma.db")
+    agent = _make_agent(tmp_path)
+    agent.storage_path = str(data_dir / "kestrel_prime.db")
+
+    assert agent._serving_data_dir() == data_dir.resolve()
+
+
+def test_an_agent_without_an_on_disk_store_records_nothing(tmp_path):
+    agent = _make_agent(tmp_path)
+    agent.storage_path = ":memory:"
+
+    assert agent._serving_data_dir() is None
+    ctx = BootContext()
+    agent._record_serving(ctx)
+    assert agent._serving_record is None
+    assert ctx.rollback_labels == []
+
+
+@pytest.mark.asyncio
 async def test_boot_records_its_embedding_profile_after_loading_the_config(tmp_path):
     """Offline tools compare their resolution with the recorded profile (#3420).
 

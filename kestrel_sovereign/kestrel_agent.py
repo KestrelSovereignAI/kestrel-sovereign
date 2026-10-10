@@ -43,7 +43,7 @@ from kestrel_sovereign.config import (
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping, Callable
 import re
-from pathlib import Path
+from pathlib import Path, PurePath
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 from kestrel_sovereign.features.privacy import PrivacyAgent
 from kestrel_sovereign.features import (
@@ -849,6 +849,9 @@ class KestrelAgent(
         self._standalone_hold_context_close_task = None
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
+        # This process's record that it serves the agent (#3522): written as
+        # boot starts, released once a shutdown completes.
+        self._serving_record = None
         effective_db_backend = db_backend or os.environ.get(
             "KESTREL_DB_BACKEND", "sqlite"
         )
@@ -2330,8 +2333,61 @@ class KestrelAgent(
                 "Persisted spawn mandate expired during active agent boot"
             )
 
+    def _serving_data_dir(self) -> Optional[Path]:
+        """The data directory this agent serves, when it has one on disk."""
+        storage_path = self.storage_path
+        if not isinstance(storage_path, (str, PurePath)):
+            return None
+        if str(storage_path) in ("", ":memory:"):
+            return None
+        # The directory, resolved: a guard resolves the registered data dir
+        # the same way, while resolving a symlinked database file would name
+        # the directory it points into.
+        return Path(storage_path).expanduser().parent.resolve()
+
+    def _record_serving(self, ctx: BootContext) -> None:
+        """Record that this process serves the agent, before boot reads anything.
+
+        A guard that must not change an agent beneath a live process —
+        ``kestrel update --no-restart`` replacing the constitution its
+        integrity audit reads, an offline reanchor writing its database —
+        finds it by this record however it was launched (#3522). Rolled back
+        when boot fails; released once a shutdown completes.
+
+        Raises:
+            OSError: The record cannot be written. Boot fails rather than
+                serve an agent those guards cannot see.
+        """
+        from kestrel_sovereign.multi_agent.liveness import ServingRecord
+
+        data_dir = self._serving_data_dir()
+        if data_dir is None or self._serving_record is not None:
+            return
+        self._serving_record = ServingRecord.acquire(data_dir)
+
+        async def _release() -> None:
+            self._release_serving_record()
+
+        ctx.on_rollback("serving record", _release)
+
+    def _release_serving_record(self) -> None:
+        """Remove this process's serving record, if it wrote one."""
+        record = getattr(self, "_serving_record", None)
+        if record is None:
+            return
+        self._serving_record = None
+        try:
+            record.release()
+        except OSError as exc:
+            # Left behind, it names this process, so a guard reads the agent
+            # as served until the process exits: a refusal, never a pass.
+            logging.warning(
+                "Could not remove serving record %s: %s", record.path, exc
+            )
+
     async def _boot_phase_storage_privacy(self, ctx: BootContext) -> None:
         """Phase 1 — storage + privacy. Cold-restore, raw/privacy storage, constitution runtime state, embedding-pin hydration, privacy agent, and the force-local-only embedding gate. Owns the primary DB connection."""
+        self._record_serving(ctx)
         # Cold-start restore from Lighthouse if DB doesn't exist (ephemeral environments)
         if (
             os.environ.get("LIGHTHOUSE_API_KEY")
@@ -8562,12 +8618,16 @@ Expected Duration: {expected_duration}
             raise asyncio.CancelledError()
 
         if tail_degraded:
+            # The serving record stays: an abandoned step may still hold the
+            # agent's storage, and the record goes stale once this process
+            # exits.
             logging.warning(
                 "Kestrel Agent async shutdown complete, but durable cleanup "
                 "was DEGRADED — one or more steps were abandoned "
                 "(see warnings above)."
             )
         else:
+            self._release_serving_record()
             logging.info("Kestrel Agent async shutdown complete.")
 
     def _durable_tail_minimum_budget(

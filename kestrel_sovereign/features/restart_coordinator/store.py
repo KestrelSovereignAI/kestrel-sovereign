@@ -151,6 +151,11 @@ _ADDED_COLUMNS = (
     # from their requester, age, status, or prior approval.
     ("authority_evidence", "TEXT DEFAULT ''"),
     ("authority_signature", "TEXT DEFAULT ''"),
+    # What the constitution adoption gate decided for this request's latest
+    # attempt (#3522): a JSON list, one entry per check, each with every
+    # agent's anchored and governing hash. A pass is recorded as well as a
+    # refusal, so "not refused" is never the only evidence the gate ran.
+    ("constitution_checks", "TEXT DEFAULT ''"),
 )
 
 # One-time data backfills for legacy rows, keyed by the column whose addition
@@ -205,7 +210,7 @@ _COLUMNS = (
     "executing_boot_id, origin_session_id, wake_delivered, "
     "wake_dispatched_at, wake_dispatch_boot_id, wake_dispatch_count, "
     "first_blocked_at, escalation_acknowledged, authority_evidence, "
-    "authority_signature"
+    "authority_signature, constitution_checks"
 )
 
 
@@ -261,6 +266,8 @@ class RestartRequest:
     # from ``to_public_dict`` so an agent cannot harvest/replay authority.
     authority_evidence: str = ""
     authority_signature: str = ""
+    # JSON list of constitution adoption gate checks (#3522).
+    constitution_checks: str = ""
 
     @classmethod
     def from_row(cls, row: Iterable[Any]) -> "RestartRequest":
@@ -297,6 +304,7 @@ class RestartRequest:
             escalation_acknowledged=bool(int(g(24) or 0)),
             authority_evidence=str(g(25) or ""),
             authority_signature=str(g(26) or ""),
+            constitution_checks=str(g(27) or ""),
         )
 
     def update_log_dict(self) -> Dict[str, Any]:
@@ -308,6 +316,16 @@ class RestartRequest:
         except (ValueError, TypeError):
             return {}
         return data if isinstance(data, dict) else {}
+
+    def constitution_checks_list(self) -> List[Dict[str, Any]]:
+        """Parse ``constitution_checks`` JSON (``[]`` if empty/invalid)."""
+        if not self.constitution_checks:
+            return []
+        try:
+            data = json.loads(self.constitution_checks)
+        except (ValueError, TypeError):
+            return []
+        return data if isinstance(data, list) else []
 
     def to_public_dict(self) -> dict:
         return {
@@ -339,6 +357,7 @@ class RestartRequest:
             "wake_dispatch_count": self.wake_dispatch_count,
             "first_blocked_at": self.first_blocked_at,
             "escalation_acknowledged": self.escalation_acknowledged,
+            "constitution_checks": self.constitution_checks_list(),
         }
 
 
@@ -373,7 +392,8 @@ async def ensure_restart_requests_table(db) -> None:
             first_blocked_at TEXT DEFAULT '',
             escalation_acknowledged INTEGER DEFAULT 0,
             authority_evidence TEXT DEFAULT '',
-            authority_signature TEXT DEFAULT ''
+            authority_signature TEXT DEFAULT '',
+            constitution_checks TEXT DEFAULT ''
         )
         """
     )
@@ -1300,6 +1320,20 @@ async def record_update_log(db, request_id: str, update_log: str) -> None:
     await db.execute(
         "UPDATE restart_requests SET update_log = ? WHERE id = ?",
         (update_log, request_id),
+    )
+
+
+async def record_constitution_checks(
+    db, request_id: str, constitution_checks: str,
+) -> None:
+    """Persist the constitution adoption gate's checks JSON onto the row.
+
+    Like :func:`record_update_log`, independent of the lifecycle state: the
+    evidence of what the gate compared survives whatever the request becomes.
+    """
+    await db.execute(
+        "UPDATE restart_requests SET constitution_checks = ? WHERE id = ?",
+        (constitution_checks, request_id),
     )
 
 

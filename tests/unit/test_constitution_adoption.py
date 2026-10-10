@@ -43,7 +43,8 @@ from kestrel_sovereign.constitution_adoption import (
     ConstitutionAdoptionError,
     check_constitution_adoption,
     check_installed_constitution_adoption,
-    packaged_constitution_at,
+    check_record,
+    deployed_content_at,
     refusal_reason,
 )
 from tests.utils.constitution_anchor import (
@@ -158,41 +159,43 @@ def test_the_incoming_package_is_judged_not_the_file_on_disk(project, installed)
     seed_anchored_agents(project, {"Emma": sha256(OLD)})
 
     incoming_new = check_constitution_adoption(
-        project, packaged_constitution=lambda: NEW
+        project, deployed_content=lambda path: NEW
     )
     assert [v.status for v in incoming_new.verdicts] == ["mismatch"]
     assert incoming_new.blocking[0].governing_hash == sha256(NEW)
 
     seed_anchored_agents(project, {"Emma": sha256(NEW)})
     assert check_constitution_adoption(
-        project, packaged_constitution=lambda: NEW
+        project, deployed_content=lambda path: NEW
     ).safe
     # ...and with no incoming change, the file on disk is what runs.
     assert not check_constitution_adoption(
-        project, packaged_constitution=lambda: None
+        project, deployed_content=lambda path: None
     ).safe
 
 
 def test_incoming_bytes_are_produced_once_and_only_when_compared(project, installed):
     calls = []
 
-    def incoming():
-        calls.append(1)
+    def incoming(path):
+        calls.append(path)
         return NEW
 
-    assert check_constitution_adoption(project, packaged_constitution=incoming).safe
+    assert check_constitution_adoption(project, deployed_content=incoming).safe
     assert calls == [], "no agent was compared, so nothing needed fetching"
 
     seed_anchored_agents(project, {"Emma": sha256(NEW), "Kite": sha256(NEW)})
-    assert check_constitution_adoption(project, packaged_constitution=incoming).safe
-    assert calls == [1]
+    assert check_constitution_adoption(project, deployed_content=incoming).safe
+    assert calls == [installed], "both agents share the package: asked once"
 
 
 def test_incoming_bytes_the_audit_would_reject_are_blocking(project, installed):
     """A blank packaged constitution fails the audit for every agent."""
     seed_anchored_agents(project, {"Emma": sha256(OLD)})
 
-    check = check_constitution_adoption(project, packaged_constitution=lambda: b"  \n")
+    check = check_constitution_adoption(
+        project, deployed_content=lambda path: b"  \n"
+    )
 
     [blocking] = check.blocking
     assert blocking.status == "audit_failure"
@@ -204,11 +207,49 @@ def test_a_failure_to_produce_incoming_bytes_is_not_an_agent_finding(
 ):
     seed_anchored_agents(project, {"Emma": sha256(OLD)})
 
-    def unavailable():
+    def unavailable(path):
         raise ConstitutionAdoptionError("git fetch failed")
 
     with pytest.raises(ConstitutionAdoptionError, match="git fetch failed"):
-        check_constitution_adoption(project, packaged_constitution=unavailable)
+        check_constitution_adoption(project, deployed_content=unavailable)
+
+
+def test_failing_to_read_the_deploy_refuses_rather_than_judging_the_source(
+    project, installed
+):
+    """Not a property of the governing source, so never a per-agent finding."""
+    seed_anchored_agents(project, {"Emma": sha256(OLD)})
+
+    def unreadable(path):
+        raise OSError("the checkout vanished")
+
+    with pytest.raises(ConstitutionAdoptionError, match="the checkout vanished"):
+        check_constitution_adoption(project, deployed_content=unreadable)
+
+
+def test_the_recorded_check_names_every_agent_and_its_result(project, installed):
+    seed_anchored_agents(project, {"Emma": sha256(OLD), "Kite": sha256(OLD)})
+
+    record = check_record(check_constitution_adoption(project))
+
+    assert record["result"] == "passed"
+    assert [(v["agent"], v["status"], v["anchored_hash"], v["governing_hash"])
+            for v in record["verdicts"]] == [
+        ("Emma", "match", sha256(OLD), sha256(OLD)),
+        ("Kite", "match", sha256(OLD), sha256(OLD)),
+    ]
+
+    (project / "agent_data" / "kite" / "kestrel_prime.db").unlink()
+    assert check_record(check_constitution_adoption(project))["result"] == (
+        "passed_with_unverified"
+    )
+
+    installed.write_bytes(NEW)
+    assert check_record(check_constitution_adoption(project))["result"] == "refused"
+    assert check_record(None, error="no registry") == {
+        "result": "unverifiable", "code": "", "error": "no registry",
+        "verdicts": [],
+    }
 
 
 def test_an_unreadable_anchor_is_unverified_not_blocking(project, installed):
@@ -232,10 +273,15 @@ def test_agent_names_limit_the_check(project, installed):
     assert check_constitution_adoption(project, agent_names=["nobody"]).verdicts == ()
 
 
-def test_a_descriptor_selected_external_source_ignores_the_incoming_package(
-    project, installed, tmp_path, monkeypatch
-):
-    """A deploy replaces the package, not an operator's external source."""
+def _govern_by_external_source(
+    directory: Path, monkeypatch, external: Path, pinned: bytes
+) -> tuple[Path, Path]:
+    """Select ``external`` by a signed descriptor pinning ``pinned``.
+
+    Writes the descriptor and its trust root into ``directory`` and
+    configures both through the environment the launcher hands an agent.
+    Returns ``(descriptor, trust_root)``.
+    """
     from kestrel_sovereign.constitution.amendment_artifact import (
         did_document_from_legacy_public_key,
     )
@@ -244,36 +290,245 @@ def test_a_descriptor_selected_external_source_ignores_the_incoming_package(
     )
     from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
 
-    external = tmp_path / "CUSTOM.md"
-    external.write_bytes(b"# Custom Constitution\n")
     keypair = Secp256k1Suite().generate_keypair()
     signer = "did:pkh:eip155:1:0x0000000000000000000000000000000000003517"
-    root = tmp_path / "root.did.json"
+    root = directory / "root.did.json"
     root.write_text(
         json.dumps(did_document_from_legacy_public_key(signer, keypair.public_key))
     )
-    descriptor = tmp_path / "source.signed.json"
+    descriptor = directory / "source.signed.json"
     descriptor.write_text(
         json.dumps(
             build_legacy_signed_source_descriptor(
                 signer_did=signer,
                 source_kind="external",
                 source_path=str(external),
-                content_sha256=hashlib.sha256(external.read_bytes()).hexdigest(),
+                content_sha256=hashlib.sha256(pinned).hexdigest(),
                 private_key=keypair.private_key,
             )
         )
     )
     monkeypatch.setenv("KESTREL_SOVEREIGN_TRUST_ROOT_PATH", str(root))
     monkeypatch.setenv("KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH", str(descriptor))
-    seed_anchored_agents(project, {"Emma": sha256(external.read_bytes())})
+    return descriptor, root
 
-    def incoming():
-        raise AssertionError("the package does not govern this agent")
 
-    check = check_constitution_adoption(project, packaged_constitution=incoming)
+CUSTOM = b"# Custom Constitution\nthe operator's own text\n"
+CUSTOM_NEW = b"# Custom Constitution\nthe operator's revised text\n"
+
+
+def test_a_descriptor_selected_source_is_judged_at_its_own_path(
+    project, installed, tmp_path, monkeypatch
+):
+    """The package does not govern this agent, so it is never asked about."""
+    external = tmp_path / "CUSTOM.md"
+    external.write_bytes(CUSTOM)
+    _govern_by_external_source(tmp_path, monkeypatch, external, CUSTOM)
+    seed_anchored_agents(project, {"Emma": sha256(CUSTOM)})
+    asked = []
+
+    def incoming(path):
+        asked.append(Path(path).resolve())
+        return None
+
+    check = check_constitution_adoption(project, deployed_content=incoming)
 
     assert [v.status for v in check.verdicts] == ["match"]
+    assert external.resolve() in asked
+    assert installed.resolve() not in asked
+
+
+@pytest.fixture
+def tracked_external(tmp_path, monkeypatch):
+    """A checkout tracking ``CUSTOM.md``, which an upstream commit replaced.
+
+    The checkout has ``CUSTOM``; ``origin/main`` (fetched, not pulled) has
+    ``CUSTOM_NEW``. Returns ``(clone, external)``; nothing governs by it yet.
+    """
+    origin, clone = origin_and_clone(tmp_path, OLD)
+    for content, message in ((CUSTOM, "adopt"), (CUSTOM_NEW, "revise")):
+        (origin / "CUSTOM.md").write_bytes(content)
+        git(origin, "add", "CUSTOM.md")
+        git(origin, "commit", "-q", "-m", f"{message} the operator's constitution")
+        if content == CUSTOM:
+            git(clone, "pull", "-q", "--ff-only")
+    git(clone, "fetch", "-q")
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(clone / PACKAGED_CONSTITUTION_RELPATH),
+    )
+    return clone, (clone / "CUSTOM.md").resolve()
+
+
+def test_an_external_source_the_checkout_replaces_is_judged_as_it_will_be(
+    project, tracked_external, tmp_path, monkeypatch
+):
+    """#3522: the incoming bytes of a tracked external source, not the disk's.
+
+    The operator signed the descriptor for the revised text ahead of the
+    deploy; Emma is still anchored to the text on disk. Restarting onto the
+    revision boots her into Safe Mode over a hash mismatch, which is what
+    the gate must report, with the hash a reanchor artifact has to sign.
+    """
+    clone, external = tracked_external
+    _govern_by_external_source(tmp_path, monkeypatch, external, CUSTOM_NEW)
+    seed_anchored_agents(project, {"Emma": sha256(CUSTOM)})
+
+    check = check_constitution_adoption(
+        project, deployed_content=deployed_content_at(clone, "origin/main")
+    )
+
+    [blocking] = check.blocking
+    assert blocking.status == "mismatch"
+    assert blocking.anchored_hash == sha256(CUSTOM)
+    assert blocking.governing_hash == sha256(CUSTOM_NEW)
+    assert blocking.governing_path == str(external)
+    # Judged by the working tree, the pin fails instead: the right refusal
+    # for the wrong reason, and no governing hash to sign.
+    [on_disk] = check_constitution_adoption(project).verdicts
+    assert on_disk.status == "audit_failure"
+    assert external.read_bytes() == CUSTOM
+
+
+def test_a_tracked_source_the_revision_breaks_is_refused_before_install(
+    project, tracked_external, tmp_path, monkeypatch
+):
+    """Judged by the working tree this matches; installed, the pin fails."""
+    clone, external = tracked_external
+    _govern_by_external_source(tmp_path, monkeypatch, external, CUSTOM)
+    seed_anchored_agents(project, {"Emma": sha256(CUSTOM)})
+
+    assert check_constitution_adoption(project).safe
+    check = check_constitution_adoption(
+        project, deployed_content=deployed_content_at(clone, "origin/main")
+    )
+
+    [blocking] = check.blocking
+    assert blocking.status == "audit_failure"
+    assert "pins" in blocking.detail
+
+
+def test_a_deploy_replacing_the_source_descriptor_is_refused(
+    project, tmp_path, monkeypatch
+):
+    """Which bytes would govern depends on a file the deploy has not installed."""
+    origin, clone = origin_and_clone(tmp_path, OLD)
+    external = tmp_path / "CUSTOM.md"
+    external.write_bytes(CUSTOM)
+    _govern_by_external_source(origin, monkeypatch, external, CUSTOM)
+    git(origin, "add", "source.signed.json", "root.did.json")
+    git(origin, "commit", "-q", "-m", "select the operator's constitution")
+    git(clone, "pull", "-q", "--ff-only")
+    _govern_by_external_source(origin, monkeypatch, external, CUSTOM_NEW)
+    git(origin, "commit", "-q", "-am", "re-sign the selection")
+    git(clone, "fetch", "-q")
+    monkeypatch.setenv(
+        "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH",
+        str(clone / "source.signed.json"),
+    )
+    monkeypatch.setenv(
+        "KESTREL_SOVEREIGN_TRUST_ROOT_PATH", str(clone / "root.did.json")
+    )
+    seed_anchored_agents(project, {"Emma": sha256(CUSTOM)})
+    assert check_constitution_adoption(project).safe
+
+    with pytest.raises(ConstitutionAdoptionError, match="replaces .*source descriptor"):
+        check_constitution_adoption(
+            project, deployed_content=deployed_content_at(clone, "origin/main")
+        )
+
+
+def _commit_files(repo: Path, files: dict[str, bytes], message: str) -> None:
+    for name, content in files.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_bytes(content)
+        git(repo, "add", name)
+    git(repo, "commit", "-q", "-m", message)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize(
+    "role, variable",
+    [
+        ("source descriptor", "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH"),
+        ("trust root", "KESTREL_SOVEREIGN_TRUST_ROOT_PATH"),
+    ],
+)
+def test_a_deploy_repointing_a_link_to_the_selection_is_refused(
+    project, tmp_path, monkeypatch, role, variable
+):
+    """#3522 review: the configured pathname is judged, not today's target.
+
+    The deploy leaves the file the link names today as it is and points the
+    link at another, so judging the resolved file finds nothing changed while
+    the installed host reads a different selection.
+    """
+    origin, clone = origin_and_clone(tmp_path, OLD)
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(clone / PACKAGED_CONSTITUTION_RELPATH),
+    )
+    external = tmp_path / "CUSTOM.md"
+    external.write_bytes(CUSTOM)
+    outside = tmp_path / "selection"
+    outside.mkdir()
+    descriptor, root = _govern_by_external_source(
+        outside, monkeypatch, external, CUSTOM
+    )
+    selected = descriptor if role == "source descriptor" else root
+    _commit_files(
+        origin,
+        {"old.json": selected.read_bytes(), "new.json": b"{}\n"},
+        "two selections",
+    )
+    _link(origin, "selection.json", "old.json", "select old")
+    git(clone, "pull", "-q", "--ff-only")
+    _link(origin, "selection.json", "new.json", "select new")
+    git(clone, "fetch", "-q")
+    monkeypatch.setenv(variable, str(clone / "selection.json"))
+    seed_anchored_agents(project, {"Emma": sha256(CUSTOM)})
+    assert check_constitution_adoption(project).safe
+
+    with pytest.raises(ConstitutionAdoptionError, match="symbolic link selection.json"):
+        check_constitution_adoption(
+            project, deployed_content=deployed_content_at(clone, "origin/main")
+        )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_a_deploy_repointing_a_directory_link_above_the_source_is_refused(
+    project, tmp_path, monkeypatch
+):
+    """#3522 review: a link above the governing file decides it as surely.
+
+    ``sources`` names ``a`` today and ``b`` after the deploy; neither file
+    changes, so only the link says the installed host reads other bytes,
+    which its descriptor's pin then rejects.
+    """
+    origin, clone = origin_and_clone(tmp_path, OLD)
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(clone / PACKAGED_CONSTITUTION_RELPATH),
+    )
+    _commit_files(
+        origin, {"a/CUSTOM.md": CUSTOM, "b/CUSTOM.md": CUSTOM_NEW}, "two sources"
+    )
+    _link(origin, "sources", "a", "select a")
+    git(clone, "pull", "-q", "--ff-only")
+    _link(origin, "sources", "b", "select b")
+    git(clone, "fetch", "-q")
+    outside = tmp_path / "selection"
+    outside.mkdir()
+    _govern_by_external_source(
+        outside, monkeypatch, clone / "sources" / "CUSTOM.md", CUSTOM
+    )
+    seed_anchored_agents(project, {"Emma": sha256(CUSTOM)})
+    assert check_constitution_adoption(project).safe
+
+    with pytest.raises(ConstitutionAdoptionError, match="symbolic link sources"):
+        check_constitution_adoption(
+            project, deployed_content=deployed_content_at(clone, "origin/main")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -394,18 +649,19 @@ def test_an_answer_this_process_cannot_read_is_refused(answer, message):
 # ---------------------------------------------------------------------------
 
 
-def test_packaged_constitution_at_reads_what_a_revision_installs(tmp_path, monkeypatch):
+def test_deployed_content_at_reads_what_a_revision_installs(tmp_path, monkeypatch):
     origin, clone = origin_and_clone(tmp_path, OLD)
     monkeypatch.setattr(
         "kestrel_sovereign.config.CONSTITUTION_PATH",
         str(clone / PACKAGED_CONSTITUTION_RELPATH),
     )
 
-    assert packaged_constitution_at(clone, "HEAD") is None
+    packaged = clone / PACKAGED_CONSTITUTION_RELPATH
+    assert deployed_content_at(clone, "HEAD")(packaged) is None
 
     commit_constitution(origin, NEW, "amend")
     git(clone, "fetch", "-q")
-    assert packaged_constitution_at(clone, "origin/main") == NEW
+    assert deployed_content_at(clone, "origin/main")(packaged) == NEW
 
 
 def test_a_revision_that_leaves_the_constitution_alone_reads_as_no_change(
@@ -421,7 +677,9 @@ def test_a_revision_that_leaves_the_constitution_alone_reads_as_no_change(
     git(origin, "commit", "-q", "-m", "unrelated")
     git(clone, "fetch", "-q")
 
-    assert packaged_constitution_at(clone, "origin/main") is None
+    assert deployed_content_at(clone, "origin/main")(
+        clone / PACKAGED_CONSTITUTION_RELPATH
+    ) is None
 
 
 def test_a_checkout_that_does_not_supply_the_package_changes_nothing(
@@ -429,7 +687,122 @@ def test_a_checkout_that_does_not_supply_the_package_changes_nothing(
 ):
     _, clone = origin_and_clone(tmp_path, NEW)
 
-    assert packaged_constitution_at(clone, "HEAD~0") is None
+    assert deployed_content_at(clone, "HEAD~0")(installed) is None
+
+
+def _link(repo: Path, name: str, target: str, message: str) -> None:
+    (repo / name).unlink(missing_ok=True)
+    (repo / name).symlink_to(target)
+    git(repo, "add", name)
+    git(repo, "commit", "-q", "-m", message)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_a_linked_source_is_judged_at_the_file_it_names(tmp_path):
+    """The resolver follows the link, so the gate judges its target."""
+    origin, clone = origin_and_clone(tmp_path, OLD)
+    (origin / "CUSTOM.md").write_bytes(CUSTOM)
+    git(origin, "add", "CUSTOM.md")
+    git(origin, "commit", "-q", "-m", "adopt")
+    _link(origin, "GOVERNING.md", "CUSTOM.md", "link")
+    git(clone, "pull", "-q", "--ff-only")
+    (origin / "CUSTOM.md").write_bytes(CUSTOM_NEW)
+    git(origin, "commit", "-q", "-am", "revise")
+    git(clone, "fetch", "-q")
+
+    content = deployed_content_at(clone, "origin/main")
+
+    assert content(clone / "GOVERNING.md") == CUSTOM_NEW
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize(
+    "change", ["repoint", "repoint-a-link-the-link-names", "replace-file-with-link"]
+)
+def test_a_revision_changing_which_file_a_path_names_is_refused(tmp_path, change):
+    origin, clone = origin_and_clone(tmp_path, OLD)
+    for name, content in (("CUSTOM.md", CUSTOM), ("OTHER.md", CUSTOM_NEW)):
+        (origin / name).write_bytes(content)
+        git(origin, "add", name)
+    git(origin, "commit", "-q", "-m", "two sources")
+    if change == "repoint":
+        _link(origin, "GOVERNING.md", "CUSTOM.md", "link")
+        git(clone, "pull", "-q", "--ff-only")
+        _link(origin, "GOVERNING.md", "OTHER.md", "repoint")
+        governing = clone / "GOVERNING.md"
+    elif change == "repoint-a-link-the-link-names":
+        _link(origin, "MIDDLE.md", "CUSTOM.md", "link")
+        _link(origin, "GOVERNING.md", "MIDDLE.md", "link the link")
+        git(clone, "pull", "-q", "--ff-only")
+        _link(origin, "MIDDLE.md", "OTHER.md", "repoint the inner link")
+        governing = clone / "GOVERNING.md"
+    else:
+        git(clone, "pull", "-q", "--ff-only")
+        _link(origin, "CUSTOM.md", "OTHER.md", "replace with a link")
+        governing = clone / "CUSTOM.md"
+    git(clone, "fetch", "-q")
+
+    with pytest.raises(ConstitutionAdoptionError, match="symbolic link"):
+        deployed_content_at(clone, "origin/main")(governing)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_a_revision_replacing_a_directory_on_the_path_with_a_link_is_refused(
+    tmp_path,
+):
+    origin, clone = origin_and_clone(tmp_path, OLD)
+    _commit_files(
+        origin,
+        {"sources/CUSTOM.md": CUSTOM, "alt/CUSTOM.md": CUSTOM_NEW},
+        "two sources",
+    )
+    git(clone, "pull", "-q", "--ff-only")
+    git(origin, "rm", "-q", "-r", "sources")
+    _link(origin, "sources", "alt", "replace the directory with a link")
+    git(clone, "fetch", "-q")
+
+    with pytest.raises(ConstitutionAdoptionError, match="directory sources"):
+        deployed_content_at(clone, "origin/main")(clone / "sources" / "CUSTOM.md")
+
+
+def test_a_directory_whose_other_files_change_still_names_the_same_file(tmp_path):
+    origin, clone = origin_and_clone(tmp_path, OLD)
+    _commit_files(origin, {"sources/CUSTOM.md": CUSTOM}, "adopt")
+    git(clone, "pull", "-q", "--ff-only")
+    _commit_files(origin, {"sources/NOTES.md": b"unrelated\n"}, "unrelated")
+    git(clone, "fetch", "-q")
+
+    assert (
+        deployed_content_at(clone, "origin/main")(clone / "sources" / "CUSTOM.md")
+        is None
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_walk_resolves_a_path_as_the_resolver_does(tmp_path):
+    """Every link it follows is noted, and it ends where ``resolve`` does."""
+    base = tmp_path.resolve()
+    (base / "deep" / "dir").mkdir(parents=True)
+    (base / "deep" / "x").write_text("x")
+    (base / "up").symlink_to(base / "deep" / "dir")
+    (base / "rel").symlink_to("up")
+    path = base / "rel" / ".." / "x"
+
+    resolved, passed = constitution_adoption._resolution_walk(path)
+
+    assert resolved == path.resolve() == base / "deep" / "x"
+    assert [location for location, link in passed if link] == [
+        base / "rel",
+        base / "up",
+    ]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_walk_refuses_a_cycle_of_links(tmp_path):
+    (tmp_path / "loop").symlink_to("loop")
+
+    with pytest.raises(ConstitutionAdoptionError, match="symbolic links"):
+        constitution_adoption._resolution_walk(tmp_path / "loop" / "x")
 
 
 def test_a_revision_without_a_packaged_constitution_is_refused(tmp_path, monkeypatch):
@@ -443,7 +816,9 @@ def test_a_revision_without_a_packaged_constitution_is_refused(tmp_path, monkeyp
     git(clone, "fetch", "-q")
 
     with pytest.raises(ConstitutionAdoptionError, match="cannot read"):
-        packaged_constitution_at(clone, "origin/main")
+        deployed_content_at(clone, "origin/main")(
+            clone / PACKAGED_CONSTITUTION_RELPATH
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -685,7 +1060,8 @@ def test_update_without_a_restart_refuses_while_a_blocking_agent_runs(
     assert rc == CONSTITUTION_ADOPTION_REQUIRED
     assert steps == []
     err = capsys.readouterr().err
-    assert "Emma is running (`kestrel terminate` stops it)" in err
+    assert "Emma is running (host PID" in err
+    assert "`kestrel terminate` stops it" in err
     assert "nothing was pulled, installed or restarted" in err
 
     rc = cli.cmd_update(
@@ -722,7 +1098,8 @@ def test_update_without_a_restart_refuses_an_unverifiable_revision_under_running
     assert steps == []
     err = capsys.readouterr().err
     assert "network is down" in err
-    assert "Emma is running (`kestrel terminate` stops it)" in err
+    assert "Emma is running (host PID" in err
+    assert "`kestrel terminate` stops it" in err
 
 
 def test_update_without_a_restart_refuses_when_it_cannot_tell_what_runs(
@@ -737,6 +1114,103 @@ def test_update_without_a_restart_refuses_when_it_cannot_tell_what_runs(
     assert rc == CONSTITUTION_ADOPTION_REQUIRED
     assert steps == []
     assert "cannot tell which agents are running" in capsys.readouterr().err
+
+
+def test_update_without_a_restart_refuses_while_a_directly_launched_agent_runs(
+    project, upstream, capsys
+):
+    """No launcher PID record: the server's own serving record shows it (#3522)."""
+    from kestrel_sovereign.multi_agent.liveness import ServingRecord
+
+    _, steps = upstream
+    seed_anchored_agents(project, {"Emma": sha256(OLD)})
+    # This process stands in for ``python -m kestrel_sovereign.server`` or a
+    # container entrypoint: nothing ran ``kestrel start``, so no PID file.
+    record = ServingRecord.acquire(project / "agent_data" / "emma")
+    assert not (project / "logs").exists()
+    assert not (project / "agent_data" / "emma" / "agent.pid").exists()
+
+    rc = cli.cmd_update(_update_args(restart=False))
+
+    assert rc == CONSTITUTION_ADOPTION_REQUIRED
+    assert steps == []
+    err = capsys.readouterr().err
+    assert (
+        f"Emma is running (PID {os.getpid()} serves it, started without "
+        "`kestrel start`"
+    ) in err
+    if sys.platform != "win32":
+        assert f"`kill {os.getpid()}` stops it" in err
+    assert "nothing was pulled, installed or restarted" in err
+
+    # Shut down, it reads nothing the install changes.
+    record.release()
+    assert cli.cmd_update(_update_args(restart=False)) == 0
+    assert steps == ["pull", "install"]
+
+
+@pytest.mark.parametrize("unknown", ["identity", "foreign", "unreadable"])
+def test_update_without_a_restart_refuses_when_liveness_is_unknown(
+    project, upstream, monkeypatch, capsys, unknown
+):
+    """A serving record this host cannot check counts as a running agent."""
+    from kestrel_sovereign.multi_agent.liveness import ServingRecord
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    _, steps = upstream
+    seed_anchored_agents(project, {"Emma": sha256(OLD)})
+    record = ServingRecord.acquire(project / "agent_data" / "emma")
+    if unknown == "identity":
+        # The liveness probe cannot say whether, or whose, the PID is.
+        monkeypatch.setattr(
+            ProcessManager, "_probe_process", staticmethod(lambda pid: (None, None))
+        )
+    elif unknown == "foreign":
+        # Written in a container sharing the data directory. Its PID and
+        # start time mean nothing here: probed locally, they read as stale.
+        payload = json.loads(record.path.read_text())
+        payload.update(host="a-container", started_at=1.0)
+        record.path.write_text(json.dumps(payload))
+    else:
+        record.path.write_text("{half a record")
+
+    rc = cli.cmd_update(_update_args(restart=False))
+
+    assert rc == CONSTITUTION_ADOPTION_REQUIRED
+    assert steps == []
+    err = capsys.readouterr().err
+    assert "Emma may be running (" in err
+    assert str(record.path) in err
+
+
+def test_update_refuses_a_revision_replacing_a_tracked_external_source(
+    project, tracked_external, tmp_path, monkeypatch, capsys
+):
+    """``kestrel update`` judges the external source as its pull leaves it."""
+    clone, external = tracked_external
+    _govern_by_external_source(tmp_path, monkeypatch, external, CUSTOM_NEW)
+    seed_anchored_agents(project, {"Emma": sha256(CUSTOM)})
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
+    monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: clone)
+    steps = []
+    monkeypatch.setattr(
+        cli, "_run_git_pull", lambda _: steps.append("pull") or (0, "")
+    )
+    monkeypatch.setattr(
+        cli,
+        "_run_uv_pip_install_editable",
+        lambda *a, **kw: steps.append("install") or (0, ""),
+    )
+    monkeypatch.setattr(cli, "cmd_restart", lambda args: steps.append("restart") or 0)
+
+    rc = cli.cmd_update(_update_args())
+
+    assert rc == CONSTITUTION_ADOPTION_REQUIRED
+    assert steps == []
+    assert external.read_bytes() == CUSTOM
+    err = capsys.readouterr().err
+    for text in ("Emma", sha256(CUSTOM), sha256(CUSTOM_NEW), str(external)):
+        assert text in err
 
 
 def test_update_without_a_pull_judges_the_installed_code(project, upstream):

@@ -80,6 +80,7 @@ from .store import (
     mark_deferral_started,
     mark_wake_delivered,
     mark_wake_dispatched,
+    record_constitution_checks,
     record_update_log,
     resolve_restart_delegation,
     revoke_restart_delegation as revoke_restart_delegation_record,
@@ -161,6 +162,13 @@ STALE_EXECUTING_SECONDS = 600
 # to kill the parent) within the live process and must NOT be falsely
 # terminalized as ``completed``; it stays visibly ``executing``.
 _PROCESS_BOOT_ID = uuid.uuid4().hex
+
+# The two points at which the constitution adoption gate judges a request
+# (#3517), as its recorded checks name them (#3522): the revision an update
+# fetched, before checkout; and the code installed on disk, judged in a fresh
+# interpreter, before any restart.
+_FETCHED_REVISION_CHECK = "fetched_revision"
+_INSTALLED_CODE_CHECK = "installed_code"
 
 logger = logging.getLogger(__name__)
 
@@ -1064,7 +1072,9 @@ class RestartCoordinatorFeature(Feature):
             "statuses: pending|approved|updating|executing|completed|"
             "rejected|refused|canceled (omit status for all). refused means "
             "the restart would have booted agents into constitution Safe "
-            "Mode; status_reason names them. An unknown status is "
+            "Mode; status_reason names them. constitution_checks records "
+            "each check the gate ran, passed or refused, with every agent's "
+            "anchored and governing hash. An unknown status is "
             "rejected with the valid set rather than silently returning no "
             "rows.\n\n"
             "Returns: data={count: int, requests: [<public dict>, ...]}."
@@ -1426,7 +1436,10 @@ class RestartCoordinatorFeature(Feature):
             # fetch, against the revision it is about to check out, and once
             # installed, against what it installed.
             if req.operation != "update_then_restart":
-                refusal = await self._constitution_adoption_refusal()
+                check, refusal = await self._check_constitution_adoption(
+                    stage=_INSTALLED_CODE_CHECK,
+                )
+                await self._record_constitution_checks(req, [check])
                 if refusal is not None:
                     if await self._refuse_restart(req, refusal):
                         refused.append({"request_id": req.id, "reason": refusal})
@@ -1727,23 +1740,26 @@ class RestartCoordinatorFeature(Feature):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _constitution_adoption_refusal(
-        self, *, repo_path: str = "", revision: str = "",
-    ) -> Optional[str]:
-        """Why restarting now would boot agents into constitution Safe Mode.
+    async def _check_constitution_adoption(
+        self, *, stage: str, repo_path: str = "", revision: str = "",
+    ) -> tuple[Dict[str, Any], Optional[str]]:
+        """Whether restarting now would boot agents into constitution Safe Mode.
 
         The deploy gate ``kestrel restart`` and ``kestrel update`` run
         (#3517), against the code the spawned ``kestrel restart`` will boot,
         for every local agent. Same project resolution as that child, which
-        inherits this process's working directory and environment. Returns the
+        inherits this process's working directory and environment. Returns
+        the check as the request records it (``stage`` names it, and every
+        agent's anchored and governing hash is in it, #3522), and the
         terminal refusal reason, or None when the restart is safe.
 
-        With ``revision``, nothing is installed yet: the packaged constitution
-        that checking out ``revision`` of ``repo_path`` would leave is judged
-        by this process's resolver. Without it, the installed code is judged
-        in a fresh interpreter. This host imported ``kestrel_sovereign`` when
-        it booted, and an update since may have changed how the governing
-        bytes are rendered, which only the installed code can say.
+        With ``revision``, nothing is installed yet: what checking out
+        ``revision`` of ``repo_path`` would leave at each governing path is
+        judged by this process's resolver. Without it, the installed code is
+        judged in a fresh interpreter. This host imported
+        ``kestrel_sovereign`` when it booted, and an update since may have
+        changed how the governing bytes are rendered, which only the
+        installed code can say.
 
         A gate that cannot work out what the code would govern by refuses
         too; an agent cannot override it — the operator restarts by hand with
@@ -1753,7 +1769,8 @@ class RestartCoordinatorFeature(Feature):
             ConstitutionAdoptionError,
             check_constitution_adoption,
             check_installed_constitution_adoption,
-            packaged_constitution_at,
+            check_record,
+            deployed_content_at,
             refusal_reason,
             unverified_lines,
         )
@@ -1764,24 +1781,46 @@ class RestartCoordinatorFeature(Feature):
                 return check_installed_constitution_adoption(project_dir())
             return check_constitution_adoption(
                 project_dir(),
-                packaged_constitution=(
-                    lambda: packaged_constitution_at(repo_path, revision)
-                ),
+                deployed_content=deployed_content_at(repo_path, revision),
                 code_label=f"{revision} of {repo_path}",
             )
 
+        checked = {
+            "stage": stage,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
         try:
             check = await asyncio.to_thread(_check)
         except ConstitutionAdoptionError as exc:
-            return (
+            return {**checked, **check_record(None, error=str(exc))}, (
                 "constitution adoption could not be verified, so the restart "
                 f"is refused: {exc}"
             )
         for line in unverified_lines(check):
             logger.warning("restart_coordinator: %s", line.strip())
+        record = {**checked, **check_record(check)}
         if check.safe:
-            return None
-        return refusal_reason(check)
+            return record, None
+        return record, refusal_reason(check)
+
+    async def _record_constitution_checks(
+        self, req, checks: List[Dict[str, Any]],
+    ) -> None:
+        """Record the adoption checks of this attempt on the request (#3522).
+
+        Replaces the previous attempt's checks. ``req`` carries them too, so
+        the status events emitted from it report what the gate compared.
+        """
+        req.constitution_checks = json.dumps(checks)
+        try:
+            await record_constitution_checks(
+                self._db, req.id, req.constitution_checks,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "restart_coordinator: failed to persist constitution checks "
+                "for %s: %s", req.id, e,
+            )
 
     async def _refuse_restart(self, req, reason: str) -> bool:
         """Terminally refuse a pending request the adoption gate stopped."""
@@ -2871,6 +2910,8 @@ class RestartCoordinatorFeature(Feature):
         ok = True
         failed_step: Optional[str] = None
         constitution_refusal: Optional[str] = None
+        constitution_checks: List[Dict[str, Any]] = []
+        await self._record_constitution_checks(req, constitution_checks)
         for step in steps:
             outcome = await self._run_update_step(step)
             results.append(outcome)
@@ -2888,9 +2929,15 @@ class RestartCoordinatorFeature(Feature):
                 # anchored to that revision's constitution would boot into
                 # Safe Mode, and refusing now leaves the checkout as it was
                 # (#3517).
-                constitution_refusal = await self._constitution_adoption_refusal(
-                    repo_path=req.update_repo_path, revision="FETCH_HEAD",
+                check, constitution_refusal = (
+                    await self._check_constitution_adoption(
+                        stage=_FETCHED_REVISION_CHECK,
+                        repo_path=req.update_repo_path,
+                        revision="FETCH_HEAD",
+                    )
                 )
+                constitution_checks.append(check)
+                await self._record_constitution_checks(req, constitution_checks)
                 if constitution_refusal is not None:
                     ok = False
                     failed_step = "constitution_adoption"
@@ -2901,7 +2948,11 @@ class RestartCoordinatorFeature(Feature):
             # fetched bytes. A revision can also change how they are rendered,
             # which only the code just installed can say: judge it in a fresh
             # interpreter before anything restarts (#3517).
-            installed_refusal = await self._constitution_adoption_refusal()
+            check, installed_refusal = await self._check_constitution_adoption(
+                stage=_INSTALLED_CODE_CHECK,
+            )
+            constitution_checks.append(check)
+            await self._record_constitution_checks(req, constitution_checks)
             if installed_refusal is not None:
                 ok = False
                 failed_step = "constitution_adoption"

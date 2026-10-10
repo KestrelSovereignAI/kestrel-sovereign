@@ -1063,7 +1063,7 @@ def test_the_guard_sees_an_agent_served_by_the_in_process_host(tmp_path, monkeyp
     assert not (agent_dir / "agent.pid").exists()
 
     holder = _agent_holder(tmp_path, "Claw", cfg)
-    assert holder == "kestrel terminate", (
+    assert holder.command == "kestrel terminate", (
         "the guard must see the shared host, and must prescribe a command "
         "that can actually terminate it — `kestrel terminate Claw` cannot terminate an "
         "agent with no process of its own, so every retry would refuse again"
@@ -1084,7 +1084,7 @@ def test_the_guard_prescribes_the_per_agent_stop_in_subprocess_mode(tmp_path):
     ProcessManager.write_pid(
         ProcessManager.agent_pid_file(agent_dir), os.getpid(), port=8801
     )
-    assert _agent_holder(tmp_path, "Claw", cfg) == "kestrel terminate Claw"
+    assert _agent_holder(tmp_path, "Claw", cfg).command == "kestrel terminate Claw"
 
 
 def _capture_reanchor_kwargs(reanchor_env, argv):
