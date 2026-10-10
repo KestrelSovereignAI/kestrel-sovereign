@@ -2461,6 +2461,7 @@ class ConstitutionMixin:
         )
         from kestrel_sovereign.constitution.reanchor_receipt import (
             supersede_constitution_reanchor,
+            validate_constitution_reanchor_evidence,
         )
 
         # Every mutation below — the new constitution blob, the artifact
@@ -2485,6 +2486,7 @@ class ConstitutionMixin:
                 agent_node = await revalidate_governance_evidence(
                     self._raw_storage, self.agent_id, governance_preflight
                 )
+                validate_constitution_reanchor_evidence(agent_node.properties, superseding=True)
                 stored_hash = await store_verified_governing_file(
                     self._raw_storage, constitution_content, verification=verification,
                     artifact_content=amendment_artifact_bytes,

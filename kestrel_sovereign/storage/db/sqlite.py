@@ -380,7 +380,6 @@ class SQLiteBackend(DatabaseBackend):
                 ``identity.local_anchor``: refuse when sidecars are present,
                 then open ``immutable=1``, which creates none.
         """
-        self.db_path = db_path
         self.cold_read = cold_read
         #: Resolved ONCE, and used for the URI, the sidecar checks and the
         #: change marker alike. SQLite places ``-wal``/``-shm`` beside the
@@ -465,6 +464,16 @@ class SQLiteBackend(DatabaseBackend):
     @property
     def is_connected(self) -> bool:
         return self._connection is not None
+
+    @property
+    def db_path(self) -> str:
+        """Construction-time resolved target, shared by all native consumers.
+
+        Retargeting a connected backend is not supported. In particular a
+        caller cannot rewrite its public path while the connection retains a
+        different inode. Consumers opening siblings also verify file custody.
+        """
+        return ":memory:" if self._resolved_path is None else str(self._resolved_path)
 
     @property
     def connected_file_identity(self) -> Optional[tuple[int, int]]:

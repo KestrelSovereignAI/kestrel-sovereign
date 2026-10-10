@@ -421,10 +421,10 @@ async def test_a_later_reanchor_preserves_the_receipt_it_supersedes(tmp_path):
     agent, node = _make_agent(stored_hash=ANCHORED_HASH, safe_mode=False)
     prior = {
         "timestamp": "2026-04-05T00:00:00Z",
-        "old_hash": "ancienthash",
+        "old_hash": "0" * 64,
         "new_hash": ANCHORED_HASH,
         "path": "/prior/KESTREL_CONSTITUTION.md",
-        "signed_artifact_hash": "priorartifacthash",
+        "signed_artifact_hash": "1" * 64,
         "signed_artifact_path": "/prior/amendment.json",
         "signed_artifact_signer": ROOT_DID,
         "signed_artifact_verification": "signed by the pinned sovereign root",

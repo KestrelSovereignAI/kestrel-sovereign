@@ -207,6 +207,24 @@ A repair requiring a 129th entry, or encountering already-overflowed or malforme
 history, refuses atomically and preserves all existing evidence. Neither runtime
 nor offline repair truncates receipts to make room. Repeating signed repairs is
 not permission to discard earlier content-audit verdicts.
+Reanchor receipt history independently uses the same 128-entry bound. Its
+current receipt, every archived receipt and supersession hash, and the proposed
+archive length are checked by one shared reader/writer rule, including when the
+operative anchor is intact. Both runtime and offline repair validate the locked
+evidence before file-owner publication. Repeated same-content repairs cannot
+append a 129th receipt or replace malformed history with an empty list. Legacy
+receipts without artifact hashes remain preserved; recovery never invents a
+signature for old evidence.
+
+Native SQLite resolves its database target once at construction and exposes a
+read-only absolute path. Primary connections, snapshot reads, SQLAlchemy
+adapters, storage audit/backup sidecars and scheduler rollout locks share that
+target even after the working directory changes. Connected inode custody is
+checked at adapter admission, connection checkout, statement execution and
+commit, and again after a blocking scheduler lock acquisition. Native
+SQLAlchemy connections open in read/write-only URI mode: a removed database is
+not silently recreated. Replacement or missing custody refuses access rather
+than admitting a different database through the old pathname.
 SQLite turn admission and final successful-audit/Safe-Mode-exit attestation reserve
 the writer slot before their first governance read, avoiding stale deferred WAL
 snapshots after unrelated writers commit. No provider work runs in that span.

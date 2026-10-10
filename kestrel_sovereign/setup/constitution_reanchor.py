@@ -1345,7 +1345,10 @@ async def _write_reanchor(
             )
             from kestrel_sovereign.constitution.anchored_bytes import revalidate_governance_evidence
 
-            await revalidate_governance_evidence(storage, agent_did, governance_preflight)
+            agent = await revalidate_governance_evidence(storage, agent_did, governance_preflight)
+            from kestrel_sovereign.constitution.reanchor_receipt import validate_constitution_reanchor_evidence
+
+            validate_constitution_reanchor_evidence(agent.properties, superseding=True)
             # 1. File blob (encrypted at rest if KESTREL_DATA_KEY is set).
             from kestrel_sovereign.constitution.anchored_bytes import store_verified_governing_file
 

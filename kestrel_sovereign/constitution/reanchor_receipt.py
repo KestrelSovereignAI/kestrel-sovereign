@@ -28,7 +28,8 @@ node is the reviewed home for this shape.
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, MutableMapping
+from typing import Any, Mapping, MutableMapping
+import re
 
 from kestrel_sovereign.constitution.genesis_audit import utc_timestamp
 
@@ -37,6 +38,48 @@ from kestrel_sovereign.constitution.genesis_audit import utc_timestamp
 # classification cannot drift apart on a string literal.
 CONSTITUTION_REANCHOR_KEY = "constitution_reanchor"
 CONSTITUTION_REANCHOR_HISTORY_KEY = "constitution_reanchor_history"
+MAX_REANCHOR_RECEIPT_HISTORY = 128
+
+
+def _receipt_hash(value: Any, field: str) -> None:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"Malformed historical governance reanchor receipt {field}; existing evidence is preserved")
+
+
+def validate_constitution_reanchor_receipt(receipt: Any) -> None:
+    """Validate evidence shape, not signature authority or legacy prose.
+
+    Legacy receipts can predate signed artifacts. Preserve their facts rather
+    than fabricating signatures; an optional hash must nevertheless be valid.
+    """
+    if not isinstance(receipt, Mapping):
+        raise ValueError("Malformed historical governance reanchor receipt; existing evidence is preserved")
+    _receipt_hash(receipt.get("new_hash"), "new_hash")
+    # Offline first-anchor receipts use None; runtime uses the literal none.
+    # Both describe absence, never a substitute destination hash.
+    if "old_hash" in receipt and receipt["old_hash"] not in (None, "none"):
+        _receipt_hash(receipt["old_hash"], "old_hash")
+    if "signed_artifact_hash" in receipt:
+        _receipt_hash(receipt["signed_artifact_hash"], "signed_artifact_hash")
+
+
+def validate_constitution_reanchor_evidence(properties: Mapping[str, Any], *, superseding: bool = False) -> list:
+    """One admission rule for complete current/history reads and both writers."""
+    history = properties.get(CONSTITUTION_REANCHOR_HISTORY_KEY, [])
+    if not isinstance(history, list) or len(history) > MAX_REANCHOR_RECEIPT_HISTORY:
+        raise ValueError("Malformed or unbounded historical governance reanchor history; existing evidence is preserved")
+    for entry in history:
+        if not isinstance(entry, Mapping):
+            raise ValueError("Malformed historical governance reanchor history entry; existing evidence is preserved")
+        validate_constitution_reanchor_receipt(entry.get("receipt"))
+        _receipt_hash(entry.get("superseded_by_constitution_hash"), "superseded_by_constitution_hash")
+        if "superseded_by_artifact_hash" in entry:
+            _receipt_hash(entry["superseded_by_artifact_hash"], "superseded_by_artifact_hash")
+    if CONSTITUTION_REANCHOR_KEY in properties:
+        validate_constitution_reanchor_receipt(properties[CONSTITUTION_REANCHOR_KEY])
+        if superseding and len(history) >= MAX_REANCHOR_RECEIPT_HISTORY:
+            raise ValueError("Reanchor history cannot archive another receipt; existing evidence is preserved")
+    return history
 
 
 def supersede_constitution_reanchor(
@@ -60,10 +103,12 @@ def supersede_constitution_reanchor(
 
     Returns the new current receipt.
     """
+    # Complete admission precedes every in-place mutation, even a same-hash
+    # repair whose genesis receipt does not need another history entry.
+    history = deepcopy(validate_constitution_reanchor_evidence(properties, superseding=True))
+    validate_constitution_reanchor_receipt(receipt)
     changed_at = recorded_at or utc_timestamp()
     existing = properties.get(CONSTITUTION_REANCHOR_KEY)
-    history = properties.get(CONSTITUTION_REANCHOR_HISTORY_KEY)
-    history = list(history) if isinstance(history, list) else []
     if existing is not None:
         history.append(
             {

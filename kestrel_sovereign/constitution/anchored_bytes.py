@@ -180,6 +180,9 @@ def historical_anchor_hash(
     names multiple superseded constitutions and is not a competing pointer.
     """
     pointer = properties.get("constitution_hash")
+    from kestrel_sovereign.constitution.reanchor_receipt import validate_constitution_reanchor_evidence
+
+    validate_constitution_reanchor_evidence(properties)
     if pointer:
         return pointer
     candidates: set[str] = set()

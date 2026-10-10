@@ -28,6 +28,7 @@ from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 from kestrel_sovereign.llm.codex_app_server import CodexAppServerClient
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
+from kestrel_sovereign.storage.db.sqlite import _aiosqlite_worker_is_alive
 
 
 # ---------------------------------------------------------------------------
@@ -35,12 +36,21 @@ from kestrel_sovereign.storage.db import SQLiteBackend
 # ---------------------------------------------------------------------------
 
 
-async def _backend(tmp_path):
+@pytest.fixture
+async def decline_db(tmp_path):
+    """Own the native connection through same-loop teardown on every path."""
     raw = SQLiteBackend(str(tmp_path / "decline-test.db"))
-    await raw.connect()
     db = AsyncDatabase(raw)
-    await ensure_codex_decline_events_table(db)
-    return db
+    try:
+        await raw.connect()
+        await ensure_codex_decline_events_table(db)
+        yield db
+    finally:
+        connection = raw._connection
+        await db.close()
+        assert raw._connection is None
+        assert not db.connection_retirement_pending
+        assert connection is None or not _aiosqlite_worker_is_alive(connection)
 
 
 def _agent_with_db(db, *, did="did:test:emma"):
@@ -59,14 +69,14 @@ def _agent_with_db(db, *, did="did:test:emma"):
 
 
 @pytest.mark.asyncio
-async def test_ensure_table_idempotent(tmp_path):
-    db = await _backend(tmp_path)
+async def test_ensure_table_idempotent(decline_db):
+    db = decline_db
     await ensure_codex_decline_events_table(db)  # second call no-ops
 
 
 @pytest.mark.asyncio
-async def test_record_and_list_round_trip(tmp_path):
-    db = await _backend(tmp_path)
+async def test_record_and_list_round_trip(decline_db):
+    db = decline_db
     await record_decline(
         db, agent_id="emma",
         request="item/commandExecution/requestApproval",
@@ -82,10 +92,10 @@ async def test_record_and_list_round_trip(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_did_scoping_isolates_agents(tmp_path):
+async def test_did_scoping_isolates_agents(decline_db):
     """Shared-backend safety: agent A's declines must not appear in
     agent B's listing."""
-    db = await _backend(tmp_path)
+    db = decline_db
     await record_decline(
         db, agent_id="emma", request="r1", tool="t1", reason="policy_deny",
     )
@@ -99,8 +109,8 @@ async def test_did_scoping_isolates_agents(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_tool_field_truncated_at_200_chars(tmp_path):
-    db = await _backend(tmp_path)
+async def test_tool_field_truncated_at_200_chars(decline_db):
+    db = decline_db
     big = "x" * 1000
     row = await record_decline(
         db, agent_id="emma", request="r", tool=big, reason="x",
@@ -115,7 +125,7 @@ async def test_tool_field_truncated_at_200_chars(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_bridge_policy_deny_records_event(tmp_path):
+async def test_bridge_policy_deny_records_event(decline_db):
     """Policy-gate DENY in the codex_adapter bridge must write a
     typed decline event tagged with the policy reason.
 
@@ -127,7 +137,7 @@ async def test_bridge_policy_deny_records_event(tmp_path):
         BinaryPolicy,
         PathPolicy,
     )
-    db = await _backend(tmp_path)
+    db = decline_db
     agent = _agent_with_db(db)
     agent.features = {
         "SecurityFeature": SimpleNamespace(
@@ -152,7 +162,7 @@ async def test_bridge_policy_deny_records_event(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_bridge_policy_allow_records_auto_approve(tmp_path):
+async def test_bridge_policy_allow_records_auto_approve(decline_db):
     """#1694: an allow-listed binary short-circuits the queue and the
     bridge records the auto-approve as a typed event with
     status=auto_approved purely for after-the-fact audit. The
@@ -163,7 +173,7 @@ async def test_bridge_policy_allow_records_auto_approve(tmp_path):
         BinaryPolicy,
         PathPolicy,
     )
-    db = await _backend(tmp_path)
+    db = decline_db
     agent = _agent_with_db(db)
     queue_called = AsyncMock(return_value=(True, "auto"))
     agent.features = {
@@ -188,7 +198,7 @@ async def test_bridge_policy_allow_records_auto_approve(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_bridge_queue_denial_records_event(tmp_path):
+async def test_bridge_queue_denial_records_event(decline_db):
     """Approval queue saying 'denied' must surface as queue_denied.
 
     Under #1694, the queue is only reached for binaries the policy
@@ -199,7 +209,7 @@ async def test_bridge_queue_denial_records_event(tmp_path):
         BinaryPolicy,
         PathPolicy,
     )
-    db = await _backend(tmp_path)
+    db = decline_db
     agent = _agent_with_db(db)
     agent.features = {
         "SecurityFeature": SimpleNamespace(
@@ -223,7 +233,7 @@ async def test_bridge_queue_denial_records_event(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_bridge_no_queue_records_event(tmp_path):
+async def test_bridge_no_queue_records_event(decline_db):
     """Missing SecurityFeature → no_approval_queue reason.
 
     Under #1694, the queue is only consulted for REQUIRE_APPROVAL
@@ -234,7 +244,7 @@ async def test_bridge_no_queue_records_event(tmp_path):
         BinaryPolicy,
         PathPolicy,
     )
-    db = await _backend(tmp_path)
+    db = decline_db
     agent = _agent_with_db(db)
     agent.features = {
         "ComputerUseFeature": SimpleNamespace(
@@ -258,12 +268,12 @@ async def test_bridge_no_queue_records_event(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_app_server_default_decline_records_event(tmp_path):
+async def test_app_server_default_decline_records_event(decline_db):
     """The codex_app_server's _DEFAULT_APPROVAL_REPLIES path is the
     fallback decline source for RPCs the bridge intentionally doesn't
     cover (elicitation / permissions / userInput). When an audit
     agent is attached, those declines must surface as typed events."""
-    db = await _backend(tmp_path)
+    db = decline_db
     agent = _agent_with_db(db)
 
     client = CodexAppServerClient.__new__(CodexAppServerClient)
@@ -290,11 +300,11 @@ async def test_app_server_default_decline_records_event(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_app_server_records_action_shape_decline(tmp_path):
+async def test_app_server_records_action_shape_decline(decline_db):
     """Codex review #1581 round 1 P1: ``mcpServer/elicitation/request``
     declines with ``{\"action\": \"decline\"}`` (NOT ``decision``).
     The auto-default recorder must catch this shape too."""
-    db = await _backend(tmp_path)
+    db = decline_db
     agent = _agent_with_db(db)
 
     client = CodexAppServerClient.__new__(CodexAppServerClient)
@@ -319,10 +329,10 @@ async def test_app_server_records_action_shape_decline(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_app_server_no_audit_agent_no_event(tmp_path):
+async def test_app_server_no_audit_agent_no_event(decline_db):
     """Without an attached audit agent (test stubs, headless callers),
     default declines must NOT raise — they just don't get recorded."""
-    db = await _backend(tmp_path)
+    db = decline_db
 
     client = CodexAppServerClient.__new__(CodexAppServerClient)
     client._server_request_handlers = {}
@@ -347,10 +357,10 @@ async def test_app_server_no_audit_agent_no_event(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_operational_block_includes_decline_summary(tmp_path):
+async def test_operational_block_includes_decline_summary(decline_db):
     """The always-on operational block must surface a decline summary
     line on the agent's next turn when the table has rows for her."""
-    db = await _backend(tmp_path)
+    db = decline_db
     await record_decline(
         db, agent_id="did:test:emma",
         request="item/commandExecution/requestApproval",
@@ -370,10 +380,10 @@ async def test_operational_block_includes_decline_summary(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_operational_block_silent_when_no_declines(tmp_path):
+async def test_operational_block_silent_when_no_declines(decline_db):
     """A clean agent with no decline rows produces no decline section
     in the block."""
-    db = await _backend(tmp_path)
+    db = decline_db
     agent = _agent_with_db(db)
 
     from kestrel_sovereign.agent.preturn_state import (
@@ -387,9 +397,9 @@ async def test_operational_block_silent_when_no_declines(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_operational_block_did_scoped_declines(tmp_path):
+async def test_operational_block_did_scoped_declines(decline_db):
     """Peer agents' declines must not leak into this agent's block."""
-    db = await _backend(tmp_path)
+    db = decline_db
     await record_decline(
         db, agent_id="did:test:meridian",
         request="r", tool="t", reason="policy_deny",
