@@ -2536,173 +2536,190 @@ async def test_postgres_schema_upgrade_does_not_invert_source_handoff_lock(
     if db_backend.backend_type != "postgres":
         pytest.skip("PostgreSQL advisory/table lock ordering regression")
 
-    peer_backend = await _independent_backend(db_backend)
-    probe_backend = await _independent_backend(db_backend)
-    seed_store = DurableSignalStore(db_backend)
-    writer_store = DurableSignalStore(peer_backend)
-    await seed_store.initialize()
-    agent_id = f"did:test:source-boundary-upgrade-race:{uuid4()}"
-    source_event_id = f"upgrade-race-seed:{uuid4()}"
-    seed = await seed_store.persist_signal(
-        _signal(agent_id),
-        agent_id=agent_id,
-        source_event_id=source_event_id,
-        retention_days=7,
-    )
-
-    # Restore one nullable legacy row and remove the completed fence so the
-    # next initializer must run both migration phases.
-    async with db_backend.transaction():
-        await _drop_postgres_source_recovery_trigger_family(db_backend)
-        await db_backend.execute(
-            "ALTER TABLE durable_signal_events DROP CONSTRAINT IF EXISTS "
-            "durable_signal_events_source_sequence_not_null"
-        )
-        await db_backend.execute(
-            "ALTER TABLE durable_signal_events "
-            "ALTER COLUMN source_sequence DROP NOT NULL"
-        )
-        await db_backend.execute(
-            "UPDATE durable_signal_events SET source_sequence = NULL "
-            "WHERE event_id = ?",
-            (seed.event_id,),
-        )
-        await db_backend.execute(
-            "DELETE FROM durable_signal_source_sequences "
-            "WHERE agent_id = ? AND source = ?",
-            (agent_id, "provider.message"),
-        )
-        await db_backend.execute(
-            "DELETE FROM durable_signal_source_sequence_recovery "
-            "WHERE agent_id = ? AND source = ?",
-            (agent_id, "provider.message"),
-        )
-        # This fixture models a pre-seen-marker legacy scope, not corruption
-        # after a positive sequence was served under the new contract.
-        await db_backend.execute(
-            "DELETE FROM durable_signal_source_sequence_seen "
-            "WHERE agent_id = ? AND source = ?",
-            (agent_id, "provider.message"),
-        )
-        await db_backend.execute(
-            "DELETE FROM durable_signal_source_sequence_high_water "
-            "WHERE agent_id = ? AND source = ?",
-            (agent_id, "provider.message"),
+    # This test deliberately removes global migration fences. Keep its
+    # bounded one-scope lock choreography independent of retained history
+    # from other tests and previous runs.
+    async with _isolated_durable_schema(db_backend) as backend:
+        peer_backend = await _independent_backend(backend)
+        probe_backend = await _independent_backend(backend)
+        seed_store = DurableSignalStore(backend)
+        writer_store = DurableSignalStore(peer_backend)
+        await seed_store.initialize()
+        agent_id = f"did:test:source-boundary-upgrade-race:{uuid4()}"
+        source_event_id = f"upgrade-race-seed:{uuid4()}"
+        seed = await seed_store.persist_signal(
+            _signal(agent_id),
+            agent_id=agent_id,
+            source_event_id=source_event_id,
+            retention_days=7,
         )
 
-    migrating_store = DurableSignalStore(db_backend)
-    counter_owned = asyncio.Event()
-    release_migration = asyncio.Event()
-    writer_owns_handoff = asyncio.Event()
-    final_ddl_requested = asyncio.Event()
-    migration_task = None
-    writer_task = None
-    original_source_sequence = migrating_store._source_sequence_locked
-    original_migration_handoff = migrating_store._lock_scope_handoff
-    original_handoff = writer_store._lock_scope_handoff
-    original_enforce = migrating_store._enforce_postgres_source_sequence_required
-    backfill_transaction_id = None
-    migration_owns_handoff = asyncio.Event()
-
-    async def observe_migration_handoff(**kwargs):
-        await original_migration_handoff(**kwargs)
-        if kwargs == {"agent_id": agent_id, "source": "provider.message"}:
-            migration_owns_handoff.set()
-
-    async def pause_with_counter_row_locked(**kwargs):
-        nonlocal backfill_transaction_id
-        sequence = await original_source_sequence(**kwargs)
-        if (
-            kwargs["agent_id"] == agent_id
-            and kwargs["source"] == "provider.message"
-        ):
-            backfill_transaction_id = await db_backend.fetch_val(
-                "SELECT txid_current()"
+        # Restore one nullable legacy row and remove the completed fence so the
+        # next initializer must run both migration phases.
+        async with backend.transaction():
+            await _drop_postgres_source_recovery_trigger_family(backend)
+            await backend.execute(
+                "ALTER TABLE durable_signal_events DROP CONSTRAINT IF EXISTS "
+                "durable_signal_events_source_sequence_not_null"
             )
-            counter_owned.set()
-            await release_migration.wait()
-        return sequence
+            await backend.execute(
+                "ALTER TABLE durable_signal_events "
+                "ALTER COLUMN source_sequence DROP NOT NULL"
+            )
+            await backend.execute(
+                "UPDATE durable_signal_events SET source_sequence = NULL "
+                "WHERE event_id = ?",
+                (seed.event_id,),
+            )
+            await backend.execute(
+                "DELETE FROM durable_signal_source_sequences "
+                "WHERE agent_id = ? AND source = ?",
+                (agent_id, "provider.message"),
+            )
+            await backend.execute(
+                "DELETE FROM durable_signal_source_sequence_recovery "
+                "WHERE agent_id = ? AND source = ?",
+                (agent_id, "provider.message"),
+            )
+            # This fixture models a pre-seen-marker legacy scope, not corruption
+            # after a positive sequence was served under the new contract.
+            await backend.execute(
+                "DELETE FROM durable_signal_source_sequence_seen "
+                "WHERE agent_id = ? AND source = ?",
+                (agent_id, "provider.message"),
+            )
+            await backend.execute(
+                "DELETE FROM durable_signal_source_sequence_high_water "
+                "WHERE agent_id = ? AND source = ?",
+                (agent_id, "provider.message"),
+            )
 
-    async def observe_owned_handoff(**kwargs):
-        await original_handoff(**kwargs)
-        writer_owns_handoff.set()
+        migrating_store = DurableSignalStore(backend)
+        counter_owned = asyncio.Event()
+        release_migration = asyncio.Event()
+        writer_owns_handoff = asyncio.Event()
+        final_ddl_requested = asyncio.Event()
+        migration_task = None
+        writer_task = None
+        original_source_sequence = migrating_store._source_sequence_locked
+        original_migration_handoff = migrating_store._lock_scope_handoff
+        original_handoff = writer_store._lock_scope_handoff
+        original_enforce = migrating_store._enforce_postgres_source_sequence_required
+        backfill_transaction_id = None
+        migration_owns_handoff = asyncio.Event()
 
-    async def prove_counter_rows_committed_before_final_ddl(state):
-        final_transaction_id = await db_backend.fetch_val("SELECT txid_current()")
-        assert backfill_transaction_id is not None
-        assert final_transaction_id != backfill_transaction_id
-        # A distinct connection can lock both rows within a bounded timeout
-        # only after the backfill transaction has committed. This is the
-        # load-bearing proof: observing Python call order alone cannot
-        # establish lock release.
-        async with probe_backend.transaction():
-            await probe_backend.execute("SET LOCAL lock_timeout = '2s'")
-            assert (
-                await probe_backend.fetch_one(
-                    "SELECT current_sequence "
-                    "FROM durable_signal_source_sequences "
-                    "WHERE agent_id = ? AND source = ? FOR UPDATE",
-                    (agent_id, "provider.message"),
+        async def observe_migration_handoff(**kwargs):
+            await original_migration_handoff(**kwargs)
+            if kwargs == {"agent_id": agent_id, "source": "provider.message"}:
+                migration_owns_handoff.set()
+
+        async def pause_with_counter_row_locked(**kwargs):
+            nonlocal backfill_transaction_id
+            sequence = await original_source_sequence(**kwargs)
+            if (
+                kwargs["agent_id"] == agent_id
+                and kwargs["source"] == "provider.message"
+            ):
+                backfill_transaction_id = await backend.fetch_val(
+                    "SELECT txid_current()"
                 )
-                is not None
-            )
-            assert (
-                await probe_backend.fetch_one(
-                    "SELECT recovery_sequence "
-                    "FROM durable_signal_source_sequence_recovery "
-                    "WHERE agent_id = ? AND source = ? FOR UPDATE",
-                    (agent_id, "provider.message"),
+                counter_owned.set()
+                await release_migration.wait()
+            return sequence
+
+        async def observe_owned_handoff(**kwargs):
+            await original_handoff(**kwargs)
+            writer_owns_handoff.set()
+
+        async def prove_counter_rows_committed_before_final_ddl(state):
+            final_transaction_id = await backend.fetch_val("SELECT txid_current()")
+            assert backfill_transaction_id is not None
+            assert final_transaction_id != backfill_transaction_id
+            # A distinct connection can lock both rows within a bounded timeout
+            # only after the backfill transaction has committed. This is the
+            # load-bearing proof: observing Python call order alone cannot
+            # establish lock release.
+            async with probe_backend.transaction():
+                await probe_backend.execute("SET LOCAL lock_timeout = '2s'")
+                assert (
+                    await probe_backend.fetch_one(
+                        "SELECT current_sequence "
+                        "FROM durable_signal_source_sequences "
+                        "WHERE agent_id = ? AND source = ? FOR UPDATE",
+                        (agent_id, "provider.message"),
+                    )
+                    is not None
                 )
-                is not None
-            )
-        final_ddl_requested.set()
-        await original_enforce(state)
+                assert (
+                    await probe_backend.fetch_one(
+                        "SELECT recovery_sequence "
+                        "FROM durable_signal_source_sequence_recovery "
+                        "WHERE agent_id = ? AND source = ? FOR UPDATE",
+                        (agent_id, "provider.message"),
+                    )
+                    is not None
+                )
+            final_ddl_requested.set()
+            await original_enforce(state)
 
-    monkeypatch.setattr(
-        migrating_store, "_source_sequence_locked", pause_with_counter_row_locked
-    )
-    monkeypatch.setattr(
-        migrating_store, "_lock_scope_handoff", observe_migration_handoff
-    )
-    monkeypatch.setattr(writer_store, "_lock_scope_handoff", observe_owned_handoff)
-    monkeypatch.setattr(
-        migrating_store,
-        "_enforce_postgres_source_sequence_required",
-        prove_counter_rows_committed_before_final_ddl,
-    )
-    try:
-        migration_task = asyncio.create_task(migrating_store.initialize())
-        # Reaching the target counter proves the ACCESS EXCLUSIVE fence phase
-        # has committed; history work no longer holds that table lock.
-        await asyncio.wait_for(counter_owned.wait(), timeout=5)
-        assert migration_owns_handoff.is_set()
-        writer_task = asyncio.create_task(
-            writer_store.persist_signal(
-                _signal(agent_id),
-                agent_id=agent_id,
-                source_event_id=f"upgrade-race-live:{uuid4()}",
-                retention_days=7,
+        monkeypatch.setattr(
+            migrating_store, "_source_sequence_locked", pause_with_counter_row_locked
+        )
+        monkeypatch.setattr(
+            migrating_store, "_lock_scope_handoff", observe_migration_handoff
+        )
+        monkeypatch.setattr(writer_store, "_lock_scope_handoff", observe_owned_handoff)
+        monkeypatch.setattr(
+            migrating_store,
+            "_enforce_postgres_source_sequence_required",
+            prove_counter_rows_committed_before_final_ddl,
+        )
+        try:
+            migration_task = asyncio.create_task(migrating_store.initialize())
+            # Reaching the target counter proves the ACCESS EXCLUSIVE fence phase
+            # has committed; history work no longer holds that table lock.
+            counter_waiter = asyncio.create_task(counter_owned.wait())
+            try:
+                completed, _ = await asyncio.wait(
+                    (migration_task, counter_waiter),
+                    timeout=5,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if migration_task in completed:
+                    # Surface migration errors rather than obscuring them behind
+                    # a timeout waiting for a checkpoint it cannot reach.
+                    await migration_task
+                assert counter_waiter in completed, "migration did not reach target counter"
+            finally:
+                await _cancel_and_drain(counter_waiter)
+            assert migration_owns_handoff.is_set()
+            writer_task = asyncio.create_task(
+                writer_store.persist_signal(
+                    _signal(agent_id),
+                    agent_id=agent_id,
+                    source_event_id=f"upgrade-race-live:{uuid4()}",
+                    retention_days=7,
+                )
             )
-        )
-        await asyncio.sleep(0.1)
-        assert writer_task is not None and not writer_task.done()
-        assert not writer_owns_handoff.is_set()
+            await asyncio.sleep(0.1)
+            assert writer_task is not None and not writer_task.done()
+            assert not writer_owns_handoff.is_set()
 
-        # Backfill owns handoff before counter rows. The live writer waits at
-        # that first lock, so no handoff->counter / counter->handoff ABBA cycle
-        # exists and it commits the next sequence only after repair.
-        release_migration.set()
-        _, persisted = await asyncio.wait_for(
-            asyncio.gather(migration_task, writer_task), timeout=10
-        )
-        assert writer_owns_handoff.is_set()
-        assert final_ddl_requested.is_set()
-        assert persisted.source_sequence == 2
-    finally:
-        release_migration.set()
-        await _cancel_and_drain(migration_task, writer_task)
-        await probe_backend.close()
-        await peer_backend.close()
+            # Backfill owns handoff before counter rows. The live writer waits at
+            # that first lock, so no handoff->counter / counter->handoff ABBA cycle
+            # exists and it commits the next sequence only after repair.
+            release_migration.set()
+            _, persisted = await asyncio.wait_for(
+                asyncio.gather(migration_task, writer_task), timeout=10
+            )
+            assert writer_owns_handoff.is_set()
+            assert final_ddl_requested.is_set()
+            assert persisted.source_sequence == 2
+        finally:
+            release_migration.set()
+            await _cancel_and_drain(migration_task, writer_task)
+            await probe_backend.close()
+            await peer_backend.close()
 
 
 @pytest.mark.asyncio
