@@ -445,6 +445,11 @@ class SQLiteBackend(DatabaseBackend):
         return "joined"
 
     @property
+    def transaction_options(self) -> frozenset[str]:
+        """Explicit extensions beyond the SDK's transaction() contract."""
+        return frozenset({"immediate", "savepoint"})
+
+    @property
     def owns_open_transaction(self) -> bool:
         """Whether the current task has a transaction open here, which a
         ``transaction()`` entered now would join rather than commit."""

@@ -181,9 +181,16 @@ consumed. Signed recovery must preserve its existing audit history.
 Surviving runtime events also veto unsigned replay if the current state row is
 lost. Such identities are not pending first-boot targets; offline tools retain
 the runtime target and return a structured refusal, not an uncaught exception.
+Existing-identity restore likewise refuses to treat surviving lifetime history
+as legacy migration: it creates a restricted new generation requiring explicit
+authorized recovery, never an unrestricted automatic audit. Doctrine metadata
+writers use native compare-and-swap to preserve concurrent completed receipts.
 Completed same-content genesis receipts survive an incorrect operative pointer
 as well as a missing one. Conflicting completed evidence is refused rather than
-selecting a favorable result. Verified signed repair publishes governance in
+selecting a favorable result. Supported legacy timestamp/risk/hash receipts are
+normalized through the same validator as runtime migration; malformed matching
+current or historical receipts are refused, not silently skipped and rerolled.
+Verified signed repair publishes governance in
 the native control-plane transaction in volatile privacy modes too; ordinary
 feature-facing privacy restrictions remain unchanged.
 Inception uses the same exact-byte native publisher, and a post-commit SQL
@@ -191,8 +198,15 @@ conversation-notice failure does not undo creation or skip remaining completion
 work. Pre-commit publication failures remove only that attempt's newly minted
 identity artifacts and close/remove its internally created database; an external
 database remains caller-owned, and committed identity artifacts are preserved.
-Cancellation receives the same rollback cleanup. If commit delivery fails or
-its outcome cannot be read, identity keys are retained rather than erased.
+Cancellation receives the same rollback cleanup, including while the genesis
+auditor awaits before publication. Inception refuses caller-owned transactions
+before minting. Once its publication body has completed, lost commit delivery is
+uncertain even if the identity or its ownership rows later disappear: minted
+keys are retained, never deleted based on a tenant-filtered absence. If its
+outcome cannot be read, identity keys are retained rather than erased.
+Native SQLite advertises its optional savepoint extension explicitly. Standard
+SDK adapters retain the argument-free top-level transaction contract; adapters
+that only join nested scopes refuse isolated avatar publication before writes.
 Physical lock ordering uses PostgreSQL's canonical `C`
 collation; target equality does not depend on database locale.
 An existing genesis receipt must validate as a literal pass, not merely be

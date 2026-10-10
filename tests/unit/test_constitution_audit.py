@@ -491,6 +491,7 @@ async def test_lifecycle_join_invalidates_failed_exit_proof_across_subsequent_en
     first, storage = await _open_durable_harness(tmp_path / "stale-repair.db", now)
     lifecycle = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
     try:
+        await _seed_exit_governance(first, storage)
         await first.enter_safe_mode("first lifecycle restriction", cause=lifecycle)
         stale = _DurableConstitutionHarness(storage, now)
         await stale._initialize_constitution_runtime_state()

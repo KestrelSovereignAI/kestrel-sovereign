@@ -216,7 +216,8 @@ async def test_signed_repair_refuses_unremovable_foreign_edge(
 @pytest.mark.parametrize("writer", ["runtime", "offline"])
 @pytest.mark.parametrize(
     "damage",
-    ["blob", "ownership", "intact", "missing-pointer-passed", "missing-pointer-failed", "wrong-pointer-passed", "wrong-pointer-failed"],
+    ["blob", "ownership", "intact", "missing-pointer-passed", "missing-pointer-failed", "wrong-pointer-passed", "wrong-pointer-failed",
+     "legacy-current-passed", "legacy-current-failed", "legacy-history-passed", "legacy-history-failed"],
 )
 async def test_same_hash_signed_repair_restores_content_and_new_signer(
     db_backend,
@@ -252,6 +253,7 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
         assert not result.startswith("Error:"), result
         prior = (await storage.get_node(identity)).properties
         digest = prior["constitution_hash"]
+        expected_genesis = prior["genesis_audit"]
         if damage.startswith(("missing-pointer-", "wrong-pointer-")):
             from kestrel_sovereign.constitution.genesis_audit import utc_timestamp
 
@@ -271,6 +273,23 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
                 node.properties["constitution_hash"] = hashlib.sha256(uuid4().hex.encode()).hexdigest()
             await storage.add_node(node)
             prior = (await storage.get_node(identity)).properties
+            expected_genesis = prior["genesis_audit"]
+        elif damage.startswith("legacy-"):
+            from kestrel_sovereign.constitution.genesis_audit import normalize_genesis_receipt, pending_genesis_audit, utc_timestamp
+            node = await storage.get_node(identity)
+            legacy = {"risk_level": 3 if damage.endswith("failed") else 1,
+                      "timestamp": utc_timestamp(), "constitution_hash": digest,
+                      "reasoning": "Legacy completed verdict, never reroll"}
+            expected_genesis = normalize_genesis_receipt(legacy, digest)
+            if damage.startswith("legacy-history-"):
+                other = hashlib.sha256(uuid4().hex.encode()).hexdigest()
+                node.properties["constitution_hash"] = other
+                node.properties["genesis_audit"] = pending_genesis_audit(other, provenance="test:other")
+                node.properties["genesis_audit_history"] = [{"receipt": legacy, "superseded_by_constitution_hash": other, "superseded_at": utc_timestamp()}]
+            else:
+                node.properties["genesis_audit"] = legacy
+            await storage.add_node(node)
+            prior = (await storage.get_node(identity)).properties
         metadata = {
             "source": "retained tenant provenance",
             "mime_type": "text/markdown",
@@ -288,7 +307,7 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
                 "DELETE FROM file_owners WHERE content_hash = ? AND agent_id = ?",
                 (digest, identity),
             )
-        if damage == "intact" or damage.startswith(("missing-pointer-", "wrong-pointer-")):
+        if damage == "intact" or damage.startswith(("missing-pointer-", "wrong-pointer-", "legacy-")):
             assert await storage.retrieve_file(digest) == content
         else:
             assert await storage.retrieve_file(digest) is None
@@ -346,7 +365,7 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
             after["constitution_reanchor_history"][-1]["receipt"]
             == prior["constitution_reanchor"]
         )
-        assert after["genesis_audit"] == prior["genesis_audit"]
+        assert after["genesis_audit"] == expected_genesis
     finally:
         await storage.close()
 

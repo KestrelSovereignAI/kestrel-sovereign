@@ -646,6 +646,9 @@ async def create_kestrel_identity_async(
                        for that verification; otherwise
                        ``KESTREL_SOVEREIGN_TRUST_ROOT_PATH``.
     """
+    if database is not None and database.owns_open_transaction is not False:
+        raise RuntimeError("Inception requires an owned top-level commit, not a caller-owned transaction")
+
     # A SpawnMandate is persisted as a JSON edge receipt. Normalize and prove
     # that representation before creating a directory, database, or key file;
     # otherwise a supported Decimal that cannot survive JSON conversion can
@@ -815,12 +818,11 @@ async def create_kestrel_identity_async(
     # agent.  Bind before the shared/content-addressed constitution node is
     # created so both that node and the governed_by edge receive durable
     # ownership witnesses (#2649).
-    graph.bind_agent(agent_did)
-    files.bind_agent(agent_did)
-
     # 3. Anchor the Kestrel Constitution as the first document
     governing_source = None
     try:
+        graph.bind_agent(agent_did)
+        files.bind_agent(agent_did)
         # Which source governs is decided by out-of-DB configuration only: the
         # packaged default, or a Sovereign-signed source descriptor verified
         # against the operator-pinned trust root (#2553). The bytes then come
@@ -922,98 +924,86 @@ async def create_kestrel_identity_async(
                 "Genesis audit constitution hash did not match stored governing bytes."
             )
         logging.info(f"Resolved Kestrel Constitution with hash: {constitution_hash}")
-    except FileNotFoundError:
-        logging.error(
-            "FATAL: Constitution file not found at %s",
-            constitution_path
-            or (governing_source.path if governing_source is not None else "?"),
+        # 4. Build the Kestrel Constitution node (keyed by content hash). Its write
+        #    is deferred to the single atomic identity commit below (#2867).
+        constitution_node = GraphNode(
+            node_id=constitution_hash,
+            node_type="document",
+            label="KESTREL_CONSTITUTION",
+            properties={
+                "hash": constitution_hash,
+                "type": "Constitution",
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
         )
-        if not using_external_db:
-            await db.close()
-            cleanup_artifacts([*identity_paths, db_path])
-        else:
-            cleanup_artifacts(identity_paths)  # Only clean up key files, not external DB
-        raise
-    except Exception as e:
-        logging.error(f"Agent creation failed during constitution anchoring: {e}")
-        if not using_external_db:
-            await db.close()
-            cleanup_artifacts([*identity_paths, db_path])
-        else:
-            cleanup_artifacts(identity_paths)  # Only clean up key files, not external DB
-        raise e
-
-    # 4. Build the Kestrel Constitution node (keyed by content hash). Its write
-    #    is deferred to the single atomic identity commit below (#2867).
-    constitution_node = GraphNode(
-        node_id=constitution_hash,
-        node_type="document",
-        label="KESTREL_CONSTITUTION",
-        properties={
-            "hash": constitution_hash,
-            "type": "Constitution",
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }
-    )
-    # 5. Create the root "agent" node
-    agent_properties = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "constitution_hash": constitution_hash,
-        "initialBalance": "1000.0",
-        "name": agent_name,
-        "description": _initial_agent_description(
-            agent_name,
-            is_child=bool(parent_did),
-            emancipated=bool(
-                emancipation_contract is not None and emancipation_contract.enabled
+        # 5. Create the root "agent" node
+        agent_properties = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "constitution_hash": constitution_hash,
+            "initialBalance": "1000.0",
+            "name": agent_name,
+            "description": _initial_agent_description(
+                agent_name,
+                is_child=bool(parent_did),
+                emancipated=bool(
+                    emancipation_contract is not None and emancipation_contract.enabled
+                ),
             ),
-        ),
-        "bootstrap_state": "pending",  # Agent needs to complete wake-up discovery
-        "genesis_audit": genesis_audit,
-    }
-
-    # #1118: Anchor the Sovereign-authored Emancipation Contract as a JSON
-    # sidecar on the agent node. This is the structured receipt that
-    # ``kestrel constitution reanchor`` re-applies to the canonical
-    # markdown so the active form survives reanchor, and that
-    # ``check_iron_rule`` compares against any future ``[emancipation]``
-    # block to refuse retroactive narrowing. Pre-emancipation the
-    # Sovereign self-binds; the framework refuses to let them unbind.
-    if emancipation_contract is not None and emancipation_contract.enabled:
-        from kestrel_sovereign.constitution.emancipation import contract_to_json
-        agent_properties["emancipation_contract"] = contract_to_json(
-            emancipation_contract
-        )
-
-    # #2553: record which Sovereign-signed source descriptor this agent was
-    # incepted under. Audit evidence only — source selection never reads it,
-    # so rewriting it cannot change what governs the agent.
-    if governing_source.descriptor is not None:
-        agent_properties["constitution_source_receipt"] = {
-            "source_path": governing_source.path,
-            **governing_source.receipt_fields(),
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "bootstrap_state": "pending",  # Agent needs to complete wake-up discovery
+            "genesis_audit": genesis_audit,
         }
 
-    # Add test instance metadata if applicable
-    if is_test_instance:
-        agent_properties["is_test_instance"] = True
-        agent_properties["test_cycle_id"] = test_cycle_id
-        agent_properties["expected_duration"] = expected_duration or "unspecified"
-        logging.info(f"Creating TEST INSTANCE: {agent_name} (cycle: {test_cycle_id})")
+        # #1118: Anchor the Sovereign-authored Emancipation Contract as a JSON
+        # sidecar on the agent node. This is the structured receipt that
+        # ``kestrel constitution reanchor`` re-applies to the canonical
+        # markdown so the active form survives reanchor, and that
+        # ``check_iron_rule`` compares against any future ``[emancipation]``
+        # block to refuse retroactive narrowing. Pre-emancipation the
+        # Sovereign self-binds; the framework refuses to let them unbind.
+        if emancipation_contract is not None and emancipation_contract.enabled:
+            from kestrel_sovereign.constitution.emancipation import contract_to_json
+            agent_properties["emancipation_contract"] = contract_to_json(
+                emancipation_contract
+            )
 
-    # #766: mark agent as demo-scoped so server-side guardrails treat
-    # destructive ops on it as safe and refuse them on live agents.
-    if is_demo:
-        agent_properties["is_demo"] = True
-        logging.info(f"Creating DEMO AGENT: {agent_name} (destructive ops permitted)")
+        # #2553: record which Sovereign-signed source descriptor this agent was
+        # incepted under. Audit evidence only — source selection never reads it,
+        # so rewriting it cannot change what governs the agent.
+        if governing_source.descriptor is not None:
+            agent_properties["constitution_source_receipt"] = {
+                "source_path": governing_source.path,
+                **governing_source.receipt_fields(),
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
 
-    agent_node = GraphNode(
-        node_id=agent_did,
-        node_type="agent",
-        label=agent_name,
-        properties=agent_properties
-    )
+        # Add test instance metadata if applicable
+        if is_test_instance:
+            agent_properties["is_test_instance"] = True
+            agent_properties["test_cycle_id"] = test_cycle_id
+            agent_properties["expected_duration"] = expected_duration or "unspecified"
+            logging.info(f"Creating TEST INSTANCE: {agent_name} (cycle: {test_cycle_id})")
+
+        # #766: mark agent as demo-scoped so server-side guardrails treat
+        # destructive ops on it as safe and refuse them on live agents.
+        if is_demo:
+            agent_properties["is_demo"] = True
+            logging.info(f"Creating DEMO AGENT: {agent_name} (destructive ops permitted)")
+
+        agent_node = GraphNode(
+            node_id=agent_did,
+            node_type="agent",
+            label=agent_name,
+            properties=agent_properties
+        )
+    except BaseException:
+        # No native publication has begun. Cancellation and synchronous
+        # construction failures have the same rollback-free cleanup boundary.
+        try:
+            if not using_external_db:
+                await db.close()
+        finally:
+            cleanup_artifacts(identity_paths if using_external_db else [*identity_paths, db_path])
+        raise
     # 4-6. Commit the constitution node, the agent node, and the governing
     #      edge as ONE atomic unit (#2867). An agent must never be recorded as
     #      existing without its governed_by edge: a present agent node makes
@@ -1033,6 +1023,7 @@ async def create_kestrel_identity_async(
     #      would block every other writer on the database (#2660). RAG
     #      indexing, the spawned_by edge, the genesis-audit event and key
     #      provisioning are all recoverable by re-running and stay OUTSIDE it.
+    publication_body_completed = False
     try:
         async with db.transaction():
             # Birth-record replication can touch the same deterministic DID and
@@ -1052,6 +1043,7 @@ async def create_kestrel_identity_async(
             await graph.add_edge(
                 agent_node.node_id, constitution_node.node_id, "governed_by"
             )
+            publication_body_completed = True
 
     except BaseException:
         # Cancellation also rolls back native publication. A commit may have
@@ -1059,10 +1051,16 @@ async def create_kestrel_identity_async(
         # not erase the keys of an identity that actually reached the graph.
         # An unreadable outcome is uncertainty, never permission to delete.
         cleanup_safe = False
-        try:
-            cleanup_safe = await graph.get_node(agent_node.node_id) is None
-        except Exception:
-            logging.exception("Inception publication outcome unreadable; retaining identity artifacts")
+        if not publication_body_completed:
+            try:
+                # Native physical absence after body failure/rollback is not
+                # a tenant-filtered lookup. Once the body completes, a commit
+                # may have happened even if delivery failed and rows vanished.
+                cleanup_safe = await db.fetchone(
+                    "SELECT node_id FROM graph_nodes WHERE node_id = ?", (agent_node.node_id,),
+                ) is None
+            except Exception:
+                logging.exception("Inception publication outcome unreadable; retaining identity artifacts")
         try:
             if not using_external_db:
                 await db.close()

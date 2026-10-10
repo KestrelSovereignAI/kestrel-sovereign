@@ -57,6 +57,7 @@ import hashlib
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -64,6 +65,7 @@ from typing import Any, List, Optional, Tuple
 from kestrel_sovereign.storage.privacy_wrapper import (
     acquire_control_plane_capability,
 )
+from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +293,7 @@ async def anchor_doctrine_bundle(
         raise DoctrineBundleError(
             "Cannot anchor doctrine bundle: agent identity node not found"
         )
+    expected_properties = deepcopy(agent_node.properties)
 
     extra_paths = agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
     anchored_paths = resolve_anchored_paths(
@@ -319,9 +322,12 @@ async def anchor_doctrine_bundle(
     agent_node.properties[PROP_BUNDLE_ANCHORED_AT] = datetime.now(
         timezone.utc
     ).isoformat()
-    await agent.storage.add_node(
-        agent_node, capability=acquire_control_plane_capability()
+    result = await agent.storage.compare_and_swap_node(
+        agent.agent_id, expected_properties, agent_node,
+        capability=acquire_control_plane_capability(),
     )
+    if result != NodeSwapResult.SWAPPED:
+        raise DoctrineBundleError("Doctrine anchor snapshot changed; retry from current identity")
     logger.info(
         f"Doctrine bundle anchored: hash={snapshot.hash[:16]}... "
         f"files={len(snapshot.files)} bytes={snapshot.total_bytes}"
@@ -418,6 +424,7 @@ async def reanchor_doctrine_bundle(
         raise DoctrineBundleError(
             "Cannot re-anchor doctrine bundle: agent identity node not found"
         )
+    expected_properties = deepcopy(agent_node.properties)
 
     extra_paths = agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
     anchored_paths = resolve_anchored_paths(
@@ -450,9 +457,12 @@ async def reanchor_doctrine_bundle(
         "expected_hash_prefix": expected_hash,
         "file_count": len(snapshot.files),
     }
-    await agent.storage.add_node(
-        agent_node, capability=acquire_control_plane_capability()
+    result = await agent.storage.compare_and_swap_node(
+        agent.agent_id, expected_properties, agent_node,
+        capability=acquire_control_plane_capability(),
     )
+    if result != NodeSwapResult.SWAPPED:
+        raise DoctrineBundleError("Doctrine reanchor snapshot changed; retry from current identity")
     logger.warning(
         f"Doctrine bundle re-anchored by {authorization or 'unspecified'}: "
         f"{old_hash[:16] if old_hash else 'none'}... -> {snapshot.hash[:16]}..."

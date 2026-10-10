@@ -3714,11 +3714,24 @@ class AsyncDatabase:
         PostgreSQL serializes such a unit with a row lock instead (see
         ``ConversationSessionProjection._claim``).
         """
-        if (immediate or savepoint) and self.backend_type == "sqlite":
-            async with self._backend.transaction(immediate=immediate, savepoint=savepoint):  # type: ignore[call-arg]
-                yield
-            return
-        async with self._backend.transaction():
+        options = {}
+        if self.backend_type == "sqlite":
+            if immediate:
+                # Older adapters supported only immediate; never send a new
+                # false-valued keyword to an unchanged transaction contract.
+                import inspect
+                if "immediate" not in inspect.signature(self._backend.transaction).parameters:
+                    raise NotImplementedError("Backend does not support immediate transactions")
+                options["immediate"] = True
+            if savepoint:
+                if "savepoint" in getattr(self._backend, "transaction_options", ()):
+                    options["savepoint"] = True
+                elif self.owns_open_transaction and self.nested_transaction_strategy != "savepoint":
+                    # SDK transaction() suffices for a top-level rollback
+                    # scope. A joined/unknown nested adapter must refuse before
+                    # writes instead of pretending to supply rollback isolation.
+                    raise NotImplementedError("Backend does not support isolated nested transactions")
+        async with self._backend.transaction(**options):
             yield
     
     async def table_exists(self, table_name: str) -> bool:

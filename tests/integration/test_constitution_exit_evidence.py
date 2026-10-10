@@ -338,7 +338,7 @@ async def test_exit_takes_edge_owners_before_edge_rows(db_backend, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-@pytest.mark.parametrize("damage", [None, "edge", "ownership", "failed_genesis"])
+@pytest.mark.parametrize("damage", [None, "edge", "ownership", "failed_genesis", "malformed_genesis", "encrypted_blob"])
 async def test_native_exit_refuses_governing_drift_after_verification(
     db_backend, damage
 ):
@@ -346,6 +346,7 @@ async def test_native_exit_refuses_governing_drift_after_verification(
         backend=db_backend, agent_id="did:test:exit-witness:" + uuid4().hex
     )
     await storage.initialize()
+    original_blob = None
     try:
         agent = await _agent(storage)
         digest = await storage.store_file(
@@ -361,6 +362,7 @@ async def test_native_exit_refuses_governing_drift_after_verification(
         )
         await agent._anchor_constitution_governance(digest)
         await agent.enter_safe_mode("verified exit race fixture")
+        original_blob = await storage.db.fetchone("SELECT content, metadata FROM files WHERE content_hash=?", (digest,))
         before = await agent._constitution_state_store.load(agent.agent_id)
         events = await agent._constitution_state_store.list_events(agent.agent_id)
         native_persist = agent._persist_constitution_runtime_state
@@ -384,6 +386,11 @@ async def test_native_exit_refuses_governing_drift_after_verification(
                         "DELETE FROM file_owners WHERE content_hash = ? AND agent_id = ?",
                         (digest, agent.agent_id),
                     )
+                elif damage == "encrypted_blob":
+                    await storage.db.execute_commit(
+                        "UPDATE files SET content=?, metadata=? WHERE content_hash=?",
+                        (b"corrupt encrypted governing blob", '{"enc":true}', digest),
+                    )
                 else:
                     node = await storage.get_node(agent.agent_id)
                     node.properties["genesis_audit"] = {
@@ -395,6 +402,8 @@ async def test_native_exit_refuses_governing_drift_after_verification(
                         "reasoning": "Concurrent rejection",
                         "provenance": "fixture",
                     }
+                    if damage == "malformed_genesis":
+                        node.properties["genesis_audit"]["completed_at"] = "not an instant"
                     await storage.add_node(node)
             return await native_persist(**kwargs)
 
@@ -418,13 +427,22 @@ async def test_native_exit_refuses_governing_drift_after_verification(
             "edge": "Missing or mis-targeted governed_by edge",
             "ownership": "Anchored constitution blob is missing",
             "failed_genesis": "requires a passed genesis receipt",
+            "malformed_genesis": "invalid completion time",
+            "encrypted_blob": "decrypt",
         }[damage]
-        assert expected_reason in agent._constitution_audit_commit_error
+        detail = agent._constitution_audit_commit_error
+        assert expected_reason in (detail.lower() if damage == "encrypted_blob" else detail)
+        assert "integrity verification refused" in result
+        assert "could not be persisted" not in result
         assert agent._safe_mode is True
         await _assert_integrity_refusal(agent, before)
         final_events = await agent._constitution_state_store.list_events(agent.agent_id)
         assert final_events[:-1] == events
     finally:
+        if damage == "encrypted_blob" and original_blob is not None:
+            await storage.db.execute_commit(
+                "UPDATE files SET content=?, metadata=? WHERE content_hash=?", (*original_blob, digest),
+            )
         await storage.close()
 
 

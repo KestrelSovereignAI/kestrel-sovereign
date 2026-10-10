@@ -248,6 +248,7 @@ class ConstitutionMixin:
         if existing:
             return existing
 
+        expected_properties = deepcopy(agent_node.properties)
         live_hash = await self.compute_live_doctrine_bundle_hash()
         if not live_hash:
             return None
@@ -293,13 +294,18 @@ class ConstitutionMixin:
             )
 
         try:
-            await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())
+            from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
+            result = await self.storage.compare_and_swap_node(
+                self.agent_id, expected_properties, agent_node,
+                capability=acquire_control_plane_capability(),
+            )
+            if result != NodeSwapResult.SWAPPED:
+                return None  # A newer receipt/metadata won; retry on a fresh snapshot.
         except Exception:
             logging.exception(
                 "ensure_doctrine_bundle_anchored: agent_node persist failed"
             )
-            # Even if persist fails, the in-memory hash is set so this
-            # dispatch can proceed; the next call will retry.
+            return None
         logging.info(
             f"Auto-anchored doctrine bundle: hash={live_hash[:16]}..."
         )
@@ -783,6 +789,21 @@ class ConstitutionMixin:
             if not ConstitutionMixin._constitution_transition_is_current(self):
                 return
             if state is None:
+                if await store.has_lifetime_history(self.agent_id):
+                    # Row loss is not a new identity or a legacy migration.
+                    # A fresh generation is restrictive and cannot reuse old
+                    # CAS authority; only explicit recovery may clear it.
+                    self._constitution_bootstrap_pending = False
+                    self._constitution_state_migration_pending = False
+                    self._interaction_count = 0
+                    self._last_audit_time = self._constitution_epoch()
+                    self._safe_mode = True  # Boot recovery never sends provider notices.
+                    await ConstitutionMixin._enter_safe_mode_locked(
+                        self,
+                        "Constitution runtime state missing despite surviving transition history; authorized recovery required",
+                        cause=SafeModeCause.STATE_UNAVAILABLE.value,
+                    )
+                    return
                 self._interaction_count = 0
                 self._last_audit_time = self._constitution_epoch()
                 self._constitution_bootstrap_pending = is_new_identity
@@ -1804,11 +1825,16 @@ class ConstitutionMixin:
         SQLite's owning writer transaction supplies the same serialization.
         """
         from kestrel_sovereign.constitution.genesis_audit import (
-            GENESIS_AUDIT_PASSED, validate_completed_genesis_audit,
+            GENESIS_AUDIT_PASSED, GenesisAuditError, validate_completed_genesis_audit,
         )
+        from kestrel_sdk.security.encryption import DecryptionError
+        from json import JSONDecodeError
 
         raw = self._raw_storage
-        node = await raw.get_node(self.agent_id)
+        try:
+            node = await raw.get_node(self.agent_id)
+        except JSONDecodeError as exc:
+            raise ConstitutionIntegrityAttestationError("Malformed governing identity metadata") from exc
         digest = node.properties.get("constitution_hash") if node is not None else None
         await raw.lock_nodes_for_update([self.agent_id, digest] if digest else [self.agent_id])
         from kestrel_sovereign.constitution.anchored_bytes import lock_governance_rows, lock_governing_file
@@ -1816,7 +1842,7 @@ class ConstitutionMixin:
         try:
             await lock_governance_rows(raw, self.agent_id, required_target=digest)
             await lock_governing_file(raw, digest)
-        except RuntimeError as exc:
+        except (RuntimeError, DecryptionError, JSONDecodeError) as exc:
             raise ConstitutionIntegrityAttestationError(str(exc)) from exc
         # A different pointer won while we waited for the graph locks. Do not
         # widen the lock set out of canonical order or adopt its newer proof.
@@ -1827,7 +1853,11 @@ class ConstitutionMixin:
         if valid is not True:
             raise ConstitutionIntegrityAttestationError("Locked integrity verification failed: " + message)
         if require_genesis and fresh is not None and "genesis_audit" in fresh.properties:
-            if validate_completed_genesis_audit(fresh.properties["genesis_audit"], digest) != GENESIS_AUDIT_PASSED:
+            try:
+                status = validate_completed_genesis_audit(fresh.properties["genesis_audit"], digest)
+            except GenesisAuditError as exc:
+                raise ConstitutionIntegrityAttestationError(str(exc)) from exc
+            if status != GENESIS_AUDIT_PASSED:
                 raise ConstitutionIntegrityAttestationError("Safe Mode exit requires a passed genesis receipt for its governing bytes")
 
     async def _exit_safe_mode_locked(self, authorization: str = None):
@@ -1879,6 +1909,7 @@ class ConstitutionMixin:
         old_exit_authorization = self._safe_mode_exit_authorization
         self._safe_mode_exited_at = now
         self._safe_mode_exit_authorization = authorization
+        self._constitution_audit_commit_error = None
         persisted = await self._persist_constitution_runtime_state(
             now=now,
             event_type="safe_mode_exited",
@@ -1893,6 +1924,8 @@ class ConstitutionMixin:
             self._safe_mode_exited_at = old_exited_at
             self._safe_mode_exit_authorization = old_exit_authorization
             self._feature_lifecycle_repair_verified = False
+            if self._constitution_audit_commit_error:
+                return "Safe Mode remains active: integrity verification refused: " + self._constitution_audit_commit_error
             return "Safe Mode remains active: constitutional state could not be persisted."
 
         self._safe_mode = False
@@ -2920,6 +2953,7 @@ class ConstitutionMixin:
             GenesisAuditPendingError,
             GenesisAuditRejectedError,
             evaluate_genesis_constitution,
+            normalize_genesis_receipt,
             validate_completed_genesis_audit,
         )
 
@@ -2941,26 +2975,9 @@ class ConstitutionMixin:
             # Pre-#2470 completed receipts had no explicit status but did carry
             # timestamp/risk/hash. Upgrade that durable evidence in place and
             # never call the auditor again merely because the schema evolved.
-            legacy_risk = existing.get("risk_level")
-            if (
-                status is None
-                and existing.get("timestamp")
-                and legacy_risk in (1, 2, 3)
-                and existing.get("constitution_hash") == constitution_hash
-            ):
-                status = (
-                    GENESIS_AUDIT_FAILED
-                    if legacy_risk >= 3
-                    else GENESIS_AUDIT_PASSED
-                )
-                existing.update(
-                    {
-                        "status": status,
-                        "completed_at": existing["timestamp"],
-                        "provenance": "runtime:migrated_legacy_receipt",
-                        "audited": True,
-                    }
-                )
+            if status is None:
+                existing = normalize_genesis_receipt(existing, constitution_hash)
+                status = existing["status"]
                 agent_node.properties["genesis_audit"] = existing
                 await self._persist_governance_receipt_node(agent_node, expected=expected)
             if status not in (

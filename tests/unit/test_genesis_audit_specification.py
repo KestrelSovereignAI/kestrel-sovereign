@@ -110,6 +110,30 @@ def test_legacy_failed_receipt_is_not_invalidated_by_a_new_specification():
     assert pending["audited"] is False
 
 
+@pytest.mark.parametrize("location", ["current", "history"])
+@pytest.mark.parametrize("damage", ["unknown-status", "legacy-time", "legacy-bool", "legacy-unaudited", "pending-completed"])
+def test_matching_malformed_receipt_never_becomes_new_pending_audit(location, damage):
+    digest = "matching-governing-hash"
+    receipt = {"constitution_hash": digest, "timestamp": "2026-10-09T21:00:00Z", "risk_level": 3}
+    if damage == "unknown-status":
+        receipt["status"] = "unknown"
+    elif damage == "legacy-time":
+        receipt["timestamp"] = "invalid"
+    elif damage == "legacy-bool":
+        receipt["risk_level"] = True
+    elif damage == "legacy-unaudited":
+        receipt["audited"] = False
+    else:
+        receipt.update(status="pending", audited=True)
+    properties = {"genesis_audit": receipt} if location == "current" else {
+        "genesis_audit_history": [{"receipt": receipt}],
+    }
+    before = deepcopy(properties)
+    with pytest.raises(GenesisAuditError):
+        supersede_genesis_audit(properties, constitution_hash=digest, provenance="test:refusal")
+    assert properties == before
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("result", [{"risk_level": True}, {"risk_level": 0}, None])
 async def test_specification_does_not_relax_invalid_result_rejection(result):

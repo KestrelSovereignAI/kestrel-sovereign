@@ -115,9 +115,12 @@ def supersede_genesis_audit(
     for candidate in candidates:
         if not isinstance(candidate, Mapping) or candidate.get("constitution_hash") != constitution_hash:
             continue
-        if candidate.get("status") in (GENESIS_AUDIT_PASSED, GENESIS_AUDIT_FAILED):
-            validate_completed_genesis_audit(candidate, constitution_hash)
-            matching.append(candidate)
+        normalized = normalize_genesis_receipt(candidate, constitution_hash)
+        status = validate_completed_genesis_audit(normalized, constitution_hash)
+        if status is not None:
+            matching.append(normalized)
+        elif normalized.get("audited") is not False:
+            raise GenesisAuditError("Pending genesis receipt claims contradictory audit evidence")
     if matching:
         if any(candidate != matching[0] for candidate in matching[1:]):
             raise GenesisAuditError("Ambiguous completed genesis receipts for replacement governing bytes")
@@ -208,6 +211,30 @@ Return JSON with:
 """
 
 
+def normalize_genesis_receipt(record: Mapping[str, Any], constitution_hash: str) -> dict[str, Any]:
+    """Upgrade supported legacy completion evidence without calling an auditor.
+
+    Explicit unaudited evidence is never promoted. Validation of the canonical
+    result also rejects boolean risk levels and malformed completion times.
+    """
+    normalized = deepcopy(dict(record))
+    if normalized.get("status") is None:
+        risk = normalized.get("risk_level")
+        if (
+            normalized.get("timestamp")
+            and type(risk) is int and risk in (1, 2, 3)
+            and normalized.get("constitution_hash") == constitution_hash
+            and normalized.get("audited") is not False
+        ):
+            normalized.update(
+                status=GENESIS_AUDIT_FAILED if risk == 3 else GENESIS_AUDIT_PASSED,
+                completed_at=normalized["timestamp"], audited=True,
+            )
+            normalized.setdefault("provenance", "runtime:migrated_legacy_receipt")
+    validate_completed_genesis_audit(normalized, constitution_hash)
+    return normalized
+
+
 def validate_completed_genesis_audit(
     record: Mapping[str, Any],
     constitution_hash: str,
@@ -219,6 +246,8 @@ def validate_completed_genesis_audit(
     times use the canonical ISO-8601/RFC-3339 shape emitted by this module,
     with at most microsecond precision and an explicit UTC or numeric offset.
     """
+    if not isinstance(record, Mapping):
+        raise GenesisAuditError("Genesis audit receipt is not a mapping.")
     status = record.get("status")
     if status == GENESIS_AUDIT_PENDING:
         return None

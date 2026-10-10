@@ -464,6 +464,13 @@ class ConstitutionRuntimeStateStore:
             event_type="initial_anchor_started" if current.bootstrap_pending else "constitution_anchor_fenced",
         )
 
+    async def has_lifetime_history(self, agent_id: str) -> bool:
+        """Bounded proof that missing current state is loss, not first boot."""
+        return await self._backend.fetch_one(
+            "SELECT 1 FROM constitution_runtime_events WHERE agent_id = ? LIMIT 1",
+            (agent_id,),
+        ) is not None
+
     async def list_events(self, agent_id: str) -> list[dict]:
         """Return transition history in insertion order (operator/test aid)."""
         rows = await self._backend.fetch_all(

@@ -217,9 +217,58 @@ async def test_cancelled_native_publication_cleans_owned_identity(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_cancelled_genesis_auditor_cleans_owned_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    native_sqlite = AsyncDatabase.sqlite
+    opened = []
+    reached = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def capture_database(path, **kwargs):
+        db = await native_sqlite(path, **kwargs)
+        opened.append(db)
+        return db
+
+    async def auditor(prompt):
+        reached.set()
+        await proceed.wait()
+        return {"risk_level": 1, "reasoning": "Synthetic cancelled inception"}
+
+    monkeypatch.setattr(AsyncDatabase, "sqlite", capture_database)
+    task = asyncio.create_task(create_kestrel_identity_async(
+        output_dir=str(tmp_path), is_test_instance=True, identity_method="did:web",
+        did_web_domain="agents.kestrel-sovereign.test", did_web_slug="cancel-auditor", genesis_auditor=auditor,
+    ))
+    try:
+        await asyncio.wait_for(reached.wait(), 15)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert opened[0]._backend._connection is None
+        assert not (tmp_path / "kestrel_prime.db").exists()
+        assert not list(tmp_path.glob("cancel-auditor_*"))
+        async def auditor_after_retry(prompt):
+            return {"risk_level": 1, "reasoning": "Synthetic retry"}
+        credentials = await create_kestrel_identity_async(
+            output_dir=str(tmp_path), is_test_instance=True, identity_method="did:web",
+            did_web_domain="agents.kestrel-sovereign.test", did_web_slug="cancel-auditor", genesis_auditor=auditor_after_retry,
+        )
+        assert credentials.agent_did.endswith(":cancel-auditor")
+    finally:
+        proceed.set()
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        for db in opened:
+            await db.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize("damage_after_commit", [None, "owner", "identity"])
 async def test_commit_delivery_error_preserves_committed_identity(
-    external_db, tmp_path, monkeypatch, owned,
+    external_db, tmp_path, monkeypatch, owned, damage_after_commit,
 ):
     monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
     identity = "did:web:agents.kestrel-sovereign.test:committed-owned"
@@ -239,6 +288,10 @@ async def test_commit_delivery_error_preserves_committed_identity(
                 "SELECT node_id FROM graph_nodes WHERE node_id=?", (identity,),
             ) is not None:
                 lost = True
+                if damage_after_commit == "owner":
+                    await db.execute_commit("DELETE FROM graph_node_owners WHERE node_id=?", (identity,))
+                elif damage_after_commit == "identity":
+                    await db.execute_commit("DELETE FROM graph_nodes WHERE node_id=?", (identity,))
                 raise RuntimeError("committed publication delivery lost")
 
         db.transaction = transaction
@@ -268,7 +321,10 @@ async def test_commit_delivery_error_preserves_committed_identity(
             assert external_db._backend._connection is not None
             check = external_db
         try:
-            node = await AsyncGraphStore(check, agent_id=identity).get_node(identity)
+            node = await AsyncGraphStore(check).get_node(identity)
+            if damage_after_commit == "identity":
+                assert node is None
+                return
             assert node is not None
             assert await check.fetchone(
                 "SELECT target_id FROM graph_edges WHERE source_id=? AND label='governed_by'",
@@ -280,6 +336,20 @@ async def test_commit_delivery_error_preserves_committed_identity(
     finally:
         for db in opened:
             await db.close()
+
+
+@pytest.mark.asyncio
+async def test_inception_refuses_caller_owned_transaction_before_mint(external_db, tmp_path):
+    async with external_db.transaction():
+        with pytest.raises(RuntimeError, match="top-level commit"):
+            await create_kestrel_identity_async(
+                output_dir=str(tmp_path), database=external_db, is_test_instance=True,
+                identity_method="did:web", did_web_domain="agents.kestrel-sovereign.test",
+                did_web_slug="outer-owned",
+            )
+        assert await external_db.fetchall("SELECT node_id FROM graph_nodes WHERE node_type='agent'") == []
+        assert not list(tmp_path.glob("outer-owned_*"))
+    assert external_db._backend._connection is not None
 
 
 @pytest.mark.asyncio

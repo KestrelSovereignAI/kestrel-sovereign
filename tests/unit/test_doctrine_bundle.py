@@ -81,6 +81,8 @@ def _make_agent(properties: dict = None) -> MagicMock:
     storage = MagicMock()
     storage.get_node = AsyncMock(return_value=node)
     storage.add_node = AsyncMock()
+    from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
+    storage.compare_and_swap_node = AsyncMock(return_value=NodeSwapResult.SWAPPED)
 
     agent = MagicMock()
     agent.agent_id = "did:test:abc"
@@ -252,7 +254,7 @@ async def test_first_anchor_writes_snapshot(tmp_path):
     assert agent._test_node.properties[PROP_BUNDLE_HASH] == snap.hash
     assert agent._test_node.properties[PROP_BUNDLE_FILES] == snap.files
     assert PROP_BUNDLE_ANCHORED_AT in agent._test_node.properties
-    agent.storage.add_node.assert_awaited_once()
+    agent.storage.compare_and_swap_node.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -272,7 +274,7 @@ async def test_anchor_is_idempotent_when_hash_matches(tmp_path):
     )
     assert snap.hash == initial_snap.hash
     # No-op: storage.add_node not called because already anchored
-    agent.storage.add_node.assert_not_called()
+    agent.storage.compare_and_swap_node.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -437,4 +439,4 @@ async def test_reanchor_is_noop_when_hash_already_matches(tmp_path):
     )
     assert old_hash == new_hash == snap.hash
     # No write because it's a no-op
-    agent.storage.add_node.assert_not_called()
+    agent.storage.compare_and_swap_node.assert_not_called()
