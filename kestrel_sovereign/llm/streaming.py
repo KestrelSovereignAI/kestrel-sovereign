@@ -49,6 +49,10 @@ from kestrel_sdk.llm import (
 )
 
 from kestrel_sovereign.llm.retry import common_declined_wait
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError, bind_execution_custody_snapshot,
+    current_execution_custody, require_execution_work,
+)
 from .adapter import (
     LLMResponse,
     ThinkingDelta,
@@ -974,10 +978,20 @@ class StreamingMixin:
         completed = False
         emitted = False
         failure: Optional[BaseException] = None
+        admitted_custody = current_execution_custody(self)
 
         async def forward(stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
             nonlocal emitted, final_response
-            async for item in stream:
+            iterator = aiter(stream)
+            while True:
+                with bind_execution_custody_snapshot(admitted_custody):
+                    require_execution_work(self)
+                    try:
+                        item = await anext(iterator)
+                    except StopAsyncIteration:
+                        require_execution_work(self)
+                        return
+                    require_execution_work(self)
                 emitted = True
                 if isinstance(item, LLMResponse):
                     final_response = item
@@ -994,6 +1008,7 @@ class StreamingMixin:
                 yield item
 
         try:
+            require_execution_work(self)
             if use_usage_stream:
                 try:
                     stream = adapter.get_streaming_response_with_tools(
@@ -1011,9 +1026,11 @@ class StreamingMixin:
                     # stub.  Falling back is safe only before any output escaped.
                     if emitted:
                         raise
+                    require_execution_work(self)
                     use_usage_stream = False
 
             if not use_usage_stream:
+                require_execution_work(self)
                 stream = adapter.get_streaming_response(
                     client=client,
                     model=model,
@@ -1284,7 +1301,10 @@ class StreamingMixin:
                 logger.info(f"Non-streaming fallback from {provider_name}")
                 return
 
+            except ExecutionAuthorityError:
+                raise
             except Exception as e:
+                require_execution_work(self)
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
                 route_errors.append(e)
@@ -1417,6 +1437,8 @@ class StreamingMixin:
                         ),
                     ):
                         yield chunk
+                except ExecutionAuthorityError:
+                    raise
                 except Exception as exc:
                     self._raise_managed_remote_failure(exc)
                 return
@@ -1490,6 +1512,8 @@ class StreamingMixin:
                         ),
                     ):
                         yield chunk
+                except ExecutionAuthorityError:
+                    raise
                 except Exception as exc:
                     self._raise_managed_remote_failure(exc)
                 return
@@ -1568,7 +1592,10 @@ class StreamingMixin:
                     )
                     yield response.content if hasattr(response, 'content') else str(response)
                     return
+            except ExecutionAuthorityError:
+                raise
             except Exception as e:
+                require_execution_work(self)
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
                 route_errors.append(e)
@@ -1823,6 +1850,8 @@ class StreamingMixin:
                         ),
                     ):
                         yield item
+                except ExecutionAuthorityError:
+                    raise
                 except Exception as exc:
                     self._raise_managed_remote_failure(exc)
                 return
@@ -1953,7 +1982,10 @@ class StreamingMixin:
                             yield chunk
                         return
 
+            except ExecutionAuthorityError:
+                raise
             except Exception as e:
+                require_execution_work(self)
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
                 route_errors.append(e)

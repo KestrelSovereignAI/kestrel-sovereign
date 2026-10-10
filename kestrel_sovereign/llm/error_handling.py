@@ -12,6 +12,7 @@ from functools import wraps
 
 import openai
 import httpx
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,8 @@ def handle_llm_errors(
             provider = provider_name or kwargs.get('provider_name', 'unknown')
             try:
                 return await func(*args, **kwargs)
+            except ExecutionAuthorityError:
+                raise
             except asyncio.TimeoutError as e:
                 error = LLMProviderTimeoutError(provider, "Request timeout", e)
                 if log_errors:
@@ -166,6 +169,8 @@ def handle_llm_errors(
             provider = provider_name or kwargs.get('provider_name', 'unknown')
             try:
                 return func(*args, **kwargs)
+            except ExecutionAuthorityError:
+                raise
             except openai.AuthenticationError as e:
                 error = LLMProviderAuthError(provider, "Authentication failed", e)
                 if log_errors:

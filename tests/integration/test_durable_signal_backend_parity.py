@@ -2325,7 +2325,7 @@ async def test_postgres_concurrent_unique_index_build_keeps_ingress_writable(db_
             build_task = asyncio.create_task(
                 DurableSignalStore(
                     builder
-                )._ensure_postgres_source_sequence_index_concurrently()
+                )._ensure_postgres_source_sequence_index()
             )
             await _wait_for_postgres_concurrent_index_build(backend)
             assert not build_task.done()

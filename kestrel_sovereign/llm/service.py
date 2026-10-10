@@ -71,6 +71,7 @@ from kestrel_sovereign.kestrel_config.constants import (
 )
 from kestrel_sovereign.config import load_config, load_section
 from kestrel_sovereign import telemetry
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, require_execution_work
 
 logger = logging.getLogger(__name__)
 
@@ -3222,6 +3223,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         every async-coroutine and async-generator method whose name
         matches a generation pattern calls this guard.
         """
+        require_execution_work(self)
         if getattr(self, "disabled", False):
             raise PolicyDeniedError(
                 "LLMService is disabled by PayerPolicy "
@@ -3229,7 +3231,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 "callers should treat this the same as 'no key configured'."
             )
 
-    def attach_to_agent(self, agent_did: str) -> None:
+    def attach_to_agent(self, agent_did: str, *, execution_custody: ExecutionCustody | None = None) -> None:
         """Claim this LLMService instance for a specific agent.
 
         Required invariant for the PayerPolicy work: each KestrelAgent
@@ -3257,16 +3259,21 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         """
         if not agent_did:
             raise ValueError("agent_did is required for attach_to_agent")
-        if self._owner_agent_did is None:
-            self._owner_agent_did = agent_did
-            return
-        if self._owner_agent_did == agent_did:
-            return
-        raise LLMServiceAlreadyAttachedError(
-            f"LLMService is already attached to agent {self._owner_agent_did[:30]}...; "
-            f"cannot re-attach to {agent_did[:30]}.... Construct a fresh LLMService "
-            "per agent (each agent's OpenRouter client mutation must be isolated)."
-        )
+        if self._owner_agent_did not in (None, agent_did):
+            raise LLMServiceAlreadyAttachedError(
+                f"LLMService is already attached to agent {self._owner_agent_did[:30]}...; "
+                f"cannot re-attach to {agent_did[:30]}.... Construct a fresh LLMService "
+                "per agent (each agent's OpenRouter client mutation must be isolated)."
+            )
+        if execution_custody is not None and not isinstance(execution_custody, ExecutionCustody):
+            raise TypeError("LLM execution custody must be host-owned ExecutionCustody")
+        retained = getattr(self, "_execution_custody", None)
+        if retained is not None and retained is not execution_custody:
+            raise ExecutionAuthorityError("LLM service cannot replace or discard retained execution custody")
+        if execution_custody is not None:
+            execution_custody.require_work()
+        self._execution_custody = execution_custody
+        self._owner_agent_did = agent_did
 
     async def use_agent_key(
         self,
@@ -3830,12 +3837,23 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
 
         started = time.monotonic()
         try:
-            response = await attempt
+            try:
+                require_execution_work(self)
+            except ExecutionAuthorityError:
+                if inspect.iscoroutine(attempt):
+                    attempt.close()
+                raise
+            with bind_execution_runtime(self):
+                response = await attempt
+                require_execution_work(self)
+        except ExecutionAuthorityError:
+            raise
         except asyncio.CancelledError:
             # No usage evidence exists on a non-streaming cancelled call.  Keep
             # the historical cancellation contract and do not fabricate a row.
             raise
         except Exception as exc:
+            require_execution_work(self)
             await self._finalize_failed_invocation(
                 provider_name,
                 model,
@@ -3873,6 +3891,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             tools_used=tools_used,
             publish_identity=publish_identity,
         )
+        require_execution_work(self)
         return response
 
     async def _log_llm_call(
@@ -4707,6 +4726,8 @@ No other text or formatting.
                 "reasoning": f"Audit failed: {e}",
                 "audited": False,
             }
+        except ExecutionAuthorityError:
+            raise
         except Exception as e:
             logger.error(f"Unexpected audit error: {e}", exc_info=True)
             return {
@@ -4991,6 +5012,8 @@ No other text or formatting.
         except (KeyError, AttributeError, TypeError) as e:
             logger.error(f"Model {model_id} data error: {e}", exc_info=True)
             raise RuntimeError(f"Model {model_id} failed: {e}") from e
+        except ExecutionAuthorityError:
+            raise
         except Exception as e:
             logger.error(f"Model {model_id} failed: {e}", exc_info=True)
             raise RuntimeError(f"Model {model_id} failed: {e}") from e
@@ -5170,6 +5193,8 @@ No other text or formatting.
                                 self._managed_remote_failure_message
                             ),
                         )
+                    except ExecutionAuthorityError:
+                        raise
                     except Exception as exc:
                         # Adapter implementations can raise provider-specific
                         # exception types. The boundary intentionally catches
@@ -5329,6 +5354,8 @@ No other text or formatting.
                             self._managed_remote_failure_message
                         ),
                     )
+                except ExecutionAuthorityError:
+                    raise
                 except Exception as exc:
                     self._raise_managed_remote_failure(exc)
 
@@ -5512,6 +5539,8 @@ No other text or formatting.
                 # Don't fall back — the request itself is broken, not the provider.
                 logger.error(f"Provider {provider['name']} rejected request (400): {e}")
                 raise LLMServiceError(f"Request rejected by {provider['name']}: {e}") from e
+            except ExecutionAuthorityError:
+                raise
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 self._maybe_disable_route(provider, e)

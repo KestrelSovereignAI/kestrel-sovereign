@@ -322,3 +322,231 @@ async def test_stream_closed_by_foreign_task_keeps_cleanup_only_runtime_custody(
     await asyncio.create_task(iterator.aclose())
     assert closed == [True]
     require_execution_work(owner)  # Closing did not revoke the whole runtime.
+
+
+@pytest.mark.asyncio
+async def test_native_feature_return_records_effect_before_post_return_denial():
+    from kestrel_sovereign.features.base import Feature
+    from kestrel_sovereign.features.base import tool
+    from kestrel_sovereign.agent.invocation import invocation_scope, current_invocation_effect_checkpoint
+
+    class Effects(Feature):
+        async def initialize(self):
+            pass
+
+        @property
+        def tool_description(self):
+            return "Test completed-effect custody"
+
+        @tool(name="effect", description="Complete an effect")
+        async def effect(self):
+            scope.revoke("effect returned after revocation")
+            return {"success": True}
+
+    feature = Effects.__new__(Effects)
+    feature.agent = None
+    feature.disabled_skills = set()
+    with bind_execution_custody(Authority()) as scope, invocation_scope("native-effect"):
+        with pytest.raises(ExecutionAuthorityError):
+            await next(tool for tool in feature.get_tools() if tool.name == "effect").execute()
+        assert current_invocation_effect_checkpoint().completed
+
+
+@pytest.mark.asyncio
+async def test_foreign_turn_carries_exact_completed_effect_state():
+    from contextvars import Context
+    from kestrel_sovereign.agent.invocation import invocation_scope, current_invocation_effect_checkpoint, mark_current_invocation_effect_completed
+
+    async def foreign(captured):
+        with captured.bind():
+            mark_current_invocation_effect_completed("foreign-session")
+
+    with invocation_scope("foreign-effect"):
+        state = current_invocation_effect_checkpoint()
+        captured = capture_turn_scope(object())
+        await asyncio.create_task(foreign(captured), context=Context())
+        assert state.completed
+        assert state.session_id == "foreign-session"
+
+
+@pytest.mark.asyncio
+async def test_foreign_stream_cannot_drop_retired_prior_admission():
+    from contextvars import Context
+    from kestrel_sovereign.agent.invocation import bind_async_generator_invocation
+
+    advanced = []
+    closed = []
+
+    class Owner:
+        _execution_custody = ExecutionCustody(Authority())
+
+        @bind_async_generator_invocation("request_id")
+        async def stream(self, request_id=None):
+            try:
+                yield "first"
+                advanced.append(True)
+                yield "private"
+            finally:
+                with pytest.raises(ExecutionAuthorityError, match="cleanup-only"):
+                    require_execution_work(self)
+                closed.append(True)
+
+    iterator = Owner().stream(request_id="pinned-stream")
+    with bind_execution_custody(Authority()):
+        assert await anext(iterator) == "first"
+    with pytest.raises(ExecutionAuthorityError):
+        await asyncio.create_task(anext(iterator), context=Context())
+    assert advanced == []
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_parent_invocation_rechecks_custody_after_child_completion():
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+
+    class Owner:
+        _execution_custody = ExecutionCustody(Authority())
+
+        def register_active_request(self, request_id, *, nested=False):
+            pass
+
+        async def await_durable_request_admission(self, request_id):
+            return True
+
+        def bind_request_operation(self, request_id, operation):
+            operation.add_done_callback(lambda task: self._execution_custody.revoke("lost before parent publication"))
+
+        def _cleanup_cancelled_request(self, request_id, **kwargs):
+            pass
+
+        @bind_async_invocation("request_id", track_request_lifecycle=True)
+        async def turn(self, request_id=None):
+            return "private"
+
+    with pytest.raises(ExecutionAuthorityError, match="lost before parent publication"):
+        await Owner().turn(request_id="parent-publication")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss", ["before", "during", "cleanup"])
+async def test_provider_attempt_never_runs_or_publishes_after_custody_loss(loss):
+    from kestrel_sovereign.execution_custody import bind_execution_cleanup
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+
+    service = LLMService.__new__(LLMService)
+    calls = []
+    finalized = []
+
+    async def finalize(*args, **kwargs):
+        finalized.append(True)
+
+    service._finalize_successful_invocation = finalize
+    service._finalize_failed_invocation = finalize
+
+    async def provider():
+        calls.append(True)
+        if loss == "during":
+            scope.revoke("provider custody lost")
+            raise ConnectionError("first provider failed")
+        return "private"
+
+    with bind_execution_custody(Authority()) as scope:
+        from contextlib import nullcontext
+        if loss == "before":
+            scope.revoke("provider custody lost")
+        with bind_execution_cleanup(service) if loss == "cleanup" else nullcontext():
+            with pytest.raises(ExecutionAuthorityError):
+                await service._run_provider_attempt(provider(), "local-test", "test", path="test", invocation_context=LLMInvocationContext())
+    assert calls == ([True] if loss == "during" else [])
+    assert finalized == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss", ["before", "during"])
+async def test_native_stream_provider_refuses_denied_dispatch_and_chunks(loss):
+    from kestrel_sovereign.llm.streaming import StreamingMixin
+
+    called = []
+    class Adapter:
+        async def get_streaming_response(self, **kwargs):
+            called.append(True)
+            scope.revoke("stream provider lost custody")
+            yield "private"
+
+    class Service(StreamingMixin):
+        async def _record_streamed_usage(self, *args, **kwargs):
+            pass
+
+    service = Service()
+    with bind_execution_custody(Authority()) as scope:
+        if loss == "before":
+            scope.revoke("stream provider lost custody")
+        iterator = service._stream_adapter_with_usage(
+            adapter=Adapter(), client=None, model="local-test", messages=[],
+            provider_name="local-test", path="test", invocation_context=None,
+            expose_protocol_events=False,
+        )
+        try:
+            with pytest.raises(ExecutionAuthorityError):
+                await anext(iterator)
+        finally:
+            await iterator.aclose()
+    assert called == ([True] if loss == "during" else [])
+
+
+def test_llm_retains_native_runtime_custody_without_ambient_context():
+    from kestrel_sovereign.llm.service import LLMService
+
+    service = LLMService.__new__(LLMService)
+    service._owner_agent_did = None
+    custody = ExecutionCustody(Authority())
+    service.attach_to_agent("did:example:runtime", execution_custody=custody)
+    custody.revoke("native provider runtime retired")
+    with pytest.raises(ExecutionAuthorityError, match="runtime retired"):
+        service._check_policy()
+    with pytest.raises(ExecutionAuthorityError, match="discard"):
+        service.attach_to_agent("did:example:runtime")
+
+
+@pytest.mark.asyncio
+async def test_hosted_scheduler_preparation_binds_resolved_runtime_for_renewal():
+    from types import SimpleNamespace
+    from kestrel_sovereign.features.scheduler.runner import HostedSchedulerExecutor, SchedulerExecution
+    from kestrel_sovereign.execution_custody import current_execution_custody
+
+    custody = ExecutionCustody(Authority())
+    async def effect(*args):
+        require_execution_work()
+
+    agent = SimpleNamespace(_execution_custody=custody, features={"SchedulerFeature": SimpleNamespace(enabled=True, _dispatch_scheduled_task=effect)})
+    async def resolve(did):
+        return agent
+
+    executor = HostedSchedulerExecutor(resolve)
+    execution = SchedulerExecution("execution", "schedule", "did:example:runtime", "effect", {}, "occurrence", "idempotency", 1, "owner")
+    async with executor.prepare_scheduled(execution):
+        assert current_execution_custody() == (custody,)
+        custody.revoke("resolved scheduler runtime retired")
+        with pytest.raises(ExecutionAuthorityError):
+            require_execution_work()
+
+
+def test_manager_resolves_independent_host_custody_before_agent_boot(tmp_path):
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager, LocalAgentConfig
+
+    first, second = ExecutionCustody(Authority()), ExecutionCustody(Authority())
+    seen = []
+    def factory(name, did, config):
+        seen.append((name, did, config))
+        return first if did == "did:first" else second
+
+    manager = AgentManager(base_data_dir=tmp_path, execution_custody_factory=factory)
+    config = LocalAgentConfig(data_dir=tmp_path / "agent", port=8881)
+    assert manager._execution_custody_for_agent("first", "did:first", config) is first
+    assert manager._execution_custody_for_agent("second", "did:second", config) is second
+    assert len(seen) == 2
+    first.revoke("first runtime retired")
+    with pytest.raises(ExecutionAuthorityError):
+        manager._execution_custody_for_agent("first", "did:first", config)
+    assert manager._execution_custody_for_agent("second", "did:second", config) is second

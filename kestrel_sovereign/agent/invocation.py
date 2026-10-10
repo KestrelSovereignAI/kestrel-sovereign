@@ -22,7 +22,7 @@ import uuid
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
-    bind_execution_cleanup, bind_execution_runtime,
+    bind_execution_cleanup, bind_execution_runtime, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
 )
 from kestrel_sovereign.auth import (
@@ -30,6 +30,7 @@ from kestrel_sovereign.auth import (
     caller_context_lifetime,
     caller_context_scope,
 )
+from kestrel_sovereign.turn_scope import turn_scoped
 
 
 MAX_INVOCATION_ID_LENGTH = 256
@@ -54,6 +55,23 @@ class InvocationEffectCheckpoint:
 
 _current_effect_checkpoint: ContextVar[InvocationEffectCheckpoint | None] = (
     ContextVar("kestrel_current_effect_checkpoint", default=None)
+)
+
+
+@contextmanager
+def _bind_effect_checkpoint(state: InvocationEffectCheckpoint | None) -> Iterator[None]:
+    token = _current_effect_checkpoint.set(state)
+    try:
+        yield
+    finally:
+        _current_effect_checkpoint.reset(token)
+
+
+turn_scoped(
+    "invocation_effect_checkpoint",
+    variables=(_current_effect_checkpoint,),
+    capture=lambda owner: _current_effect_checkpoint.get(),
+    bind=_bind_effect_checkpoint,
 )
 
 
@@ -539,6 +557,7 @@ def bind_async_invocation(
                             )
                         try:
                             result = await isolated_operation
+                            require_execution_work(lifecycle_owner)
                             # ``Task.cancel()`` is a no-op once the isolated
                             # child has produced a result.  Stop can linearize
                             # in the narrow window between that completion and
@@ -816,7 +835,7 @@ def bind_async_generator_invocation(
                             effective_id,
                             effective_provenance,
                             effect_checkpoint,
-                        ), caller_context_binding_scope(caller_binding), bind_execution_runtime(lifecycle_owner):
+                        ), caller_context_binding_scope(caller_binding), bind_execution_custody_snapshot(admitted_custody), bind_execution_runtime(lifecycle_owner):
                             admitted_custody = current_execution_custody(lifecycle_owner)
                             try:
                                 item = await anext(iterator)

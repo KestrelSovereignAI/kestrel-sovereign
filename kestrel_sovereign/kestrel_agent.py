@@ -1521,7 +1521,10 @@ class KestrelAgent(
         # surface. Real LLMService instances always have attach_to_agent;
         # the invariant is enforced for them and silently waived for fakes.
         if hasattr(self.llm_service, "attach_to_agent"):
-            self.llm_service.attach_to_agent(did)
+            if isinstance(self.llm_service, LLMService):
+                self.llm_service.attach_to_agent(did, execution_custody=self._execution_custody)
+            else:
+                self.llm_service.attach_to_agent(did)
         # Mirror the construction-time display name onto the LLMService so LLM
         # spans are attributed from the very first call — including the genesis
         # audit and feature-init calls that run inside initialize() before the

@@ -13113,6 +13113,7 @@ class TestLoadFromConfig:
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    @pytest.mark.parametrize("custody_bound", [False, True])
     async def test_postgres_host_factory_wires_one_shared_pool_into_every_agent(
         self,
         mock_llm_cls,
@@ -13120,8 +13121,11 @@ class TestLoadFromConfig:
         mock_get_did,
         monkeypatch,
         tmp_path,
+        custody_bound,
     ):
         from kestrel_sovereign.storage.db.postgres import PostgresBackend
+        from kestrel_sovereign.execution_custody import ExecutionCustody
+        from tests.unit.test_execution_custody import Authority
 
         class _Pool:
             def get_max_size(self):
@@ -13132,6 +13136,7 @@ class TestLoadFromConfig:
             pool,
             advisory_dsn="postgresql://host/kestrel",
             advisory_max_pool_size=6,
+            execution_custody=ExecutionCustody(Authority()) if custody_bound else None,
         )
         mock_agent_cls.side_effect = [
             _make_mock_agent("did:tenant-a"),
@@ -13153,6 +13158,8 @@ class TestLoadFromConfig:
         assert second["pg_pool"] is pool
         assert first["shared_postgres_advisory_backend"] is host_backend
         assert second["shared_postgres_advisory_backend"] is host_backend
+        assert first["execution_custody"] is host_backend._execution_custody
+        assert second["execution_custody"] is host_backend._execution_custody
         assert host_backend._advisory_max_pool_size == 6
 
     @pytest.mark.asyncio

@@ -48,12 +48,36 @@ before execution, and again before publishing its result. Already submitted
 remote effects cannot be recalled by cancellation or process termination;
 destination-side fencing is required for a stronger external guarantee.
 
-The context owns no connection between operations. Streaming must retire and
-release each admission before consumer handoff and use a fresh, separately
-validated admission for continuation/send. Children from a retired admission
+The context owns no connection between operations. A stream retains its
+original admission membership across consumer handoff, foreign continuation
+and cleanup. A later consumer may add live scopes but cannot silently discard
+an earlier retired/denying scope; reopening work requires a newly admitted
+operation, not reusing that suspended stream. Children from a retired admission
 cannot inherit its replacement. Consumers must join all owned work before
 normal advisory retirement. Cleanup does not grant new cognition/tool/storage
 authority; terminal identity/token CAS needs its own explicit native custody.
+
+The native provider service retains the owning agent's runtime custody and
+checks each adapter attempt and streamed chunk. Authority errors are not
+provider failures and must never trigger provider fallback. The AgentManager
+accepts a trusted per-agent `execution_custody_factory` before construction;
+it also preserves an explicitly bound shared backend and refuses replacing
+that binding. Multi-tenant hosts should use an unbound shared operational pool
+and inject independent per-agent custody through the factory.
+
+PostgreSQL scheduler execution records `executing` in the existing exact
+occurrence log before target dispatch. Only exact-owner live finalization
+resolves it into a known outcome. Lease loss, process death or post-dispatch
+uncertainty does not authorize replay: recovery disables the schedule with
+`unresolved_effect`, retaining the original occurrence evidence for operator
+reconciliation. This deliberately trades automatic retry for duplicate-effect
+safety; a supplied idempotency key alone is not proof of destination deduplication.
+Renewal retains the original resolved runtime and exact advisory effect handle.
+
+Custody-bound durable-signal boot uses transactional creation/repair of its
+exact source-sequence index, retaining generation locks through commit. Unbound
+host maintenance keeps concurrent index DDL. Large preexisting ledgers should
+be migrated before runtime admission to avoid a blocking bootstrap index build.
 
 ## Delivery status
 

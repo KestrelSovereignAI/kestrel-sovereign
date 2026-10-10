@@ -4,7 +4,9 @@
 the stable execution identity for that occurrence.  A runner claims before it
 dispatches, renews the claim while dispatch is in flight, and finalizes with a
 compare-and-set.  This makes concurrent runners safe against one another; a
-process death leaves a lease which another runner may recover after expiry.
+process death before dispatch leaves a claim recoverable after expiry. Once
+PostgreSQL dispatch begins, an unfinished occurrence requires reconciliation
+instead of automatic replay of a potentially completed external effect.
 """
 
 import asyncio
@@ -36,6 +38,7 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     bind_execution_custody,
     bind_execution_custody_snapshot,
+    bind_execution_runtime,
     current_execution_custody,
     require_execution_work,
 )
@@ -329,8 +332,10 @@ class SchedulerFeatureUnavailable(RuntimeError):
 
     This is not an execution failure: a feature may be intentionally excluded
     from a cold tenant or be soft-disabled while its persisted schedules are
-    retained.  The runner therefore leaves the durable claim recoverable
-    instead of consuming the occurrence as a failed task.
+    retained. Before dispatch the runner leaves the durable claim recoverable
+    instead of consuming it as a failed task. A PostgreSQL occurrence already
+    marked executing requires reconciliation, even if the dispatcher reports
+    this exception: an exception alone cannot prove absence of external effects.
     """
 
     def __init__(self, agent_id: str) -> None:
@@ -346,8 +351,9 @@ class SchedulerDispatchNotReady(RuntimeError):
     Until every feature finished cross-feature wiring, a task's owning tool
     may simply not be registered yet (#2474). Nothing was executed, so the
     runner neither records a result nor advances the occurrence: the claim
-    stays live and is recovered after its lease expires, which bounds retries
-    to one per lease interval.
+    stays live. Before dispatch, lease expiry bounds recovery to one retry per
+    lease interval. After the PostgreSQL effect-start marker, reconciliation is
+    required rather than assuming this exception proves no effect occurred.
     """
 
     def __init__(self, agent_id: str, task_name: str) -> None:
@@ -742,7 +748,8 @@ class HostedSchedulerExecutor:
         async def dispatch() -> Any:
             return await self._dispatch_resolved_agent(agent, execution)
 
-        yield dispatch
+        with bind_execution_runtime(agent):
+            yield dispatch
 
     async def execute_scheduled(self, execution: SchedulerExecution) -> Any:
         # Retain the public one-shot hosted-executor contract for callers that
@@ -929,7 +936,8 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
                     async def dispatch() -> Any:
                         return await self._dispatch_resolved_agent(agent, execution)
 
-                    yield dispatch
+                    with bind_execution_runtime(agent):
+                        yield dispatch
                 return
 
             await lifecycle_lock.acquire()
@@ -981,7 +989,8 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
             async def dispatch() -> Any:
                 return await self._dispatch_resolved_agent(agent, execution)
 
-            yield dispatch
+            with bind_execution_runtime(agent):
+                yield dispatch
 
     def _loaded_agent_for(self, agent_id: str) -> Optional[Any]:
         """Return an already-published agent for ``agent_id``, if present."""
@@ -2393,6 +2402,8 @@ class SchedulerRunner:
                         if renewal_state is not None else None
                     ),
                 )):
+                    if renewal_state is not None:
+                        renewal_state.custody = current_execution_custody()
                     yield
             else:
                 yield
@@ -2781,12 +2792,12 @@ class SchedulerRunner:
             SET enabled = 0, scheduler_claim_fenced = 0,
                 lease_owner = NULL, lease_expires_at = NULL, claim_token = NULL,
                 claim_execution_id = NULL, claim_scheduled_for = NULL,
-                terminal_status = 'execution_log_inconsistent',
+                terminal_status = ?,
                 terminal_at = {terminal_at}
             WHERE id = ? AND agent_id = ? AND lease_owner = ?
               AND claim_token = ? AND claim_execution_id = ?
             """,
-            params,
+            (("unresolved_effect" if status == "executing" else "execution_log_inconsistent"), *params),
         )
         if not self._updated(updated):
             raise RuntimeError(
@@ -3356,6 +3367,7 @@ class SchedulerRunner:
                                 execution.id,
                             )
                             return
+                        await self._mark_effect_started(task, execution)
                         try:
                             completed, raw = await self._run_dispatch_while_lease_live(
                                 dispatch,
@@ -3377,8 +3389,9 @@ class SchedulerRunner:
                             # A runtime disable can race preparation/admission.
                             # It is not a task failure and must not advance this
                             # occurrence. Leaving the exact claim live prevents a
-                            # hot retry; once it expires, a later re-enable can
-                            # recover the same durable execution identity.
+                            # hot retry. PostgreSQL already persisted the effect-
+                            # start marker, so expiry requires reconciliation;
+                            # it cannot safely prove this dispatcher did no work.
                             logger.info(
                                 "Deferring scheduler claim %s because %s has no enabled "
                                 "SchedulerFeature",
@@ -3389,7 +3402,8 @@ class SchedulerRunner:
                         except SchedulerDispatchNotReady as e:
                             # Same deferral contract as above (#2474): nothing
                             # ran, so no success row, no last_run_at, no cron
-                            # advance. Lease expiry bounds the retry.
+                            # advance. PostgreSQL's effect-start marker still
+                            # requires reconciliation rather than automatic retry.
                             logger.info(
                                 "Deferring scheduler claim %s: %s", execution.id, e
                             )
@@ -3564,8 +3578,14 @@ class SchedulerRunner:
         """Renew a claim and expose only its bounded live-lease interval."""
 
         state = _rollout_renewal_state.get()
+        if state is not None and state.lost.is_set():
+            self._forget_live_claim(task)
+            return False
         with bind_execution_custody_snapshot(state.custody if state is not None else ()):
             renewed = await self._renew_lease_once(task)
+        if state is not None and state.lost.is_set():
+            self._forget_live_claim(task)
+            return False
         execution_id = task.claim_execution_id
         if not execution_id:
             return renewed
@@ -3604,6 +3624,38 @@ class SchedulerRunner:
             execution.id,
             phase,
         )
+
+    async def _mark_effect_started(self, task: ScheduledTask, execution: SchedulerExecution) -> None:
+        """Persist indeterminate effect evidence BEFORE PostgreSQL dispatch.
+
+        An expired claim alone is not proof that an external effect did not
+        happen. Recovery preserves this occurrence's canonical log instead of
+        making it executable again. Only exact-owner live finalization may
+        resolve ``executing`` into a known outcome. This is a short ordinary
+        guarded transaction, not a post-loss work grant or a new receipt table.
+        """
+        if self._database_backend_type() != "postgres":
+            return
+        async with self._transaction():
+            claimed = await self._db.execute(
+                f"""UPDATE scheduled_tasks SET attempt_count = attempt_count
+                WHERE id = ? AND agent_id = ? AND lease_owner = ?
+                  AND claim_token = ? AND claim_execution_id = ?
+                  AND scheduler_protocol_version = ? AND scheduler_rollout_fenced = 0
+                  AND enabled = 0 AND scheduler_claim_fenced = 1
+                  AND {self._database_lease_live_sql()}""",
+                (task.id, task.agent_id, self._owner_id, task.claim_token,
+                 execution.id, SCHEDULER_PROTOCOL_VERSION),
+            )
+            if not self._updated(claimed):
+                raise ExecutionAuthorityError("scheduler claim lost before effect evidence")
+            marked = await self._db.execute(
+                """UPDATE task_execution_log SET status = 'executing'
+                WHERE id = ? AND task_id = ? AND agent_id = ? AND status = 'claimed'""",
+                (execution.id, task.id, task.agent_id),
+            )
+            if not self._updated(marked):
+                raise ExecutionAuthorityError("scheduler effect evidence already resolved or missing")
 
     async def _run_dispatch_while_lease_live(
         self,
@@ -3960,7 +4012,7 @@ class SchedulerRunner:
                     SET status = ?, result_text = ?, duration_ms = ?,
                         executed_at = {now_sql}, outcome_signal = ?,
                         attempt_count = ?, completed_at = {now_sql}
-                    WHERE id = ? AND task_id = ? AND agent_id = ? AND status = 'claimed'
+                    WHERE id = ? AND task_id = ? AND agent_id = ? AND status IN ('claimed', 'executing')
                     """,
                     (
                         status, result_text, duration_ms, outcome_signal,
@@ -4007,7 +4059,7 @@ class SchedulerRunner:
                     UPDATE task_execution_log
                     SET status = ?, result_text = ?, duration_ms = ?, executed_at = ?,
                         outcome_signal = ?, attempt_count = ?, completed_at = ?
-                    WHERE id = ? AND task_id = ? AND agent_id = ? AND status = 'claimed'
+                    WHERE id = ? AND task_id = ? AND agent_id = ? AND status IN ('claimed', 'executing')
                     """,
                     (
                         status, result_text, duration_ms, now_iso, outcome_signal,

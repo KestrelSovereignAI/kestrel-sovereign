@@ -1500,7 +1500,7 @@ class DurableSignalStore(UnifiedStoreBase):
             # indexed lookup. The separately durable event work table orders
             # NULL rows by immutable event ID without repeatedly sorting the
             # wide event ledger.
-            await self._ensure_postgres_source_sequence_index_concurrently()
+            await self._ensure_postgres_source_sequence_index()
 
         if postgres_finalization_required:
             # Each PostgreSQL history batch is its own durable transaction.
@@ -3280,14 +3280,24 @@ class DurableSignalStore(UnifiedStoreBase):
             and not nulls_not_distinct
         )
 
-    async def _ensure_postgres_source_sequence_index_concurrently(self) -> None:
-        """Repair/build the exact index under initialize's session lock."""
+    async def _ensure_postgres_source_sequence_index(self) -> None:
+        """Repair/build the exact index under initialize's session lock.
+
+        A custody-bound boot uses transactional DDL so the native executor
+        retains authority-row locks through the actual index commit. Unbound
+        host maintenance uses concurrent DDL. Neither mode bypasses ordinary
+        storage custody; large existing ledgers should be migrated by the host
+        before admitting runtime work to avoid a blocking bootstrap build.
+        """
 
         if not self.is_postgres:
             raise RuntimeError("PostgreSQL source-sequence index requires postgres")
         catalog = await self._postgres_source_sequence_index_catalog()
         if self._postgres_source_sequence_index_catalog_valid(catalog):
             return
+        from kestrel_sovereign.execution_custody import current_execution_custody
+
+        concurrency = "" if current_execution_custody(self._backend) else " CONCURRENTLY"
         if catalog is not None:
             # CREATE INDEX CONCURRENTLY can leave an invalid/indisready shell
             # after cancellation or failure. IF NOT EXISTS would trust that
@@ -3305,11 +3315,11 @@ class DurableSignalStore(UnifiedStoreBase):
                 )
             else:
                 await self._backend.execute(
-                    "DROP INDEX CONCURRENTLY IF EXISTS "
+                    f"DROP INDEX{concurrency} IF EXISTS "
                     f"{_quoted_identifier(self.SOURCE_SEQUENCE_SCOPE_INDEX)}"
                 )
         await self._backend.execute(
-            "CREATE UNIQUE INDEX CONCURRENTLY "
+            f"CREATE UNIQUE INDEX{concurrency} "
             f"{_quoted_identifier(self.SOURCE_SEQUENCE_SCOPE_INDEX)} "
             f"ON {_quoted_identifier(self.EVENTS)} "
             "(agent_id, source, source_sequence)"

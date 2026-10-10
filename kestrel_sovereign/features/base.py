@@ -2314,6 +2314,11 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             require_execution_work(self.func.__self__.agent)
                             try:
                                 result = await self.func(**kwargs)
+                                # Preserve effect evidence at the actual method
+                                # return, before a post-return denial can stop
+                                # the orchestrator from observing completion.
+                                from kestrel_sovereign.agent.invocation import mark_current_invocation_effect_completed
+                                mark_current_invocation_effect_completed(None)
                                 require_execution_work(self.func.__self__.agent)
                             except ExecutionAuthorityError:
                                 raise

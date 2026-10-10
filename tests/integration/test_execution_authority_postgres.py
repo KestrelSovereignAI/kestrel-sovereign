@@ -133,9 +133,10 @@ async def test_unlock_loss_does_not_replace_original_cancellation(native_pg, mon
         replacement.require_live()
 
 
-@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("explicit,scoped", [(False, True), (True, True), (True, False)])
 @pytest.mark.parametrize("cancelled", [False, True])
-async def test_lost_commit_acknowledgement_requires_reconciliation(native_pg, monkeypatch, explicit, cancelled):
+async def test_lost_commit_acknowledgement_requires_reconciliation(native_pg, monkeypatch, explicit, scoped, cancelled):
+    from contextlib import nullcontext
     from kestrel_sovereign.execution_custody import execution_commit_outcome
 
     backend, _, _ = native_pg
@@ -150,7 +151,7 @@ async def test_lost_commit_acknowledgement_requires_reconciliation(native_pg, mo
         return result
 
     monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", lose_ack)
-    with bind_execution_custody(GenerationFence()):
+    with bind_execution_custody(GenerationFence()) if scoped else nullcontext():
         with pytest.raises(Exception) as caught:
             if explicit:
                 async with backend.transaction():
@@ -532,8 +533,11 @@ async def test_native_scheduler_shared_gate_loses_original_advisory_authority(na
         with pytest.raises(Exception, match="authority|session|advisory"):
             async with runner._postgres_rollout_effect_gate("did:example:gate"):
                 lease = current_execution_custody()[-1].fence.lease
+                assert state.custody == current_execution_custody()
                 assert await control.fetchval("SELECT pg_terminate_backend($1)", lease.backend_pid)
                 await asyncio.wait_for(state.lost.wait(), timeout=5)
+                from types import SimpleNamespace
+                assert await runner._renew_live_claim_once(SimpleNamespace(claim_execution_id="lost-claim")) is False
                 with pytest.raises(Exception, match="authority|session|advisory"):
                     require_execution_work()
                 with pytest.raises(Exception, match="authority|session|advisory"):
@@ -575,3 +579,73 @@ async def test_native_scheduler_renewal_rebinds_original_host_generation(native_
         assert "old-claim" not in runner._live_claim_deadlines
     finally:
         _rollout_renewal_state.reset(token)
+
+
+async def test_custody_bound_native_signal_boot_builds_exact_sequence_index(native_pg):
+    from kestrel_sovereign.signals.durable import DurableSignalStore
+
+    backend, _, _ = native_pg
+    store = DurableSignalStore(backend)
+    with bind_execution_custody(GenerationFence()):
+        await store.initialize()
+        assert store._postgres_source_sequence_index_catalog_valid(
+            await store._postgres_source_sequence_index_catalog()
+        )
+
+
+async def test_scheduler_session_loss_cannot_repeat_completed_external_effect(native_pg):
+    from datetime import datetime, timedelta, timezone
+    from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask, SCHEDULER_PROTOCOL_VERSION, _rollout_renewal_state
+    from kestrel_sovereign.execution_custody import current_execution_custody
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    backend, control, _ = native_pg
+    db = AsyncDatabase(backend)
+    agent_id = "did:example:no-effect-replay"
+    seen = []
+
+    async def effect(name, args):
+        seen.append(True)
+        await backend.execute("INSERT INTO effects VALUES (1, 'irreversible external effect')")
+        assert await db.fetchval("SELECT status FROM task_execution_log WHERE task_id='no-repeat'") == "executing"
+        lease = current_execution_custody()[-1].fence.lease
+        assert await control.fetchval("SELECT pg_terminate_backend($1)", lease.backend_pid)
+        await asyncio.wait_for(_rollout_renewal_state.get().lost.wait(), timeout=5)
+        return "completed external effect"
+
+    runner = SchedulerRunner(db, agent_id, effect, owner_id="original-owner")
+    await runner._ensure_tables()
+    due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    await db.execute("""INSERT INTO scheduled_tasks
+        (id, agent_id, task_name, cron_expression, enabled, next_run_at, created_at, idempotency_key, scheduler_protocol_version)
+        VALUES ('no-repeat', ?, 'effect', '* * * * *', 1, ?, ?, 'no-repeat-base', ?)""",
+        (agent_id, due, due, SCHEDULER_PROTOCOL_VERSION))
+    task = ScheduledTask.from_row((await runner._due_rows(datetime.now(timezone.utc)))[0])
+    claimed = await runner._claim(task, datetime.now(timezone.utc))
+    assert claimed is not None
+    from kestrel_sdk.storage.database import QueryError
+    try:
+        await runner._execute_claim(claimed)
+    except (ExecutionAuthorityError, QueryError):
+        pass  # The exact-session exclusion boundary must remain failed closed.
+    assert seen == [True]
+    assert await db.fetchval("SELECT status FROM task_execution_log WHERE task_id='no-repeat'") == "executing"
+    await db.execute("UPDATE scheduled_tasks SET lease_expires_at=? WHERE id='no-repeat'", (due,))
+    replacement = SchedulerRunner(db, agent_id, effect, owner_id="replacement-owner")
+    retry = ScheduledTask.from_row((await replacement._due_rows(datetime.now(timezone.utc)))[0])
+    assert await replacement._claim(retry, datetime.now(timezone.utc)) is None
+    assert await db.fetchone("SELECT enabled, terminal_status FROM scheduled_tasks WHERE id='no-repeat'") == (0, "unresolved_effect")
+    assert seen == [True]
+    assert await backend.fetch_val("SELECT count(*) FROM effects") == 1
+
+
+async def test_failed_generation_validation_irrevocably_retires_original_admission(native_pg):
+    backend, control, schema = native_pg
+    with bind_execution_custody(GenerationFence()):
+        await control.execute(f'UPDATE "{schema}".authority SET generation=2 WHERE id=1')
+        with pytest.raises(Exception, match="generation changed"):
+            await backend.execute("INSERT INTO effects VALUES (1, 'old generation')")
+        await control.execute(f'UPDATE "{schema}".authority SET generation=1 WHERE id=1')
+        with pytest.raises(ExecutionAuthorityError, match="generation changed"):
+            await backend.execute("INSERT INTO effects VALUES (2, 'revived generation')")
+    assert await backend.fetch_val("SELECT count(*) FROM effects") == 0

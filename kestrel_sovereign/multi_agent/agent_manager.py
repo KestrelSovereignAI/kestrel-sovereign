@@ -810,6 +810,7 @@ class AgentManager:
             ]
         ] = None,
         shared_postgres_backend: object | None = None,
+        execution_custody_factory: Callable[[str, str, LocalAgentConfig], object | None] | None = None,
         hold_store: object | None = None,
     ):
         self._validate_shared_postgres_backend(shared_postgres_backend)
@@ -863,6 +864,7 @@ class AgentManager:
         # terminally drained every child. Each hosted child gets the exact same
         # operational pool and delegates advisory sessions back to this owner.
         self._shared_postgres_backend = shared_postgres_backend
+        self._execution_custody_factory = execution_custody_factory
         self._lock = asyncio.Lock()
         # Inbound hosted A2A verification/authorization/task persistence holds
         # a shared reader lease from DID resolution through create_task.
@@ -1134,6 +1136,28 @@ class AgentManager:
                 "shared PostgreSQL backend must be bound before agent initialization"
             )
         self._shared_postgres_backend = backend
+
+    def _execution_custody_for_agent(self, name: str, did: str, config: LocalAgentConfig):
+        """Resolve trusted custody before boot; never discard a bound pool owner.
+
+        Hosts with independent per-agent generations should pass an unbound
+        operational pool plus this factory. A bound shared backend cannot be
+        silently replaced by a different per-agent admission.
+        """
+        from kestrel_sovereign.execution_custody import ExecutionCustody, ExecutionAuthorityError
+
+        retained = getattr(self._shared_postgres_backend, "_execution_custody", None)
+        custody = (
+            self._execution_custody_factory(name, did, config)
+            if self._execution_custody_factory is not None else retained
+        )
+        if custody is not None and not isinstance(custody, ExecutionCustody):
+            raise TypeError("agent execution custody factory must return ExecutionCustody")
+        if retained is not None and custody is not retained:
+            raise ExecutionAuthorityError("AgentManager cannot discard shared-backend execution custody")
+        if custody is not None:
+            custody.require_work()
+        return custody
 
     def bind_hold_store(self, store: object) -> None:
         """Bind durable Hold admission before any hosted agent initializes."""
@@ -2705,6 +2729,9 @@ class AgentManager:
             )
 
         agent: Optional[KestrelAgent] = None
+        execution_custody = self._execution_custody_for_agent(name, agent_did, config)
+        if execution_custody is not None and not hosted_runtime_configured:
+            raise ValueError("execution custody requires a PostgreSQL hosted runtime")
         scheduler_registration: Optional[
             _DynamicSchedulerTenantRegistration
         ] = None
@@ -2735,6 +2762,7 @@ class AgentManager:
                     database_url=database_url,
                     db_backend="postgres",
                     pg_pool=shared_postgres_pool,
+                    execution_custody=execution_custody,
                     shared_postgres_advisory_backend=(
                         self._shared_postgres_backend
                     ),

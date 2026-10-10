@@ -104,7 +104,11 @@ class ExecutionCustody:
     def require_work(self) -> None:
         if self._denial is not None:
             raise ExecutionAuthorityError(self._denial)
-        self.fence.require_work()
+        try:
+            self.fence.require_work()
+        except ExecutionAuthorityError as error:
+            self.revoke(str(error))
+            raise
 
 
 _CURRENT_CUSTODY: ContextVar[tuple[ExecutionCustody, ...]] = ContextVar(
@@ -159,7 +163,11 @@ async def lock_execution_authority(
     captured = current_execution_custody() if scopes is None else scopes
     require_execution_backend(backend_type, captured)
     for scope in captured:
-        await scope.fence.lock_and_validate(connection)
+        try:
+            await scope.fence.lock_and_validate(connection)
+        except ExecutionAuthorityError as error:
+            scope.revoke(str(error))
+            raise
         # Cancellation-resistant validators must not republish a lost scope.
         require_execution_backend(backend_type, captured)
 
