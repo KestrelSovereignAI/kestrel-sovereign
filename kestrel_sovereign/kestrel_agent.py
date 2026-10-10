@@ -4246,13 +4246,15 @@ class KestrelAgent(
     # kept the resource, and an exception when the close failed. The agent's
     # custody believes ``RELEASED`` only from an owner that reports a failed
     # close truthfully, so the resource, and the serving record with it,
-    # stays held otherwise. A durable dispatcher is the deliberate exception
-    # to eager handle clearing: a dispatcher whose owner release failed, or
-    # is still fenced by live cognition, keeps its handle, and storage stays
-    # open beneath it. A fenced release hands storage close to the agent-owned
-    # continuation shutdown uses; a failed one leaves both for a later
-    # lifecycle shutdown to retry. The rollback driver logs failures and
-    # continues with independent resources.
+    # stays held otherwise. A durable dispatcher and the TaskManager are the
+    # deliberate exceptions to eager handle clearing: a TaskManager whose
+    # close failed keeps its handle for shutdown to retry (#3558), and a
+    # dispatcher whose owner release failed, or is still fenced by live
+    # cognition, keeps its handle, and storage stays open beneath it. A
+    # fenced release hands storage close to the agent-owned continuation
+    # shutdown uses; a failed one leaves both for a later lifecycle shutdown
+    # to retry. The rollback driver logs failures and continues with
+    # independent resources.
     # ------------------------------------------------------------------
     async def _boot_teardown_storage(self) -> ReleaseOutcome:
         """Close the primary DB connection and drop the privacy layer."""
@@ -4301,12 +4303,20 @@ class KestrelAgent(
         return ReleaseOutcome.RELEASED
 
     async def _boot_teardown_task_manager(self) -> ReleaseOutcome:
-        """Close the A2A TaskManager stores."""
+        """Close the A2A TaskManager stores.
+
+        The handle is dropped only once the close is confirmed. A close that
+        raised or kept a store leaves the manager in place, so shutdown
+        retries it (#3558).
+        """
         tm = self.task_manager
-        self.task_manager = None
-        if tm is not None and hasattr(tm, "close"):
-            return reported_outcome(await tm.close())
-        return ReleaseOutcome.RELEASED
+        if tm is None or not hasattr(tm, "close"):
+            self.task_manager = None
+            return ReleaseOutcome.RELEASED
+        outcome = reported_outcome(await tm.close())
+        if outcome is ReleaseOutcome.RELEASED and self.task_manager is tm:
+            self.task_manager = None
+        return outcome
 
     async def _boot_teardown_sync_service(self) -> ReleaseOutcome:
         """Stop the background sync worker."""

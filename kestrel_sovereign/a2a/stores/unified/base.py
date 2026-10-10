@@ -238,6 +238,10 @@ class UnifiedStoreBase:
 
         Should be called when the store is no longer needed to prevent
         resource leaks from open database connections.
+
+        The backend's close runs even when it reports no connection: a close
+        that failed may have dropped the connection while its resources are
+        still being released, and only the backend can say whether they now
+        are (#3558).
         """
-        if self._backend.is_connected:
-            await self._backend.close()
+        await self._backend.close()

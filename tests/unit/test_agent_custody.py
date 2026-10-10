@@ -22,24 +22,38 @@ def _step(outcome, calls=None):
     return step
 
 
-def test_no_owner_is_trusted_to_report_its_release_yet():
-    """Every owner's close still swallows failures (#3558, #3559, #3560)."""
-    assert TRUTHFUL_CLOSE_OWNERS == frozenset()
+def test_only_the_task_manager_is_trusted_to_report_its_release():
+    """Every other owner's close still swallows failures (#3559, #3560)."""
+    assert TRUTHFUL_CLOSE_OWNERS == frozenset({"task_manager"})
 
 
 @pytest.mark.asyncio
 async def test_an_unconverted_owner_that_reports_released_stays_held():
     custody = ResourceCustody()
-    custody.acquire("task_manager")
+    custody.acquire("llm_service")
     calls: list = []
 
     outcome = await custody.release(
-        "task_manager", _step(ReleaseOutcome.RELEASED, calls)
+        "llm_service", _step(ReleaseOutcome.RELEASED, calls)
     )
 
     assert calls == [ReleaseOutcome.RELEASED], "the release step still runs"
     assert outcome is ReleaseOutcome.UNKNOWN
-    assert custody.held == ("task_manager",)
+    assert custody.held == ("llm_service",)
+
+
+@pytest.mark.asyncio
+async def test_the_task_manager_reporting_released_leaves_custody():
+    """Its close raises on a failed store close, so it is believed (#3558)."""
+    custody = ResourceCustody()
+    custody.acquire("task_manager")
+
+    outcome = await custody.release(
+        "task_manager", _step(ReleaseOutcome.RELEASED)
+    )
+
+    assert outcome is ReleaseOutcome.RELEASED
+    assert custody.held == ()
 
 
 @pytest.mark.asyncio

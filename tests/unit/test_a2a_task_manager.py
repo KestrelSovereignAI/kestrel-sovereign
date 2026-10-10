@@ -7,7 +7,7 @@ Tests task lifecycle management and background processing.
 import asyncio
 import os
 import tempfile
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -477,6 +477,163 @@ class TestTaskManager:
             recipient_agent_id="test-agent",
         )
         assert len(session_tasks) == 2
+
+
+_STORE_NAMES = (
+    "feedback_store",
+    "memory_service",
+    "observability_store",
+    "session_service",
+    "task_store",
+)
+
+
+def _open_stores(manager) -> set[str]:
+    return {
+        name
+        for name in _STORE_NAMES
+        if getattr(manager, name).backend.is_connected
+    }
+
+
+class TestTaskManagerClose:
+    """``close`` reports a store it could not close, and a retry closes it (#3558)."""
+
+    @pytest.mark.asyncio
+    async def test_close_closes_every_store(self, db_path):
+        manager = track_manager(await create_task_manager(db_path))
+        assert _open_stores(manager) == set(_STORE_NAMES)
+
+        await manager.close()
+
+        assert _open_stores(manager) == set()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_store_close_raises_and_the_retry_closes_it(
+        self, db_path
+    ):
+        manager = track_manager(await create_task_manager(db_path))
+        backend = manager.observability_store.backend
+
+        with patch.object(
+            backend, "close", side_effect=ConnectionError("injected close failure")
+        ):
+            with pytest.raises(ConnectionError, match="injected close failure"):
+                await manager.close()
+
+        # The stores before and after it were still closed, and it stays on the
+        # manager, still open, for a later close to retry.
+        assert _open_stores(manager) == {"observability_store"}
+        assert manager.observability_store.backend is backend
+
+        await manager.close()
+
+        assert _open_stores(manager) == set()
+
+    @pytest.mark.asyncio
+    async def test_every_store_that_failed_to_close_is_named(self, db_path):
+        manager = track_manager(await create_task_manager(db_path))
+
+        with patch.object(
+            manager.memory_service.backend,
+            "close",
+            side_effect=ConnectionError("memory close failed"),
+        ), patch.object(
+            manager.task_store.backend,
+            "close",
+            side_effect=OSError("task close failed"),
+        ):
+            with pytest.raises(ConnectionError, match="memory close failed") as raised:
+                await manager.close()
+
+        notes = raised.value.__notes__
+        assert any("memory_service" in note for note in notes)
+        assert any(
+            "task_store" in note and "task close failed" in note for note in notes
+        )
+        assert _open_stores(manager) == {"memory_service", "task_store"}
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_drain_leaves_every_store_open_for_a_retry(
+        self, db_path
+    ):
+        manager = track_manager(await create_task_manager(db_path))
+
+        with patch.object(
+            manager,
+            "drain_execution_tasks",
+            AsyncMock(side_effect=asyncio.CancelledError()),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await manager.close()
+
+        assert _open_stores(manager) == set(_STORE_NAMES)
+
+        await manager.close()
+
+        assert _open_stores(manager) == set()
+
+    @pytest.mark.asyncio
+    async def test_a_store_still_retiring_fails_every_close_until_it_exits(
+        self, db_path, monkeypatch
+    ):
+        """A failed close drops the connection before its worker has exited.
+
+        A retry must keep failing while that worker runs, rather than read the
+        dropped connection as a store already closed.
+        """
+        import threading
+
+        import kestrel_sovereign.storage.db.sqlite as sqlite_backend_module
+        from kestrel_sovereign.storage.db import ConnectionError as BackendError
+        from tests.utils.aiosqlite_workers import (
+            aiosqlite_worker,
+            delay_aiosqlite_worker_exit,
+        )
+
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+        delayed: list = []
+        with delay_aiosqlite_worker_exit(
+            release_worker,
+            worker_exit_delayed,
+            should_delay=lambda worker: worker in delayed,
+        ) as workers:
+            manager = track_manager(await create_task_manager(db_path))
+            backend = manager.session_service.backend
+            worker = aiosqlite_worker(backend._connection)
+            delayed.append(worker)
+            monkeypatch.setattr(
+                sqlite_backend_module, "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S", 0.01
+            )
+            try:
+                # Under load an earlier store can miss the shortened deadline
+                # too and be the one raised; the session store is named either way.
+                with pytest.raises(BackendError) as raised:
+                    await manager.close()
+                assert any(
+                    "could not close session_service" in note
+                    for note in raised.value.__notes__
+                )
+                assert workers == [worker]
+                assert backend.connection_retirement_pending
+                assert _open_stores(manager) == set()
+
+                with pytest.raises(BackendError, match="still retiring"):
+                    await manager.close()
+            finally:
+                release_worker.set()
+                worker.join(timeout=5.0)
+
+        assert not worker.is_alive()
+        # Under load another store's worker can miss the shortened deadline
+        # too; the retry is only expected to succeed once every worker exited.
+        backends = [getattr(manager, name).backend for name in _STORE_NAMES]
+        async with asyncio.timeout(10.0):
+            while any(b.connection_retirement_pending for b in backends):
+                await asyncio.sleep(0.01)
+        await manager.close()
+        assert not backend.connection_retirement_pending
 
 
 class TestOnTaskSubmittedCallback:
