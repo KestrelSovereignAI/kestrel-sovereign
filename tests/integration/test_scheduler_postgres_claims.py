@@ -1344,6 +1344,7 @@ async def test_postgres_renewal_does_not_resurrect_expired_token_after_row_lock_
     row_lock_held = asyncio.Event()
     blocked_renewal_started = asyncio.Event()
     blocked_renewal_finished = asyncio.Event()
+    blocked_renewal_cancelled = asyncio.Event()
     blocked_renewal_results: list[bool] = []
 
     async def executor(_task_name, _args):
@@ -1362,6 +1363,9 @@ async def test_postgres_renewal_does_not_resurrect_expired_token_after_row_lock_
                 renewed = await super()._renew_lease_once(task)
                 blocked_renewal_results.append(renewed)
                 return renewed
+            except asyncio.CancelledError:
+                blocked_renewal_cancelled.set()
+                raise
             finally:
                 blocked_renewal_finished.set()
 
@@ -1432,7 +1436,11 @@ async def test_postgres_renewal_does_not_resurrect_expired_token_after_row_lock_
 
         row_lock_held.clear()
         await asyncio.wait_for(blocked_renewal_finished.wait(), timeout=2)
-        assert blocked_renewal_results == [False]
+        # The independently confirmed deadline may cancel/join renewal before
+        # the row lock is released. Neither path may extend the durable lease.
+        assert blocked_renewal_results == [False] or (
+            blocked_renewal_results == [] and blocked_renewal_cancelled.is_set()
+        )
         assert locked_expiry is not None
         row = await db.fetchone(
             "SELECT lease_expires_at, claim_token FROM scheduled_tasks WHERE id = ?",

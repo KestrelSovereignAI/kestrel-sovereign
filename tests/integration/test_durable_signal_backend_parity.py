@@ -3383,87 +3383,90 @@ async def test_postgres_recovery_recreation_adopts_primary_before_live_ingress(
     if db_backend.backend_type != "postgres":
         pytest.skip("PostgreSQL primary/recovery row-lock race")
 
-    peer_backend = await _independent_backend(db_backend)
-    seed_store = DurableSignalStore(db_backend)
-    writer_store = DurableSignalStore(peer_backend)
-    await seed_store.initialize()
-    target_agent = f"did:test:recovery-adoption-race:z:{uuid4()}"
-    earlier_agent = f"did:test:recovery-adoption-race:a:{uuid4()}"
-    source = "provider.message"
-    for agent_id in (earlier_agent, target_agent):
-        await seed_store.persist_signal(
-            _signal(agent_id),
-            agent_id=agent_id,
-            source_event_id=f"recovery-adoption-seed:{uuid4()}",
-            retention_days=7,
-        )
-
-    # Recreate the independently recoverable table while preserving primary
-    # rows and immutable scope markers. The next initializer adopts one scope
-    # per transaction, always primary before recovery; pause on the target
-    # scope to prove a live writer cannot invert that edge.
-    await db_backend.execute("DROP TABLE durable_signal_source_sequence_recovery")
-    migrating_store = DurableSignalStore(db_backend)
-    primary_family_locked = asyncio.Event()
-    release_adoption = asyncio.Event()
-    migration_task = None
-    writer_task = None
-    original_source_sequence_locked = migrating_store._source_sequence_locked
-
-    async def pause_with_target_primary_locked(
-        *, agent_id, source, allow_retained_reconstruction=False
-    ):
-        sequence = await original_source_sequence_locked(
-            agent_id=agent_id,
-            source=source,
-            allow_retained_reconstruction=allow_retained_reconstruction,
-        )
-        if agent_id == target_agent:
-            primary_family_locked.set()
-            await release_adoption.wait()
-        return sequence
-
-    monkeypatch.setattr(
-        migrating_store,
-        "_source_sequence_locked",
-        pause_with_target_primary_locked,
-    )
-    try:
-        migration_task = asyncio.create_task(migrating_store.initialize())
-        await asyncio.wait_for(primary_family_locked.wait(), timeout=5)
-        writer_task = asyncio.create_task(
-            writer_store.persist_signal(
-                _signal(target_agent),
-                agent_id=target_agent,
-                source_event_id=f"recovery-adoption-live:{uuid4()}",
+    # The recreated family belongs to this test, not accumulated parity rows.
+    # Keep the five-second boundary wait a race check, not a global backfill SLA.
+    async with _independent_postgres_schema_backend(db_backend) as db_backend:
+        peer_backend = await _independent_backend(db_backend)
+        seed_store = DurableSignalStore(db_backend)
+        writer_store = DurableSignalStore(peer_backend)
+        await seed_store.initialize()
+        target_agent = f"did:test:recovery-adoption-race:z:{uuid4()}"
+        earlier_agent = f"did:test:recovery-adoption-race:a:{uuid4()}"
+        source = "provider.message"
+        for agent_id in (earlier_agent, target_agent):
+            await seed_store.persist_signal(
+                _signal(agent_id),
+                agent_id=agent_id,
+                source_event_id=f"recovery-adoption-seed:{uuid4()}",
                 retention_days=7,
             )
-        )
-        await asyncio.sleep(0.2)
-        assert writer_task.done() is False
 
-        release_adoption.set()
-        _, persisted = await asyncio.wait_for(
-            asyncio.gather(migration_task, writer_task), timeout=10
+        # Recreate the independently recoverable table while preserving primary
+        # rows and immutable scope markers. The next initializer adopts one scope
+        # per transaction, always primary before recovery; pause on the target
+        # scope to prove a live writer cannot invert that edge.
+        await db_backend.execute("DROP TABLE durable_signal_source_sequence_recovery")
+        migrating_store = DurableSignalStore(db_backend)
+        primary_family_locked = asyncio.Event()
+        release_adoption = asyncio.Event()
+        migration_task = None
+        writer_task = None
+        original_source_sequence_locked = migrating_store._source_sequence_locked
+
+        async def pause_with_target_primary_locked(
+            *, agent_id, source, allow_retained_reconstruction=False
+        ):
+            sequence = await original_source_sequence_locked(
+                agent_id=agent_id,
+                source=source,
+                allow_retained_reconstruction=allow_retained_reconstruction,
+            )
+            if agent_id == target_agent:
+                primary_family_locked.set()
+                await release_adoption.wait()
+            return sequence
+
+        monkeypatch.setattr(
+            migrating_store,
+            "_source_sequence_locked",
+            pause_with_target_primary_locked,
         )
-        assert persisted.source_sequence == 2
-        assert await db_backend.fetch_val(
-            "SELECT current_sequence FROM durable_signal_source_sequences "
-            "WHERE agent_id = ? AND source = ?",
-            (target_agent, source),
-        ) == 2
-        assert await db_backend.fetch_val(
-            "SELECT recovery_sequence "
-            "FROM durable_signal_source_sequence_recovery "
-            "WHERE agent_id = ? AND source = ?",
-            (target_agent, source),
-        ) == 2
-    finally:
-        release_adoption.set()
-        await _cancel_and_drain(migration_task, writer_task)
-        # Leave the shared parity database in the completed family shape.
-        await DurableSignalStore(db_backend).initialize()
-        await peer_backend.close()
+        try:
+            migration_task = asyncio.create_task(migrating_store.initialize())
+            await asyncio.wait_for(primary_family_locked.wait(), timeout=5)
+            writer_task = asyncio.create_task(
+                writer_store.persist_signal(
+                    _signal(target_agent),
+                    agent_id=target_agent,
+                    source_event_id=f"recovery-adoption-live:{uuid4()}",
+                    retention_days=7,
+                )
+            )
+            await asyncio.sleep(0.2)
+            assert writer_task.done() is False
+
+            release_adoption.set()
+            _, persisted = await asyncio.wait_for(
+                asyncio.gather(migration_task, writer_task), timeout=10
+            )
+            assert persisted.source_sequence == 2
+            assert await db_backend.fetch_val(
+                "SELECT current_sequence FROM durable_signal_source_sequences "
+                "WHERE agent_id = ? AND source = ?",
+                (target_agent, source),
+            ) == 2
+            assert await db_backend.fetch_val(
+                "SELECT recovery_sequence "
+                "FROM durable_signal_source_sequence_recovery "
+                "WHERE agent_id = ? AND source = ?",
+                (target_agent, source),
+            ) == 2
+        finally:
+            release_adoption.set()
+            await _cancel_and_drain(migration_task, writer_task)
+            # Leave the shared parity database in the completed family shape.
+            await DurableSignalStore(db_backend).initialize()
+            await peer_backend.close()
 
 
 @pytest.mark.asyncio
