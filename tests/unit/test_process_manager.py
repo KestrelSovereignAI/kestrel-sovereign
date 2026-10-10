@@ -539,6 +539,28 @@ class TestRegisterAgent:
 class TestStartAgent:
     """Test starting agent processes (mocked subprocess)."""
 
+    @pytest.mark.parametrize("detach_output", [False, True])
+    def test_output_strategy_is_explicit_without_changing_supervisor_default(
+        self, pm, project_dir, detach_output
+    ):
+        cfg = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
+        options = {"detach_output": True} if detach_output else {}
+        with (
+            patch.object(pm, "_spawn", return_value=12345) as pumped,
+            patch.object(pm, "_spawn_detached", return_value=12345) as detached,
+        ):
+            agent = pm.start_agent("claw", cfg, standalone=True, **options)
+        selected, unused = (detached, pumped) if detach_output else (pumped, detached)
+        selected.assert_called_once()
+        unused.assert_not_called()
+        assert agent.pid == 12345
+        assert selected.call_args.kwargs["port"] == cfg.port
+        assert selected.call_args.args[1]["KESTREL_SERVE_UI"] == "true"
+        if detach_output:
+            assert "agent_name" not in selected.call_args.kwargs
+        else:
+            assert selected.call_args.kwargs["agent_name"] == "claw"
+
     def test_managed_subprocess_refuses_co_resident_sovereign_key(
         self,
         pm,

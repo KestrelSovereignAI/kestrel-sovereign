@@ -908,6 +908,7 @@ class ProcessManager:
         standalone: bool = False,
         *,
         roster: Optional[MultiAgentConfig] = None,
+        detach_output: bool = False,
     ) -> AgentProcess:
         """Start a single agent process.
 
@@ -920,6 +921,9 @@ class ProcessManager:
             roster: Active launcher configuration. Bulk starts pass their
                 exact in-memory roster so trust construction cannot reload a
                 different project file.
+            detach_output: Route output directly to the agent log for a
+                fire-and-exit launcher. Persistent supervisors retain the
+                default log-and-host-stdout pump.
 
         Returns:
             AgentProcess with pid set on success.
@@ -1191,9 +1195,17 @@ class ProcessManager:
         )
         env.update(registry_env)
         try:
-            pid = self._spawn(
-                cmd, env, log_file, pid_file, agent_name=name, port=config.port
-            )
+            if detach_output:
+                # A named CLI launcher returns after readiness. Its child
+                # must not depend on a daemon thread in that exiting process
+                # for continued logging or safe interpreter shutdown.
+                pid = self._spawn_detached(
+                    cmd, env, log_file, pid_file, port=config.port
+                )
+            else:
+                pid = self._spawn(
+                    cmd, env, log_file, pid_file, agent_name=name, port=config.port
+                )
         except BaseException:
             if registry_file is not None:
                 registry_file.unlink(missing_ok=True)

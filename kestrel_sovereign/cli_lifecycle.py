@@ -273,7 +273,13 @@ def cmd_start(args) -> int:
         agent_cfg = local_agents[args.name]
         print(f"   Starting {args.name} on :{agent_cfg.port}...", end="", flush=True)
         try:
-            pm.start_agent(args.name, agent_cfg, multi_agent.host.bind, standalone=True)
+            pm.start_agent(
+                args.name,
+                agent_cfg,
+                multi_agent.host.bind,
+                standalone=True,
+                detach_output=True,
+            )
         except RuntimeError as e:
             print("          \u274c")
             print(f"   {e}")
