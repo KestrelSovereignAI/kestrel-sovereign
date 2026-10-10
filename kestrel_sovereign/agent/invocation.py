@@ -25,7 +25,7 @@ from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     bind_execution_cleanup, bind_execution_runtime, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
-    execution_commit_outcome,
+    execution_commit_outcome, execution_terminal_error,
 )
 from kestrel_sovereign.auth import (
     caller_context_binding_scope,
@@ -858,6 +858,7 @@ def bind_async_generator_invocation(
                         yield item
                 finally:
                     active_error = sys.exception()
+                    source_close_error = None
                     if active_error is not None and execution_commit_outcome(active_error) is not None:
                         cleanup_abandoned = True
                     try:
@@ -871,18 +872,21 @@ def bind_async_generator_invocation(
                                 if callable(close_iterator):
                                     await close_iterator()
                             except BaseException as close_error:
+                                source_close_error = close_error
                                 if execution_commit_outcome(close_error) is not None:
                                     cleanup_abandoned = True
                                 raise
                             finally:
                                 try:
                                     await checkpoint_completed_effects()
-                                except BaseException:
+                                except BaseException as checkpoint_error:
                                     cleanup_abandoned = cleanup_abandoned or (
                                         effect_checkpoint.completed
                                         and not effect_checkpoint.checkpointed
                                     )
-                                    raise
+                                    raise execution_terminal_error(
+                                        active_error, source_close_error, checkpoint_error
+                                    )
                     finally:
                         if registered:
                             if cleanup_abandoned:

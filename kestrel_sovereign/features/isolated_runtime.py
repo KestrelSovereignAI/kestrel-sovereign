@@ -11953,7 +11953,10 @@ class ProxyFeature(Feature):
                 "tool": name,
                 "success": False,
             }
-        except IsolatedRuntimePreparationError:
+        except IsolatedRuntimePreparationError as error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(error):
+                raise
             if context is not None:
                 raise
             return {

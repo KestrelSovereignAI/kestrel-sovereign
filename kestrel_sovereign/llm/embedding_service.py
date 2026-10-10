@@ -4,6 +4,7 @@ Embedding Service for Kestrel.
 Provides text embeddings using Ollama's embedding models.
 This replaces the need for local sentence-transformers installation.
 """
+import asyncio
 import hashlib
 import inspect
 import logging
@@ -13,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional
 import numpy as np
 
 from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, bind_execution_cleanup, bind_execution_runtime, require_execution_work
+from kestrel_sovereign.execution_custody import await_execution_work, bind_execution_cleanup, bind_execution_runtime, require_execution_work, is_execution_control_error, execution_commit_outcome, execution_terminal_error
 
 from .adapter import ReportedUsage
 from .modality_recording import ModalityCall
@@ -343,6 +344,8 @@ class EmbeddingService:
                 return embeddings[0]
             return None
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             self._handle_embed_error(e, "Embedding failed")
             return None
 
@@ -367,6 +370,8 @@ class EmbeddingService:
             )
             return response.get('embeddings', [None] * len(texts))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             self._handle_embed_error(e, "Batch embedding failed")
             return [None] * len(texts)
 
@@ -394,6 +399,8 @@ class EmbeddingService:
                 return embeddings[0]
             return None
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             self._handle_embed_error(e, "Async embedding failed")
             return None
 
@@ -414,6 +421,8 @@ class EmbeddingService:
             embeddings = response.get("embeddings", [])
             return embeddings[0] if embeddings else None
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             self._handle_embed_error(exc, "Async query embedding failed")
             return None
 
@@ -446,6 +455,8 @@ class EmbeddingService:
             )
             return response.get('embeddings', [None] * len(texts))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             self._handle_embed_error(e, "Async batch embedding failed")
             return [None] * len(texts)
 
@@ -596,6 +607,8 @@ class ProviderEmbeddingService:
                 try:
                     declared = adapter_space_id()
                 except Exception as exc:  # pragma: no cover - defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "adapter.embedding_space_id() failed for %s: %s",
                         type(self.adapter).__name__,
@@ -677,7 +690,7 @@ class ProviderEmbeddingService:
             error = exc
             raise
         finally:
-            with (bind_execution_cleanup(recorder) if error is not None else bind_execution_runtime(recorder)):
+            with (bind_execution_cleanup(recorder) if error is not None and (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error)) else bind_execution_runtime(recorder)):
                 try:
                     await recorder.record_modality_call(
                         self._embedding_call(
@@ -690,9 +703,14 @@ class ProviderEmbeddingService:
                             context=context,
                         )
                     )
-                except ExecutionAuthorityError:
-                    if error is None:
-                        raise
+                except Exception as accounting_error:
+                    if (
+                        error is None
+                        or not is_execution_control_error(accounting_error)
+                        or not (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error))
+                        or execution_commit_outcome(accounting_error) is not None
+                    ):
+                        raise execution_terminal_error(error, accounting_error)
         require_execution_work(recorder)
         return result
 
@@ -822,6 +840,8 @@ class ProviderEmbeddingService:
                 ),
             )
         except ValueError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "Could not derive embedding profile for %s: %s",
                 provider_label, exc,
@@ -982,6 +1002,8 @@ def get_provider_embedding_service(llm_service: Optional[Any] = None) -> Optiona
 
         return LLMService().get_embedding_service()
     except ImportError as exc:
+        if is_execution_control_error(exc):
+            raise
         # A circular import here means provider embeddings are disabled by a
         # code-structure bug, not by configuration — surface it loudly (#1792).
         # Everything that depends on embeddings (RAG, memory retrieval) silently
@@ -995,6 +1017,8 @@ def get_provider_embedding_service(llm_service: Optional[Any] = None) -> Optiona
         )
         return None
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         logger.warning("Provider embedding service not available: %s", exc)
         return None
 

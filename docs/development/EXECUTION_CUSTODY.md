@@ -139,6 +139,19 @@ be migrated before runtime admission to avoid a blocking bootstrap index build.
 
 ## Delivery status
 
+Forwarded streams establish their requested session before capturing the
+explicit turn/privacy-reentry carriers. They do not delegate the conversation
+hold: a child wake must queue for a distinct cognition turn. Scheduler cold
+preparation and dispatch run in one joined owner under the original confirmed
+deadline; expiry synchronously denies cancellation-resistant bootstrap children
+and interrupts/joins the owner, without holding database locks across boot.
+Cause-aware control classification applies before outer retries, stale-route
+or canary results, timeout conversion, subagent envelopes and failed-wake
+envelopes. Streaming settlement keeps unknown/committed evidence ahead of any
+checkpoint denial. Ordinary provider/validation failures with live original
+authority still record content-free accounting; control/cancellation cleanup
+does not reopen ordinary accounting writes.
+
 This is an implementation checkpoint, **not release approval**. Real native
 tests cover session termination/release races, original-generation scheduler
 renewal, retained runtime/backend denials, native graph/file/conversation writes,

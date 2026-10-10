@@ -31,7 +31,7 @@ from kestrel_sdk.llm.decisions import (
 )
 
 from kestrel_sovereign.config import load_section
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, bind_execution_cleanup, bind_execution_runtime, execution_work_operation, require_execution_work
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, bind_execution_cleanup, bind_execution_runtime, execution_work_operation, require_execution_work, is_execution_control_error, execution_commit_outcome, execution_terminal_error
 
 from .adapter import ReportedUsage
 from .decisions.config import (
@@ -213,6 +213,8 @@ class DecisionServiceMixin:
             except ExecutionAuthorityError:
                 raise
             except Exception as exc:  # noqa: BLE001 - any discovery failure marks the route stale
+                if is_execution_control_error(exc):
+                    raise
                 state.record_discovery_failure()
                 logger.warning(
                     "Decision discovery failed for %s (%s); keeping the last "
@@ -259,6 +261,8 @@ class DecisionServiceMixin:
                 ))
             normalize_response(CANARY_REQUEST, body)
         except ExecutionAuthorityError as exc:
+            if is_execution_control_error(exc):
+                raise
             error = exc
             raise
         except asyncio.CancelledError as exc:
@@ -266,15 +270,21 @@ class DecisionServiceMixin:
             state.canary_stale_since = state.canary_stale_since or time.time()
             raise
         except DecisionProtocolError as exc:
+            if is_execution_control_error(exc):
+                raise
             error = exc
             self._mark_pin_unverified(state, name, f"canary answer invalid: {exc}")
         except DecisionHTTPError as exc:
+            if is_execution_control_error(exc):
+                raise
             error = exc
             if exc.status_code == 404:
                 self._mark_pin_unverified(state, name, "endpoint or model not found (HTTP 404)")
             else:
                 state.canary_stale_since = state.canary_stale_since or time.time()
         except (DecisionTransportError, TimeoutError) as exc:
+            if is_execution_control_error(exc):
+                raise
             error = exc
             state.canary_stale_since = state.canary_stale_since or time.time()
             logger.warning("Decision pin canary for %s did not complete (%s)", name, type(exc).__name__)
@@ -396,6 +406,8 @@ class DecisionServiceMixin:
                 ))
                 normalized = normalize_response(snapshot, body)
         except TimeoutError as exc:
+            if is_execution_control_error(exc):
+                raise
             error = exc
             raise DecisionTimeout(
                 f"decision for {caller!r} exceeded {timeout_seconds}s"
@@ -457,7 +469,7 @@ class DecisionServiceMixin:
         reported = body.get("usage") if isinstance(body, Mapping) else None
         if isinstance(reported, Mapping):
             usage.add(input_tokens=reported.get("input_tokens"), cost=reported.get("cost"))
-        with (bind_execution_cleanup(self) if error is not None else bind_execution_runtime(self)):
+        with (bind_execution_cleanup(self) if error is not None and (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error)) else bind_execution_runtime(self)):
             try:
                 await self.record_modality_call(
                     ModalityCall(
@@ -478,6 +490,11 @@ class DecisionServiceMixin:
                         },
                     )
                 )
-            except ExecutionAuthorityError:
-                if error is None:
-                    raise
+            except Exception as accounting_error:
+                if (
+                    error is None
+                    or not is_execution_control_error(accounting_error)
+                    or not (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error))
+                    or execution_commit_outcome(accounting_error) is not None
+                ):
+                    raise execution_terminal_error(error, accounting_error)

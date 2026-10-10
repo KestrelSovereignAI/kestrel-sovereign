@@ -1420,6 +1420,8 @@ class OrchestratorEngineMixin:
         except ExecutionAuthorityError:
             raise
         except Exception as e:  # noqa: BLE001 — boundary catch is the contract
+            if is_execution_control_error(e):
+                raise
             logging.warning(
                 "[GOVERNED-DISPATCH] subagent execute raised source=%s feature=%s err=%s",
                 source, feature_name, e, exc_info=True,
@@ -1517,6 +1519,8 @@ class OrchestratorEngineMixin:
                 "tools": tools,
             })
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Never let event emission break the tool execution path
             logging.warning(
                 "Failed to emit tools_updated event for session %s: %s",
@@ -1923,6 +1927,8 @@ class OrchestratorEngineMixin:
                 )
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             print(f"a2a_tool_dispatches dispatch wrapper failed: {exc}", file=sys.stderr)
 
     async def _dispatch_feature_tool(
@@ -2057,12 +2063,16 @@ class OrchestratorEngineMixin:
         except ExecutionAuthorityError:
             raise
         except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
+            if is_execution_control_error(e):
+                raise
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
                 session_id=session_id, dispatch_meta=dispatch_meta,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
@@ -2135,6 +2145,8 @@ class OrchestratorEngineMixin:
         except ExecutionAuthorityError:
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.debug(f"[SECURITY] Could not check denied tools: {e}")
             return set()
 
@@ -2902,6 +2914,8 @@ class OrchestratorEngineMixin:
             try:
                 qualified = (selection() or {}).get("model")
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 logging.debug(
                     "[ORCHESTRATOR] get_active_model_selection failed (%s); "
                     "falling back to get_active_model_id.", exc,
@@ -2914,6 +2928,8 @@ class OrchestratorEngineMixin:
             try:
                 resolved = active()
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 logging.warning(
                     "[ORCHESTRATOR] Could not resolve the active model for "
                     "continuation pruning (%s).", exc,
@@ -2969,6 +2985,8 @@ class OrchestratorEngineMixin:
                 if limit:
                     return int(limit)
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 # Never silently substitute a window we can't justify — say
                 # which model failed to resolve and that the default is a guess.
                 logging.warning(

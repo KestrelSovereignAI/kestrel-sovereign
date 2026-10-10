@@ -928,7 +928,8 @@ async def test_scheduler_marker_rechecks_expiry_after_untouched_row_lock(native_
             await asyncio.gather(pending, return_exceptions=True)
 
 
-async def test_stalled_native_renewal_cancels_and_joins_expired_effect(native_pg):
+@pytest.mark.parametrize("phase", ["effect", "preparation"])
+async def test_stalled_native_renewal_cancels_and_joins_expired_effect(native_pg, phase):
     from datetime import datetime, timedelta, timezone
     from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask, SCHEDULER_PROTOCOL_VERSION
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -951,7 +952,20 @@ async def test_stalled_native_renewal_cancels_and_joins_expired_effect(native_pg
             cancelled.set()
             return "cancellation resisted"
 
-    runner = SchedulerRunner(db, "stalled-renewal", effect, owner_id="stalled-owner", lease_seconds=1)
+    executor = effect
+    if phase == "preparation":
+        from contextlib import asynccontextmanager
+        class PreparedExecutor:
+            @asynccontextmanager
+            async def prepare_scheduled(self, execution):
+                await effect()
+                async def dispatch():
+                    effects.append("stale dispatch")
+                yield dispatch
+            async def execute_scheduled(self, execution):
+                raise AssertionError("prepared path required")
+        executor = PreparedExecutor()
+    runner = SchedulerRunner(db, "stalled-renewal", executor, owner_id="stalled-owner", lease_seconds=1)
     await runner._ensure_tables()
     due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
     await db.execute("""INSERT INTO scheduled_tasks

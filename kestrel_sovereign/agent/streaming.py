@@ -1206,6 +1206,9 @@ class StreamingMixin:
                             invocation_context,
                             session_id=session_id,
                         ):
+                            # Establish the live session before capturing the
+                            # task-relative turn binding for the source task.
+                            self._active_session_id = session_id
                             async with owned_execution_stream(self, self._process_input_streaming_traced_locked(
                                 user_input, model_override, session_id, _otel_span,
                                 request_id=request_id, attachments=attachments,
