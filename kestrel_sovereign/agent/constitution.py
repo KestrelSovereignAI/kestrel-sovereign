@@ -999,7 +999,15 @@ class ConstitutionMixin:
             for attempt in range(3):
                 try:
                     conflict = None
-                    async with store._backend.transaction():
+                    # Reserve SQLite's writer slot before final attestation's
+                    # first read; a deferred WAL snapshot cannot be upgraded
+                    # after an unrelated connection commits.
+                    transaction = (
+                        store._backend.transaction(immediate=True)
+                        if store._backend.backend_type == "sqlite"
+                        else store._backend.transaction()
+                    )
+                    async with transaction:
                         if event_type == "safe_mode_exited":
                             await ConstitutionMixin._lock_verified_constitution_exit(self)
                         elif event_type == "audit_succeeded":
@@ -2995,7 +3003,7 @@ class ConstitutionMixin:
 
     async def _reconcile_runtime_genesis_receipt(self, agent_node: GraphNode) -> None:
         from kestrel_sovereign.constitution.genesis_audit import (
-            GenesisAuditError, reconcile_genesis_receipt, utc_timestamp,
+            archive_genesis_receipt, reconcile_genesis_receipt,
         )
 
         digest = agent_node.properties.get("constitution_hash")
@@ -3005,13 +3013,8 @@ class ConstitutionMixin:
             return
         expected = await ConstitutionMixin._genesis_publication_witness(self, agent_node)
         if existing is not None:
-            history = deepcopy(agent_node.properties.get("genesis_audit_history", []))
-            if len(history) >= 128:
-                raise GenesisAuditError("Genesis receipt history cannot safely archive another receipt")
-            history.append({"receipt": deepcopy(existing), "superseded_at": utc_timestamp(),
-                            "superseded_by_constitution_hash": digest,
-                            "provenance": "runtime:reconciled_historical_receipt"})
-            agent_node.properties["genesis_audit_history"] = history
+            archive_genesis_receipt(agent_node.properties, existing, constitution_hash=digest,
+                                   provenance="runtime:reconciled_historical_receipt")
         agent_node.properties["genesis_audit"] = resolved
         await self._persist_governance_receipt_node(agent_node, expected=expected)
 
@@ -3284,7 +3287,7 @@ class ConstitutionMixin:
 
         ConstitutionMixin._require_owned_constitution_commit(self)
         raw = self._raw_storage
-        async with raw.transaction():
+        async with raw.transaction(immediate=True):
             node = await raw.get_node(self.agent_id)
             digest = node.properties.get("constitution_hash") if node else None
             if not digest:

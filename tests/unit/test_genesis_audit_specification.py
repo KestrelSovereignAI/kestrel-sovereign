@@ -87,22 +87,23 @@ async def test_actual_submitted_prompt_is_bound_to_pass_and_rejection_receipts(r
 
 
 def test_legacy_failed_receipt_is_not_invalidated_by_a_new_specification():
+    old_hash = sha256(b"old governing content").hexdigest()
     receipt = {
         "status": "failed",
-        "constitution_hash": "old-content-hash",
+        "constitution_hash": old_hash,
         "completed_at": "2026-10-08T13:16:42Z",
         "risk_level": 3,
         "reasoning": "Historical rejection must remain a rejection.",
         "audited": True,
     }
     original = deepcopy(receipt)
-    assert validate_completed_genesis_audit(receipt, "old-content-hash") == "failed"
+    assert validate_completed_genesis_audit(receipt, old_hash) == "failed"
     assert receipt == original
 
     properties = {"genesis_audit": receipt}
     pending = supersede_genesis_audit(
         properties,
-        constitution_hash="new-content-hash",
+        constitution_hash=sha256(b"new governing content").hexdigest(),
         provenance="test:explicit_reanchor",
     )
     assert properties["genesis_audit_history"][0]["receipt"] == original

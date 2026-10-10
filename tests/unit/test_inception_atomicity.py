@@ -280,9 +280,9 @@ async def test_commit_delivery_error_preserves_committed_identity(
         lost = False
 
         @contextlib.asynccontextmanager
-        async def transaction():
+        async def transaction(**options):
             nonlocal lost
-            async with native_transaction():
+            async with native_transaction(**options):
                 yield db
             if not lost and not db.owns_open_transaction and await db.fetchone(
                 "SELECT node_id FROM graph_nodes WHERE node_id=?", (identity,),
@@ -414,8 +414,11 @@ async def test_inception_prelocks_complete_identity_graph_write_set(
     )
 
     assert events[0][0] == "lock"
-    assert set(events[0][1]) == {creds.agent_did, constitution[0]}
-    assert [event[0] for event in events].count("lock") == 1
+    assert set(events[0][1]) == {creds.agent_did}  # early lifetime refusal
+    assert events[1][0] == "lock"
+    assert set(events[1][1]) == {creds.agent_did, constitution[0]}
+    assert [event[0] for event in events].count("lock") == 2
+    assert all(event[0] == "add_node" for event in events[2:])
 
 
 @pytest.mark.asyncio

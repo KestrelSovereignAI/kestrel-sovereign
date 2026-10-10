@@ -380,7 +380,9 @@ def _born_hybrid_identity_paths(output_dir: Path, slug: str) -> list[Path]:
     ]
 
 
-def backup_or_refuse_existing_identity(output_dir: Path, slug: str, force: bool) -> None:
+def backup_or_refuse_existing_identity(
+    output_dir: Path, slug: str, force: bool, *, backups: list | None = None,
+) -> None:
     """Guard against silently overwriting or shadowing an existing
     hybrid identity in ``output_dir``.
 
@@ -443,7 +445,68 @@ def backup_or_refuse_existing_identity(output_dir: Path, slug: str, force: bool)
     for p in existing:
         backup = Path(f"{p}.backup-{stamp}")
         shutil.move(str(p), backup)
+        if backups is not None:
+            backups.append((p, backup))
         logging.warning("Backed up existing %s → %s before re-inception.", p, backup)
+
+
+async def _assert_fresh_inception_lifetime(db, identity: str) -> None:
+    """Check physical identity and lifetime under the caller's graph custody."""
+    if await db.fetchone("SELECT node_id FROM graph_nodes WHERE node_id=?", (identity,)) is not None:
+        raise ValueError("Inception refuses an existing identity; use authorized recovery")
+    if db.backend_type == "postgres":
+        await db.fetchone(
+            "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ?, 0))",
+            (":constitution_runtime_lifetime:" + identity,),
+        )
+    from kestrel_sovereign.identity.birth_record import assert_birth_replay_custody
+
+    await assert_birth_replay_custody(db, identity, retain=True)
+    for table in ("constitution_runtime_state", "constitution_runtime_events"):
+        if await db.table_exists(table) and await db.fetchone(
+            f"SELECT agent_id FROM {table} WHERE agent_id=? LIMIT 1", (identity,),
+        ) is not None:
+            raise ValueError("Inception refuses an existing constitutional lifetime; use authorized recovery")
+
+
+def _publish_staged_identity(paths: list[Path], output_dir: Path, *, slug, force) -> list[Path]:
+    """Publish only after the final native refusal checks, before its commit.
+
+    Restore original active names if this bounded synchronous publication
+    fails. Existing-root refusal never reaches this function. A lost commit
+    acknowledgement retains the published keys, not an old root's replacements.
+    """
+    backups, installed = [], []
+    try:
+        if slug is not None:
+            backup_or_refuse_existing_identity(output_dir, slug, force, backups=backups)
+        for source in paths:
+            destination = output_dir / source.name
+            # Atomic no-replace publication, including if another filesystem
+            # actor created a destination after the native admission check.
+            os.link(source, destination, follow_symlinks=False)
+            installed.append(destination)
+            source.unlink()
+    except BaseException:
+        for path in reversed(installed):
+            path.unlink()
+        for original, backup in reversed(backups):
+            # Never overwrite a competing active artifact while restoring.
+            os.link(backup, original, follow_symlinks=False)
+            backup.unlink()
+        raise
+    return installed
+
+
+def _discard_identity_staging(directory: Path | None, paths: list[Path]) -> None:
+    """Remove only this attempt's bounded, explicit staged artifact set."""
+    if directory is None:
+        return
+    cleanup_artifacts(paths)
+    try:
+        directory.rmdir()
+    except OSError:
+        logging.warning("Identity staging directory retained for recovery: %s", directory)
 
 
 def save_born_hybrid_identity(
@@ -709,6 +772,10 @@ async def create_kestrel_identity_async(
             slug = validate_did_web_slug(
                 f"{slugify_agent_name(agent_name)}-{secrets.token_hex(3)}"
             )
+        # Validate the deterministic name before creating a DB or key file.
+        from kestrel_sovereign.identity.did_web import build_did
+
+        deterministic_did = build_did(domain, [slug])
 
     # Determine if we're using external database or creating SQLite
     using_external_db = database is not None
@@ -760,15 +827,32 @@ async def create_kestrel_identity_async(
     files = AsyncFileStore(db)
     graph = AsyncGraphStore(db)
 
+    if method == IDENTITY_METHOD_DID_WEB:
+        # This early probe avoids minting over a known identity. The final
+        # locked check below is still authoritative after provider awaits.
+        try:
+            async with db.transaction(immediate=True):
+                await graph.lock_nodes_for_update([deterministic_did])
+                await _assert_fresh_inception_lifetime(db, deterministic_did)
+        except BaseException:
+            if not using_external_db:
+                await db.close()
+                cleanup_artifacts([db_path])
+            raise
+
     # 1+2. Generate cryptographic identity and persist it.
     # Default (#2397): born-hybrid did:web (Ed25519 + ML-DSA-65).
     # Explicit opt-out: identity_method="did:pkh" (classical secp256k1).
     # Method / domain / slug were resolved and validated pre-DB above.
     identity_paths: list[Path]
+    identity_stage_dir = None
+    staged_identity_paths = []
 
     if method == IDENTITY_METHOD_DID_WEB:
         try:
-            backup_or_refuse_existing_identity(Path(output_dir), slug, force)
+            import tempfile
+
+            identity_stage_dir = Path(tempfile.mkdtemp(prefix=".inception-", dir=output_dir))
             # A malformed domain (scheme, port, path) raises in here —
             # keep it inside the cleanup path so a failed mint never
             # leaves a half-created database behind.
@@ -781,38 +865,41 @@ async def create_kestrel_identity_async(
                 logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
             else:
                 logging.info(f"Generated DID: {agent_did}")
+            staged_identity_paths = _born_hybrid_identity_paths(identity_stage_dir, slug)
             identity_paths = save_born_hybrid_identity(
-                did_document, hybrid_identity, archival_kp, slug, Path(output_dir),
+                did_document, hybrid_identity, archival_kp, slug, identity_stage_dir,
             )
-        except Exception:
+        except BaseException:
+            _discard_identity_staging(identity_stage_dir, staged_identity_paths)
             if not using_external_db:
                 await db.close()
                 cleanup_artifacts([db_path])
             raise
         logging.info(f"Saved born-hybrid keys ({slug}_*) to {output_dir}")
     else:
-        did_document, keys = generate_kestrel_identity()
-        agent_did = did_document["id"]
+        try:
+            did_document, keys = generate_kestrel_identity()
+            agent_did = did_document["id"]
+            if parent_did:
+                did_document["controller"] = parent_did
+                logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
+            else:
+                logging.info(f"Generated DID: {agent_did}")
+            key_id = f"kestrel_{keys['address']}"
+            import tempfile
 
-        # If spawned by a parent, add controller field to DID document
-        if parent_did:
-            did_document["controller"] = parent_did
-            logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
-        else:
-            logging.info(f"Generated DID: {agent_did}")
-
-        # Save keys (encrypted if KESTREL_DATA_KEY is set)
-        key_id = f"kestrel_{keys['address']}"
-        save_kestrel_identity(did_document, keys, key_id, Path(output_dir))
-        key_path = Path(output_dir) / f"{key_id}.key.enc"
-        if not key_path.exists():
-            # Fallback path for plaintext
-            key_path = Path(output_dir) / f"{key_id}.pem"
-        # Include the DID document in every post-mint rollback. Previously the
-        # constitution cleanup removed only the private key and could strand a
-        # partial public identity after an audit/anchor failure (#2470).
-        identity_paths = [key_path, Path(output_dir) / f"{key_id}.json"]
-        logging.info(f"Saved keys to {key_path}")
+            identity_stage_dir = Path(tempfile.mkdtemp(prefix=".inception-", dir=output_dir))
+            # Name every possible partial artifact before the writer begins.
+            staged_identity_paths = [identity_stage_dir / f"{key_id}{suffix}"
+                                     for suffix in (".key.enc", ".pem", ".json")]
+            save_kestrel_identity(did_document, keys, key_id, identity_stage_dir)
+            identity_paths = [p for p in staged_identity_paths if p.exists()]
+        except BaseException:
+            _discard_identity_staging(identity_stage_dir, staged_identity_paths)
+            if not using_external_db:
+                await db.close()
+                cleanup_artifacts([db_path])
+            raise
 
     # Every graph row written during inception belongs to this newly minted
     # agent.  Bind before the shared/content-addressed constitution node is
@@ -1003,6 +1090,7 @@ async def create_kestrel_identity_async(
                 await db.close()
         finally:
             cleanup_artifacts(identity_paths if using_external_db else [*identity_paths, db_path])
+            _discard_identity_staging(identity_stage_dir, staged_identity_paths)
         raise
     # 4-6. Commit the constitution node, the agent node, and the governing
     #      edge as ONE atomic unit (#2867). An agent must never be recorded as
@@ -1038,22 +1126,7 @@ async def create_kestrel_identity_async(
             # key material, governance or consumed lifetime of that identity.
             # Inspect PHYSICAL roots (including foreign-owned roots) while
             # retaining the same graph custody used by birth/recovery writers.
-            if await db.fetchone("SELECT node_id FROM graph_nodes WHERE node_id=?", (agent_node.node_id,)) is not None:
-                raise ValueError("Inception refuses an existing identity; use authorized recovery")
-            if db.backend_type == "postgres":
-                await db.fetchone(
-                    "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ?, 0))",
-                    (":constitution_runtime_lifetime:" + agent_node.node_id,),
-                )
-            from kestrel_sovereign.identity.birth_record import assert_birth_replay_custody
-
-            await assert_birth_replay_custody(db, agent_node.node_id, retain=True)
-            for table in ("constitution_runtime_state", "constitution_runtime_events"):
-                if await db.table_exists(table) and await db.fetchone(
-                    f"SELECT agent_id FROM {table} WHERE agent_id=? LIMIT 1",
-                    (agent_node.node_id,),
-                ) is not None:
-                    raise ValueError("Inception refuses an existing constitutional lifetime; use authorized recovery")
+            await _assert_fresh_inception_lifetime(db, agent_node.node_id)
             from kestrel_sovereign.constitution.anchored_bytes import _store_exact_native_file
 
             await _store_exact_native_file(db, files, governing_bytes, "KESTREL_CONSTITUTION.md")
@@ -1062,6 +1135,11 @@ async def create_kestrel_identity_async(
             # 6. Link the agent to its constitution.
             await graph.add_edge(
                 agent_node.node_id, constitution_node.node_id, "governed_by"
+            )
+            identity_paths = _publish_staged_identity(
+                identity_paths, Path(output_dir),
+                slug=slug if method == IDENTITY_METHOD_DID_WEB else None,
+                force=force,
             )
             publication_body_completed = True
 
@@ -1087,7 +1165,12 @@ async def create_kestrel_identity_async(
         finally:
             if cleanup_safe:
                 cleanup_artifacts(identity_paths if using_external_db else [*identity_paths, db_path])
+            # Staged files never became active and are safe to discard even
+            # when a competing existing root caused the final refusal.
+            _discard_identity_staging(identity_stage_dir, staged_identity_paths)
         raise
+
+    _discard_identity_staging(identity_stage_dir, staged_identity_paths)
 
     # A completed audit has two durable witnesses: the structured node receipt
     # and a conversation/audit event. Pending is already explicit on the node

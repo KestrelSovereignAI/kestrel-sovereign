@@ -178,6 +178,22 @@ cannot claim another tenant's private graph properties; public shared-content
 metadata must pass canonical admission. A missing runtime identity cannot be
 restored from a frozen birth record once its constitutional lifetime was
 consumed. Signed recovery must preserve its existing audit history.
+
+Native inception checks deterministic identity/lifetime custody before minting,
+then checks again after audit/provider awaits. Keys remain in a private staging
+directory until final native admission, so even `force` cannot replace active
+keys on a refused birth. A partial filesystem publication restores the original
+active files; an uncertain database commit retains the published keys for
+recovery rather than deleting potentially committed identity material.
+
+Genesis receipt history has one shared publication/runtime limit of 128 entries.
+A repair requiring a 129th entry, or encountering already-overflowed or malformed
+history, refuses atomically and preserves all existing evidence. Neither runtime
+nor offline repair truncates receipts to make room. Repeating signed repairs is
+not permission to discard earlier content-audit verdicts.
+SQLite turn admission and final successful-audit/Safe-Mode-exit attestation reserve
+the writer slot before their first governance read, avoiding stale deferred WAL
+snapshots after unrelated writers commit. No provider work runs in that span.
 Surviving runtime events also veto unsigned replay if the current state row is
 lost. Such identities are not pending first-boot targets; offline tools retain
 the runtime target and return a structured refusal, not an uncaught exception.
