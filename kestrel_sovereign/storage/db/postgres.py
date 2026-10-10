@@ -101,7 +101,7 @@ class AdvisoryLease:
 
     def __init__(
         self, connection: Any,
-        on_loss: Callable[[AdvisoryLease], None] | None,
+        on_loss: Callable[["AdvisoryLease"], None] | None,
     ) -> None:
         self.backend_pid: int = connection.get_server_pid()
         self._connection = connection
