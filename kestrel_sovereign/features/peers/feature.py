@@ -2191,7 +2191,12 @@ class PeersFeature(Feature):
                 },
             )
 
-        # Spawn the supervisor as a FEATURE-owned background task. It runs the
+        # The POST and durable correlation insert completed under the caller's
+        # admission. Publish only its registered subscription as a resident
+        # source, not a continuation of that ending turn. The supervisor still
+        # revalidates the persisted outbound route and current peer directory;
+        # correlation alone never authorizes a route or a cognition turn.
+        # Spawn the supervisor as a FEATURE-owned resident task. It runs the
         # SSE loop, fires the a2a.question_answered signal on terminal frame,
         # and exits. Still agent-tracked (auto-cancelled at full agent shutdown
         # by ``_shutdown_background_tasks``), but also owned by this feature so
@@ -2200,7 +2205,7 @@ class PeersFeature(Feature):
         # (and could still fire a resumption signal) after this feature is torn
         # down (kestrel-sovereign#2522 P1). Same ownership as the startup-replay
         # supervisor and the hourly expiry sweep.
-        self._track_owned_background_task(
+        self._track_owned_runtime_task(
             self._supervise_a2a_question(
                 task_id=task_id,
                 recipient=recipient,
@@ -3638,8 +3643,9 @@ class PeersFeature(Feature):
         # occurrence that happened to boot this runtime. Publish one feature-
         # owned driver under the original runtime's READY barrier; replay's
         # supervisors, deferred signal joins and retries inherit that resident
-        # root through the ordinary child tracker. Live question supervisors
-        # still keep their caller's full custody and cannot use this handoff.
+        # root through the ordinary child tracker. A newly committed outbound
+        # question publishes its registered subscription through the same
+        # explicit resident contract; arbitrary effect children never do.
         if callable(getattr(type(agent), "_track_runtime_task", None)):
             self._track_owned_runtime_task(
                 self._replay_and_sweep_questions(store),

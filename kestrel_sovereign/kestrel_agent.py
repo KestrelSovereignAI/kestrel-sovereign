@@ -1534,6 +1534,13 @@ class KestrelAgent(
 
             if isinstance(self.llm_service, NativeLLMService):
                 self.llm_service.attach_to_agent(did, execution_custody=self._execution_custody)
+                # AgentManager supplies a service before native storage exists.
+                # It needs the same original-session usage executor as a
+                # directly constructed service, not a later SQLAlchemy pool.
+                self._llm_service_needs_native_usage = bool(
+                    self._execution_custody is not None
+                    and self.llm_service._usage_db is None
+                )
             else:
                 self.llm_service.attach_to_agent(did)
         # Mirror the construction-time display name onto the LLMService so LLM
@@ -8697,6 +8704,12 @@ Expected Duration: {expected_duration}
             raise RuntimeError(
                 "Cannot shut down an agent from a live durable signal operation"
             )
+        from kestrel_sovereign.execution_custody import (
+            retire_process_runtime_custody,
+        )
+        # Borrowed tenant/shared host authority must never be retired by
+        # shutting down one agent. Deny local children before any await.
+        retire_process_runtime_custody(getattr(self, "_execution_custody", None))
         storage_close_timeout = _minimum_storage_close_timeout(self.storage)
         # A feature may lazily create a file-backed SQLAlchemy factory during
         # its shutdown.  Reserve that backend-declared *potential* close

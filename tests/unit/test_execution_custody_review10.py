@@ -198,17 +198,20 @@ async def test_actual_isolated_supervisor_survives_claim_retirement_not_generati
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pool_supplied", [False, True])
-async def test_default_llm_boot_binds_storage_native_usage_before_first_consumer(monkeypatch, tmp_path, pool_supplied):
+@pytest.mark.parametrize("service_supplied", [False, True])
+async def test_default_llm_boot_binds_storage_native_usage_before_first_consumer(monkeypatch, tmp_path, pool_supplied, service_supplied):
     import kestrel_sovereign.kestrel_agent as agent_module
     from kestrel_sovereign.agent.boot import BootContext
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
     scope = ExecutionCustody(Authority())
     monkeypatch.setattr(agent_module, "_resolve_authenticated_agent_assertion_capability", lambda *args: None)
+    from kestrel_sovereign.llm.service import LLMService
+    service = LLMService(agent_data_dir=tmp_path) if service_supplied else None
     agent = KestrelAgent(
         did="did:test:default-native-usage", storage_path=str(tmp_path / "agent.db"), db_backend="postgres",
         database_url="postgresql://disposable.invalid/local",
-        pg_pool=object() if pool_supplied else None, execution_custody=scope,
+        pg_pool=object() if pool_supplied else None, execution_custody=scope, llm_service=service,
     )
     backend = PostgresBackend.__new__(PostgresBackend)
     backend._execution_custody = scope

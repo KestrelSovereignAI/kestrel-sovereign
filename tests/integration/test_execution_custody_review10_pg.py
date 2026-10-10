@@ -109,7 +109,7 @@ async def test_native_cognition_terminal_cas_never_revives_work_or_successor(nat
 
 
 @pytest.mark.parametrize("retained", [False, True])
-@pytest.mark.parametrize("carrier", ["direct", "cancel", "stop", "self-fence"])
+@pytest.mark.parametrize("carrier", ["direct", "cancel", "stop", "self-fence", "checkpoint", "checkpoint-cancel"])
 @pytest.mark.parametrize("outcome", ["unknown", "committed"])
 async def test_actual_native_cognition_keeps_uncertain_committed_effect_nonretryable(native_pg, retained, carrier, outcome):
     from kestrel_sovereign.signals import (
@@ -135,11 +135,14 @@ async def test_actual_native_cognition_keeps_uncertain_committed_effect_nonretry
     entered, release = asyncio.Event(), asyncio.Event()
     calls = 0
     handle = None
-    from kestrel_sovereign.agent.invocation import InvocationCancelledError, InvocationSelfFencedError
+    from kestrel_sovereign.agent.invocation import (
+        InvocationCancelledError, InvocationSelfFencedError,
+        bind_async_invocation, mark_current_invocation_effect_completed,
+    )
     error = ExecutionCommitOutcomeError(outcome)
-    if carrier != "direct":
+    if carrier not in {"direct", "checkpoint"}:
         error_type = {"cancel": asyncio.CancelledError, "stop": InvocationCancelledError,
-                      "self-fence": InvocationSelfFencedError}[carrier]
+                      "self-fence": InvocationSelfFencedError, "checkpoint-cancel": asyncio.CancelledError}[carrier]
         wrapper = error_type("Stop raced irreversible effect")
         wrapper.__cause__ = error
         error = wrapper
@@ -154,9 +157,21 @@ async def test_actual_native_cognition_keeps_uncertain_committed_effect_nonretry
                 await release.wait()
             except asyncio.CancelledError:
                 await release.wait()
+        if carrier.startswith("checkpoint"):
+            mark_current_invocation_effect_completed("session")
+            raise ValueError("ordinary turn failure after committed tool")
         raise error
 
-    agent.process_input = process_input
+    if carrier.startswith("checkpoint"):
+        class TurnOwner:
+            async def _persist_completed_tool_stop_checkpoint(self, **kwargs):
+                raise error
+            @bind_async_invocation("request_id")
+            async def turn(self, prompt, request_id=None):
+                return await process_input(prompt)
+        agent.process_input = TurnOwner().turn
+    else:
+        agent.process_input = process_input
     try:
         await dispatcher.register_durable_consumer(consumer)
         handle = await dispatcher.enqueue_durable_cognition(

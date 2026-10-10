@@ -105,6 +105,34 @@ class ExecutionFence(Protocol):
     async def lock_and_validate(self, connection: Any) -> None: ...
 
 
+@dataclass(eq=False)
+class ProcessRuntimeExecutionFence:
+    """Original process-owned runtime lifetime for a standalone PG host.
+
+    This is NOT a tenant row, distributed generation, Hold grant or scheduler
+    occurrence. A trusted standalone host creates one per runtime construction;
+    shutdown irrevocably retires it. Tenant hosts must supply their own native
+    generation fence instead. Ordinary calls still retain ALL ambient leases.
+    """
+
+    agent_id: str
+    backend_type: str = field(default="postgres", init=False)
+    _retired: bool = field(default=False, init=False)
+
+    def retire(self) -> None:
+        self._retired = True
+
+    def require_work(self) -> None:
+        if self._retired:
+            raise ExecutionAuthorityError("original process runtime retired")
+
+    async def lock_and_validate(self, connection: Any) -> None:
+        # No authority rows exist for a standalone process lifetime. Validate
+        # this SAME local object on the mutation's session; never check out a
+        # replacement lease or pretend it is distributed row authority.
+        self.require_work()
+
+
 @dataclass(frozen=True)
 class AdvisoryExecutionFence:
     """Carry a native advisory capability into storage and tool boundaries.
@@ -155,6 +183,14 @@ class ExecutionCustody:
         except ExecutionAuthorityError as error:
             self.revoke(str(error))
             raise
+
+
+def retire_process_runtime_custody(custody: ExecutionCustody | None) -> None:
+    """Retire only a locally owned standalone lifetime, never tenant authority."""
+    if isinstance(custody, ExecutionCustody) and isinstance(
+        custody.fence, ProcessRuntimeExecutionFence
+    ):
+        custody.fence.retire()
 
 
 _CURRENT_CUSTODY: ContextVar[tuple[ExecutionCustody, ...]] = ContextVar(

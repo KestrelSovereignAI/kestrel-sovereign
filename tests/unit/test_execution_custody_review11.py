@@ -171,3 +171,99 @@ async def test_boot_peer_replay_and_sweep_survive_only_original_runtime():
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_committed_question_subscription_outlives_requesting_turn():
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+    owner = runtime_owner()
+    owner._runtime_publication_ready.set()
+    owner.pending_a2a_questions = SimpleNamespace(insert=AsyncMock())
+    feature = PeersFeature(owner)
+    feature._post_a2a_task = AsyncMock(return_value=(
+        {"id": "task", "sessionId": "session"}, None, "did:test:peer", None,
+    ))
+    observed = []
+
+    async def subscription(**kwargs):
+        require_execution_work(owner)
+        observed.append(kwargs["task_id"])
+
+    feature._supervise_a2a_question = subscription
+    try:
+        with bind_execution_custody(Authority()):
+            await feature.send_a2a_question("peer", "question")
+        tasks = tuple(owner._background_tasks)
+        assert len(tasks) == 1
+        assert await asyncio.gather(*tasks, return_exceptions=True) == [None]
+        assert observed == ["task"]
+        owner.pending_a2a_questions.insert.assert_awaited_once()
+    finally:
+        await feature._cancel_owned_background_tasks()
+        for task in tuple(owner._background_tasks):
+            task.cancel()
+        await asyncio.gather(*tuple(owner._background_tasks), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retirement", ["none", "generation", "disable"])
+async def test_actual_live_question_subscription_retains_only_original_runtime(retirement):
+    from kestrel_sovereign.features.peers.directory import PeerSubscriptionEvent
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+    from tests.unit.test_send_a2a_question_supervisor import _DeliveredSignalHandle
+
+    owner = runtime_owner()
+    owner.did = "did:test:sender"
+    owner._runtime_publication_ready.set()
+    owner.pending_a2a_questions = SimpleNamespace(
+        insert=AsyncMock(), mark_resolved=AsyncMock(return_value=True),
+    )
+    owner.dispatcher = SimpleNamespace(enqueue_signal=AsyncMock(return_value=_DeliveredSignalHandle()))
+    feature = PeersFeature(owner)
+    feature._post_a2a_task = AsyncMock(return_value=(
+        {"id": "task", "sessionId": "session"}, None, "did:test:peer", None,
+    ))
+    feature._outbound_recipient_agent_id = AsyncMock(return_value="did:test:peer")
+    entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def subscribe(*args, **kwargs):
+        entered.set()
+        try:
+            await release.wait()
+            yield PeerSubscriptionEvent(event="status", data='{"status":"completed","message":"reply"}')
+        finally:
+            closed.set()
+
+    router = SimpleNamespace(subscribe_a2a_task=subscribe)
+    feature._resolve_retained_automatic_peer = AsyncMock(return_value=(router, object(), object()))
+    tasks = ()
+    try:
+        with bind_execution_custody(Authority()):
+            await feature.send_a2a_question("peer", "question")
+        tasks = tuple(owner._background_tasks)
+        await asyncio.wait_for(entered.wait(), 1)
+        if retirement == "generation":
+            owner._execution_custody.revoke("original question runtime retired")
+        if retirement == "disable":
+            await feature._cancel_owned_background_tasks()
+        release.set()
+        outcomes = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 1)
+        assert closed.is_set()
+        if retirement == "none":
+            assert outcomes == [None]
+            owner.pending_a2a_questions.mark_resolved.assert_awaited_once_with("task")
+            owner.dispatcher.enqueue_signal.assert_awaited_once()
+            signal = owner.dispatcher.enqueue_signal.await_args.args[0]
+            assert signal.target_agent == owner.did
+        else:
+            assert all(isinstance(error, (ExecutionAuthorityError, asyncio.CancelledError)) for error in outcomes)
+            owner.pending_a2a_questions.mark_resolved.assert_not_awaited()
+            owner.dispatcher.enqueue_signal.assert_not_awaited()
+        assert not feature._owned_background_tasks
+    finally:
+        release.set()
+        await feature._cancel_owned_background_tasks()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tuple(owner._background_tasks):
+            task.cancel()
+        await asyncio.gather(*tuple(owner._background_tasks), return_exceptions=True)

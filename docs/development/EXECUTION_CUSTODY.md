@@ -76,6 +76,24 @@ it also preserves an explicitly bound shared backend and refuses replacing
 that binding. Multi-tenant hosts should use an unbound shared operational pool
 and inject independent per-agent custody through the factory.
 
+The built-in standalone PostgreSQL server explicitly creates one
+`ProcessRuntimeExecutionFence` per agent construction. This declares only the
+original process-owned runtime lifetime: it is not a tenant row, distributed
+generation or scheduler occurrence. Cold boot checks the launching occurrence
+as well, while published resident services retain only the original runtime.
+Shutdown retires that local lifetime before yielding. It never retires borrowed
+tenant/shared-backend custody; multi-tenant hosts must supply their own native
+generation factory. Provider construction validates and binds the original
+custody first, and manager-supplied services reuse native agent usage storage.
+
+Owned iterators retain the original terminal exception independently of
+asyncio task retrieval, which otherwise discards cancellation causes after the
+first read. Requested close consumes only a private, control-free interrupt.
+Both later closure failures and caller cancellation preserve native authority
+and irreversible commit evidence. Completed-effect checkpoint failure likewise
+selects terminal evidence across the turn and checkpoint instead of making an
+ordinary turn failure retryable.
+
 Concurrent discovery owns each lazy child: control failure cancels and joins
 all siblings before choosing terminal evidence, including late uncertain commits.
 Tolerant discovery returns only ordinary failures as values. Catalog worker
@@ -154,8 +172,11 @@ control evidence before classification: an unknown/committed cognition effect
 is failed, non-ACKable and non-retryable, including retained late completions.
 Peers' restored-question replay and hourly backstop use one feature-owned
 resident driver after READY. Restored subscriptions, deferred terminal-signal
-joins and retries inherit that original runtime root. Live question supervisors
-remain ordinary children of their requesting turn. Feature disable and boot
+joins and retries inherit that original runtime root. Newly committed outbound
+questions likewise publish only their registered subscription as a resident
+source, after POST/correlation insert under live caller admission; subscriptions
+still verify the persisted outbound route and current peer scope. Ordinary
+children receive no such handoff. Feature disable and boot
 rollback still cancel/join exactly the feature's owned tasks.
 SDK event-reader callbacks are explicit new inbound events, not continuations
 of the completed boot claim. The registered exact-client handoff joins its

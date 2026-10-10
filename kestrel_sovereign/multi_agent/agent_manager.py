@@ -2642,11 +2642,6 @@ class AgentManager:
 
         db_path = str(resolved_dir / "kestrel_prime.db")
 
-        # Each agent gets its own LLMService (mutable model state). Bind it to
-        # THIS agent's data root: an in-process host shares one environment
-        # across every agent, so ``KESTREL_DB_PATH`` cannot name each agent's
-        # directory and usage rows would all land in one agent's DB (#2769).
-        llm_service = LLMService(agent_data_dir=resolved_dir)
         hosted_telegram_resolver = None
         if self._hosted_telegram_route_attestation_resolver_factory is not None:
             hosted_telegram_resolver = (
@@ -2732,10 +2727,18 @@ class AgentManager:
         execution_custody = self._execution_custody_for_agent(name, agent_did, config)
         if execution_custody is not None and not hosted_runtime_configured:
             raise ValueError("execution custody requires a PostgreSQL hosted runtime")
+        from kestrel_sovereign.execution_custody import bind_execution_custody_snapshot
+        llm_service = None
         scheduler_registration: Optional[
             _DynamicSchedulerTenantRegistration
         ] = None
         try:
+            # Validate both the original host generation and every ambient
+            # admission before provider clients/plugins can be constructed.
+            # The service belongs to THIS agent's data root (#2769).
+            captured = () if execution_custody is None else (execution_custody,)
+            with bind_execution_custody_snapshot(captured):
+                llm_service = LLMService(agent_data_dir=resolved_dir)
             scheduler_registration = (
                 await self._begin_dynamic_scheduler_tenant_registration(
                     name,
@@ -2989,6 +2992,8 @@ class AgentManager:
                         data_dir=config.resolve_data_dir(self._base_data_dir),
                     )
             else:
+                from kestrel_sovereign.execution_custody import retire_process_runtime_custody
+                retire_process_runtime_custody(execution_custody)
                 if scheduler_registration is not None:
                     rollback_task = asyncio.create_task(
                         scheduler_registration.rollback(),
@@ -3007,14 +3012,15 @@ class AgentManager:
                                 rollback_failure.__traceback__,
                             ),
                         )
-                try:
-                    await llm_service.close()
-                except Exception:
-                    logger.warning(
-                        "Failed to close LLM service for uninitialized agent %r",
-                        name,
-                        exc_info=True,
-                    )
+                if llm_service is not None:
+                    try:
+                        await llm_service.close()
+                    except Exception:
+                        logger.warning(
+                            "Failed to close LLM service for uninitialized agent %r",
+                            name,
+                            exc_info=True,
+                        )
             raise
         # Spawn-mandate enforcement (restricted_tools hook + spawn_mandate attach)
         # is reattached inside KestrelAgent.initialize() from the persisted

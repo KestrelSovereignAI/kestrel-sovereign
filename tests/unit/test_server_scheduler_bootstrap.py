@@ -464,6 +464,12 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     def _manager_factory(**kwargs):
         assert "shared_postgres_backend" not in kwargs
         assert kwargs["base_data_dir"] == runtime_base
+        factory = kwargs["execution_custody_factory"]
+        from kestrel_sovereign.execution_custody import ExecutionCustody, ProcessRuntimeExecutionFence
+        original = factory("ColdRoot", "did:test:cold-root", cold_root_config)
+        assert isinstance(original, ExecutionCustody)
+        assert isinstance(original.fence, ProcessRuntimeExecutionFence)
+        assert factory("ColdRoot", "did:test:cold-root", cold_root_config) is not original
         return manager
 
     def _load_config(*_args, **kwargs):

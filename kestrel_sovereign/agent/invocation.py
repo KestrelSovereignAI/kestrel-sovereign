@@ -443,13 +443,17 @@ def bind_async_invocation(
                     except BaseException as checkpoint_error:
                         # A completed effect without durable anti-repeat
                         # evidence remains unresolved, not a clean failure.
-                        # Retain the original error and existing exact Stop
-                        # identity; never reopen ordinary work for cleanup.
+                        # Keep irreversible evidence from either failure;
+                        # an ordinary turn error is not rollback proof for
+                        # its failed checkpoint. Never reopen ordinary work.
                         cleanup_abandoned = True
                         error.add_note(
                             "completed-effect checkpoint remains unresolved: "
                             f"{type(checkpoint_error).__name__}"
                         )
+                        terminal = execution_terminal_error(error, checkpoint_error)
+                        if terminal is not error:
+                            raise terminal
 
                 if track_request_lifecycle and lifecycle_owner is not None:
                     register = getattr(
