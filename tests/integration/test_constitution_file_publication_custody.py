@@ -303,7 +303,7 @@ async def test_signed_file_creation_validates_actual_concurrent_winner(
 
         if winner == "corrupt":
             with pytest.raises(
-                TransactionError, match="differs from exact signed content"
+                TransactionError, match="do not verify against exact publication content"
             ) as refused:
                 await publish()
             assert isinstance(refused.value.__cause__, RuntimeError)

@@ -1037,6 +1037,45 @@ class AsyncGraphStore:
             f"outside its shared shape: {node_type}/{label}"
         )
 
+    async def adopt_shared_content_node(self, node: GraphNode) -> None:
+        """Birth repair may admit an ownerless canonical public-content row.
+
+        Possessing a same-named file is not authority over arbitrary graph
+        properties. Use the ordinary shared-content shape and identity rules;
+        foreign-owned rows go through the canonical add_node admission path.
+        """
+        owner = self._node_owner(node)
+        shape = _SHARED_CONTENT_SHAPES.get((node.node_type, node.label))
+        if not owner or shape is None or not shape.is_shareable(node.properties, node.node_id):
+            raise ValueError("Birth adoption requires canonical shared-content metadata")
+        async with self.db.transaction():
+            await self.lock_nodes_for_update([node.node_id])
+            suffix = " FOR UPDATE" if self.db.backend_type == "postgres" else ""
+            existing = await self.db.fetchone(
+                "SELECT node_type, label, properties FROM graph_nodes WHERE node_id = ?" + suffix,
+                (node.node_id,),
+            )
+            owners = await self.db.fetchall(
+                "SELECT agent_id FROM graph_node_owners WHERE node_id = ?" + suffix,
+                (node.node_id,),
+            )
+            if existing is None or owners:
+                await self.add_node(node)
+                return
+            properties = json.loads(existing[2]) if existing[2] else {}
+            file_owner = await self.db.fetchone(
+                "SELECT 1 FROM file_owners WHERE content_hash = ? AND agent_id = ?" + suffix,
+                (node.node_id, owner),
+            )
+            if (
+                (existing[0], existing[1]) != (node.node_type, node.label)
+                or not shape.is_shareable(properties, node.node_id)
+                or not _agrees_on_shared_identity(properties, node.properties, shape)
+                or file_owner is None
+            ):
+                raise ValueError("Cannot adopt incompatible or private graph metadata")
+            await record_graph_node_owner(self.db, node.node_id, owner)
+
     async def add_node(self, node: GraphNode) -> None:
         """Add or update a node and its ownership witness atomically.
 

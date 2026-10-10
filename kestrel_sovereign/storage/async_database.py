@@ -3703,7 +3703,7 @@ class AsyncDatabase:
         return await self._backend.fetch_val(sql, params)
     
     @asynccontextmanager
-    async def transaction(self, *, immediate: bool = False):
+    async def transaction(self, *, immediate: bool = False, savepoint: bool = False):
         """Transaction context manager with automatic rollback on error.
 
         ``immediate`` asks SQLite for its writer slot at ``BEGIN`` instead of on
@@ -3714,8 +3714,8 @@ class AsyncDatabase:
         PostgreSQL serializes such a unit with a row lock instead (see
         ``ConversationSessionProjection._claim``).
         """
-        if immediate and self.backend_type == "sqlite":
-            async with self._backend.transaction(immediate=True):  # type: ignore[call-arg]
+        if (immediate or savepoint) and self.backend_type == "sqlite":
+            async with self._backend.transaction(immediate=immediate, savepoint=savepoint):  # type: ignore[call-arg]
                 yield
             return
         async with self._backend.transaction():

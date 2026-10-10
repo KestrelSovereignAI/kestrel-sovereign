@@ -107,7 +107,7 @@ async def test_signed_artifact_publication_validates_bytes_and_preserves_owner(
             error = result.error
         if damage == "corrupt":
             assert error is not None, result
-            assert "exact signed content" in error, error
+            assert "do not verify against exact publication content" in error, error
             assert (await storage.get_node(identity)).properties == before
         else:
             assert error is None, error
@@ -556,5 +556,81 @@ async def test_runtime_rights_validation_uses_exact_captured_edge_witness(
             (agent.agent_id,),
         )
         assert [row[0] for row in rows] == [prior_hash]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("writer", ["runtime", "offline"])
+async def test_signed_writers_refuse_readable_corrupt_legacy_rights(
+    db_backend, tmp_path, monkeypatch, writer
+):
+    """A genuine amendment signature cannot turn corrupt old bytes into rights evidence."""
+    identity = "did:test:corrupt-legacy-rights:" + uuid4().hex
+    db_path = tmp_path / "kestrel_prime.db"
+    storage = (
+        AsyncStorage(str(db_path), backend="sqlite", agent_id=identity)
+        if db_backend.backend_type == "sqlite"
+        else AsyncStorage(backend=db_backend, agent_id=identity)
+    )
+    await storage.initialize()
+    try:
+        agent = await _agent(storage)
+        active = resolve_governing_constitution_bytes(
+            EmancipationContract(enabled=True, terms="Retained legacy rights " + uuid4().hex)
+        )
+        old_hash = await storage.store_file(active, "legacy-active.md")
+        await storage.add_node(GraphNode(
+            node_id=identity, node_type="agent", label="legacy rights",
+            properties={"constitution_hash": old_hash},
+        ))
+        await agent._anchor_constitution_governance(old_hash)
+        # Deliberately no structured emancipation sidecar: the real writer
+        # must inspect the historical plaintext, which is physically corrupt.
+        dormant = resolve_governing_constitution_bytes(None)
+        await storage.db.execute_commit(
+            "UPDATE files SET content=?,metadata=NULL WHERE content_hash=?",
+            (dormant, old_hash),
+        )
+        artifact, root = _write_authority_files(tmp_path, dormant)
+        agent._sovereign_trust_root_path = root
+        properties = (await storage.get_node(identity)).properties
+        before = await agent._constitution_state_store.load(identity)
+        events = await agent._constitution_state_store.list_events(identity)
+        if writer == "runtime":
+            error = await ConstitutionMixin.reanchor_constitution(
+                agent, amendment_artifact_path=str(artifact)
+            )
+            assert error.startswith("Error:"), error
+        else:
+            target = (
+                offline.ReanchorTarget(db_path, "sqlite", identity)
+                if db_backend.backend_type == "sqlite"
+                else offline.ReanchorTarget(None, "postgres", identity, db_backend._dsn)
+            )
+
+            async def exact_target(*args, **kwargs):
+                return target
+
+            @asynccontextmanager
+            async def no_embedding(*args, **kwargs):
+                yield None
+
+            monkeypatch.setattr(offline, "resolve_reanchor_target", exact_target)
+            monkeypatch.setattr(offline, "_agent_embedding", no_embedding)
+            result = await offline.reanchor_constitution(
+                agent_name="corrupt legacy rights", agent_dir=tmp_path if target.anchor_path else None,
+                force=True, sovereign_trust_root_path=root, amendment_artifact_path=artifact,
+                runtime_backend=target.backend, runtime_dsn=target.dsn,
+                hosted_agent_did=identity if target.backend == "postgres" else None, environ={},
+            )
+            assert not result.reanchored and result.error is not None, result
+            error = result.error
+        assert "could not be read" in error and "irrevocable" in error, error
+        assert (await storage.get_node(identity)).properties == properties
+        assert await agent._constitution_state_store.load(identity) == before
+        assert await agent._constitution_state_store.list_events(identity) == events
+        assert await storage.retrieve_file(old_hash) == dormant
     finally:
         await storage.close()

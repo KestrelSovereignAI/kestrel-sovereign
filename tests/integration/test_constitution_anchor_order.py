@@ -15,6 +15,7 @@ from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 from tests.integration.test_constitution_refusal_races import _agent
+from tests.unit.test_constitution_audit import _seed_exit_governance
 from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
 from tests.utils.postgres_schema import (
     disposable_postgres_schema,
@@ -96,7 +97,8 @@ async def test_consent_wait_cannot_downgrade_intervening_lifecycle_refusal(db_ba
     try:
         agent = await _agent(storage)
         agent._boot_state = BootPhaseState.READY
-        await agent._record_successful_constitution_audit(source="ready fixture")
+        await _seed_exit_governance(agent, storage)
+        assert await agent._record_successful_constitution_audit(source="ready fixture")
         before = await agent._constitution_state_store.load(agent.agent_id)
         events_before = await agent._constitution_state_store.list_events(
             agent.agent_id

@@ -88,6 +88,83 @@ async def test_constitution_agent_and_edge_all_commit(external_db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_inception_refuses_corrupt_actual_conflict_winner(external_db, tmp_path):
+    """A generic store's returned input hash is not proof of persisted bytes."""
+    import hashlib
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
+
+    content = resolve_governing_constitution_bytes(None)
+    digest = hashlib.sha256(content).hexdigest()
+    await external_db.execute_commit(
+        "INSERT INTO files (content_hash,original_name,content) VALUES (?,?,?)",
+        (digest, "preexisting corruption", b"not the governing bytes"),
+    )
+    await external_db.execute_commit(
+        "INSERT INTO file_owners (content_hash,agent_id,original_name) VALUES (?,?,?)",
+        (digest, "did:test:prior-file-owner", "preexisting corruption"),
+    )
+    with pytest.raises(Exception, match="do not verify"):
+        await _incept(external_db, tmp_path)
+    assert (
+        await external_db.fetchall(
+            "SELECT node_id FROM graph_nodes WHERE node_type='agent'"
+        )
+        == []
+    )
+    assert (
+        await external_db.fetchall(
+            "SELECT source_id FROM graph_edges WHERE label='governed_by'"
+        )
+        == []
+    )
+    assert await external_db.fetchall(
+        "SELECT agent_id FROM file_owners WHERE content_hash=?", (digest,)
+    ) == [("did:test:prior-file-owner",)]
+    assert (
+        await external_db.fetchone(
+            "SELECT content FROM files WHERE content_hash=?", (digest,)
+        )
+    )[0] == b"not the governing bytes"
+
+
+@pytest.mark.asyncio
+async def test_committed_inception_survives_native_genesis_notice_failure(
+    external_db, tmp_path
+):
+    """The post-commit observation cannot turn a completed birth into failure."""
+    await external_db.execute_script("""
+        CREATE TRIGGER refuse_genesis_notice BEFORE INSERT ON conversation_history
+        BEGIN SELECT RAISE(ABORT, 'native post-commit notice failure'); END;
+    """)
+
+    async def auditor(prompt):
+        assert not external_db.owns_open_transaction
+        return {"risk_level": 1, "reasoning": "Synthetic provider seam"}
+
+    creds = await _incept(external_db, tmp_path, genesis_auditor=auditor)
+    node = await AsyncGraphStore(external_db, agent_id=creds.agent_did).get_node(
+        creds.agent_did
+    )
+    assert node.properties["genesis_audit"]["status"] == "passed"
+    assert (
+        node.properties["genesis_audit"]["constitution_hash"]
+        == node.properties["constitution_hash"]
+    )
+    assert (
+        await external_db.fetchone(
+            "SELECT source_id FROM graph_edges WHERE source_id=? AND label='governed_by'",
+            (creds.agent_did,),
+        )
+        is not None
+    )
+    assert await AsyncRAGStore(
+        external_db, agent_id=creds.agent_did
+    ).read_indexed_chunks(node.properties["constitution_hash"])
+
+
+@pytest.mark.asyncio
 async def test_inception_prelocks_complete_identity_graph_write_set(
     external_db, tmp_path, monkeypatch
 ):
@@ -105,9 +182,7 @@ async def test_inception_prelocks_complete_identity_graph_write_set(
         events.append(("add_node", node.node_id))
         return await original_add_node(self, node)
 
-    monkeypatch.setattr(
-        AsyncGraphStore, "lock_nodes_for_update", observe_lock
-    )
+    monkeypatch.setattr(AsyncGraphStore, "lock_nodes_for_update", observe_lock)
     monkeypatch.setattr(AsyncGraphStore, "add_node", observe_add_node)
 
     creds = await _incept(external_db, tmp_path)
@@ -138,9 +213,7 @@ async def test_failure_between_agent_node_and_edge_leaves_no_agent_node(
 
     async def failing_add_edge(self, source_id, target_id, label, properties=None):
         if label == "governed_by":
-            raise RuntimeError(
-                "injected failure between agent node and governing edge"
-            )
+            raise RuntimeError("injected failure between agent node and governing edge")
         return await original_add_edge(self, source_id, target_id, label, properties)
 
     monkeypatch.setattr(AsyncGraphStore, "add_edge", failing_add_edge)

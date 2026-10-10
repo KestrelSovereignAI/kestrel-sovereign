@@ -1091,7 +1091,12 @@ async def runtime_record_is_pending(target: ReanchorTarget) -> bool:
 
         agent = await storage.graph.get_node(target.agent_did)
         if agent is not None:
-            return is_fabricated_placeholder(agent, target.agent_did)
+            if not is_fabricated_placeholder(agent, target.agent_did):
+                return False
+            from kestrel_sovereign.identity.birth_record import assert_birth_replay_custody
+
+            await assert_birth_replay_custody(storage.db, target.agent_did)
+            return True
         # The bound read found nothing. Only a physically absent row is
         # pending; an existing one this agent cannot see is ledger damage.
         # By ``node_id`` alone, deliberately: a row occupying this DID under
@@ -1100,7 +1105,12 @@ async def runtime_record_is_pending(target: ReanchorTarget) -> bool:
         physical = await storage.db.fetchone(
             "SELECT 1 FROM graph_nodes WHERE node_id = ?", (target.agent_did,)
         )
-        return physical is None
+        if physical is not None:
+            return False
+        from kestrel_sovereign.identity.birth_record import assert_birth_replay_custody
+
+        await assert_birth_replay_custody(storage.db, target.agent_did)
+        return True
 
 
 async def _initial_anchor_custody_pending(target: ReanchorTarget) -> bool:

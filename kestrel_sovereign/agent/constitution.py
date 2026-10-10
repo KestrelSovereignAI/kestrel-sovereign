@@ -967,6 +967,8 @@ class ConstitutionMixin:
                     async with store._backend.transaction():
                         if event_type == "safe_mode_exited":
                             await ConstitutionMixin._lock_verified_constitution_exit(self)
+                        elif event_type == "audit_succeeded":
+                            await ConstitutionMixin._lock_verified_constitution_exit(self, require_genesis=False)
                         # A transaction-owning task can refuse without waiting
                         # for our state lock. Recheck AFTER the database writer
                         # lock is acquired, never publish over that new latch.
@@ -1324,6 +1326,9 @@ class ConstitutionMixin:
                 "governing anchor is missing. Re-anchor with a signed amendment "
                 "artifact before resuming."
             )
+
+        if await self._raw_storage.get_node(stored_hash) is None:
+            return False, "INTEGRITY FAILURE: Governing target node or its tenant ownership is missing"
 
         # PROOF 1 — the operative stored blob must be retrievable, decryptable,
         # and hash to the stored anchor (#2463 review). Merely matching the
@@ -1756,7 +1761,7 @@ class ConstitutionMixin:
                 self, authorization
             )
 
-    async def _lock_verified_constitution_exit(self):
+    async def _lock_verified_constitution_exit(self, *, require_genesis=True):
         """Retain native governance, blob and ownership custody through exit.
 
         The earlier diagnostic verification is not authority to clear state:
@@ -1785,7 +1790,7 @@ class ConstitutionMixin:
         valid, message = await self._verify_constitution_integrity()
         if valid is not True:
             raise RuntimeError("Safe Mode exit locked integrity verification failed: " + message)
-        if fresh is not None and "genesis_audit" in fresh.properties:
+        if require_genesis and fresh is not None and "genesis_audit" in fresh.properties:
             if validate_completed_genesis_audit(fresh.properties["genesis_audit"], digest) != GENESIS_AUDIT_PASSED:
                 raise RuntimeError("Safe Mode exit requires a passed genesis receipt for its governing bytes")
 

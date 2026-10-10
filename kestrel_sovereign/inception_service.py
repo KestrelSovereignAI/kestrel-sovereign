@@ -915,12 +915,12 @@ async def create_kestrel_identity_async(
                 provenance=audit_provenance,
             )
 
-        constitution_hash = await files.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
+        constitution_hash = expected_constitution_hash
         if constitution_hash != genesis_audit["constitution_hash"]:
             raise RuntimeError(
                 "Genesis audit constitution hash did not match stored governing bytes."
             )
-        logging.info(f"Stored Kestrel Constitution with hash: {constitution_hash}")
+        logging.info(f"Resolved Kestrel Constitution with hash: {constitution_hash}")
     except FileNotFoundError:
         logging.error(
             "FATAL: Constitution file not found at %s",
@@ -1041,6 +1041,9 @@ async def create_kestrel_identity_async(
         await graph.lock_nodes_for_update(
             [constitution_node.node_id, agent_node.node_id]
         )
+        from kestrel_sovereign.constitution.anchored_bytes import _store_exact_native_file
+
+        await _store_exact_native_file(db, files, governing_bytes, "KESTREL_CONSTITUTION.md")
         await graph.add_node(constitution_node)
         await graph.add_node(agent_node)
         # 6. Link the agent to its constitution.
@@ -1057,15 +1060,20 @@ async def create_kestrel_identity_async(
         )
 
         conversation = AsyncConversationStore(db, agent_id=agent_did)
-        await conversation.add_conversation(
-            role="system",
-            content=(
-                "Genesis audit passed. "
-                f"Risk level: {genesis_audit['risk_level']}. "
-                f"{genesis_audit.get('reasoning', '')}"
-            ),
-            metadata={"event": "genesis_audit", "result": genesis_audit},
-        )
+        from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
+
+        try:
+            await conversation.add_conversation(
+                role="system",
+                content=(
+                    "Genesis audit passed. "
+                    f"Risk level: {genesis_audit['risk_level']}. "
+                    f"{genesis_audit.get('reasoning', '')}"
+                ),
+                metadata={"event": "genesis_audit", "result": genesis_audit},
+            )
+        except (QueryError, TransactionError) as exc:
+            logging.error("Committed inception genesis notification failed: %s", type(exc).__name__)
 
     # 6b. If spawned by a parent, record the delegation relationship
     if parent_did:

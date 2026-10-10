@@ -3176,6 +3176,15 @@ class KestrelAgent(
         )
         if not shortfall:
             return
+        if shortfall.identity:
+            from kestrel_sovereign.identity.birth_record import assert_birth_replay_custody
+
+            try:
+                await assert_birth_replay_custody(runtime_db, self.agent_id)
+            except ValueError as exc:
+                raise IdentityReadinessError(
+                    "birth_record", cause_type="BirthRecordReplayRefused"
+                ) from exc
 
         anchor_db = None
         copy_committed = False
@@ -6522,6 +6531,9 @@ Expected Duration: {expected_duration}
                     # authority. The observability feature may replace this
                     # with its dedicated turn-root span in USER_PROMPT_SUBMIT.
                     self.bind_current_turn_span(_otel_span)
+                    genesis_block = await self._genesis_audit_cognition_block(user_input)
+                    if genesis_block is not None:
+                        return genesis_block
                     # A feature/privacy transition can latch Safe Mode while this turn
                     # is queued for the same boundary. Recheck after acquisition so a
                     # request admitted under the prior generation cannot execute over

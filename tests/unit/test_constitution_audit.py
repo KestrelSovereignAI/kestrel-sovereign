@@ -278,6 +278,13 @@ class _DurableConstitutionHarness:
         self._constitution_state_store = None
         self._constitution_state_lock = asyncio.Lock()
         self.features = {}
+        self.extension = None
+        for name in (
+            "_agent_signing_dids", "_trusted_sovereign_did_document",
+            "verify_constitution_overlay", "_verify_spawn_mandate_constraints",
+            "_verify_constitution_integrity",
+        ):
+            setattr(self, name, getattr(KestrelAgent, name).__get__(self))
         self.privacy_agent = MagicMock()
         self.privacy_agent.add_conversation = AsyncMock()
         self._genesis_audit_cognition_block = AsyncMock(return_value=None)
@@ -319,6 +326,7 @@ async def test_stale_replica_interaction_cannot_clear_durable_safe_mode(tmp_path
     now = datetime(2026, 10, 9, 16, tzinfo=timezone.utc)
     first, storage = await _open_durable_harness(tmp_path / "replicas.db", now)
     try:
+        await _seed_exit_governance(first, storage)
         await first._record_successful_constitution_audit(source="fixture")
         stale = _DurableConstitutionHarness(storage, now)
         await stale._initialize_constitution_runtime_state()
@@ -400,6 +408,11 @@ async def _seed_exit_governance(agent, storage):
     from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
     from kestrel_sovereign.storage import GraphNode
 
+    # Unbound fixtures for state-only tests now need actual tenant custody
+    # before recording successful integrity evidence.
+    storage.agent_id = agent.agent_id
+    storage.files.agent_id = agent.agent_id
+    storage.graph.agent_id = agent.agent_id
     digest = await storage.store_file(resolve_governing_constitution_bytes(None), "constitution.md")
     await storage.add_node(GraphNode(
         node_id=agent.agent_id, node_type="agent", label="native exit", properties={"constitution_hash": digest},
@@ -582,6 +595,7 @@ async def test_future_persisted_audit_requires_real_startup_verification(tmp_pat
     first, storage = await _open_durable_harness(tmp_path / "future.db", now)
     future = now + timedelta(hours=5)
     try:
+        await _seed_exit_governance(first, storage)
         await first._record_successful_constitution_audit(source="legacy", audited_at=future)
         restarted = _DurableConstitutionHarness(storage, now)
         await restarted._initialize_constitution_runtime_state()
@@ -593,7 +607,7 @@ async def test_future_persisted_audit_requires_real_startup_verification(tmp_pat
             return_value=(integrity_valid, "native integrity result")
         )
         await restarted._audit_constitution_on_startup()
-        restarted._verify_constitution_integrity.assert_awaited_once()
+        assert restarted._verify_constitution_integrity.await_count == (2 if integrity_valid else 1)
         restored = await restarted._constitution_state_store.load(first.agent_id)
         if integrity_valid:
             assert restored.last_successful_audit_at == now
@@ -611,12 +625,13 @@ async def test_live_clock_reversal_does_not_postpone_periodic_integrity_audit(tm
     now = datetime(2026, 10, 9, 14, tzinfo=timezone.utc)
     agent, storage = await _open_durable_harness(tmp_path / "clock.db", now)
     try:
+        await _seed_exit_governance(agent, storage)
         await agent._record_successful_constitution_audit(
             source="before-clock-change", audited_at=now + timedelta(minutes=1)
         )
         agent._verify_constitution_integrity = AsyncMock(return_value=(True, "verified"))
         await agent._maybe_audit()
-        agent._verify_constitution_integrity.assert_awaited_once()
+        assert agent._verify_constitution_integrity.await_count == 2
         assert (await agent._constitution_state_store.load(agent.agent_id)).last_successful_audit_at == now
     finally:
         await storage.close()
@@ -629,6 +644,7 @@ async def test_future_deadline_failure_and_failed_safe_mode_write_survive_restar
     agent, storage = await _open_durable_harness(tmp_path / "future-fault.db", now)
     future = now + timedelta(minutes=5)
     try:
+        await _seed_exit_governance(agent, storage)
         await agent._record_successful_constitution_audit(source="legacy", audited_at=future)
         real_write = agent._constitution_state_store.write
         verification_started = False
@@ -671,6 +687,7 @@ async def test_future_deadline_verifier_is_not_called_without_durable_marker(tmp
     now = datetime(2026, 10, 9, 14, tzinfo=timezone.utc)
     agent, storage = await _open_durable_harness(tmp_path / "marker-fault.db", now)
     try:
+        await _seed_exit_governance(agent, storage)
         await agent._record_successful_constitution_audit(
             source="legacy", audited_at=now + timedelta(minutes=5)
         )
@@ -716,6 +733,7 @@ async def test_explicit_audit_is_one_serialized_durable_transition(tmp_path):
 
     now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
     agent, storage = await _open_durable_harness(tmp_path / "agent.db", now)
+    await _seed_exit_governance(agent, storage)
     agent._verify_constitution_integrity = AsyncMock(
         return_value=(True, "Constitution integrity verified")
     )
@@ -738,6 +756,7 @@ async def test_safe_mode_and_reason_survive_real_database_reopen(tmp_path):
     db_path = tmp_path / "agent.db"
     now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
     first, storage = await _open_durable_harness(db_path, now)
+    await _seed_exit_governance(first, storage)
     await first._record_successful_constitution_audit(source="test", audited_at=now)
     await first.enter_safe_mode("governing bytes changed")
     await storage.close()
@@ -984,6 +1003,7 @@ async def test_overdue_audit_remains_due_across_restart_with_injected_clock(tmp_
     db_path = tmp_path / "agent.db"
     last_success = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
     first, storage = await _open_durable_harness(db_path, last_success)
+    await _seed_exit_governance(first, storage)
     await first._record_successful_constitution_audit(
         source="test", audited_at=last_success
     )
@@ -996,7 +1016,7 @@ async def test_overdue_audit_remains_due_across_restart_with_injected_clock(tmp_
     )
     try:
         await restarted._audit_constitution_on_startup()
-        restarted._verify_constitution_integrity.assert_awaited_once()
+        assert restarted._verify_constitution_integrity.await_count == 2
         assert restarted._last_audit_time == restart_time
         assert restarted._interaction_count == 0
     finally:
@@ -1040,6 +1060,7 @@ async def test_interaction_deadline_survives_restart_and_audits_next_turn(tmp_pa
     db_path = tmp_path / "agent.db"
     now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
     first, storage = await _open_durable_harness(db_path, now)
+    await _seed_exit_governance(first, storage)
     await first._record_successful_constitution_audit(source="test", audited_at=now)
     first._interaction_count = first.AUDIT_INTERVAL - 1
     await first._persist_constitution_runtime_state(now=now)
@@ -1051,7 +1072,7 @@ async def test_interaction_deadline_survives_restart_and_audits_next_turn(tmp_pa
     )
     try:
         await restarted._maybe_audit()
-        restarted._verify_constitution_integrity.assert_awaited_once()
+        assert restarted._verify_constitution_integrity.await_count == 2
         assert restarted._interaction_count == 0
     finally:
         await storage.close()
@@ -1063,6 +1084,7 @@ async def test_failed_audit_never_advances_last_successful_deadline(tmp_path):
     last_success = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
     now = last_success + timedelta(hours=1)
     first, storage = await _open_durable_harness(db_path, now)
+    await _seed_exit_governance(first, storage)
     await first._record_successful_constitution_audit(
         source="test", audited_at=last_success
     )
@@ -1085,6 +1107,7 @@ async def test_legacy_row_migration_requires_real_startup_audit(tmp_path):
     """No row does not fabricate a successful audit timestamp."""
     now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
     agent, storage = await _open_durable_harness(tmp_path / "agent.db", now)
+    await _seed_exit_governance(agent, storage)
     agent._verify_constitution_integrity = AsyncMock(
         return_value=(True, "Constitution integrity verified")
     )
@@ -1097,7 +1120,7 @@ async def test_legacy_row_migration_requires_real_startup_audit(tmp_path):
         assert "required startup integrity audit" in blocked
         agent._verify_constitution_integrity.assert_not_awaited()
         await agent._audit_constitution_on_startup()
-        agent._verify_constitution_integrity.assert_awaited_once()
+        assert agent._verify_constitution_integrity.await_count == 2
         assert agent._constitution_state_migration_pending is False
         assert agent._constitution_audit_pending is False
         assert agent._last_audit_time == now
@@ -1112,9 +1135,13 @@ async def test_new_identity_bootstrap_anchors_then_full_audits(tmp_path):
     agent, storage = await _open_durable_harness(
         tmp_path / "agent.db", now, is_new_identity=True
     )
-    agent._get_governing_constitution = AsyncMock(
-        return_value="Kestrel Constitution"
-    )
+    from kestrel_sovereign.storage import GraphNode
+
+    await storage.add_node(GraphNode(
+        node_id=agent.agent_id, node_type="agent", label="new bootstrap", properties={},
+    ))
+    agent._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(agent)
+    agent._get_governing_constitution = KestrelAgent._get_governing_constitution.__get__(agent)
     agent._verify_constitution_integrity = AsyncMock(
         return_value=(True, "Constitution integrity verified")
     )
@@ -1125,8 +1152,7 @@ async def test_new_identity_bootstrap_anchors_then_full_audits(tmp_path):
 
         await agent._audit_constitution_on_startup()
 
-        agent._get_governing_constitution.assert_awaited_once()
-        agent._verify_constitution_integrity.assert_awaited_once()
+        assert agent._verify_constitution_integrity.await_count == 2
         assert agent._constitution_bootstrap_pending is False
         assert agent._constitution_audit_pending is False
         persisted = await agent._constitution_state_store.load(agent.agent_id)
@@ -1164,9 +1190,11 @@ async def test_missing_identity_after_completed_bootstrap_fails_closed(tmp_path)
     db_path = tmp_path / "agent.db"
     now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
     first, storage = await _open_durable_harness(db_path, now)
+    await _seed_exit_governance(first, storage)
     await first._record_successful_constitution_audit(
         source="test", audited_at=now
     )
+    await storage.db.execute_commit("DELETE FROM graph_nodes WHERE node_id=?", (first.agent_id,))
     await storage.close()
 
     restarted, storage = await _open_durable_harness(
@@ -1719,6 +1747,7 @@ async def test_a_buffered_cause_survives_the_restore_that_persists_it(tmp_path):
     first = _DurableConstitutionHarness(storage, now)
     await first._initialize_constitution_runtime_state()
     try:
+        await _seed_exit_governance(first, storage)
         await first._record_successful_constitution_audit(source="startup")
     finally:
         await storage.close()
@@ -1794,7 +1823,9 @@ async def test_a_missing_identity_node_is_not_reported_as_a_read_outage(tmp_path
     first = _DurableConstitutionHarness(storage, now)
     await first._initialize_constitution_runtime_state()
     try:
+        await _seed_exit_governance(first, storage)
         await first._record_successful_constitution_audit(source="startup")
+        await storage.db.execute_commit("DELETE FROM graph_nodes WHERE node_id=?", (first.agent_id,))
     finally:
         await storage.close()
 
@@ -1830,6 +1861,7 @@ async def test_a_failed_write_is_not_recorded_as_a_read_outage(tmp_path):
             side_effect=RuntimeError("disk is full")
         )
         # A normal-mode checkpoint, with the agent NOT restricted.
+        await _seed_exit_governance(agent, storage)
         await agent._record_successful_constitution_audit(source="startup")
 
         assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
@@ -1862,6 +1894,7 @@ async def test_recovery_clears_the_durability_flag_but_keeps_the_cause(tmp_path)
         agent._constitution_state_store.write = AsyncMock(
             side_effect=RuntimeError("disk is full")
         )
+        await _seed_exit_governance(agent, storage)
         await agent._record_successful_constitution_audit(source="startup")
         assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
 
@@ -1921,6 +1954,7 @@ async def test_a_recovered_write_persists_the_trigger_it_recorded(tmp_path):
         agent._constitution_state_store.write = AsyncMock(
             side_effect=RuntimeError("disk is full")
         )
+        await _seed_exit_governance(agent, storage)
         await agent._record_successful_constitution_audit(source="startup")
         assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
 
@@ -2012,6 +2046,7 @@ async def test_a_retry_that_also_fails_still_says_not_persisted(tmp_path):
         agent._constitution_state_store.write = AsyncMock(
             side_effect=RuntimeError("disk is full")
         )
+        await _seed_exit_governance(agent, storage)
         await agent._record_successful_constitution_audit(source="startup")
         assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
 

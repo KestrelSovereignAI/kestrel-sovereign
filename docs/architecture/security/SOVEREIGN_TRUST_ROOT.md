@@ -101,6 +101,9 @@ Inside that owning transaction they compare the exact governing pointer,
 rights, receipt/history and edge witness against the facts inspected before
 authorization. A concurrent change requires a fresh inspection and signed
 repair attempt; unrelated identity metadata is preserved, not overwritten.
+Historical plaintext must hash to its addressed digest before it can supply
+legacy emancipation-rights evidence. Readable corrupt bytes are unreadable
+evidence, not permission to treat an active contract as dormant.
 Native edge deletion and avatar publication participate in the same graph-first
 order; they must not acquire edge/file ownership before reserving graph rows.
 Signed file publication retains both the physical blob and exact tenant owner
@@ -135,6 +138,8 @@ An ordinary SQL notice-delivery failure is reported separately and cannot
 replace the committed audit outcome or cause that hash to be audited again.
 The locking reads must actually return each captured existing edge and the
 current edge's own tenant witness; a later ordinary reread is not a substitute.
+Required-target attestations also retain the actual target node and this
+agent's ownership witness, not just an edge pointing to that target.
 Initial bootstrap refuses any prior governance evidence rather than expanding
 its lock set and pruning history without a signed repair.
 
@@ -148,12 +153,24 @@ integrity evidence. Periodic integrity verification, governing-text retrieval
 and genesis input read the bound native store as well, not that cache. A passed
 genesis publication re-attests native bytes inside its commit owner after the
 auditor await; concurrent blob corruption cannot publish a fresh pass.
+Successful ordinary integrity-audit publication likewise repeats verification
+under native custody before resetting the durable audit deadline. Direct and
+streaming requests recheck hash-bound genesis readiness after acquiring their
+turn boundary, so queued requests cannot inherit admission for an older hash.
 New-identity bootstrap uses the same exact-native-byte
 publisher as signed repair, only after resolver verification and the durable
 single-use bootstrap fence, so volatile privacy storage cannot consume authority
 without publishing the constitution. Birth-record replication reserves its full
-graph set before file-owner writes, while still publishing files before nodes
-for tenant admission. Physical lock ordering uses PostgreSQL's canonical `C`
+graph and payload-blob set before file-owner writes, while still publishing
+files before nodes for tenant admission. Source and destination bytes are
+verified, including existing physical conflict winners. Same-named file custody
+cannot claim another tenant's private graph properties; public shared-content
+metadata must pass canonical admission. A missing runtime identity cannot be
+restored from a frozen birth record once its constitutional lifetime was
+consumed. Signed recovery must preserve its existing audit history.
+Inception uses the same exact-byte native publisher, and a post-commit SQL
+conversation-notice failure does not undo creation or skip remaining completion
+work. Physical lock ordering uses PostgreSQL's canonical `C`
 collation; target equality does not depend on database locale.
 An existing genesis receipt must validate as a literal pass, not merely be
 terminal. Failure leaves the durable restriction and exit-event history intact.
@@ -175,6 +192,12 @@ dollar-quoted and SQL-standard `BEGIN ATOMIC` routine bodies, and
 newline-continued escape strings retain their database
 semantics. This lexical refusal
 protects the commit boundary; it is not a general SQL authorization parser.
+If a conflict policy or trigger implicitly rolls back SQLite's native owner,
+the adapter poisons the scope: subsequent work and successful completion are
+refused rather than escaping into autocommit. Explicit nested savepoint scopes
+make avatar publication independently rollback-safe even if an outer caller
+catches rejection and commits unrelated work. Default nested scopes remain
+joined for compatibility.
 
 ### Hosted PostgreSQL agents without a local anchor
 

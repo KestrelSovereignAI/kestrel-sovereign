@@ -17,7 +17,7 @@ from tests.integration.test_constitution_refusal_races import _agent
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-@pytest.mark.parametrize("rejection", ["foreign-owner", "oversized", "unowned-blob"])
+@pytest.mark.parametrize("rejection", ["foreign-owner", "oversized", "unowned-blob", "ownerless-avatar"])
 async def test_rejected_avatar_has_no_joined_transaction_side_effects(
     db_backend, monkeypatch, rejection
 ):
@@ -43,11 +43,22 @@ async def test_rejected_avatar_has_no_joined_transaction_side_effects(
                 "INSERT INTO files (content_hash,original_name,content) VALUES (?,?,?)",
                 (hashlib.sha256(b"avatar").hexdigest(), "legacy.jpg", b"avatar"),
             )
+        elif rejection == "ownerless-avatar":
+            import hashlib
+
+            avatar_id = storage.files._avatar_node_id(target, "primary", hashlib.sha256(b"avatar").hexdigest())
+            await storage.db.execute_commit(
+                "INSERT INTO graph_nodes (node_id,node_type,label,properties) VALUES (?,?,?,?)",
+                (avatar_id, "episode", "private legacy row", '{"private":"retained"}'),
+            )
+        await storage.db.execute_commit("CREATE TABLE other_work (value INTEGER)")
         async with storage.transaction():
             # A caller may catch a validation error and commit other work.
             # Native SQLite joins rather than rolling back the nested scope.
             with pytest.raises(ValueError):
                 await storage.files.store_avatar(b"avatar", target)
+            await storage.db.execute("INSERT INTO other_work VALUES (1)")
+        assert await storage.db.fetchval("SELECT COUNT(*) FROM other_work") == 1
         assert (
             await storage.db.fetchone(
                 "SELECT node_id FROM graph_node_owners WHERE node_id=? AND agent_id=?",
@@ -55,6 +66,16 @@ async def test_rejected_avatar_has_no_joined_transaction_side_effects(
             )
             is None
         )
+        if rejection == "ownerless-avatar":
+            assert await storage.db.fetchone(
+                "SELECT content_hash FROM file_owners WHERE agent_id=?", (identity,),
+            ) is None
+            assert await storage.db.fetchone(
+                "SELECT content_hash FROM files WHERE original_name='avatar_primary.jpg'",
+            ) is None
+            assert await storage.db.fetchone(
+                "SELECT node_id FROM graph_node_owners WHERE node_id=?", (avatar_id,),
+            ) is None
     finally:
         await storage.close()
 

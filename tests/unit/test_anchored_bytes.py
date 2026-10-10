@@ -19,6 +19,7 @@ so those propagate to it.
 from __future__ import annotations
 
 import json
+import hashlib
 
 import pytest
 
@@ -90,9 +91,16 @@ async def test_a_missing_row_is_absent():
 
 @pytest.mark.asyncio
 async def test_stored_plaintext_comes_back_as_text():
-    rows = _Rows(row=(b"# Kestrel Constitution\n", None))
-    text, present = await read_anchored_constitution(rows, HASH)
+    content = b"# Kestrel Constitution\n"
+    rows = _Rows(row=(content, None))
+    text, present = await read_anchored_constitution(rows, hashlib.sha256(content).hexdigest())
     assert (text, present) == ("# Kestrel Constitution\n", True)
+
+
+@pytest.mark.asyncio
+async def test_readable_plaintext_under_the_wrong_hash_is_unreadable():
+    rows = _Rows(row=(b"readable but not the addressed constitution", None))
+    assert await read_anchored_constitution(rows, HASH) == (None, True)
 
 
 @pytest.mark.asyncio

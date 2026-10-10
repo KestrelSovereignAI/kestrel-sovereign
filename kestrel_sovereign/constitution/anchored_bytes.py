@@ -89,15 +89,27 @@ async def _store_exact_governing_file(storage, content: bytes, name: str) -> Non
     complete graph reservation first. Privacy-facing file caches are neither
     publication nor an attestation of the actual native conflict winner.
     """
-    from kestrel_sovereign.storage.async_file_store import AsyncFileStore
-
-    digest = hashlib.sha256(content).hexdigest()
     files = storage.files
     if storage.owns_open_transaction is not True or not files.agent_id:
         raise RuntimeError("governing publication requires owned native tenant custody")
-    unbound = AsyncFileStore(storage.db)
-    lock = " FOR UPDATE" if storage.db.backend_type == "postgres" else ""
-    row = await storage.db.fetchone(
+    await _store_exact_native_file(storage.db, files, content, name)
+
+
+async def _store_exact_native_file(db, files, content: bytes, name: str, *, metadata=None) -> str:
+    """First-party publication after complete graph reservations and authority.
+
+    Birth copies use an owned, digest-verified source; inception uses resolved
+    new-identity bytes. Signed repair establishes its external authority before
+    calling this same native conflict-winner/tenant-owner attestation.
+    """
+    from kestrel_sovereign.storage.async_file_store import AsyncFileStore
+
+    if db.owns_open_transaction is not True or not files.agent_id:
+        raise RuntimeError("exact file publication requires owned native tenant custody")
+    digest = hashlib.sha256(content).hexdigest()
+    unbound = AsyncFileStore(db)
+    lock = " FOR UPDATE" if db.backend_type == "postgres" else ""
+    row = await db.fetchone(
         "SELECT content_hash FROM files WHERE content_hash = ?" + lock, (digest,),
     )
     if row is None:
@@ -105,31 +117,32 @@ async def _store_exact_governing_file(storage, content: bytes, name: str) -> Non
         # Another creator may win the absent-row race; INSERT ignores that
         # conflict, so lock and validate the ACTUAL winner below, not our input.
         await unbound.store_file(content, name)
-        row = await storage.db.fetchone(
+        row = await db.fetchone(
             "SELECT content_hash FROM files WHERE content_hash = ?" + lock, (digest,),
         )
         if row is None:
-            raise RuntimeError("signed file disappeared before physical custody acquisition")
+            raise RuntimeError("file disappeared before physical custody acquisition")
     existing = await unbound.retrieve_file(digest)
     if existing != content:
-        raise RuntimeError("stored governing file differs from exact signed content")
+        raise RuntimeError("stored file bytes do not verify against exact publication content")
     # Restore only a missing ownership witness. Existing per-tenant name and
     # provenance are not replaced. Shared blob metadata may belong to another
     # tenant; verified public bytes confer no authority over that provenance.
-    await storage.db.execute(
+    await db.execute(
         "INSERT OR IGNORE INTO file_owners (content_hash, agent_id, original_name, metadata) VALUES (?, ?, ?, ?)",
-        (digest, files.agent_id, name, None),
+        (digest, files.agent_id, name, json.dumps(metadata) if metadata else None),
     )
-    if storage.db.backend_type == "postgres":
+    if db.backend_type == "postgres":
         # Conflict-ignore insertion does not retain an existing owner's row.
         # Hold that exact tenant witness after the shared blob (the same order
         # as native exit), or refuse if it disappeared before custody arrived.
-        owner = await storage.db.fetchone(
+        owner = await db.fetchone(
             "SELECT content_hash FROM file_owners WHERE content_hash = ? AND agent_id = ? FOR UPDATE",
             (digest, files.agent_id),
         )
         if owner is None:
             raise RuntimeError("governing file ownership disappeared during publication")
+    return digest
 
 
 async def lock_governing_file(storage, digest: str) -> bytes:
@@ -253,6 +266,17 @@ async def lock_governance_rows(
     )
     if identity is None or not identity_owners:
         raise RuntimeError("Agent identity or its ownership disappeared before governing custody")
+    if required_target is not None:
+        target = await storage.db.fetchone(
+            "SELECT node_id FROM graph_nodes WHERE node_id = ?" + lock,
+            (required_target,),
+        )
+        target_owner = await storage.db.fetchone(
+            "SELECT node_id FROM graph_node_owners WHERE node_id = ? AND agent_id = ?" + lock,
+            (required_target, agent_id),
+        )
+        if target is None or target_owner is None:
+            raise RuntimeError("Governing target node or its ownership custody is absent")
     # Never lock an endpoint outside the graph reservation set. Exit needs
     # only its current governing edge; signed repair/genesis pass their
     # complete captured set and reject changes without extending custody.
@@ -340,6 +364,9 @@ async def read_anchored_constitution(
         return None, True
     if raw is None:
         return None, False
+    if hashlib.sha256(raw).hexdigest() != anchored_hash:
+        logger.warning("Stored historical constitution fails its addressed hash: %s", anchored_hash[:12])
+        return None, True
     try:
         return raw.decode("utf-8"), True
     except UnicodeDecodeError:

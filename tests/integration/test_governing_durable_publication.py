@@ -40,6 +40,45 @@ async def _identity(storage, properties):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+@pytest.mark.parametrize("damage", ["target-owner", "target-row", "blob-owner", "blob-bytes"])
+async def test_integrity_success_rechecks_native_evidence_before_publication(db_backend, damage):
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:audit-publication:" + uuid4().hex)
+    await storage.initialize()
+    physical = None
+    try:
+        agent = await _agent(storage)
+        content = resolve_governing_constitution_bytes(None)
+        digest = await storage.store_file(content, "constitution.md")
+        physical = await storage.db.fetchone("SELECT content,metadata FROM files WHERE content_hash=?", (digest,))
+        await _identity(storage, {"constitution_hash": digest})
+        await agent._anchor_constitution_governance(digest)
+        assert (await agent._verify_constitution_integrity())[0] is True
+        before = await agent._constitution_state_store.load(agent.agent_id)
+        if damage == "target-owner":
+            await storage.db.execute_commit("DELETE FROM graph_node_owners WHERE node_id=? AND agent_id=?", (digest, agent.agent_id))
+        elif damage == "target-row":
+            # A single-tenant SQLite database permits deleting this target
+            # without touching unrelated tenants' shared physical rows.
+            if db_backend.backend_type != "sqlite":
+                pytest.skip("physical shared target deletion confined to isolated SQLite")
+            await storage.db.execute_commit("DELETE FROM graph_nodes WHERE node_id=?", (digest,))
+        elif damage == "blob-owner":
+            await storage.db.execute_commit("DELETE FROM file_owners WHERE content_hash=? AND agent_id=?", (digest, agent.agent_id))
+        else:
+            await storage.db.execute_commit("UPDATE files SET content=?,metadata=NULL WHERE content_hash=?", (b"corrupt after successful diagnostic", digest))
+        assert await agent._record_successful_constitution_audit(source="earlier successful diagnostic") is False
+        after = await agent._constitution_state_store.load(agent.agent_id)
+        assert after == before
+        assert agent._safe_mode is True
+        assert not any(e["event_type"] == "audit_succeeded" for e in await agent._constitution_state_store.list_events(agent.agent_id))
+    finally:
+        if physical is not None:
+            await storage.db.execute_commit("UPDATE files SET content=?,metadata=? WHERE content_hash=?", (*physical, digest))
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 @pytest.mark.parametrize("damage", ["corrupt", "missing-owner", "absent"])
 async def test_exit_cannot_use_isolated_cache_as_durable_attestation(
     db_backend, damage
@@ -110,8 +149,9 @@ async def test_exit_cannot_use_isolated_cache_as_durable_attestation(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+@pytest.mark.parametrize("witness", ["edge-owner", "target-owner"])
 async def test_genesis_refuses_ownership_removed_during_actual_auditor_await(
-    db_backend,
+    db_backend, witness,
 ):
     storage = AsyncStorage(
         backend=db_backend, agent_id="did:test:genesis-owner:" + uuid4().hex
@@ -137,10 +177,16 @@ async def test_genesis_refuses_ownership_removed_during_actual_auditor_await(
         async def auditor(prompt):
             calls.append(prompt)
             assert storage.owns_open_transaction is False
-            await storage.db.execute_commit(
-                "DELETE FROM graph_edge_owners WHERE source_id=? AND target_id=? AND label='governed_by' AND agent_id=?",
-                (agent.agent_id, digest, agent.agent_id),
-            )
+            if witness == "edge-owner":
+                await storage.db.execute_commit(
+                    "DELETE FROM graph_edge_owners WHERE source_id=? AND target_id=? AND label='governed_by' AND agent_id=?",
+                    (agent.agent_id, digest, agent.agent_id),
+                )
+            else:
+                await storage.db.execute_commit(
+                    "DELETE FROM graph_node_owners WHERE node_id=? AND agent_id=?",
+                    (digest, agent.agent_id),
+                )
             return {
                 "risk_level": 1,
                 "reasoning": "Synthetic provider seam; real ownership deletion",
