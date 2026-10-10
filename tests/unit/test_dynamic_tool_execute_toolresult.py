@@ -103,6 +103,9 @@ class _FixtureFeature(Feature):
 @pytest.fixture
 def feature():
     feat = _FixtureFeature.__new__(_FixtureFeature)
+    # This serialization-only fixture bypasses Feature.__init__. Present its
+    # required owner slot explicitly; no hosted runtime is installed here.
+    feat.agent = None
     feat.disabled_skills = frozenset()  # set by Feature.__init__ normally
     return feat
 

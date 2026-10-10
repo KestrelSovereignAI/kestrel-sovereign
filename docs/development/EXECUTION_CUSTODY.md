@@ -1,3 +1,15 @@
+---
+type: Developer Guide
+title: Transaction-bound hosted execution custody
+description: Native host generation validation, exact advisory custody and cleanup boundaries.
+status: proposed
+privacy: public
+tags:
+- development
+- storage
+- authority
+---
+
 # Transaction-bound hosted execution custody
 
 Core issue #3569 extends existing PostgreSQL advisory and native transaction
@@ -45,9 +57,16 @@ authority; terminal identity/token CAS needs its own explicit native custody.
 
 ## Delivery status
 
-This is an implementation checkpoint, **not release approval**. Initial real
-PostgreSQL tests cover exact session termination, immutable replacement denial,
-stale generation across all native SQL methods, transfer serialization,
-revocation rollback and transaction-control refusal. Scheduler loss wiring,
-persistent runtime/alternate-session propagation, terminal cleanup, Frinz
-generation integration and full independent gates remain before release.
+This is an implementation checkpoint, **not release approval**. Real native
+tests cover session termination/release races, original-generation scheduler
+renewal, retained runtime/backend denials, native graph/file/conversation writes,
+fixed transaction membership/lock ordering, commit acknowledgement loss
+(including cancellation), reanchor reconciliation and exact Stop settlement.
+Hosted cleanup preserves failed checkpoints in the existing unresolved ledger
+without reopening general work. SQLAlchemy cached/yielded execution remains
+explicitly unsupported under custody; rollback/close remain available.
+
+See the [canonical storage contract](../architecture/storage/STORAGE_ARCHITECTURE.md#hosted-execution-custody)
+for installation and limitations. Full independent review, repository/CI gates,
+immutable publication/verification and Frinz generation adoption/live acceptance
+remain required; a source check is not evidence of downstream rollout.
