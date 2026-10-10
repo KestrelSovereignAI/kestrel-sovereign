@@ -1800,6 +1800,7 @@ async def test_partially_sequenced_rows_repair_counter_and_backfill_on_postgres(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+@pytest.mark.timeout(120)
 async def test_postgres_large_scope_backfill_plan_and_work_scale_linearly(
     db_backend, monkeypatch
 ):

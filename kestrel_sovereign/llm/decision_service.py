@@ -261,31 +261,31 @@ class DecisionServiceMixin:
                 ))
             normalize_response(CANARY_REQUEST, body)
         except ExecutionAuthorityError as exc:
+            error = exc
             if is_execution_control_error(exc):
                 raise
-            error = exc
             raise
         except asyncio.CancelledError as exc:
             error = exc
             state.canary_stale_since = state.canary_stale_since or time.time()
             raise
         except DecisionProtocolError as exc:
+            error = exc
             if is_execution_control_error(exc):
                 raise
-            error = exc
             self._mark_pin_unverified(state, name, f"canary answer invalid: {exc}")
         except DecisionHTTPError as exc:
+            error = exc
             if is_execution_control_error(exc):
                 raise
-            error = exc
             if exc.status_code == 404:
                 self._mark_pin_unverified(state, name, "endpoint or model not found (HTTP 404)")
             else:
                 state.canary_stale_since = state.canary_stale_since or time.time()
         except (DecisionTransportError, TimeoutError) as exc:
+            error = exc
             if is_execution_control_error(exc):
                 raise
-            error = exc
             state.canary_stale_since = state.canary_stale_since or time.time()
             logger.warning("Decision pin canary for %s did not complete (%s)", name, type(exc).__name__)
         else:
@@ -406,9 +406,9 @@ class DecisionServiceMixin:
                 ))
                 normalized = normalize_response(snapshot, body)
         except TimeoutError as exc:
+            error = exc
             if is_execution_control_error(exc):
                 raise
-            error = exc
             raise DecisionTimeout(
                 f"decision for {caller!r} exceeded {timeout_seconds}s"
             ) from None
@@ -465,6 +465,10 @@ class DecisionServiceMixin:
     ) -> None:
         """Record one dispatched decision through the shared recorder."""
 
+        if error is not None and is_execution_control_error(error):
+            # Irreversible control is not a successful/failed provider call.
+            # Even absent ambient custody, it must not start ordinary writes.
+            return
         usage = ReportedUsage()
         reported = body.get("usage") if isinstance(body, Mapping) else None
         if isinstance(reported, Mapping):

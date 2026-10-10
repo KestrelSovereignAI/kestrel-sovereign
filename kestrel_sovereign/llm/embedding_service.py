@@ -690,27 +690,28 @@ class ProviderEmbeddingService:
             error = exc
             raise
         finally:
-            with (bind_execution_cleanup(recorder) if error is not None and (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error)) else bind_execution_runtime(recorder)):
-                try:
-                    await recorder.record_modality_call(
-                        self._embedding_call(
-                            operation,
-                            input_count,
-                            result=result,
-                            error=error,
-                            usage=usage,
-                            duration_ms=int((time.monotonic() - started) * 1000),
-                            context=context,
+            if error is None or not is_execution_control_error(error):
+                with (bind_execution_cleanup(recorder) if error is not None and (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error)) else bind_execution_runtime(recorder)):
+                    try:
+                        await recorder.record_modality_call(
+                            self._embedding_call(
+                                operation,
+                                input_count,
+                                result=result,
+                                error=error,
+                                usage=usage,
+                                duration_ms=int((time.monotonic() - started) * 1000),
+                                context=context,
+                            )
                         )
-                    )
-                except Exception as accounting_error:
-                    if (
-                        error is None
-                        or not is_execution_control_error(accounting_error)
-                        or not (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error))
-                        or execution_commit_outcome(accounting_error) is not None
-                    ):
-                        raise execution_terminal_error(error, accounting_error)
+                    except Exception as accounting_error:
+                        if (
+                            error is None
+                            or not is_execution_control_error(accounting_error)
+                            or not (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error))
+                            or execution_commit_outcome(accounting_error) is not None
+                        ):
+                            raise execution_terminal_error(error, accounting_error)
         require_execution_work(recorder)
         return result
 

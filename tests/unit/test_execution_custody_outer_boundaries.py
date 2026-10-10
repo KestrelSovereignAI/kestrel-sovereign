@@ -69,6 +69,8 @@ async def test_decision_boundaries_preserve_wrapped_controls(phase):
     assert caught.value is error
     assert execution_commit_outcome(caught.value) == "unknown"
     assert len(adapter.decide_calls) == (0 if phase == "discovery" else 1)
+    service._track_model_usage.assert_not_awaited()
+    service._observability_store.log_llm_call.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -146,6 +148,24 @@ async def test_stream_checkpoint_denial_cannot_replace_unknown(phase):
     assert caught.value is error
     assert execution_commit_outcome(caught.value) == "unknown"
     assert dispositions == [RequestCompletionDisposition.ABANDONED]
+
+
+@pytest.mark.asyncio
+async def test_unbound_embedding_control_does_not_start_ordinary_accounting():
+    from tests.unit.test_embedding_usage_recording import UsageReportingAdapter, _provider
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+    service = LLMService.__new__(LLMService)
+    service.snapshot_invocation_context = lambda: LLMInvocationContext()
+    service._record_model_usage = AsyncMock()
+    service._log_llm_call = AsyncMock()
+    error = wrapped()
+    embedding = service._new_embedding_service(_provider(UsageReportingAdapter(error=error)))
+    with pytest.raises(RuntimeError) as caught:
+        await embedding.aembed("synthetic fixture")
+    assert caught.value is error
+    service._record_model_usage.assert_not_awaited()
+    service._log_llm_call.assert_not_awaited()
 
 
 @pytest.mark.asyncio
