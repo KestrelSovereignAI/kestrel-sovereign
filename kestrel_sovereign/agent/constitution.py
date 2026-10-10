@@ -1773,15 +1773,10 @@ class ConstitutionMixin:
         node = await raw.get_node(self.agent_id)
         digest = node.properties.get("constitution_hash") if node is not None else None
         await raw.lock_nodes_for_update([self.agent_id, digest] if digest else [self.agent_id])
-        from kestrel_sovereign.constitution.anchored_bytes import lock_governance_rows
+        from kestrel_sovereign.constitution.anchored_bytes import lock_governance_rows, lock_governing_file
 
         await lock_governance_rows(raw, self.agent_id, required_target=digest)
-        if raw.db.backend_type == "postgres":
-            if digest:
-                blob = await raw.db.fetchone("SELECT content_hash FROM files WHERE content_hash = ? FOR UPDATE", (digest,))
-                owner = await raw.db.fetchone("SELECT content_hash FROM file_owners WHERE content_hash = ? AND agent_id = ? FOR UPDATE", (digest, self.agent_id))
-                if blob is None or owner is None:
-                    raise RuntimeError("Anchored constitution blob is missing or its ownership custody is absent")
+        await lock_governing_file(raw, digest)
         # A different pointer won while we waited for the graph locks. Do not
         # widen the lock set out of canonical order or adopt its newer proof.
         fresh = await raw.get_node(self.agent_id)
@@ -2459,19 +2454,27 @@ class ConstitutionMixin:
             f"from {constitution_path_used}"
         )
 
-        await self.privacy_agent.add_conversation(
-            role="system",
-            content=f"Constitution re-anchored. Old: {old_hash[:16]}... New: {stored_hash[:16]}...",
-            metadata={
-                "event": "constitution_reanchor",
-                "old_hash": old_hash,
-                "new_hash": stored_hash,
-                "signed_artifact_hash": artifact_hash,
-                "signed_artifact_signer": verification.signer,
-                "authorization": authorization or "unspecified",
-                "timestamp": self._get_timestamp(),
-            },
-        )
+        from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
+
+        try:
+            await self.privacy_agent.add_conversation(
+                role="system",
+                content=f"Constitution re-anchored. Old: {old_hash[:16]}... New: {stored_hash[:16]}...",
+                metadata={
+                    "event": "constitution_reanchor",
+                    "old_hash": old_hash,
+                    "new_hash": stored_hash,
+                    "signed_artifact_hash": artifact_hash,
+                    "signed_artifact_signer": verification.signer,
+                    "authorization": authorization or "unspecified",
+                    "timestamp": self._get_timestamp(),
+                },
+            )
+        except (QueryError, TransactionError) as exc:
+            # The authoritative repair has committed. Observational SQL
+            # delivery failure cannot turn it into an ambiguous failed write.
+            # Cancellation remains BaseException and is not swallowed.
+            logging.error("Committed reanchor notification failed: %s", type(exc).__name__)
 
         safe_mode_note = ""
         if self._safe_mode:
@@ -2618,7 +2621,17 @@ class ConstitutionMixin:
                         or bootstrap.generation != self._constitution_state_generation
                     ):
                         raise ValueError("durable new-identity bootstrap custody changed")
-                    constitution_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
+                    from kestrel_sovereign.constitution.anchored_bytes import _store_exact_governing_file
+
+                    # The resolver and durable new-identity CAS above are the
+                    # authority for this first-party public governance write.
+                    # An ISOLATED feature-facing store only writes a cache;
+                    # consume bootstrap custody only after native exact-byte
+                    # publication in this same owning transaction.
+                    await _store_exact_governing_file(
+                        self._raw_storage, constitution_content, "KESTREL_CONSTITUTION.md",
+                    )
+                    constitution_hash = initial_hash
                     persisted_state = await ConstitutionMixin._consume_initial_anchor_custody(self)
                     # Mirror inception's governance wiring so the integrity audit's
                     # edge proof (#2463) holds for a lazily-anchored legacy agent.

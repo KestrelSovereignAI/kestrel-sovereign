@@ -140,7 +140,17 @@ its lock set and pruning history without a signed repair.
 
 Safe Mode exit verifies again inside its owning transaction. PostgreSQL holds
 the identity/ownership, governing edges/ownership and constitution file/owner
-rows through the exit commit; SQLite retains its native writer custody.
+rows through the exit commit; SQLite retains its native writer custody. Both
+backends require actual physical identity and governing-edge ownership rows:
+serialization does not substitute for existence. Exit decrypts and hashes the
+locked tenant-owned native blob; an ISOLATED session cache is not durable
+integrity evidence. New-identity bootstrap uses the same exact-native-byte
+publisher as signed repair, only after resolver verification and the durable
+single-use bootstrap fence, so volatile privacy storage cannot consume authority
+without publishing the constitution. Birth-record replication reserves its full
+graph set before file-owner writes, while still publishing files before nodes
+for tenant admission. Physical lock ordering uses PostgreSQL's canonical `C`
+collation; target equality does not depend on database locale.
 An existing genesis receipt must validate as a literal pass, not merely be
 terminal. Failure leaves the durable restriction and exit-event history intact.
 After a changed-hash repair the public genesis audit/readiness path can complete

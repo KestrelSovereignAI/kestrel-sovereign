@@ -71,23 +71,30 @@ async def store_verified_governing_file(
             or artifact.get("signer") != verification.signer
         ):
             raise RuntimeError("signed artifact does not describe the verified governing content")
-    await _store_exact_signed_file(storage, content, "KESTREL_CONSTITUTION.md")
+    await _store_exact_governing_file(storage, content, "KESTREL_CONSTITUTION.md")
     if artifact_content is not None:
         # The callers supply the exact detached artifact they verified, not
         # its serialization rebuilt from a mapping. Both public witnesses use
         # the same physical-byte and tenant-custody primitive.
-        await _store_exact_signed_file(
+        await _store_exact_governing_file(
             storage, artifact_content, "KESTREL_CONSTITUTION.reanchor.signed.json",
         )
     return digest
 
 
-async def _store_exact_signed_file(storage, content: bytes, name: str) -> None:
-    """Store one already verified public witness under the caller's custody."""
+async def _store_exact_governing_file(storage, content: bytes, name: str) -> None:
+    """Publish native public bytes after signed or single-use bootstrap authority.
+
+    Private first-party primitive: callers must establish their authority and
+    complete graph reservation first. Privacy-facing file caches are neither
+    publication nor an attestation of the actual native conflict winner.
+    """
     from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 
     digest = hashlib.sha256(content).hexdigest()
     files = storage.files
+    if storage.owns_open_transaction is not True or not files.agent_id:
+        raise RuntimeError("governing publication requires owned native tenant custody")
     unbound = AsyncFileStore(storage.db)
     lock = " FOR UPDATE" if storage.db.backend_type == "postgres" else ""
     row = await storage.db.fetchone(
@@ -123,6 +130,28 @@ async def _store_exact_signed_file(storage, content: bytes, name: str) -> None:
         )
         if owner is None:
             raise RuntimeError("governing file ownership disappeared during publication")
+
+
+async def lock_governing_file(storage, digest: str) -> bytes:
+    """After graph custody, retain and verify the actual tenant-owned blob."""
+    if storage.owns_open_transaction is not True or not storage.files.agent_id:
+        raise RuntimeError("governing attestation requires owned native tenant custody")
+    lock = " FOR UPDATE" if storage.db.backend_type == "postgres" else ""
+    blob = await storage.db.fetchone(
+        "SELECT content_hash FROM files WHERE content_hash = ?" + lock, (digest,),
+    )
+    owner = await storage.db.fetchone(
+        "SELECT content_hash FROM file_owners WHERE content_hash = ? AND agent_id = ?" + lock,
+        (digest, storage.files.agent_id),
+    )
+    if blob is None or owner is None:
+        raise RuntimeError("Anchored constitution blob is missing or its ownership custody is absent")
+    # Always the bound native reader: no session cache can attest to bytes in
+    # the locked database row. Decryption failure refuses the owning commit.
+    content = await storage.files.retrieve_file(digest)
+    if content is None or hashlib.sha256(content).hexdigest() != digest:
+        raise RuntimeError("Anchored constitution physical bytes fail content-address verification")
+    return content
 
 
 def historical_anchor_hash(
@@ -210,43 +239,47 @@ async def lock_governance_rows(
     """After graph reservation, retain the physical governing row witness.
 
     All publishers use ownership-before-edge order, matching native deletion.
-    SQLite's owning writer already supplies this physical serialization.
+    SQLite's owning writer supplies serialization, not existence. Both
+    backends must read the actual required witnesses.
     """
-    if storage.db.backend_type == "postgres":
-        identity = await storage.db.fetchone(
-            "SELECT node_id FROM graph_nodes WHERE node_id = ? FOR UPDATE", (agent_id,),
+    postgres = storage.db.backend_type == "postgres"
+    lock = " FOR UPDATE" if postgres else ""
+    identity = await storage.db.fetchone(
+        "SELECT node_id FROM graph_nodes WHERE node_id = ?" + lock, (agent_id,),
+    )
+    identity_owners = await storage.db.fetchall(
+        "SELECT node_id FROM graph_node_owners WHERE node_id = ? AND agent_id = ?" + lock,
+        (agent_id, agent_id),
+    )
+    if identity is None or not identity_owners:
+        raise RuntimeError("Agent identity or its ownership disappeared before governing custody")
+    # Never lock an endpoint outside the graph reservation set. Exit needs
+    # only its current governing edge; signed repair/genesis pass their
+    # complete captured set and reject changes without extending custody.
+    targets = sorted(set(expected_targets)) if expected_targets is not None else (
+        [required_target] if required_target is not None else []
+    )
+    edge_owners, edges = [], []
+    if targets:
+        predicate = " AND target_id IN (" + ",".join("?" for _ in targets) + ")"
+        params = (agent_id, *targets)
+        canonical_target = 'target_id COLLATE "C"' if postgres else "target_id"
+        canonical_owner = 'agent_id COLLATE "C"' if postgres else "agent_id"
+        edge_owners = await storage.db.fetchall(
+            "SELECT target_id, agent_id FROM graph_edge_owners WHERE source_id = ? AND label = 'governed_by'"
+            + predicate + f" ORDER BY {canonical_target}, {canonical_owner}" + lock, params,
         )
-        identity_owners = await storage.db.fetchall(
-            "SELECT node_id FROM graph_node_owners WHERE node_id = ? AND agent_id = ? FOR UPDATE",
-            (agent_id, agent_id),
+        edges = await storage.db.fetchall(
+            "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'"
+            + predicate + f" ORDER BY {canonical_target}" + lock, params,
         )
-        if identity is None or not identity_owners:
-            raise RuntimeError("Agent identity or its ownership disappeared before governing custody")
-        # Never lock an endpoint outside the graph reservation set. Exit needs
-        # only its current governing edge; signed repair/genesis pass their
-        # complete captured set and reject changes without extending custody.
-        targets = sorted(set(expected_targets)) if expected_targets is not None else (
-            [required_target] if required_target is not None else []
-        )
-        edge_owners, edges = [], []
-        if targets:
-            predicate = " AND target_id IN (" + ",".join("?" for _ in targets) + ")"
-            params = (agent_id, *targets)
-            edge_owners = await storage.db.fetchall(
-                "SELECT target_id, agent_id FROM graph_edge_owners WHERE source_id = ? AND label = 'governed_by'"
-                + predicate + " ORDER BY target_id, agent_id FOR UPDATE", params,
-            )
-            edges = await storage.db.fetchall(
-                "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'"
-                + predicate + " ORDER BY target_id FOR UPDATE", params,
-            )
-        if expected_targets is not None and [row[0] for row in edges] != targets:
-            raise RuntimeError("Captured governing edges disappeared before physical custody")
-        if required_target is not None and (
-            (required_target, agent_id) not in edge_owners
-            or (required_target,) not in edges
-        ):
-            raise RuntimeError("Missing or mis-targeted governed_by edge or ownership custody")
+    if expected_targets is not None and {row[0] for row in edges} != set(targets):
+        raise RuntimeError("Captured governing edges disappeared before physical custody")
+    if required_target is not None and (
+        (required_target, agent_id) not in edge_owners
+        or (required_target,) not in edges
+    ):
+        raise RuntimeError("Missing or mis-targeted governed_by edge or ownership custody")
 
 
 async def revalidate_governance_evidence(

@@ -61,7 +61,9 @@ async def test_rejected_avatar_has_no_joined_transaction_side_effects(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-@pytest.mark.parametrize("writer", ["runtime", "offline", "bootstrap", "avatar"])
+@pytest.mark.parametrize(
+    "writer", ["runtime", "offline", "bootstrap", "avatar", "replication"]
+)
 async def test_postgres_governance_custody_precedes_file_owner_write(
     db_backend,
     tmp_path,
@@ -75,7 +77,7 @@ async def test_postgres_governance_custody_precedes_file_owner_write(
     identity = "did:test:graph-before-file:" + uuid4().hex
     storage = AsyncStorage(backend=db_backend, agent_id=identity)
     await storage.initialize()
-    task = None
+    task = anchor = None
     blocker = probe = None
     transaction = None
     try:
@@ -94,6 +96,34 @@ async def test_postgres_governance_custody_precedes_file_owner_write(
                 agent, amendment_artifact_path=str(artifact)
             )
             assert not initial.startswith("Error:"), initial
+
+        if writer == "replication":
+            anchor = AsyncStorage(
+                str(tmp_path / "birth.db"), backend="sqlite", agent_id=identity
+            )
+            await anchor.initialize()
+            assert await anchor.store_file(content, "constitution.md") == digest
+            await anchor.add_node(
+                GraphNode(
+                    node_id=identity,
+                    node_type="agent",
+                    label="real birth",
+                    properties={"constitution_hash": digest},
+                )
+            )
+            await anchor.add_node(
+                GraphNode(
+                    node_id=digest,
+                    node_type="document",
+                    label="constitution",
+                    properties={"hash": digest},
+                )
+            )
+            await anchor.add_edge(identity, digest, "governed_by")
+            await storage.db.execute_commit(
+                "DELETE FROM file_owners WHERE content_hash=? AND agent_id=?",
+                (digest, identity),
+            )
 
         backend_class = type(db_backend)
         native_fetch_all = backend_class.fetch_all
@@ -126,6 +156,14 @@ async def test_postgres_governance_custody_precedes_file_owner_write(
         monkeypatch.setattr(offline, "_agent_embedding", no_embedding)
 
         async def repair():
+            if writer == "replication":
+                from kestrel_sovereign.identity.birth_record import (
+                    replicate_birth_record,
+                )
+
+                return await replicate_birth_record(
+                    runtime_db=storage.db, anchor_db=anchor.db, agent_did=identity
+                )
             if writer == "avatar":
                 return await storage.files.store_avatar(content, identity)
             if writer == "runtime":
@@ -167,18 +205,41 @@ async def test_postgres_governance_custody_precedes_file_owner_write(
                 != "Lock"
             ):
                 await asyncio.sleep(0.02)
-        assert (
-            await probe.execute(
-                "UPDATE file_owners SET agent_id=agent_id WHERE content_hash=$1 AND agent_id=$2",
-                digest,
-                identity,
+        if writer == "replication":
+            # With the graph reservation blocked, replication must not have
+            # inserted/retained the missing owner. An actual signed publisher
+            # needing that owner can therefore never form the inverse cycle.
+            async with probe.transaction():
+                assert (
+                    await probe.execute(
+                        "INSERT INTO file_owners (content_hash,agent_id,original_name) VALUES ($1,$2,'fixture') ON CONFLICT DO NOTHING",
+                        digest,
+                        identity,
+                    )
+                    == "INSERT 0 1"
+                )
+                # Remove our diagnostic row before the real writer resumes.
+                await probe.execute(
+                    "DELETE FROM file_owners WHERE content_hash=$1 AND agent_id=$2",
+                    digest,
+                    identity,
+                )
+        else:
+            assert (
+                await probe.execute(
+                    "UPDATE file_owners SET agent_id=agent_id WHERE content_hash=$1 AND agent_id=$2",
+                    digest,
+                    identity,
+                )
+                == "UPDATE 1"
             )
-        ) == "UPDATE 1"
         await transaction.rollback()
         transaction = None
         result = await asyncio.wait_for(task, 10)
         if writer == "offline":
             assert result.reanchored and result.error is None, result.error
+        elif writer == "replication":
+            assert result.files == 1
         else:
             assert not result.startswith("Error:"), result
         assert await storage.retrieve_file(digest) == content
@@ -197,4 +258,6 @@ async def test_postgres_governance_custody_precedes_file_owner_write(
             await probe.close()
         if blocker is not None:
             await blocker.close()
+        if anchor is not None:
+            await anchor.close()
         await storage.close()
