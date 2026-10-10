@@ -25,7 +25,7 @@ from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     bind_execution_cleanup, bind_execution_runtime, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
-    execution_terminal_error, is_execution_control_error,
+    execution_terminal_error, is_execution_control_error, execution_commit_outcome,
 )
 from kestrel_sovereign.auth import (
     caller_context_binding_scope,
@@ -433,6 +433,7 @@ def bind_async_invocation(
                         # cleanup, before a tool marks completion. Retain the
                         # exact lifecycle identity without acknowledging Stop.
                         cleanup_abandoned = True
+                    if execution_commit_outcome(error) is not None:
                         return
                     state = _current_effect_checkpoint.get()
                     if state is None or not state.completed or state.checkpointed:
