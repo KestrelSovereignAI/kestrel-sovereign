@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Protocol, TYPE_CHECKING, TypeVar
 
-from kestrel_sovereign.turn_scope import turn_scoped
+from kestrel_sovereign.turn_scope import capture_turn_scope, turn_scoped
 from kestrel_sdk.storage.database import TransactionError
 
 if TYPE_CHECKING:
@@ -163,6 +163,25 @@ _CURRENT_CUSTODY: ContextVar[tuple[ExecutionCustody, ...]] = ContextVar(
 _CLEANUP_ONLY: ContextVar[bool] = ContextVar("kestrel_execution_cleanup_only", default=False)
 
 
+@dataclass(eq=False)
+class _StreamCleanupState:
+    # Shared by reference with the producer and its children. The closer sets
+    # this BEFORE cancellation, which cannot mutate another task's ContextVars.
+    scopes: tuple[ExecutionCustody, ...]
+    requested: bool = False
+
+
+_STREAM_CLEANUP: ContextVar[tuple[_StreamCleanupState, ...]] = ContextVar(
+    "kestrel_execution_stream_cleanup", default=(),
+)
+
+
+def _execution_cleanup_requested() -> bool:
+    return _CLEANUP_ONLY.get() or any(
+        state.requested and bool(state.scopes) for state in _STREAM_CLEANUP.get()
+    )
+
+
 def current_execution_custody(owner: Any = None) -> tuple[ExecutionCustody, ...]:
     """Capture immutable scope membership, retaining shared revocation state."""
 
@@ -174,7 +193,7 @@ def current_execution_custody(owner: Any = None) -> tuple[ExecutionCustody, ...]
 
 
 def require_execution_work(owner: Any = None) -> None:
-    if _CLEANUP_ONLY.get():
+    if _execution_cleanup_requested():
         raise ExecutionAuthorityError("execution is cleanup-only; ordinary work is denied")
     for scope in current_execution_custody(owner):
         scope.require_work()
@@ -182,7 +201,7 @@ def require_execution_work(owner: Any = None) -> None:
 
 def refuse_unfenced_executor(owner: Any = None) -> None:
     """SQLAlchemy cannot validate authority on its actual mutation session."""
-    if _CLEANUP_ONLY.get() or current_execution_custody(owner):
+    if _execution_cleanup_requested() or current_execution_custody(owner):
         raise ExecutionAuthorityError(
             "custody-bound execution cannot use the unfenced SQLAlchemy executor"
         )
@@ -191,7 +210,7 @@ def refuse_unfenced_executor(owner: Any = None) -> None:
 def require_execution_backend(
     backend_type: str, scopes: tuple[ExecutionCustody, ...] | None = None,
 ) -> None:
-    if _CLEANUP_ONLY.get():
+    if _execution_cleanup_requested():
         raise ExecutionAuthorityError("execution is cleanup-only; ordinary work is denied")
     for scope in current_execution_custody() if scopes is None else scopes:
         scope.require_work()
@@ -348,7 +367,20 @@ class _ExecutionForwarder:
         self._runtime_owner = owner
         self._source = aiter(stream)
         self._scopes = current_execution_custody(owner)
-        self._iterator = OwnedAsyncIterator(self._produce, operation="execution-stream-forward")
+        self._cleanup_state = _StreamCleanupState(self._scopes)
+        # Task-relative capabilities (notably privacy-lock reentry) are not
+        # supplied by copy_context alone. Capture them on the lock owner.
+        self._turn_scope = capture_turn_scope(owner)
+        import contextvars
+        context = contextvars.copy_context()
+        get_lock_manager = getattr(type(owner), "_get_lock_manager", None)
+        manager = get_lock_manager(owner) if callable(get_lock_manager) else None
+        delegate = getattr(manager, "delegate_current_task_ownership", None)
+        if callable(delegate):
+            delegate(context)
+        self._iterator = OwnedAsyncIterator(
+            self._produce, operation="execution-stream-forward", owner_context=context,
+        )
 
     def __aiter__(self):
         return self
@@ -356,6 +388,7 @@ class _ExecutionForwarder:
     async def __anext__(self):
         additional = current_execution_custody(self._runtime_owner)
         self._scopes += tuple(scope for scope in additional if scope not in self._scopes)
+        self._cleanup_state.scopes = self._scopes
         with _bind_captured_custody(self._scopes):
             try:
                 item = await anext(self._iterator)
@@ -367,30 +400,32 @@ class _ExecutionForwarder:
             return item
 
     async def _produce(self):
-        error = None
-        try:
-            while True:
-                with _bind_captured_custody(self._scopes), bind_execution_runtime(self._runtime_owner):
-                    try:
-                        item = await anext(self._source)
-                    except StopAsyncIteration:
+        with self._turn_scope.bind(), _bind_stream_cleanup((self._cleanup_state,)):
+            error = None
+            try:
+                while True:
+                    with _bind_captured_custody(self._scopes), bind_execution_runtime(self._runtime_owner):
+                        try:
+                            item = await anext(self._source)
+                        except StopAsyncIteration:
+                            require_execution_work(self._runtime_owner)
+                            return
                         require_execution_work(self._runtime_owner)
-                        return
-                    require_execution_work(self._runtime_owner)
-                yield item
-        except BaseException as caught:
-            error = caught
-            raise
-        finally:
-            close = getattr(self._source, "aclose", None)
-            if callable(close):
-                with bind_execution_cleanup(self._runtime_owner, self._scopes):
-                    try:
-                        await close()
-                    except BaseException as cleanup_error:
-                        raise execution_terminal_error(error, cleanup_error)
+                    yield item
+            except BaseException as caught:
+                error = caught
+                raise
+            finally:
+                close = getattr(self._source, "aclose", None)
+                if callable(close):
+                    with bind_execution_cleanup(self._runtime_owner, self._scopes):
+                        try:
+                            await close()
+                        except BaseException as cleanup_error:
+                            raise execution_terminal_error(error, cleanup_error)
 
     async def aclose(self):
+        self._cleanup_state.requested = True
         await close_execution_stream(self._runtime_owner, self._iterator, self._scopes)
 
 
@@ -449,4 +484,22 @@ turn_scoped(
     variables=(_CLEANUP_ONLY,),
     capture=lambda owner: _CLEANUP_ONLY.get(),
     bind=_bind_cleanup_flag,
+)
+
+
+@contextmanager
+def _bind_stream_cleanup(captured: tuple[_StreamCleanupState, ...]) -> Iterator[None]:
+    existing = _STREAM_CLEANUP.get()
+    token = _STREAM_CLEANUP.set(existing + tuple(state for state in captured if state not in existing))
+    try:
+        yield
+    finally:
+        _STREAM_CLEANUP.reset(token)
+
+
+turn_scoped(
+    "execution_stream_cleanup",
+    variables=(_STREAM_CLEANUP,),
+    capture=lambda owner: _STREAM_CLEANUP.get(),
+    bind=_bind_stream_cleanup,
 )

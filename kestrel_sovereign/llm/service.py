@@ -71,7 +71,7 @@ from kestrel_sovereign.kestrel_config.constants import (
 )
 from kestrel_sovereign.config import load_config, load_section
 from kestrel_sovereign import telemetry
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, require_execution_work, execution_work_operation
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, require_execution_work, execution_work_operation, is_execution_control_error
 
 logger = logging.getLogger(__name__)
 
@@ -433,6 +433,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         try:
             self.providers = self._convert_providers_format(self.provider_registry.initialize_providers())
         except ProviderInitializationError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to initialize providers: {e}")
             self.providers = []
         # Decisions modality (#3424): ``[llm] decision_*`` and
@@ -539,6 +541,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
 
             self._embedding_space_pins = parse_embedding_space_pins(self.config)
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error(
                 "Invalid [llm.embedding_spaces] config; shared embedding spaces "
                 "are DISABLED until fixed: %s",
@@ -1039,6 +1043,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         try:
             vector = await service.aembed(canary)
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             hint = self._embedding_probe_hint(route, exc, subject="route")
             raise ValueError(
                 f"Cannot set embedding_route '{route}': live embedding probe "
@@ -1485,6 +1491,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         try:
             vector = await service.aembed(canary)
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             raise ValueError(
                 self._embedding_probe_failure_message(route, model, exc)
             ) from exc
@@ -1726,12 +1734,16 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             try:
                 await self.reconcile_embedding_capabilities(use_cache=True)
             except Exception as exc:  # pragma: no cover - never fail the read
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug("embedding capability reconcile skipped in aget: %s", exc)
         provider = self.resolve_embedding_provider()
         if provider is not None:
             try:
                 await self.resolve_route_embedding_model(provider)
             except Exception as exc:  # pragma: no cover - never fail the read
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug("active-route embedding resolve skipped: %s", exc)
         return self.get_embedding_settings()
 
@@ -1754,6 +1766,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             try:
                 model, dim = await self.resolve_route_embedding_model(provider)
             except Exception as exc:  # pragma: no cover - never fail the echo
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug("route embedding resolve skipped for %s: %s", route, exc)
             else:
                 route_name = provider.get("name")
@@ -2451,6 +2465,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         try:
             return bool(self._force_local_only_provider())
         except Exception as exc:  # pragma: no cover - defensive
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "force_local_only provider raised %s; defaulting to "
                 "local-only to fail safely.",
@@ -2644,6 +2660,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 force_local_only=force_local_only,
             )
         except RuntimeError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.info(
                 "Embedding provider unavailable under force_local_only=%s: %s; "
                 "semantic storage search will use keyword fallback.",
@@ -2992,6 +3010,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 parity_cosine=result.min_cosine,
             )
         except Exception as exc:  # pragma: no cover - defensive, never fatal
+            if is_execution_control_error(exc):
+                raise
             logger.debug("Recording embedding-space parity failed: %s", exc)
 
     async def hydrate_verified_space_pins(self, db: Any) -> None:
@@ -3023,6 +3043,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                     (pin.space_id,),
                 )
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "Hydrating parity for space %s failed: %s", pin.space_id, exc
                 )
@@ -3164,6 +3186,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             provider_infos = self.provider_registry.initialize_providers()
             return self._convert_providers_format(provider_infos)
         except ProviderInitializationError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to initialize providers: {e}")
             return []
 
@@ -3187,6 +3211,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         try:
             provider_infos = await registry.finalize_providers(host_db=host_db)
         except Exception as e:  # noqa: BLE001 - never block startup on this
+            if is_execution_control_error(e):
+                raise
             logger.warning("finalize_providers failed: %s", e)
             return
         self.providers = self._convert_providers_format(provider_infos)
@@ -3205,6 +3231,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
 
                 get_shared_model_cache().clear()
             except Exception as e:  # noqa: BLE001 - cache clear is best-effort
+                if is_execution_control_error(e):
+                    raise
                 logger.debug("Could not clear model cache after finalize: %s", e)
 
     def _check_policy(self) -> None:
@@ -3653,6 +3681,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 else (str(response) if response is not None else None)
             )
         except Exception as exc:  # noqa: BLE001 - response text is optional telemetry
+            if is_execution_control_error(exc):
+                raise
             response_text = None
             logger.warning("Could not render %s response for telemetry: %s", path, exc)
 
@@ -3672,6 +3702,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                             for call in executed
                         ]
             except Exception as exc:  # noqa: BLE001 - tool details are optional
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning("Could not normalize %s tool telemetry: %s", path, exc)
 
         cost = self._extract_provider_cost(response)
@@ -3854,6 +3886,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 # the historical cancellation contract and do not fabricate a row.
                 raise
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 require_execution_work(self)
                 await self._finalize_failed_invocation(
                     provider_name,
@@ -4027,6 +4061,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - independent best-effort sink
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning("Observability store failed for LLM call: %s", exc)
 
         # Prometheus metrics (no-op when prometheus-client not installed)
@@ -4071,6 +4107,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                         output_tokens
                     )
         except Exception as exc:  # noqa: BLE001 - independent best-effort sink
+            if is_execution_control_error(exc):
+                raise
             logger.warning("Prometheus metrics failed for LLM call: %s", exc)
 
         # Trigger metering callback for billing (Phase 1: tracking only)
@@ -4127,6 +4165,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - independent billing sink
+                    if is_execution_control_error(exc):
+                        raise
                     logger.warning("LLM metering callback failed: %s", exc)
 
         # Wrap in try/except so a serialization edge case can never break
@@ -4154,6 +4194,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 usage_log["caller"] = caller
             logger.info("llm.usage: %s", json.dumps(usage_log, default=str))
         except Exception as log_err:
+            if is_execution_control_error(log_err):
+                raise
             logger.warning("llm.usage log failed: %s", log_err)
 
     def get_cheap_model(self) -> Optional[str]:
@@ -4278,6 +4320,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         try:
             return resolve_provider_default(provider["name"])
         except ValueError as exc:
+            if is_execution_control_error(exc):
+                raise
             # Route is misconfigured (model="auto" + empty discovery) AND
             # the caller didn't supply an override. Refuse to send "auto"
             # downstream — that's the #1408 bug we're fixing, no soft
@@ -4615,6 +4659,8 @@ No other text or formatting.
                 try:
                     effective_model = self._resolve_concrete_model(target_model, provider)
                 except ModelNotAvailableForRoute as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     errors[provider["name"]] = str(exc)
                     logger.debug(
                         "Audit: skipping %s (cannot resolve concrete model: %s)",
@@ -4631,6 +4677,8 @@ No other text or formatting.
                 try:
                     supports_structured = provider["adapter"].provider_capabilities().supports_structured_output
                 except Exception as exc:  # capability introspection must never hard-fail the audit
+                    if is_execution_control_error(exc):
+                        raise
                     supports_structured = False
                     logger.debug(
                         "Audit: could not read capabilities for %s (%s); treating as no structured output",
@@ -4681,6 +4729,8 @@ No other text or formatting.
                         raise ValueError("Missing required keys in audit response.")
                     return response_json
                 except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     # A malformed/unparseable audit payload from this route must
                     # not short-circuit the whole audit (#2032): record it and try
                     # the next eligible provider rather than forcing risk_level=3.
@@ -4688,6 +4738,8 @@ No other text or formatting.
                     logger.warning(f"Audit provider {provider['name']} returned unparseable JSON: {exc}")
                     continue
                 except (LLMProviderError, openai.APIError, openai.APIConnectionError, httpx.HTTPError, ConnectionError, TimeoutError) as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     errors[provider["name"]] = str(exc)
                     logger.warning(f"Audit provider {provider['name']} failed: {exc}")
                     continue
@@ -4702,6 +4754,8 @@ No other text or formatting.
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
         except json.JSONDecodeError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to parse audit JSON: {e}")
             return {
                 "risk_level": 3,
@@ -4709,6 +4763,8 @@ No other text or formatting.
                 "audited": False,
             }
         except LLMProviderError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Audit provider failed: {e}")
             return {
                 "risk_level": 3,
@@ -4716,6 +4772,8 @@ No other text or formatting.
                 "audited": False,
             }
         except (ValueError, KeyError, AttributeError, TypeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Data validation error in audit: {e}", exc_info=True)
             return {
                 "risk_level": 3,
@@ -4723,6 +4781,8 @@ No other text or formatting.
                 "audited": False,
             }
         except (openai.APIError, openai.APIConnectionError, httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Network/API error in audit: {e}", exc_info=True)
             return {
                 "risk_level": 3,
@@ -4732,6 +4792,8 @@ No other text or formatting.
         except ExecutionAuthorityError:
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Unexpected audit error: {e}", exc_info=True)
             return {
                 "risk_level": 3,
@@ -4877,6 +4939,8 @@ No other text or formatting.
                 return result
 
             except ModelNotAvailableForRoute as e:
+                if is_execution_control_error(e):
+                    raise
                 # Route can't serve the target model. Skip silently — no HTTP
                 # call was made — and try the next provider.
                 logger.debug(
@@ -4887,6 +4951,8 @@ No other text or formatting.
                 continue
 
             except LLMProviderError as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"Provider {provider['name']} failed: {e}")
                 errors[provider['name']] = e
                 route_errors.append(e)
@@ -4963,12 +5029,18 @@ No other text or formatting.
                             provider_for_model = provider
                             break
                 except (RuntimeError, ValueError, ConnectionError, TimeoutError) as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.error(f"Auto-pull failed: {e}", exc_info=True)
                     raise ValueError(f"Model '{model_id}' not found and auto-pull failed: {e}")
                 except (openai.APIError, httpx.HTTPError) as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.error(f"Auto-pull network error: {e}", exc_info=True)
                     raise ValueError(f"Model '{model_id}' not found and auto-pull failed: {e}")
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.error(f"Auto-pull failed: {e}", exc_info=True)
                     raise ValueError(f"Model '{model_id}' not found and auto-pull failed: {e}")
 
@@ -5007,17 +5079,25 @@ No other text or formatting.
                 return self._annotate_and_return(span, response, redact=_redact)
 
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Model {model_id} API error: {e}", exc_info=True)
             raise RuntimeError(f"Model {model_id} failed: {e}") from e
         except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Model {model_id} network error: {e}", exc_info=True)
             raise RuntimeError(f"Model {model_id} failed: {e}") from e
         except (KeyError, AttributeError, TypeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Model {model_id} data error: {e}", exc_info=True)
             raise RuntimeError(f"Model {model_id} failed: {e}") from e
         except ExecutionAuthorityError:
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Model {model_id} failed: {e}", exc_info=True)
             raise RuntimeError(f"Model {model_id} failed: {e}") from e
 
@@ -5041,6 +5121,8 @@ No other text or formatting.
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(
                         "Error closing %s adapter: %s",
                         provider.get("name"), e, exc_info=True,
@@ -5065,10 +5147,16 @@ No other text or formatting.
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         pass
             except (ConnectionError, OSError) as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.debug(f"Connection error closing {provider.get('name')} client: {e}")
             except (RuntimeError, AttributeError) as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"Error closing {provider.get('name')} client: {e}", exc_info=True)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"Unexpected error closing {provider.get('name')} client: {e}", exc_info=True)
 
         # Stop accepting remote calls and drain them before discarding route
@@ -5086,6 +5174,8 @@ No other text or formatting.
                     require_active=False,
                 )
             except LLMServiceError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "Private inference route cleanup did not complete during "
                     "LLMService shutdown (%s)",
@@ -5199,6 +5289,8 @@ No other text or formatting.
                     except ExecutionAuthorityError:
                         raise
                     except Exception as exc:
+                        if is_execution_control_error(exc):
+                            raise
                         # Adapter implementations can raise provider-specific
                         # exception types. The boundary intentionally catches
                         # them all, exposes only a safe category, and never
@@ -5360,6 +5452,8 @@ No other text or formatting.
                 except ExecutionAuthorityError:
                     raise
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     self._raise_managed_remote_failure(exc)
 
         if remote_route is not None:
@@ -5538,6 +5632,8 @@ No other text or formatting.
                     return self._annotate_and_return(span, response.content or "", redact=_redact)
                 return self._annotate_and_return(span, response, redact=_redact)
             except openai.BadRequestError as e:
+                if is_execution_control_error(e):
+                    raise
                 # 400 = request problem (context too big, bad format, etc.)
                 # Don't fall back — the request itself is broken, not the provider.
                 logger.error(f"Provider {provider['name']} rejected request (400): {e}")
@@ -5545,6 +5641,8 @@ No other text or formatting.
             except ExecutionAuthorityError:
                 raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 self._maybe_disable_route(provider, e)
                 last_error = e

@@ -98,6 +98,7 @@ class OwnedAsyncIterator(Generic[_T]):
         *,
         operation: str,
         cleanup_requested: Callable[[], bool] | None = None,
+        owner_context: contextvars.Context | None = None,
     ) -> None:
         self._iterator_factory = iterator_factory
         self._operation = operation
@@ -117,7 +118,7 @@ class OwnedAsyncIterator(Generic[_T]):
         # this iterator's close record is bound, so the producer can find
         # the record of ITS consumer. The record's owner binding below is
         # what keeps tasks the producer spawns from claiming it.
-        owner_context = contextvars.copy_context()
+        owner_context = contextvars.copy_context() if owner_context is None else owner_context
         owner_context.run(_CONSUMER_CLOSE.set, self._consumer_close)
         self._owner = asyncio.create_task(
             self._run(),

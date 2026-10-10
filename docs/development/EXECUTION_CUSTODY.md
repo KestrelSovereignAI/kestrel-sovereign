@@ -115,6 +115,23 @@ is already an executing occurrence: uncertain bootstrap cannot advance or replay
 the original schedule. A known feature-unavailable deferral restores only the
 same live claim, never an uncertain occurrence under fresh authority.
 
+Stream forwarding captures declaration-site turn capabilities before moving
+execution to its source owner, including privacy-lock reentry and delegated
+conversation-lock ownership. A shared close record reaches that source and its
+children before cancellation starts unwinding an actively advancing generator;
+ordinary storage/provider/tool work is then denied, even while runtime custody
+is otherwise live. Closing one stream does not revoke its reusable runtime.
+Provider classification, retry and fallback preserve cause-chained control
+evidence before ordinary failed-invocation accounting.
+
+Scheduler effect markers lock the exact claim first and sample database lease
+time in a separate statement after the row lock is held. Each confirmed renewal
+also supplies a conservative monotonic deadline measured from before renewal
+checkout. Synchronous effect guards enforce that deadline, and a separately
+owned watcher expires/cancels/joins work even while renewal is blocked. A late
+renewal acknowledgement cannot revive an expired admission; watcher and renewal
+tasks are joined before occurrence ownership is released.
+
 Custody-bound durable-signal boot uses transactional creation/repair of its
 exact source-sequence index, retaining generation locks through commit. Unbound
 host maintenance keeps concurrent index DDL. Large preexisting ledgers should

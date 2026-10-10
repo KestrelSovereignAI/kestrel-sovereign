@@ -488,11 +488,28 @@ class _LeaseRenewalState:
     lost: asyncio.Event = field(default_factory=asyncio.Event)
     error: Optional[BaseException] = None
     custody: tuple = ()
+    confirmed_deadline: float | None = None
+    deadline_changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def is_live(self) -> bool:
+        # Synchronous guards must deny even if renewal/the timer is stalled.
+        if self.confirmed_deadline is not None and time.monotonic() >= self.confirmed_deadline:
+            self.mark_lost(ExecutionAuthorityError("scheduler confirmed lease expired"))
+        return not self.lost.is_set()
+
+    def confirm(self, deadline: float) -> bool:
+        if not self.is_live() or deadline <= time.monotonic():
+            self.mark_lost(ExecutionAuthorityError("scheduler renewal exceeded confirmed lease"))
+            return False
+        self.confirmed_deadline = deadline
+        self.deadline_changed.set()
+        return True
 
     def mark_lost(self, error: Optional[BaseException] = None) -> None:
         if self.error is None and error is not None:
             self.error = error
         self.lost.set()
+        self.deadline_changed.set()
 
 
 _rollout_renewal_state: contextvars.ContextVar[_LeaseRenewalState | None] = contextvars.ContextVar(
@@ -2400,7 +2417,7 @@ class SchedulerRunner:
             if shared and lease is not None:
                 with bind_execution_custody(AdvisoryExecutionFence(
                     lease, owner_live=(
-                        (lambda: not renewal_state.lost.is_set())
+                        renewal_state.is_live
                         if renewal_state is not None else None
                     ),
                 )):
@@ -3268,14 +3285,24 @@ class SchedulerRunner:
             attempt=task.attempt_count,
             owner=self._owner_id,
         )
-        renewal_state = _LeaseRenewalState()
+        renewal_state = _LeaseRenewalState(
+            confirmed_deadline=self._live_claim_deadlines.get(task.claim_execution_id),
+        )
         rollout_token = _rollout_renewal_state.set(renewal_state)
+        deadline_watch = None
         try:
+            deadline_watch = asyncio.create_task(
+                self._monitor_confirmed_lease_deadline(renewal_state),
+                name=f"scheduler-lease-deadline:{execution.id}",
+            )
             renewal = asyncio.create_task(
                 self._monitor_lease_renewal(task, renewal_state),
                 name=f"scheduler-lease:{execution.id}",
             )
         except BaseException:
+            if deadline_watch is not None:
+                deadline_watch.cancel()
+                await await_owned_task(deadline_watch)
             self._forget_live_claim(task)
             _rollout_renewal_state.reset(rollout_token)
             raise
@@ -3299,7 +3326,7 @@ class SchedulerRunner:
                 # later database read or assume task creation inherited it.
                 renewal_state.custody = current_execution_custody()
                 in_preparation = False
-                if renewal_state.lost.is_set():
+                if not renewal_state.is_live():
                     self._log_lease_loss(execution, phase="preparation")
                     return
                 async with self._active_dispatch_admission(task) as admitted:
@@ -3309,7 +3336,7 @@ class SchedulerRunner:
                             execution.id,
                         )
                         return
-                    if renewal_state.lost.is_set():
+                    if not renewal_state.is_live():
                         self._log_lease_loss(execution, phase="admission")
                         return
                     now = (
@@ -3329,7 +3356,7 @@ class SchedulerRunner:
                         else MISFIRE_SKIP
                     )
                     if policy == MISFIRE_SKIP and grace and late > grace:
-                        if renewal_state.lost.is_set():
+                        if not renewal_state.is_live():
                             self._log_lease_loss(execution, phase="misfire finalization")
                             return
                         await self._finalize(
@@ -3367,12 +3394,12 @@ class SchedulerRunner:
                         # claimed occurrence. Only errors after admission are
                         # normalized as target failures below.
                         if (
-                            renewal_state.lost.is_set()
+                            not renewal_state.is_live()
                             or not await self._agent_is_currently_authorized(
                                 task.agent_id
                             )
                             or not await self._claim_token_is_live(task)
-                            or renewal_state.lost.is_set()
+                            or not renewal_state.is_live()
                         ):
                             logger.warning(
                                 "Refusing scheduler effect for %s: agent was revoked, "
@@ -3454,7 +3481,7 @@ class SchedulerRunner:
                         # runner cancels or completes its owned effect.
                         scope.revoke()
                         _current_execution.reset(token)
-                    if renewal_state.lost.is_set():
+                    if not renewal_state.is_live():
                         self._log_lease_loss(execution, phase="finalization")
                         return
                     # Keep renewal alive until the terminal compare-and-set
@@ -3491,7 +3518,7 @@ class SchedulerRunner:
             # An explicit unavailable-feature verdict is known non-dispatch,
             # not a lost acknowledgement. Restore the pre-effect claim only
             # under its original live exact-owner CAS; expiry/loss cannot do so.
-            if self._prepared_executor_method() is not None and not renewal_state.lost.is_set():
+            if self._prepared_executor_method() is not None and renewal_state.is_live():
                 await self._mark_effect_started(task, execution, preparation_deferred=True)
             return
         except Exception as error:
@@ -3514,11 +3541,11 @@ class SchedulerRunner:
                 task.task_name,
                 error,
             )
-            if renewal_state.lost.is_set():
+            if not renewal_state.is_live():
                 self._log_lease_loss(execution, phase="preparation failure")
                 return
             async with self._active_dispatch_admission(task) as admitted:
-                if not admitted or renewal_state.lost.is_set():
+                if not admitted or not renewal_state.is_live():
                     logger.warning(
                         "Refusing scheduler preparation failure finalization for %s",
                         execution.id,
@@ -3537,7 +3564,16 @@ class SchedulerRunner:
             try:
                 await self._stop_renewal(renewal, task, execution)
             finally:
-                _rollout_renewal_state.reset(rollout_token)
+                try:
+                    if deadline_watch is not None:
+                        deadline_watch.cancel()
+                        outcome = await await_owned_task(deadline_watch)
+                        if outcome.cancellation is not None:
+                            raise outcome.cancellation
+                        if outcome.error is not None and not isinstance(outcome.error, asyncio.CancelledError):
+                            raise outcome.error
+                finally:
+                    _rollout_renewal_state.reset(rollout_token)
 
     def _prepared_executor_method(self) -> Optional[Callable[[SchedulerExecution], Any]]:
         """Return a structurally supplied preparation method, if any.
@@ -3604,16 +3640,33 @@ class SchedulerRunner:
         finally:
             self._forget_live_claim(task)
 
+    async def _monitor_confirmed_lease_deadline(self, state: _LeaseRenewalState) -> None:
+        """Expire custody independently of a blocked renewal checkout/row lock."""
+        while state.is_live():
+            state.deadline_changed.clear()
+            deadline = state.confirmed_deadline
+            if deadline is None:
+                await state.deadline_changed.wait()
+                continue
+            try:
+                async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+                    await state.deadline_changed.wait()
+            except TimeoutError:
+                # A completed renewal may have advanced the deadline in this
+                # same event-loop turn. Recheck, never revoke a newer interval.
+                state.is_live()
+
     async def _renew_live_claim_once(self, task: ScheduledTask) -> bool:
         """Renew a claim and expose only its bounded live-lease interval."""
 
         state = _rollout_renewal_state.get()
-        if state is not None and state.lost.is_set():
+        if state is not None and not state.is_live():
             self._forget_live_claim(task)
             return False
+        renewal_started = time.monotonic()
         with bind_execution_custody_snapshot(state.custody if state is not None else ()):
             renewed = await self._renew_lease_once(task)
-        if state is not None and state.lost.is_set():
+        if state is not None and not state.is_live():
             self._forget_live_claim(task)
             return False
         execution_id = task.claim_execution_id
@@ -3623,8 +3676,15 @@ class SchedulerRunner:
             self._forget_live_claim(task)
             return False
         now = time.monotonic()
+        # The DB expiry cannot precede statement execution, but a delayed
+        # acknowledgement consumes the lease. Starting BEFORE the checkout is
+        # conservative and cannot extend authority beyond the durable interval.
+        deadline = renewal_started + self._lease_seconds
+        if deadline <= now or (state is not None and not state.confirm(deadline)):
+            self._forget_live_claim(task)
+            return False
         was_live = self._live_claim_deadlines.get(execution_id, 0.0) > now
-        self._live_claim_deadlines[execution_id] = now + self._lease_seconds
+        self._live_claim_deadlines[execution_id] = deadline
         self._refresh_live_claim_deadline_snapshot()
         if not was_live:
             self._runtime_status_wake.set()
@@ -3672,6 +3732,10 @@ class SchedulerRunner:
         if self._database_backend_type() != "postgres":
             return
         async with self._transaction():
+            if not await self._lock_claim_token_for_renewal(task):
+                raise ExecutionAuthorityError("scheduler claim lost before effect evidence")
+            # Evaluate clock_timestamp only AFTER owning the unchanged row,
+            # not in the statement that may wait for that row's lock.
             claimed = await self._db.execute(
                 f"""UPDATE scheduled_tasks SET attempt_count = attempt_count
                 WHERE id = ? AND agent_id = ? AND lease_owner = ?
@@ -3725,7 +3789,7 @@ class SchedulerRunner:
             await asyncio.wait(
                 {effect, lease_lost}, return_when=asyncio.FIRST_COMPLETED
             )
-            if renewal_state.lost.is_set():
+            if not renewal_state.is_live():
                 if not effect.done():
                     effect.cancel()
                 outcome = await await_owned_task(effect)
@@ -3748,7 +3812,7 @@ class SchedulerRunner:
                 raise outcome.error
             # Give a renewal completion that raced the effect task precedence:
             # even a completed effect must not terminalize under a lost lease.
-            if renewal_state.lost.is_set():
+            if not renewal_state.is_live():
                 return False, None
             return True, outcome.result
         finally:

@@ -701,3 +701,105 @@ async def test_deferred_readiness_keeps_retained_scope_and_rejects_hook_loss():
         await agent.complete_deferred_agent_readiness()
     assert agent._agent_ready_hooks_deferred
     assert not agent._agent_ready_hooks_completed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hosted", [False, True])
+async def test_public_stream_rename_retains_privacy_lock_reentry(monkeypatch, hosted):
+    from tests.unit.test_streaming_audit import _make_streaming_audit_agent
+    from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
+    from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
+    import kestrel_sovereign.features.storage_access as storage_access
+
+    agent, _ = _make_streaming_audit_agent([], mode="warn", register_hook=False)
+    lock = ReentrantTransitionLock()
+    agent._get_privacy_transition_lock.return_value = lock
+    agent._agent_name = "Before"
+    if hosted:
+        agent._execution_custody = ExecutionCustody(Authority())
+    monkeypatch.setattr(storage_access, "hides_persisted_user_content", lambda owner: True)
+
+    async def body(*args, **kwargs):
+        outcome = await rename_agent_core(agent, "After")
+        assert outcome.skipped_privacy
+        yield "renamed"
+
+    agent._process_input_streaming_traced_locked = body
+    stream = agent.process_input_streaming("rename")
+    try:
+        assert await asyncio.wait_for(anext(stream), timeout=0.5) == "renamed"
+        assert agent._agent_name == "After"
+    finally:
+        await stream.aclose()
+    assert not lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_advancing_stream_close_denies_source_finalizer_and_its_child():
+    from kestrel_sovereign.execution_custody import owned_execution_stream
+    owner = SimpleNamespace(_execution_custody=ExecutionCustody(Authority()))
+    advancing = asyncio.Event()
+    closed = []
+
+    async def source():
+        try:
+            advancing.set()
+            await asyncio.Event().wait()
+            yield "never"
+        finally:
+            for check in (lambda: require_execution_work(owner), require_execution_work):
+                with pytest.raises(ExecutionAuthorityError, match="cleanup-only"):
+                    check()
+            async def child():
+                with pytest.raises(ExecutionAuthorityError, match="cleanup-only"):
+                    require_execution_work()
+            await asyncio.create_task(child())
+            closed.append(True)
+
+    async with owned_execution_stream(owner, source()) as stream:
+        advance = asyncio.create_task(anext(stream))
+        try:
+            await asyncio.wait_for(advancing.wait(), timeout=1)
+            await stream.aclose()
+            await asyncio.gather(advance, return_exceptions=True)
+        finally:
+            if not advance.done():
+                advance.cancel()
+                await asyncio.gather(advance, return_exceptions=True)
+    assert closed == [True]
+    require_execution_work(owner)  # Closing this stream did not revoke the runtime.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retired", [False, True])
+async def test_class_provider_attempt_preserves_wrapped_control_before_finalization(retired):
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+    service = LLMService.__new__(LLMService)
+    service._execution_custody = ExecutionCustody(Authority())
+    service._finalize_failed_invocation = AsyncMock()
+
+    async def provider():
+        if retired:
+            service._execution_custody.revoke("provider owner retired")
+        uncertain()
+
+    with pytest.raises(RuntimeError) as caught:
+        await service._run_provider_attempt(provider(), "test", "test", path="test", invocation_context=LLMInvocationContext())
+    assert execution_commit_outcome(caught.value) == "unknown"
+    service._finalize_failed_invocation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("normalizer", ["classify", "retry", "fallback"])
+async def test_provider_error_decorators_do_not_normalize_or_retry_control(normalizer):
+    from kestrel_sovereign.llm.error_handling import handle_llm_errors, with_retry, handle_provider_fallback
+    calls = []
+    async def provider(*args, **kwargs):
+        calls.append(True)
+        uncertain()
+    decorators = {"classify": handle_llm_errors(), "retry": with_retry(delay=0), "fallback": handle_provider_fallback(["one", "two"])}
+    with pytest.raises(RuntimeError) as caught:
+        await decorators[normalizer](provider)()
+    assert execution_commit_outcome(caught.value) == "unknown"
+    assert calls == [True]

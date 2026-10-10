@@ -882,3 +882,102 @@ async def test_scheduler_preparation_control_error_preserves_original_occurrence
     assert await db.fetchval("SELECT terminal_status FROM scheduled_tasks WHERE id='prepare-uncertain'") == "unresolved_effect"
     assert prepared == [claimed.claim_execution_id]
     assert not dispatched
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+async def test_scheduler_marker_rechecks_expiry_after_untouched_row_lock(native_pg, deferred):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask, SCHEDULER_PROTOCOL_VERSION
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    backend, control, schema = native_pg
+    db = AsyncDatabase(backend)
+    runner = SchedulerRunner(db, "marker-expiry", lambda *args: None, owner_id="marker-owner")
+    await runner._ensure_tables()
+    due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    await db.execute("""INSERT INTO scheduled_tasks
+        (id, agent_id, task_name, cron_expression, enabled, next_run_at, created_at, idempotency_key, scheduler_protocol_version)
+        VALUES ('marker', 'marker-expiry', 'effect', '* * * * *', 1, ?, ?, 'marker-base', ?)""", (due, due, SCHEDULER_PROTOCOL_VERSION))
+    task = ScheduledTask.from_row((await runner._due_rows(datetime.now(timezone.utc)))[0])
+    claimed = await runner._claim(task, datetime.now(timezone.utc))
+    before = "executing" if deferred else "claimed"
+    await db.execute("UPDATE task_execution_log SET status=? WHERE id=?", (before, claimed.claim_execution_id))
+    await db.execute("UPDATE scheduled_tasks SET lease_expires_at=(clock_timestamp()+interval '0.6 seconds')::text WHERE id='marker'")
+    blocker = control.transaction()
+    await blocker.start()
+    pending = None
+    try:
+        await control.fetchrow(f'SELECT id FROM "{schema}".scheduled_tasks WHERE id=\'marker\' FOR UPDATE')
+        pending = asyncio.create_task(runner._mark_effect_started(claimed, SimpleNamespace(id=claimed.claim_execution_id), preparation_deferred=deferred))
+        async with asyncio.timeout(5):
+            while not await control.fetchval("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%scheduled_tasks%' AND pid<>pg_backend_pid())"):
+                await asyncio.sleep(0.01)
+        # Real PostgreSQL evaluates the stale UPDATE predicate before this wait.
+        # Holding an unchanged row is crucial: EPQ cannot refresh it afterward.
+        await asyncio.sleep(0.65)
+        await blocker.rollback()
+        with pytest.raises(Exception, match="claim lost") as caught:
+            await pending
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+        assert is_execution_control_error(caught.value)
+        assert await db.fetchval("SELECT status FROM task_execution_log WHERE id=?", (claimed.claim_execution_id,)) == before
+    finally:
+        if control.is_in_transaction():
+            await blocker.rollback()
+        if pending is not None:
+            await asyncio.gather(pending, return_exceptions=True)
+
+
+async def test_stalled_native_renewal_cancels_and_joins_expired_effect(native_pg):
+    from datetime import datetime, timedelta, timezone
+    from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask, SCHEDULER_PROTOCOL_VERSION
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    backend, _, _ = native_pg
+    db = AsyncDatabase(backend)
+    started, stalled, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    release = asyncio.Event()
+    effects = []
+
+    async def effect(*args):
+        started.set()
+        try:
+            await release.wait()
+            require_execution_work()
+            effects.append("stale effect")
+        except asyncio.CancelledError:
+            # Cancellation-resistant code must also be denied by the native fence.
+            with pytest.raises(ExecutionAuthorityError):
+                require_execution_work()
+            cancelled.set()
+            return "cancellation resisted"
+
+    runner = SchedulerRunner(db, "stalled-renewal", effect, owner_id="stalled-owner", lease_seconds=1)
+    await runner._ensure_tables()
+    due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    await db.execute("""INSERT INTO scheduled_tasks
+        (id, agent_id, task_name, cron_expression, enabled, next_run_at, created_at, idempotency_key, scheduler_protocol_version)
+        VALUES ('stalled', 'stalled-renewal', 'effect', '* * * * *', 1, ?, ?, 'stalled-base', ?)""", (due, due, SCHEDULER_PROTOCOL_VERSION))
+    task = ScheduledTask.from_row((await runner._due_rows(datetime.now(timezone.utc)))[0])
+    claimed = await runner._claim(task, datetime.now(timezone.utc))
+    renew_once = runner._renew_lease_once
+    attempts = []
+    async def stalled_renewal(task):
+        attempts.append(True)
+        if len(attempts) == 1:
+            return await renew_once(task)
+        stalled.set()
+        await asyncio.Event().wait()  # Bounded test owner always joins this worker.
+    runner._renew_lease_once = stalled_renewal
+    pending = asyncio.create_task(runner._execute_claim(claimed))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.wait_for(stalled.wait(), timeout=1)
+        await asyncio.wait_for(cancelled.wait(), timeout=1.5)
+        await asyncio.wait_for(pending, timeout=1)
+        assert not effects
+        assert await db.fetchval("SELECT status FROM task_execution_log WHERE id=?", (claimed.claim_execution_id,)) == "executing"
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
