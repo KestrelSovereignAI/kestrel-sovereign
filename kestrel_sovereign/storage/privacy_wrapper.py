@@ -6356,14 +6356,15 @@ class PrivacyEnforcingStorage:
         return self._storage.rag
     
     async def close(self):
-        """Close the underlying storage."""
-        await self._storage.close()
+        """Close the underlying storage, passing on what its close reports."""
+        return await self._storage.close()
 
     async def dispose_cached_sqla_factory(self):
         """Bound SQLAlchemy pre-close without hiding the storage contract."""
         dispose = getattr(self._storage, "dispose_cached_sqla_factory", None)
         if callable(dispose):
-            await dispose()
+            return await dispose()
+        return None
     
     async def __aenter__(self):
         return self

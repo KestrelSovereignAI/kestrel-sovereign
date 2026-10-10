@@ -21,6 +21,7 @@ from kestrel_sovereign.multi_agent.config import (
     LocalAgentConfig,
     RemoteAgentConfig,
 )
+from kestrel_sovereign.multi_agent import process_manager
 from kestrel_sovereign.multi_agent.process_manager import (
     ProcessManager,
     AgentProcess,
@@ -310,6 +311,97 @@ class TestStaticHelpers:
                 "an unreadable file may name a live host; deleting it would "
                 "destroy the only record of it"
             )
+
+    @pytest.mark.parametrize("pid_state", ["running", "exited"])
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"pid": true}',
+            '{"pid": %(pid)d.0}',
+            '{"pid": "%(pid)d"}',
+            '{"pid": 0}',
+            '{"pid": -%(pid)d}',
+            '{"pid": %(beyond)d}',
+            '{"pid": 1e400}',
+            "-%(pid)d",
+            "0",
+            '{"pid": %(pid)d, "started_at": null}',
+            '{"pid": %(pid)d, "started_at": NaN}',
+            '{"pid": %(pid)d, "started_at": Infinity}',
+            '{"pid": %(pid)d, "started_at": -Infinity}',
+            '{"pid": %(pid)d, "started_at": 1e400}',
+            '{"pid": %(pid)d, "started_at": 1' + "0" * 400 + "}",
+            '{"pid": %(pid)d, "started_at": "1.0"}',
+            '{"pid": %(pid)d, "started_at": true}',
+            '{"pid": %(pid)d, "started_at": 0}',
+            '{"pid": %(pid)d, "started_at": -1.0}',
+        ],
+        ids=[
+            "bool-pid",
+            "float-pid",
+            "string-pid",
+            "zero-pid",
+            "negative-pid",
+            "pid-beyond-platform-range",
+            "overflowing-pid",
+            "negative-bare-pid",
+            "zero-bare-pid",
+            "null-started-at",
+            "nan-started-at",
+            "infinite-started-at",
+            "negative-infinite-started-at",
+            "overflowing-started-at",
+            "overflowing-integer-started-at",
+            "string-started-at",
+            "bool-started-at",
+            "zero-started-at",
+            "negative-started-at",
+        ],
+    )
+    def test_a_value_that_is_not_one_is_unreadable_never_stale(
+        self, tmp_path, content, pid_state
+    ):
+        """A damaged record proves neither that its process lives nor that it is gone.
+
+        ``NaN`` or an infinity compared with a live process's start time made
+        this process read as another one, and a PID that no process table
+        issues read as absent: either way STALE, which the launcher clears
+        and the guards read as stopped (#3522).
+        """
+        if pid_state == "running":
+            pid = os.getpid()
+        else:
+            dead = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead.wait()
+            pid = dead.pid
+        pid_file = tmp_path / "damaged.pid"
+        pid_file.write_text(
+            content.replace("%(pid)d", str(pid)).replace(
+                "%(beyond)d", str(process_manager._MAX_PID + 1)
+            )
+        )
+
+        record = ProcessManager.read_pid_record(pid_file)
+
+        assert record.status is PidStatus.UNREADABLE
+        assert record.pid is None
+        assert record.needs_cleanup is False
+        assert record.is_running is False
+
+    def test_a_record_with_no_start_time_is_judged_by_its_pid_alone(self, tmp_path):
+        """``write_pid`` omits a start time it cannot read: not a damaged record.
+
+        It reads as a legacy file does: stale once nothing runs as its PID.
+        """
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        pid_file = tmp_path / "unidentified.pid"
+        pid_file.write_text(json.dumps({"pid": dead.pid}))
+
+        record = ProcessManager.read_pid_record(pid_file)
+
+        assert record.status is PidStatus.STALE
+        assert record.started_at is None
 
     def test_the_recorded_start_time_is_what_reaches_the_caller(self, tmp_path):
         """The record must carry the instant from the FILE.

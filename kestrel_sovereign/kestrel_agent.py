@@ -43,7 +43,7 @@ from kestrel_sovereign.config import (
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping, Callable
 import re
-from pathlib import Path
+from pathlib import Path, PurePath
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 from kestrel_sovereign.features.privacy import PrivacyAgent
 from kestrel_sovereign.features import (
@@ -76,6 +76,14 @@ from kestrel_sovereign.agent.boot import (
     BootPhase,
     BootPhaseState,
     run_boot_sequence,
+)
+from kestrel_sovereign.agent.custody import (
+    FEATURE_OWNER,
+    STANDALONE_HOLD_CONTEXT,
+    ReleaseOutcome,
+    ResourceCustody,
+    feature_resource_name,
+    reported_outcome,
 )
 from kestrel_sovereign.spawn.mandate import (
     PersistedSpawnMandateExpiredError,
@@ -302,6 +310,17 @@ def _raise_unexpected_lifecycle_exception_group(
     _expected, unexpected = error.split((asyncio.CancelledError, Exception))
     if unexpected is not None:
         raise unexpected
+
+
+def _dispatcher_release_outcome(result: object) -> ReleaseOutcome:
+    """What a ``shutdown_durable_delivery()`` that returned ``result`` reports.
+
+    It returns ``False`` while live cognition still fences its delivery, so
+    that release is not done (#3522).
+    """
+    if result is False:
+        return ReleaseOutcome.RETAINED
+    return reported_outcome(result)
 
 
 async def await_lifecycle_task_completion(
@@ -853,6 +872,12 @@ class KestrelAgent(
         self._standalone_hold_context_close_task = None
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
+        # This process's record that it serves the agent (#3522): written as
+        # boot starts, removed only once every resource the agent acquired has
+        # a confirmed release in ``_custody``.
+        self._serving_record = None
+        self._custody = ResourceCustody()
+        self._unreleased_features: list[tuple[Optional[str], Feature]] = []
         effective_db_backend = db_backend or os.environ.get(
             "KESTREL_DB_BACKEND", "sqlite"
         )
@@ -2138,7 +2163,10 @@ class KestrelAgent(
                 "back; construct a fresh agent (or shutdown() this one) before "
                 "retrying — a partial-state retry is refused."
             )
-        ctx = BootContext(logger_=logging.getLogger(__name__))
+        ctx = BootContext(
+            logger_=logging.getLogger(__name__),
+            custody=self._resource_custody(),
+        )
         self._boot_context = ctx
 
         def _set_state(new_state: BootPhaseState) -> None:
@@ -2170,6 +2198,10 @@ class KestrelAgent(
             # (or while rolling the private candidate back).
             if self._boot_state is not BootPhaseState.READY:
                 self._disarm_host_authority_boot_deadline()
+            if self._boot_state is BootPhaseState.FAILED and not (
+                self._release_serving_record()
+            ):
+                ctx.note_retained("serving record")
 
     def _disarm_host_authority_boot_deadline(self) -> None:
         """Retire the pre-publication mandate watchdog after a safe handoff."""
@@ -2334,8 +2366,124 @@ class KestrelAgent(
                 "Persisted spawn mandate expired during active agent boot"
             )
 
+    def _serving_data_dir(self) -> Optional[Path]:
+        """The data directory this agent serves, when it has one on disk."""
+        storage_path = self.storage_path
+        if not isinstance(storage_path, (str, PurePath)):
+            return None
+        if str(storage_path) in ("", ":memory:"):
+            return None
+        # The directory, resolved: a guard resolves the registered data dir
+        # the same way, while resolving a symlinked database file would name
+        # the directory it points into.
+        return Path(storage_path).expanduser().parent.resolve()
+
+    def _record_serving(self) -> None:
+        """Record that this process serves the agent, before boot reads anything.
+
+        A guard that must not change an agent beneath a live process —
+        ``kestrel update --no-restart`` replacing the constitution its
+        integrity audit reads, an offline reanchor writing its database —
+        finds it by this record however it was launched (#3522). It is
+        removed only by :meth:`_release_serving_record`.
+
+        Raises:
+            OSError: The record cannot be written. Boot fails rather than
+                serve an agent those guards cannot see.
+        """
+        from kestrel_sovereign.multi_agent.liveness import ServingRecord
+
+        data_dir = self._serving_data_dir()
+        if data_dir is None or self._serving_record is not None:
+            return
+        self._serving_record = ServingRecord.acquire(data_dir)
+
+    def _resource_custody(self) -> ResourceCustody:
+        """The tracker of the resources this agent holds (#3522)."""
+        custody = vars(self).get("_custody")
+        if custody is None:
+            custody = ResourceCustody()
+            self._custody = custody
+        return custody
+
+    def _unreleased_feature_registry(self) -> list[tuple[Optional[str], Feature]]:
+        """Feature instances whose teardown has not succeeded, with their keys.
+
+        The owner registry a failed feature cleanup leaves its instance in, so
+        that boot rollback and shutdown can find it and retry (#3522). It holds
+        instances a failed unload dropped from ``self.features`` and instances
+        whose registration failed before they ever reached it. An instance
+        leaves only once a teardown or shutdown of it succeeds.
+        """
+        registry = vars(self).get("_unreleased_features")
+        if registry is None:
+            registry = []
+            self._unreleased_features = registry
+        return registry
+
+    def _keep_unreleased_feature(
+        self, feature_key: Optional[str], feature: Feature
+    ) -> None:
+        registry = self._unreleased_feature_registry()
+        if not any(held is feature for _key, held in registry):
+            registry.append((feature_key, feature))
+
+    def _forget_unreleased_feature(self, feature: Feature) -> None:
+        registry = self._unreleased_feature_registry()
+        registry[:] = [(key, held) for key, held in registry if held is not feature]
+
+    def _unreleased_features_not_loaded(self) -> list[tuple[Optional[str], Feature]]:
+        """The unreleased features that are not also in ``self.features``."""
+        loaded = list(self.features.values())
+        return [
+            (key, feature)
+            for key, feature in self._unreleased_feature_registry()
+            if not any(feature is other for other in loaded)
+        ]
+
+    def _release_serving_record(self) -> bool:
+        """Remove this process's serving record once nothing is held.
+
+        The one gate the boot rollback and the shutdown both use (#3522). The
+        record stays while any resource the agent acquired lacks a confirmed
+        release: whatever still holds it may still read or write the agent's
+        data, so the guards must keep reporting the agent served. A record
+        that stays goes stale once this process exits.
+
+        Returns:
+            Whether no record is left naming this process.
+        """
+        record = getattr(self, "_serving_record", None)
+        if record is None:
+            return True
+        held = self._resource_custody().held
+        if held:
+            logging.info(
+                "Keeping serving record %s: release of %s not confirmed",
+                record.path,
+                ", ".join(held),
+            )
+            return False
+        try:
+            record.release()
+        except OSError as exc:
+            # Left behind, it names this process, so a guard reads the agent
+            # as served until the process exits: a refusal, never a pass. The
+            # handle stays, so a later call retries the removal.
+            logging.warning(
+                "Could not remove serving record %s: %s", record.path, exc
+            )
+            return False
+        self._serving_record = None
+        return True
+
     async def _boot_phase_storage_privacy(self, ctx: BootContext) -> None:
         """Phase 1 — storage + privacy. Cold-restore, raw/privacy storage, constitution runtime state, embedding-pin hydration, privacy agent, and the force-local-only embedding gate. Owns the primary DB connection."""
+        self._record_serving()
+        # The agent closes its LLM service at shutdown, and boot may start
+        # provider clients with it from here on (#3522).
+        if self.llm_service is not None and hasattr(self.llm_service, "close"):
+            self._resource_custody().acquire("llm_service")
         # Cold-start restore from Lighthouse if DB doesn't exist (ephemeral environments)
         if (
             os.environ.get("LIGHTHOUSE_API_KEY")
@@ -2423,6 +2571,9 @@ class KestrelAgent(
         # so closing a partially-initialized storage is safe; it also drops the
         # privacy wrapper / privacy agent set below.
         ctx.on_rollback("storage", self._boot_teardown_storage)
+        # Agent-owned background work may use storage from here on, so it is
+        # stopped just before storage closes (#3522).
+        ctx.on_rollback("background_tasks", self._boot_teardown_background_tasks)
         await self._raw_storage.initialize()
 
         # Wrap storage with privacy-enforcing layer
@@ -2797,7 +2948,7 @@ class KestrelAgent(
         )
         # Unregister them in reverse if a later phase fails, so the discarded
         # boot leaves no orphan source registrations behind.
-        ctx.on_rollback(
+        ctx.on_rollback_unheld(
             "core_signal_sources",
             lambda names=list(core_source_names): self._boot_teardown_signal_sources(names),
         )
@@ -3468,7 +3619,7 @@ class KestrelAgent(
         # through registration (or in post_all_features_loaded below) rolls back
         # every feature already initialized — each feature.initialize() may have
         # opened connections or started workers.
-        ctx.on_rollback("features", self._boot_teardown_features)
+        ctx.on_rollback_unheld("features", self._boot_teardown_features)
         enabled_discovered_features = tuple(
             feature
             for feature in discovered_features
@@ -3846,7 +3997,7 @@ class KestrelAgent(
         self.signal_registry.register_with_policy(
             _heartbeat_reg, RegistrationPolicy.MANDATORY
         )
-        ctx.on_rollback(
+        ctx.on_rollback_unheld(
             "heartbeat_source",
             lambda n=_heartbeat_reg.name: self._boot_teardown_signal_sources([n]),
         )
@@ -3880,7 +4031,7 @@ class KestrelAgent(
             build_system_resumed_registration(handler=_resume_action_handler),
             RegistrationPolicy.MANDATORY,
         )
-        ctx.on_rollback(
+        ctx.on_rollback_unheld(
             "system_resumed_source",
             lambda n=RESUME_SOURCE_NAME: self._boot_teardown_signal_sources([n]),
         )
@@ -4090,56 +4241,92 @@ class KestrelAgent(
     # Each releases exactly ONE resource a boot phase acquired and is
     # registered via ``ctx.on_rollback`` at the moment of acquisition, so the
     # BootContext can unwind them in reverse (LIFO) order on any phase failure.
-    # Each clears its handle only after releasing the resource it protects. A
-    # durable dispatcher is the deliberate exception to eager handle clearing:
-    # a failed owner release retains both dispatcher and storage so a later
-    # lifecycle shutdown can retry safely. The rollback driver logs failures
-    # and continues with independent resources.
+    # Each reports what it did (#3522): the outcome its owner's close returned
+    # (``RELEASED`` when the close returns anything else), ``RETAINED`` when it
+    # kept the resource, and an exception when the close failed. The agent's
+    # custody believes ``RELEASED`` only from an owner that reports a failed
+    # close truthfully, so the resource, and the serving record with it,
+    # stays held otherwise. A durable dispatcher is the deliberate exception
+    # to eager handle clearing: a dispatcher whose owner release failed, or
+    # is still fenced by live cognition, keeps its handle, and storage stays
+    # open beneath it. A fenced release hands storage close to the agent-owned
+    # continuation shutdown uses; a failed one leaves both for a later
+    # lifecycle shutdown to retry. The rollback driver logs failures and
+    # continues with independent resources.
     # ------------------------------------------------------------------
-    async def _boot_teardown_storage(self) -> None:
+    async def _boot_teardown_storage(self) -> ReleaseOutcome:
         """Close the primary DB connection and drop the privacy layer."""
         # Dispatcher teardown owns a runtime-owner release against this very
-        # backend.  If its retryable release has not succeeded, retaining both
-        # handles is the only safe rollback state: closing here would strand a
-        # live owner or let its completion touch a closed SQLite worker.
+        # backend.  If that release has not finished, retaining both handles
+        # is the only safe rollback state: closing here would strand a live
+        # owner or let its completion touch a closed SQLite worker.
         if getattr(self, "dispatcher", None) is not None:
-            logging.error(
-                "boot rollback: retaining storage because durable dispatcher "
-                "teardown is still incomplete"
-            )
-            return
+            if getattr(self, "_durable_shutdown_continuation", None) is not None:
+                logging.warning(
+                    "boot rollback: leaving storage to the durable shutdown "
+                    "continuation, which closes it once the dispatcher's "
+                    "owner release finishes"
+                )
+            else:
+                logging.error(
+                    "boot rollback: retaining storage because durable "
+                    "dispatcher teardown is still incomplete"
+                )
+            return ReleaseOutcome.RETAINED
         raw = self._raw_storage
         self._raw_storage = None
         self.storage = None
         self.privacy_agent = None
         if raw is not None and hasattr(raw, "close"):
-            await raw.close()
+            return reported_outcome(await raw.close())
+        return ReleaseOutcome.RELEASED
 
-    async def _boot_teardown_task_manager(self) -> None:
+    async def _boot_teardown_background_tasks(self) -> ReleaseOutcome:
+        """Cancel agent-owned background work and reap it, within one bound."""
+        tasks = set(getattr(self, "_background_tasks", ()))
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            _done, pending = await asyncio.wait(
+                tasks, timeout=KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S
+            )
+            if pending:
+                logging.warning(
+                    "boot rollback: %d background task(s) still running after "
+                    "cancellation",
+                    len(pending),
+                )
+                return ReleaseOutcome.RETAINED
+        return ReleaseOutcome.RELEASED
+
+    async def _boot_teardown_task_manager(self) -> ReleaseOutcome:
         """Close the A2A TaskManager stores."""
         tm = self.task_manager
         self.task_manager = None
         if tm is not None and hasattr(tm, "close"):
-            await tm.close()
+            return reported_outcome(await tm.close())
+        return ReleaseOutcome.RELEASED
 
-    async def _boot_teardown_sync_service(self) -> None:
+    async def _boot_teardown_sync_service(self) -> ReleaseOutcome:
         """Stop the background sync worker."""
         svc = self._sync_service
         self._sync_service = None
         if svc is not None and getattr(svc, "is_running", False):
-            await svc.stop()
+            return reported_outcome(await svc.stop())
+        return ReleaseOutcome.RELEASED
 
-    async def _boot_teardown_dispatcher(self) -> None:
+    async def _boot_teardown_dispatcher(self) -> ReleaseOutcome:
         """Stop durable dispatcher liveness before its storage is released."""
         dispatcher = getattr(self, "dispatcher", None)
         if dispatcher is None:
-            return
+            return ReleaseOutcome.RELEASED
 
         cancelled = False
         retried_failure = False
         while True:
             try:
-                await dispatcher.shutdown_durable_delivery()
+                delivered = await dispatcher.shutdown_durable_delivery()
                 break
             except asyncio.CancelledError:
                 # BootContext guarantees a complete rollback, but this
@@ -4164,13 +4351,27 @@ class KestrelAgent(
                     exc_info=True,
                 )
 
-        # Only a successfully released dispatcher may lose its public handle.
-        # The following storage rollback can now close the shared backend.
-        self.dispatcher = None
+        outcome = _dispatcher_release_outcome(delivered)
+        fenced = bool(getattr(dispatcher, "durable_shutdown_owner_fenced", False))
+        if outcome is ReleaseOutcome.RELEASED and not fenced:
+            # Only a released dispatcher may lose its public handle. The
+            # following storage rollback can now close the shared backend.
+            self.dispatcher = None
+        elif delivered is False or fenced:
+            # Live cognition still fences its delivery, so the owner is
+            # released later by the dispatcher's own task (#3522). Keep the
+            # handle: storage rollback then keeps the shared backend open
+            # beneath it, and a later shutdown finds the owner to join. The
+            # agent-owned continuation shutdown uses joins that release and
+            # only then closes storage; ``wait_for_shutdown_completion`` joins
+            # the continuation.
+            await self._ensure_durable_shutdown_continuation(dispatcher)
+            outcome = ReleaseOutcome.RETAINED
         if cancelled:
             raise asyncio.CancelledError()
+        return outcome
 
-    async def _boot_teardown_features(self) -> None:
+    async def _boot_teardown_features(self) -> ReleaseOutcome:
         """Reverse every feature registration made before the failure, LIFO.
 
         Delegates to the canonical per-feature teardown
@@ -4180,54 +4381,93 @@ class KestrelAgent(
         subset. The old rollback called only ``feature.shutdown()``, leaving a
         rolled-back feature's hooks and ``task:``/``talon:`` wait providers
         registered on a dead agent (kestrel-sovereign#2522). Each feature is
-        guarded so one stubborn teardown can't strand the rest.
+        guarded so one stubborn teardown can't strand the rest. Each feature's
+        own custody is settled by that teardown (#3522), and a feature whose
+        teardown failed, by raising or by reporting anything but ``RELEASED``,
+        stays in ``self.features``, so a later shutdown retries it.
+
+        It also retries every feature whose earlier teardown failed and that
+        is no longer, or never was, in ``self.features``: one whose
+        registration failed (:meth:`_shutdown_failed_feature`), or whose
+        unload did. Those stay in the unreleased-feature registry until a
+        teardown of them succeeds.
+
+        Returns:
+            ``RETAINED`` when any feature's teardown failed, else ``RELEASED``.
         """
         self._post_all_features_loaded_complete = False
-        for name, feature in reversed(list(self.features.items())):
+        loaded = list(self.features.items())
+        unloaded = self._unreleased_features_not_loaded()
+        failed: list = []
+        for name, feature in [*reversed(unloaded), *reversed(loaded)]:
+            label = name or type(feature).__name__
             try:
-                await self._unregister_feature_runtime(feature)
+                reported = reported_outcome(
+                    await self._unregister_feature_runtime(feature)
+                )
             except Exception as exc:  # noqa: BLE001 - best-effort teardown
                 logging.warning(
                     "boot rollback: feature '%s' teardown failed: %s",
-                    name,
+                    label,
                     exc,
                 )
-        self.features = {}
+                failed.append(feature)
+                continue
+            if reported is not ReleaseOutcome.RELEASED:
+                logging.warning(
+                    "boot rollback: feature '%s' teardown reported %s",
+                    label,
+                    reported.value,
+                )
+                failed.append(feature)
+        self.features = {
+            name: feature
+            for name, feature in loaded
+            if any(feature is held for held in failed)
+        }
+        return ReleaseOutcome.RETAINED if failed else ReleaseOutcome.RELEASED
 
-    async def _boot_teardown_memory(self) -> None:
+    async def _boot_teardown_memory(self) -> ReleaseOutcome:
         """Shut down the memory system."""
         ms = getattr(self, "memory_system", None)
         self.memory_system = None
         if ms is not None and hasattr(ms, "shutdown"):
-            await ms.shutdown()
+            return reported_outcome(await ms.shutdown())
+        return ReleaseOutcome.RELEASED
 
-    async def _boot_teardown_salvage(self) -> None:
+    async def _boot_teardown_salvage(self) -> ReleaseOutcome:
         """Drain and stop the context-manager salvage worker."""
         cm = getattr(self, "context_manager", None)
         if cm is not None and hasattr(cm, "stop_salvage_worker"):
-            await cm.stop_salvage_worker()
+            return reported_outcome(await cm.stop_salvage_worker())
+        return ReleaseOutcome.RELEASED
 
-    async def _boot_teardown_heartbeat(self) -> None:
+    async def _boot_teardown_heartbeat(self) -> ReleaseOutcome:
         """Stop the heartbeat runner."""
         hb = getattr(self, "heartbeat_runner", None)
         if hb is not None and hasattr(hb, "stop"):
-            await hb.stop()
+            return reported_outcome(await hb.stop())
+        return ReleaseOutcome.RELEASED
 
-    async def _boot_teardown_resume(self) -> None:
+    async def _boot_teardown_resume(self) -> ReleaseOutcome:
         """Stop the resume monitor."""
         rm = getattr(self, "resume_monitor", None)
         if rm is not None and hasattr(rm, "stop"):
-            await rm.stop()
+            return reported_outcome(await rm.stop())
+        return ReleaseOutcome.RELEASED
 
-    async def _boot_teardown_signal_sources(self, names: list[str]) -> None:
+    async def _boot_teardown_signal_sources(self, names: list[str]) -> ReleaseOutcome:
         """Unregister the named signal sources (registry rollback).
 
         Async so it composes with the ``await``-based rollback driver even
-        though ``unregister`` itself is synchronous.
+        though ``unregister`` itself is synchronous. The registrations live
+        only in this agent's registry, so custody does not hold them; the
+        outcome reports any that could not be unregistered.
         """
         reg = getattr(self, "signal_registry", None)
         if reg is None:
-            return
+            return ReleaseOutcome.RELEASED
+        outcome = ReleaseOutcome.RELEASED
         for name in names:
             try:
                 reg.unregister(name)
@@ -4237,6 +4477,8 @@ class KestrelAgent(
                     name,
                     exc,
                 )
+                outcome = ReleaseOutcome.RETAINED
+        return outcome
 
     @property
     def privacy_mode(self) -> PrivacyMode:
@@ -5327,8 +5569,11 @@ class KestrelAgent(
         ``MandatoryFeatureReadinessError`` wrap) is what surfaces to the caller.
         Every teardown step is idempotent, so it is safe even when the feature
         only got as far as ``initialize()`` (never added to ``self.features``) or
-        a stage left nothing to undo — and ``unload=True`` still drops the
-        instance so boot rollback never double-tears-down it (#2522 P1).
+        a stage left nothing to undo. ``unload=True`` drops the instance from
+        ``self.features`` (#2522 P1). A teardown that succeeded leaves nothing
+        for boot rollback to repeat; one that failed leaves the instance in the
+        unreleased-feature registry, where boot rollback and shutdown find it
+        and retry, until a teardown of it succeeds (#3522).
         """
         name = getattr(feature, "name", None)
         try:
@@ -5577,6 +5822,9 @@ class KestrelAgent(
             prepared_contributions = self._prepare_feature_contribution_transition(
                 (feature,)
             ).only()
+        # Held from before initialize(), which may start workers or child
+        # processes, until a teardown's release is confirmed (#3522).
+        self._hold_feature(feature)
         try:
             await feature.initialize()
         except Exception as exc:
@@ -5809,6 +6057,7 @@ class KestrelAgent(
             prepared_contributions = self._prepare_feature_contribution_transition(
                 (feature,)
             ).only()
+        self._hold_feature(feature)
         try:
             # An isolated re-enable starts from a terminal proxy with no live
             # ingress. Persist its declared config first so initialize forwards
@@ -5939,7 +6188,7 @@ class KestrelAgent(
 
     async def _unregister_feature_runtime(
         self, feature: "Feature", *, unload: bool = True
-    ) -> None:
+    ) -> ReleaseOutcome:
         """Reverse *every* runtime registration a fully-registered feature acquired.
 
         The single canonical inverse of the wiring ``_register_feature`` /
@@ -5972,6 +6221,17 @@ class KestrelAgent(
         failure. It does NOT enforce the mandatory-feature guard — that is a
         caller policy (runtime disable refuses; boot rollback must tear mandatory
         features down too).
+
+        The feature leaves the agent's custody only when no step failed and
+        its owner is known to report a failed teardown truthfully (#3522).
+        When a step failed, or ``feature.shutdown()`` reported anything but
+        ``RELEASED``, the instance stays in the unreleased-feature registry
+        (:meth:`_unreleased_feature_registry`) even though a full unload drops
+        it from ``self.features``, so boot rollback and shutdown can retry it.
+
+        Returns:
+            What the teardown reported: ``RELEASED``, or the outcome
+            ``feature.shutdown()`` returned when that was not ``RELEASED``.
         """
         feature_key = next(
             (key for key, value in self.features.items() if value is feature),
@@ -6006,8 +6266,9 @@ class KestrelAgent(
             )
 
         # The feature's own resource teardown (signal sources + wait providers).
+        reported = ReleaseOutcome.RELEASED
         try:
-            await feature.shutdown()
+            reported = reported_outcome(await feature.shutdown())
         except (Exception, asyncio.CancelledError) as exc:
             errors.append(exc)
             logging.exception(
@@ -6067,15 +6328,40 @@ class KestrelAgent(
             )
 
         # Full unload drops the instance; soft-toggle keeps it re-enable-able.
+        # Only this instance: one that is not loaded must not pop another
+        # instance registered under its name.
         feature.enabled = False
-        if unload:
-            if feature_key is not None:
-                self.features.pop(feature_key, None)
+        if (
+            unload
+            and feature_key is not None
+            and self.features.get(feature_key) is feature
+        ):
+            self.features.pop(feature_key)
         self._cached_features_prompt = self._build_features_prompt_section()
+
+        # A failed teardown leaves the instance in the owner registry, whether
+        # or not it is still loaded, so boot rollback and shutdown retry it; a
+        # successful one takes it out (#3522).
+        outcome = ReleaseOutcome.RETAINED if errors else reported
+        if outcome is ReleaseOutcome.RELEASED:
+            self._forget_unreleased_feature(feature)
+        else:
+            self._keep_unreleased_feature(feature_key, feature)
+        if feature_key is not None:
+            self._resource_custody().settle(
+                feature_resource_name(feature_key), outcome
+            )
 
         # Surface the failure only AFTER every independent cleanup step ran.
         if errors:
             raise errors[0]
+        return reported
+
+    def _hold_feature(self, feature: "Feature") -> None:
+        """Hold a feature in custody from before it can acquire anything."""
+        self._resource_custody().acquire(
+            feature_resource_name(feature.name), FEATURE_OWNER
+        )
 
     async def _disable_feature(self, feature_name: str):
         """Disable a feature and remove its runtime registrations."""
@@ -7876,18 +8162,39 @@ Expected Duration: {expected_duration}
         durable dispatcher already owns a shielded, retryable release task,
         and storage cannot safely close until that task has actually finished.
         The production lifecycle owner joins this continuation before removing
-        the agent or releasing its budget.
+        the agent or releasing its budget. It releases both resources through
+        the agent's custody and then asks the serving-record gate again, since
+        the shutdown that started it found them still held (#3522).
         """
-        await dispatcher.shutdown_durable_delivery()
-        wait_for_owner_release = getattr(
-            dispatcher, "wait_for_durable_shutdown_release", None
-        )
-        if callable(wait_for_owner_release):
-            await wait_for_owner_release()
-        if storage_preclose is not None:
-            await storage_preclose()
-        if storage is not None and hasattr(storage, "close"):
-            await storage.close()
+        custody = self._resource_custody()
+
+        async def release_dispatcher() -> ReleaseOutcome:
+            delivered = await dispatcher.shutdown_durable_delivery()
+            wait_for_owner_release = getattr(
+                dispatcher, "wait_for_durable_shutdown_release", None
+            )
+            if not callable(wait_for_owner_release):
+                return _dispatcher_release_outcome(delivered)
+            # A fenced first call is expected here: the wait is what ends it.
+            waited = reported_outcome(await wait_for_owner_release())
+            if isinstance(delivered, ReleaseOutcome) and (
+                delivered is not ReleaseOutcome.RELEASED
+            ):
+                return delivered
+            return waited
+
+        async def close_storage() -> ReleaseOutcome:
+            precloses = ReleaseOutcome.RELEASED
+            if storage_preclose is not None:
+                precloses = reported_outcome(await storage_preclose())
+            closed = ReleaseOutcome.RELEASED
+            if storage is not None and hasattr(storage, "close"):
+                closed = reported_outcome(await storage.close())
+            return closed if precloses is ReleaseOutcome.RELEASED else precloses
+
+        await custody.release("signal_dispatcher", release_dispatcher)
+        await custody.release("storage", close_storage)
+        self._release_serving_record()
 
     async def _ensure_durable_shutdown_continuation(self, dispatcher) -> asyncio.Task:
         """Return the single agent-owned dispatcher-to-storage continuation."""
@@ -8187,6 +8494,8 @@ Expected Duration: {expected_duration}
         task = state.get("_standalone_hold_context_close_task")
         if context is None and task is None:
             return False, None
+        custody = self._resource_custody()
+        custody.acquire(STANDALONE_HOLD_CONTEXT)
         if task is None:
             from kestrel_sovereign.hold import close_bound_host_context
 
@@ -8201,6 +8510,11 @@ Expected Duration: {expected_duration}
         # A failed close remains retryable on a later shutdown call; a terminal
         # success is idempotent and no longer needs a task reference.
         self._standalone_hold_context_close_task = None
+        # ``cancelled`` is this joiner's; the close itself ran to completion.
+        custody.settle(
+            STANDALONE_HOLD_CONTEXT,
+            ReleaseOutcome.RELEASED if failure is None else ReleaseOutcome.RETAINED,
+        )
         return cancelled, failure
 
     async def shutdown(self):
@@ -8228,6 +8542,11 @@ Expected Duration: {expected_duration}
         step is bounded against it. Features additionally fair-divide the
         remaining budget so a single hung early feature can consume only its
         own slice and cannot starve a later feature — or the durable tail.
+
+        Every step releases its resource through the agent's custody (#3522).
+        A step that times out, raises, or is abandoned is logged and the sweep
+        goes on, and its resource stays held. The serving record is removed
+        only once custody holds nothing.
         """
         loop = asyncio.get_running_loop()
         dispatcher = getattr(self, "dispatcher", None)
@@ -8276,9 +8595,14 @@ Expected Duration: {expected_duration}
         # can consume only its slice and never starves a later op or the
         # durable tail. This is what makes the internal deadline composition
         # coherent with the production outer wait_for.
+        # Loaded features, then those a failed teardown left unreleased that
+        # are no longer, or never were, loaded (#3522).
         remaining_features = [
             (name, feature)
-            for name, feature in self.features.items()
+            for name, feature in [
+                *self.features.items(),
+                *self._unreleased_features_not_loaded(),
+            ]
             if feature is not security_feature
             and feature is not mcp_feature
             and hasattr(feature, "shutdown")
@@ -8322,6 +8646,113 @@ Expected Duration: {expected_duration}
                 pending_ops -= 1
             return min(KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S, share)
 
+        custody = self._resource_custody()
+        if vars(self).get("_standalone_hold_context") is not None:
+            # A standalone helper hands the agent its Hold context after boot.
+            # Held from here, before any step can reach the serving-record
+            # gate, until its close is confirmed (#3522).
+            custody.acquire(STANDALONE_HOLD_CONTEXT)
+
+        async def _release_within(
+            resource: str,
+            label: str,
+            operation: Callable[[], Any],
+            budget: float,
+        ) -> Optional[ReleaseOutcome]:
+            """Release one resource within its fair share of the budget.
+
+            The step reports the resource released when ``operation``
+            completes within ``budget``, or whatever :class:`ReleaseOutcome`
+            it returns; custody decides whether that confirms the release
+            (#3522). A timeout or an error is logged and the sweep goes on,
+            leaving the resource held. Cancellation propagates.
+
+            Returns:
+                What the step reported, before custody judged it, or ``None``
+                when it timed out or raised.
+            """
+            reported: Optional[ReleaseOutcome] = None
+
+            async def step() -> ReleaseOutcome:
+                nonlocal reported
+                reported = reported_outcome(
+                    await asyncio.wait_for(operation(), timeout=budget)
+                )
+                return reported
+
+            try:
+                await custody.release(resource, step)
+            except asyncio.CancelledError:
+                # Whole-agent shutdown is being cancelled. Stop the sweep and
+                # propagate to the durable tail via ``finally``.
+                logging.warning(
+                    "%s shutdown cancelled; running durable cleanup before "
+                    "propagating",
+                    label,
+                )
+                raise
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "%s shutdown exceeded %.2fs; abandoning and continuing sweep",
+                    label,
+                    budget,
+                )
+            except Exception as e:
+                logging.warning(
+                    "Error during %s shutdown: %s", label, e, exc_info=True
+                )
+            return reported
+
+        async def _release_feature(
+            resource: str,
+            label: str,
+            feature,
+            operation: Callable[[], Any],
+            budget: float,
+        ) -> None:
+            """Release one feature; a shutdown that succeeded unregisters it.
+
+            Only then does it leave the unreleased-feature registry, so one
+            that failed is retried by a later shutdown (#3522).
+            """
+            reported = await _release_within(resource, label, operation, budget)
+            if reported is ReleaseOutcome.RELEASED:
+                self._forget_unreleased_feature(feature)
+
+        def _feature_shutdown(feature) -> Any:
+            # Some lifecycle owners (notably isolated SDK facades) must keep
+            # an exact stop coroutine alive after this fair-share deadline:
+            # it may own the only subprocess handle.  The optional wrapper
+            # gives such a feature the canonical agent-deadline signal, so it
+            # can retain that task and return cancellation promptly instead of
+            # consuming later features' and the durable tail's time. Look on
+            # the class, not the instance: test doubles and dynamic adapters
+            # can fabricate arbitrary attributes, which must not be mistaken
+            # for this lifecycle contract.
+            bounded_shutdown = getattr(
+                type(feature), "shutdown_with_agent_deadline", None
+            )
+            prepare_bounded_shutdown = getattr(
+                type(feature), "prepare_shutdown_with_agent_deadline", None
+            )
+            if callable(prepare_bounded_shutdown):
+                # A zero fair share is still a terminal shutdown request.
+                # Establish isolated runtime ownership before wait_for can
+                # cancel its coroutine prior to the first instruction in its
+                # async body.
+                feature.prepare_shutdown_with_agent_deadline()
+            if callable(bounded_shutdown):
+                return feature.shutdown_with_agent_deadline()
+            return feature.shutdown()
+
+        def _feature_resource(feature) -> str:
+            return feature_resource_name(
+                next(
+                    (key for key, value in self.features.items() if value is feature),
+                    getattr(feature, "name", None),
+                )
+            )
+
         shutdown_cancelled = False
         try:
             # EPHEMERAL hard-purge defense-in-depth (#767 / #2673). If the agent
@@ -8333,66 +8764,48 @@ Expected Duration: {expected_duration}
             if getattr(self, "_privacy_mode", None) == PrivacyMode.EPHEMERAL:
                 await self._purge_ephemeral_on_shutdown(timeout=_step_budget())
 
-            # Stop heartbeat runner
             if hasattr(self, 'heartbeat_runner') and self.heartbeat_runner:
-                try:
-                    await asyncio.wait_for(
-                        self.heartbeat_runner.stop(), timeout=_step_budget()
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except asyncio.TimeoutError:
-                    logging.warning("Stopping heartbeat timed out")
-                except Exception as e:
-                    logging.warning(f"Error stopping heartbeat: {e}")
+                await _release_within(
+                    "heartbeat_runner",
+                    "Heartbeat",
+                    self.heartbeat_runner.stop,
+                    _step_budget(),
+                )
 
             # Stop resume monitor (#1545)
             if hasattr(self, 'resume_monitor') and self.resume_monitor:
-                try:
-                    await asyncio.wait_for(
-                        self.resume_monitor.stop(), timeout=_step_budget()
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except asyncio.TimeoutError:
-                    logging.warning("Stopping resume monitor timed out")
-                except Exception as e:
-                    logging.warning(f"Error stopping resume monitor: {e}")
+                await _release_within(
+                    "resume_monitor",
+                    "Resume monitor",
+                    self.resume_monitor.stop,
+                    _step_budget(),
+                )
 
             # Stop C / #1311 durable salvage worker. Drains in-flight
             # summary tasks; the janitor catches up the rest on next start.
             if hasattr(self, "context_manager") and self.context_manager:
-                try:
-                    await asyncio.wait_for(
-                        self.context_manager.stop_salvage_worker(),
-                        timeout=_step_budget(),
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except asyncio.TimeoutError:
-                    logging.warning("Stopping salvage worker timed out")
-                except Exception as e:
-                    logging.warning(f"Error stopping salvage worker: {e}")
+                await _release_within(
+                    "salvage_worker",
+                    "Salvage worker",
+                    self.context_manager.stop_salvage_worker,
+                    _step_budget(),
+                )
 
             # Shutdown security feature if it exists
             if security_feature and hasattr(security_feature, 'shutdown'):
-                try:
-                    await asyncio.wait_for(
-                        security_feature.shutdown(), timeout=_step_budget()
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except asyncio.TimeoutError:
-                    logging.warning("Security feature shutdown timed out")
-                except (AttributeError, TypeError, ConnectionError) as e:
-                    logging.warning(f"Error during security shutdown: {e}")
-                except Exception as e:
-                    logging.warning(f"Error during security shutdown: {e}", exc_info=True)
+                await _release_feature(
+                    _feature_resource(security_feature),
+                    "Security feature",
+                    security_feature,
+                    security_feature.shutdown,
+                    _step_budget(),
+                )
 
-            # Shutdown every other loaded feature via its standard lifecycle
-            # (#2409). Feature-owned background workers (health, delivery,
-            # scheduler, ...) only cancel/await when their own shutdown()
-            # runs; whole-agent shutdown previously reached only
+            # Shutdown every other loaded feature, and every feature an
+            # earlier failed teardown left unreleased (#3522), via its
+            # standard lifecycle (#2409). Feature-owned background workers
+            # (health, delivery, scheduler, ...) only cancel/await when their
+            # own shutdown() runs; whole-agent shutdown previously reached only
             # SecurityFeature, leaking those workers past process exit.
             # Skip SecurityFeature (already stopped above) and the MCP agent
             # (handled by its own block below) so neither is double-stopped,
@@ -8402,112 +8815,41 @@ Expected Duration: {expected_duration}
             # count, so each feature already fair-divides the SAME live budget
             # as every other prefix op (heartbeat, MCP, LLM, TaskManager, ...).
             for feature_name, feature in remaining_features:
-                per_feature = _step_budget()
-                try:
-                    # Some lifecycle owners (notably isolated SDK facades)
-                    # must keep an exact stop coroutine alive after this
-                    # fair-share deadline: it may own the only subprocess
-                    # handle.  The optional wrapper gives such a feature the
-                    # canonical agent-deadline signal, so it can retain that
-                    # task and return cancellation promptly instead of
-                    # consuming later features' and the durable tail's time.
-                    # Look on the class, not the instance: test doubles and
-                    # dynamic adapters can fabricate arbitrary attributes,
-                    # which must not be mistaken for this lifecycle contract.
-                    bounded_shutdown = getattr(
-                        type(feature), "shutdown_with_agent_deadline", None
-                    )
-                    prepare_bounded_shutdown = getattr(
-                        type(feature), "prepare_shutdown_with_agent_deadline", None
-                    )
-                    if callable(prepare_bounded_shutdown):
-                        # A zero fair share is still a terminal shutdown
-                        # request.  Establish isolated runtime ownership
-                        # before wait_for can cancel its coroutine prior to
-                        # the first instruction in its async body.
-                        feature.prepare_shutdown_with_agent_deadline()
-                    shutdown_operation = (
-                        feature.shutdown_with_agent_deadline()
-                        if callable(bounded_shutdown)
-                        else feature.shutdown()
-                    )
-                    await asyncio.wait_for(
-                        shutdown_operation, timeout=per_feature
-                    )
-                except asyncio.TimeoutError:
-                    logging.warning(
-                        "Feature '%s' shutdown exceeded %.2fs; abandoning "
-                        "and continuing sweep",
-                        feature_name,
-                        per_feature,
-                    )
-                except asyncio.CancelledError:
-                    # Whole-agent shutdown is being cancelled. Stop the sweep
-                    # and propagate to the durable tail via `finally`.
-                    logging.warning(
-                        "Feature '%s' shutdown cancelled; running durable "
-                        "cleanup before propagating",
-                        feature_name,
-                    )
-                    raise
-                except Exception as e:
-                    logging.warning(
-                        "Error during feature '%s' shutdown: %s",
-                        feature_name,
-                        e,
-                        exc_info=True,
-                    )
+                await _release_feature(
+                    feature_resource_name(feature_name),
+                    f"Feature '{feature_name}'",
+                    feature,
+                    lambda feature=feature: _feature_shutdown(feature),
+                    _step_budget(),
+                )
 
             # Shutdown MCP agent if it exists
             if self.mcp_agent and hasattr(self.mcp_agent, 'shutdown'):
-                try:
-                    await asyncio.wait_for(
-                        self.mcp_agent.shutdown(), timeout=_step_budget()
-                    )
-                except asyncio.CancelledError:
-                    logging.warning(
-                        "MCP shutdown cancelled; running durable cleanup "
-                        "before propagating"
-                    )
-                    raise
-                except asyncio.TimeoutError:
-                    logging.warning("MCP shutdown timed out")
-                except (AttributeError, TypeError, ConnectionError) as e:
-                    logging.warning(f"Error during MCP shutdown: {e}")
-                except Exception as e:
-                    logging.warning(f"Error during MCP shutdown: {e}", exc_info=True)
+                await _release_feature(
+                    _feature_resource(self.mcp_agent),
+                    "MCP",
+                    self.mcp_agent,
+                    self.mcp_agent.shutdown,
+                    _step_budget(),
+                )
 
             # Close LLM service async clients
             if self.llm_service and hasattr(self.llm_service, 'close'):
-                try:
-                    await asyncio.wait_for(
-                        self.llm_service.close(), timeout=_step_budget()
-                    )
-                except asyncio.CancelledError:
-                    logging.debug("LLM service close cancelled")
-                    raise
-                except asyncio.TimeoutError:
-                    logging.warning("LLM service close timed out")
-                except (AttributeError, TypeError, ConnectionError) as e:
-                    logging.warning(f"Error closing LLM service: {e}")
-                except Exception as e:
-                    logging.warning(f"Error closing LLM service: {e}", exc_info=True)
+                await _release_within(
+                    "llm_service",
+                    "LLM service",
+                    self.llm_service.close,
+                    _step_budget(),
+                )
 
             # Close TaskManager stores (critical for preventing thread leaks)
             if self.task_manager and hasattr(self.task_manager, 'close'):
-                try:
-                    await asyncio.wait_for(
-                        self.task_manager.close(), timeout=_step_budget()
-                    )
-                except asyncio.CancelledError:
-                    logging.debug("TaskManager close cancelled")
-                    raise
-                except asyncio.TimeoutError:
-                    logging.warning("TaskManager close timed out")
-                except (AttributeError, TypeError, ConnectionError) as e:
-                    logging.warning(f"Error closing TaskManager: {e}")
-                except Exception as e:
-                    logging.warning(f"Error closing TaskManager: {e}", exc_info=True)
+                await _release_within(
+                    "task_manager",
+                    "TaskManager",
+                    self.task_manager.close,
+                    _step_budget(),
+                )
         except asyncio.CancelledError:
             shutdown_cancelled = True
         finally:
@@ -8596,6 +8938,9 @@ Expected Duration: {expected_duration}
                 )
             raise asyncio.CancelledError()
 
+        # The serving record stays while custody holds anything (#3522); it
+        # goes stale once this process exits.
+        self._release_serving_record()
         if tail_degraded:
             logging.warning(
                 "Kestrel Agent async shutdown complete, but durable cleanup "
@@ -8893,9 +9238,23 @@ Expected Duration: {expected_duration}
                 defer_failure_report=defer_failure_report,
             )
 
+        # Each step below releases its resource through the agent's custody
+        # (#3522): an abandoned, failed, or cancelled step leaves it held.
+        custody = self._resource_custody()
+
+        def _released(operation: Callable[[], Any]) -> Callable[[], Any]:
+            async def step() -> ReleaseOutcome:
+                return reported_outcome(await operation())
+
+            return step
+
         # Cancel agent-owned background work before storage/sync shutdown.
         await _bounded(
-            self._shutdown_background_tasks(), _step_guard(), "background-tasks"
+            custody.release(
+                "background_tasks", _released(self._shutdown_background_tasks)
+            ),
+            _step_guard(),
+            "background-tasks",
         )
 
         # Durable signal events retain only their policy-safe projection, but
@@ -8904,8 +9263,19 @@ Expected Duration: {expected_duration}
         # must not outlive this agent instance.
         dispatcher_shutdown_complete = True
         if run_dispatcher:
+
+            async def release_dispatcher() -> ReleaseOutcome:
+                delivered = _dispatcher_release_outcome(
+                    await dispatcher.shutdown_durable_delivery()
+                )
+                if getattr(dispatcher, "durable_shutdown_owner_fenced", False):
+                    # Cognition still holds its delivery; the continuation
+                    # below releases the dispatcher once it settles.
+                    return ReleaseOutcome.RETAINED
+                return delivered
+
             dispatcher_shutdown_status = await _bounded(
-                dispatcher.shutdown_durable_delivery(),
+                custody.release("signal_dispatcher", release_dispatcher),
                 _step_guard(),
                 "durable-signal-dispatcher",
             )
@@ -8930,7 +9300,11 @@ Expected Duration: {expected_duration}
 
         # Stop memory-owned bookkeeping before storage/sync shutdown.
         if run_memory:
-            await _bounded(memory_system.shutdown(), _step_guard(), "memory-system")
+            await _bounded(
+                custody.release("memory_system", _released(memory_system.shutdown)),
+                _step_guard(),
+                "memory-system",
+            )
 
         # Final snapshot to all sync targets before closing storage. The
         # snapshot is SHIELDED so cancellation neither aborts it nor skips the
@@ -8944,7 +9318,20 @@ Expected Duration: {expected_duration}
             )
             # Always attempt stop() — even if the snapshot was abandoned or
             # cancellation was observed — so the sync worker is released.
-            await _bounded(sync_service.stop(), _step_guard(), "sync-stop")
+
+            async def release_sync() -> ReleaseOutcome:
+                stopped = reported_outcome(await sync_service.stop())
+                if status in {"abandoned", "cancelled"}:
+                    # Work the unfinished snapshot started may still be
+                    # running against the sync targets (#3522).
+                    return ReleaseOutcome.RETAINED
+                return stopped
+
+            await _bounded(
+                custody.release("sync_service", release_sync),
+                _step_guard(),
+                "sync-stop",
+            )
             if status == "ok":
                 logging.info("Sync service: final snapshot flushed")
 
@@ -8975,9 +9362,15 @@ Expected Duration: {expected_duration}
         # phase.  Otherwise a slow engine disposal can consume the guard that
         # the following primary SQLite close requires to drain its worker.
         storage_preclose_status = None
+        preclose_reported = ReleaseOutcome.RELEASED
         if storage_preclose is not None:
+
+            async def run_preclose() -> None:
+                nonlocal preclose_reported
+                preclose_reported = reported_outcome(await storage_preclose())
+
             storage_preclose_status = await _bounded(
-                storage_preclose(),
+                run_preclose(),
                 _step_guard(
                     max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, storage_preclose_timeout)
                 ),
@@ -8993,8 +9386,19 @@ Expected Duration: {expected_duration}
         # keeps running through an external cancellation until that bounded
         # contract completes.  Other backends retain the existing behavior.
         if run_storage:
+            storage = self.storage
+
+            async def close_storage() -> ReleaseOutcome:
+                closed = reported_outcome(await storage.close())
+                if storage_preclose_status in {"error", "abandoned", "cancelled"}:
+                    # The cached SQLAlchemy engine may still hold the store.
+                    return ReleaseOutcome.RETAINED
+                if preclose_reported is not ReleaseOutcome.RELEASED:
+                    return preclose_reported
+                return closed
+
             await _bounded(
-                self.storage.close(),
+                custody.release("storage", close_storage),
                 _step_guard(storage_close_timeout),
                 "storage-close",
                 shielded=storage_close_timeout > 0.0,

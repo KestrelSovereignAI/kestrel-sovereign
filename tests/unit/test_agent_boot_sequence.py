@@ -10,6 +10,8 @@ so the sequencing/rollback contract is pinned independently of any phase body:
   re-raises the ORIGINAL exception;
 * resources a phase declares ``retained`` are never rolled back;
 * rollback is best-effort — one stubborn undo can't strand the others;
+* a resource leaves custody only when its undo reports ``RELEASED`` for an
+  owner that reports a failed release truthfully;
 * a boot cancelled mid-phase still releases every acquired resource before
   the ``CancelledError`` propagates.
 """
@@ -24,6 +26,7 @@ from kestrel_sovereign.agent.boot import (
     BootPhaseState,
     run_boot_sequence,
 )
+from kestrel_sovereign.agent.custody import ReleaseOutcome, ResourceCustody
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
@@ -123,8 +126,9 @@ async def test_failure_unwinds_rollback_in_reverse_order():
     released: list[str] = []
 
     async def acquire(ctx: BootContext, label: str) -> None:
-        async def undo(name: str = label) -> None:
+        async def undo(name: str = label) -> ReleaseOutcome:
             released.append(name)
+            return ReleaseOutcome.RELEASED
 
         ctx.on_rollback(label, undo)
 
@@ -171,8 +175,8 @@ async def test_failure_reraises_original_exception_type():
 @pytest.mark.asyncio
 async def test_rollback_labels_reflect_acquisition_order():
     async def body(ctx: BootContext) -> None:
-        async def noop() -> None:
-            return None
+        async def noop() -> ReleaseOutcome:
+            return ReleaseOutcome.RELEASED
 
         ctx.on_rollback("first", noop)
         ctx.on_rollback("second", noop)
@@ -196,8 +200,9 @@ async def test_retained_resources_are_not_rolled_back():
         # A retained phase commits a durable resource. It registers NO undo
         # for the retained artifact (that is the whole point) but does open a
         # rollback-able side resource to prove the two are handled separately.
-        async def undo_side() -> None:
+        async def undo_side() -> ReleaseOutcome:
             released.append("side")
+            return ReleaseOutcome.RELEASED
 
         ctx.on_rollback("side", undo_side)
 
@@ -238,8 +243,9 @@ async def test_rollback_tolerates_a_failing_undo_step():
     released: list[str] = []
 
     async def acquire_ok(ctx: BootContext, label: str) -> None:
-        async def undo(name: str = label) -> None:
+        async def undo(name: str = label) -> ReleaseOutcome:
             released.append(name)
+            return ReleaseOutcome.RELEASED
 
         ctx.on_rollback(label, undo)
 
@@ -279,14 +285,19 @@ async def test_rollback_tolerates_a_failing_undo_step():
     assert "bottom" in released
 
 
+def _trusting(*owners: str) -> BootContext:
+    """A context whose custody believes a release reported by ``owners``."""
+    return BootContext(custody=ResourceCustody(truthful_owners=owners))
+
+
 @pytest.mark.asyncio
 async def test_run_rollback_reports_error_and_ok_steps():
-    ctx = BootContext()
+    ctx = _trusting("ok", "err")
 
-    async def undo_ok() -> None:
-        return None
+    async def undo_ok() -> ReleaseOutcome:
+        return ReleaseOutcome.RELEASED
 
-    async def undo_err() -> None:
+    async def undo_err() -> ReleaseOutcome:
         raise ValueError("nope")
 
     ctx.on_rollback("ok", undo_ok)
@@ -297,6 +308,132 @@ async def test_run_rollback_reports_error_and_ok_steps():
     assert released == ["err (error)", "ok"]
     # Stack drained.
     assert ctx.rollback_labels == []
+    # The failed undo's resource is still held; the released one is not.
+    assert ctx.custody.held == ("err",)
+    assert ctx.retained_resources == ["err"]
+
+
+# ---------------------------------------------------------------------------
+# Custody — a resource is released only by a confirmed undo (#3522)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_undo_released_by_an_unconverted_owner_stays_held():
+    """No owner is trusted yet: a clean undo cannot confirm its release."""
+    ctx = BootContext()
+    ran: list[str] = []
+
+    async def undo() -> ReleaseOutcome:
+        ran.append("storage")
+        return ReleaseOutcome.RELEASED
+
+    ctx.on_rollback("storage", undo)
+
+    assert await ctx.run_rollback() == ["storage (unknown)"]
+    assert ran == ["storage"]
+    assert ctx.custody.held == ("storage",)
+    assert ctx.retained_resources == ["storage"]
+
+
+@pytest.mark.asyncio
+async def test_an_undo_is_released_by_the_owner_it_was_registered_with():
+    ctx = _trusting("feature")
+
+    async def undo() -> ReleaseOutcome:
+        return ReleaseOutcome.RELEASED
+
+    ctx.on_rollback("feature:Talon", undo, owner="feature")
+    ctx.on_rollback("storage", undo)
+
+    assert await ctx.run_rollback() == ["storage (unknown)", "feature:Talon"]
+    assert ctx.custody.held == ("storage",)
+
+
+@pytest.mark.parametrize(
+    "outcome, label",
+    [
+        (ReleaseOutcome.RETAINED, "retained"),
+        (ReleaseOutcome.UNKNOWN, "unknown"),
+        (None, "unknown"),
+    ],
+    ids=["retained", "unknown", "returns-nothing"],
+)
+@pytest.mark.asyncio
+async def test_an_undo_that_does_not_report_released_leaves_its_resource_held(
+    outcome, label
+):
+    ctx = _trusting("ok", "unclear")
+    ran: list[str] = []
+
+    async def undo_unclear():
+        ran.append("unclear")
+        return outcome
+
+    async def undo_ok() -> ReleaseOutcome:
+        ran.append("ok")
+        return ReleaseOutcome.RELEASED
+
+    ctx.on_rollback("ok", undo_ok)
+    ctx.on_rollback("unclear", undo_unclear)
+    assert ctx.custody.held == ("ok", "unclear")
+
+    assert await ctx.run_rollback() == [f"unclear ({label})", "ok"]
+    # The unwind went on past it, and only the unclear resource stays held.
+    assert ran == ["unclear", "ok"]
+    assert ctx.custody.held == ("unclear",)
+    assert ctx.retained_resources == ["unclear"]
+
+
+@pytest.mark.parametrize("failure", ["error", "cancelled"])
+@pytest.mark.asyncio
+async def test_an_undo_that_raises_leaves_its_resource_held(failure):
+    ctx = _trusting("worker")
+
+    async def undo() -> ReleaseOutcome:
+        if failure == "error":
+            raise RuntimeError("teardown failed")
+        raise asyncio.CancelledError()
+
+    ctx.on_rollback("worker", undo)
+
+    assert await ctx.run_rollback() == [f"worker ({failure})"]
+    assert ctx.custody.held == ("worker",)
+    assert ctx.retained_resources == ["worker"]
+
+
+@pytest.mark.asyncio
+async def test_a_rollback_into_a_shared_custody_leaves_what_it_kept_for_later():
+    """An agent passes its own custody, so a later shutdown sees what stayed."""
+    custody = ResourceCustody(truthful_owners={"cache", "storage"})
+    ctx = BootContext(custody=custody)
+
+    async def released() -> ReleaseOutcome:
+        return ReleaseOutcome.RELEASED
+
+    async def kept() -> ReleaseOutcome:
+        return ReleaseOutcome.RETAINED
+
+    ctx.on_rollback("cache", released)
+    ctx.on_rollback("storage", kept)
+    await ctx.run_rollback()
+
+    assert custody.held == ("storage",)
+
+
+@pytest.mark.asyncio
+async def test_an_unheld_undo_reports_its_outcome_but_holds_nothing_itself():
+    ctx = BootContext()
+
+    async def sweep() -> ReleaseOutcome:
+        return ReleaseOutcome.RETAINED
+
+    ctx.on_rollback_unheld("features", sweep)
+    assert ctx.custody.held == ()
+
+    assert await ctx.run_rollback() == ["features (retained)"]
+    assert ctx.retained_resources == ["features"]
+    assert ctx.custody.held == ()
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +447,9 @@ async def test_cancellation_mid_phase_still_unwinds_all_resources():
     hanging_started = asyncio.Event()
 
     async def acquire_phase(ctx: BootContext) -> None:
-        async def undo() -> None:
+        async def undo() -> ReleaseOutcome:
             released.append("db-connection")
+            return ReleaseOutcome.RELEASED
 
         ctx.on_rollback("db-connection", undo)
 
@@ -351,10 +489,11 @@ async def test_cancellation_completes_teardown_even_if_undo_awaits():
     hanging_started = asyncio.Event()
 
     async def acquire_phase(ctx: BootContext) -> None:
-        async def undo() -> None:
+        async def undo() -> ReleaseOutcome:
             # Yield to the loop mid-teardown to model a real async close().
             await asyncio.sleep(0)
             released.append("worker")
+            return ReleaseOutcome.RELEASED
 
         ctx.on_rollback("worker", undo)
 

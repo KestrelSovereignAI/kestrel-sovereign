@@ -19,7 +19,11 @@ explicit state machine:
   resumable contract).
 * :class:`BootContext` — carries cross-phase values and, crucially, the
   **reverse-order rollback stack**. Each phase pushes an undo action as it
-  acquires a resource; on failure the stack unwinds LIFO.
+  acquires a resource, which also puts that resource in the agent's
+  :class:`~kestrel_sovereign.agent.custody.ResourceCustody`; on failure the
+  stack unwinds LIFO, and a resource leaves custody only when its undo
+  reports :attr:`~kestrel_sovereign.agent.custody.ReleaseOutcome.RELEASED`
+  for an owner known to report a failed release truthfully.
 * :func:`run_boot_sequence` — the orchestrator: runs phases in order,
   records a journal, and on *any* exception (including
   :class:`asyncio.CancelledError`) unwinds the rollback stack to completion
@@ -38,10 +42,13 @@ import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable, List, Optional
 
+from kestrel_sovereign.agent.custody import ReleaseOutcome, ResourceCustody
+
 logger = logging.getLogger(__name__)
 
-# An undo action: a zero-arg coroutine function that releases one resource.
-RollbackAction = Callable[[], Awaitable[None]]
+# An undo action: a zero-arg coroutine function that releases one resource and
+# reports what it did. Anything but ``ReleaseOutcome.RELEASED`` keeps it held.
+RollbackAction = Callable[[], Awaitable[ReleaseOutcome]]
 # A phase body: a coroutine function taking the shared BootContext.
 PhaseBody = Callable[["BootContext"], Awaitable[None]]
 # Callback the orchestrator uses to publish state transitions onto the agent.
@@ -53,7 +60,8 @@ class BootPhaseState(enum.Enum):
 
     ``READY`` is the *only* state in which readiness may have fired; it is set
     exactly once, after every phase commits. ``FAILED`` is terminal: the
-    resources a partial boot acquired have been rolled back, and a fresh
+    resources a partial boot acquired have been rolled back (any whose
+    release custody could not confirm stay held, #3522), and a fresh
     ``initialize()`` is refused until the agent is closed/reconstructed, so a
     retry can never run readiness on partial state.
     """
@@ -106,10 +114,20 @@ class BootContext:
     :attr:`early_agent_node` today) and register an undo action the moment
     they acquire a resource. The undo stack is LIFO: :meth:`run_rollback`
     releases resources in the exact reverse of acquisition order.
+
+    Every resource registered with :meth:`on_rollback` is held in
+    :attr:`custody` until a release of it is confirmed (#3522).
     """
 
-    def __init__(self, logger_: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        logger_: Optional[logging.Logger] = None,
+        custody: Optional[ResourceCustody] = None,
+    ) -> None:
         self.logger = logger_ or logger
+        #: The tracker of held resources. An agent passes its own, so what a
+        #: rollback could not release stays held for its shutdown.
+        self.custody = custody if custody is not None else ResourceCustody()
         self._undo: List[_Undo] = []
         #: Phases that fully committed, in order (the journal).
         self.committed_phases: List[str] = []
@@ -120,8 +138,25 @@ class BootContext:
         #: again by the providers/sync phase (constitution-anchor gate).
         self.early_agent_node: object = None
 
-    def on_rollback(self, label: str, action: RollbackAction) -> None:
-        """Register an undo action for a resource this phase just acquired."""
+    def on_rollback(
+        self, label: str, action: RollbackAction, owner: Optional[str] = None
+    ) -> None:
+        """Register an undo action for a resource this phase just acquired.
+
+        The resource is held in :attr:`custody` under ``label``, released by
+        ``owner`` (default: ``label``), until a release of it is confirmed.
+        """
+        self.custody.acquire(label, owner)
+        self._undo.append(_Undo(label, action))
+
+    def on_rollback_unheld(self, label: str, action: RollbackAction) -> None:
+        """Register an undo for something :attr:`custody` does not hold.
+
+        For a collection whose members enter custody one by one, such as an
+        agent's features, and for registrations that live only in the agent
+        object, such as its signal sources. The undo's outcome is reported
+        like any other.
+        """
         self._undo.append(_Undo(label, action))
 
     def note_retained(self, resource: str) -> None:
@@ -133,13 +168,17 @@ class BootContext:
         return [u.label for u in self._undo]
 
     async def _unwind(self) -> List[str]:
-        """Pop and run every undo LIFO, tolerating per-step failure/cancel."""
+        """Pop and run every undo LIFO, tolerating per-step failure/cancel.
+
+        A step that raises, is cancelled, or whose release custody cannot
+        confirm leaves its resource held and is listed in
+        :attr:`retained_resources`; the unwind goes on with the rest.
+        """
         released: List[str] = []
         while self._undo:
             undo = self._undo.pop()
             try:
-                await undo.action()
-                released.append(undo.label)
+                outcome = await self.custody.release(undo.label, undo.action)
             except asyncio.CancelledError:
                 # Teardown must complete even under cancellation — record and
                 # keep going rather than abandoning the remaining resources.
@@ -147,7 +186,9 @@ class BootContext:
                     "boot rollback step '%s' was cancelled; continuing teardown",
                     undo.label,
                 )
+                self.note_retained(undo.label)
                 released.append(f"{undo.label} (cancelled)")
+                continue
             except Exception as exc:  # noqa: BLE001 - teardown is best-effort
                 self.logger.warning(
                     "boot rollback step '%s' failed: %s",
@@ -155,7 +196,14 @@ class BootContext:
                     exc,
                     exc_info=True,
                 )
+                self.note_retained(undo.label)
                 released.append(f"{undo.label} (error)")
+                continue
+            if outcome is ReleaseOutcome.RELEASED:
+                released.append(undo.label)
+                continue
+            self.note_retained(undo.label)
+            released.append(f"{undo.label} ({outcome.value})")
         return released
 
     async def run_rollback(self) -> List[str]:

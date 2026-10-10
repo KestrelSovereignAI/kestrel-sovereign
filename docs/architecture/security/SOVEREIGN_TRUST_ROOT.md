@@ -413,6 +413,53 @@ deploying process's own resolver exists to judge the incoming bytes with.
 | `kestrel restart [name]` | The installed code, in a fresh interpreter, for the named agent or every local agent. | Refused with exit status 5 before anything is terminated. |
 | Restart coordinator | A `restart_only` request: the installed code, in a fresh interpreter, before the request is claimed. An `update_then_restart` request: the fetched revision, before the update checks it out, and then the code the update installed, in a fresh interpreter, before the restart. | The request ends in the terminal `refused` status. Its `status_reason` names the agents and both hashes, and says when the update was already installed. |
 
+The coordinator records every check it runs on the request's
+`constitution_checks`, passed or refused, and carries them in the request's
+`restart_status` events (#3522). Each entry names its stage
+(`fetched_revision` or `installed_code`), what was judged, the result
+(`passed`; `passed_with_unverified` when an agent's anchor could not be read;
+`refused`; or `unverifiable` with its error), and for every local agent the
+anchored hash, the governing hash, and the verdict. A completed
+restart therefore shows that the gate ran and what it compared, not only
+that nothing refused it.
+
+Recording a check is a precondition of acting on it. When the write fails,
+the coordinator neither refuses nor restarts: no checkout follows a fetched
+revision's check it could not record, and no restart follows an installed
+code check it could not record. The request stays retryable, with a
+`status_reason` naming the failed write: a plain restart's request keeps its
+`pending` or `approved` status, and an update's returns from `updating` to
+`pending`. The next coordinator tick runs the checks again and records them
+before it refuses or dispatches.
+
+`kestrel update --no-restart` asks which blocking agents are running. A
+process serves an agent however it was launched: `kestrel start` writes a PID
+file, and every agent also writes a serving record into its data directory
+(`.serving/`) as it boots, so a server started with
+`python -m kestrel_sovereign.server` or a container entrypoint is found too
+(#3522). The process removes its record only once the release of every
+resource the agent acquired is confirmed, and a release counts as confirmed
+only from an owner whose close reports a failure instead of logging it and
+returning. No owner qualifies yet (#3558, #3559, #3560), so for now a record
+stays until its process exits. An agent stopped inside a host that keeps
+running therefore still counts as running, as does one whose boot failed. A
+serving record is stale only on proof: it says it was written on this host and
+in this PID namespace, its PID is a positive integer and its start time a
+finite, positive number of seconds, and nothing runs as that PID here or what
+does started at another time. A stale record is ignored, and the next agent to
+boot in that data directory deletes it. No other record is deleted.
+
+An agent whose liveness cannot be established counts as running too: a PID
+file or serving record that cannot be read, or that is missing a field or
+holds a value that is not one (a PID that is not a positive integer, a start
+time that is `NaN`, infinite or not a number); a record written on another
+host or in another PID namespace (a container sharing the data directory,
+including one that has since stopped); or a PID whose identity cannot be
+checked. The refusal names the evidence and how to stop the process; a record
+whose process cannot be checked from here is deleted by hand only once nothing
+serves the agent. A server started before this release wrote no serving record
+and is found only by its PID file.
+
 The refusal names each agent, its anchored hash, the governing hash, and the
 adoption steps below. Two findings refuse:
 
@@ -425,8 +472,18 @@ The audit puts the agent in Safe Mode in both cases. An agent whose anchor
 cannot be read (an encrypted database, no agent node) is reported as not
 verified. It does not block the restart.
 
-A deploy replaces the package. A descriptor-selected external source is
-operator configuration, so it is read from disk.
+A deploy replaces the files its checkout tracks: the packaged constitution,
+and also a descriptor-selected external source inside that checkout. Each is
+judged as the incoming revision leaves it (#3522). Each path is walked as
+configured, component by component, following every symbolic link as the
+resolver does. A source outside the checkout is operator configuration and
+is read from disk. A deploy is refused when it replaces the source
+descriptor or trust root that selects an agent's source. It is also refused
+when it changes any entry the walk to the source, the descriptor, or the
+trust root passes through inside the checkout: a link, including a link to
+a directory above the file, or a directory it turns into a link or a file.
+In either case, which bytes would govern cannot be judged before the deploy
+is installed.
 
 ### Adopting a new constitution
 
@@ -435,7 +492,8 @@ restarts anyway. Use it only when you are about to run the ceremony. The
 coordinator has no override, so an agent cannot restart the fleet into Safe
 Mode. `kestrel start` is not gated. Either order works:
 
-- **Offline.** `kestrel terminate` first: a running agent's periodic
+- **Offline.** `kestrel terminate` first (a server started without
+  `kestrel start` is stopped directly): a running agent's periodic
   integrity audit reads the constitution from disk, and the Safe Mode it
   enters persists across restarts. Then `kestrel update --no-restart`
   installs the new code. Reanchor each agent with `kestrel constitution

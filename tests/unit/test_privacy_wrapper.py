@@ -84,6 +84,19 @@ async def test_governed_corpus_delta_uses_incremental_privacy_gate(monkeypatch):
     ordinary_gate.assert_not_called()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["close", "dispose_cached_sqla_factory"])
+async def test_closing_through_the_wrapper_passes_on_what_the_store_reports(method):
+    """An agent's custody reads a failed release from the close's result (#3522)."""
+    from kestrel_sovereign.agent.custody import ReleaseOutcome
+
+    storage = Mock()
+    setattr(storage, method, AsyncMock(return_value=ReleaseOutcome.RETAINED))
+    wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+
+    assert await getattr(wrapper, method)() is ReleaseOutcome.RETAINED
+
+
 class TestEphemeralMode:
     """Tests for EPHEMERAL privacy mode enforcement."""
 

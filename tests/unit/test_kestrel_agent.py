@@ -2105,6 +2105,141 @@ class TestLifecycle:
                 await backend.close()
 
     @pytest.mark.asyncio
+    async def test_boot_rollback_keeps_storage_open_beneath_a_fenced_dispatcher(
+        self, tmp_path, monkeypatch
+    ):
+        """A dispatcher fenced by live cognition keeps its handle and storage.
+
+        The real ``shutdown_durable_delivery`` returns ``False`` while a
+        retained cognition task still owns its delivery (#3522). Rollback must
+        keep the dispatcher handle and leave storage open beneath its live
+        owner; the agent-owned continuation closes storage only after the
+        owner release, and a later shutdown joins it instead of closing twice.
+        """
+        from kestrel_sovereign.agent.boot import (
+            BootContext,
+            BootPhase,
+            run_boot_sequence,
+        )
+        from kestrel_sovereign.signals import (
+            OrderedLockManager,
+            SignalDispatcher,
+            SignalLogStore,
+            SourceRegistry,
+        )
+        from kestrel_sovereign.signals import dispatcher as dispatcher_module
+        from kestrel_sovereign.storage.db import SQLiteBackend
+
+        monkeypatch.setattr(
+            dispatcher_module, "_DURABLE_COGNITION_CANCELLATION_GRACE", 0.01
+        )
+        agent = KestrelAgent(
+            did="did:test:boot-rollback-fenced-dispatcher",
+            storage_path=str(tmp_path / "agent.db"),
+        )
+        backend = SQLiteBackend(str(tmp_path / "ledger.db"))
+        await backend.connect()
+        log_store = SignalLogStore(backend)
+        await log_store.initialize()
+        dispatcher = SignalDispatcher(
+            agent=agent,
+            registry=SourceRegistry(),
+            lock_manager=OrderedLockManager(),
+            store=log_store,
+        )
+        await dispatcher.initialize_durable_delivery()
+        agent.dispatcher = dispatcher
+
+        allow_exit = asyncio.Event()
+
+        async def hostile_cognition():
+            # Ignores every cancellation until the test lets it settle.
+            while True:
+                try:
+                    await allow_exit.wait()
+                    return None
+                except asyncio.CancelledError:
+                    continue
+
+        cognition = asyncio.create_task(hostile_cognition())
+        dispatcher._retain_durable_cognition_task(
+            cognition, delivery=SimpleNamespace(delivery_id="fenced-delivery")
+        )
+
+        owner_stopped_at_close: list[object] = []
+
+        async def owner_stopped_at():
+            row = await backend.fetch_one(
+                "SELECT stopped_at FROM durable_signal_runtime_owners "
+                "WHERE agent_id = ? AND owner_id = ?",
+                (agent.did, dispatcher._durable_delivery_owner),
+            )
+            return None if row is None else row[0]
+
+        class _RawStorage:
+            async def close(self):
+                owner_stopped_at_close.append(await owner_stopped_at())
+                await backend.close()
+
+        raw = _RawStorage()
+        agent._raw_storage = raw
+        agent.storage = raw
+        # The agent's own custody, as ``initialize()`` passes it, so what the
+        # rollback keeps is what the continuation later releases.
+        ctx = BootContext(custody=agent._resource_custody())
+
+        async def acquire(ctx):
+            ctx.on_rollback("storage", agent._boot_teardown_storage)
+            ctx.on_rollback("signal_dispatcher", agent._boot_teardown_dispatcher)
+
+        async def fail_after_dispatcher(_ctx):
+            raise RuntimeError("fail after dispatcher startup")
+
+        try:
+            with pytest.raises(RuntimeError, match="fail after dispatcher startup"):
+                await run_boot_sequence(
+                    [
+                        BootPhase("acquire", acquire),
+                        BootPhase("fail", fail_after_dispatcher),
+                    ],
+                    ctx,
+                    lambda _state: None,
+                )
+
+            assert dispatcher.durable_shutdown_owner_fenced is True
+            assert agent.dispatcher is dispatcher
+            assert agent._raw_storage is raw
+            assert owner_stopped_at_close == []
+            assert backend._connection is not None
+            assert await owner_stopped_at() is None
+            assert {"signal_dispatcher", "storage"} <= set(ctx.retained_resources)
+            assert {"signal_dispatcher", "storage"} <= set(
+                agent._resource_custody().held
+            )
+            continuation = agent._durable_shutdown_continuation
+            assert continuation is not None and not continuation.done()
+
+            allow_exit.set()
+            await asyncio.wait_for(agent.wait_for_shutdown_completion(), timeout=10)
+
+            # Storage closed once, and only after the owner was released.
+            assert len(owner_stopped_at_close) == 1
+            assert owner_stopped_at_close[0] is not None
+            assert backend._connection is None
+
+            # A later lifecycle shutdown joins the finished continuation.
+            agent.llm_service = None
+            agent.task_manager = None
+            agent.features = {}
+            await asyncio.wait_for(agent.shutdown(), timeout=30)
+            assert len(owner_stopped_at_close) == 1
+        finally:
+            allow_exit.set()
+            await asyncio.gather(cognition, return_exceptions=True)
+            if backend._connection is not None:
+                await backend.close()
+
+    @pytest.mark.asyncio
     async def test_shutdown_bounds_a_hung_feature(self, tmp_path):
         """A feature that never returns from shutdown() is bounded (#2409).
 
