@@ -149,6 +149,18 @@ async def test_postgres_advisory_lock_rejects_unvalidated_lock_session_cluster(
             self.executed = []
             self.terminated = False
 
+        def get_server_pid(self):
+            return 3569
+
+        def is_closed(self):
+            return self.terminated
+
+        def add_termination_listener(self, callback):
+            self.listener = callback
+
+        def remove_termination_listener(self, callback):
+            assert callback == self.listener
+
         async def fetchval(self, query, *_params):
             assert "pg_control_system" in query
             return "cluster-selected-by-load-balancer"

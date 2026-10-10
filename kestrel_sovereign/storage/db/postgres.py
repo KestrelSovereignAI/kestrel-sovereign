@@ -25,13 +25,19 @@ ADVANCED MODE:
 import asyncio
 import contextvars
 import logging
-from collections.abc import Sequence as SequenceABC
+from collections.abc import Callable, Sequence as SequenceABC
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
 from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    current_execution_custody,
+    lock_execution_authority,
+    require_execution_backend,
+)
 
 from .interface import (
     ConnectionError,
@@ -67,6 +73,71 @@ class _OperationalSessionLease:
     connection: Any
     lock: asyncio.Lock
     active: bool = True
+
+
+class AdvisoryLease:
+    """Exact physical-session capability, never revived by reconnection.
+
+    Listeners are registered during acquisition, not by the body after entry.
+    PostgreSQL/asyncpg can queue a loss notification; retirement is monotonic
+    and a queued callback cannot turn normal completed retirement into loss.
+    The consumer must settle its owned work before leaving the lease context.
+    """
+
+    def __init__(
+        self, connection: Any,
+        on_loss: Callable[[AdvisoryLease], None] | None,
+    ) -> None:
+        self.backend_pid: int = connection.get_server_pid()
+        self._connection = connection
+        self._on_loss = on_loss
+        self._state = "acquiring"
+
+    @property
+    def lost(self) -> bool:
+        return self._state == "lost"
+
+    def _connection_terminated(self, _connection: Any) -> None:
+        if self._state in ("acquiring", "held"):
+            self._state = "lost"
+            if self._on_loss is not None:
+                self._on_loss(self)
+
+    def require_live(self) -> None:
+        if self._state in ("acquiring", "held"):
+            try:
+                closed = self._connection.is_closed()
+            except asyncpg.InterfaceError:
+                # asyncpg detaches a dead physical session's public pool proxy
+                # before its queued termination listener necessarily runs.
+                closed = True
+            if closed:
+                self._connection_terminated(self._connection)
+        if self._state not in ("acquiring", "held"):
+            raise ExecutionAuthorityError(
+                f"PostgreSQL advisory authority session {self.backend_pid} "
+                f"is {self._state}"
+            )
+
+    def _admit(self) -> None:
+        self.require_live()
+        self._state = "held"
+
+    def _retire(self) -> None:
+        if self._state != "lost":
+            self._state = "retired"
+
+    def _remove_listener(self) -> bool:
+        """False means asyncpg already detached this dead session's proxy."""
+
+        try:
+            self._connection.remove_termination_listener(self._connection_terminated)
+        except asyncpg.InterfaceError:
+            # Physical session death clears its listeners and releases its
+            # pool holder. There is no live session to unlock/terminate, and
+            # probing that invalid proxy must not mask the original loss.
+            return False
+        return True
 
 
 def is_concurrent_update_error(exc: BaseException) -> bool:
@@ -559,6 +630,7 @@ class PostgresBackend(DatabaseBackend):
     
     def _ensure_connected(self) -> asyncpg.Pool:
         """Ensure we have an active pool."""
+        require_execution_backend("postgres")
         if self._pool is None:
             raise ConnectionError("Not connected to database. Call connect() first.")
         return self._pool
@@ -612,10 +684,47 @@ class PostgresBackend(DatabaseBackend):
     
     def _convert_query(self, query: str) -> str:
         """Convert SQLite-style ? placeholders to PostgreSQL $N style."""
-        if self._current_txn_conn() is not None:
+        if self._current_txn_conn() is not None or current_execution_custody():
             reject_transaction_control(query, dialect="postgres")
         converted, _ = sqlite_to_postgres(query)
         return converted
+
+    @asynccontextmanager
+    async def _execution_query_executor(self, executor: Any) -> AsyncIterator[Any]:
+        """Fence every native SQL surface on its own transaction/session.
+
+        Unfenced callers retain their normal autocommit path. A fenced read is
+        guarded too: SELECT can invoke mutating functions, and stale reads can
+        disclose old-owner data. Never classify authority from a SQL verb.
+        """
+
+        if not current_execution_custody():
+            yield executor
+            return
+        require_execution_backend("postgres")
+        if self._current_txn_conn() is not None:
+            await lock_execution_authority(executor, "postgres")
+            yield executor
+            require_execution_backend("postgres")
+            return
+        if executor is self._pool:
+            async with executor.acquire() as connection:
+                async with self._execution_query_executor(connection) as checked:
+                    yield checked
+            return
+        async with executor.transaction():
+            await lock_execution_authority(executor, "postgres")
+            yield executor
+            require_execution_backend("postgres")
+        # Commit has completed. If loss raced its acknowledgement, denial here
+        # does not mean rollback; callers must reconcile their idempotent write.
+        try:
+            require_execution_backend("postgres")
+        except ExecutionAuthorityError as exc:
+            raise ExecutionAuthorityError(
+                "execution authority lost after transaction commit; "
+                "the operation may have committed"
+            ) from exc
 
     @staticmethod
     def _strip_tz(params: Params) -> Tuple[Any, ...]:
@@ -653,13 +762,12 @@ class PostgresBackend(DatabaseBackend):
             try:
                 txn = self._current_txn_conn()
                 if txn is not None:
-                    result = await txn.execute(pg_query, *params)
+                    async with self._execution_query_executor(txn) as checked:
+                        result = await checked.execute(pg_query, *params)
                 else:
                     async with self._operational_query_connection() as conn:
-                        if conn is None:
-                            result = await pool.execute(pg_query, *params)
-                        else:
-                            result = await conn.execute(pg_query, *params)
+                        async with self._execution_query_executor(conn or pool) as checked:
+                            result = await checked.execute(pg_query, *params)
 
                 # Parse affected rows from result (e.g., "INSERT 0 1" or "UPDATE 5")
                 if result:
@@ -694,14 +802,17 @@ class PostgresBackend(DatabaseBackend):
         try:
             txn = self._current_txn_conn()
             if txn is not None:
-                await txn.executemany(pg_query, params_list)
+                async with self._execution_query_executor(txn) as checked:
+                    await checked.executemany(pg_query, params_list)
             else:
                 async with self._operational_query_connection() as conn:
                     if conn is not None:
-                        await conn.executemany(pg_query, params_list)
+                        async with self._execution_query_executor(conn) as checked:
+                            await checked.executemany(pg_query, params_list)
                     else:
                         async with pool.acquire() as acquired:
-                            await acquired.executemany(pg_query, params_list)
+                            async with self._execution_query_executor(acquired) as checked:
+                                await checked.executemany(pg_query, params_list)
             return len(params_list)  # asyncpg doesn't return affected count
             
         except Exception as e:
@@ -717,13 +828,12 @@ class PostgresBackend(DatabaseBackend):
         try:
             txn = self._current_txn_conn()
             if txn is not None:
-                row = await txn.fetchrow(pg_query, *params)
+                async with self._execution_query_executor(txn) as checked:
+                    row = await checked.fetchrow(pg_query, *params)
             else:
                 async with self._operational_query_connection() as conn:
-                    if conn is None:
-                        row = await pool.fetchrow(pg_query, *params)
-                    else:
-                        row = await conn.fetchrow(pg_query, *params)
+                    async with self._execution_query_executor(conn or pool) as checked:
+                        row = await checked.fetchrow(pg_query, *params)
             
             if row is None:
                 return None
@@ -742,13 +852,12 @@ class PostgresBackend(DatabaseBackend):
         try:
             txn = self._current_txn_conn()
             if txn is not None:
-                rows = await txn.fetch(pg_query, *params)
+                async with self._execution_query_executor(txn) as checked:
+                    rows = await checked.fetch(pg_query, *params)
             else:
                 async with self._operational_query_connection() as conn:
-                    if conn is None:
-                        rows = await pool.fetch(pg_query, *params)
-                    else:
-                        rows = await conn.fetch(pg_query, *params)
+                    async with self._execution_query_executor(conn or pool) as checked:
+                        rows = await checked.fetch(pg_query, *params)
             
             return [tuple(row.values()) for row in rows]
             
@@ -765,18 +874,18 @@ class PostgresBackend(DatabaseBackend):
         try:
             txn = self._current_txn_conn()
             if txn is not None:
-                return await txn.fetchval(pg_query, *params)
+                async with self._execution_query_executor(txn) as checked:
+                    return await checked.fetchval(pg_query, *params)
             async with self._operational_query_connection() as conn:
-                if conn is None:
-                    return await pool.fetchval(pg_query, *params)
-                return await conn.fetchval(pg_query, *params)
+                async with self._execution_query_executor(conn or pool) as checked:
+                    return await checked.fetchval(pg_query, *params)
             
         except Exception as e:
             raise QueryError(f"Query failed: {e}\nQuery: {pg_query}") from e
     
     async def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script."""
-        if self._current_txn_conn() is not None:
+        if self._current_txn_conn() is not None or current_execution_custody():
             reject_transaction_control(script, dialect="postgres")
         record_write_script(script)
         pool = self._ensure_connected()
@@ -784,14 +893,17 @@ class PostgresBackend(DatabaseBackend):
         try:
             txn = self._current_txn_conn()
             if txn is not None:
-                await txn.execute(script)
+                async with self._execution_query_executor(txn) as checked:
+                    await checked.execute(script)
             else:
                 async with self._operational_query_connection() as conn:
                     if conn is not None:
-                        await conn.execute(script)
+                        async with self._execution_query_executor(conn) as checked:
+                            await checked.execute(script)
                     else:
                         async with pool.acquire() as acquired:
-                            await acquired.execute(script)
+                            async with self._execution_query_executor(acquired) as checked:
+                                await checked.execute(script)
                     
         except Exception as e:
             raise QueryError(f"Script execution failed: {e}") from e
@@ -894,7 +1006,9 @@ class PostgresBackend(DatabaseBackend):
         if existing is not None:
             # Nested transaction (same task) - use savepoint on this task's conn.
             async with existing.transaction():
+                await lock_execution_authority(existing, "postgres")
                 yield
+                require_execution_backend("postgres")
             return
 
         operational = self._current_operational_lease()
@@ -906,7 +1020,10 @@ class PostgresBackend(DatabaseBackend):
                     )
                     try:
                         async with operational.connection.transaction():
+                            await lock_execution_authority(operational.connection, "postgres")
                             yield
+                            require_execution_backend("postgres")
+                        require_execution_backend("postgres")
                     except Exception as e:
                         raise TransactionError(f"Transaction failed: {e}") from e
                     finally:
@@ -917,7 +1034,10 @@ class PostgresBackend(DatabaseBackend):
             token = self._txn_conn_var.set((asyncio.current_task(), conn))
             try:
                 async with conn.transaction():
+                    await lock_execution_authority(conn, "postgres")
                     yield
+                    require_execution_backend("postgres")
+                require_execution_backend("postgres")
             except Exception as e:
                 raise TransactionError(f"Transaction failed: {e}") from e
             finally:
@@ -930,7 +1050,8 @@ class PostgresBackend(DatabaseBackend):
         *,
         shared: bool = False,
         expected_cluster_identity: Optional[str] = None,
-    ) -> AsyncIterator[None]:
+        on_loss: Callable[[AdvisoryLease], None] | None = None,
+    ) -> AsyncIterator[AdvisoryLease | None]:
         """Hold multiple session advisory locks on one bounded-pool connection.
 
         A multi-tenant bootstrap can need to drain effects for more than one
@@ -958,7 +1079,9 @@ class PostgresBackend(DatabaseBackend):
             # A dynamic hosted scheduler can legitimately have no tenants
             # during bootstrap. Do not pin a spare pool connection just to
             # represent that empty exclusion set.
-            yield
+            if on_loss is not None:
+                raise ValueError("empty advisory keys cannot grant authority custody")
+            yield None
             return
         lock_function = "pg_advisory_lock_shared" if shared else "pg_advisory_lock"
         unlock_function = (
@@ -970,7 +1093,11 @@ class PostgresBackend(DatabaseBackend):
         # connection that an admitted effect still needs.
         async with advisory_pool.acquire() as conn:
             acquired: list[Tuple[int, int]] = []
+            capability = AdvisoryLease(conn, on_loss)
+            conn.add_termination_listener(capability._connection_terminated)
+            listener_attached = True
             try:
+                capability.require_live()
                 if expected_cluster_identity is not None:
                     actual_cluster_identity = await conn.fetchval(
                         "SELECT system_identifier::text "
@@ -990,16 +1117,26 @@ class PostgresBackend(DatabaseBackend):
                         f"SELECT {lock_function}($1, $2)", namespace, key
                     )
                     acquired.append((namespace, key))
-                yield
+                    capability.require_live()
+                capability._admit()
+                yield capability
+                capability.require_live()
             except BaseException:
                 # A cancellation can race PostgreSQL granting a blocking lock
                 # after asyncpg has sent the cancellation request. Terminating
                 # this dedicated connection is the only unconditional release
                 # in that race; the bounded pool discards it and never returns
                 # a possibly locked session to another scheduler operation.
-                conn.terminate()
+                capability._retire()
+                session_attached = capability._remove_listener()
+                listener_attached = False
+                if session_attached:
+                    conn.terminate()
                 raise
             else:
+                capability._retire()
+                capability._remove_listener()
+                listener_attached = False
                 try:
                     # ``pg_advisory_unlock`` must run on the same session that
                     # acquired the lock. The normal path returns the clean,
@@ -1011,6 +1148,10 @@ class PostgresBackend(DatabaseBackend):
                 except BaseException:
                     conn.terminate()
                     raise
+            finally:
+                capability._retire()
+                if listener_attached:
+                    capability._remove_listener()
 
     @asynccontextmanager
     async def polled_advisory_lock(

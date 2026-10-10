@@ -61,6 +61,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     held_transition_reentry_token,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
+from kestrel_sovereign.execution_custody import require_execution_work
 from kestrel_sovereign.agent.streaming import (
     _DeferredToolBatchCancellation,
     _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
@@ -690,7 +691,9 @@ class OrchestratorEngineMixin:
         # executions — a telemetry-layer ``agent.tool_execution`` span would
         # double-instrument the call and root as the ``unknown`` agent.
         exec_start = time.time()
+        require_execution_work()
         result = await execute_fn(args)
+        require_execution_work()
         exec_duration_ms = int((time.time() - exec_start) * 1000)
 
         # #2641: envelope-carried parts → this turn's collector, BEFORE the
@@ -1158,7 +1161,9 @@ class OrchestratorEngineMixin:
         # OpenInference TOOL span is the one source of truth for tool
         # executions.
         exec_start = time.time()
+        require_execution_work()
         result = await found_tool.execute(**effective_args)
+        require_execution_work()
         exec_duration_ms = int((time.time() - exec_start) * 1000)
         # #2641: envelope-carried parts → the owning turn's collector. The
         # codex inline executor wraps this call in ``bind_part_collector``, so

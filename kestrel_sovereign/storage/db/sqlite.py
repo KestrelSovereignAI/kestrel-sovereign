@@ -26,6 +26,7 @@ from .interface import (
     TransactionError,
 )
 from .write_audit import record_write_query, record_write_script
+from kestrel_sovereign.execution_custody import require_execution_backend
 from .transaction_control import reject_transaction_control, sqlite_statements
 
 logger = logging.getLogger(__name__)
@@ -862,6 +863,7 @@ class SQLiteBackend(DatabaseBackend):
     
     def _ensure_connected(self) -> aiosqlite.Connection:
         """Ensure we have an active connection."""
+        require_execution_backend("sqlite")
         if self._connection is None:
             raise ConnectionError("Not connected to database. Call connect() first.")
         return self._connection
