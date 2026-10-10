@@ -338,3 +338,34 @@ async def test_turn_history_custody_preserves_pass_and_refuses_conflicts(db_back
         assert calls == []
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("risk", [1, 3])
+async def test_exit_cannot_ignore_terminal_history_when_current_receipt_is_missing(db_backend, risk):
+    from tests.integration.test_constitution_turn_admission import _ready_turn
+
+    storage = AsyncStorage(backend=db_backend, agent_id="did:test:exit-history:" + uuid4().hex)
+    await storage.initialize()
+    try:
+        agent, _ = await _ready_turn(storage)
+        # Use the native durable lifecycle harness, not the turn-only shape.
+        native = await _agent(storage, is_new_identity=False)
+        root = await storage.get_node(storage.agent_id)
+        terminal = root.properties.pop("genesis_audit")
+        terminal = dict(terminal, risk_level=risk, status="failed" if risk == 3 else "passed")
+        root.properties["genesis_audit_history"] = [{"receipt": terminal}]
+        await storage.add_node(root)
+        assert await native.enter_safe_mode("historical exit fixture")
+        result = await native.exit_safe_mode(authorization="explicit fixture owner")
+        current = await native._constitution_state_store.load(storage.agent_id)
+        if risk == 3:
+            assert result.startswith("Safe Mode remains active:"), result
+            assert current.safe_mode is True
+            assert "passed genesis" in result, result
+        else:
+            assert not result.startswith("Safe Mode remains active:"), result
+            assert current.safe_mode is False
+    finally:
+        await storage.close()

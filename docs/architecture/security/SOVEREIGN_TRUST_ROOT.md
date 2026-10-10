@@ -196,6 +196,14 @@ Frozen birth replay likewise refuses a migrated pending lifetime rather than
 restoring it as a newly created identity.
 Doctrine metadata
 writers use native compare-and-swap to preserve concurrent completed receipts.
+Bootstrap status, description, rename and overlay metadata writers merge only
+their own fields into a freshly locked native identity. An old identity read
+cannot replace newer governance, and a failed write does not mutate its read
+object or report a live rename. Runtime genesis audit, turn admission and
+commit-time exit reconcile matching current and historical terminal receipts
+before granting authority or calling an auditor. A missing or pending current
+receipt cannot reroll a historical rejection; contradictory terminals refuse
+without choosing a favorable result. History validation is bounded.
 Completed same-content genesis receipts survive an incorrect operative pointer
 as well as a missing one. Conflicting completed evidence is refused rather than
 selecting a favorable result. Supported legacy timestamp/risk/hash receipts are
@@ -206,7 +214,10 @@ the native control-plane transaction in volatile privacy modes too; ordinary
 feature-facing privacy restrictions remain unchanged.
 Inception uses the same exact-byte native publisher, and a post-commit SQL
 conversation-notice failure does not undo creation or skip remaining completion
-work. Pre-commit publication failures remove only that attempt's newly minted
+work. Under its owning graph and lifetime custody, inception refuses an existing
+physical identity or any prior constitutional lifetime, including a consumed
+lifetime whose root was deleted. Deterministic DID reuse requires authorized
+recovery, not new key minting over old governance. Pre-commit publication failures remove only that attempt's newly minted
 identity artifacts and close/remove its internally created database; an external
 database remains caller-owned, and committed identity artifacts are preserved.
 Cancellation receives the same rollback cleanup, including while the genesis
@@ -218,6 +229,11 @@ outcome cannot be read, identity keys are retained rather than erased.
 Native SQLite advertises its optional savepoint extension explicitly. Standard
 SDK adapters retain the argument-free top-level transaction contract; adapters
 that only join nested scopes refuse isolated avatar publication before writes.
+Avatar publication retains and verifies the actual decrypted blob and exact
+tenant owner before publishing a graph reference or identity avatar pointer.
+The input digest alone is not evidence that a conflict winner contains the
+image; corruption rolls back isolated publication even when a caller catches
+the refusal and commits its surrounding transaction.
 Physical lock ordering uses PostgreSQL's canonical `C`
 collation; target equality does not depend on database locale.
 An existing genesis receipt must validate as a literal pass, not merely be

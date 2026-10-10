@@ -1883,7 +1883,9 @@ class ConstitutionMixin:
             raise ConstitutionIntegrityAttestationError("Malformed native governance metadata during final verification") from exc
         if valid is not True:
             raise ConstitutionIntegrityAttestationError("Locked integrity verification failed: " + message)
-        if require_genesis and fresh is not None and "genesis_audit" in fresh.properties:
+        if require_genesis and fresh is not None and (
+            "genesis_audit" in fresh.properties or "genesis_audit_history" in fresh.properties
+        ):
             try:
                 receipt = reconcile_genesis_receipt(fresh.properties, digest)
                 status = validate_completed_genesis_audit(receipt, digest)
