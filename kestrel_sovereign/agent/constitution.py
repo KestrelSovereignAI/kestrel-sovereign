@@ -1660,11 +1660,14 @@ class ConstitutionMixin:
         overlay_sha = getattr(self, "_constitution_overlay_sha", None)
         if overlay_sha is None:
             return False, "No per-agent constitution overlay to anchor."
-        agent_node = await self.storage.get_node(self.agent_id)
+        from kestrel_sovereign.storage.identity_metadata import merge_identity_metadata
+
+        agent_node = await merge_identity_metadata(
+            self.storage, self.agent_id, {self.OVERLAY_HASH_PROPERTY: overlay_sha},
+            capability=acquire_control_plane_capability(),
+        )
         if not agent_node:
             return False, "Agent identity node not found; cannot anchor overlay."
-        agent_node.properties[self.OVERLAY_HASH_PROPERTY] = overlay_sha
-        await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())  # upsert
         self.constitution_overlay_verified = True
         logging.info("Anchored constitution overlay hash %s", overlay_sha[:16])
         return True, f"Anchored constitution overlay. Hash: {overlay_sha[:16]}..."
@@ -1850,7 +1853,7 @@ class ConstitutionMixin:
         SQLite's owning writer transaction supplies the same serialization.
         """
         from kestrel_sovereign.constitution.genesis_audit import (
-            GENESIS_AUDIT_PASSED, GenesisAuditError, validate_completed_genesis_audit,
+            GENESIS_AUDIT_PASSED, GenesisAuditError, reconcile_genesis_receipt, validate_completed_genesis_audit,
         )
         from kestrel_sdk.security.encryption import DecryptionError
         from json import JSONDecodeError
@@ -1882,7 +1885,8 @@ class ConstitutionMixin:
             raise ConstitutionIntegrityAttestationError("Locked integrity verification failed: " + message)
         if require_genesis and fresh is not None and "genesis_audit" in fresh.properties:
             try:
-                status = validate_completed_genesis_audit(fresh.properties["genesis_audit"], digest)
+                receipt = reconcile_genesis_receipt(fresh.properties, digest)
+                status = validate_completed_genesis_audit(receipt, digest)
             except GenesisAuditError as exc:
                 raise ConstitutionIntegrityAttestationError(str(exc)) from exc
             if status != GENESIS_AUDIT_PASSED:
@@ -1928,8 +1932,11 @@ class ConstitutionMixin:
             self._feature_lifecycle_repair_verified = False
             return "Safe Mode remains active: verification was invalidated by an unpersisted restriction."
         if not is_valid:
-            await self.enter_safe_mode(f"Safe Mode exit verification failed: {message}")
-            return f"Safe Mode remains active: integrity verification failed: {message}"
+            persisted = await self.enter_safe_mode(f"Safe Mode exit verification failed: {message}")
+            result = f"Safe Mode remains active: integrity verification failed: {message}"
+            if not persisted or self._constitution_state_persistence_pending:
+                result += " (replacement restriction could not be persisted; recovery remains pending)."
+            return result
 
         now = self._constitution_now()
         old_reason = self._safe_mode_reason
@@ -2636,6 +2643,13 @@ class ConstitutionMixin:
             return "Error: Agent's own identity node not found in storage."
 
         constitution_hash = agent_node.properties.get("constitution_hash")
+        if witness:
+            from kestrel_sovereign.constitution.genesis_audit import GenesisAuditError, reconcile_genesis_receipt
+
+            try:
+                reconcile_genesis_receipt(agent_node.properties, constitution_hash)
+            except GenesisAuditError:
+                return "Error: Governing genesis receipt history changed after this turn's audited admission."
         if witness and (
             constitution_hash != witness[2]
             or agent_node.properties.get("genesis_audit") != witness[3]
@@ -2901,6 +2915,11 @@ class ConstitutionMixin:
                 # Merge only this receipt. A pre-auditor graph node is never a
                 # replacement for metadata written during the awaited audit.
                 fresh.properties["genesis_audit"] = deepcopy(agent_node.properties["genesis_audit"])
+                if "genesis_audit_history" in agent_node.properties:
+                    # The complete expected history was revalidated under
+                    # native custody above; reconciliation cannot erase an
+                    # intervening completed receipt or signed repair.
+                    fresh.properties["genesis_audit_history"] = deepcopy(agent_node.properties["genesis_audit_history"])
                 await write(fresh)
                 store = vars(self).get("_constitution_state_store")
                 if "_constitution_state_store" in vars(self):
@@ -2972,6 +2991,28 @@ class ConstitutionMixin:
         agent_node.properties["genesis_audit"] = existing
         await self._persist_governance_receipt_node(agent_node, expected=expected)
 
+    async def _reconcile_runtime_genesis_receipt(self, agent_node: GraphNode) -> None:
+        from kestrel_sovereign.constitution.genesis_audit import (
+            GenesisAuditError, reconcile_genesis_receipt, utc_timestamp,
+        )
+
+        digest = agent_node.properties.get("constitution_hash")
+        resolved = reconcile_genesis_receipt(agent_node.properties, digest)
+        existing = agent_node.properties.get("genesis_audit")
+        if resolved is None or existing == resolved:
+            return
+        expected = await ConstitutionMixin._genesis_publication_witness(self, agent_node)
+        if existing is not None:
+            history = deepcopy(agent_node.properties.get("genesis_audit_history", []))
+            if len(history) >= 128:
+                raise GenesisAuditError("Genesis receipt history cannot safely archive another receipt")
+            history.append({"receipt": deepcopy(existing), "superseded_at": utc_timestamp(),
+                            "superseded_by_constitution_hash": digest,
+                            "provenance": "runtime:reconciled_historical_receipt"})
+            agent_node.properties["genesis_audit_history"] = history
+        agent_node.properties["genesis_audit"] = resolved
+        await self._persist_governance_receipt_node(agent_node, expected=expected)
+
     async def perform_genesis_audit(
         self,
         *,
@@ -3001,6 +3042,7 @@ class ConstitutionMixin:
                 "Genesis audit failed: governing constitution hash is missing."
             )
 
+        await ConstitutionMixin._reconcile_runtime_genesis_receipt(self, agent_node)
         expected = await ConstitutionMixin._genesis_publication_witness(self, agent_node)
         existing = agent_node.properties.get("genesis_audit")
         if isinstance(existing, dict):
@@ -3106,6 +3148,7 @@ class ConstitutionMixin:
         if agent_node is None:
             raise GenesisAuditError("Genesis audit readiness has no agent node.")
 
+        await ConstitutionMixin._reconcile_runtime_genesis_receipt(self, agent_node)
         record = agent_node.properties.get("genesis_audit")
         if record is None:
             # Migrate every pre-#2470 identity. Missing birth metadata is not a
@@ -3257,5 +3300,7 @@ class ConstitutionMixin:
             fresh = await raw.get_node(self.agent_id)
             if fresh is None or fresh.properties.get("constitution_hash") != digest:
                 raise RuntimeError("Native governing pointer changed during turn custody acquisition")
-            receipt = deepcopy(fresh.properties.get("genesis_audit"))
+            from kestrel_sovereign.constitution.genesis_audit import reconcile_genesis_receipt
+
+            receipt = reconcile_genesis_receipt(fresh.properties, digest)
         return state, digest, receipt

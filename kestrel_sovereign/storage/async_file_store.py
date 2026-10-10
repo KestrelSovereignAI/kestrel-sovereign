@@ -326,6 +326,21 @@ class AsyncFileStore:
             await self.store_file(
                 image_data, f"avatar_{avatar_type}.jpg", metadata
             )
+            # store_file returns the INPUT digest even on a conflict. Retain
+            # the actual blob and exact owner, then decrypt/compare the winner
+            # before publishing any avatar node, edge or identity pointer.
+            lock = " FOR UPDATE" if self.db.backend_type == "postgres" else ""
+            if await self.db.fetchone(
+                "SELECT content_hash FROM files WHERE content_hash=?" + lock,
+                (content_hash,),
+            ) is None or await self.db.fetchone(
+                "SELECT content_hash FROM file_owners WHERE content_hash=? AND agent_id=?" + lock,
+                (content_hash, agent_id),
+            ) is None:
+                raise ValueError("Avatar publication lacks physical blob ownership")
+            bound_files = self if self.agent_id else AsyncFileStore(self.db, agent_id=agent_id)
+            if await bound_files.retrieve_file(content_hash) != image_data:
+                raise ValueError("Stored avatar bytes do not verify against the input image")
             await graph.add_node(
                 GraphNode(
                     node_id=avatar_node_id,

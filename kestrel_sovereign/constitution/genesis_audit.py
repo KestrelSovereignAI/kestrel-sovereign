@@ -211,6 +211,50 @@ Return JSON with:
 """
 
 
+def reconcile_genesis_receipt(properties: Mapping[str, Any], constitution_hash: str) -> dict[str, Any] | None:
+    """Resolve matching durable evidence before audit or cognition admission.
+
+    Reanchoring through other content never grants a fresh attempt at a
+    completed verdict. Conflicting completions are repair refusals, not votes.
+    This pure check is also used on the locked native turn snapshot.
+    """
+    history = properties.get("genesis_audit_history", [])
+    if not isinstance(history, list) or len(history) > 128:
+        raise GenesisAuditError("Malformed or unbounded genesis receipt history")
+    candidates = []
+    current = properties.get("genesis_audit")
+    if current is not None:
+        if not isinstance(current, Mapping):
+            raise GenesisAuditError("Genesis audit state is malformed.")
+        if current.get("constitution_hash") != constitution_hash:
+            raise GenesisAuditError("Current genesis receipt is bound to different governing bytes")
+        candidates.append(current)
+    for entry in history:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("receipt"), Mapping):
+            raise GenesisAuditError("Malformed genesis receipt history entry")
+        receipt = entry["receipt"]
+        if not isinstance(receipt.get("constitution_hash"), str) or re.fullmatch(r"[0-9a-f]{64}", receipt["constitution_hash"]) is None:
+            raise GenesisAuditError("Historical genesis receipt lacks a valid content hash")
+        if receipt["constitution_hash"] == constitution_hash:
+            candidates.append(receipt)
+    completed = []
+    pending = None
+    for candidate in candidates:
+        normalized = normalize_genesis_receipt(candidate, constitution_hash)
+        if validate_completed_genesis_audit(normalized, constitution_hash) is None:
+            if normalized.get("audited") is not False:
+                raise GenesisAuditError("Pending genesis receipt claims contradictory audit evidence")
+            if candidate is current:
+                pending = normalized
+        else:
+            completed.append(normalized)
+    if completed:
+        if any(receipt != completed[0] for receipt in completed[1:]):
+            raise GenesisAuditError("Ambiguous completed genesis receipts for governing bytes")
+        return deepcopy(completed[0])
+    return pending
+
+
 def normalize_genesis_receipt(record: Mapping[str, Any], constitution_hash: str) -> dict[str, Any]:
     """Upgrade supported legacy completion evidence without calling an auditor.
 

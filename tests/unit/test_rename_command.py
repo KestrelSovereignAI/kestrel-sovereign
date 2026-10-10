@@ -6,6 +6,7 @@ Tests the agent renaming functionality in the Bootstrap Feature.
 
 import pytest
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,6 +16,13 @@ class MockStorage:
 
     def __init__(self):
         self.nodes = {}
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield
+
+    async def lock_nodes_for_update(self, node_ids):
+        pass
 
     async def get_node(self, node_id: str):
         """Get a node by ID."""
@@ -96,6 +104,7 @@ class MockNode:
 
     def __init__(self, node_id, properties=None, label=None):
         self.node_id = node_id
+        self.node_type = "agent"
         self.properties = properties or {}
         self.label = label or ""
 

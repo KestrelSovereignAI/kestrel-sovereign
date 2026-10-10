@@ -235,14 +235,9 @@ async def persist_agent_description(
         )
 
         if storage is not None:
-            node = await storage.get_node(agent_id)
-            if node:
-                node.properties["description"] = description
-                # The identity graph node is a control-plane type: this write is on
-                # the persistent-mode path (volatile modes returned above), and the
-                # wrapper only enforces the capability while governance is active, so
-                # no capability is needed here (#2672).
-                await storage.add_node(node)
+            from kestrel_sovereign.storage.identity_metadata import merge_identity_metadata
+
+            await merge_identity_metadata(storage, agent_id, {"description": description})
 
         return PersistOutcome.PERSISTED
 
@@ -564,31 +559,22 @@ class BootstrapService:
         except Exception as exc:
             logger.warning("Failed to persist stale bootstrap metadata: %s", exc)
 
-        if agent_node is None and storage is not None:
-            try:
-                agent_node = await storage.get_node(self.agent_id)
-            except Exception as exc:
-                logger.debug("Failed to load agent node for stale bootstrap mark: %s", exc)
-                agent_node = None
-
-        if agent_node is None or storage is None:
+        if storage is None:
             return
 
         try:
-            from copy import copy
+            from kestrel_sovereign.storage.identity_metadata import merge_identity_metadata
 
-            updated_node = copy(agent_node)
-            updated_node.properties = dict(getattr(agent_node, "properties", {}) or {})
-            updated_node.properties["bootstrap_state"] = BootstrapState.PENDING.value
-            updated_node.properties["bootstrap_status"] = self.STALE_BOOTSTRAP_STATUS
-            updated_node.properties["bootstrap_stale_at"] = stale_at
+            updates = {"bootstrap_state": BootstrapState.PENDING.value,
+                       "bootstrap_status": self.STALE_BOOTSTRAP_STATUS,
+                       "bootstrap_stale_at": stale_at}
             if age_seconds is not None:
-                updated_node.properties["bootstrap_pending_age_seconds"] = int(age_seconds)
+                updates["bootstrap_pending_age_seconds"] = int(age_seconds)
             # Trusted control-plane write: agent identity node. The written fields
             # are content-free bootstrap state; the capability admits the durable
             # write in a volatile mode (#2672).
-            await storage.add_node(
-                updated_node, capability=acquire_control_plane_capability()
+            await merge_identity_metadata(
+                storage, self.agent_id, updates, capability=acquire_control_plane_capability()
             )
         except Exception as exc:
             logger.warning("Failed to persist stale bootstrap graph state: %s", exc)

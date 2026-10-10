@@ -164,8 +164,11 @@ async def _anchor_overlay_in(
                 old_hash=old_hash, new_hash=new_hash, overlay_path=overlay_path,
                 target_label=target.describe(), target_backend=target.backend,
             )
-        node.properties[OVERLAY_HASH_PROPERTY] = new_hash
-        await storage.graph.add_node(node)  # upsert
+        from kestrel_sovereign.storage.identity_metadata import merge_identity_metadata
+
+        updated = await merge_identity_metadata(storage, target.agent_did, {OVERLAY_HASH_PROPERTY: new_hash})
+        if updated is None:
+            raise ReanchorTargetError("Agent identity disappeared before overlay publication")
         logger.info(
             "Anchored constitution overlay for %s in %s: %s",
             agent_name, target.describe(), new_hash[:16],

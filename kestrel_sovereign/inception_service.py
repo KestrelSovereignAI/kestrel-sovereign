@@ -1034,6 +1034,26 @@ async def create_kestrel_identity_async(
             await graph.lock_nodes_for_update(
                 [constitution_node.node_id, agent_node.node_id]
             )
+            # Deterministic did:web is a name, not permission to replace the
+            # key material, governance or consumed lifetime of that identity.
+            # Inspect PHYSICAL roots (including foreign-owned roots) while
+            # retaining the same graph custody used by birth/recovery writers.
+            if await db.fetchone("SELECT node_id FROM graph_nodes WHERE node_id=?", (agent_node.node_id,)) is not None:
+                raise ValueError("Inception refuses an existing identity; use authorized recovery")
+            if db.backend_type == "postgres":
+                await db.fetchone(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ?, 0))",
+                    (":constitution_runtime_lifetime:" + agent_node.node_id,),
+                )
+            from kestrel_sovereign.identity.birth_record import assert_birth_replay_custody
+
+            await assert_birth_replay_custody(db, agent_node.node_id, retain=True)
+            for table in ("constitution_runtime_state", "constitution_runtime_events"):
+                if await db.table_exists(table) and await db.fetchone(
+                    f"SELECT agent_id FROM {table} WHERE agent_id=? LIMIT 1",
+                    (agent_node.node_id,),
+                ) is not None:
+                    raise ValueError("Inception refuses an existing constitutional lifetime; use authorized recovery")
             from kestrel_sovereign.constitution.anchored_bytes import _store_exact_native_file
 
             await _store_exact_native_file(db, files, governing_bytes, "KESTREL_CONSTITUTION.md")

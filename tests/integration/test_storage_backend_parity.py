@@ -742,6 +742,7 @@ async def test_constitution_state_cas_rejects_stale_clear_and_due_marker_clobber
     with pytest.raises(ConstitutionStateConflictError):
         await store.write(replace(latched, safe_mode=False))
     assert await store.list_events(state.agent_id) == [
+        {"event_type": "runtime_lifetime_created", "reason": None, "authorization": None, "occurred_at": now},
         {"event_type": "safe_mode_entered", "reason": None, "authorization": None, "occurred_at": now}
     ]
     await store.write(replace(latched, safe_mode=False, safe_mode_exited_at=now,
@@ -1639,7 +1640,8 @@ async def _assert_migrated_anchor_custody_refused(backend, advance_legacy_revisi
         restored = _DurableConstitutionHarness(storage, now)
         restored.agent_id = storage.agent_id
         await restored._initialize_constitution_runtime_state()
-        assert restored._constitution_state_generation == ""
+        assert restored._constitution_state_generation.startswith("legacy:")
+        assert restored._constitution_state_generation == (await restored._constitution_state_store.load(storage.agent_id)).generation
         if advance_legacy_revision:
             assert await restored._persist_constitution_runtime_state()
         restored.extension = None
