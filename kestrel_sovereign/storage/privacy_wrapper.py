@@ -2976,9 +2976,8 @@ class PrivacyEnforcingStorage:
             if rendered_content is not None else None
         )
 
-        if metadata is None:
-            metadata = {}
-        metadata["privacy_mode"] = self._privacy_mode.value
+        # A copy: the caller's dict may be shared (#3552).
+        metadata = {**(metadata or {}), "privacy_mode": self._privacy_mode.value}
 
         if self._policy.use_session_storage:
             # Store in session-local list (ISOLATED mode). The session

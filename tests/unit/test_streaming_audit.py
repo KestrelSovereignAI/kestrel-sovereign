@@ -2356,15 +2356,14 @@ class TestFinding1OrchestratorReviseSuppression:
 
 
 # =========================================================================
-# #2674 (Terra P1) — a strict/buffered continuation that TIMES OUT must not
-# collapse into a silent empty 200. In advisory mode a follow-up-LLM timeout
-# renders as an ❌ tool card (a tool sentinel); under an enforcing (buffered)
-# audit that sentinel is stripped by the buffering gate, leaving empty audited
-# text, empty persisted content, and an empty response. The strict path must
-# instead deliver + persist a deterministic non-empty safe block, discarding any
-# partial/protected buffered continuation, while advisory behavior is preserved.
-# These bind the REAL orchestrator continuation loop and force a genuine
-# ``asyncio.timeout`` on the follow-up synthesis call.
+# #2674 (Terra P1) / #3552 — a continuation that TIMES OUT is a failed attempt.
+# It must never collapse into a silent empty 200 (#2674), and it must never be
+# recorded as an answer (#3552): the turn fails, the stream's own error notice
+# reaches the client, and the only persisted row is the fixed checkpoint that
+# keeps the next turn from repeating the completed tool batch. Under an
+# enforcing (buffered) audit nothing unreviewed is released first; in advisory
+# mode the live ❌ tool card still renders. These bind the REAL orchestrator
+# continuation loop and force a genuine watchdog timeout on the follow-up.
 # =========================================================================
 
 import asyncio
@@ -2374,8 +2373,8 @@ from unittest.mock import patch
 def _tool_then_timeout_streams(*, partial_marker: str = ""):
     """``stream_with_tool_detection`` mock: main call returns a tool call; the
     orchestrator continuation optionally yields ``partial_marker`` prose and then
-    HANGS so the per-call ``asyncio.timeout`` fires. ``partial_marker`` lets a
-    test prove protected/partial buffered text is discarded, never released."""
+    HANGS so the per-call watchdog fires. ``partial_marker`` lets a test prove
+    partial text is never released (strict) and never persisted (either mode)."""
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
     state = {"n": 0}
@@ -2390,7 +2389,7 @@ def _tool_then_timeout_streams(*, partial_marker: str = ""):
             )
             return
         # Continuation (post-tool synthesis): optionally stream partial prose,
-        # then hang until the orchestrator's asyncio.timeout cancels us.
+        # then hang until the orchestrator's watchdog cancels us.
         if partial_marker:
             yield partial_marker
         await asyncio.sleep(30)
@@ -2399,8 +2398,8 @@ def _tool_then_timeout_streams(*, partial_marker: str = ""):
     return mock_stream, state
 
 
-class TestStrictContinuationTimeoutSafeBlock:
-    """#2674 (Terra P1): strict buffered continuation timeout → safe block."""
+class TestContinuationTimeoutFailsTheTurn:
+    """#2674 / #3552: a continuation timeout fails the turn in every mode."""
 
     def _agent(self, add_convo, *, mode, partial_marker=""):
         agent, hook = _make_streaming_audit_agent(
@@ -2414,91 +2413,88 @@ class TestStrictContinuationTimeoutSafeBlock:
         return agent, hook
 
     async def _drive(self, agent):
-        chunks = []
-        async for c in agent.process_input_streaming("hi there", session_id="s1"):
-            chunks.append(c)
-        return chunks
-
-    @pytest.mark.asyncio
-    async def test_strict_timeout_delivers_nonempty_safe_block(self):
-        from kestrel_sovereign.agent.streaming import (
-            STRICT_AUDIT_CONTINUATION_TIMEOUT_BLOCK as BLOCK,
+        """The chunks delivered before the turn failed, and its failure."""
+        from kestrel_sovereign.agent.orchestrator_engine import (
+            LLMCallInactivityTimeout,
         )
 
-        add_convo = []
-        agent, _hook = self._agent(add_convo, mode="strict")
+        chunks = []
         # Force the per-call watchdog to fire almost immediately.
         with patch(
             "kestrel_sovereign.agent.orchestrator_engine."
             "ORCHESTRATOR_TURN_TIMEOUT_SECS", 0.05,
-        ):
-            chunks = await self._drive(agent)
-        joined = "".join(str(c) for c in chunks)
+        ), pytest.raises(LLMCallInactivityTimeout) as raised:
+            async for c in agent.process_input_streaming("hi there", session_id="s1"):
+                chunks.append(c)
+        return chunks, raised.value
 
-        # The strict client gets a NON-EMPTY, deterministic safe block — never a
-        # silent empty 200.
-        assert joined.strip(), "strict timeout produced an empty response"
-        assert BLOCK in joined
-        # No wire-protocol tool sentinel escaped (advisory-only rendering), and no
-        # raw timeout/error detail leaked.
-        assert "KESTREL:TOOL" not in joined
-        assert "timeout after" not in joined
-        # Persisted assistant content EQUALS the delivered block (so a history
-        # reload replays exactly what was released — the #2674 invariant).
+    @staticmethod
+    def _assert_only_the_checkpoint_persisted(add_convo, marker=None):
+        from kestrel_sovereign.agent.streaming import (
+            INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT as CHECKPOINT,
+        )
+
         persisted = [c for c in add_convo if c["role"] == "assistant"]
         assert len(persisted) == 1
-        assert persisted[0]["content"] == BLOCK
-        assert joined.count(BLOCK) == 1
+        assert persisted[0]["content"] == CHECKPOINT
+        assert persisted[0]["metadata"]["tool_batch_checkpoint"]["status"] == (
+            "completed"
+        )
+        if marker is not None:
+            assert marker not in str(persisted[0])
+
+    @pytest.mark.asyncio
+    async def test_strict_timeout_fails_with_a_nonempty_safe_notice(self):
+        from kestrel_sovereign.llm.streaming_errors import agent_stream_error_block
+
+        add_convo = []
+        agent, _hook = self._agent(add_convo, mode="strict")
+        chunks, failure = await self._drive(agent)
+        joined = "".join(str(c) for c in chunks)
+
+        # Nothing unreviewed was released before the failure: no tool sentinel,
+        # no raw timeout detail.
+        assert "KESTREL:TOOL" not in joined
+        assert "timeout after" not in joined
+        # The failure is not silent: the stream's error notice says the model
+        # did not finish, and names nothing else.
+        notice = agent_stream_error_block(failure)
+        assert "did not finish its response" in notice
+        assert "timeout after" not in notice
+        # No answer is recorded; the completed tool batch is.
+        self._assert_only_the_checkpoint_persisted(add_convo)
 
     @pytest.mark.asyncio
     async def test_strict_timeout_discards_partial_protected_text(self):
         """Partial synthesis prose buffered before the timeout is PROTECTED,
-        unfinished, unreviewed content — it must be discarded, never released or
-        persisted, and replaced wholesale by the safe block."""
-        from kestrel_sovereign.agent.streaming import (
-            STRICT_AUDIT_CONTINUATION_TIMEOUT_BLOCK as BLOCK,
-        )
-
+        unfinished, unreviewed content — it must never be released or
+        persisted."""
         marker = "PROTECTED_PARTIAL_MARKER_must_never_surface"
         add_convo = []
         agent, _hook = self._agent(add_convo, mode="strict", partial_marker=marker)
-        with patch(
-            "kestrel_sovereign.agent.orchestrator_engine."
-            "ORCHESTRATOR_TURN_TIMEOUT_SECS", 0.05,
-        ):
-            chunks = await self._drive(agent)
-        joined = "".join(str(c) for c in chunks)
+        chunks, _failure = await self._drive(agent)
 
-        assert marker not in joined, "partial protected text leaked to client"
-        assert joined.strip() and BLOCK in joined
-        persisted = [c for c in add_convo if c["role"] == "assistant"]
-        assert len(persisted) == 1
-        assert marker not in persisted[0]["content"]
-        assert persisted[0]["content"] == BLOCK
+        assert marker not in "".join(str(c) for c in chunks), (
+            "partial protected text leaked to client"
+        )
+        self._assert_only_the_checkpoint_persisted(add_convo, marker)
 
     @pytest.mark.asyncio
-    async def test_advisory_timeout_preserves_error_sentinel(self):
-        """Warn (advisory) turns are NOT buffered: a continuation timeout must
-        still render the ❌ error tool card (tool sentinel) exactly as before —
-        the safe-block substitution is strict-only."""
-        from kestrel_sovereign.agent.streaming import (
-            STRICT_AUDIT_CONTINUATION_TIMEOUT_BLOCK as BLOCK,
-        )
-
+    async def test_advisory_timeout_shows_its_card_and_records_no_answer(self):
+        """Warn (advisory) turns are NOT buffered: the partial prose and the ❌
+        error tool card stream live, but the partial prose is not an answer
+        and is never persisted as one (#3552)."""
+        marker = "PARTIAL_SYNTHESIS_not_an_answer"
         add_convo = []
-        agent, _hook = self._agent(add_convo, mode="warn")
-        with patch(
-            "kestrel_sovereign.agent.orchestrator_engine."
-            "ORCHESTRATOR_TURN_TIMEOUT_SECS", 0.05,
-        ):
-            chunks = await self._drive(agent)
+        agent, _hook = self._agent(add_convo, mode="warn", partial_marker=marker)
+        chunks, _failure = await self._drive(agent)
         joined = "".join(str(c) for c in chunks)
 
-        # Advisory path keeps the in-band error tool sentinel with its detail...
+        # Advisory path keeps the in-band error tool sentinel with its detail.
         assert "KESTREL:TOOL" in joined
         assert "timeout after" in joined
-        # ...and does NOT substitute the strict safe block.
-        assert BLOCK not in joined
+        assert marker in joined
+        self._assert_only_the_checkpoint_persisted(add_convo, marker)
 
 
 # =========================================================================

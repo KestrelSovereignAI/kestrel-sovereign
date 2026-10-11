@@ -9,7 +9,7 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-07-24T00:00:00Z'
+timestamp: '2026-10-10T00:00:00Z'
 status: active
 owner: architecture
 canonical: true
@@ -71,6 +71,18 @@ async def get_response(
 ```
 
 The framework hands you a provider-native client (constructed during route init from your config), a concrete model id (the framework resolves `"auto"` upstream — you never see it), OpenAI-format messages, and optional tools / structured-output schema. Return an `LLMResponse`.
+
+### Completion evidence: the stop reason
+
+A response becomes a turn's answer, or the tool calls a turn runs, only on positive evidence that the model finished ([#3552](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3552)). The evidence is the provider's own terminal stop reason, set as a `stop_reason` attribute on the `LLMResponse` you return, or on the terminal `LLMResponse` that ends your stream. The SDK dataclass has no field for it yet; the framework reads the attribute.
+
+```python
+response = LLMResponse(content=msg.content, tool_calls=tool_calls)
+response.stop_reason = resp.choices[0].finish_reason  # "stop", "tool_calls", "length", ...
+return response
+```
+
+Report the provider's value as it is. A natural end (`stop`, `end_turn`, `stop_sequence`, `tool_use`, `tool_calls`, `function_call`, `STOP`, `completed`) is accepted. Anything else is a failed attempt: a stop at an output limit (`length`, `max_tokens`, `MAX_TOKENS`, `model_context_window_exceeded`), any other or unknown reason, and **no stop reason at all**. A route whose adapter reports none fails every turn it serves, with an error naming the missing stop reason. The decision is `kestrel_sovereign.llm.generation_gate.judge_generation`.
 
 ### The optional surface
 
@@ -164,13 +176,16 @@ class KimiAdapter(LLMAdapter):
                     ToolCall(id=tc.id, name=tc.function.name, arguments=args)
                 )
 
-        return LLMResponse(
+        response = LLMResponse(
             content=msg.content,
             tool_calls=tool_calls,
             input_tokens=getattr(usage, "prompt_tokens", None),
             output_tokens=getattr(usage, "completion_tokens", None),
             total_tokens=getattr(usage, "total_tokens", None),
         )
+        # The evidence the model finished (see "Completion evidence").
+        response.stop_reason = resp.choices[0].finish_reason
+        return response
 
     # Recommended metadata.
     def substrate_type(self) -> Optional[str]:
@@ -252,7 +267,7 @@ The contract is on **stream order**, not literal index value: the order of disti
 
 1. `ToolCallStarted` events with distinct `index` values are yielded in the order their corresponding entries appear in `LLMResponse.tool_calls`.
 2. Text chunks may interleave with `ToolCallStarted` events. Anthropic mixes text and tool blocks; OpenAI may emit a leading text segment before tool deltas. Consumers handle both text-before-tool and text-during-tool.
-3. The terminal `LLMResponse` is yielded after all text and `ToolCallStarted` events, exactly once for tool-call responses. Pure-text streams may terminate without one.
+3. The terminal `LLMResponse` is yielded after all text and `ToolCallStarted` events, exactly once, and carries the stop reason (see "Completion evidence"). A stream that ends without one has given no evidence that it finished, and the turn it served fails.
 
 ### Edge cases
 
@@ -328,7 +343,7 @@ After your plugin is `pip install`'d, the framework:
 4. **Pulls metadata** from your `cost_per_1m_tokens()`, `substrate_type()`, `display_name()`, `key_env_var()`, `deliberation_style()` for the council, identity export, and UI surfaces.
 5. **Discovers models** via your `list_models(client)`. The framework caches results and surfaces them in the model dropdown.
 
-You can ship a working plugin without implementing any of `list_models`, `get_streaming_response`, or `get_streaming_response_with_tools` — the framework gates each capability and falls back gracefully. The minimum viable plugin (just `get_response`) is fully conforming.
+You can ship a working plugin without implementing any of `list_models`, `get_streaming_response`, or `get_streaming_response_with_tools` — the framework gates each capability and falls back gracefully. The minimum viable plugin (just `get_response`, returning its stop reason) is fully conforming. A plain-text `get_streaming_response` carries no stop reason, so to serve streamed turns implement `get_streaming_response_with_tools` and end the stream with a terminal `LLMResponse`.
 
 ---
 

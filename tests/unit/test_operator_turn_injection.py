@@ -139,7 +139,7 @@ def _turn_agent(*, role, fail_operator_persistence):
         ),
         _build_all_tools=lambda: [],
         _lazy_attachment_hint=lambda attachments: "",
-        _make_inline_tool_executor=lambda _session_id: None,
+        _make_inline_tool_executor=lambda _session_id, watchdog=None: None,
     )
     return agent, llm, context_manager, privacy_agent, producer
 

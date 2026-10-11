@@ -36,7 +36,12 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     self_fenced_invocation_http_error,
     validate_request_invocation_id,
 )
-from kestrel_sovereign.api_errors import ApiHTTPException, rate_limited_until
+from kestrel_sovereign.api_errors import (
+    ApiHTTPException,
+    generation_incomplete,
+    rate_limited_until,
+)
+from kestrel_sovereign.llm.output_ceiling import incomplete_generation
 from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
 from kestrel_sovereign.agent.invocation import (
@@ -662,6 +667,13 @@ async def invoke_agent(request: Request, http_response: Response):
                 declined.retry_at.isoformat(timespec="seconds"),
             )
             raise rate_limited_until(declined)
+        # Nor is a model that did not finish (#3552): the route's output cap
+        # or the inactivity bound ended it, and the turn recorded no answer.
+        if incomplete_generation(exc) is not None:
+            logger.error(
+                "Agent invocation failed: the model did not finish its response"
+            )
+            raise generation_incomplete()
         # Invocation failures can wrap caller content, provider errors, or a
         # client-controlled retry id.  Keep the operator event useful without
         # recording any of those values outside the governed request path:

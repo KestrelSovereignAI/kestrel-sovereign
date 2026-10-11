@@ -4026,7 +4026,7 @@ class TestInvocationContextEndToEndThreading:
 
         agent = KestrelAgent.__new__(KestrelAgent)
         agent.llm_service = _StubService()
-        agent._make_inline_tool_executor = lambda sid: None
+        agent._make_inline_tool_executor = lambda sid, watchdog=None: None
         agent._visible_features_by_tool_name = lambda: {}
         agent._visible_known_tool_names = lambda: set()
         agent._known_tool_names = lambda: set()

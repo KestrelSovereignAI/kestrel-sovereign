@@ -28,7 +28,8 @@ from kestrel_sdk.llm import (
 from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
 from .image_utils import process_images
-from .google_adapter import _normalized_google_genai_usage
+from .google_adapter import _finish_reason, _normalized_google_genai_usage
+from .output_ceiling import attach_stop_reason
 
 logger = logging.getLogger(__name__)
 
@@ -396,10 +397,12 @@ class VertexAIAdapter(LLMAdapter):
             # Parse response
             content = None
             parsed_tool_calls = None
+            finish_reason = None
 
             # Check for function calls in candidates
             if response.candidates:
                 candidate = response.candidates[0]
+                finish_reason = _finish_reason(candidate)
                 if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts') and candidate.content.parts:
                     for part in candidate.content.parts:
                         if hasattr(part, 'text') and part.text:
@@ -432,7 +435,7 @@ class VertexAIAdapter(LLMAdapter):
                     cache_read_input_tokens,
                 ) = _normalized_google_genai_usage(response.usage_metadata)
 
-            return LLMResponse(
+            return attach_stop_reason(LLMResponse(
                 content=content,
                 tool_calls=parsed_tool_calls,
                 raw=response,
@@ -440,7 +443,7 @@ class VertexAIAdapter(LLMAdapter):
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            )
+            ), finish_reason)
 
         except Exception as e:
             logger.error(f"Vertex AI API error: {e}")
@@ -503,9 +506,14 @@ class VertexAIAdapter(LLMAdapter):
             )
             text_content = ""
             usage_meta = None
+            finish_reason = None
             async for chunk in stream:
                 if getattr(chunk, "usage_metadata", None):
                     usage_meta = chunk.usage_metadata
+                # The finish reason arrives on the last chunk's candidate.
+                candidates = getattr(chunk, "candidates", None)
+                if candidates:
+                    finish_reason = _finish_reason(candidates[0]) or finish_reason
                 if hasattr(chunk, 'text') and chunk.text:
                     text_content += chunk.text
                     yield chunk.text
@@ -526,14 +534,14 @@ class VertexAIAdapter(LLMAdapter):
                     total_tokens,
                     cache_read_input_tokens,
                 ) = _normalized_google_genai_usage(usage_meta)
-            yield LLMResponse(
+            yield attach_stop_reason(LLMResponse(
                 content=text_content if text_content else None,
                 tool_calls=None,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            )
+            ), finish_reason)
 
         except Exception as e:
             logger.error(f"Vertex AI streaming error: {e}")
