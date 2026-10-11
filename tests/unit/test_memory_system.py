@@ -1423,6 +1423,8 @@ class TestMemoryConsolidatorEpisodeCreation:
         ]
         mock_db.execute = AsyncMock()
         mock_db.fetchval.return_value = 5  # COUNT(*) total_messages_processed
+        # No attestation pass has run: no watermark defers archival (#3544).
+        mock_db.table_exists.return_value = False
 
         consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
         report = await consolidator.run_consolidation()
@@ -1468,6 +1470,8 @@ class TestMemoryConsolidatorEpisodeCreation:
         ]
         mock_db.execute = AsyncMock()
         mock_db.fetchval.return_value = 5  # COUNT(*) total_messages_processed
+        # No attestation pass has run: no watermark defers archival (#3544).
+        mock_db.table_exists.return_value = False
 
         consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
         report = await consolidator.run_consolidation()

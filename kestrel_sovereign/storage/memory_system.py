@@ -26,8 +26,9 @@ Usage:
 import asyncio
 import logging
 import math
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
+from typing import AsyncIterator, Dict, Any, List, Optional
 
 from .memory_models import MemoryMetadata, TemporalPattern, MemoryEpisode
 from .emotional_tagger import EmotionalTagger
@@ -669,6 +670,21 @@ class MemorySystem:
             self.agent_id,
             depth=depth
         )
+
+    @asynccontextmanager
+    async def durable_writes(self) -> AsyncIterator[bool]:
+        """Hold the privacy-transition lock; say whether a durable write may run.
+
+        The same permission and lock the consolidator's durable writes use
+        (#2672, #2856). A writer that checks the mode and then awaits its
+        write does both inside this block, so a transition to EPHEMERAL /
+        ISOLATED cannot land between them. Yields ``False`` in a mode that
+        forbids persistence: the block must then write nothing.
+        """
+        from .privacy_wrapper import optional_transition_lock, persistent_writes_allowed
+
+        async with optional_transition_lock(self._transition_lock):
+            yield persistent_writes_allowed(self._privacy_storage)
 
     async def mark_applied(
         self,

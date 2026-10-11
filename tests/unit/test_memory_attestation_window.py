@@ -13,7 +13,8 @@ import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -21,7 +22,7 @@ import pytest
 from kestrel_sdk.llm.decisions import DecisionResult, DecisionTimeout, NoulAnswer
 from kestrel_sdk.storage.database.interface import QueryError
 
-from kestrel_sovereign.agent.sleep import SleepHookStatus
+from kestrel_sovereign.agent.sleep import SleepHookStatus, SleepMixin
 from kestrel_sovereign.features.memory import reflection_hook as hook_module
 from kestrel_sovereign.features.memory.reflection_hook import (
     ATTESTATION_BOOTSTRAP_LOOKBACK,
@@ -35,12 +36,20 @@ from kestrel_sovereign.features.memory.reflection_hook import (
     render_turn,
     retrieving_turn,
 )
+from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage import AsyncStorage
+from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.conversation_created_at import created_at_bind
+from kestrel_sovereign.storage.memory_attestation_state import ensure_attestation_tables
 from kestrel_sovereign.storage.memory_system import (
     MemoryApplicationNotRecorded,
     MemorySystem,
 )
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PrivacyEnforcingStorage,
+    ReentrantTransitionLock,
+)
+from tests.utils.postgres_schema import disposable_postgres_schema, with_search_path
 
 
 # --- fixtures and doubles ----------------------------------------------------
@@ -63,7 +72,7 @@ async def storage(request, tmp_path):
             yield opened
         finally:
             # A PostgreSQL database outlives the run: remove what this wrote.
-            await ReflectionSleepHook()._ensure_state_tables(opened.db)
+            await ensure_attestation_tables(opened.db)
             for table in (ATTESTATION_STATE_TABLE, ATTESTATION_MARKS_TABLE):
                 await opened.db.execute(
                     f"DELETE FROM {table} WHERE agent_id = ?", (did,)
@@ -208,9 +217,10 @@ async def _watermark(storage):
 
 
 async def _set_watermark(storage, instant):
-    hook = ReflectionSleepHook()
-    await hook._ensure_state_tables(storage.db)
-    await hook._advance_watermark(storage.db, agent_id=storage.test_did, through=instant)
+    await ensure_attestation_tables(storage.db)
+    await ReflectionSleepHook()._advance_watermark(
+        storage.db, agent_id=storage.test_did, through=instant
+    )
 
 
 async def _marks(storage):
@@ -838,6 +848,333 @@ async def test_a_record_racing_a_watermark_advance_does_not_recount(storage):
     assert await racing is False
     assert (await _metadata(storage, row_id))["applied_count"] == 1
     assert await _marks(storage) == []
+
+
+# --- privacy -----------------------------------------------------------------
+
+
+class _SleepingAgent(_Agent, SleepMixin):
+    """The agent's own sleep cycle around the hook, consolidation included."""
+
+    def __init__(self, storage, memory_system, llm_service, hook):
+        super().__init__(storage, memory_system, llm_service)
+        self.sleep_hooks = [hook]
+
+
+async def _governed_memory_system(storage, privacy, lock):
+    """``MemorySystem`` as the agent builds it, governed by ``privacy``."""
+    memory_system = MemorySystem(
+        storage, storage.test_did, privacy_storage=privacy, transition_lock=lock
+    )
+    await memory_system.initialize()
+    return memory_system
+
+
+async def _attestation_rows(storage):
+    """This agent's rows in either attestation table, where it exists."""
+    rows = []
+    for table in (ATTESTATION_STATE_TABLE, ATTESTATION_MARKS_TABLE):
+        if await storage.db.table_exists(table):
+            rows += await storage.db.fetchall(
+                f"SELECT * FROM {table} WHERE agent_id = ?", (storage.test_did,)
+            )
+    return rows
+
+
+@pytest.mark.parametrize("backend", ["chat", "decision"])
+async def test_a_sleep_in_a_no_storage_mode_writes_nothing(storage, backend):
+    """EPHEMERAL: no watermark, mark or application, and the purge is clean.
+
+    The pass used to create its tables and store this agent's watermark
+    before anything read the mode. ``purge_ephemeral_session`` does not sweep
+    those tables, so it reported a clean purge with the row still there.
+    """
+    now = datetime.now(timezone.utc)
+    memory = "a memory retrieved before the agent went off the record"
+    row_id = await _memory(storage, memory, retrieved_at=now - timedelta(hours=3))
+    private = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+    memory_system = await _governed_memory_system(
+        storage, private, ReentrantTransitionLock()
+    )
+    judge = _JUDGES[backend](applied={memory})
+    agent = _SleepingAgent(
+        storage, memory_system, judge, ReflectionSleepHook(backend=backend)
+    )
+    agent.storage = private
+
+    report = await agent.sleep(skip_export=True)
+
+    (pre,) = report.pre_reflection
+    assert pre["skipped"] is True
+    assert pre["reason"] == "privacy_mode_forbids_persistence"
+    assert judge.sessions == {}
+    assert await _attestation_rows(storage) == []
+    if storage.db.backend_type == "sqlite":
+        # This test's own database: not even the tables were created.
+        assert not await storage.db.table_exists(ATTESTATION_STATE_TABLE)
+    assert "applied_count" not in await _metadata(storage, row_id)
+
+    purge = await private.purge_ephemeral_session(reason="test")
+    assert purge.leaked_rows == 0
+    assert not purge.any_sweep_failed
+    assert await _attestation_rows(storage) == []
+
+
+async def test_a_memory_that_cannot_say_whether_it_may_write_is_not_attested():
+    """Without ``durable_writes`` the pass cannot know the mode allows it."""
+    memory = SimpleNamespace(mark_applied=AsyncMock())
+    agent = SimpleNamespace(memory_system=memory, did="did:test:no-write-scope")
+    hook = ReflectionSleepHook()
+    result = await hook.on_pre_sleep(agent)
+    assert result["skipped"] is True
+    assert result["reason"] == "memory_system_unavailable"
+    memory.mark_applied.assert_not_awaited()
+
+
+@pytest.mark.parametrize("applied", [True, False])
+@pytest.mark.parametrize("backend", ["chat", "decision"])
+async def test_a_transition_during_the_pass_stops_its_writes(storage, backend, applied):
+    """Each write reads the mode under the transition lock.
+
+    The transition holds the lock while it changes the mode. The pass's next
+    write (the application, or with nothing applied the watermark) waits for
+    it, then finds the mode forbids persistence and writes nothing. Read
+    before taking the lock, the mode would still say NORMAL.
+    """
+    now = datetime.now(timezone.utc)
+    previous_pass = now - timedelta(hours=24)
+    await _set_watermark(storage, previous_pass)
+    memory = "a memory judged while the mode changes"
+    row_id = await _memory(storage, memory, retrieved_at=now - timedelta(hours=3))
+    private = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+    lock = ReentrantTransitionLock()
+    memory_system = await _governed_memory_system(storage, private, lock)
+
+    transition_holds_the_lock = asyncio.Event()
+
+    async def transition():
+        async with lock:
+            transition_holds_the_lock.set()
+            # Time for a write that did not wait for the lock to land first.
+            await asyncio.sleep(0.5)
+            private.set_privacy_mode(PrivacyMode.EPHEMERAL)
+
+    transitions = []
+
+    async def while_judging(_memory):
+        transitions.append(asyncio.create_task(transition()))
+        await transition_holds_the_lock.wait()
+
+    hook = ReflectionSleepHook(backend=backend)
+    judge = _JUDGES[backend](
+        applied={memory} if applied else (), on_judged=while_judging
+    )
+    agent = _Agent(storage, memory_system, judge)
+    agent.storage = private
+    result = await hook.on_pre_sleep(agent)
+    await asyncio.gather(*transitions)
+
+    assert set(judge.sessions) == {memory}
+    assert result["skipped"] is True
+    assert result["reason"] == "privacy_mode_forbids_persistence"
+    assert hook._pre_sleep_status.get() is SleepHookStatus.SKIPPED
+    assert "applied_count" not in await _metadata(storage, row_id)
+    assert await _marks(storage) == []
+    assert await _watermark(storage) == previous_pass
+
+
+# --- archival ----------------------------------------------------------------
+
+
+async def _decayed_memory(storage, content, *, retrieved_at):
+    """240 days old, importance 0.5, retrieved once: decayed below the
+    archive threshold unless an attestation applies it."""
+    row_id = await _add(
+        storage, "assistant", content,
+        at=datetime.now(timezone.utc) - timedelta(days=240),
+    )
+    await storage.conversation.update_message_metadata(
+        row_id,
+        {
+            "importance": 0.5,
+            "access_count": 1,
+            "last_accessed": retrieved_at.isoformat(),
+        },
+    )
+    return row_id
+
+
+async def _archived(storage, row_id):
+    row = await storage.db.fetchone(
+        "SELECT archived_at FROM conversation_history WHERE id = ?", (row_id,)
+    )
+    return row[0] is not None
+
+
+async def _require_archival(storage, control):
+    """``control``, decayed and judged long ago, was archived by the sleep.
+
+    On PostgreSQL nothing is: ``created_at`` is ``timestamp without time
+    zone``, so ``calculate_decay`` subtracts a naive value from an aware now
+    and the ``TypeError`` it catches makes every row's strength 0.5. That is
+    so before and after #3544, and until it is fixed a PostgreSQL case cannot
+    show what archival leaves alone.
+    """
+    if await _archived(storage, control):
+        return
+    if storage.db.backend_type == "postgres":
+        pytest.xfail(
+            "decay archival archives nothing on PostgreSQL: calculate_decay "
+            "gets a naive created_at (pre-existing; reported on #3544)"
+        )
+    pytest.fail("the decayed control memory was not archived")
+
+
+@pytest.mark.parametrize("applied_next_sleep", [True, False])
+@pytest.mark.parametrize("backend", ["chat", "decision"])
+async def test_a_retrieval_left_to_the_next_pass_is_not_archived_before_it(
+    storage, backend, applied_next_sleep, monkeypatch
+):
+    """Codex's case: retrieved inside the settle margin, then archived.
+
+    The pass left the retrieval to the next one, and the same sleep's
+    consolidation archived it. The next pass's application raised its
+    ``applied_count`` but never cleared ``archived_at``.
+    """
+    now = datetime.now(timezone.utc)
+    await _set_watermark(storage, now - timedelta(hours=24))
+    deferred_memory = "retrieved a minute before sleep"
+    deferred = await _decayed_memory(
+        storage, deferred_memory, retrieved_at=now - timedelta(minutes=1)
+    )
+    # Retrieved before the watermark: judged by an earlier pass, so archival
+    # runs over it as before.
+    judged = await _decayed_memory(
+        storage, "retrieved before the last sleep", retrieved_at=now - timedelta(days=3)
+    )
+    memory_system = await _memory_system(storage)
+    hook = ReflectionSleepHook(backend=backend)
+
+    judge = _JUDGES[backend](applied={deferred_memory})
+    report = await _SleepingAgent(storage, memory_system, judge, hook).sleep(
+        skip_export=True
+    )
+    assert judge.sessions == {}
+    assert not await _archived(storage, deferred)
+    await _require_archival(storage, judged)
+    assert report.messages_archived == 1
+
+    # The next sleep judges it. Applied, it is kept; otherwise it decays.
+    _clock_ahead(monkeypatch, timedelta(days=1))
+    judge = _JUDGES[backend](applied={deferred_memory} if applied_next_sleep else ())
+    await _SleepingAgent(storage, memory_system, judge, hook).sleep(skip_export=True)
+    assert set(judge.sessions) == {deferred_memory}
+    assert await _archived(storage, deferred) is not applied_next_sleep
+
+
+@pytest.mark.parametrize("backend", ["chat", "decision"])
+async def test_a_retrieval_whose_pass_failed_is_not_archived_before_it_is_judged(
+    storage, backend
+):
+    now = datetime.now(timezone.utc)
+    await _set_watermark(storage, now - timedelta(hours=24))
+    memory = "a memory whose judgment failed"
+    row_id = await _decayed_memory(
+        storage, memory, retrieved_at=now - timedelta(hours=5)
+    )
+    judged = await _decayed_memory(
+        storage, "retrieved before the last sleep", retrieved_at=now - timedelta(days=3)
+    )
+    memory_system = await _memory_system(storage)
+    hook = ReflectionSleepHook(backend=backend)
+
+    failing = _JUDGES[backend](fail_on={memory})
+    await _SleepingAgent(storage, memory_system, failing, hook).sleep(skip_export=True)
+    assert not await _archived(storage, row_id)
+    await _require_archival(storage, judged)
+
+    retry = _JUDGES[backend](applied={memory})
+    await _SleepingAgent(storage, memory_system, retry, hook).sleep(skip_export=True)
+    assert (await _metadata(storage, row_id))["applied_count"] == 1
+    assert not await _archived(storage, row_id)
+
+
+async def test_consolidation_leaves_a_retrieval_at_the_watermark(storage):
+    """A retrieval at the watermark itself is in the next pass's window."""
+    watermark = datetime.now(timezone.utc) - timedelta(hours=2)
+    await _set_watermark(storage, watermark)
+    at_watermark = await _decayed_memory(
+        storage, "retrieved at the watermark", retrieved_at=watermark
+    )
+    judged = await _decayed_memory(
+        storage, "retrieved just before it",
+        retrieved_at=watermark - timedelta(microseconds=1),
+    )
+    memory_system = await _memory_system(storage)
+    await memory_system.consolidate()
+    assert not await _archived(storage, at_watermark)
+    await _require_archival(storage, judged)
+
+
+# --- the tables --------------------------------------------------------------
+
+
+async def _no_schema(_db):
+    return None
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+async def fresh_databases(request, tmp_path):
+    """Eight connections to one database the attestation tables are not in."""
+    if request.param == "postgres":
+        url = os.environ.get("TEST_POSTGRES_URL")
+        if not url:
+            pytest.skip("TEST_POSTGRES_URL is not set")
+        admin = await AsyncDatabase.postgres(url, schema_initializer=_no_schema)
+        try:
+            async with disposable_postgres_schema(admin, "attestation_tables") as schema:
+                handles = [
+                    await AsyncDatabase.postgres(
+                        with_search_path(url, schema), schema_initializer=_no_schema
+                    )
+                    for _ in range(8)
+                ]
+                try:
+                    yield handles
+                finally:
+                    for handle in handles:
+                        await handle.close()
+        finally:
+            await admin.close()
+    else:
+        path = str(tmp_path / "fresh.db")
+        handles = [
+            await AsyncDatabase.sqlite(path, schema_initializer=_no_schema)
+            for _ in range(8)
+        ]
+        try:
+            yield handles
+        finally:
+            for handle in handles:
+                await handle.close()
+
+
+async def test_first_passes_on_many_connections_create_the_tables_once(
+    fresh_databases,
+):
+    """Concurrent first passes create the tables without colliding.
+
+    Two PostgreSQL sessions that both ran the bare ``CREATE TABLE IF NOT
+    EXISTS`` could both find the table missing, and one then failed on the
+    catalogue's unique index.
+    """
+    outcomes = await asyncio.gather(
+        *(ensure_attestation_tables(db) for db in fresh_databases),
+        return_exceptions=True,
+    )
+    assert outcomes == [None] * len(fresh_databases)
+    for table in (ATTESTATION_STATE_TABLE, ATTESTATION_MARKS_TABLE):
+        assert await fresh_databases[0].table_exists(table)
 
 
 async def test_a_memory_whose_turn_was_never_written_is_judged_without_one(storage):

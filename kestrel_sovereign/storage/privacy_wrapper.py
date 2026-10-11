@@ -593,6 +593,25 @@ async def optional_transition_lock(lock):
             yield
 
 
+def persistent_writes_allowed(policy) -> bool:
+    """Whether ``policy`` permits durable, user-derived writes now (#2672).
+
+    ``policy`` exposes ``allows_persistent_writes()``: the agent's
+    :class:`PrivacyEnforcingStorage`. ``None`` (raw storage, offline CLI,
+    tests) imposes no gate, preserving prior behaviour. A probe that raises
+    denies: a mode that cannot be read does not permit a write. A writer that
+    awaits between this check and its write holds the transition lock across
+    both (:func:`optional_transition_lock`).
+    """
+    if policy is None:
+        return True
+    try:
+        return bool(policy.allows_persistent_writes())
+    except Exception as e:  # noqa: BLE001 - a failed probe denies the write
+        logger.debug("persist-policy probe failed, denying: %s", type(e).__name__)
+        return False
+
+
 def _resolve_transition_lock(holder):
     """Best-effort resolve an agent's privacy-transition lock, or ``None``.
 

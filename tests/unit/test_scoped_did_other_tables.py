@@ -21,6 +21,7 @@ not the site's own refusal.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -115,8 +116,15 @@ async def test_notice_retention_sweep_refuses_without_a_did(monkeypatch, caplog)
 
 # --- features/memory/reflection_hook.py --------------------------------------
 
+@asynccontextmanager
+async def _writes_allowed():
+    yield True
+
+
 def _hook_agent(**identity):
-    memory = SimpleNamespace(mark_applied=lambda *a, **k: None)
+    memory = SimpleNamespace(
+        mark_applied=lambda *a, **k: None, durable_writes=_writes_allowed
+    )
     return SimpleNamespace(memory=memory, memory_system=memory, **identity)
 
 

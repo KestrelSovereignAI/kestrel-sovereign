@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -140,6 +141,10 @@ class _ReflectionMemory:
 
     async def mark_applied(self, message_id, *, reason):
         self.marked_ids.append((message_id, reason))
+
+    @asynccontextmanager
+    async def durable_writes(self):
+        yield True
 
 
 @pytest.fixture
