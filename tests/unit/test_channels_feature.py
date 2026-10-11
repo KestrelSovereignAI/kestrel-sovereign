@@ -716,7 +716,10 @@ class TestChannelFeature:
         )))
 
         handle.wait.assert_awaited_once()
-        handle.wait_for_durable_admission.assert_not_awaited()
+        # A verified terminal-only retry can have no cognition row. Admission
+        # is now read AFTER terminal completion; it cannot ACK the initial
+        # marker-only handoff before the real terminal result/delivery below.
+        handle.wait_for_durable_admission.assert_awaited_once()
         agent.dispatcher.get_durable_delivery_for_event.assert_awaited_once()
         assert agent.dispatcher.get_durable_delivery_for_event.await_args.kwargs == {
             "consumer_id": "core.channel-cognition-v1",
@@ -1335,6 +1338,12 @@ class TestChannelFeature:
         agent.dispatcher = MagicMock()
         agent.dispatcher.register_durable_consumer = AsyncMock()
         handle = MagicMock()
+        handle.wait_for_durable_admission = AsyncMock(
+            return_value=DurableAdmissionResult(
+                disposition=DurableAdmissionDisposition.HELD,
+                signal_id="held-signal",
+            )
+        )
         handle.wait = AsyncMock(
             return_value=SimpleNamespace(
                 status=Status.COALESCED,
