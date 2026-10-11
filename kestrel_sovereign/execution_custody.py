@@ -9,20 +9,23 @@ has been reset. Causation and telemetry are not consulted for authority.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+import stat
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-import asyncio
-import inspect
-import sys
-import stat
-from typing import Any, Protocol, TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+
+from httpx import AsyncClient as _NativeHTTPXAsyncClient
+from httpx import Response as _NativeHTTPXResponse
+from kestrel_sdk.storage.database import TransactionError
 
 from kestrel_sovereign.turn_scope import capture_turn_scope, turn_scoped
-from kestrel_sdk.storage.database import TransactionError
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.db.postgres import AdvisoryLease
@@ -475,11 +478,10 @@ def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None
     cancelled first close therefore cannot safely be repaired by calling the
     original close again. Retain its task before iteration can start it.
     """
-    import httpx
     from kestrel_sovereign._async_ownership import await_owned_task
 
-    response = stream if isinstance(stream, httpx.Response) else getattr(stream, "response", None)
-    if not isinstance(response, httpx.Response):
+    response = stream if isinstance(stream, _NativeHTTPXResponse) else getattr(stream, "response", None)
+    if not isinstance(response, _NativeHTTPXResponse):
         return
     if "kestrel.native_close_owner" in response.extensions:
         return
@@ -509,8 +511,7 @@ def retain_native_execution_http_client_close(client: Any) -> None:
     client. The hook only installs the same per-response physical close owner
     used by exposed SDK streams; it grants no execution or retry authority.
     """
-    import httpx
-    if not isinstance(client, httpx.AsyncClient):
+    if not isinstance(client, _NativeHTTPXAsyncClient):
         return
     if getattr(client, "_kestrel_native_close_hook", None) is not None:
         return
@@ -518,7 +519,9 @@ def retain_native_execution_http_client_close(client: Any) -> None:
     async def retain_response(response):
         retain_native_execution_stream_close(response)
 
-    client.event_hooks["response"].append(retain_response)
+    # A caller's existing observer may itself read/close the response, or
+    # cancellation may land while it awaits. Own the body before ANY observer.
+    client.event_hooks["response"].insert(0, retain_response)
     client._kestrel_native_close_hook = retain_response
 
 
@@ -562,6 +565,7 @@ async def await_execution_work_group(
     callables avoid creating undispatched coroutine objects after denial.
     """
     import asyncio
+
     from kestrel_sovereign._async_ownership import await_owned_task
 
     tasks = []
@@ -732,6 +736,7 @@ async def close_execution_stream(
 ) -> None:
     """Join an owned source's close despite repeated caller cancellation."""
     import asyncio
+
     from kestrel_sovereign._async_ownership import await_owned_task
 
     close = getattr(stream, "aclose", None)

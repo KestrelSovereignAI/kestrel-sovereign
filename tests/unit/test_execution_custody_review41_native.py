@@ -30,7 +30,7 @@ from tests.unit.test_signals_dispatcher import (
 @pytest.mark.parametrize("operation", ["chat", "embed"])
 @pytest.mark.parametrize("status", [200, 503])
 @pytest.mark.parametrize("kind", [None, "unknown", "cancel_unknown", "group"])
-async def test_nonstream_sdk_implicit_body_close_is_physically_joined(provider, operation, status, kind):
+async def test_nonstream_sdk_implicit_body_close_is_physically_joined(provider, operation, status, kind, preexisting_observer=False):
     original = receipt(kind) if kind is not None else None
     class ReceiptBody(EndingBody):
         raised = False
@@ -58,6 +58,10 @@ async def test_nonstream_sdk_implicit_body_close_is_physically_joined(provider, 
         requests.append(request)
         return httpx.Response(status, headers={"content-type": "application/json"}, stream=body)
     http = httpx.AsyncClient(base_url="http://127.0.0.1:11434", transport=httpx.MockTransport(respond))
+    if preexisting_observer:
+        async def observe(response):
+            await response.aread()
+        http.event_hooks["response"].append(observe)
     original_http = None
     if provider == "ollama":
         import ollama
@@ -106,6 +110,14 @@ async def test_nonstream_sdk_implicit_body_close_is_physically_joined(provider, 
         await http.aclose()
         if original_http is not None:
             await original_http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "openrouter", "ollama"])
+async def test_response_close_is_owned_before_preexisting_body_observer(provider):
+    await test_nonstream_sdk_implicit_body_close_is_physically_joined(
+        provider, "chat", 200, None, preexisting_observer=True,
+    )
 
 
 @pytest.mark.asyncio

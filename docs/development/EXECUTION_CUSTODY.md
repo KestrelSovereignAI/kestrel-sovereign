@@ -550,6 +550,9 @@ implicit SDK/HTTPX EOF close and explicit adapter teardown join the same
 physical resource retirement. SDK generators that hide their response (Ollama)
 install that same owner at HTTPX's pre-body response hook, capturing each
 request's own custody rather than the first caller's scope on a shared client.
+The custody hook runs before existing response observers, since an observer
+may itself consume/close the body before SDK parsing begins. Native HTTPX
+types are retained independently of catalog test doubles and client factories.
 Non-streaming chat, embeddings, model discovery, files, batch operations and
 raw SDK calls install that same response hook before dispatch. HTTPX's
 internal read/close therefore cannot retire the response without joining its
