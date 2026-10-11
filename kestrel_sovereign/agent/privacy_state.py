@@ -38,7 +38,9 @@ records the mode it resolved, keeping whatever saved mandate can still be
 recovered from the old record, so a later boot that can read the record does
 not return to a less restrictive mode than this one ran in. The one exception
 is a record boot cannot read even once more: nothing is written over it,
-because it may hold the saved mandate, until a transition can read it.
+because it may hold the saved mandate, until a transition can read it. A
+transition that cannot read the record is refused and writes nothing: an
+unreadable record never stands for one with no saved mandate.
 
 The record is control-plane state, not user content: it is written in every
 privacy mode, including the volatile ones.
@@ -251,7 +253,8 @@ class RestoredPrivacyState:
     ``rewrite`` is True when the record does not name the restored state and
     may be replaced: it does not validate, or it was left mid-transition. Boot
     records the restored state before any turn runs. ``record_read`` is False
-    when the record could not be read at all: nothing is written over it.
+    only at boot, when the record could not be read at all: nothing is written
+    over it. A transition that cannot read the record is refused instead.
     """
 
     mode: PrivacyMode
@@ -285,29 +288,11 @@ def _saved_preference_in(rows: list) -> Optional[SavedModelPreference]:
 async def _fail_closed(db: Any, agent_id: str) -> RestoredPrivacyState:
     """Fail closed, keeping whatever saved mandate the record still holds.
 
-    Reads the record again: a read that failed may succeed now. If it does
-    not, nothing is known about the record, so it is left as it is rather
-    than overwritten: it may hold the saved mandate a local-only mode
-    displaced, and a later boot that can read it restores both.
+    Reads the record again: a read that failed may succeed now. A database
+    error on that read propagates, because nothing is then known about the
+    record: it may hold the saved mandate a local-only mode displaced.
     """
-    try:
-        rows = await _fetch_record_rows(db, agent_id)
-    except Exception as exc:  # noqa: BLE001 - recovery is best-effort
-        logger.error(
-            "Could not re-read the privacy record for %s (%s: %s); leaving it "
-            "as it is, so this boot's fail-closed mode is not recorded",
-            agent_id,
-            type(exc).__name__,
-            exc,
-        )
-        return RestoredPrivacyState(
-            mode=FAIL_CLOSED_PRIVACY_MODE,
-            saved_preference=None,
-            recorded=True,
-            failed_closed=True,
-            record_read=False,
-        )
-    saved = _saved_preference_in(rows)
+    saved = _saved_preference_in(await _fetch_record_rows(db, agent_id))
     if saved is not None:
         logger.warning(
             "Keeping the saved model mandate %s recovered from the privacy "
@@ -332,7 +317,9 @@ async def resolve_recorded_privacy_state(
     No record: ``initial_mode``. A pending record: the more restrictive of its
     two modes. A record that does not validate: the most restrictive mode,
     holding any saved mandate the record still yields. A database error
-    propagates: the caller decides what an unreadable store means.
+    propagates, including one on the second read of a record that does not
+    validate: the caller decides what a record it cannot read means. A
+    transition refuses; boot fails closed (:func:`restore_privacy_state`).
     """
     try:
         state = await load_privacy_state(db, agent_id)
@@ -371,7 +358,10 @@ async def restore_privacy_state(
     """Resolve the privacy mode an agent boots in.
 
     :func:`resolve_recorded_privacy_state`, except that a read that fails also
-    fails closed: to the most restrictive mode, never ``initial_mode``.
+    fails closed: to the most restrictive mode, never ``initial_mode``. If the
+    record cannot be read even once more, nothing is known about it, so it is
+    left as it is rather than overwritten (``record_read`` False): a later boot
+    that can read it restores both the mode and the saved mandate it holds.
     """
     try:
         return await resolve_recorded_privacy_state(
@@ -386,7 +376,23 @@ async def restore_privacy_state(
             exc,
             FAIL_CLOSED_PRIVACY_MODE.value,
         )
+    try:
         return await _fail_closed(db, agent_id)
+    except Exception as exc:  # noqa: BLE001 - recovery is best-effort
+        logger.error(
+            "Could not re-read the privacy record for %s (%s: %s); leaving it "
+            "as it is, so this boot's fail-closed mode is not recorded",
+            agent_id,
+            type(exc).__name__,
+            exc,
+        )
+    return RestoredPrivacyState(
+        mode=FAIL_CLOSED_PRIVACY_MODE,
+        saved_preference=None,
+        recorded=True,
+        failed_closed=True,
+        record_read=False,
+    )
 
 
 def transition_origin(

@@ -4794,8 +4794,14 @@ class KestrelAgent(
         What a transition records starts from the more restrictive of the
         live state and the state the record would restore, which differ only
         after a write failed (see ``kestrel_sovereign.agent.privacy_state``).
-        Its model side is planned from the live mode, whose mandate is the
-        one in force.
+        A record it cannot read refuses it: an unreadable record never stands
+        for one with no saved mandate. Its model side is planned from the live
+        mode, whose mandate is the one in force.
+
+        Planning, persisting and installing the mandate is one
+        :meth:`LLMService.mandate_change`, so a model selection
+        (``/api/model/set``) neither lands between the transition's writes nor
+        has its own write overtaken by them.
         """
         # Record agent consent before applying the change
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
@@ -4851,66 +4857,74 @@ class KestrelAgent(
         previous_mode = self._privacy_mode
         previous_config = privacy_mode_to_config(previous_mode)
         config = privacy_mode_to_config(mode)
-        recorded = await self._recorded_privacy_state()
-        if recorded is None:
-            return PrivacyTransitionResult(
-                message=PRIVACY_STATE_UNRECORDED_MESSAGE,
-                allows_cloud_llm=previous_config.allows_cloud_llm(),
-                applied=False,
-                persistence_failed=True,
+        # One mandate change, from planning through persistence to install: a
+        # model selection waits for it, and it waits for one in progress, so
+        # neither lands between the other's writes.
+        async with self._model_mandate_change():
+            recorded = await self._recorded_privacy_state()
+            if recorded is None:
+                return PrivacyTransitionResult(
+                    message=PRIVACY_STATE_UNRECORDED_MESSAGE,
+                    allows_cloud_llm=previous_config.allows_cloud_llm(),
+                    applied=False,
+                    persistence_failed=True,
+                )
+            origin = transition_origin(
+                previous_mode,
+                getattr(self, "_privacy_saved_preference", None),
+                recorded,
             )
-        origin = transition_origin(
-            previous_mode, getattr(self, "_privacy_saved_preference", None), recorded
-        )
-        plan = self._plan_privacy_model_state(
-            config, previous_config, origin.saved_preference
-        )
-        # Persist before mutating: nothing below changes until the transition
-        # and the mandate it implies are both recorded.
-        pending = PrivacyState(
-            mode=mode,
-            saved_preference=(
-                plan.saved if plan.saved is not None else origin.saved_preference
-            ),
-            transition_from=origin.mode,
-        )
-        refusal = await self._persist_privacy_transition(mode, origin, pending, plan)
-        if refusal is not None:
-            return PrivacyTransitionResult(
-                message=refusal,
-                allows_cloud_llm=previous_config.allows_cloud_llm(),
-                applied=False,
-                persistence_failed=True,
+            plan = self._plan_privacy_model_state(
+                config, previous_config, origin.saved_preference
             )
+            # Persist before mutating: nothing below changes until the
+            # transition and the mandate it implies are both recorded.
+            pending = PrivacyState(
+                mode=mode,
+                saved_preference=(
+                    plan.saved if plan.saved is not None else origin.saved_preference
+                ),
+                transition_from=origin.mode,
+            )
+            refusal = await self._persist_privacy_transition(
+                mode, origin, pending, plan
+            )
+            if refusal is not None:
+                return PrivacyTransitionResult(
+                    message=refusal,
+                    allows_cloud_llm=previous_config.allows_cloud_llm(),
+                    applied=False,
+                    persistence_failed=True,
+                )
 
-        # The storage wrapper owns the linearization guard against durable
-        # explicit-fact operations.  Ask it first: if a fact operation is in
-        # flight, the transition is refused without leaving the agent and its
-        # privacy policy in a split state.
-        try:
-            self.storage.set_privacy_mode(mode)
-        except PrivacyViolationError:
-            # Nothing flipped, but the transition is already recorded: put
-            # back the state it started from.
-            note = await self._roll_back_privacy_record(
-                origin,
-                pending,
-                left=PrivacyState(mode=mode, saved_preference=plan.saved),
-            )
-            return PrivacyTransitionResult(
-                message=PRIVACY_TRANSITION_RETRY_MESSAGE + note,
-                allows_cloud_llm=previous_config.allows_cloud_llm(),
-                applied=False,
-                retryable_conflict=True,
-                persistence_failed=bool(note),
-            )
-        self._privacy_mode = mode
-        self._privacy_saved_preference = plan.saved
-        # Under the persistence gate held exclusive: a later durable signal
-        # receipt names this installation, not the one it replaced (#3484).
-        self._privacy_policy_epoch = getattr(self, "_privacy_policy_epoch", 0) + 1
-        status_message = self.privacy_agent.set_mode(mode)
-        self._install_privacy_mandate(plan)
+            # The storage wrapper owns the linearization guard against durable
+            # explicit-fact operations.  Ask it first: if a fact operation is
+            # in flight, the transition is refused without leaving the agent
+            # and its privacy policy in a split state.
+            try:
+                self.storage.set_privacy_mode(mode)
+            except PrivacyViolationError:
+                # Nothing flipped, but the transition is already recorded: put
+                # back the state it started from.
+                note = await self._roll_back_privacy_record(
+                    origin,
+                    pending,
+                    left=PrivacyState(mode=mode, saved_preference=plan.saved),
+                )
+                return PrivacyTransitionResult(
+                    message=PRIVACY_TRANSITION_RETRY_MESSAGE + note,
+                    allows_cloud_llm=previous_config.allows_cloud_llm(),
+                    applied=False,
+                    retryable_conflict=True,
+                    persistence_failed=bool(note),
+                )
+            self._privacy_mode = mode
+            self._privacy_saved_preference = plan.saved
+            # Under the persistence gate held exclusive: a later durable signal
+            # receipt names this installation, not the one it replaced (#3484).
+            self._privacy_policy_epoch = getattr(self, "_privacy_policy_epoch", 0) + 1
+            status_message = self.privacy_agent.set_mode(mode)
+            self._install_privacy_mandate(plan)
         if plan.warning:
             status_message = f"{status_message} {plan.warning}"
 
@@ -5097,15 +5111,20 @@ class KestrelAgent(
             preference["model"], preference["vendor"], preference["route"], validate=False
         )
 
+    def _model_mandate_change(self):
+        """The LLM service's ``mandate_change``, held by a privacy transition.
+
+        See :meth:`LLMService.mandate_change`. Without an LLM service there is
+        no mandate to change, and nothing to hold.
+        """
+        llm = getattr(self, "llm_service", None)
+        if not llm:
+            return contextlib.nullcontext()
+        return llm.mandate_change()
+
     def _privacy_record_db(self):
         """The database the privacy record lives in; None in a harness without one."""
         return getattr(getattr(self, "_raw_storage", None), "db", None)
-
-    async def _drain_model_preference_persistence(self) -> None:
-        """Wait until every scheduled model-preference write has finished."""
-        drain = getattr(getattr(self, "llm_service", None), "drain_preference_persistence", None)
-        if inspect.iscoroutinefunction(drain):
-            await drain()
 
     async def _write_privacy_mandate(
         self, preference: Optional[Mapping[str, Optional[str]]]
@@ -5114,12 +5133,13 @@ class KestrelAgent(
 
         The ``LLMService`` persistence callback logs a failed write and
         returns, so the mandate a privacy record implies is written here
-        instead, where a failure is seen (#3554). Writes ``LLMService`` already
-        scheduled are waited out first, so none of them lands after this one.
+        instead, where a failure is seen (#3554). No write ``LLMService``
+        scheduled earlier lands after this one: a transition writes inside the
+        mandate change, which waits for them before it begins, and boot writes
+        before the persistence callback is wired.
         """
         if preference is None or self._privacy_record_db() is None:
             return True
-        await self._drain_model_preference_persistence()
         try:
             await self._write_model_preference(
                 preference["model"], preference["vendor"], preference["route"]

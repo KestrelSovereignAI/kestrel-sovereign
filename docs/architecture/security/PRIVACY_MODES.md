@@ -472,7 +472,13 @@ cloud routes by a restart.
   restrictive of the live mode and the recorded one, so retrying a refused
   exit cannot overwrite the saved mandate. A record that cannot be read
   restarts the agent in EPHEMERAL, never NORMAL; boot then records EPHEMERAL,
-  keeping any saved mandate the old record still yields.
+  keeping any saved mandate the old record still yields. A transition that
+  cannot read the record is refused and writes nothing: an unreadable record
+  never stands for one with no saved mandate.
+- **Serialized with model selection**: a model selection (`/api/model/set`,
+  `!model-set`) and a privacy transition never interleave. Each waits until
+  the other has recorded the mandate, so the mandate in force is the one a
+  restart restores.
 
 The record and its resolution live in `kestrel_sovereign.agent.privacy_state`.
 

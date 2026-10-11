@@ -2312,7 +2312,14 @@ async def set_current_model(request: Request):
                 vendor = left
 
         try:
-            agent.llm_service.set_model_preference(model_name, vendor, route)
+            # One mandate change: it waits for a privacy-mode transition
+            # recording the mandate its mode implies, and that transition
+            # waits for this selection to be persisted (#3554).
+            async with agent.llm_service.mandate_change():
+                agent.llm_service.set_model_preference(model_name, vendor, route)
+                # Re-read the selection so the response reflects any vendor
+                # auto-resolution that happened inside set_model_preference.
+                pref = agent.llm_service.get_model_preference()
         except ValueError as ve:
             # set_model_preference raises ValueError for bare models that
             # can't be auto-resolved (unknown or ambiguous). Surface the
@@ -2320,10 +2327,6 @@ async def set_current_model(request: Request):
             # tool — sees *why* and can try again with a vendor-qualified
             # form instead of silently failing.
             raise HTTPException(status_code=400, detail=str(ve))
-
-        # Re-read the persisted selection so the response reflects any
-        # vendor auto-resolution that happened inside set_model_preference.
-        pref = agent.llm_service.get_model_preference()
         final_vendor = pref.get("vendor")
         final_route = pref.get("route")
         final_model = pref.get("model") or model_name

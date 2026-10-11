@@ -97,6 +97,10 @@ class _FakeLLMService:
         self.calls.append(None)
         self._pref = {"vendor": None, "model": None, "route": None}
 
+    @asynccontextmanager
+    async def mandate_change(self):
+        yield
+
     def get_active_model_id(self):
         if self._pref.get("model"):
             return self._pref["model"]

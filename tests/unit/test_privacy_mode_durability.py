@@ -12,6 +12,8 @@ Ollama route, the pair in the issue's repro.
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -413,6 +415,10 @@ class _RecordingLLM:
     def clear_model_preference(self):
         self.calls.append(None)
         self._pref = dict(UNPINNED)
+
+    @asynccontextmanager
+    async def mandate_change(self):
+        yield
 
 
 def _bare_agent(*, mode=PrivacyMode.NORMAL, preference=CLOUD, db=None):
@@ -827,17 +833,20 @@ async def test_mandate_is_persisted_before_the_transition_is_recorded_as_applied
 
     agent = _bare_agent(db=_OrderedRows())
 
-    async def drain_preference_persistence():
+    @asynccontextmanager
+    async def mandate_change():
+        # The real change begins once earlier scheduled writes have landed.
         events.append("scheduled writes finished")
+        yield
 
-    agent.llm_service.drain_preference_persistence = drain_preference_persistence
+    agent.llm_service.mandate_change = mandate_change
 
     await agent.set_privacy_mode_with_effects(PrivacyMode.ISOLATED)
     await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
 
     assert events == [
-        "pending",
         "scheduled writes finished",
+        "pending",
         "mandate written",
         "applied",
     ] * 2
@@ -1625,3 +1634,484 @@ async def test_transition_is_refused_when_the_record_cannot_be_read():
     assert db.writes == []
     _assert_consistent(agent, PrivacyMode.NORMAL)
     assert agent.llm_service.calls == []
+
+
+# --- An unreadable record never means "no saved mandate" (#3554 merge review)
+
+
+class _RereadFails(_StoredRows):
+    """The first read returns the stored rows; every later one fails."""
+
+    def __init__(self, rows):
+        super().__init__(rows=rows)
+        self.reads = 0
+
+    async def fetchall(self, _sql, _params):
+        import sqlite3
+
+        self.reads += 1
+        if self.reads > 1:
+            raise sqlite3.OperationalError("database is locked")
+        return self.rows
+
+
+_MALFORMED_RECORD_HOLDING_CLOUD = json.dumps(
+    {
+        "version": 1,
+        "mode": "secret",
+        "transition_from": None,
+        "saved_preference": CLOUD,
+    }
+)
+
+
+@pytest.mark.asyncio
+async def test_resolving_a_malformed_record_that_cannot_be_reread_raises():
+    """A transition resolves the record with this; it decides what an
+    unreadable record means, so the failed second read reaches it."""
+    import sqlite3
+
+    from kestrel_sovereign.agent.privacy_state import resolve_recorded_privacy_state
+
+    db = _RereadFails([(_MALFORMED_RECORD_HOLDING_CLOUD,)])
+    with pytest.raises(sqlite3.OperationalError):
+        await resolve_recorded_privacy_state(
+            db, "did:example:a", initial_mode=PrivacyMode.NORMAL
+        )
+
+
+@pytest.mark.asyncio
+async def test_boot_fails_closed_on_a_malformed_record_that_cannot_be_reread():
+    restored = await restore_privacy_state(
+        _RereadFails([(_MALFORMED_RECORD_HOLDING_CLOUD,)]),
+        "did:example:a",
+        initial_mode=PrivacyMode.NORMAL,
+    )
+    assert restored.mode is FAIL_CLOSED_PRIVACY_MODE
+    assert restored.record_read is False
+    assert restored.rewrite is False
+
+
+async def _raw_record(agent):
+    rows = await agent._raw_storage.db.fetchall(
+        "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+        (agent.did, PRIVACY_STATE_KEY),
+    )
+    return rows[0][0]
+
+
+@pytest.mark.asyncio
+async def test_leaving_with_a_malformed_record_that_cannot_be_reread_is_refused(
+    tmp_path, monkeypatch
+):
+    """The record does not validate, and reading it again fails.
+
+    Nothing is known about the record then: it holds the mandate the
+    local-only mode displaced. Boot failed closed and could not read it, so
+    the agent holds no saved copy of its own. Before the fix the transition
+    took the failed second read for a record with no saved mandate, kept the
+    local route and recorded NORMAL over the record. It is now refused and
+    writes nothing; once the record can be read again, leaving restores the
+    mandate it holds."""
+    import sqlite3
+
+    from kestrel_sovereign.agent import privacy_state
+
+    async def seed(agent):
+        await _seed_model_preference(agent, LOCAL)
+        await _seed_record(agent, _MALFORMED_RECORD_HOLDING_CLOUD)
+
+    fetch = privacy_state._fetch_record_rows
+    reads = 0
+
+    async def first_read_only(db, agent_id):
+        nonlocal reads
+        reads += 1
+        if reads > 1:
+            raise sqlite3.OperationalError("database is locked")
+        return await fetch(db, agent_id)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(privacy_state, "_fetch_record_rows", first_read_only)
+        async with _booted_agent(tmp_path, before_initialize=seed) as agent:
+            _assert_consistent(agent, FAIL_CLOSED_PRIVACY_MODE)
+            assert agent._privacy_saved_preference is None
+            assert _mandate(agent) == LOCAL
+            reads = 0
+
+            result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+
+            assert result.applied is False
+            assert result.persistence_failed is True
+            assert result.message == PRIVACY_STATE_UNRECORDED_MESSAGE
+            _assert_consistent(agent, FAIL_CLOSED_PRIVACY_MODE)
+            assert _mandate(agent) == LOCAL
+            assert await _raw_record(agent) == _MALFORMED_RECORD_HOLDING_CLOUD
+            assert await _persisted_preference(agent) == LOCAL
+
+            patched.undo()
+            result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+
+            assert result.applied is True
+            _assert_consistent(agent, PrivacyMode.NORMAL)
+            assert _mandate(agent) == CLOUD
+            assert await _persisted_preference(agent) == CLOUD
+            assert await _recorded(agent) == PrivacyState(mode=PrivacyMode.NORMAL)
+
+
+# --- Model selection and privacy transitions do not interleave (#3554) ------
+
+
+def _is_pending_record_write(params) -> bool:
+    return (
+        isinstance(params, (tuple, list))
+        and len(params) > 2
+        and params[1] == PRIVACY_STATE_KEY
+        and PrivacyState.decode(params[2]).transition_from is not None
+    )
+
+
+def _is_privacy_record_write(params) -> bool:
+    return (
+        isinstance(params, (tuple, list))
+        and len(params) > 1
+        and params[1] == PRIVACY_STATE_KEY
+    )
+
+
+def _request_task(context, coro):
+    """Run ``coro`` as a request the server received: in ``context``, captured
+    before the transition, not one inherited from inside it."""
+    return asyncio.get_running_loop().create_task(coro, context=context.copy())
+
+
+async def _select_model_over_http(agent, spec: dict):
+    """``POST /api/model/set`` on the running event loop, as the console does."""
+    import httpx
+
+    from tests.unit.test_privacy_mode_model_restore_contracts import (
+        _prepare_app,
+        _restore_app,
+    )
+
+    app, original = _prepare_app(agent)
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://kestrel.test"
+        ) as client:
+            return await client.post(
+                "/api/model/set", headers={"X-API-Key": "test-key"}, json=spec
+            )
+    finally:
+        _restore_app(app, original)
+
+
+def _observe_waiting_to_change_the_mandate(patched, llm, waiting: asyncio.Event) -> None:
+    """Set ``waiting`` when a caller has to wait to change the mandate: for a
+    change another caller holds, or for mandate writes still in flight."""
+    lock = llm._get_mandate_lock()
+    acquire = lock.acquire
+    settle = llm._settle_preference_persistence
+
+    async def observed_acquire():
+        if lock.locked():
+            waiting.set()
+        return await acquire()
+
+    async def observed_settle():
+        if llm._preference_persistence_tasks:
+            waiting.set()
+        await settle()
+
+    patched.setattr(lock, "acquire", observed_acquire)
+    patched.setattr(llm, "_settle_preference_persistence", observed_settle)
+
+
+async def _first_of(*awaitables) -> None:
+    tasks = [asyncio.ensure_future(awaitable) for awaitable in awaitables]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_model_selected_during_a_pending_transition_write_survives_a_restart(
+    tmp_path, monkeypatch
+):
+    """``/api/model/set`` arrives while NORMAL -> PUBLIC writes its pending record.
+
+    That transition keeps the mandate in force, and records the one it planned
+    from. Before the fix the selection took effect and persisted at once, and
+    the transition's own mandate write then put the planned one back over it:
+    the agent ran on the selected model, and a restart restored the old one.
+    The selection now waits for the transition, so the selected model is both
+    the one in force and the one a restart restores."""
+    monkeypatch.setenv("KESTREL_API_KEY", "test-key")
+    async with _booted_agent(tmp_path) as agent:
+        assert _mandate(agent) == UNPINNED
+        server_context = contextvars.copy_context()
+        db = agent._raw_storage.db
+        execute = db.execute
+        selection = None
+
+        with monkeypatch.context() as patched:
+
+            async def select_during_the_pending_write(sql, params=()):
+                nonlocal selection
+                if selection is None and _is_pending_record_write(params):
+                    waiting = asyncio.Event()
+                    _observe_waiting_to_change_the_mandate(
+                        patched, agent.llm_service, waiting
+                    )
+                    selection = _request_task(
+                        server_context, _select_model_over_http(agent, CLOUD)
+                    )
+                    # Either the selection completes here (the bug), or it
+                    # waits for the mandate change the transition holds.
+                    await _first_of(asyncio.shield(selection), waiting.wait())
+                return await execute(sql, params)
+
+            patched.setattr(db, "execute", select_during_the_pending_write)
+            result = await agent.set_privacy_mode_with_effects(PrivacyMode.PUBLIC)
+            response = await selection
+
+        assert result.applied is True
+        assert response.status_code == 200, response.text
+        _assert_consistent(agent, PrivacyMode.PUBLIC)
+        assert _mandate(agent) == CLOUD
+        assert await _persisted_preference(agent) == CLOUD
+        assert await _recorded(agent) == PrivacyState(mode=PrivacyMode.PUBLIC)
+
+    async with _booted_agent(tmp_path) as agent:
+        _assert_consistent(agent, PrivacyMode.PUBLIC)
+        assert _mandate(agent) == CLOUD
+
+
+@pytest.mark.asyncio
+async def test_transition_waits_for_a_model_selection_still_being_persisted(
+    tmp_path, monkeypatch
+):
+    """The other direction: ``!privacy public`` arrives while a selection's
+    write is in flight. The transition writes nothing until the selection is
+    persisted, then plans from the selected model."""
+    monkeypatch.setenv("KESTREL_API_KEY", "test-key")
+    async with _booted_agent(tmp_path) as agent:
+        db = agent._raw_storage.db
+        execute = db.execute
+        release = asyncio.Event()
+        selection_writing = asyncio.Event()
+        recorded_while_selecting = asyncio.Event()
+
+        with monkeypatch.context() as patched:
+
+            async def hold_the_selection_write(sql, params=()):
+                if not release.is_set():
+                    if _is_mandate_write(params) and json.loads(params[2]) == CLOUD:
+                        selection_writing.set()
+                        await release.wait()
+                    elif _is_privacy_record_write(params):
+                        recorded_while_selecting.set()
+                return await execute(sql, params)
+
+            patched.setattr(db, "execute", hold_the_selection_write)
+            selection = asyncio.ensure_future(_select_model_over_http(agent, CLOUD))
+            transition = None
+            try:
+                await selection_writing.wait()
+
+                waiting = asyncio.Event()
+                _observe_waiting_to_change_the_mandate(
+                    patched, agent.llm_service, waiting
+                )
+                transition = asyncio.ensure_future(
+                    agent.set_privacy_mode_with_effects(PrivacyMode.PUBLIC)
+                )
+                await _first_of(
+                    asyncio.shield(transition),
+                    waiting.wait(),
+                    recorded_while_selecting.wait(),
+                )
+                # Either the transition has started recording (the bug), or
+                # it waits until the selection's write lands.
+                assert not recorded_while_selecting.is_set()
+                assert waiting.is_set()
+                assert not transition.done()
+            finally:
+                release.set()
+            response = await selection
+            result = await transition
+
+        assert response.status_code == 200, response.text
+        assert result.applied is True
+        _assert_consistent(agent, PrivacyMode.PUBLIC)
+        assert _mandate(agent) == CLOUD
+        assert await _persisted_preference(agent) == CLOUD
+        assert await _recorded(agent) == PrivacyState(mode=PrivacyMode.PUBLIC)
+
+    async with _booted_agent(tmp_path) as agent:
+        _assert_consistent(agent, PrivacyMode.PUBLIC)
+        assert _mandate(agent) == CLOUD
+
+
+@pytest.mark.asyncio
+async def test_a_mandate_change_in_progress_refuses_a_setter_outside_it():
+    """A caller that sets or clears the mandate without holding the change
+    is refused while another holds it, rather than landing between its
+    writes; the holder itself sets freely, and the change is not reentrant."""
+    from kestrel_sovereign.llm.service import LLMService, MandateChangeInProgressError
+
+    llm = LLMService()
+    llm.providers = _routes()
+    holding = asyncio.Event()
+    release = asyncio.Event()
+    waiter = None
+
+    async def wait_for_it():
+        async with llm.mandate_change():
+            llm.clear_model_preference()
+
+    async def hold():
+        nonlocal waiter
+        async with llm.mandate_change():
+            llm.set_model_preference(LOCAL["model"], LOCAL["vendor"], LOCAL["route"])
+            with pytest.raises(RuntimeError, match="not reentrant"):
+                async with llm.mandate_change():
+                    pass
+            # A task the holder starts waits for the change like any other.
+            waiter = asyncio.ensure_future(wait_for_it())
+            holding.set()
+            await release.wait()
+
+    holder = asyncio.ensure_future(hold())
+    try:
+        await holding.wait()
+        with pytest.raises(MandateChangeInProgressError):
+            llm.set_model_preference(CLOUD["model"], CLOUD["vendor"], CLOUD["route"])
+        with pytest.raises(MandateChangeInProgressError):
+            llm.clear_model_preference()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not waiter.done()
+        assert llm.get_model_preference() == LOCAL
+    finally:
+        release.set()
+        await holder
+    await waiter
+    assert llm.get_model_preference() == UNPINNED
+
+    llm.set_model_preference(CLOUD["model"], CLOUD["vendor"], CLOUD["route"])
+    assert llm.get_model_preference() == CLOUD
+    await llm.close()
+
+
+@pytest.mark.asyncio
+async def test_set_model_tool_waits_for_a_mandate_change_in_progress():
+    """The ``set_model`` tool is a model selection like ``/api/model/set``: it
+    waits for a change in progress (a privacy transition recording the
+    mandate) rather than being refused or landing inside it."""
+    from types import SimpleNamespace
+
+    from kestrel_sdk.tools.result import ToolResultStatus
+
+    from kestrel_sovereign.features.model.feature import ModelAgent
+    from kestrel_sovereign.llm.service import LLMService
+
+    llm = LLMService()
+    llm.providers = _routes()
+    feature = ModelAgent(SimpleNamespace(llm_service=llm, features={}))
+    await feature.initialize()
+    holding = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold():
+        async with llm.mandate_change():
+            holding.set()
+            await release.wait()
+
+    holder = asyncio.ensure_future(hold())
+    await holding.wait()
+    selection = asyncio.ensure_future(
+        feature.set_model(f"{CLOUD['vendor']}:{CLOUD['route']}", CLOUD["model"])
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not selection.done()
+    assert llm.get_model_preference() == UNPINNED
+
+    release.set()
+    await holder
+    result = await selection
+
+    assert result.status is ToolResultStatus.OK, result
+    assert llm.get_model_preference() == CLOUD
+    await llm.close()
+
+
+@pytest.mark.asyncio
+async def test_a_mandate_change_begins_once_earlier_writes_have_landed():
+    """A change begins only once every write scheduled before it has landed,
+    the previous change's included. While it waits it already holds the
+    mandate, refusing a setter outside it; cancelling it neither cancels
+    those writes nor lets it begin."""
+    from kestrel_sovereign.llm.service import LLMService, MandateChangeInProgressError
+
+    llm = LLMService()
+    llm.providers = _routes()
+    landed: list = []
+    in_flight: dict = {}
+
+    async def persist(model, vendor, route):
+        in_flight[model] = asyncio.Event()
+        await in_flight[model].wait()
+        landed.append(model)
+
+    async def settle():
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    began: list[str] = []
+
+    async def change(name, model=None):
+        async with llm.mandate_change():
+            began.append(name)
+            if model is not None:
+                llm.set_model_preference(model["model"], model["vendor"], model["route"])
+
+    llm.set_preference_persistence_callback(persist)
+    # A write scheduled outside any change, still in flight.
+    llm.clear_model_preference()
+    first = asyncio.ensure_future(change("first", CLOUD))
+    try:
+        await settle()
+        assert began == []
+        with pytest.raises(MandateChangeInProgressError):
+            llm.set_model_preference(LOCAL["model"], LOCAL["vendor"], LOCAL["route"])
+
+        first.cancel()
+        await settle()
+        assert not first.done()
+    finally:
+        in_flight[None].set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert began == []
+    assert landed == [None]
+
+    # A change does not wait for its own write; the next one does.
+    await change("second", CLOUD)
+    assert began == ["second"]
+    third = asyncio.ensure_future(change("third"))
+    try:
+        await settle()
+        assert began == ["second"]
+    finally:
+        in_flight[CLOUD["model"]].set()
+    await third
+    assert began == ["second", "third"]
+    assert landed == [None, CLOUD["model"]]
+    assert llm.get_model_preference() == CLOUD
+    await llm.close()
