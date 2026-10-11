@@ -734,8 +734,13 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
     # a provider timeout fails its attempt at once.
     from kestrel_sovereign.llm import ollama_adapter
 
-    async def no_retry(func, *args, **kwargs):
-        return await func(*args, **kwargs)
+    async def no_retry(func, *args, acquired_result_cleanup=None, **kwargs):
+        from kestrel_sovereign.execution_custody import await_execution_work
+
+        return await await_execution_work(
+            None, lambda: func(*args, **kwargs),
+            acquired_result_cleanup=acquired_result_cleanup,
+        )
 
     monkeypatch.setattr(ollama_adapter, "with_retry", no_retry)
 
@@ -879,8 +884,13 @@ async def test_a_discovery_reply_becomes_the_answer_only_when_it_finished(
     from kestrel_sovereign.bootstrap import BootstrapState
     from kestrel_sovereign.llm import ollama_adapter
 
-    async def no_retry(func, *args, **kwargs):
-        return await func(*args, **kwargs)
+    async def no_retry(func, *args, acquired_result_cleanup=None, **kwargs):
+        from kestrel_sovereign.execution_custody import await_execution_work
+
+        return await await_execution_work(
+            None, lambda: func(*args, **kwargs),
+            acquired_result_cleanup=acquired_result_cleanup,
+        )
 
     monkeypatch.setattr(ollama_adapter, "with_retry", no_retry)
     monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", UNREACHED_BOUND)
