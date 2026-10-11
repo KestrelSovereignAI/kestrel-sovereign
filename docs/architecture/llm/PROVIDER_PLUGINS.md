@@ -82,7 +82,7 @@ response.stop_reason = resp.choices[0].finish_reason  # "stop", "tool_calls", "l
 return response
 ```
 
-Report the provider's value as it is. A natural end (`stop`, `end_turn`, `stop_sequence`, `tool_use`, `tool_calls`, `function_call`, `STOP`, `completed`) is accepted. Anything else is a failed attempt: a stop at an output limit (`length`, `max_tokens`, `MAX_TOKENS`, `model_context_window_exceeded`), any other or unknown reason, and **no stop reason at all**. A route whose adapter reports none fails every turn it serves, with an error naming the missing stop reason. The decision is `kestrel_sovereign.llm.generation_gate.judge_generation`.
+Report the provider's value as it is. A natural end (`stop`, `end_turn`, `stop_sequence`, `tool_use`, `tool_calls`, `function_call`, `STOP`, `completed`) is accepted. Anything else is a failed attempt: a stop at an output limit (`length`, `max_tokens`, `MAX_TOKENS`, `model_context_window_exceeded`), any other or unknown reason, and **no stop reason at all**. A route whose adapter reports none fails every turn it serves, with an error naming the missing stop reason. The decision is `kestrel_sovereign.llm.generation_gate.judge_generation`. Telemetry records a rejected response as a failed attempt (`success=false` in `llm_calls` and in Prometheus), with the token usage your response reported; the metering callback bills that usage as it would a finished response's, because the provider billed it ([#3576](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3576)).
 
 ### The optional surface
 

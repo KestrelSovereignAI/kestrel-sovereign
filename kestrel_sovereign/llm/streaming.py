@@ -906,6 +906,7 @@ class StreamingMixin:
         usage_available: Optional[bool] = None,
         publish_identity: bool = True,
         invocation_context: Optional["LLMInvocationContext"] = None,
+        meter_usage: Optional[bool] = None,
     ) -> None:
         """Finalize one streamed provider attempt from honest usage evidence.
 
@@ -919,6 +920,8 @@ class StreamingMixin:
         ``partial=True`` flags a mid-stream-abort flush (no terminal response
         arrived). Tokens were still consumed/billed by the provider, so the
         usage is recorded; the metadata flag lets telemetry tell it apart.
+        ``meter_usage`` overrides whether the usage is billed (``success`` by
+        default), for a failed attempt the provider still billed.
         """
         if not isinstance(response, LLMResponse):
             return
@@ -950,6 +953,7 @@ class StreamingMixin:
                     publish_identity=publish_identity,
                     usage_available=usage_available,
                     track_model_usage=bool(usage_available),
+                    meter_usage=meter_usage,
                 )
             except asyncio.CancelledError:
                 raise
@@ -990,6 +994,12 @@ class StreamingMixin:
 
         call_logger = getattr(self, "_log_llm_call", None)
         if call_logger is not None:
+            # Passed only when it overrides ``success``, so a host logger
+            # without the parameter still records every other attempt.
+            billing: Dict[str, Any] = (
+                {} if meter_usage in (None, success)
+                else {"meter_usage": meter_usage}
+            )
             try:
                 await call_logger(
                     provider=provider_name,
@@ -1009,6 +1019,7 @@ class StreamingMixin:
                     metadata=metadata,
                     cost=self._streamed_call_cost(response),
                     usage_available=usage_available,
+                    **billing,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1052,8 +1063,9 @@ class StreamingMixin:
         (:func:`~kestrel_sovereign.llm.generation_gate.judge_generation`,
         #3552): its terminal response is judged before anyone sees it, and a
         stream that ends without one has given no evidence it finished. A
-        rejected attempt raises the gate's failure instead of ending; its
-        usage and stop reason are recorded as for any other response.
+        rejected attempt raises the gate's failure instead of ending, and is
+        recorded as a failed attempt with the usage and stop reason its
+        provider reported (#3576).
         """
 
         common_kwargs: Dict[str, Any] = {}
@@ -1084,12 +1096,23 @@ class StreamingMixin:
         completed = False
         emitted = False
         failure: Optional[BaseException] = None
+        rejected: Optional[IncompleteGenerationError] = None
 
         def reject_unfinished(response: Optional[LLMResponse]) -> None:
+            nonlocal rejected
             if require_completion:
-                self._require_finished_generation(
-                    response, provider_name=provider_name, model=model,
-                )
+                try:
+                    self._require_finished_generation(
+                        response, provider_name=provider_name, model=model,
+                    )
+                except IncompleteGenerationError as unfinished:
+                    rejected = unfinished
+                    raise
+
+        def recorded_message(error: BaseException) -> str:
+            if error_message_override is not None:
+                return error_message_override
+            return str(error)
 
         async def forward(stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
             nonlocal emitted, final_response
@@ -1150,6 +1173,9 @@ class StreamingMixin:
             raise
         finally:
             duration_ms = int((time.monotonic() - started) * 1000)
+            rejection_message = (
+                None if rejected is None else recorded_message(rejected)
+            )
             if final_response is not None:
                 await self._record_streamed_usage(
                     final_response,
@@ -1157,9 +1183,13 @@ class StreamingMixin:
                     provider_name,
                     duration_ms=duration_ms,
                     path=path,
+                    success=rejected is None,
+                    error_message=rejection_message,
                     # The terminal response was stamped before it was exposed.
                     publish_identity=False,
                     invocation_context=invocation_context,
+                    # The provider billed the usage whatever the gate decided.
+                    meter_usage=True,
                 )
             elif usage_sink:
                 # Preserve the existing partial-usage billing behavior.  The
@@ -1180,8 +1210,11 @@ class StreamingMixin:
                     duration_ms=duration_ms,
                     partial=True,
                     path=path,
+                    success=rejected is None,
+                    error_message=rejection_message,
                     publish_identity=False,
                     invocation_context=invocation_context,
+                    meter_usage=True,
                 )
             elif completed:
                 await self._record_streamed_usage(
@@ -1204,11 +1237,7 @@ class StreamingMixin:
                     duration_ms=duration_ms,
                     path=path,
                     success=False,
-                    error_message=(
-                        error_message_override
-                        if error_message_override is not None
-                        else str(failure)
-                    ),
+                    error_message=recorded_message(failure),
                     usage_available=False,
                     publish_identity=False,
                     invocation_context=invocation_context,
@@ -1227,12 +1256,21 @@ class StreamingMixin:
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         force_local_only: Optional[bool] = None,
+        require_completion: bool = False,
     ) -> Any:
-        """Finalize a non-streaming fallback through the same attempt runner."""
+        """Finalize a non-streaming fallback through the same attempt runner.
 
-        runner = getattr(self, "_run_provider_attempt", None)
-        if runner is not None and invocation_context is not None:
-            return await runner(
+        ``require_completion`` holds the attempt to the generation gate
+        before it is finalized, as ``_run_provider_attempt`` does: a rejected
+        response is recorded as a failed attempt and the gate's failure is
+        raised (#3576).
+        """
+
+        if (
+            getattr(self, "_run_provider_attempt", None) is not None
+            and invocation_context is not None
+        ):
+            return await self._run_provider_attempt(
                 attempt,
                 provider_name,
                 model,
@@ -1244,10 +1282,19 @@ class StreamingMixin:
                 response_format=response_format,
                 force_local_only=force_local_only,
                 metadata={"streaming_fallback": True},
+                require_completion=require_completion,
             )
 
         started = time.monotonic()
         response = await attempt
+        rejected: Optional[IncompleteGenerationError] = None
+        if require_completion:
+            try:
+                self._require_finished_generation(
+                    response, provider_name=provider_name, model=model,
+                )
+            except IncompleteGenerationError as unfinished:
+                rejected = unfinished
         if isinstance(response, LLMResponse):
             await self._record_streamed_usage(
                 response,
@@ -1255,8 +1302,14 @@ class StreamingMixin:
                 provider_name,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 path=path,
+                success=rejected is None,
+                error_message=None if rejected is None else str(rejected),
+                publish_identity=rejected is None,
                 invocation_context=invocation_context,
+                meter_usage=True,
             )
+        if rejected is not None:
+            raise rejected
         return response
 
     async def get_streaming_response(
@@ -2071,9 +2124,7 @@ class StreamingMixin:
                             invocation_context=invocation_context,
                             tools=tools,
                             force_local_only=force_local_only,
-                        )
-                        self._require_finished_generation(
-                            response, provider_name=provider_name, model=model,
+                            require_completion=True,
                         )
                         route_emitted = True
                         if response.has_tool_calls:
