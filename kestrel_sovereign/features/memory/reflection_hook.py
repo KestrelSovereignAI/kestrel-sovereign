@@ -266,15 +266,22 @@ def retrieving_turn(
     Context assembly retrieves memories just before it writes the turn's user
     row, so the retrieval's turn is normally the first one at or after it. A
     memory tool retrieves inside a turn whose user row was already written and
-    whose reply comes after. Within one stored second the order of a retrieval
-    and the rows around it is unknown, so a reply in the retrieval's own
-    second does not make an earlier turn the retrieval's when a later one
-    exists: a wake can start within the second the previous reply was written.
-    The user row follows its retrieval by however long embedding it takes, so
-    a later turn counts unless its user row is ``SESSION_GAP_MINUTES`` or more
-    after the retrieval. A retrieval whose turn failed before writing its user
-    row therefore has none only when no other turn starts within that gap; the
-    stored rows cannot tell such a turn from its own.
+    whose reply comes after. The user row follows its retrieval by however
+    long embedding it takes, so a later turn counts unless its user row is
+    ``SESSION_GAP_MINUTES`` or more after the retrieval. A retrieval whose
+    turn failed before writing its user row therefore has none only when no
+    other turn starts within that gap; the stored rows cannot tell such a turn
+    from its own.
+
+    A turn still open at the retrieval keeps it once answered, however soon
+    the next turn starts (#3583). Within one stored second the order of a
+    retrieval and the rows around it is unknown, so a reply in the
+    retrieval's own second may have come before it: a turn queued behind the
+    open one, such as a wake, can make its context retrieval within the
+    second that reply was written. Nothing stored records which path made a
+    retrieval, and the next turn's start cannot stand in for it: a memory
+    tool's turn can be followed by another at any interval. So such a queued
+    turn's retrieval is judged with the turn before it.
     """
 
     def second_of(row: Dict[str, Any]) -> Optional[datetime]:
@@ -318,10 +325,7 @@ def retrieving_turn(
         # Still open when the memory was retrieved: a tool retrieval. A turn
         # that was never answered is not the one this retrieval served.
         turn = through_reply(earlier[earlier_user:] + later)
-        reply = reply_of(turn)
-        if reply is not None and (
-            later_user is None or second_of(reply) != retrieved_second
-        ):
+        if reply_of(turn) is not None:
             return turn
 
     if later_user is not None:
