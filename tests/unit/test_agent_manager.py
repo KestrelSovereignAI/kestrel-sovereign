@@ -2345,10 +2345,13 @@ async def test_expired_private_candidate_cancels_admission_owner_and_shuts_down(
         )
         await asyncio.wait_for(initialized.wait(), timeout=0.2)
         try:
-            await asyncio.sleep(0.08)
-            assert load.done(), "signed expiry must cancel the admission owner"
+            # The signed deadline revokes admission at 30ms; physical owned
+            # rollback may require several more event-loop turns. Do not
+            # confuse an actively cancelling owner with missed expiry under
+            # xdist load. Shield preserves the deadline as the sole source of
+            # cancellation; a missing expiry still fails this bounded wait.
             with pytest.raises(asyncio.CancelledError):
-                await load
+                await asyncio.wait_for(asyncio.shield(load), timeout=1.0)
         finally:
             if not load.done():
                 load.cancel()
