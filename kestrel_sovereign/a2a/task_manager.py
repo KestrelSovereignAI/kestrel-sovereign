@@ -15,7 +15,7 @@ import logging
 from datetime import datetime
 from typing import Any, AsyncGenerator, Callable, Coroutine, Optional
 
-from kestrel_sovereign.execution_custody import execution_terminal_error
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 
@@ -221,10 +221,12 @@ class TaskManager:
                 failures.append((name, e))
 
         if failures:
-            first_name, first = failures[0]
+            first = execution_terminal_error(*(error for _, error in failures))
+            first_name = next(name for name, error in failures if error is first)
             first.add_note(f"TaskManager could not close {first_name}")
-            for name, error in failures[1:]:
-                first.add_note(f"TaskManager could not close {name} either: {error}")
+            for name, error in failures:
+                if error is not first:
+                    first.add_note(f"TaskManager could not close {name} either: {error}")
             raise first
 
         logger.info("TaskManager closed all stores")
@@ -444,6 +446,8 @@ class TaskManager:
                             expected_state=expected_state,
                         )
                 except Exception as save_err:
+                    if is_execution_control_error(save_err):
+                        raise
                     logger.error(
                         f"Failed to save task outcome {task.id}: {save_err}. "
                         "Retrying outside transaction..."
@@ -455,6 +459,8 @@ class TaskManager:
                             expected_state=expected_state,
                         )
                     except Exception as retry_err:
+                        if is_execution_control_error(retry_err):
+                            raise
                         logger.critical(
                             f"Task outcome {task.id} failed to save permanently: {retry_err}. "
                             f"Result lost for skill={skill_id}, agent={agent_id}"
@@ -570,7 +576,9 @@ class TaskManager:
                 agent_name=authority_agent_id,
                 task_payload=task,
             )
-        except ValueError:
+        except ValueError as cancellation_error:
+            if is_execution_control_error(cancellation_error):
+                raise
             current = await self.task_store.get_for_recipient(
                 task.id,
                 authority_agent_id,
@@ -604,7 +612,9 @@ class TaskManager:
                     final=task.status.state
                     in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED},
                 )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
+            if is_execution_control_error(cancellation):
+                raise
             try:
                 await self.cancel_task(
                     task.id,
@@ -617,6 +627,8 @@ class TaskManager:
                 pass
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Async task execution failed: {e}")
             task.status = TaskStatus(
                 state=TaskState.FAILED,
@@ -665,6 +677,13 @@ class TaskManager:
                 terminal_operation_id=terminal_operation_id,
             )
         except Exception as save_error:
+            if is_execution_control_error(save_error):
+                raise
+            # Authority/uncertain-COMMIT control is not an ordinary transport
+            # failure. A matching terminal token cannot authorize a retired
+            # execution to claim a completion wake or start new readback work.
+            if is_execution_control_error(save_error):
+                raise
             # PostgreSQL can commit and then lose the COMMIT acknowledgement.
             # Reconcile the recipient-scoped canonical row before treating the
             # exception as a failed write: the private per-attempt token proves
@@ -685,7 +704,9 @@ class TaskManager:
             except asyncio.CancelledError:
                 raise
             except Exception as reconciliation_error:
-                raise save_error from reconciliation_error
+                if is_execution_control_error(reconciliation_error):
+                    raise
+                raise execution_terminal_error(save_error, reconciliation_error)
             if committed_operation_id != terminal_operation_id:
                 raise
 
@@ -701,7 +722,9 @@ class TaskManager:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as reconciliation_error:
+                if is_execution_control_error(reconciliation_error):
+                    raise
                 logger.warning(
                     "Task %s terminal commit was proven by operation token but "
                     "its canonical payload could not be reread; emitting the "
@@ -907,6 +930,8 @@ class TaskManager:
             return {"success": True, "result": "Task completed"}
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Command execution failed: {e}")
             return {"success": False, "error": str(e)}
 
@@ -974,6 +999,8 @@ class TaskManager:
             try:
                 chain = self._causation_chain_provider()
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "causation_chain_provider raised; proceeding "
                     "without chain metadata: %s", e,
@@ -1020,6 +1047,8 @@ class TaskManager:
             try:
                 self._on_task_submitted(task)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "on_task_submitted callback failed for %s: %s",
                     task.id, e, exc_info=True,
@@ -1046,7 +1075,9 @@ class TaskManager:
                     "parts": [p.model_dump() for p in params.message.parts],
                 },
             )
-        except Exception:
+        except Exception as execution_error:
+            if is_execution_control_error(execution_error):
+                raise
             logger.warning(
                 "Task %s was created but its session projection failed",
                 task.id,
@@ -1060,7 +1091,9 @@ class TaskManager:
                 session_id=params.sessionId,
                 metadata={"task_id": task.id},
             )
-        except Exception:
+        except Exception as execution_error:
+            if is_execution_control_error(execution_error):
+                raise
             logger.warning(
                 "Task %s was created but observability logging failed",
                 task.id,
@@ -1087,7 +1120,9 @@ class TaskManager:
                 operation="A2A task creation canonical readback",
             )
             canonical_read_succeeded = canonical is not None
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError) as readback_error:
+            if is_execution_control_error(readback_error):
+                raise
             canonical = None
             logger.warning(
                 "Task %s was accepted but its canonical readback failed",
@@ -1508,6 +1543,8 @@ class TaskManager:
             try:
                 self._on_task_cancelled(task)
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "on_task_cancelled callback failed for %s: %s",
                     task.id,
@@ -1607,7 +1644,9 @@ class TaskManager:
                     session_id=task.sessionId,
                     metadata={"task_id": task_id},
                 )
-            except Exception:
+            except Exception as execution_error:
+                if is_execution_control_error(execution_error):
+                    raise
                 logger.warning(
                     "Task %s failed durably but failure observability logging failed",
                     task_id,
@@ -1694,7 +1733,9 @@ class TaskManager:
                     event_type="status_update",
                     data=event_data,
                 )
-            except Exception:
+            except Exception as execution_error:
+                if is_execution_control_error(execution_error):
+                    raise
                 logger.warning(
                     "Task %s transitioned durably but its session projection failed",
                     task.id,
@@ -1715,7 +1756,9 @@ class TaskManager:
                     session_id=task.sessionId,
                     metadata=metadata,
                 )
-            except Exception:
+            except Exception as execution_error:
+                if is_execution_control_error(execution_error):
+                    raise
                 logger.warning(
                     "Task %s transitioned durably but observability logging failed",
                     task.id,
@@ -1724,7 +1767,9 @@ class TaskManager:
 
         try:
             await self._notify_status_update(task, final=is_final)
-        except Exception:
+        except Exception as execution_error:
+            if is_execution_control_error(execution_error):
+                raise
             logger.warning(
                 "Task %s transitioned durably but subscriber notification failed",
                 task.id,
@@ -1733,7 +1778,9 @@ class TaskManager:
         if is_final and self.memory_service and task.sessionId:
             try:
                 await self._save_to_memory(task)
-            except Exception:
+            except Exception as execution_error:
+                if is_execution_control_error(execution_error):
+                    raise
                 logger.warning(
                     "Task %s transitioned durably but memory recording failed",
                     task.id,
@@ -1859,6 +1906,8 @@ class TaskManager:
             try:
                 self._on_task_complete(task)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Task completion callback error: {e}")
 
         # Notify SSE subscribers

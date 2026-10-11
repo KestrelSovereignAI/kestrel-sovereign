@@ -201,7 +201,9 @@ async def test_cancel_right_after_marker_persists_no_dangling_boundary():
     """Codex review: the revise boundary is armed lazily. If the user
     cancels after the marker but before any post-tool text arrives, the
     persisted turn must NOT carry a trailing ``\\n\\n`` the client never
-    rendered (the client leaves its pendingReviseBoundary unconsumed)."""
+    rendered (the client leaves its pendingReviseBoundary unconsumed).
+    Since #3552 a stopped turn records no answer at all, so the row is
+    empty: neither the pre-tool prose nor a boundary."""
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
     from kestrel_sdk.llm import ToolCallStarted
 
@@ -231,7 +233,7 @@ async def test_cancel_right_after_marker_persists_no_dangling_boundary():
 
     assistant_rows = [r for r in persisted if r["role"] == "assistant"]
     assert len(assistant_rows) == 1
-    assert assistant_rows[0]["content"] == "Let me check.", (
-        "a turn cancelled right after the marker must persist exactly the "
-        "pre-tool prose — no dangling boundary the client never drew"
+    assert assistant_rows[0]["content"] == "", (
+        "a turn cancelled right after the marker records no answer — no "
+        "pre-tool prose, and no dangling boundary the client never drew"
     )

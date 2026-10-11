@@ -58,17 +58,27 @@ def models_api(*, max_tokens: Any = DEFAULT_TEST_OUTPUT_CEILING) -> SimpleNamesp
 
 class FinalMessageStream:
     """What ``client.messages.stream(...)`` returns, reduced to the part
-    ``get_response`` uses: an async context whose ``get_final_message()``
-    is the complete response."""
+    ``get_response`` uses: an async context whose events it reads (as call
+    progress, #3552) and whose ``get_final_message()`` is the complete
+    response."""
 
-    def __init__(self, message: Any) -> None:
+    def __init__(self, message: Any, events: tuple = ()) -> None:
         self._message = message
+        self._events = list(events)
 
     async def __aenter__(self) -> "FinalMessageStream":
         return self
 
     async def __aexit__(self, *exc: Any) -> bool:
         return False
+
+    def __aiter__(self) -> "FinalMessageStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        if not self._events:
+            raise StopAsyncIteration
+        return self._events.pop(0)
 
     async def get_final_message(self) -> Any:
         return self._message

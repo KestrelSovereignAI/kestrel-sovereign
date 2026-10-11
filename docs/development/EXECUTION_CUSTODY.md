@@ -307,6 +307,12 @@ later rollback or A2A readback failures become context, not replacement causes.
 All database factories use the same joined retirement boundary; cancellation
 after uncertain initialization cannot supersede the original COMMIT receipt,
 and unsuccessful cleanup retains its database owner and both failure objects.
+A2A producer, command, worker, completion, and best-effort projection boundaries
+propagate cause-carried control instead of converting it into a task error,
+retry, completion wake, or successful projection. A durable terminal token
+permits ordinary transport reconciliation, never new authority after retirement.
+Store retirement still attempts every owner, selecting irreversible control
+ahead of an earlier ordinary close failure when reporting joined failures.
 Deferred OpenRouter provisioning validates the original admission after client
 acquisition and immediately before each POST, including retries after backoff.
 Cause-carried control errors bypass retry/error normalization; ordinary live

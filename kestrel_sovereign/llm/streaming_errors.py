@@ -65,6 +65,17 @@ _ROUTE_ERROR = (
     "server logs.",
 )
 
+# A model call that ended without a finished response (#3552): it stopped at
+# its route's output cap, went silent past the orchestrator's inactivity
+# bound, or its stream failed after part of the response was sent. Which one,
+# and on which route, stays in the operator log.
+_INCOMPLETE_GENERATION_ERROR = (
+    "The model did not finish its response.",
+    "It stopped at its output limit, went silent for too long, or its stream "
+    "failed partway, so no answer was recorded. Try again, or pick a different "
+    "model/route from the dropdown. The specific cause is in the server logs.",
+)
+
 
 def _is_llm_streaming_error(exc: BaseException) -> bool:
     """True when ``exc`` is an :class:`LLMStreamingError` (a selected-route
@@ -86,6 +97,16 @@ def _declined_wait(exc: BaseException):
     except Exception:  # pragma: no cover - defensive import guard
         return None
     return advised_wait_exceeding_budget(exc)
+
+
+def _is_incomplete_generation(exc: BaseException) -> bool:
+    """True when ``exc`` is or wraps an incomplete generation (imported lazily
+    for the same reason as :func:`_is_llm_streaming_error`)."""
+    try:
+        from kestrel_sovereign.llm.output_ceiling import incomplete_generation
+    except Exception:  # pragma: no cover - defensive import guard
+        return False
+    return incomplete_generation(exc) is not None
 
 
 def _rate_limited_message(declined) -> tuple[str, str]:
@@ -111,6 +132,8 @@ def _classify(exc: BaseException):
     declined = _declined_wait(exc)
     if declined is not None:
         return _rate_limited_message(declined)
+    if _is_incomplete_generation(exc):
+        return _INCOMPLETE_GENERATION_ERROR
     return _ROUTE_ERROR if _is_llm_streaming_error(exc) else _GENERIC_ERROR
 
 
@@ -119,9 +142,9 @@ def safe_streaming_error_message(exc: BaseException) -> str:
 
     CONSTANT per error class (plus a declined wait's computed reset time) —
     never interpolates ``str(exc)``, ``underlying``,
-    or ``provider``. A selected-route failure returns the recovery guidance; any
-    other exception returns the generic message. Full detail is the caller's job
-    to log operator-side.
+    or ``provider``. A selected-route failure returns the recovery guidance, a
+    call that ended unfinished says so (#3552), and any other exception returns
+    the generic message. Full detail is the caller's job to log operator-side.
     """
     header, body = _classify(exc)
     return f"{header} {body}"

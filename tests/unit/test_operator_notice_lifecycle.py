@@ -209,7 +209,7 @@ def _turn_agent(
         ),
         _build_all_tools=lambda: [],
         _lazy_attachment_hint=lambda attachments: "",
-        _make_inline_tool_executor=lambda _session_id: None,
+        _make_inline_tool_executor=lambda _session_id, watchdog=None: None,
         _resolve_eager_images=resolve_eager_images,
         is_request_cancelled=lambda _rid=None: False,
     )

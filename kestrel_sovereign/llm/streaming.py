@@ -18,6 +18,32 @@ or override-restricted case. Multi-provider default chains still retry
 through the list, but the fallback happens in server logs, not by
 injecting a ``[Provider X unavailable, trying next...]`` note into the
 chat stream where it corrupts the agent's response.
+
+No fallback after output
+------------------------
+A chain falls back only while the failing route has sent nothing to the
+caller. Once a route's stream has yielded output, its failure ends the call
+(#3552): another route's answer would be appended to the text already sent,
+and the turn would record the two as one answer. The call raises
+``LLMStreamingError`` over the attempt's verdict from the generation gate
+(:func:`~kestrel_sovereign.llm.generation_gate.judge_generation`) — the
+route's own incomplete generation (an output cap, an unfinished stop), or
+:class:`StreamInterruptedError` — so the turn fails and records no answer.
+A route that fails before sending anything contributes nothing, and the next
+route's answer stands alone.
+
+No fallback after an inline tool
+--------------------------------
+Nor does a chain fall back when the gate rejects a terminal response whose
+route already ran tools inside its call (``executed_tool_calls``), even if it
+streamed nothing: those tools may have acted, and another route could run
+them again. The call raises ``LLMStreamingError`` over
+:class:`~kestrel_sovereign.llm.generation_gate.UnfinishedAfterInlineToolsError`
+instead; the turn records no answer and checkpoints the tools that completed.
+(A route that raises after its tools ran is #3574.)
+
+``stream_with_tool_detection`` holds every attempt to that gate: a stream
+ends only with a terminal response whose stop reason is a natural end.
 """
 import asyncio
 import logging
@@ -48,7 +74,7 @@ from kestrel_sdk.llm import (
     ToolCallStarted,
 )
 
-from kestrel_sovereign.llm.retry import common_declined_wait
+from kestrel_sovereign.llm.retry import state_aggregate_verdicts
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
@@ -65,6 +91,12 @@ from .adapter import (
 from .cancellation import CancelToken
 from .codex_app_server import CodexAppServerTransportError
 from .error_handling import LLMError
+from .generation_gate import (
+    UnfinishedAfterInlineToolsError,
+    judge_generation,
+    ran_inline_tools,
+)
+from .output_ceiling import IncompleteGenerationError
 from .provider_registry import provider_cache_body
 
 if TYPE_CHECKING:
@@ -270,6 +302,56 @@ class LLMStreamingError(LLMError):
         super().__init__(message)
         self.provider = provider
         self.underlying = underlying
+
+
+class StreamInterruptedError(IncompleteGenerationError):
+    """A route's stream failed after part of its response reached the caller.
+
+    The attempt ended unfinished, so it is an incomplete generation like an
+    output cap (#3552). Its ``__cause__`` is the route's error.
+    """
+
+    summary = "failed partway through its response"
+
+    def __init__(self, provider: str) -> None:
+        self.provider = provider
+        super().__init__(
+            f"Route {provider} failed after streaming part of its response; "
+            f"the attempt failed."
+        )
+
+
+def _failed_after_output(provider: str, error: Exception) -> LLMStreamingError:
+    """What a route loop raises when ``provider`` failed after sending output.
+
+    See "No fallback after output" in the module docstring. The error carries
+    the gate's verdict on the attempt: ``error``'s own incomplete generation
+    when it has one, else a :class:`StreamInterruptedError` caused by
+    ``error``.
+    """
+    underlying = judge_generation(error=error, provider=provider)
+    if not isinstance(underlying, IncompleteGenerationError):
+        underlying = StreamInterruptedError(provider)
+        underlying.__cause__ = error
+    return LLMStreamingError(
+        f"Route {provider} failed after streaming part of its response; not "
+        f"falling back to another route: {error}",
+        provider=provider,
+        underlying=underlying,
+    )
+
+
+def _failed_after_inline_tools(
+    provider: str, error: UnfinishedAfterInlineToolsError,
+) -> LLMStreamingError:
+    """What a route loop raises when the gate rejected ``provider``'s response
+    after its call ran tools inside it, before sending any output.
+
+    See "No fallback after an inline tool" in the module docstring.
+    """
+    return LLMStreamingError(
+        str(error), provider=provider, underlying=error,
+    )
 
 
 class StreamingMixin:
@@ -792,6 +874,26 @@ class StreamingMixin:
             return None
 
     @staticmethod
+    def _require_finished_generation(
+        response: Any, *, provider_name: str, model: str,
+    ) -> Any:
+        """``response``, if the generation gate accepts it; else raise the
+        gate's failure (:func:`~kestrel_sovereign.llm.generation_gate.judge_generation`).
+
+        For a non-streaming attempt of a call a turn's answer comes from. A
+        streamed attempt is judged in :meth:`_stream_adapter_with_usage`. A
+        rejected response that reports tools its route already ran inside the
+        call raises :class:`UnfinishedAfterInlineToolsError`, so the route
+        walk does not fall back and run them again.
+        """
+        failure = judge_generation(response, provider=provider_name, model=model)
+        if failure is None:
+            return response
+        if ran_inline_tools(response):
+            raise UnfinishedAfterInlineToolsError(provider_name, failure) from failure
+        raise failure
+
+    @staticmethod
     def _adapter_has_usage_stream(adapter: Any) -> bool:
         """Whether ``adapter`` implements the usage-bearing stream contract.
 
@@ -967,6 +1069,7 @@ class StreamingMixin:
         ] = None,
         cancel_token: Optional[CancelToken] = None,
         error_message_override: Optional[str] = None,
+        require_completion: bool = False,
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """The sole adapter streaming leaf and attempt-finalization boundary.
 
@@ -976,6 +1079,13 @@ class StreamingMixin:
         shape.  A third-party basic stream remains supported; it records an
         explicit ``usage_available=false`` attempt instead of inventing zero
         tokens or silently skipping telemetry.
+
+        ``require_completion`` holds the attempt to the generation gate
+        (:func:`~kestrel_sovereign.llm.generation_gate.judge_generation`,
+        #3552): its terminal response is judged before anyone sees it, and a
+        stream that ends without one has given no evidence it finished. A
+        rejected attempt raises the gate's failure instead of ending; its
+        usage and stop reason are recorded as for any other response.
         """
 
         common_kwargs: Dict[str, Any] = {}
@@ -1008,6 +1118,12 @@ class StreamingMixin:
         failure: Optional[BaseException] = None
         admitted_custody = current_execution_custody(self)
 
+        def reject_unfinished(response: Optional[LLMResponse]) -> None:
+            if require_completion:
+                self._require_finished_generation(
+                    response, provider_name=provider_name, model=model,
+                )
+
         async def forward(stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
             nonlocal emitted, final_response
             async with _owned_stream(self, stream) as iterator:
@@ -1028,6 +1144,7 @@ class StreamingMixin:
                         self._stamp_response_identity(
                             item, model=model, provider=provider_name
                         )
+                        reject_unfinished(item)
                         if expose_protocol_events:
                             yield item
                         continue
@@ -1072,6 +1189,10 @@ class StreamingMixin:
                 async with _owned_stream(self, forward(stream)) as forwarded_stream:
                     async for item in forwarded_stream:
                         yield item
+            if final_response is None:
+                # A stream that ends without a terminal response reported no
+                # stop reason at all.
+                reject_unfinished(None)
             completed = True
         except BaseException as exc:
             failure = exc
@@ -1306,6 +1427,9 @@ class StreamingMixin:
                     provider.get("name"), provider.get("vendor"),
                 )
                 continue
+            # Whether this route has yielded anything to the caller: after
+            # that, its failure ends the call (no fallback after output).
+            route_emitted = False
             try:
                 provider_name = provider["name"]
                 last_provider_name = provider_name
@@ -1341,6 +1465,7 @@ class StreamingMixin:
                             cancel_token=cancel_token,
                         )) as forwarded_stream:
                             async for chunk in forwarded_stream:
+                                route_emitted = True
                                 yield chunk
                         logger.info(f"Streaming completed from {provider_name}")
                         return
@@ -1365,6 +1490,7 @@ class StreamingMixin:
                     force_local_only=force_local_only,
                 )
                 # Yield content as string (LLMResponse.content) to match streaming behavior
+                route_emitted = True
                 yield response.content or ""
                 logger.info(f"Non-streaming fallback from {provider_name}")
                 return
@@ -1397,6 +1523,8 @@ class StreamingMixin:
                         underlying=e,
                     )
                 self._maybe_disable_route(provider, e)
+                if route_emitted:
+                    raise _failed_after_output(provider_name, e)
                 if explicit_selection:
                     # No silent fallthrough when the user has explicitly narrowed
                     # routing. Fail loudly — the caller / agent / user must see
@@ -1422,9 +1550,9 @@ class StreamingMixin:
                         provider=provider_name,
                         underlying=e,
                     )
-                    # An aggregate of every attempted route: the verdict is
-                    # the common decline, not this route's error.
-                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    # An aggregate of every attempted route: its verdicts
+                    # describe them all, not this route's error.
+                    state_aggregate_verdicts(exhausted, route_errors)
                     raise exhausted
                 # Default multi-provider chain: log the fallback server-side;
                 # don't corrupt the stream with a note about it.
@@ -1441,8 +1569,8 @@ class StreamingMixin:
             provider=last_provider_name,
             underlying=last_error,
         )
-        # The aggregate states its own verdict (see common_declined_wait).
-        aggregate.declined_wait = common_declined_wait(route_errors)
+        # The aggregate states its own verdicts (see state_aggregate_verdicts).
+        state_aggregate_verdicts(aggregate, route_errors)
         raise aggregate
 
     @execution_work_stream
@@ -1629,6 +1757,8 @@ class StreamingMixin:
                     provider.get("name"), provider.get("vendor"),
                 )
                 continue
+            # No fallback after output (module docstring).
+            route_emitted = False
             try:
                 last_provider_name = provider["name"]
                 adapter = provider["adapter"]
@@ -1651,6 +1781,7 @@ class StreamingMixin:
                         cancel_token=cancel_token,
                     )) as forwarded_stream:
                         async for chunk in forwarded_stream:
+                            route_emitted = True
                             yield chunk
                     return
                 else:
@@ -1670,6 +1801,7 @@ class StreamingMixin:
                         invocation_context=invocation_context,
                         force_local_only=force_local_only,
                     )
+                    route_emitted = True
                     yield response.content if hasattr(response, 'content') else str(response)
                     return
             except ExecutionAuthorityError:
@@ -1691,6 +1823,8 @@ class StreamingMixin:
                         underlying=e,
                     )
                 self._maybe_disable_route(provider, e)
+                if route_emitted:
+                    raise _failed_after_output(provider["name"], e)
                 if explicit_selection:
                     raise LLMStreamingError(
                         f"Selected route {provider['name']} failed: {e}",
@@ -1713,9 +1847,9 @@ class StreamingMixin:
                         provider=provider["name"],
                         underlying=e,
                     )
-                    # An aggregate of every attempted route: the verdict is
-                    # the common decline, not this route's error.
-                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    # An aggregate of every attempted route: its verdicts
+                    # describe them all, not this route's error.
+                    state_aggregate_verdicts(exhausted, route_errors)
                     raise exhausted
                 logger.warning(
                     "Falling through from %s: %s", provider["name"], e,
@@ -1728,8 +1862,8 @@ class StreamingMixin:
             provider=last_provider_name,
             underlying=last_error,
         )
-        # The aggregate states its own verdict (see common_declined_wait).
-        aggregate.declined_wait = common_declined_wait(route_errors)
+        # The aggregate states its own verdicts (see state_aggregate_verdicts).
+        state_aggregate_verdicts(aggregate, route_errors)
         raise aggregate
 
     @staticmethod
@@ -1866,6 +2000,11 @@ class StreamingMixin:
         This eliminates the "double LLM call" pattern where you first
         called non-streaming to detect tools then streaming for text.
 
+        A turn's answer and tool calls come from here, so every attempt is
+        held to the generation gate (#3552): the stream ends normally only
+        when the provider's terminal stop reason is a natural end. Otherwise
+        it raises, and what it already yielded is not an answer.
+
         Args:
             messages: Pre-built message list
             tools: Optional tools for function calling
@@ -1935,6 +2074,7 @@ class StreamingMixin:
                         error_message_override=(
                             self._managed_remote_failure_message
                         ),
+                        require_completion=True,
                     )) as forwarded_stream:
                         async for item in forwarded_stream:
                             yield item
@@ -1981,6 +2121,9 @@ class StreamingMixin:
                     provider.get("name"), provider.get("vendor"),
                 )
                 continue
+            # No fallback after output, or after an inline tool (module
+            # docstring).
+            route_emitted = False
             try:
                 adapter = provider["adapter"]
                 model = self._resolve_concrete_model(target_model, provider)
@@ -2020,8 +2163,10 @@ class StreamingMixin:
                         keep_trailing_system=keep_trailing_system,
                         tool_executor=tool_executor,
                         cancel_token=cancel_token,
+                        require_completion=True,
                     )) as forwarded_stream:
                         async for item in forwarded_stream:
+                            route_emitted = True
                             yield item
                     logger.info(f"Streaming with tools completed from {provider_name}")
                     return
@@ -2047,6 +2192,10 @@ class StreamingMixin:
                             tools=tools,
                             force_local_only=force_local_only,
                         )
+                        self._require_finished_generation(
+                            response, provider_name=provider_name, model=model,
+                        )
+                        route_emitted = True
                         if response.has_tool_calls:
                             yield response
                             return
@@ -2069,8 +2218,10 @@ class StreamingMixin:
                             session_id=session_id,
                             keep_trailing_system=keep_trailing_system,
                             cancel_token=cancel_token,
+                            require_completion=True,
                         )) as forwarded_stream:
                             async for chunk in forwarded_stream:
+                                route_emitted = True
                                 yield chunk
                         return
 
@@ -2094,6 +2245,10 @@ class StreamingMixin:
                         underlying=e,
                     )
                 self._maybe_disable_route(provider, e)
+                if route_emitted:
+                    raise _failed_after_output(provider["name"], e)
+                if isinstance(e, UnfinishedAfterInlineToolsError):
+                    raise _failed_after_inline_tools(provider["name"], e)
                 if explicit_selection:
                     raise LLMStreamingError(
                         f"Selected route {provider['name']} failed: {e}",
@@ -2117,9 +2272,9 @@ class StreamingMixin:
                         provider=provider["name"],
                         underlying=e,
                     )
-                    # An aggregate of every attempted route: the verdict is
-                    # the common decline, not this route's error.
-                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    # An aggregate of every attempted route: its verdicts
+                    # describe them all, not this route's error.
+                    state_aggregate_verdicts(exhausted, route_errors)
                     raise exhausted
                 logger.warning(
                     "Falling through from %s: %s", provider["name"], e,
@@ -2132,6 +2287,6 @@ class StreamingMixin:
             provider=last_provider_name,
             underlying=last_error,
         )
-        # The aggregate states its own verdict (see common_declined_wait).
-        aggregate.declined_wait = common_declined_wait(route_errors)
+        # The aggregate states its own verdicts (see state_aggregate_verdicts).
+        state_aggregate_verdicts(aggregate, route_errors)
         raise aggregate

@@ -268,6 +268,7 @@ async def test_unvalidated_remote_client_is_never_used_for_image_turn(monkeypatc
     """A stale client without an SDK lease cannot bypass normal routing."""
     from kestrel_sovereign.llm.adapter import LLMResponse
     from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+    from kestrel_sovereign.llm.output_ceiling import attach_stop_reason
     from kestrel_sovereign.llm.remote_backend import BackendType
     from kestrel_sovereign.llm.service import LLMService
 
@@ -310,7 +311,8 @@ async def test_unvalidated_remote_client_is_never_used_for_image_turn(monkeypatc
     async def _fake_stream(**kw):
         normal["n"] += 1
         normal["messages"] = kw["messages"]
-        yield LLMResponse(content="ok", tool_calls=[])
+        # A finished response: the generation gate needs its stop reason.
+        yield attach_stop_reason(LLMResponse(content="ok", tool_calls=[]), "stop")
 
     adapter.get_streaming_response_with_tools = _fake_stream
     provider = {"name": "openai:api", "vendor": "openai", "adapter": adapter,

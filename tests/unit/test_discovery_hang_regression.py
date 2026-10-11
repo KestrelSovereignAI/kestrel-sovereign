@@ -55,8 +55,14 @@ async def test_generate_with_messages_lazy_resolves_auto_models():
     svc._disabled_routes = {}
     svc._mandate_preference = {"vendor": None, "model": None, "route": None}
 
+    from kestrel_sovereign.llm.adapter import LLMResponse
+    from kestrel_sovereign.llm.output_ceiling import attach_stop_reason
+
     adapter = MagicMock()
-    adapter.get_response = AsyncMock(return_value="resolved-model-said-hello")
+    # A finished response: the generation gate needs its stop reason (#3552).
+    adapter.get_response = AsyncMock(return_value=attach_stop_reason(
+        LLMResponse(content="resolved-model-said-hello"), "stop",
+    ))
 
     seed_provider = {
         "name": "ollama:local",
