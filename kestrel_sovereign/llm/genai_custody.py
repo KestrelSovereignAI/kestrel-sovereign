@@ -1,0 +1,188 @@
+"""Own google-genai's otherwise unclosed async forwarding layers.
+
+The maintained SDK returns several generators whose bare ``async for`` does
+not close its child. Record each acquired handle in a request-local lexical
+owner, including the HTTP response before any read. Retirement joins every
+layer and the native body; async-generator finalization is never the owner.
+"""
+
+import inspect
+import sys
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from functools import wraps
+
+from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+from kestrel_sovereign.execution_custody import (
+    _NATIVE_RESPONSE_SINK,
+    close_native_execution_stream,
+    execution_terminal_error,
+    retain_native_execution_http_client_close,
+)
+
+_OWNER = ContextVar("kestrel_genai_stream_owner", default=None)
+
+
+class _StreamOwner:
+    def __init__(self):
+        self.handles = []
+
+    def retain(self, handle):
+        if not any(handle is existing for existing in self.handles):
+            self.handles.append(handle)
+        return handle
+
+    async def close(self, original=None):
+        terminal = original
+        # Take deepest generators first. Each one is still strongly retained,
+        # so its native finally cannot escape into a GC finalizer task.
+        for handle in reversed(self.handles):
+            try:
+                await close_native_execution_stream(handle)
+            except BaseException as error:
+                terminal = execution_terminal_error(terminal, error)
+        self.handles.clear()
+        if terminal is not None and terminal is not original:
+            raise terminal
+        # Even the SAME receipt must propagate if caught from native close.
+        if terminal is not None and original is None:
+            raise terminal
+
+
+def _track_iterator_factory(instance, name):
+    original = getattr(instance, name)
+
+    @wraps(original)
+    def acquire(*args, **kwargs):
+        handle = original(*args, **kwargs)
+        owner = _OWNER.get()
+        return owner.retain(handle) if owner is not None else handle
+
+    setattr(instance, name, acquire)
+
+
+def is_genai_client(client):
+    try:
+        from google.genai import Client
+    except ImportError:
+        return False
+    return isinstance(client, Client)
+
+
+def prepare_genai_client(client):
+    """Pin native async transport and install request-local handle custody.
+
+    Core uses the SDK's HTTPX transport, whose pre-body response hooks permit
+    ownership BEFORE error-body reads as well as streaming. Existing HTTPX
+    settings/client are retained. The SDK then treats that handle as injected;
+    Core records its explicit close responsibility instead of leaking it.
+    Legacy in-memory adapter doubles have no native transport and are untouched.
+    """
+    if not is_genai_client(client) or getattr(client, "_kestrel_genai_custody", False):
+        return
+    api = client._api_client
+    http = api._async_httpx_client
+    if http is None:
+        raise RuntimeError("Core google-genai requires an owned HTTPX async transport")
+    if api._http_options.aiohttp_client is not None:
+        raise RuntimeError("Core google-genai cannot own an explicitly injected aiohttp transport")
+    if api._http_options.httpx_async_client is None:
+        api._http_options.httpx_async_client = http
+        client._kestrel_genai_httpx_owned = http
+    retain_native_execution_http_client_close(http)
+
+    # SDK-version-specific integration points, proved against real SDKs by
+    # offline transport tests. No frame inspection or finalizer dependence.
+    native_request = api._async_request
+
+    @wraps(native_request)
+    async def request(*args, **kwargs):
+        response = await native_request(*args, **kwargs)
+        if _OWNER.get() is not None:
+            _track_iterator_factory(response, "async_segments")
+            _track_iterator_factory(response, "_aiter_response_stream")
+        return response
+
+    api._async_request = request
+    for instance, name in ((api, "async_request_streamed"),
+                           (client.aio.models, "_generate_content_stream"),
+                           (client.aio.models, "generate_content_stream")):
+        original = getattr(instance, name)
+
+        def tracked(original):
+            @wraps(original)
+            async def acquire(*args, **kwargs):
+                handle = await original(*args, **kwargs)
+                owner = _OWNER.get()
+                return owner.retain(handle) if owner is not None else handle
+            return acquire
+
+        setattr(instance, name, tracked(original))
+    client._kestrel_genai_custody = True
+
+
+@asynccontextmanager
+async def genai_stream_owner(client):
+    prepare_genai_client(client)
+    owner = _StreamOwner()
+    token = _OWNER.set(owner)
+    sink_token = _NATIVE_RESPONSE_SINK.set(owner.retain)
+    try:
+        yield owner
+    finally:
+        original = sys.exc_info()[1]
+        try:
+            await owner.close(original)
+        finally:
+            _NATIVE_RESPONSE_SINK.reset(sink_token)
+            _OWNER.reset(token)
+
+
+@asynccontextmanager
+async def joined_iterator(stream):
+    """Explicitly retire a Core forwarding child before its parent returns."""
+    try:
+        yield stream
+    finally:
+        await close_native_execution_stream(stream)
+
+
+def genai_operation(function):
+    @wraps(function)
+    async def owned(self, client, *args, **kwargs):
+        client = client if client is not None else self._get_client()
+        async with genai_stream_owner(client):
+            return await function(self, client, *args, **kwargs)
+    return owned
+
+
+def genai_stream(function):
+    @wraps(function)
+    def owned(self, client, *args, **kwargs):
+        client = client if client is not None else self._get_client()
+        async def produce():
+            async with genai_stream_owner(client) as owner:
+                source = owner.retain(function(self, client, *args, **kwargs))
+                async for item in source:
+                    yield item
+        # Acquisition, advancement and closure share ONE task/context even
+        # when the caller abandons a read or closes from another task.
+        return OwnedAsyncIterator(produce, operation="genai-native-stream")
+    return owned
+
+
+async def close_genai_client(client):
+    """Close async SDK sessions AND its sync client, joining independent debt."""
+    terminal = None
+    for close in (client.aio.aclose, client.close,
+                  getattr(getattr(client, "_kestrel_genai_httpx_owned", None), "aclose", None)):
+        if close is None:
+            continue
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except BaseException as error:
+            terminal = execution_terminal_error(terminal, error)
+    if terminal is not None:
+        raise terminal

@@ -86,6 +86,30 @@ Report the provider's value as it is. A natural end (`stop`, `end_turn`, `stop_s
 
 ### The optional surface
 
+### Native request and retirement ownership
+
+Sovereign's built-in routes disable SDK-owned retries: each retry must return
+through Core's original execution admission. OpenAI-compatible and Anthropic
+HTTPX clients acquire response-close ownership in the first pre-body hook,
+before SDK error-body reads or other response observers. Native request hooks
+also reject a revoked copied admission; a shared client does not inherit its
+first caller's tenant scope.
+
+The maintained `google-genai` adapters use the SDK's HTTPX async transport and
+retain its nested stream handles in one request-local owner task. Closing a
+forwarding iterator physically joins the SDK layers and response body, rather
+than leaving cleanup to async-generator finalizers. An explicitly injected
+aiohttp transport is refused because it lacks this pre-body custody contract.
+Provider shutdown joins `client.aio.aclose()` as well as synchronous close;
+any transport whose ownership Core made explicit is closed separately. A
+caller-injected HTTPX transport remains borrowed according to the SDK contract.
+
+Cancellation and explicit irreversible control receipts remain original errors,
+including their causes/groups. Model discovery must not translate them into an
+empty catalog. These built-in integrations are verified with actual SDKs and
+offline HTTPX transports; they do not imply that an arbitrary third-party
+adapter automatically closes an opaque native transport.
+
 | Method | Default | What it does |
 |---|---|---|
 | `get_streaming_response(...)` | raises `NotImplementedError` | yields text chunks for plain streaming |

@@ -5345,7 +5345,10 @@ No other text or formatting.
             if client is None:
                 continue
             async def close_client(client=client):
-                if hasattr(client, "close") and callable(client.close):
+                from .genai_custody import close_genai_client, is_genai_client
+                if is_genai_client(client):
+                    await close_genai_client(client)
+                elif hasattr(client, "close") and callable(client.close):
                     await _wait_for_close_result(client.close())
                 elif hasattr(client, "_client") and hasattr(client._client, "aclose"):
                     await _wait_for_close_result(client._client.aclose())

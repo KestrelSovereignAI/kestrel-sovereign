@@ -54,6 +54,10 @@ from .retry import with_retry
 import asyncio
 import sys
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
+from kestrel_sovereign.execution_custody import (
+    retain_native_execution_http_client_close,
+    is_execution_control_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +103,7 @@ async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
     async def _enter():
         from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
 
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         cm = client.messages.stream(**api_params)
         stream = await cm.__aenter__()
         retain_native_execution_stream_close(stream)
@@ -523,6 +528,7 @@ class AnthropicAdapter(LLMAdapter):
         known = self._output_ceilings.get(wire_model)
         if known is not None:
             return known
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         record = await await_or_cancelled(
             with_retry(client.models.retrieve, wire_model),
             cancel_token,
@@ -683,6 +689,7 @@ class AnthropicAdapter(LLMAdapter):
             params["system"] = combined_system
         if tools:
             params["tools"] = self._convert_tools_to_anthropic_format(tools)
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         result = await client.messages.count_tokens(**params)
         input_tokens = getattr(result, "input_tokens", None)
         return TokenCount(input_tokens=input_tokens, raw=result)
@@ -734,6 +741,7 @@ class AnthropicAdapter(LLMAdapter):
                 "unsupported because it would bypass SDK authentication"
             )
         target: Any = client
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         for part in operation.split("."):
             target = getattr(target, part)
         # Support both the dict-payload form and the SDK-style keyword form
@@ -1970,6 +1978,7 @@ class AnthropicAdapter(LLMAdapter):
                 return []
 
             async with httpx.AsyncClient() as client:
+                retain_native_execution_http_client_close(client)
                 response = await client.get(
                     "https://api.anthropic.com/v1/models",
                     headers={
@@ -1993,12 +2002,18 @@ class AnthropicAdapter(LLMAdapter):
 
         except httpx.HTTPStatusError as e:
             logger.error(f"Anthropic API HTTP error: {e.response.status_code} - {e.response.text}")
+            if is_execution_control_error(e):
+                raise
             return []
         except httpx.RequestError as e:
             logger.error(f"Anthropic API connection error: {e}")
+            if is_execution_control_error(e):
+                raise
             return []
         except Exception as e:
             logger.error(f"Failed to list Anthropic models: {e}", exc_info=True)
+            if is_execution_control_error(e):
+                raise
             return []
 
     # ---- Provider metadata (SDK 0.6.0) -------------------------------------

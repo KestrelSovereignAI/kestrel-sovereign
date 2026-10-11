@@ -235,6 +235,9 @@ _CURRENT_CUSTODY: ContextVar[tuple[ExecutionCustody, ...]] = ContextVar(
     "kestrel_execution_custody", default=(),
 )
 _CLEANUP_ONLY: ContextVar[bool] = ContextVar("kestrel_execution_cleanup_only", default=False)
+_NATIVE_RESPONSE_SINK: ContextVar[Callable[[Any], None] | None] = ContextVar(
+    "kestrel_native_response_sink", default=None,
+)
 
 
 @dataclass(eq=False)
@@ -518,10 +521,20 @@ def retain_native_execution_http_client_close(client: Any) -> None:
 
     async def retain_response(response):
         retain_native_execution_stream_close(response)
+        sink = _NATIVE_RESPONSE_SINK.get()
+        if sink is not None:
+            sink(response)
+
+    async def require_request_authority(request):
+        # A native SDK must not spend an already-revoked admission, even if
+        # a caller enabled internal retry or automatic function-call dispatch.
+        # Check THAT request's active scope, never the client's first caller.
+        require_execution_work()
 
     # A caller's existing observer may itself read/close the response, or
     # cancellation may land while it awaits. Own the body before ANY observer.
     client.event_hooks["response"].insert(0, retain_response)
+    client.event_hooks["request"].insert(0, require_request_authority)
     client._kestrel_native_close_hook = retain_response
 
 

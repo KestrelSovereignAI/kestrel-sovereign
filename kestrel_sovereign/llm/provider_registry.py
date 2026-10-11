@@ -460,7 +460,7 @@ class ProviderRegistry:
             )
             if oauth_manager is not None:
                 client = anthropic.AsyncAnthropic(
-                    auth_token=oauth_manager.initial_access_token
+                    auth_token=oauth_manager.initial_access_token, max_retries=0,
                 )
                 # The Anthropic SDK back-fills ``api_key`` from
                 # ``ANTHROPIC_API_KEY`` in the environment whenever the
@@ -474,7 +474,7 @@ class ProviderRegistry:
                 client.api_key = None
                 logger.info("%s:%s using OAuth token", vendor, route)
             elif api_key:
-                client = anthropic.AsyncAnthropic(api_key=api_key)
+                client = anthropic.AsyncAnthropic(api_key=api_key, max_retries=0)
             else:
                 raise ValueError(
                     f"{vendor}:{route} requires api_key_env, auth_token_env, or "

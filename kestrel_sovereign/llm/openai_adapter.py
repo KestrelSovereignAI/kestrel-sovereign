@@ -1412,6 +1412,7 @@ class OpenAIAdapter(LLMAdapter):
         Returns:
             List of ModelInfo objects.
         """
+        temporary_client = None
         retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             if client is None:
@@ -1430,7 +1431,8 @@ class OpenAIAdapter(LLMAdapter):
                     "OpenAIAdapter.list_models called with client=None — "
                     "rebuilding from OPENAI_API_KEY (canonical OpenAI only)"
                 )
-                client = openai.AsyncOpenAI(api_key=api_key)
+                client = openai.AsyncOpenAI(api_key=api_key, max_retries=0)
+                temporary_client = client
                 retain_native_execution_http_client_close(getattr(client, "_client", None))
 
             response = await client.models.list()
@@ -1455,16 +1457,27 @@ class OpenAIAdapter(LLMAdapter):
 
         except openai.RateLimitError as e:
             logger.error(f"OpenAI rate limit exceeded while listing models: {e}")
+            if is_execution_control_error(e):
+                raise
             return []
         except openai.APIConnectionError as e:
             logger.error(f"OpenAI connection error while listing models: {e}")
+            if is_execution_control_error(e):
+                raise
             return []
         except openai.APIError as e:
             logger.error(f"OpenAI API error while listing models: {e}")
+            if is_execution_control_error(e):
+                raise
             return []
         except Exception as e:
             logger.error(f"Failed to list OpenAI models: {e}", exc_info=True)
+            if is_execution_control_error(e):
+                raise
             return []
+        finally:
+            if temporary_client is not None:
+                await close_native_execution_stream(temporary_client)
 
     #: Substrings that mark an OpenAI ``/v1/models`` id as an embedding model.
     #: OpenAI's model list carries no category, so discovery filters by id.
@@ -1505,6 +1518,7 @@ class OpenAIAdapter(LLMAdapter):
                 (getattr(m, "id", m) for m in chat_models), provider
             )
 
+        temporary_client = None
         if client is None:
             api_key = os.environ.get("OPENAI_API_KEY")
             if not api_key:
@@ -1513,13 +1527,18 @@ class OpenAIAdapter(LLMAdapter):
                     "and no OPENAI_API_KEY; returning empty list"
                 )
                 return []
-            client = openai.AsyncOpenAI(api_key=api_key)
+            client = openai.AsyncOpenAI(api_key=api_key, max_retries=0)
+            temporary_client = client
             retain_native_execution_http_client_close(getattr(client, "_client", None))
 
-        response = await client.models.list()
-        return self._embedding_models_from_ids(
-            (model.id for model in response.data), provider
-        )
+        try:
+            response = await client.models.list()
+            return self._embedding_models_from_ids(
+                (model.id for model in response.data), provider
+            )
+        finally:
+            if temporary_client is not None:
+                await close_native_execution_stream(temporary_client)
 
     def _embedding_models_from_ids(
         self, ids: Any, provider: str

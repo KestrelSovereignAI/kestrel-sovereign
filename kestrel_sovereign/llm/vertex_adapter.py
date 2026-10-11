@@ -28,6 +28,7 @@ from kestrel_sdk.llm import (
 from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
 from .image_utils import process_images
+from .genai_custody import genai_operation, genai_stream, joined_iterator
 from .google_adapter import _finish_reason, _normalized_google_genai_usage
 from .output_ceiling import attach_stop_reason
 
@@ -95,6 +96,7 @@ class VertexAIAdapter(LLMAdapter):
             out[idx] = cls._embedding_values(item)
         return out
 
+    @genai_operation
     async def aembed(
         self,
         client: Any,
@@ -110,6 +112,7 @@ class VertexAIAdapter(LLMAdapter):
         )
         return self._embeddings_from_response(response, 1)[0]
 
+    @genai_operation
     async def aembed_batch(
         self,
         client: Any,
@@ -182,7 +185,6 @@ class VertexAIAdapter(LLMAdapter):
         if self._client is None:
             try:
                 from google import genai
-                from google.genai import types
             except ImportError:
                 raise ImportError(
                     "google-genai package not installed. "
@@ -327,6 +329,7 @@ class VertexAIAdapter(LLMAdapter):
 
         return system_prompt, filtered
 
+    @genai_operation
     async def get_response(
         self,
         client: Any,
@@ -449,6 +452,7 @@ class VertexAIAdapter(LLMAdapter):
             logger.error(f"Vertex AI API error: {e}")
             raise
 
+    @genai_stream
     async def _stream_with_usage(
         self,
         client: Any,
@@ -566,16 +570,17 @@ class VertexAIAdapter(LLMAdapter):
         Yields:
             Text chunks as they arrive
         """
-        async for item in self._stream_with_usage(
+        async with joined_iterator(self._stream_with_usage(
             client=client,
             model=model,
             messages=messages,
             tools=tools,
             response_format=response_format,
             **kwargs
-        ):
-            if isinstance(item, str):
-                yield item
+        )) as stream:
+            async for item in stream:
+                if isinstance(item, str):
+                    yield item
 
     async def get_streaming_response_with_tools(
         self,
@@ -641,14 +646,15 @@ class VertexAIAdapter(LLMAdapter):
 
             # No tools - stream text and forward the terminal usage response so
             # the service layer meters text-only streamed turns (#1684).
-            async for item in self._stream_with_usage(
+            async with joined_iterator(self._stream_with_usage(
                 client=client,
                 model=model,
                 messages=messages,
                 response_format=response_format,
                 **kwargs
-            ):
-                yield item
+            )) as stream:
+                async for item in stream:
+                    yield item
 
         except Exception as e:
             logger.error(f"Vertex AI streaming with tools failed: {e}")

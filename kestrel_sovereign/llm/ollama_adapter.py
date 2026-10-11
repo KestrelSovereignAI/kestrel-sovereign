@@ -1362,6 +1362,8 @@ class OllamaAdapter(LLMAdapter):
             return results
         except Exception as e:
             logger.error(f"Failed to list Ollama embedding models: {e}", exc_info=True)
+            if is_execution_control_error(e):
+                raise
             return []
 
     # ---- Provider metadata (SDK 0.6.0) -------------------------------------

@@ -21,6 +21,7 @@ from kestrel_sdk.llm import (
 )
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
+from .genai_custody import genai_operation, genai_stream, joined_iterator
 from .output_ceiling import (
     OutputCeilingUnknownError,
     OutputCeilings,
@@ -116,6 +117,7 @@ class GoogleAdapter(LLMAdapter):
 
     # ---- Output ceiling (#3355) --------------------------------------------
 
+    @genai_operation
     async def _model_output_ceiling(self, client: Any, model: str) -> int:
         """The largest ``max_output_tokens`` Gemini accepts for ``model``.
 
@@ -219,6 +221,7 @@ class GoogleAdapter(LLMAdapter):
             out[idx] = cls._embedding_values(item)
         return out
 
+    @genai_operation
     async def aembed(
         self,
         client: Any,
@@ -236,6 +239,7 @@ class GoogleAdapter(LLMAdapter):
         )
         return self._embeddings_from_response(response, 1)[0]
 
+    @genai_operation
     async def aembed_batch(
         self,
         client: Any,
@@ -333,6 +337,7 @@ class GoogleAdapter(LLMAdapter):
                 })
         return function_declarations
 
+    @genai_operation
     async def get_response(
         self,
         client: Any,
@@ -452,6 +457,7 @@ class GoogleAdapter(LLMAdapter):
             logger.error(f"Google Gemini API error: {e}", exc_info=True)
             raise
 
+    @genai_stream
     async def _stream_with_usage(
         self,
         client: Any,
@@ -535,15 +541,16 @@ class GoogleAdapter(LLMAdapter):
         **kwargs
     ) -> AsyncIterator[str]:
         """Preserve the public text-only stream while retaining one source."""
-        async for item in self._stream_with_usage(
+        async with joined_iterator(self._stream_with_usage(
             client=client,
             model=model,
             messages=messages,
             tools=tools,
             **kwargs,
-        ):
-            if isinstance(item, str):
-                yield item
+        )) as stream:
+            async for item in stream:
+                if isinstance(item, str):
+                    yield item
 
     async def get_streaming_response_with_tools(
         self,
@@ -575,14 +582,15 @@ class GoogleAdapter(LLMAdapter):
             yield response
             return
 
-        async for item in self._stream_with_usage(
+        async with joined_iterator(self._stream_with_usage(
             client=client,
             model=model,
             messages=messages,
             tools=tools,
             **kwargs,
-        ):
-            yield item
+        )) as stream:
+            async for item in stream:
+                yield item
 
     async def continue_with_tool_results(
         self,
