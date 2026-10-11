@@ -330,6 +330,12 @@ Feature retirement still unregisters its sleep hooks after a control-bearing
 child failure. Full feature removal attempts every independent inverse and
 selects irreversible control evidence ahead of an earlier ordinary cleanup
 failure, retaining the failed feature owner for later joined retirement.
+Signal terminal-delivery helpers preserve the same original dispatch receipt
+before non-delivery, cancellation or detached-enqueue normalization. Peers
+cannot restore a completed-effect question to WAITING on that control path;
+neither a delivery supervisor's cancellation cleanup nor local finalizer may
+turn it into an automatic retry. Ordinary delivery failure and control-free
+shutdown still retain their documented restore/retry behavior.
 The real agent shutdown joins every later resource owner before reporting that
 receipt. Physical retirement is not reconciliation or an acknowledged Stop.
 Deferred OpenRouter provisioning validates the original admission after client

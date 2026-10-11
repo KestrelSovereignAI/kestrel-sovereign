@@ -138,6 +138,7 @@ async def test_boot_peer_replay_and_sweep_survive_only_original_runtime():
     feature = PeersFeature(owner)
     feature._peer_directory_context = lambda: object()
     feature.EXPIRY_SWEEP_INTERVAL_SECONDS = 0.001
+    outcomes = ()
 
     async def supervisor(**kwargs):
         await owner._runtime_publication_ready.wait()
@@ -166,11 +167,15 @@ async def test_boot_peer_replay_and_sweep_survive_only_original_runtime():
         assert not feature._owned_background_tasks
     finally:
         release.set()
-        await feature._cancel_owned_background_tasks()
-        tasks = tuple(owner._background_tasks)
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await feature._cancel_owned_background_tasks()
+        except ExecutionAuthorityError as retained:
+            assert any(retained is error for error in outcomes)
+        finally:
+            tasks = tuple(owner._background_tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -237,6 +242,7 @@ async def test_actual_live_question_subscription_retains_only_original_runtime(r
     router = SimpleNamespace(subscribe_a2a_task=subscribe)
     feature._resolve_retained_automatic_peer = AsyncMock(return_value=(router, object(), object()))
     tasks = ()
+    outcomes = ()
     try:
         with bind_execution_custody(Authority()):
             await feature.send_a2a_question("peer", "question")
@@ -262,8 +268,13 @@ async def test_actual_live_question_subscription_retains_only_original_runtime(r
         assert not feature._owned_background_tasks
     finally:
         release.set()
-        await feature._cancel_owned_background_tasks()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        for task in tuple(owner._background_tasks):
-            task.cancel()
-        await asyncio.gather(*tuple(owner._background_tasks), return_exceptions=True)
+        try:
+            await feature._cancel_owned_background_tasks()
+        except ExecutionAuthorityError as retained:
+            assert retirement == "generation"
+            assert any(retained is error for error in outcomes)
+        finally:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for task in tuple(owner._background_tasks):
+                task.cancel()
+            await asyncio.gather(*tuple(owner._background_tasks), return_exceptions=True)

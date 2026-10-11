@@ -3323,7 +3323,9 @@ class PeersFeature(Feature):
 
         try:
             outcome = await await_terminal_delivery(handle, label=label)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
+            if is_execution_control_error(cancellation):
+                raise
             # We are being torn down mid-delivery. The caller's `if not fired`
             # restore never runs because this propagates past it, so the
             # obligation is ours: shield the restore so the row does not stay
