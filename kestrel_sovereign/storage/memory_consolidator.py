@@ -21,6 +21,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 from .memory_models import MemoryEpisode, TemporalPattern
 from .async_database import AsyncDatabase
+from .memory_attestation_state import attested_through, awaiting_attestation
 from .memory_retriever import calculate_decay
 from .async_conversation_store import (
     _strip_search_wrappers,
@@ -1537,14 +1538,9 @@ class MemoryConsolidator:
         (#2672). ``None`` policy (raw storage, tests) → allowed, preserving prior
         behaviour.
         """
-        policy = self._persist_policy
-        if policy is None:
-            return True
-        try:
-            return bool(policy.allows_persistent_writes())
-        except Exception as e:  # noqa: BLE001 - never let a policy probe crash consolidation
-            logger.debug("episode persist-policy probe failed, denying: %s", e)
-            return False
+        from .privacy_wrapper import persistent_writes_allowed
+
+        return persistent_writes_allowed(self._persist_policy)
 
     async def _save_episode(self, episode: MemoryEpisode) -> None:
         """Save episode to database and optionally to the Knowledge Graph."""
@@ -1998,10 +1994,18 @@ class MemoryConsolidator:
         They won't appear in normal retrieval but can still be
         accessed if specifically requested.
 
+        A memory whose latest retrieval is still awaiting the pre-sleep
+        attestation is left for after it (#3544): it is at or after the
+        agent's attestation watermark, deferred within the current pass's
+        settle margin or in the window of a pass that failed. An attestation
+        that came later would raise its ``applied_count`` but never clear
+        ``archived_at``.
+
         Returns:
             Number of messages archived
         """
         archived_count = 0
+        attestation_watermark = await attested_through(self._db, self.agent_id)
 
         # Get all messages (paginated for large histories)
         rows = await self._db.fetchall(
@@ -2052,6 +2056,9 @@ class MemoryConsolidator:
             # Sovereign deletion (privacy wipes, compliance erasure) overrides
             # pins unconditionally -- see MemoryAgencyFeature.sovereign_override_pins().
             if metadata.get("decay_protected"):
+                continue
+
+            if awaiting_attestation(metadata, attestation_watermark):
                 continue
 
             # Calculate decay.  ``applied_count`` is the load-bearing
