@@ -2623,7 +2623,7 @@ class KestrelAgent(
         # The agent closes its LLM service at shutdown, and boot may start
         # provider clients with it from here on (#3522).
         if self.llm_service is not None and hasattr(self.llm_service, "close"):
-            self._resource_custody().acquire("llm_service")
+            ctx.on_rollback("llm_service", self._boot_teardown_llm)
         # Cold-start restore from Lighthouse if DB doesn't exist (ephemeral environments)
         if (
             os.environ.get("LIGHTHOUSE_API_KEY")
@@ -2650,8 +2650,12 @@ class KestrelAgent(
                 else:
                     logging.info("Cold-start: no Lighthouse snapshot found, starting fresh")
             except (ImportError, AttributeError, TypeError, ConnectionError) as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.warning(f"Cold-start restore from Lighthouse failed: {e}")
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.warning(f"Cold-start restore from Lighthouse failed: {e}", exc_info=True)
 
         # Assertion authority is minted only after this agent boot path has
@@ -2764,6 +2768,8 @@ class KestrelAgent(
             early_agent_node = await self.storage.get_node(self.agent_id)
             identity_lookup_succeeded = True
         except Exception as exc:  # noqa: BLE001
+            if is_execution_control_error(exc):
+                raise
             logging.warning(
                 "Could not load agent identity node for sync policy: %s",
                 exc,
@@ -2797,6 +2803,8 @@ class KestrelAgent(
                     getattr(self._raw_storage, "db", None)
                 )
         except Exception as exc:  # noqa: BLE001
+            if is_execution_control_error(exc):
+                raise
             logging.debug("Embedding-space pin hydration skipped: %s", exc)
 
         if early_agent_node is not None:
@@ -3001,6 +3009,8 @@ class KestrelAgent(
             await store.initialize()
             self._feature_enablement_store = store
         except Exception as e:  # noqa: BLE001 - never block init on this
+            if is_execution_control_error(e):
+                raise
             logging.warning(
                 "FeatureEnablementStore unavailable; enablement deltas "
                 "disabled (features still load from the bootstrap allowlist): %s",
@@ -3273,6 +3283,8 @@ class KestrelAgent(
                 # explicitly rather than degrading silently.
                 raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.warning(f"LighthouseProvider init failed: {e}")
 
         # Sync service — event-driven snapshots to all configured targets.
@@ -3350,6 +3362,8 @@ class KestrelAgent(
                     self._sync_service = None
 
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.warning(f"Sync service init failed: {e}", exc_info=True)
                 self._sync_service = None
         elif not self._sync_enabled:
@@ -3743,6 +3757,8 @@ class KestrelAgent(
             if not ok:
                 logging.warning("Constitution overlay not trusted: %s", msg)
         except Exception as e:  # noqa: BLE001 - never block init on this
+            if is_execution_control_error(e):
+                raise
             logging.warning("Constitution overlay verification errored: %s", e)
             self.constitution_overlay_verified = False
 
@@ -3822,6 +3838,8 @@ class KestrelAgent(
             try:
                 await feature.post_all_features_loaded(self)
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 
                 if type(feature).__name__ in MANDATORY_FEATURES:
@@ -3961,6 +3979,8 @@ class KestrelAgent(
                         f"Could not activate agent OpenRouter key: {e}"
                     )
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logging.warning(
                         f"Could not activate agent OpenRouter key: {e}",
                         exc_info=True,
@@ -3971,6 +3991,8 @@ class KestrelAgent(
             # agent.
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Fail-closed for known policy/provisioning errors:
             # PayerPolicyError (e.g., HOST_MASTER_PROVISIONED but
             # no master configured) and OpenRouterProvisioningError
@@ -4258,6 +4280,8 @@ class KestrelAgent(
                 await self.context_manager.start_salvage_worker()
                 ctx.on_rollback("salvage_worker", self._boot_teardown_salvage)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.warning(f"failed to start salvage worker: {e}")
 
         # Reattach the complete spawn mandate and its enforcement (#2137,
@@ -4441,6 +4465,33 @@ class KestrelAgent(
     # to retry. The rollback driver logs failures and continues with
     # independent resources.
     # ------------------------------------------------------------------
+    async def _boot_teardown_llm(self) -> ReleaseOutcome:
+        """Join the original provider owners before retiring borrowed storage."""
+        if getattr(self, "dispatcher", None) is not None:
+            return ReleaseOutcome.RETAINED
+        service = getattr(self, "llm_service", None)
+        if service is None or not callable(getattr(service, "close", None)):
+            return ReleaseOutcome.RELEASED
+        from kestrel_sovereign.llm.service import LLMService as NativeLLMService
+        if isinstance(service, NativeLLMService):
+            from kestrel_sovereign.execution_custody import current_execution_custody
+            from kestrel_sovereign.llm.lifecycle import retire_unpublished_llm
+            await retire_unpublished_llm(
+                vars(self).setdefault("_boot_llm_retirement_owners", {}),
+                "llm_service", service, current_execution_custody(self),
+                join_native=True,
+            )
+            return ReleaseOutcome.RELEASED
+        # Non-native injected services still own one joined close and must
+        # report RETAINED/UNKNOWN truthfully rather than losing their result.
+        from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+        task = vars(self).get("_boot_llm_close_task")
+        if task is None:
+            task = asyncio.create_task(service.close(), name="boot:llm-close")
+            self._boot_llm_close_task = task
+        outcome = await await_owned_task(task)
+        return reported_outcome(raise_owned_outcome(outcome, operation="boot LLM close"))
+
     async def _boot_teardown_storage(self) -> ReleaseOutcome:
         """Close the primary DB connection and drop the privacy layer."""
         # Dispatcher teardown owns a runtime-owner release against this very
@@ -4460,12 +4511,23 @@ class KestrelAgent(
                     "dispatcher teardown is still incomplete"
                 )
             return ReleaseOutcome.RETAINED
+        custody = self._resource_custody()
+        if custody.is_held("llm_service"):
+            llm_outcome = await self._boot_teardown_llm()
+            # The serving-record audit remains conservative for uncertified
+            # owners. Its UNKNOWN does not undo this native owner's physical
+            # writer/provider join; storage may retire only after that join.
+            custody.settle("llm_service", llm_outcome)
+            if llm_outcome is not ReleaseOutcome.RELEASED:
+                return ReleaseOutcome.RETAINED
         raw = self._raw_storage
+        if raw is not None and hasattr(raw, "close"):
+            outcome = reported_outcome(await raw.close())
+            if outcome is not ReleaseOutcome.RELEASED:
+                return outcome
         self._raw_storage = None
         self.storage = None
         self.privacy_agent = None
-        if raw is not None and hasattr(raw, "close"):
-            return reported_outcome(await raw.close())
         return ReleaseOutcome.RELEASED
 
     async def _boot_teardown_background_tasks(self) -> ReleaseOutcome:
@@ -4523,14 +4585,18 @@ class KestrelAgent(
             try:
                 delivered = await dispatcher.shutdown_durable_delivery()
                 break
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as failure:
+                if is_execution_control_error(failure):
+                    raise
                 # BootContext guarantees a complete rollback, but this
                 # particular step owns the dispatcher-to-storage ordering.
                 # Do not let repeated cancellation leave its owner release
                 # alive while the next rollback action closes SQLite.
                 cancelled = True
                 continue
-            except Exception:
+            except Exception as failure:
+                if is_execution_control_error(failure):
+                    raise
                 if retried_failure:
                     raise
                 # Durable teardown is intentionally retryable.  A failure can
@@ -4594,13 +4660,16 @@ class KestrelAgent(
         loaded = list(self.features.items())
         unloaded = self._unreleased_features_not_loaded()
         failed: list = []
+        control_errors: list[BaseException] = []
         for name, feature in [*reversed(unloaded), *reversed(loaded)]:
             label = name or type(feature).__name__
             try:
                 reported = reported_outcome(
                     await self._unregister_feature_runtime(feature)
                 )
-            except Exception as exc:  # noqa: BLE001 - best-effort teardown
+            except BaseException as exc:  # finish every independent feature
+                if is_execution_control_error(exc) or not isinstance(exc, Exception):
+                    control_errors.append(exc)
                 logging.warning(
                     "boot rollback: feature '%s' teardown failed: %s",
                     label,
@@ -4620,6 +4689,10 @@ class KestrelAgent(
             for name, feature in loaded
             if any(feature is held for held in failed)
         }
+        if control_errors:
+            terminal = execution_terminal_error(*control_errors)
+            assert terminal is not None
+            raise terminal
         return ReleaseOutcome.RETAINED if failed else ReleaseOutcome.RELEASED
 
     async def _boot_teardown_memory(self) -> ReleaseOutcome:

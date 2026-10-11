@@ -520,6 +520,16 @@ embedding/recall compatibility fallbacks and modality accounting preserve native
 control receipts before ordinary error/cancellation normalization; uncertainty
 cannot authorize another INSERT, vector rewrite or legacy retrieval retry.
 
+Failed boot joins the original LLM preference/accounting and native provider
+owners before retiring their borrowed database. Dispatcher cleanup control is
+not a request to retry cancellation indefinitely. Every independent feature
+and resource inverse is attempted even when another returns a cancellation or
+native exception group; FAILED is published before the strongest original
+control receipt propagates. The serving-record audit remains conservative for
+uncertified close owners even after physical cleanup finishes. Optional startup
+initialization, inference-lease tools and model selection preserve explicit
+control causes/groups before formatting ordinary failures or taking fallbacks.
+
 See the [canonical storage contract](../architecture/storage/STORAGE_ARCHITECTURE.md#hosted-execution-custody)
 for installation and limitations. Full independent review, repository/CI gates,
 immutable publication/verification and Frinz generation adoption/live acceptance
