@@ -51,6 +51,8 @@ from .output_ceiling import (
 from contextlib import asynccontextmanager
 
 from .retry import with_retry
+import asyncio
+import sys
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 
 logger = logging.getLogger(__name__)
@@ -98,11 +100,25 @@ async def _anthropic_stream_with_retry(client, api_params):
         cm = client.messages.stream(**api_params)
         return cm, await cm.__aenter__()
 
-    stream_cm, stream = await with_retry(_enter)
+    async def close_acquired(pair):
+        from kestrel_sovereign._async_ownership import await_owned_task
+        from kestrel_sovereign.execution_custody import bind_execution_cleanup
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+
+        original = sys.exc_info()[1]
+
+        async def owned_close():
+            with bind_execution_cleanup(None):
+                await pair[0].__aexit__(None, None, None)
+        outcome = await await_owned_task(asyncio.create_task(owned_close()))
+        if outcome.error is not None or outcome.cancellation is not None:
+            raise execution_terminal_error(original, outcome.error, outcome.cancellation)
+
+    stream_cm, stream = await with_retry(_enter, acquired_result_cleanup=close_acquired)
     try:
         yield stream
     finally:
-        await stream_cm.__aexit__(None, None, None)
+        await close_acquired((stream_cm, stream))
 
 
 async def _anthropic_final_message(client, api_params):

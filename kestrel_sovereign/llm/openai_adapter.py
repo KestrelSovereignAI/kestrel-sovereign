@@ -72,6 +72,7 @@ from .output_ceiling import (
     output_limit_cut_notice,
 )
 from .retry import with_retry
+from kestrel_sovereign.execution_custody import close_native_execution_stream
 
 logger = logging.getLogger(__name__)
 
@@ -714,25 +715,29 @@ class OpenAIAdapter(LLMAdapter):
                 model=model,
                 messages=normalized_messages,
                 stream=True,
+                acquired_result_cleanup=close_native_execution_stream,
                 **extra_kwargs
             )
 
             splitter = _ThinkingContentSplitter(provider=self.name)
             chunk_count = 0
             finish_reason = None
-            async for chunk in stream:
-                # #3355: the finish reason rides on the last choice chunk.
-                finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
-                delta = chunk.choices[0].delta
-                reasoning_content = getattr(delta, "reasoning_content", None)
-                if isinstance(reasoning_content, str) and reasoning_content:
-                    yield ThinkingDelta(reasoning_content, provider=self.name)
-                content_delta = getattr(delta, "content", None)
-                if isinstance(content_delta, str) and content_delta:
-                    for item in splitter.feed(content_delta):
-                        if isinstance(item, str):
-                            chunk_count += 1
-                        yield item
+            try:
+                async for chunk in stream:
+                    # #3355: the finish reason rides on the last choice chunk.
+                    finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
+                    delta = chunk.choices[0].delta
+                    reasoning_content = getattr(delta, "reasoning_content", None)
+                    if isinstance(reasoning_content, str) and reasoning_content:
+                        yield ThinkingDelta(reasoning_content, provider=self.name)
+                    content_delta = getattr(delta, "content", None)
+                    if isinstance(content_delta, str) and content_delta:
+                        for item in splitter.feed(content_delta):
+                            if isinstance(item, str):
+                                chunk_count += 1
+                            yield item
+            finally:
+                await close_native_execution_stream(stream, self)
 
             for item in splitter.flush():
                 if isinstance(item, str):
@@ -851,6 +856,7 @@ class OpenAIAdapter(LLMAdapter):
                 model=model,
                 messages=normalized_messages,
                 stream=True,
+                acquired_result_cleanup=close_native_execution_stream,
                 **extra_kwargs
             )
 
@@ -869,100 +875,103 @@ class OpenAIAdapter(LLMAdapter):
             call_cost = None
             finish_reason = None
 
-            async for chunk in stream:
-                # Extract usage from final chunk (OpenAI sends it with stream_options)
-                if hasattr(chunk, 'usage') and chunk.usage:
-                    (
-                        input_tokens,
-                        output_tokens,
-                        total_tokens,
-                        cache_creation_input_tokens,
-                        cache_read_input_tokens,
-                    ) = _normalized_openai_usage(chunk.usage)
-                    # OpenRouter reports exact per-call cost on the usage-only
-                    # final chunk when ``usage: {include: true}`` was sent
-                    # (kestrel #1806). Stash it for the terminal response.
-                    _cost = getattr(chunk.usage, 'cost', None)
-                    if _cost is None:
-                        _extra = getattr(chunk.usage, 'model_extra', None)
-                        if isinstance(_extra, dict):
-                            _cost = _extra.get('cost')
-                    if _cost is not None:
-                        try:
-                            call_cost = float(_cost)
-                        except (TypeError, ValueError):
-                            call_cost = None
+            try:
+                async for chunk in stream:
+                    # Extract usage from final chunk (OpenAI sends it with stream_options)
+                    if hasattr(chunk, 'usage') and chunk.usage:
+                        (
+                            input_tokens,
+                            output_tokens,
+                            total_tokens,
+                            cache_creation_input_tokens,
+                            cache_read_input_tokens,
+                        ) = _normalized_openai_usage(chunk.usage)
+                        # OpenRouter reports exact per-call cost on the usage-only
+                        # final chunk when ``usage: {include: true}`` was sent
+                        # (kestrel #1806). Stash it for the terminal response.
+                        _cost = getattr(chunk.usage, 'cost', None)
+                        if _cost is None:
+                            _extra = getattr(chunk.usage, 'model_extra', None)
+                            if isinstance(_extra, dict):
+                                _cost = _extra.get('cost')
+                        if _cost is not None:
+                            try:
+                                call_cost = float(_cost)
+                            except (TypeError, ValueError):
+                                call_cost = None
 
-                # Skip chunks with no choices (like the final usage-only chunk)
-                if not chunk.choices:
-                    continue
+                    # Skip chunks with no choices (like the final usage-only chunk)
+                    if not chunk.choices:
+                        continue
 
-                # #3355: the finish reason rides on the last choice chunk.
-                finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
-                delta = chunk.choices[0].delta
+                    # #3355: the finish reason rides on the last choice chunk.
+                    finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
+                    delta = chunk.choices[0].delta
 
-                # Handle text content - yield immediately for real-time streaming
-                delta_reasoning_content = getattr(delta, "reasoning_content", None)
-                if isinstance(delta_reasoning_content, str) and delta_reasoning_content:
-                    reasoning_content += delta_reasoning_content
-                    yield ThinkingDelta(delta_reasoning_content, provider=self.name)
+                    # Handle text content - yield immediately for real-time streaming
+                    delta_reasoning_content = getattr(delta, "reasoning_content", None)
+                    if isinstance(delta_reasoning_content, str) and delta_reasoning_content:
+                        reasoning_content += delta_reasoning_content
+                        yield ThinkingDelta(delta_reasoning_content, provider=self.name)
 
-                content_delta = getattr(delta, "content", None)
-                if isinstance(content_delta, str) and content_delta:
-                    for item in splitter.feed(content_delta):
-                        if isinstance(item, str):
-                            chunk_count += 1
-                            text_content += item
-                        yield item
+                    content_delta = getattr(delta, "content", None)
+                    if isinstance(content_delta, str) and content_delta:
+                        for item in splitter.feed(content_delta):
+                            if isinstance(item, str):
+                                chunk_count += 1
+                                text_content += item
+                            yield item
 
-                # Handle tool call deltas - accumulate by index
-                if hasattr(delta, 'tool_calls') and delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
+                    # Handle tool call deltas - accumulate by index
+                    if hasattr(delta, 'tool_calls') and delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
 
-                        # Initialize accumulator for this tool call if
-                        # needed AND emit the SDK 0.7.0 ToolCallStarted
-                        # marker — exactly once per distinct index, on
-                        # the first delta for that index. OpenAI's
-                        # first delta typically carries id and name (in
-                        # the same fragment that introduces the index),
-                        # but the contract permits None for either when
-                        # the provider stream hasn't surfaced them yet.
-                        # We capture whatever's on this delta and emit
-                        # ``None`` for any field that arrives empty —
-                        # the final LLMResponse is the source of truth
-                        # for the assembled call.
-                        is_new_call = idx not in tool_calls_accumulator
-                        if is_new_call:
-                            tool_calls_accumulator[idx] = {
-                                "id": "",
-                                "name": "",
-                                "arguments": ""
-                            }
+                            # Initialize accumulator for this tool call if
+                            # needed AND emit the SDK 0.7.0 ToolCallStarted
+                            # marker — exactly once per distinct index, on
+                            # the first delta for that index. OpenAI's
+                            # first delta typically carries id and name (in
+                            # the same fragment that introduces the index),
+                            # but the contract permits None for either when
+                            # the provider stream hasn't surfaced them yet.
+                            # We capture whatever's on this delta and emit
+                            # ``None`` for any field that arrives empty —
+                            # the final LLMResponse is the source of truth
+                            # for the assembled call.
+                            is_new_call = idx not in tool_calls_accumulator
+                            if is_new_call:
+                                tool_calls_accumulator[idx] = {
+                                    "id": "",
+                                    "name": "",
+                                    "arguments": ""
+                                }
 
-                        # Accumulate id (usually comes in first chunk)
-                        if tc_delta.id:
-                            tool_calls_accumulator[idx]["id"] += tc_delta.id
+                            # Accumulate id (usually comes in first chunk)
+                            if tc_delta.id:
+                                tool_calls_accumulator[idx]["id"] += tc_delta.id
 
-                        # Accumulate function name (usually comes in first chunk)
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                tool_calls_accumulator[idx]["name"] += tc_delta.function.name
-                            # Accumulate arguments (comes in multiple chunks)
-                            if tc_delta.function.arguments:
-                                tool_calls_accumulator[idx]["arguments"] += tc_delta.function.arguments
+                            # Accumulate function name (usually comes in first chunk)
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    tool_calls_accumulator[idx]["name"] += tc_delta.function.name
+                                # Accumulate arguments (comes in multiple chunks)
+                                if tc_delta.function.arguments:
+                                    tool_calls_accumulator[idx]["arguments"] += tc_delta.function.arguments
 
-                        if is_new_call:
-                            # Emit ToolCallStarted only after we've
-                            # absorbed the first delta's id/name so the
-                            # marker carries them when present rather
-                            # than always being ``(None, None)``.
-                            current = tool_calls_accumulator[idx]
-                            yield ToolCallStarted(
-                                index=idx,
-                                id=current["id"] or None,
-                                name=current["name"] or None,
-                            )
+                            if is_new_call:
+                                # Emit ToolCallStarted only after we've
+                                # absorbed the first delta's id/name so the
+                                # marker carries them when present rather
+                                # than always being ``(None, None)``.
+                                current = tool_calls_accumulator[idx]
+                                yield ToolCallStarted(
+                                    index=idx,
+                                    id=current["id"] or None,
+                                    name=current["name"] or None,
+                                )
+            finally:
+                await close_native_execution_stream(stream, self)
 
             logger.info(f"Stream completed. Text chunks: {chunk_count}, Tool calls: {len(tool_calls_accumulator)}")
 

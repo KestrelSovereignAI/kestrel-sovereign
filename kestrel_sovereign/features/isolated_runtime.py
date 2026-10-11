@@ -15795,6 +15795,7 @@ class ProxyFeature(Feature):
         payload: dict[str, Any],
         *,
         terminal_disposition: str | None = None,
+        acknowledgement_only: bool = False,
     ) -> Any:
         """Durably admit one host-authenticated Telegram webhook result.
 
@@ -15819,6 +15820,15 @@ class ProxyFeature(Feature):
             and terminal_disposition not in _TELEGRAM_TERMINAL_DISPOSITIONS
         ):
             raise ProtocolError("invalid hosted Telegram terminal disposition")
+        if type(acknowledgement_only) is not bool or (
+            acknowledgement_only and terminal_disposition is not None
+        ):
+            raise ProtocolError("invalid hosted acknowledgement admission")
+        # This classification is supplied only by the authenticated host API.
+        # It is intentionally not a child-advertised terminal descriptor: a
+        # transport may not downgrade arbitrary messages to care receipts.
+        if acknowledgement_only:
+            terminal_disposition = "care_acknowledgement"
         return await self._route_validated_inbound(
             payload,
             cursor_owned_protocol=True,

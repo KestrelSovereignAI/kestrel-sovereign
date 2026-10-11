@@ -10,6 +10,7 @@ Adapter for local Ollama instance with support for:
 """
 import json
 import logging
+from kestrel_sovereign.execution_custody import owned_execution_stream, close_native_execution_stream
 from collections.abc import Mapping
 from typing import (
     Any, AsyncIterator, Dict, List, Optional, Tuple, Type, Union, TYPE_CHECKING,
@@ -733,9 +734,11 @@ class OllamaAdapter(LLMAdapter):
                     model=model,
                     messages=messages,
                     stream=True,
+                    acquired_result_cleanup=close_native_execution_stream,
                     **extra_kwargs
                 ),
                 cancel_token,
+                abandoned_result_cleanup=close_native_execution_stream,
             )
 
             chunk_count = 0
@@ -796,9 +799,7 @@ class OllamaAdapter(LLMAdapter):
             finally:
                 # Closing the response is what stops the server generating
                 # when this stream is abandoned or fails part-way.
-                aclose = getattr(stream, "aclose", None)
-                if aclose is not None:
-                    await aclose()
+                await close_native_execution_stream(stream, self)
 
             if done_reason == _LENGTH_DONE_REASON:
                 raise self._output_cap_reached(model, budget)
@@ -862,16 +863,17 @@ class OllamaAdapter(LLMAdapter):
         Yields:
             Text chunks as they arrive. For structured output, yields JSON chunks.
         """
-        async for item in self._stream_with_usage(
+        async with owned_execution_stream(self, self._stream_with_usage(
             client=client,
             model=model,
             messages=messages,
             tools=tools,
             response_format=response_format,
             **kwargs
-        ):
-            if not isinstance(item, LLMResponse):
-                yield item
+        )) as owned_stream:
+            async for item in owned_stream:
+                if not isinstance(item, LLMResponse):
+                    yield item
 
     async def get_streaming_response_with_tools(
         self,
@@ -957,14 +959,15 @@ class OllamaAdapter(LLMAdapter):
 
             # No tools - stream text and forward the terminal usage response so
             # the service layer meters text-only streamed turns (#1684).
-            async for item in self._stream_with_usage(
+            async with owned_execution_stream(self, self._stream_with_usage(
                 client=client,
                 model=model,
                 messages=messages,
                 response_format=response_format,
                 **kwargs
-            ):
-                yield item
+            )) as owned_stream:
+                async for item in owned_stream:
+                    yield item
 
         except OutputCapReachedError:
             raise

@@ -160,6 +160,8 @@ from kestrel_sovereign.signals.sources.channels import (
     DURABLE_COGNITION_MARKER,
     DURABLE_COGNITION_MARKER_VALUE,
     DURABLE_TERMINAL_CONSUMER_ID,
+    DURABLE_TERMINAL_MARKER,
+    DURABLE_TERMINAL_MARKER_VALUE,
 )
 from kestrel_sovereign.signals.store import SignalLogStore
 from kestrel_sovereign.storage.db.write_audit import (
@@ -4268,7 +4270,7 @@ class SignalDispatcher:
         consumer_id: str,
         durable_admission: asyncio.Future[DurableAdmissionResult] | None,
     ) -> SignalResult:
-        """Mark one selected malformed-ingress delivery terminal and ACKable.
+        """Mark one selected non-cognitive ingress delivery terminal and ACKable.
 
         No channel content reaches cognition on this path. The durable row is
         nevertheless claimed and terminally settled so a polling provider can
@@ -4409,6 +4411,30 @@ class SignalDispatcher:
                 consumer_id=consumer_id,
                 event_id=persisted_event_id,
             )
+            if existing is None and consumer_id == DURABLE_COGNITION_CONSUMER_ID:
+                terminal = await self.get_durable_delivery_for_event(
+                    consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
+                    event_id=persisted_event_id,
+                )
+                if terminal is not None and terminal.status == TERMINAL_ACKABLE:
+                    expected = dict(signal.payload)
+                    expected.pop(DURABLE_COGNITION_MARKER, None)
+                    expected[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
+                    retained = self._signal_from_durable_event(
+                        terminal.event, dispatch_signal=signal,
+                    )
+                    if (
+                        retained.source == signal.source
+                        and retained.target_agent == signal.target_agent
+                        and retained.kind == signal.kind
+                        and retained.caller == signal.caller
+                        and retained.dedupe_key == signal.dedupe_key
+                        and retained.payload == expected
+                    ):
+                        # A lost webhook response may redeliver after recovery
+                        # opens. ACK the exact retained terminal receipt; never
+                        # upgrade care-only/malformed content into cognition.
+                        existing = terminal
             if existing is not None and existing.status in {
                 ACKNOWLEDGED,
                 TERMINAL_ACKABLE,

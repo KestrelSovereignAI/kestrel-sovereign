@@ -15,6 +15,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
+import asyncio
+import inspect
+import sys
 import stat
 from typing import Any, Protocol, TYPE_CHECKING, TypeVar
 
@@ -427,7 +430,10 @@ def bind_execution_runtime(owner: Any) -> Iterator[None]:
 _Result = TypeVar("_Result")
 
 
-async def await_execution_work(owner: Any, operation: Callable[[], Awaitable[_Result]]) -> _Result:
+async def await_execution_work(
+    owner: Any, operation: Callable[[], Awaitable[_Result]], *,
+    acquired_result_cleanup: Callable[[_Result], Awaitable[None]] | None = None,
+) -> _Result:
     """Dispatch a lazy provider operation under its original runtime custody.
 
     The callable is evaluated only after admission, and its owned children
@@ -445,8 +451,39 @@ async def await_execution_work(owner: Any, operation: Callable[[], Awaitable[_Re
                 raise
             require_execution_work(owner)
             raise
-        require_execution_work(owner)
+        try:
+            require_execution_work(owner)
+        except BaseException as denial:
+            # A successful OPEN may already own an HTTP response. Admission
+            # loss must not erase the sole native handle before its adapter
+            # gets an opportunity to install the ordinary stream closer.
+            if acquired_result_cleanup is not None:
+                from kestrel_sovereign._async_ownership import await_owned_task
+
+                with bind_execution_cleanup(owner):
+                    close = asyncio.create_task(acquired_result_cleanup(result))
+                    outcome = await await_owned_task(close)
+                raise execution_terminal_error(denial, outcome.error, outcome.cancellation)
+            raise
         return result
+
+
+async def close_native_execution_stream(stream: Any, owner: Any = None) -> None:
+    """Physically join an acquired SDK stream close under cleanup-only custody."""
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+    if not callable(close):
+        return  # Legacy in-memory iterators have no native response resource.
+    original = sys.exc_info()[1]
+    async def owned_close():
+        with bind_execution_cleanup(owner):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+    outcome = await await_owned_task(asyncio.create_task(owned_close()))
+    if outcome.error is not None or outcome.cancellation is not None:
+        raise execution_terminal_error(original, outcome.error, outcome.cancellation)
 
 
 def execution_work_operation(function: Callable) -> Callable:

@@ -594,6 +594,9 @@ class RestartCoordinatorFeature(Feature):
         try:
             return await self._reap_post_restart_rows()
         except Exception as e:  # never let readiness wiring break boot
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             logger.warning("post-restart wake sweep on_agent_ready failed: %s", e)
             return []
 
@@ -3919,6 +3922,9 @@ class RestartCoordinatorFeature(Feature):
         try:
             landed = await mark_wake_delivered(self._db, row.id)
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "restart sweep: failed to flag wake_delivered for %s: %s; "
                 "until this write lands the next sweep will re-emit this "
@@ -3955,6 +3961,9 @@ class RestartCoordinatorFeature(Feature):
                 boot_id=_PROCESS_BOOT_ID,
             )
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "restart sweep: failed to record wake dispatch for %s: %s; "
                 "the wake still fires, but this dispatch leaves no record",

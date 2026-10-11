@@ -19,6 +19,7 @@ Key features:
 """
 import os
 import logging
+from kestrel_sovereign.execution_custody import owned_execution_stream
 from dataclasses import replace
 import httpx
 from typing import List, Optional, Dict, Any, Type, AsyncIterator, TYPE_CHECKING, Union
@@ -269,15 +270,16 @@ class OpenRouterAdapter(OpenAIAdapter):
         if client is None:
             client = self._get_client()
 
-        async for chunk in super().get_streaming_response(
+        async with owned_execution_stream(self, super().get_streaming_response(
             client=client,
             model=model,
             messages=messages,
             tools=tools,
             response_format=response_format,
             **kwargs
-        ):
-            yield chunk
+        )) as owned_stream:
+            async for chunk in owned_stream:
+                yield chunk
 
     async def get_streaming_response_with_tools(
         self,
@@ -292,15 +294,16 @@ class OpenRouterAdapter(OpenAIAdapter):
         if client is None:
             client = self._get_client()
 
-        async for item in super().get_streaming_response_with_tools(
+        async with owned_execution_stream(self, super().get_streaming_response_with_tools(
             client=client,
             model=model,
             messages=messages,
             tools=tools,
             response_format=response_format,
             **self._with_usage_accounting(kwargs)
-        ):
-            yield item
+        )) as owned_stream:
+            async for item in owned_stream:
+                yield item
 
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """Fetch models from OpenRouter API with rich metadata.

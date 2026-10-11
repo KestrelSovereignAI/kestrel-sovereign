@@ -484,6 +484,7 @@ async def with_retry(
     max_delay: float = MAX_DELAY,
     throttle_max_retries: int = THROTTLE_MAX_RETRIES,
     throttle_max_delay: float = THROTTLE_MAX_DELAY,
+    acquired_result_cleanup: Callable[[Any], Any] | None = None,
     **kwargs
 ) -> T:
     """
@@ -538,7 +539,10 @@ async def with_retry(
 
     while True:
         try:
-            return await await_execution_work(None, lambda: func(*args, **kwargs))
+            return await await_execution_work(
+                None, lambda: func(*args, **kwargs),
+                acquired_result_cleanup=acquired_result_cleanup,
+            )
         except ExecutionAuthorityError:
             raise
         except Exception as e:

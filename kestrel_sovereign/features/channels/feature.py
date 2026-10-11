@@ -70,6 +70,7 @@ _TELEGRAM_TERMINAL_DISPOSITIONS = frozenset(
         "unsupported_update",
         "senderless_update",
         "unauthorized_sender",
+        "care_acknowledgement",
     }
 )
 
@@ -998,6 +999,19 @@ class ChannelFeature(Feature):
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
         if metadata.get("dedupe_key") != message.id:
             return InboundAdmission(InboundAdmissionDisposition.REJECTED)
+        if disposition == "care_acknowledgement":
+            # Valid care replies retain their sanitized content for durable
+            # workflow observers, but never create a cognition delivery.
+            adapter = self.registry.get(message.channel_type)
+            config = getattr(adapter, "config", None)
+            if (
+                canonical_telegram_user_id(message.sender) is None
+                or config is None
+                or not config.enabled
+                or not getattr(config, "allowed_senders", None)
+                or not config.is_sender_allowed(message.sender)
+            ):
+                return InboundAdmission(InboundAdmissionDisposition.REJECTED)
         if (
             self._durable_cognition_registration_failed
             or not self._durable_terminal_ready

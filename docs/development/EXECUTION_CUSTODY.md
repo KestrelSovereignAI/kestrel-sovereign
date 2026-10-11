@@ -530,6 +530,21 @@ uncertified close owners even after physical cleanup finishes. Optional startup
 initialization, inference-lease tools and model selection preserve explicit
 control causes/groups before formatting ordinary failures or taking fallbacks.
 
+Native SDK stream acquisition retains the opened resource through post-open
+authority validation. A rejected handle is closed under cleanup-only custody
+before its original denial escapes. Every adapter forwarding layer owns and
+joins its inner iterator, and native response closure preserves original
+control receipts even when Stop races a completed child or cleanup fails.
+
+Authenticated hosts may admit a care-only Telegram acknowledgement through
+the durable non-cognitive terminal path. Its sanitized content reaches
+registered workflow observers, but no cognition delivery is created. A child
+wire descriptor cannot request this host-only classification; a later ordinary
+retry cannot upgrade its retained source event into cognition. The host must
+fence the current outstanding wait, reply identity, owner, route and config
+generation through admission. This does not bypass privacy, sender or Hold
+policy, or replace Workflows' signal/deadline CAS.
+
 See the [canonical storage contract](../architecture/storage/STORAGE_ARCHITECTURE.md#hosted-execution-custody)
 for installation and limitations. Full independent review, repository/CI gates,
 immutable publication/verification and Frinz generation adoption/live acceptance
