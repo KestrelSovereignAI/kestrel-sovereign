@@ -477,10 +477,22 @@ class Feature(_SdkFeature):
         safe. Overrides that do their own teardown should call
         ``await super().shutdown()``.
         """
-        await self._unregister_owned_signal_sources()
-        await self._unregister_owned_wait_providers()
-        await self._cancel_owned_background_tasks()
-        await self._unregister_owned_sleep_hooks()
+        failures = []
+        for release in (
+            self._unregister_owned_signal_sources,
+            self._unregister_owned_wait_providers,
+            self._cancel_owned_background_tasks,
+            self._unregister_owned_sleep_hooks,
+        ):
+            try:
+                await release()
+            except BaseException as error:
+                if not is_execution_control_error(error):
+                    raise
+                failures.append(error)
+        if failures:
+            from kestrel_sovereign.execution_custody import execution_terminal_error
+            raise execution_terminal_error(*failures)
 
     # ------------------------------------------------------------------
     # Signal-source ownership (#2522 P2)
@@ -908,12 +920,20 @@ class Feature(_SdkFeature):
         # set auto-discard. ``_owned`` binds THIS list, so a late callback firing
         # after :meth:`_cancel_owned_background_tasks` rebinds the attribute is a
         # harmless no-op rather than touching the fresh list (#2522 P1/P2).
-        task.add_done_callback(
-            lambda finished, _owned=owned: (
-                _owned.remove(finished) if finished in _owned else None
-            )
-        )
+        def completed(finished, _owned=owned):
+            from kestrel_sovereign._async_ownership import owned_task_error
+            self._remember_background_control(owned_task_error(finished))
+            if finished in _owned:
+                _owned.remove(finished)
+        task.add_done_callback(completed)
         return task
+
+    def _remember_background_control(self, error: BaseException | None) -> None:
+        if error is None or not is_execution_control_error(error):
+            return
+        failures = vars(self).setdefault("_owned_background_control_failures", [])
+        if all(existing is not error for existing in failures):
+            failures.append(error)
 
     def _track_owned_runtime_task(self, coro, *, name: str) -> asyncio.Task:
         """Own an explicit resident service through READY and feature teardown.
@@ -938,15 +958,22 @@ class Feature(_SdkFeature):
         cancelled task from its global set, so this does not leave a dangling
         reference there.
         """
-        tasks = getattr(self, "_owned_background_tasks", None)
-        if not tasks:
-            return
+        tasks = tuple(getattr(self, "_owned_background_tasks", ()) or ())
         pending = [task for task in tasks if not task.done()]
         for task in pending:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        from kestrel_sovereign._async_ownership import owned_task_error
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+        for task in tasks:
+            self._remember_background_control(owned_task_error(task))
         self._owned_background_tasks = []
+        terminal = execution_terminal_error(
+            *vars(self).get("_owned_background_control_failures", ()),
+        )
+        if terminal is not None:
+            raise terminal
 
     # ------------------------------------------------------------------
     # Sleep-hook ownership (#2522 P1)

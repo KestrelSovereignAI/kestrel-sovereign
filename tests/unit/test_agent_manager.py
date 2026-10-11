@@ -2730,9 +2730,12 @@ async def test_spawn_join_tracks_operation_not_callers_later_work(tmp_path):
     await asyncio.sleep(0)
     release_spawn.set()
     await asyncio.wait_for(spawn_returned.wait(), timeout=1)
-    await asyncio.sleep(0)
 
     try:
+        # Completion-only lifecycle joins intentionally take their own callback
+        # turn. Assert the actual operation boundary, not a fixed tick count:
+        # the enclosing caller is still blocked on release_caller throughout.
+        await asyncio.wait_for(asyncio.shield(join), timeout=1)
         assert join.done(), "spawn join followed the enclosing caller task"
         assert join.result() == (False, [])
         assert not caller.done()

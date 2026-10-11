@@ -6326,8 +6326,9 @@ class KestrelAgent(
         UNCONDITIONALLY even if an earlier one raises (#2522 P2): a failing
         ``on_disable`` must not leave the feature's shutdown / hooks / A2A /
         tools / dropped-from-``features`` cleanup un-run. Errors are collected
-        and the first is re-raised *after* all cleanup so callers still see the
-        failure. It does NOT enforce the mandatory-feature guard — that is a
+        and original control evidence takes precedence over ordinary errors
+        *after* all cleanup so callers still see the failure. It does NOT
+        enforce the mandatory-feature guard — that is a
         caller policy (runtime disable refuses; boot rollback must tear mandatory
         features down too).
 
@@ -6349,13 +6350,23 @@ class KestrelAgent(
         feature_tool_name = getattr(feature, "tool_name", feature_key)
         errors: List[BaseException] = []
 
+        def retain_failure(error):
+            if (
+                isinstance(error, BaseExceptionGroup)
+                and not isinstance(error, Exception)
+                and not is_execution_control_error(error)
+            ):
+                raise error
+            errors.append(error)
+            self._remember_shutdown_control(error)
+
         # Declarative contributions are exact lifecycle capabilities. Remove
         # them independently even when the feature's imperative hooks fail.
         try:
             runtime = self._ensure_feature_contribution_runtime()
             runtime.deactivate(feature)
-        except (Exception, asyncio.CancelledError) as exc:
-            errors.append(exc)
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            retain_failure(exc)
             logging.exception(
                 "Feature '%s' SDK contribution teardown failed; "
                 "continuing with the remaining cleanup",
@@ -6366,8 +6377,8 @@ class KestrelAgent(
         # every teardown step below, so its failure must not skip them.
         try:
             await feature.on_disable()
-        except (Exception, asyncio.CancelledError) as exc:
-            errors.append(exc)
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            retain_failure(exc)
             logging.exception(
                 "Feature '%s' on_disable() failed during teardown; "
                 "continuing with the remaining cleanup",
@@ -6378,8 +6389,8 @@ class KestrelAgent(
         reported = ReleaseOutcome.RELEASED
         try:
             reported = reported_outcome(await feature.shutdown())
-        except (Exception, asyncio.CancelledError) as exc:
-            errors.append(exc)
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            retain_failure(exc)
             logging.exception(
                 "Feature '%s' shutdown() failed during teardown; "
                 "continuing with the remaining cleanup",
@@ -6395,8 +6406,8 @@ class KestrelAgent(
                         f"Auto-unregistered hook '{hook.name}' from feature "
                         f"'{feature_key}'"
                     )
-            except (Exception, asyncio.CancelledError) as exc:
-                errors.append(exc)
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+                retain_failure(exc)
                 logging.exception(
                     "Feature '%s' hook unregistration failed during teardown; "
                     "continuing with the remaining cleanup",
@@ -6406,7 +6417,11 @@ class KestrelAgent(
         if self.task_manager:
             try:
                 self.task_manager.unregister_agent(feature.get_agent_card().name)
-            except (Exception, asyncio.CancelledError) as exc:
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+                if isinstance(exc, BaseExceptionGroup) and not isinstance(exc, Exception) and not is_execution_control_error(exc):
+                    raise
+                if is_execution_control_error(exc):
+                    retain_failure(exc)
                 logging.warning(
                     "Failed to unregister feature '%s' from task manager: %s",
                     feature_key,
@@ -6428,8 +6443,8 @@ class KestrelAgent(
                 self._tool_context_hidden_features.discard(feature.__class__.__name__)
             if isinstance(getattr(self, "_tool_context_hidden_tools", None), set):
                 self._tool_context_hidden_tools.difference_update(to_remove)
-        except (Exception, asyncio.CancelledError) as exc:
-            errors.append(exc)
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            retain_failure(exc)
             logging.exception(
                 "Feature '%s' dynamic-tool teardown failed; "
                 "continuing with the remaining cleanup",
@@ -6463,7 +6478,7 @@ class KestrelAgent(
 
         # Surface the failure only AFTER every independent cleanup step ran.
         if errors:
-            raise errors[0]
+            raise execution_terminal_error(*errors)
         return reported
 
     def _hold_feature(self, feature: "Feature") -> None:
@@ -8247,7 +8262,11 @@ Expected Duration: {expected_duration}
         # parallel map that could outlive the task.
         task._kestrel_started_at = time.monotonic()  # type: ignore[attr-defined]
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        def completed(done):
+            from kestrel_sovereign._async_ownership import owned_task_error
+            self._remember_shutdown_control(owned_task_error(done))
+            self._background_tasks.discard(done)
+        task.add_done_callback(completed)
         return task
 
     def _runtime_owner_context(self):
@@ -8302,6 +8321,8 @@ Expected Duration: {expected_duration}
         self._background_tasks.add(task)
 
         def completed(done):
+            from kestrel_sovereign._async_ownership import owned_task_error
+            self._remember_shutdown_control(owned_task_error(done))
             self._background_tasks.discard(done)
             if not started:
                 coro.close()
@@ -8312,6 +8333,7 @@ Expected Duration: {expected_duration}
     async def _shutdown_background_tasks(self) -> None:
         tasks = set(self._background_tasks)
         if not tasks:
+            self._raise_shutdown_control()
             return
 
         for task in tasks:
@@ -8319,7 +8341,11 @@ Expected Duration: {expected_duration}
                 task.cancel()
 
         await asyncio.gather(*tasks, return_exceptions=True)
+        from kestrel_sovereign._async_ownership import owned_task_error
+        for task in tasks:
+            self._remember_shutdown_control(owned_task_error(task))
         self._background_tasks.clear()
+        self._raise_shutdown_control()
 
     async def _complete_durable_shutdown_continuation(
         self,

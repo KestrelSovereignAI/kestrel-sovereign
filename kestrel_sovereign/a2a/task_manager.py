@@ -514,10 +514,8 @@ class TaskManager:
         self._execution_authorities[task] = (task_id, authority_agent_id)
 
         def _discard(done: asyncio.Task[None]) -> None:
-            try:
-                error = done.exception()
-            except asyncio.CancelledError as cancellation:
-                error = cancellation
+            from kestrel_sovereign._async_ownership import owned_task_error
+            error = owned_task_error(done)
             if error is not None and is_execution_control_error(error):
                 self._remember_execution_control(error)
             self._execution_tasks.discard(done)

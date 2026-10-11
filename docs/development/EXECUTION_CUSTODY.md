@@ -323,6 +323,13 @@ error or cancellation. Explicit exception-group members retain their strongest
 control evidence; incidental implicit handling context does not grant authority.
 Background task managers harvest original child cancellation before discarding
 completed tasks and retain unresolved receipts through subsequent drain/close.
+Feature-owned ordinary and resident tasks share that first terminal receipt
+with their agent owner. Completed-task removal cannot erase it, and repeated
+joins cannot replace a cause-bearing cancellation with a fresh cancellation.
+Feature retirement still unregisters its sleep hooks after a control-bearing
+child failure. Full feature removal attempts every independent inverse and
+selects irreversible control evidence ahead of an earlier ordinary cleanup
+failure, retaining the failed feature owner for later joined retirement.
 The real agent shutdown joins every later resource owner before reporting that
 receipt. Physical retirement is not reconciliation or an acknowledged Stop.
 Deferred OpenRouter provisioning validates the original admission after client

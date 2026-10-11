@@ -18,6 +18,7 @@ from typing import Generic, TypeVar, cast
 _T = TypeVar("_T")
 _ITERATOR_TERMINAL = object()
 _ITERATOR_INTERRUPTED = object()
+_TASK_ERROR_UNSET = object()
 
 
 class _ConsumerCloseRecord:
@@ -370,6 +371,26 @@ class OwnedAsyncIterator(Generic[_T]):
         raise_owned_outcome(outcome, operation=self._operation)
 
 
+def owned_task_error(task: asyncio.Task[_T]) -> BaseException | None:
+    """Retain the first terminal error across every owner of the same task.
+
+    Asyncio consumes a cancelled task's original exception on first retrieval.
+    A completion callback and a later lifecycle join must share that evidence,
+    not manufacture a cause-free cancellation on the second read.
+    """
+    retained = getattr(task, "_kestrel_owned_terminal_error", _TASK_ERROR_UNSET)
+    if retained is not _TASK_ERROR_UNSET:
+        return retained
+    if not task.done():
+        raise RuntimeError("owned task has not reached terminal state")
+    try:
+        error = task.exception()
+    except asyncio.CancelledError as cancellation:
+        error = cancellation
+    task._kestrel_owned_terminal_error = error  # type: ignore[attr-defined]
+    return error
+
+
 async def await_owned_task(
     task: asyncio.Task[_T],
     pending_cancellation: asyncio.CancelledError | None = None,
@@ -404,10 +425,10 @@ async def await_owned_task(
     finally:
         task.remove_done_callback(mark_complete)
 
-    try:
-        return OwnedTaskOutcome(task.result(), None, pending_cancellation)
-    except BaseException as error:
+    error = owned_task_error(task)
+    if error is not None:
         return OwnedTaskOutcome(None, error, pending_cancellation)
+    return OwnedTaskOutcome(task.result(), None, pending_cancellation)
 
 
 def raise_owned_outcome(
