@@ -219,6 +219,93 @@ class EndingBody(Body):
         yield self.chunk
 
 
+@pytest.mark.asyncio
+async def test_keyless_terminal_retry_uses_original_channel_sender_not_opaque_label(tmp_path, monkeypatch):
+    from tests.unit.test_execution_custody_review39_native import (
+        test_host_care_ack_fans_out_native_delivery_without_cognition_or_upgrade,
+    )
+    monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+    await test_host_care_ack_fans_out_native_delivery_without_cognition_or_upgrade(tmp_path, "normal")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tools", [False, True])
+async def test_ollama_implicit_sdk_http_close_has_one_retained_owner(tools):
+    import ollama
+
+    from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
+    body = EndingBody(json.dumps({
+        "model": "offline", "message": {"role": "assistant", "content": "hello"}, "done": False,
+    }).encode() + b"\n")
+    http = httpx.AsyncClient(base_url="http://offline.invalid", transport=httpx.MockTransport(
+        lambda _: httpx.Response(200, headers={"content-type": "application/x-ndjson"}, stream=body)
+    ))
+    client, adapter = ollama.AsyncClient(host="http://offline.invalid"), OllamaAdapter()
+    original_http = client._client
+    client._client = http
+    method = adapter.get_streaming_response_with_tools if tools else adapter.get_streaming_response
+    iterator = method(client=client, model="offline", messages=[{"role": "user", "content": "hello"}])
+    async def consume():
+        async for _ in iterator:
+            pass
+    task = asyncio.create_task(consume())
+    try:
+        await _interrupt_native_close(task, body)
+    finally:
+        body.release_close.set()
+        await await_owned_task(task)
+        await iterator.aclose()
+        await body.aclose()
+        await http.aclose()
+        await original_http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_shared_ollama_http_client_retains_each_original_request_scope():
+    import ollama
+
+    from kestrel_sovereign.execution_custody import (
+        bind_execution_custody,
+        current_execution_custody,
+    )
+    from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
+    from tests.unit.test_execution_custody_review39_native import Fence
+
+    observations, bodies = [], []
+    class RecordingBody(EndingBody):
+        async def aclose(self):
+            observations.append(current_execution_custody())
+            await super().aclose()
+    def response(_request):
+        body = RecordingBody(json.dumps({
+            "model": "offline", "message": {"role": "assistant", "content": "hello"}, "done": False,
+        }).encode() + b"\n")
+        body.release_close.set()
+        bodies.append(body)
+        return httpx.Response(200, stream=body)
+    http = httpx.AsyncClient(base_url="http://offline.invalid", transport=httpx.MockTransport(response))
+    client, adapter = ollama.AsyncClient(host="http://offline.invalid"), OllamaAdapter()
+    original_http = client._client
+    client._client = http
+    scopes = []
+    try:
+        for _ in range(2):
+            with bind_execution_custody(Fence()) as scope:
+                scopes.append(scope)
+                iterator = adapter.get_streaming_response(client=client, model="offline", messages=[])
+                try:
+                    async for _ in iterator:
+                        pass
+                finally:
+                    await iterator.aclose()
+        assert observations == [(scopes[0],), (scopes[1],)]
+        assert all(body.closed for body in bodies)
+        assert len(http.event_hooks["response"]) == 1
+    finally:
+        await http.aclose()
+        await original_http.aclose()
+
+
 async def _interrupt_native_close(task, body):
     await asyncio.wait_for(body.close_entered.wait(), 2)
     task.cancel()

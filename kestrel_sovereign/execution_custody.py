@@ -478,7 +478,7 @@ def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None
     import httpx
     from kestrel_sovereign._async_ownership import await_owned_task
 
-    response = getattr(stream, "response", None)
+    response = stream if isinstance(stream, httpx.Response) else getattr(stream, "response", None)
     if not isinstance(response, httpx.Response):
         return
     if "kestrel.native_close_owner" in response.extensions:
@@ -499,6 +499,27 @@ def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None
 
     response.extensions["kestrel.native_close_owner"] = joined_close
     response.aclose = joined_close
+
+
+def retain_native_execution_http_client_close(client: Any) -> None:
+    """Acquire response custody for SDKs that hide it inside generators.
+
+    HTTPX response hooks run before body iteration. Capture each request's
+    own active custody there, never the first caller's scope on a shared
+    client. The hook only installs the same per-response physical close owner
+    used by exposed SDK streams; it grants no execution or retry authority.
+    """
+    import httpx
+    if not isinstance(client, httpx.AsyncClient):
+        return
+    if getattr(client, "_kestrel_native_close_hook", None) is not None:
+        return
+
+    async def retain_response(response):
+        retain_native_execution_stream_close(response)
+
+    client.event_hooks["response"].append(retain_response)
+    client._kestrel_native_close_hook = retain_response
 
 
 async def close_native_execution_stream(stream: Any, owner: Any = None) -> None:

@@ -10,7 +10,9 @@ Adapter for local Ollama instance with support for:
 """
 import json
 import logging
-from kestrel_sovereign.execution_custody import owned_execution_stream, close_native_execution_stream
+from kestrel_sovereign.execution_custody import (
+    owned_execution_stream, close_native_execution_stream, retain_native_execution_http_client_close,
+)
 from collections.abc import Mapping
 from typing import (
     Any, AsyncIterator, Dict, List, Optional, Tuple, Type, Union, TYPE_CHECKING,
@@ -728,6 +730,10 @@ class OllamaAdapter(LLMAdapter):
             # a server that ignores ``num_predict`` must not stream without end.
             extra_kwargs, budget = self._chat_kwargs(extra_kwargs, kwargs, model)
 
+            # Ollama returns an async generator rather than an SDK stream
+            # exposing .response. Own its native HTTP response BEFORE the
+            # generator can reach HTTPX's implicit EOF close.
+            retain_native_execution_http_client_close(getattr(client, "_client", None))
             stream = await await_or_cancelled(
                 with_retry(
                     client.chat,

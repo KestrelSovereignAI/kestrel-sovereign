@@ -4195,11 +4195,27 @@ class SignalDispatcher:
                         # privacy-safe persisted projection to match exactly.
                         projection = self._signal_for_durable_persistence(candidate, registration)
                         retained = self._signal_from_durable_event(terminal.event, dispatch_signal=signal)
+                        caller_matches = retained.caller == candidate.caller
+                        if (
+                            isinstance(retained.caller, str)
+                            and retained.caller.startswith(_DURABLE_CALLER_IDENTITY_KEYLESS_PREFIX)
+                        ):
+                            # The protected field is intentionally opaque in
+                            # keyless NORMAL installs. This channel's original
+                            # raw sender is already in its retained payload;
+                            # it is the source-owned replay identity, not the
+                            # opaque audit label. Recovery above validated the
+                            # versioned label and exact payload equality below
+                            # still fences content and correlation metadata.
+                            caller_matches = (
+                                candidate.caller == retained.payload.get("sender")
+                                == projection.signal.payload.get("sender")
+                            )
                         verified_terminal_retry = not projection.payload_elided and projection.signal.payload == candidate.payload and (
                             retained.source == candidate.source
                             and retained.target_agent == candidate.target_agent
                             and retained.kind == candidate.kind
-                            and retained.caller == candidate.caller
+                            and caller_matches
                             and retained.dedupe_key == candidate.dedupe_key
                             and retained.payload == projection.signal.payload
                         )

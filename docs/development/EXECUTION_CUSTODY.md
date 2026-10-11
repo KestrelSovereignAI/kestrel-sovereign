@@ -547,7 +547,10 @@ policy, or replace Workflows' signal/deadline CAS.
 
 SDK HTTP responses retain one native close owner before iteration, so an
 implicit SDK/HTTPX EOF close and explicit adapter teardown join the same
-physical resource retirement. A cancelled successful Codex session-lock
+physical resource retirement. SDK generators that hide their response (Ollama)
+install that same owner at HTTPX's pre-body response hook, capturing each
+request's own custody rather than the first caller's scope on a shared client.
+A cancelled successful Codex session-lock
 acquisition releases that exact lock before reporting cancellation.
 
 Dispatcher withdrawal joins both monitor and cognition owners before reporting
@@ -564,6 +567,9 @@ reasserted only after proving the retained terminal consumer row; ANONYMOUS
 retains no extra plaintext, and privacy-elided channels use that verified
 terminal receipt without creating a cognition delivery. Unverifiable legacy
 private content and altered sender/content/correlation metadata fail closed.
+Keyless NORMAL channel receipts use the retained source payload's original
+sender as replay identity; their validated opaque caller label remains an
+audit identity and is never compared to a raw provider sender identifier.
 
 See the [canonical storage contract](../architecture/storage/STORAGE_ARCHITECTURE.md#hosted-execution-custody)
 for installation and limitations. Full independent review, repository/CI gates,
