@@ -10,7 +10,10 @@ Adapter for local Ollama instance with support for:
 """
 import json
 import logging
-from typing import Any, Dict, List, Optional, Type, Union, TYPE_CHECKING, AsyncIterator
+from collections.abc import Mapping
+from typing import (
+    Any, AsyncIterator, Dict, List, Optional, Tuple, Type, Union, TYPE_CHECKING,
+)
 
 import httpx
 from pydantic import BaseModel
@@ -39,6 +42,11 @@ from kestrel_sdk.llm.decisions import (
 from .decisions.http import post_systemone, systemone_body
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import get_base64_only
+from .output_ceiling import (
+    OutputCapReachedError,
+    attach_stop_reason,
+    reported_token_limit,
+)
 from .retry import with_retry
 
 # Optional ollama import (not available in remote-only containers)
@@ -61,6 +69,28 @@ logger = logging.getLogger(__name__)
 OLLAMA_DECISION_MAX_QUESTIONS = 64
 OLLAMA_DECISION_MAX_OPTIONS = 26
 OLLAMA_DECISION_MAX_REQUEST_BYTES = 64 * 1024
+
+#: Ollama's ``done_reason`` for a generation that stopped at ``num_predict``.
+_LENGTH_DONE_REASON = "length"
+
+
+def _options_mapping(value: Any) -> Dict[str, Any]:
+    """A chat call's merged ``options`` as a dict its output budget can be set on.
+
+    ``RequestOptions.raw`` may replace the dict with an ``ollama.Options`` model
+    or with ``None``; both still carry the budget. Anything else is not an
+    Ollama options value and fails the call.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, BaseModel):
+        return value.model_dump(exclude_none=True)
+    raise TypeError(
+        f"Ollama chat options must be a mapping or ollama.Options, got "
+        f"{type(value).__name__}"
+    )
 
 
 def _show_field(info: Any, name: str) -> Any:
@@ -130,12 +160,16 @@ class OllamaAdapter(LLMAdapter):
 
     DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
     DEFAULT_EMBEDDING_DIM = 768
+    #: Output cap sent as ``num_predict`` on every chat call unless the route
+    #: configures ``max_output_tokens`` (#3552).
+    DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
     def __init__(
         self,
         *,
         embedding_model: Optional[str] = None,
         embedding_dim: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
     ):
         """Ollama is a local runtime; embeddings default to nomic-embed-text.
 
@@ -144,7 +178,20 @@ class OllamaAdapter(LLMAdapter):
         with the same weights served in the cloud. ``embedding_dim`` is
         forwarded as the ``dimensions`` param for Matryoshka-capable models and
         keys the model-identity embedding space (``<model>@<dim>``).
+
+        ``max_output_tokens`` is the route's output cap (#3552). Ollama itself
+        applies none, so without one a small model stuck in a repetition loop
+        generates until its context is exhausted while the turn waits on it.
         """
+        if max_output_tokens is None:
+            max_output_tokens = self.DEFAULT_MAX_OUTPUT_TOKENS
+        cap = reported_token_limit(max_output_tokens)
+        if cap is None:
+            raise ValueError(
+                f"Ollama max_output_tokens must be a positive integer, got "
+                f"{max_output_tokens!r}"
+            )
+        self._max_output_tokens = cap
         self._embedding_model = (
             str(embedding_model) if embedding_model else self.DEFAULT_EMBEDDING_MODEL
         )
@@ -211,9 +258,10 @@ class OllamaAdapter(LLMAdapter):
         if isinstance(raw, dict):
             for key, value in raw.items():
                 # Deep-merge the nested ``options`` dict so a raw escape hatch
-                # composes with the sampling/token options already built from
-                # neutral kwargs (temperature, max_tokens) instead of replacing
-                # them wholesale; per-key, raw wins.
+                # composes with the sampling options already built from
+                # neutral kwargs (temperature) instead of replacing them
+                # wholesale; per-key, raw wins. The chat paths then clamp
+                # ``num_predict`` to the route's cap (#3552).
                 if (
                     key == "options"
                     and isinstance(value, dict)
@@ -237,6 +285,47 @@ class OllamaAdapter(LLMAdapter):
         if options is not None:
             extra_kwargs = self.apply_request_options(extra_kwargs, options, model=model)
         return extra_kwargs
+
+    def _chat_kwargs(
+        self,
+        extra_kwargs: Dict[str, Any],
+        call_kwargs: Dict[str, Any],
+        model: str,
+    ) -> Tuple[Dict[str, Any], int]:
+        """Finish one chat call's request kwargs; return them and its output budget.
+
+        The budget is computed once, after ``RequestOptions.raw`` is merged
+        (#3552): the route's cap, lowered by a caller's ``max_tokens`` or a raw
+        ``options.num_predict`` that asks for fewer tokens. A value that is not
+        a positive integer, or is larger than the cap, cannot remove or raise
+        it. The request sends this budget as ``num_predict``, and the stream
+        guard bounds by the same value.
+        """
+        options: Dict[str, Any] = {}
+        if "temperature" in call_kwargs:
+            options["temperature"] = call_kwargs["temperature"]
+        extra_kwargs["options"] = options
+        extra_kwargs = self._maybe_apply_request_options(extra_kwargs, call_kwargs, model)
+        merged = _options_mapping(extra_kwargs.get("options"))
+        budget = self._max_output_tokens
+        for requested in (call_kwargs.get("max_tokens"), merged.get("num_predict")):
+            limit = reported_token_limit(requested)
+            if limit is not None and limit < budget:
+                budget = limit
+        merged["num_predict"] = budget
+        extra_kwargs["options"] = merged
+        return extra_kwargs, budget
+
+    def _output_cap_reached(self, model: str, budget: int) -> OutputCapReachedError:
+        """The failure for a generation that stopped at its output budget.
+
+        Raised for a stop at any budget, the route's or a smaller one the call
+        asked for: an unfinished response is never an answer.
+        """
+        return OutputCapReachedError(
+            provider="ollama", model=model, cap=budget,
+            route_cap=self._max_output_tokens,
+        )
 
     async def raw_request(
         self,
@@ -462,16 +551,7 @@ class OllamaAdapter(LLMAdapter):
             if tools:
                 extra_kwargs["tools"] = tools
 
-            # Pass through options (temperature, max_tokens, etc.)
-            options = {}
-            if "temperature" in kwargs:
-                options["temperature"] = kwargs["temperature"]
-            if "max_tokens" in kwargs:
-                options["num_predict"] = kwargs["max_tokens"]
-            if options:
-                extra_kwargs["options"] = options
-
-            extra_kwargs = self._maybe_apply_request_options(extra_kwargs, kwargs, model)
+            extra_kwargs, budget = self._chat_kwargs(extra_kwargs, kwargs, model)
 
             response = await with_retry(
                 client.chat,
@@ -479,6 +559,13 @@ class OllamaAdapter(LLMAdapter):
                 messages=messages,
                 **extra_kwargs
             )
+
+            if isinstance(response, dict):
+                done_reason = response.get("done_reason")
+            else:
+                done_reason = getattr(response, "done_reason", None)
+            if done_reason == _LENGTH_DONE_REASON:
+                raise self._output_cap_reached(model, budget)
 
             # Extract content - handle both dict and Pydantic model responses
             if isinstance(response, dict):
@@ -564,15 +651,17 @@ class OllamaAdapter(LLMAdapter):
             if input_tokens is not None and output_tokens is not None:
                 total_tokens = input_tokens + output_tokens
 
-            return LLMResponse(
+            return attach_stop_reason(LLMResponse(
                 content=content,
                 tool_calls=parsed_tool_calls,
                 raw=response,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
-            )
+            ), done_reason)
 
+        except OutputCapReachedError:
+            raise
         except ollama.ResponseError as e:
             logger.error(f"Ollama API error: {e}")
             raise
@@ -609,16 +698,9 @@ class OllamaAdapter(LLMAdapter):
             if response_format is not None and issubclass(response_format, BaseModel):
                 extra_kwargs["format"] = response_format.model_json_schema()
 
-            # Pass through options
-            options = {}
-            if "temperature" in kwargs:
-                options["temperature"] = kwargs["temperature"]
-            if "max_tokens" in kwargs:
-                options["num_predict"] = kwargs["max_tokens"]
-            if options:
-                extra_kwargs["options"] = options
-
-            extra_kwargs = self._maybe_apply_request_options(extra_kwargs, kwargs, model)
+            # The budget the server is asked to honor is enforced here as well:
+            # a server that ignores ``num_predict`` must not stream without end.
+            extra_kwargs, budget = self._chat_kwargs(extra_kwargs, kwargs, model)
 
             stream = await with_retry(
                 client.chat,
@@ -629,39 +711,64 @@ class OllamaAdapter(LLMAdapter):
             )
 
             chunk_count = 0
+            generated_chunks = 0
+            done_reason = None
             response_accum = ""
             text_content = ""
             input_tokens = None
             output_tokens = None
             splitter = ThinkingContentSplitter(provider="ollama")
-            async for chunk in stream:
-                # Usage arrives on the final (done) chunk; keep the latest.
-                if isinstance(chunk, dict):
-                    it = chunk.get('prompt_eval_count')
-                    ot = chunk.get('eval_count')
-                else:
-                    it = getattr(chunk, 'prompt_eval_count', None)
-                    ot = getattr(chunk, 'eval_count', None)
-                if it is not None:
-                    input_tokens = it
-                if ot is not None:
-                    output_tokens = ot
-
-                thinking, content = _extract_message_fields(chunk)
-
-                if thinking and response_format is None:
-                    yield ThinkingDelta(thinking, provider="ollama")
-
-                if content:
-                    chunk_count += 1
-                    text_content += content
-                    if response_format is not None:
-                        # Accumulate for final validation
-                        response_accum += content
-                        yield content
+            try:
+                async for chunk in stream:
+                    # Usage and the stop reason arrive on the final (done)
+                    # chunk; keep the latest.
+                    if isinstance(chunk, dict):
+                        it = chunk.get('prompt_eval_count')
+                        ot = chunk.get('eval_count')
+                        reason = chunk.get('done_reason')
                     else:
-                        for event in splitter.feed(content):
-                            yield event
+                        it = getattr(chunk, 'prompt_eval_count', None)
+                        ot = getattr(chunk, 'eval_count', None)
+                        reason = getattr(chunk, 'done_reason', None)
+                    if it is not None:
+                        input_tokens = it
+                    if ot is not None:
+                        output_tokens = ot
+                    if reason:
+                        done_reason = reason
+
+                    thinking, content = _extract_message_fields(chunk)
+
+                    if thinking or content:
+                        # Each chunk carries at least one generated token, so
+                        # more chunks than ``num_predict`` means the server is
+                        # not honoring the cap.
+                        generated_chunks += 1
+                        if generated_chunks > budget:
+                            raise self._output_cap_reached(model, budget)
+
+                    if thinking and response_format is None:
+                        yield ThinkingDelta(thinking, provider="ollama")
+
+                    if content:
+                        chunk_count += 1
+                        text_content += content
+                        if response_format is not None:
+                            # Accumulate for final validation
+                            response_accum += content
+                            yield content
+                        else:
+                            for event in splitter.feed(content):
+                                yield event
+            finally:
+                # Closing the response is what stops the server generating
+                # when this stream is abandoned or fails part-way.
+                aclose = getattr(stream, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+
+            if done_reason == _LENGTH_DONE_REASON:
+                raise self._output_cap_reached(model, budget)
 
             if response_format is None:
                 for event in splitter.flush():
@@ -683,14 +790,16 @@ class OllamaAdapter(LLMAdapter):
             total_tokens = None
             if input_tokens is not None and output_tokens is not None:
                 total_tokens = input_tokens + output_tokens
-            yield LLMResponse(
+            yield attach_stop_reason(LLMResponse(
                 content=text_content if text_content else None,
                 tool_calls=None,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
-            )
+            ), done_reason)
 
+        except OutputCapReachedError:
+            raise
         except ollama.ResponseError as e:
             logger.error(f"Ollama streaming API error: {e}")
             raise
@@ -824,6 +933,8 @@ class OllamaAdapter(LLMAdapter):
             ):
                 yield item
 
+        except OutputCapReachedError:
+            raise
         except ollama.ResponseError as e:
             logger.error(f"Ollama streaming with tools API error: {e}")
             raise

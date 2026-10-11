@@ -26,6 +26,19 @@ Two halves of one fact (#3300):
   the next turn. :func:`output_limit_cut_notice` makes that decision for every
   adapter. Previously a cut turn was indistinguishable from a finished one: a
   233-second turn returned HTTP 200 with an empty body.
+
+* **The cap.** A local route has no server-side output limit of its own, so a
+  small model stuck in a repetition loop generated 129,966 tokens over 19
+  minutes while holding the turn lock (#3552). Such a route sends an output
+  cap on every chat call, and a response that stops on that cap is not an
+  answer at all: the adapter raises :class:`OutputCapReachedError`, an
+  :class:`IncompleteGenerationError`, and the attempt fails.
+  :func:`incomplete_generation` finds one inside the service's wrappers so a
+  transport can say what happened without reflecting any error text.
+
+Whether a generation may become a turn's answer at all is decided in one
+place, :func:`kestrel_sovereign.llm.generation_gate.judge_generation`, from
+the stop reason :func:`attach_stop_reason` records.
 """
 
 from __future__ import annotations
@@ -57,6 +70,108 @@ class OutputCeilingUnknownError(LookupError):
             f"refusing to guess one. Pass max_tokens explicitly, or use a "
             f"model the provider's model metadata describes."
         )
+
+
+class IncompleteGenerationError(RuntimeError):
+    """A model call ended without a finished response.
+
+    Raised instead of returning what the model produced, so the turn sees a
+    failed attempt rather than a cut-off answer presented as complete (#3552).
+    """
+
+    #: Why the call ended, short and content-free: the detail on the failed
+    #: call's card in the chat.
+    summary = "did not finish"
+
+
+class OutputCapReachedError(IncompleteGenerationError):
+    """A response stopped at its output cap, not because it finished.
+
+    ``cap`` is the budget the request carried: the route's cap, or a smaller
+    one the call asked for. ``route_cap`` is the route's own cap (``cap`` when
+    not given). ``cap`` is ``None`` when only the provider's stop reason
+    (``stop_reason``) says the response hit an output limit, not how large.
+    """
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        model: str,
+        cap: Optional[int],
+        route_cap: Optional[int] = None,
+        stop_reason: Optional[str] = None,
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.cap = cap
+        self.route_cap = cap if route_cap is None else route_cap
+        self.stop_reason = stop_reason
+        if cap is None:
+            self.summary = "stopped at its output limit"
+            super().__init__(
+                f"{provider} stopped model {model!r} at an output limit "
+                f"(stop_reason={stop_reason}) before it finished; the attempt "
+                f"failed."
+            )
+            return
+        self.summary = f"stopped at the output cap of {cap:,} tokens"
+        if self.route_cap > cap:
+            remedy = (
+                f"The call asked for at most {cap:,} tokens; the route's cap is "
+                f"{self.route_cap:,}."
+            )
+        else:
+            remedy = (
+                "Raise the route's max_output_tokens if this model needs longer "
+                "answers."
+            )
+        super().__init__(
+            f"{provider} stopped model {model!r} at its output cap of {cap:,} "
+            f"tokens before it finished; the attempt failed. {remedy}"
+        )
+
+
+#: Runtime attribute on an aggregate of several routes' errors: its
+#: incomplete-generation verdict (see
+#: :func:`~kestrel_sovereign.llm.generation_gate.first_unfinished_attempt`).
+INCOMPLETE_ATTEMPT_ATTR = "incomplete_attempt"
+
+
+def incomplete_generation(
+    error: BaseException,
+) -> Optional[IncompleteGenerationError]:
+    """The :class:`IncompleteGenerationError` ``error`` is or wraps, if any.
+
+    Follows the same explicit links as
+    :func:`~kestrel_sovereign.llm.retry.advised_wait_exceeding_budget`:
+    ``__cause__``, ``original_error`` and ``underlying``, never the implicit
+    ``__context__``. An aggregate of several routes' errors (one carrying
+    ``declined_wait``) states its own verdict in
+    :data:`INCOMPLETE_ATTEMPT_ATTR`, and its links are not read past: they
+    lead to the last route's error, which describes neither the routes before
+    it nor the call as a whole.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, IncompleteGenerationError):
+            return current
+        if hasattr(current, "declined_wait"):
+            verdict = getattr(current, INCOMPLETE_ATTEMPT_ATTR, None)
+            return verdict if isinstance(verdict, IncompleteGenerationError) else None
+        for link in (
+            current.__cause__,
+            getattr(current, "original_error", None),
+            getattr(current, "underlying", None),
+        ):
+            if isinstance(link, BaseException):
+                pending.append(link)
+    return None
 
 
 def reported_token_limit(value: Any) -> Optional[int]:
@@ -206,10 +321,14 @@ def join_output_ceiling_notice(text: Optional[str], notice: str) -> str:
 
 __all__ = [
     "STOP_REASON_ATTR",
+    "INCOMPLETE_ATTEMPT_ATTR",
+    "IncompleteGenerationError",
+    "OutputCapReachedError",
     "OutputCeilingUnknownError",
     "OutputCeilings",
     "attach_stop_reason",
     "context_window_notice",
+    "incomplete_generation",
     "join_output_ceiling_notice",
     "output_ceiling_notice",
     "output_ceiling_notice_chunk",

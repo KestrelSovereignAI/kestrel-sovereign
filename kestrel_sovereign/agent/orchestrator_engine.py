@@ -18,8 +18,11 @@ import os
 import re
 import sys
 import time
+from contextlib import aclosing, contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import (
+    Any, AsyncIterator, Awaitable, Dict, Iterator, List, Optional, TypeVar, Union,
+)
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
@@ -33,6 +36,9 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
     tool_result_size_bytes,
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
+from kestrel_sovereign.llm.call_progress import call_progress_listener
+from kestrel_sovereign.llm.generation_gate import failure_summary, judge_generation
+from kestrel_sovereign.llm.output_ceiling import IncompleteGenerationError
 from kestrel_sovereign.turn_completion import (
     confirm_unfinished,
     confirms_complete,
@@ -66,6 +72,8 @@ from kestrel_sovereign.agent.streaming import (
     _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
     _build_revise_sentinel,
     _build_tool_sentinel,
+    _stopped_generation,
+    INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT,
     STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
 )
 from kestrel_sovereign.agent.direct_tool_arguments import (
@@ -104,16 +112,159 @@ MAX_TOOL_CONCURRENCY = int(os.environ.get("KESTREL_MAX_TOOL_CONCURRENCY", "10"))
 # warning naming the model that failed to resolve — never as a silent default.
 _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT = 131072
 
-# Inactivity watchdog for the orchestrator's multi-iteration tool loop.
-# Wraps each follow-up ``stream_with_tool_detection`` so a hung upstream
-# (anthropic 429 backoff, network blip, frozen provider queue) surfaces
-# as a visible "❌ failed: timeout" marker instead of silent dead air.
-# It fires after this many seconds WITHOUT a stream item (#3300) — re-armed
-# on every item — so a long but progressing response is never killed, and
-# it applies PER iteration, so a long multi-iteration turn isn't either.
+# Inactivity watchdog for every streamed orchestrator LLM call: the turn's
+# first ``stream_with_tool_detection`` (#3552) and each tool-loop follow-up, so
+# a hung upstream (anthropic 429 backoff, network blip, frozen provider queue,
+# a local model still loading) surfaces as a visible failure instead of silent
+# dead air. It fires after this many seconds WITHOUT a stream item (#3300) —
+# re-armed on every item — so a long but progressing response is never killed,
+# and it applies PER call, so a long multi-iteration turn isn't either. See
+# ``LLMCallWatchdog``.
 ORCHESTRATOR_TURN_TIMEOUT_SECS = float(
     os.environ.get("KESTREL_ORCHESTRATOR_TURN_TIMEOUT_SECS", "180")
 )
+
+_T = TypeVar("_T")
+
+
+class LLMCallInactivityTimeout(IncompleteGenerationError):
+    """An orchestrator LLM call went its whole inactivity bound without progress."""
+
+    def __init__(self, timeout: float) -> None:
+        self.timeout = timeout
+        self.summary = f"timeout after {int(timeout)}s"
+        super().__init__(
+            f"LLM call produced nothing for {timeout:g}s and was abandoned"
+        )
+
+
+class LLMCallWatchdog:
+    """The inactivity bound on one orchestrator LLM call.
+
+    One code path for every call a turn makes (#3552): its first call, each
+    tool-loop follow-up, and the premature-yield repair, streamed or not. The
+    bound re-arms on every sign of progress, so a response that is still
+    arriving is never cut however long it runs (#3300). A call that goes
+    ``timeout`` seconds without progress, including before its first, has its
+    pending wait cancelled, which closes the provider request, and raises
+    :class:`LLMCallInactivityTimeout`.
+
+    * :meth:`watch` bounds a streamed call; each item it yields is progress.
+    * :meth:`call` bounds a non-streaming call, which yields nothing until it
+      returns. Its progress is what the adapter reports while the answer
+      arrives (:mod:`kestrel_sovereign.llm.call_progress`); a call whose
+      adapter reports none is bounded as a whole.
+
+    Only time spent waiting on the provider counts. Time the consumer spends
+    on an item does not, and neither does an inline tool the provider is
+    waiting on (:meth:`tool_running`): an adapter that runs tools inside the
+    call (the codex app-server) is silent for as long as the tool takes.
+    """
+
+    def __init__(self, timeout: float) -> None:
+        self.timeout = timeout
+        self._pending: Optional[asyncio.Timeout] = None
+        self._tools_running = 0
+
+    @classmethod
+    def for_call(
+        cls,
+        llm_service: Any,
+        *,
+        model_override: Optional[str],
+        force_local_only: bool,
+        streaming: bool = True,
+    ) -> "LLMCallWatchdog":
+        """The watchdog for one call, never firing before its LLM client would.
+
+        #1966: a slow local route (e.g. GLM via llama_cpp with a large
+        timeout) lifts the bound to that route's own request timeout, so the
+        route ``timeout`` is the single knob. Scoped to THIS call's candidate
+        routes (the resolution the dispatch will use), so an explicit cloud
+        selection in a mixed deployment keeps the default.
+
+        A non-streaming call (``streaming=False``) whose adapter reports no
+        progress is silent until it answers, so its client's own timeout is
+        the earliest point a hang can be told from a long answer: every
+        candidate's timeout lifts its bound, cloud routes included.
+        """
+        timeout = ORCHESTRATOR_TURN_TIMEOUT_SECS
+        try:
+            candidates, _ = llm_service.resolve_provider_routing(
+                model_override=model_override,
+                force_local_only=force_local_only,
+            )
+            if streaming:
+                route_timeout = llm_service.effective_request_timeout(candidates)
+            else:
+                route_timeout = llm_service.effective_request_timeout(
+                    candidates, completion_only=True,
+                )
+            if route_timeout and route_timeout > timeout:
+                timeout = route_timeout
+        except Exception:
+            # Routing that cannot be resolved here fails again, loudly, in the
+            # call itself; the default bound still applies to it.
+            pass
+        return cls(timeout)
+
+    async def watch(self, stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
+        """Yield ``stream``'s items, bounding the wait for each one."""
+        iterator = stream.__aiter__()
+        try:
+            while True:
+                try:
+                    item = await self._bounded(iterator.__anext__())
+                except StopAsyncIteration:
+                    return
+                yield item
+        finally:
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    async def call(self, pending: Awaitable[_T]) -> _T:
+        """Await the non-streaming call ``pending``, bounding its silence."""
+        return await self._bounded(pending)
+
+    async def _bounded(self, pending: Awaitable[_T]) -> _T:
+        deadline = asyncio.timeout(None if self._tools_running else self.timeout)
+        try:
+            async with deadline:
+                self._pending = deadline
+                try:
+                    with call_progress_listener(self._rearm):
+                        return await pending
+                finally:
+                    self._pending = None
+        except TimeoutError as exc:
+            if not deadline.expired():
+                raise
+            logging.warning(
+                "[ORCHESTRATOR] LLM call produced nothing for %ss; abandoning "
+                "it as a failed attempt", self.timeout,
+            )
+            raise LLMCallInactivityTimeout(self.timeout) from exc
+
+    @contextmanager
+    def tool_running(self) -> Iterator[None]:
+        """Suspend the bound while an inline tool runs inside the call."""
+        self._tools_running += 1
+        self._rearm()
+        try:
+            yield
+        finally:
+            self._tools_running -= 1
+            self._rearm()
+
+    def _rearm(self) -> None:
+        pending = self._pending
+        if pending is None or pending.expired():
+            return
+        if self._tools_running:
+            pending.reschedule(None)
+        else:
+            pending.reschedule(asyncio.get_running_loop().time() + self.timeout)
 
 CONTINUATION_INTENT_RE = re.compile(
     r"\b("
@@ -569,13 +720,14 @@ class OrchestratorEngineMixin:
         # identity as the original turn. Without this, an explicit-context
         # caller loses companion/user attribution on repair calls (there is
         # no ambient set_observability_context state to recover from).
-        repaired = await self.llm_service.generate_with_messages(
+        repaired = await OrchestratorEngineMixin._generate_with_messages_bounded(
+            self,
+            executor_session_id=session_id,
             messages=OrchestratorEngineMixin._append_missing_tool_call_repair(messages, content),
             tools=tools or None,
             force_local_only=force_local_only,
             model_override=effective_model,
             session_id=session_id,
-            tool_executor=self._make_inline_tool_executor(session_id),
             cancel_token=(
                 (lambda: self.is_request_cancelled(request_id))
                 if request_id else None
@@ -717,7 +869,102 @@ class OrchestratorEngineMixin:
 
         return result
 
-    def _make_inline_tool_executor(self, session_id: str):
+    async def _generate_with_messages_bounded(
+        self,
+        *,
+        executor_session_id: Optional[str],
+        **call_kwargs: Any,
+    ) -> Union[str, LLMResponse]:
+        """``llm_service.generate_with_messages`` under the turn's inactivity bound.
+
+        The non-streaming counterpart of :meth:`LLMCallWatchdog.watch` (#3552):
+        the turn's first non-streaming call, each tool-loop follow-up and the
+        premature-yield repair all go through here, so none can hold the turn
+        lock indefinitely. The call's inline tool executor, built for
+        ``executor_session_id``, suspends the bound while a tool runs.
+        """
+        watchdog = LLMCallWatchdog.for_call(
+            self.llm_service,
+            model_override=call_kwargs.get("model_override"),
+            force_local_only=bool(call_kwargs.get("force_local_only")),
+            streaming=False,
+        )
+        try:
+            return await watchdog.call(self.llm_service.generate_with_messages(
+                tool_executor=self._make_inline_tool_executor(
+                    executor_session_id, watchdog=watchdog,
+                ),
+                **call_kwargs,
+            ))
+        except Exception as exc:
+            await OrchestratorEngineMixin._settle_failed_generation(
+                self, exc, session_id=call_kwargs.get("session_id"),
+            )
+            raise
+
+    async def _stream_with_tool_detection_bounded(
+        self,
+        watchdog: LLMCallWatchdog,
+        **call_kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        """``llm_service.stream_with_tool_detection`` under ``watchdog``.
+
+        The streamed counterpart of :meth:`_generate_with_messages_bounded`:
+        the turn's first streamed call and each tool-loop follow-up go through
+        here, bounded by the same inactivity watchdog (#3552), and a call that
+        raises is settled by :meth:`_settle_failed_generation` before the
+        error reaches the turn.
+        """
+        try:
+            async with aclosing(watchdog.watch(
+                self.llm_service.stream_with_tool_detection(**call_kwargs)
+            )) as stream:
+                async for item in stream:
+                    yield item
+        except Exception as exc:
+            await OrchestratorEngineMixin._settle_failed_generation(
+                self, exc, session_id=call_kwargs.get("session_id"),
+            )
+            raise
+
+    async def _settle_failed_generation(
+        self,
+        error: BaseException,
+        *,
+        session_id: Optional[str],
+    ) -> BaseException:
+        """Settle a turn's model call that raised; return the gate's verdict.
+
+        A call that raised is never accepted
+        (:func:`~kestrel_sovereign.llm.generation_gate.judge_generation`), so
+        the turn records no answer (#3552). If tools already acted in this
+        turn and nothing has recorded that yet, the fixed checkpoint is
+        persisted, so the next turn does not repeat them: the Stop checkpoint
+        when the request was stopped meanwhile, else the incomplete-generation
+        one. Every turn model call, first or follow-up, streamed or not, is
+        settled here.
+        """
+        failure = judge_generation(error=error)
+        state = current_invocation_effect_checkpoint()
+        if state is not None and state.completed and not state.checkpointed:
+            request_id = current_invocation_id()
+            stopped = _stopped_generation(self, request_id) is not None
+            await OrchestratorEngineMixin._persist_completed_tool_stop_checkpoint(
+                self,
+                session_id=session_id or state.session_id,
+                request_id=request_id,
+                checkpoint=(
+                    STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT if stopped
+                    else INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT
+                ),
+            )
+        return failure
+
+    def _make_inline_tool_executor(
+        self,
+        session_id: str,
+        watchdog: Optional[LLMCallWatchdog] = None,
+    ):
         """Return an async ``(name, args) -> result`` callable bound to
         this agent's hooks/registry, for transports that run an inline
         tool loop *inside* a single LLM turn (the codex app-server's
@@ -729,6 +976,10 @@ class OrchestratorEngineMixin:
         stripping — fires exactly as it does for orchestrator-driven
         dispatch. Adapters that don't run an inline tool loop ignore
         the callable.
+
+        ``watchdog`` is the inactivity bound on the LLM call this executor
+        serves; it is suspended while a tool runs, since a tool's run time is
+        not the provider going silent.
         """
         # Capture EVERY turn-scoped value on the OWNING turn task, at closure
         # creation. The codex app-server dispatches each ``item/tool/call`` on
@@ -753,7 +1004,8 @@ class OrchestratorEngineMixin:
             # redactors stay applied in audit/UI/STOP-hook
             # surfaces — pre-hook args would leak redacted values).
             capture: Dict[str, Any] = {}
-            with turn_scope.bind():
+            paused = watchdog.tool_running() if watchdog is not None else nullcontext()
+            with paused, turn_scope.bind():
                 result = await self.execute_named_tool(
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,
@@ -791,11 +1043,16 @@ class OrchestratorEngineMixin:
         *,
         session_id: Optional[str],
         request_id: Optional[str],
+        checkpoint: str = STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
     ) -> None:
-        """Persist fixed anti-repeat evidence for a cancelled completed batch."""
+        """Persist fixed anti-repeat evidence for a completed batch.
+
+        The turn records no answer: Stop cancelled it (the default
+        ``checkpoint``), or its model did not finish afterwards (#3552).
+        """
 
         await self._persist_assistant_turn_safely(
-            STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+            checkpoint,
             metadata={
                 "tool_batch_checkpoint": dict(
                     _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA[
@@ -2765,13 +3022,14 @@ class OrchestratorEngineMixin:
             # #2614: propagate the caller's explicit invocation_context (if
             # any) so each tool-loop continuation keeps the original turn's
             # correlation identity for metering/tracing.
-            response = await self.llm_service.generate_with_messages(
+            response = await OrchestratorEngineMixin._generate_with_messages_bounded(
+                self,
+                executor_session_id=session_id,
                 messages=messages,
                 tools=all_tools or None,
                 force_local_only=force_local_only,
                 model_override=effective_model,
                 session_id=session_id,
-                tool_executor=self._make_inline_tool_executor(session_id),
                 invocation_context=invocation_context,
             )
 
@@ -3085,7 +3343,6 @@ class OrchestratorEngineMixin:
         images: Optional[list] = None,
         invocation_context=None,
         buffer_audit: bool = False,
-        strict_timeout_state: Optional[dict] = None,
         conversation_history: Optional[List[Dict[str, Any]]] = None,
         continuation_user_content: Optional[str] = None,
     ):
@@ -3109,16 +3366,11 @@ class OrchestratorEngineMixin:
         response-derived tool id/name the audit has not yet approved. Warn /
         no-audit turns (``buffer_audit`` False) keep emitting both unchanged.
 
-        ``strict_timeout_state`` (#2674 finding 2): a per-turn mutable dict the
-        outer buffered loop passes in so a continuation TIMEOUT under an
-        enforcing audit can be signalled without a sentinel. In advisory mode a
-        follow-up-LLM timeout renders as an ``❌`` error tool card (a tool
-        sentinel). Under ``buffer_audit`` the buffering gate STRIPS that sentinel,
-        so the audit would see empty text, persist empty content, and the client
-        would get a silent empty 200. Instead we set ``timed_out`` here and emit
-        NO sentinel / protected text; the outer loop discards the withheld
-        continuation and substitutes a deterministic safe block that is audited,
-        persisted, and released like any other buffered turn.
+        A follow-up call (or its repair) that ends unfinished — silent past
+        its ``LLMCallWatchdog`` bound, or stopped at its route's output cap —
+        is raised out of this generator as the failed attempt it is (#3552),
+        after an error tool card when the turn is not buffered. The caller
+        persists no answer, only the completed tool batch's checkpoint.
 
         ``conversation_history`` (#2841): the turn's budgeted prior-turn
         messages (``ContextResult.messages``). Replayed ahead of the current
@@ -3332,12 +3584,12 @@ class OrchestratorEngineMixin:
             # The streaming primitive yields text/thinking/tool-start
             # events as they arrive AND a final LLMResponse with any
             # detected tool_calls — single pass, no double-call waste,
-            # and the per-iteration asyncio.timeout below surfaces a
+            # and the per-call inactivity watchdog below surfaces a
             # hang as a visible failure marker rather than silent dead
             # air.
             iter_text_chunks: List[str] = []
             response = None
-            timed_out = False
+            incomplete: Optional[Exception] = None
             # Separator emission is deferred until the first TEXT chunk
             # arrives. Two reasons:
             #   1. If the iteration goes straight to another tool_call
@@ -3349,42 +3601,29 @@ class OrchestratorEngineMixin:
             #      ``\n---\n`` into "response", not "toolActivity" — a
             #      timeout marker rendered as response prose loses its
             #      tool-card error styling).
-            # #1966: never fire the per-call watchdog before the LLM client
-            # itself would. A slow local route (e.g. GLM via llama_cpp with a
-            # large timeout) lifts this automatically, so the route ``timeout``
-            # is the single knob — no separate KESTREL_ORCHESTRATOR_TURN_TIMEOUT_SECS
-            # needed. Scoped to THIS call's candidate routes (same resolution the
-            # dispatch will use), so an explicit cloud selection in a mixed
-            # deployment keeps the default watchdog.
-            _call_timeout = ORCHESTRATOR_TURN_TIMEOUT_SECS
+            # #3300/#3552: the same inactivity bound as the turn's first call
+            # (``LLMCallWatchdog``). It re-arms on every item, so a response
+            # that is still arriving is never cut off however long it runs,
+            # while a stream that goes silent for the bound — including before
+            # its first item — trips it.
+            watchdog = LLMCallWatchdog.for_call(
+                self.llm_service,
+                model_override=effective_model,
+                force_local_only=force_local_only,
+            )
             try:
-                _candidates, _ = self.llm_service.resolve_provider_routing(
-                    model_override=effective_model,
-                    force_local_only=force_local_only,
-                )
-                _route_timeout = self.llm_service.effective_request_timeout(_candidates)
-                if _route_timeout and _route_timeout > _call_timeout:
-                    _call_timeout = _route_timeout
-            except Exception:
-                pass
-            # #3300: the watchdog measures INACTIVITY, not total elapsed time.
-            # Its job is hang detection — "silent dead air" from a stuck
-            # upstream — and it now re-arms on every item the stream yields,
-            # so a response that is still arriving is never cut off however
-            # long it runs (output is bounded by the model's own ceiling, not
-            # a 4,096-token literal, so a legitimate answer can take minutes),
-            # while a stream that goes silent for ``_call_timeout`` seconds —
-            # including before its first item — still trips it.
-            _watchdog_loop = asyncio.get_running_loop()
-            try:
-                async with asyncio.timeout(_call_timeout) as _watchdog:
-                    async for item in self.llm_service.stream_with_tool_detection(
+                async with aclosing(
+                    OrchestratorEngineMixin._stream_with_tool_detection_bounded(
+                        self,
+                        watchdog,
                         messages=messages,
                         tools=all_tools or None,
                         force_local_only=force_local_only,
                         model_override=effective_model,
                         session_id=session_id,
-                        tool_executor=self._make_inline_tool_executor(session_id),
+                        tool_executor=self._make_inline_tool_executor(
+                            session_id, watchdog=watchdog,
+                        ),
                         invocation_context=invocation_context,
                         # #1662: keep the pasted image visible to the model that
                         # synthesizes the post-tool answer. The fold targets the
@@ -3395,8 +3634,9 @@ class OrchestratorEngineMixin:
                             (lambda: self.is_request_cancelled(request_id))
                             if request_id else None
                         ),
-                    ):
-                        _watchdog.reschedule(_watchdog_loop.time() + _call_timeout)
+                    )
+                ) as followup_stream:
+                    async for item in followup_stream:
                         if _cancelled():
                             break
                         if isinstance(item, str):
@@ -3446,44 +3686,28 @@ class OrchestratorEngineMixin:
                                 yield _build_revise_sentinel(item)
                         elif isinstance(item, LLMResponse):
                             response = item
-            except TimeoutError:
-                timed_out = True
+            except Exception as exc:
+                # #3552: the follow-up was not accepted — it went silent past
+                # the watchdog, stopped without a natural end, or failed. The
+                # bounded call already settled it (its completed tool batch is
+                # checkpointed).
+                incomplete = exc
 
             if _cancelled():
                 return
 
-            if timed_out:
-                # #1659: render the follow-up timeout as an error tool card,
-                # not response prose — record the structured event (so it
-                # persists for reload) AND emit the error sentinel (so the live
-                # card shows it). Replaces the legacy "❌ llm call failed" text
-                # that the old segmenter grouped as tool activity.
-                logging.warning(
-                    "[ORCHESTRATOR-STREAM] follow-up LLM call timed out after %ss",
-                    _call_timeout,
-                )
-                _timeout_detail = (
-                    f"timeout after {int(_call_timeout)}s"
-                )
-                if buffer_audit:
-                    # #2674 finding 2: strict / fail-closed audit. The tool
-                    # sentinel below is stripped by the buffering gate, so
-                    # emitting it (and appending the tool_event, which the
-                    # buffered persist drops anyway) would leave the audit with
-                    # empty text → empty persisted content → a silent empty 200.
-                    # Signal the outer loop instead so it replaces the withheld
-                    # continuation with a deterministic safe block. Emit NO
-                    # sentinel, NO tool_event, and — critically — NO protected /
-                    # partial text or raw error detail here.
-                    if strict_timeout_state is not None:
-                        strict_timeout_state['timed_out'] = True
-                    return
-                if tool_events is not None:
-                    tool_events.append({
-                        'type': 'error', 'tool': 'llm', 'error': _timeout_detail,
-                    })
-                yield _build_tool_sentinel('error', 'llm', detail=_timeout_detail)
-                return
+            if incomplete is not None:
+                # The attempt failed: raise it out of the turn, which persists
+                # no answer. Its partial prose is never recorded as one.
+                # #1659: shown live as an error tool card, not response prose;
+                # under an enforcing audit (#2674) nothing unreviewed is
+                # emitted, and the failure reaches the client as the stream's
+                # own error notice.
+                if not buffer_audit:
+                    yield _build_tool_sentinel(
+                        'error', 'llm', detail=failure_summary(incomplete),
+                    )
+                raise incomplete
 
             if response is None:
                 # Stream produced no LLMResponse — either an empty stream
@@ -3505,19 +3729,30 @@ class OrchestratorEngineMixin:
                     )
                 )
                 if repaired_missing_tool_call:
-                    response = await self._repair_premature_turn_yield(
-                        response=response,
-                        request=continuation_user_content or user_message,
-                        messages=messages,
-                        tools=all_tools,
-                        force_local_only=force_local_only,
-                        effective_model=effective_model,
-                        session_id=session_id,
-                        streaming=True,
-                        request_id=request_id,
-                        invocation_context=invocation_context,
-                        original_delivered=bool(streamed_text),
-                    )
+                    try:
+                        response = await self._repair_premature_turn_yield(
+                            response=response,
+                            request=continuation_user_content or user_message,
+                            messages=messages,
+                            tools=all_tools,
+                            force_local_only=force_local_only,
+                            effective_model=effective_model,
+                            session_id=session_id,
+                            streaming=True,
+                            request_id=request_id,
+                            invocation_context=invocation_context,
+                            original_delivered=bool(streamed_text),
+                        )
+                    except Exception as exc:
+                        # The repair is part of this follow-up: one that is
+                        # not accepted fails it the same way (#3552).
+                        if _cancelled():
+                            return
+                        if not buffer_audit:
+                            yield _build_tool_sentinel(
+                                'error', 'llm', detail=failure_summary(exc),
+                            )
+                        raise
                     if isinstance(response, str):
                         yield response
                         return

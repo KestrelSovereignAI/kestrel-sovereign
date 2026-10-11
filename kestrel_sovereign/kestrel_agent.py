@@ -7665,14 +7665,18 @@ Expected Duration: {expected_duration}
                 resolved_context = _replace_dataclass(
                     resolved_context, redact_content=True
                 )
-            response = await self.llm_service.generate_with_messages(
+            # #3552: the same inactivity bound as every other orchestrator
+            # call, so a local model that never answers fails the turn rather
+            # than holding its lock indefinitely.
+            response = await OrchestratorEngineMixin._generate_with_messages_bounded(
+                self,
+                executor_session_id=session_id or "",
                 messages=messages,
                 force_local_only=force_local_only,
                 model_override=effective_model,
                 tools=feature_tools if feature_tools else None,
                 session_id=session_id,
                 keep_trailing_system=operator_turn.keep_trailing_system,
-                tool_executor=self._make_inline_tool_executor(session_id or ""),
                 invocation_context=resolved_context,
             )
         except BaseException as exc:

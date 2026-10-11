@@ -337,11 +337,13 @@ class PrivacyAgent:
             if final_rendered is not None:
                 final_rendered = self._anonymize_text(final_rendered)
 
-        # Add privacy mode to metadata for tracking
-        if metadata is None:
-            metadata = {}
-        metadata["privacy_mode"] = self._get_preset_name(config)
-        metadata["timestamp"] = datetime.now(timezone.utc).isoformat()
+        # Add privacy mode to metadata for tracking, on a copy: the caller's
+        # dict may be shared (a module-level checkpoint, #3552).
+        metadata = {
+            **(metadata or {}),
+            "privacy_mode": self._get_preset_name(config),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
         await self.storage.add_conversation(
             role, final_content, metadata, session_id,

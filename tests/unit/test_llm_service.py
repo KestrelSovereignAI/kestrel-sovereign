@@ -22,6 +22,7 @@ from kestrel_sdk.llm import (
 from pydantic import BaseModel, SecretStr
 
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+from kestrel_sovereign.llm.output_ceiling import attach_stop_reason
 from kestrel_sovereign.llm.error_handling import (
     LLMAllProvidersFailedError,
     LLMProviderError,
@@ -65,6 +66,12 @@ def _ready_remote_lease(*, expired: bool = False) -> InferenceLease:
 # =============================================================================
 # Test Fixtures
 # =============================================================================
+
+
+def _finished(response: LLMResponse) -> LLMResponse:
+    """``response`` as an adapter returns a finished one: with the provider's
+    natural-end stop reason, the evidence the generation gate needs (#3552)."""
+    return attach_stop_reason(response, "stop")
 
 
 @pytest.fixture
@@ -118,12 +125,12 @@ def mock_adapter():
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
     ])
-    adapter.get_response = AsyncMock(return_value=LLMResponse(
+    adapter.get_response = AsyncMock(return_value=_finished(LLMResponse(
         content="Hello! How can I help you?",
         input_tokens=10,
         output_tokens=8,
         total_tokens=18,
-    ))
+    )))
     return adapter
 
 
@@ -836,6 +843,63 @@ class TestCoreGeneration:
         assert advised_wait_exceeding_budget(info.value) is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("exhausted_mid_chain", [False, True])
+    @pytest.mark.parametrize("entry", [
+        "get_response", "generate_with_messages", "generate_stream",
+        "stream_with_messages", "stream_with_tool_detection",
+    ])
+    async def test_every_aggregate_says_when_an_attempt_ended_unfinished(
+        self, llm_service, mock_adapter, entry, exhausted_mid_chain,
+    ):
+        """#3552: the first route's model stopped at its output cap, the last
+        route failed otherwise. Every aggregate's links lead to the last route,
+        so only its own verdict can say an attempt ended unfinished: the turn
+        then records no answer and checkpoints the tools it already ran."""
+        from unittest.mock import Mock
+
+        from kestrel_sovereign.llm.output_ceiling import (
+            OutputCapReachedError,
+            incomplete_generation,
+        )
+
+        cap = OutputCapReachedError(provider="ollama", model="m", cap=64)
+        if exhausted_mid_chain:
+            llm_service._configured_routes_exhausted = Mock(side_effect=[False, True])
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            cap, LLMProviderError("anthropic", "Connection reset by peer"),
+        ])
+        mock_adapter.get_streaming_response = None
+        mock_adapter.get_streaming_response_with_tools = None
+        messages = [{"role": "user", "content": "Hello"}]
+        tools = [{"name": "noop", "description": "a tool", "parameters": {"type": "object"}}]
+
+        async def call():
+            if entry == "get_response":
+                return await llm_service.get_response(system_prompt="Test", user_prompt="Hello")
+            if entry == "generate_with_messages":
+                return await llm_service.generate_with_messages(messages=messages)
+            stream = {
+                "generate_stream": lambda: llm_service.generate_stream(
+                    system_prompt="Test", user_prompt="Hello",
+                ),
+                "stream_with_messages": lambda: llm_service.stream_with_messages(
+                    messages=messages,
+                ),
+                "stream_with_tool_detection": lambda: llm_service.stream_with_tool_detection(
+                    messages=messages, tools=tools,
+                ),
+            }[entry]()
+            async for _chunk in stream:
+                pass
+
+        with pytest.raises(Exception) as info:
+            await call()
+
+        assert mock_adapter.get_response.await_count == 2
+        assert ("refusing to silently swap vendors" in str(info.value)) is exhausted_mid_chain
+        assert incomplete_generation(info.value) is cap
+
+    @pytest.mark.asyncio
     async def test_generate_stream_aggregate_carries_the_common_decline(
         self, llm_service, mock_adapter,
     ):
@@ -1126,8 +1190,8 @@ class TestCoreGeneration:
                 attempted.append(name)
                 if raise_exc is not None:
                     raise raise_exc
-                return LLMResponse(content="ok", input_tokens=1, output_tokens=1,
-                                   total_tokens=2)
+                return _finished(LLMResponse(content="ok", input_tokens=1, output_tokens=1,
+                                   total_tokens=2))
             ad.get_response = _get_response
             return ad
 
@@ -1366,9 +1430,9 @@ class TestMeteringAndCost:
         a cost-aware callback receives it (#1806)."""
         usage = SimpleNamespace(prompt_tokens=10, completion_tokens=8, cost=0.0042)
         raw = SimpleNamespace(usage=usage)
-        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+        mock_adapter.get_response = AsyncMock(return_value=_finished(LLMResponse(
             content="hi", input_tokens=10, output_tokens=8, total_tokens=18, raw=raw,
-        ))
+        )))
         seen = []
 
         async def _cb(*, companion_id, user_id, provider, model,
@@ -1389,14 +1453,14 @@ class TestMeteringAndCost:
         self, llm_service, mock_adapter
     ):
         """Uncached input and discounted cache buckets both reach billing."""
-        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+        mock_adapter.get_response = AsyncMock(return_value=_finished(LLMResponse(
             content="hi",
             input_tokens=40,
             output_tokens=5,
             total_tokens=45,
             cache_creation_input_tokens=7,
             cache_read_input_tokens=80,
-        ))
+        )))
         seen = []
 
         async def _cb(
@@ -1492,13 +1556,13 @@ class TestMeteringAndCost:
         self, llm_service, mock_adapter
     ):
         """Existing Frinz-shaped callbacks retain the inclusive token count."""
-        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+        mock_adapter.get_response = AsyncMock(return_value=_finished(LLMResponse(
             content="hi",
             input_tokens=40,
             output_tokens=5,
             total_tokens=45,
             cache_read_input_tokens=80,
-        ))
+        )))
         seen = []
 
         async def _cb(
@@ -1521,13 +1585,13 @@ class TestMeteringAndCost:
         self, llm_service, mock_adapter
     ):
         """A legacy extensible callback must keep inclusive prompt billing."""
-        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+        mock_adapter.get_response = AsyncMock(return_value=_finished(LLMResponse(
             content="hi",
             input_tokens=40,
             output_tokens=5,
             total_tokens=45,
             cache_read_input_tokens=80,
-        ))
+        )))
         seen = []
 
         async def _cb(
@@ -1550,12 +1614,12 @@ class TestMeteringAndCost:
         self, llm_service, mock_adapter
     ):
         """Explicit cache opt-in remains callable when telemetry is absent."""
-        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+        mock_adapter.get_response = AsyncMock(return_value=_finished(LLMResponse(
             content="hi",
             input_tokens=10,
             output_tokens=5,
             total_tokens=15,
-        ))
+        )))
         seen = []
 
         async def _cb(
@@ -2206,13 +2270,13 @@ class TestInvocationBoundary:
             content = "ok"
             tool_calls = None
         mock_adapter.get_response = AsyncMock(
-            return_value=LLMResponse(
+            return_value=_finished(LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
                 input_tokens=5,
                 output_tokens=3,
                 total_tokens=8,
-            )
+            ))
         )
         finalizer = AsyncMock(wraps=llm_service._finalize_successful_invocation)
         llm_service._finalize_successful_invocation = finalizer
@@ -2373,16 +2437,16 @@ class TestInvocationBoundary:
     async def test_remote_tool_stream_finalizes_terminal_response_once(
         self, llm_service
     ):
-        adapter = self._activate_fake_remote(llm_service, LLMResponse(content="unused"))
+        adapter = self._activate_fake_remote(llm_service, _finished(LLMResponse(content="unused")))
 
         async def remote_stream(**_kwargs):
             yield "remote chunk"
-            yield LLMResponse(
+            yield _finished(LLMResponse(
                 content="remote chunk",
                 input_tokens=7,
                 output_tokens=4,
                 total_tokens=11,
-            )
+            ))
 
         adapter.get_streaming_response_with_tools = remote_stream
         llm_service._track_model_usage = AsyncMock()
@@ -2423,6 +2487,7 @@ class TestInvocationBoundary:
             "streamed": True,
             "path": "stream_with_tool_detection",
             "correlation_id": "stream-correlation",
+            "stop_reason": "stop",
         }
         assert len(meter_calls) == 1
         assert meter_calls[0]["companion_id"] == "stream-companion"
@@ -2554,7 +2619,7 @@ class TestInvocationBoundary:
     async def test_remote_message_success_finalizes_once(self, llm_service):
         self._activate_fake_remote(
             llm_service,
-            LLMResponse(content="remote message", input_tokens=4, output_tokens=2),
+            _finished(LLMResponse(content="remote message", input_tokens=4, output_tokens=2)),
         )
         finalizer = AsyncMock(wraps=llm_service._finalize_successful_invocation)
         llm_service._finalize_successful_invocation = finalizer
@@ -2655,12 +2720,12 @@ class TestInvocationBoundary:
             await both_started.wait()
             if session_id == "session-a":
                 await asyncio.sleep(0.01)
-            return LLMResponse(
+            return _finished(LLMResponse(
                 content=f"answer-{session_id}",
                 input_tokens=3,
                 output_tokens=2,
                 total_tokens=5,
-            )
+            ))
 
         mock_adapter.get_response = AsyncMock(side_effect=interleaved_response)
         llm_service._track_model_usage = AsyncMock()
@@ -3197,7 +3262,7 @@ class TestStreamingMandatePreference:
     async def test_stream_with_tool_detection_passes_cancel_token(self, llm_service, mock_adapter):
         """Request cancellation token is forwarded to tool-aware streams."""
         async def mock_streaming(*args, **kwargs):
-            yield LLMResponse(content="done", input_tokens=1, output_tokens=1)
+            yield _finished(LLMResponse(content="done", input_tokens=1, output_tokens=1))
 
         mock_adapter.get_streaming_response_with_tools = Mock(
             return_value=mock_streaming()
@@ -3285,7 +3350,7 @@ class TestLivePrivacySeam:
         adapter = Mock()
         adapter.create_messages = Mock(return_value=[])
         adapter.get_response = AsyncMock(
-            return_value=LLMResponse(content="local", input_tokens=1, output_tokens=1)
+            return_value=_finished(LLMResponse(content="local", input_tokens=1, output_tokens=1))
         )
         llm_service.providers.append({
             "name": "ollama:local", "vendor": "ollama", "route": "local",

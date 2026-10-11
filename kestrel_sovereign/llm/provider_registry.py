@@ -600,9 +600,12 @@ class ProviderRegistry:
             embedding_dim = route_cfg.get("embedding_dim")
             if embedding_dim is not None:
                 embedding_dim = int(embedding_dim)
+            # Output cap sent on every chat call (#3552); the adapter's default
+            # when unset, and a non-positive value fails the route.
             return client, adapter_cls(
                 embedding_model=embedding_model,
                 embedding_dim=embedding_dim,
+                max_output_tokens=route_cfg.get("max_output_tokens"),
             )
 
         # --- Google Gemini (maintained google-genai SDK) ---

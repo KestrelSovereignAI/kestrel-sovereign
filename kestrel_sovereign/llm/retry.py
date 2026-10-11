@@ -11,6 +11,9 @@ import random
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Iterable, Optional, TypeVar
 
+from kestrel_sovereign.llm.generation_gate import first_unfinished_attempt
+from kestrel_sovereign.llm.output_ceiling import INCOMPLETE_ATTEMPT_ATTR
+
 logger = logging.getLogger(__name__)
 
 # Retry configuration.
@@ -276,6 +279,32 @@ def common_declined_wait(
         if earliest is None or declined.retry_at < earliest.retry_at:
             earliest = declined
     return earliest
+
+
+def state_aggregate_verdicts(
+    aggregate: BaseException,
+    route_errors: Iterable[BaseException],
+) -> BaseException:
+    """Record on ``aggregate`` every verdict it states for ``route_errors``.
+
+    ``aggregate`` is the error a call raises when its routes are spent. Its
+    links lead to one route's error, which does not describe the call, so it
+    carries each verdict a surface reads instead: ``declined_wait``
+    (:func:`common_declined_wait`) and the generation gate's verdict on the
+    attempts
+    (:func:`~kestrel_sovereign.llm.generation_gate.first_unfinished_attempt`,
+    #3552). Every route walk in the LLM service raises its aggregate through
+    here, so none carries one verdict without the other. Returns
+    ``aggregate``.
+    """
+    route_errors = list(route_errors)
+    aggregate.declined_wait = common_declined_wait(route_errors)
+    setattr(
+        aggregate,
+        INCOMPLETE_ATTEMPT_ATTR,
+        first_unfinished_attempt(route_errors),
+    )
+    return aggregate
 
 
 def retry_after_seconds(error: Exception) -> Optional[float]:

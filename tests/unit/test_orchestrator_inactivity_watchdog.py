@@ -16,7 +16,7 @@ these tests cover 400 "seconds" of streaming without sleeping.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, List
+from typing import Any, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock
 
 from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
@@ -91,18 +91,31 @@ def _agent_with_followup(followup) -> MagicMock:
     return agent
 
 
-def _run_turn(loop: _VirtualClockLoop, agent: MagicMock) -> List[Any]:
-    async def drive() -> List[Any]:
+def _run_turn(
+    loop: _VirtualClockLoop, agent: MagicMock,
+) -> Tuple[List[Any], Optional[BaseException]]:
+    """The chunks the follow-up yielded, and the timeout that failed it, if any
+    (#3552: a cut follow-up is raised out of the turn after its error card)."""
+    from kestrel_sovereign.agent.orchestrator_engine import LLMCallInactivityTimeout
+
+    chunks: List[Any] = []
+
+    async def drive() -> None:
         first = LLMResponse(
             content="",
             tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})],
         )
-        return [chunk async for chunk in agent._handle_orchestrator_response_streaming(
+        async for chunk in agent._handle_orchestrator_response_streaming(
             response=first, feature_tools=[], system_prompt="sys",
             force_local_only=False, effective_model="m", user_message="hi",
-        )]
+        ):
+            chunks.append(chunk)
 
-    return loop.run_until_complete(drive())
+    try:
+        loop.run_until_complete(drive())
+    except LLMCallInactivityTimeout as exc:
+        return chunks, exc
+    return chunks, None
 
 
 def _timeout_markers(chunks: List[Any]) -> List[dict]:
@@ -129,11 +142,12 @@ def test_a_stream_that_keeps_progressing_past_the_watchdog_is_not_cut():
         yield LLMResponse(content="".join(words), tool_calls=[])
 
     try:
-        chunks = _run_turn(loop, _agent_with_followup(long_followup))
+        chunks, failure = _run_turn(loop, _agent_with_followup(long_followup))
     finally:
         loop.close()
 
     assert loop.time() > 2 * ORCHESTRATOR_TURN_TIMEOUT_SECS
+    assert failure is None
     assert _timeout_markers(chunks) == []
     text = "".join(c for c in chunks if isinstance(c, str))
     assert "".join(words) in text
@@ -159,10 +173,11 @@ def test_a_stream_that_goes_silent_is_still_cut():
         yield "this never arrives"
 
     try:
-        chunks = _run_turn(loop, _agent_with_followup(stalling_followup))
+        chunks, failure = _run_turn(loop, _agent_with_followup(stalling_followup))
     finally:
         loop.close()
 
+    assert failure is not None
     assert len(_timeout_markers(chunks)) == 1
     assert "this never arrives" not in "".join(c for c in chunks if isinstance(c, str))
     # Tripped by silence measured from the last item, not from the start:
@@ -183,8 +198,9 @@ def test_a_stream_that_never_starts_is_still_cut():
         yield "this never arrives"
 
     try:
-        chunks = _run_turn(loop, _agent_with_followup(hung_followup))
+        chunks, failure = _run_turn(loop, _agent_with_followup(hung_followup))
     finally:
         loop.close()
 
+    assert failure is not None
     assert len(_timeout_markers(chunks)) == 1
