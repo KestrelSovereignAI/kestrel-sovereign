@@ -29,7 +29,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kestrel_sovereign.agent.streaming import StreamingMixin
+from kestrel_sovereign.agent.streaming import (
+    STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+    StreamingMixin,
+    _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
+)
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
 
@@ -235,8 +239,9 @@ async def test_stream_loop_breaks_when_cancel_arrives_mid_stream():
     """The inner ``async for item in stream_with_tool_detection`` loop
     must break the moment ``is_request_cancelled`` returns True.
     Chunks that follow the cancellation point must NOT reach the
-    client, and the partial assistant turn must be persisted with the
-    cancellation marker in metadata."""
+    client. The stopped generation is not an answer (#3552): the turn
+    persists an empty row with the cancellation marker in metadata,
+    not the partial the client saw live."""
     # Cancellation flips True on the 3rd is_request_cancelled call.
     # Loop checks at top of each iteration — so iter 1, iter 2 produce
     # output; iter 3 detects cancel and breaks before processing.
@@ -262,7 +267,7 @@ async def test_stream_loop_breaks_when_cancel_arrives_mid_stream():
     assert "second " in text
     assert "should-not-reach-client" not in text
 
-    # Partial turn persisted, with cancellation marker.
+    # An empty turn persisted, with cancellation marker.
     agent.privacy_agent.add_conversation.assert_awaited()
     # Find the assistant-role call (the user turn is also persisted).
     assistant_calls = [
@@ -271,10 +276,7 @@ async def test_stream_loop_breaks_when_cancel_arrives_mid_stream():
     ]
     assert len(assistant_calls) == 1
     call = assistant_calls[0]
-    persisted_text = call.args[1]
-    assert "first " in persisted_text
-    assert "second " in persisted_text
-    assert "should-not-reach-client" not in persisted_text
+    assert call.args[1] == ""
     assert call.kwargs.get("metadata") == {"cancelled": True}
 
 
@@ -286,7 +288,8 @@ async def test_cancel_between_llm_and_tool_dispatch_skips_tools():
     marker. This is the original surprising-side-effect bug class —
     when the SSE closes client-side but the server keeps obeying the
     LLM's tool_use intent, message/email/file tools fire ghost
-    actions."""
+    actions. The stopped turn records no answer (#3552), so its
+    pre-tool prose is not persisted either."""
     # cancel_on_call: 1st call is in the stream loop (returns False —
     # we want the stream to complete). 2nd call is the new branch we
     # added before tool dispatch. Set cancel to fire on the 2nd call.
@@ -328,13 +331,16 @@ async def test_cancel_between_llm_and_tool_dispatch_skips_tools():
     ]
     assert len(assistant_calls) == 1
     call = assistant_calls[0]
-    assert "pre-tool prose" in call.args[1]
+    assert call.args[1] == ""
     assert call.kwargs.get("metadata") == {"cancelled": True}
 
 
 @pytest.mark.asyncio
 async def test_cancel_during_tool_batch_persists_completed_result_before_unwind():
-    """A completed external effect must cross the history checkpoint on Stop."""
+    """A completed external effect must cross the history checkpoint on Stop.
+
+    The stopped turn records no answer (#3552): the row is the fixed
+    checkpoint of the completed batch, as under an enforcing audit."""
 
     from kestrel_sovereign.agent.orchestrator_engine import (
         OrchestratorEngineMixin,
@@ -431,15 +437,11 @@ async def test_cancel_during_tool_batch_persists_completed_result_before_unwind(
     ]
     assert len(assistant_calls) == 1
     assert persistence_requirements == [True]
-    assert assistant_calls[0].kwargs["metadata"]["cancelled"] is True
-    assert assistant_calls[0].kwargs["metadata"]["tool_results"] == [
-        {
-            "tool_call_id": "tc1",
-            "name": "send_message",
-            "arguments": {"text": "sent once"},
-            "result": {"success": True},
-        }
-    ]
+    assert assistant_calls[0].args[1] == STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT
+    assert assistant_calls[0].kwargs["metadata"] == {
+        **_STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
+        "cancelled": True,
+    }
 
 
 @pytest.mark.asyncio

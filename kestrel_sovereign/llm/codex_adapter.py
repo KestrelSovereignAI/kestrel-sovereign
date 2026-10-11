@@ -60,6 +60,7 @@ from kestrel_sovereign._async_ownership import await_owned_task
 from .adapter import LLMAdapter, LLMResponse, ThinkingDelta, ToolCall
 from .call_progress import report_call_progress
 from .cancellation import CancelToken, await_or_cancelled, raise_if_cancelled
+from .output_ceiling import attach_stop_reason
 from kestrel_sdk.llm import (
     ProviderCapabilities,
     StructuredOutputMode,
@@ -2928,6 +2929,8 @@ class CodexAdapter(LLMAdapter):
 
             text_parts: List[str] = []
             final_text: Optional[str] = None
+            # The ``turn/completed`` status: the turn's stop reason (#3552).
+            turn_status: Optional[str] = None
             tool_calls: List[ToolCall] = []
             usage: Dict[str, Optional[int]] = {}
             seen_tool_ids: set = set()
@@ -3197,7 +3200,8 @@ class CodexAdapter(LLMAdapter):
                     # final yield with empty content. Same honesty
                     # rationale as the ``error`` branch.
                     turn_info = p.get("turn") or {}
-                    if turn_info.get("status") == "failed":
+                    turn_status = turn_info.get("status")
+                    if turn_status == "failed":
                         err = turn_info.get("error") or {}
                         msg = (
                             err.get("message") if isinstance(err, dict)
@@ -3212,6 +3216,9 @@ class CodexAdapter(LLMAdapter):
             content = final_text if final_text is not None else "".join(text_parts)
             yield {
                 "final": (content or None, tool_calls or None, usage),
+                # How the turn ended (``completed``, ``interrupted``), recorded
+                # on the response as its stop reason (#3552).
+                "stop_reason": turn_status,
                 # The orchestrator reads this via getattr(response,
                 # "executed_tool_calls", None) and produces standard
                 # chat-history breadcrumbs from it.
@@ -3471,6 +3478,7 @@ class CodexAdapter(LLMAdapter):
         usage: Dict[str, Optional[int]] = {}
         executed: List[Dict[str, Any]] = []
         pre_tool_prose: Optional[str] = None
+        stop_reason: Optional[str] = None
         async for ev in self._run_turn_with_retry(
             model, messages, tools, session_id, tool_executor,
             cancel_token=cancel_token,
@@ -3482,14 +3490,15 @@ class CodexAdapter(LLMAdapter):
                 content, tool_calls, usage = ev["final"]
                 executed = ev.get("executed") or []
                 pre_tool_prose = ev.get("pre_tool_prose")
-        resp = LLMResponse(
+                stop_reason = ev.get("stop_reason")
+        resp = attach_stop_reason(LLMResponse(
             content=content,
             tool_calls=tool_calls,
             input_tokens=usage.get("input_tokens"),
             output_tokens=usage.get("output_tokens"),
             total_tokens=usage.get("total_tokens"),
             cache_read_input_tokens=usage.get("cache_read_input_tokens"),
-        )
+        ), stop_reason)
         # Attach inline-executed tool record as a runtime attribute. The
         # SDK ``LLMResponse`` dataclass is not frozen, so this is a
         # legal (if currently undocumented) extension. A follow-up SDK
@@ -3566,14 +3575,14 @@ class CodexAdapter(LLMAdapter):
                 idx += 1
             elif "final" in ev:
                 content, tcs, usage = ev["final"]
-                resp = LLMResponse(
+                resp = attach_stop_reason(LLMResponse(
                     content=content,
                     tool_calls=tcs,
                     input_tokens=usage.get("input_tokens"),
                     output_tokens=usage.get("output_tokens"),
                     total_tokens=usage.get("total_tokens"),
                     cache_read_input_tokens=usage.get("cache_read_input_tokens"),
-                )
+                ), ev.get("stop_reason"))
                 executed = ev.get("executed") or []
                 if executed:
                     resp.executed_tool_calls = executed

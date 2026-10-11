@@ -16,7 +16,7 @@ import inspect
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
-from kestrel_sovereign.llm.retry import common_declined_wait
+from kestrel_sovereign.llm.retry import state_aggregate_verdicts
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
 
@@ -51,6 +51,7 @@ from .adapter import (
     response_usage_available,
 )
 from .output_ceiling import response_stop_reason
+from .generation_gate import UnfinishedAfterInlineToolsError
 from .model_discovery import ModelDiscoveryMixin
 from .mandate import ModelMandateMixin
 from .usage_tracking import UsageTrackingMixin
@@ -4910,16 +4911,17 @@ No other text or formatting.
                         f"Underlying error: {e}"
                     )
                     # This too is an aggregate of every attempted route: its
-                    # verdict is the common decline, not this route's error.
-                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    # verdicts describe them all, not this route's error.
+                    state_aggregate_verdicts(exhausted, route_errors)
                     raise exhausted from e
 
-        # The aggregate states its own verdict: a reset time only when every
-        # ATTEMPTED route declined (skipped routes and models a route cannot
-        # serve were not attempted). Surfaces read the verdict, never the
-        # routes' errors behind it.
+        # The aggregate states its own verdicts (state_aggregate_verdicts): a
+        # reset time only when every ATTEMPTED route declined (skipped routes
+        # and models a route cannot serve were not attempted), and whether an
+        # attempt ended unfinished. Surfaces read the verdicts, never the
+        # routes' errors behind them.
         aggregate = LLMAllProvidersFailedError(errors)
-        aggregate.declined_wait = common_declined_wait(route_errors)
+        state_aggregate_verdicts(aggregate, route_errors)
         raise aggregate from aggregate.declined_wait
 
     async def get_response_with_model(
@@ -5248,6 +5250,14 @@ No other text or formatting.
                 preserving encrypted reasoning across turns. Stateless adapters
                 ignore it. See #808.
 
+        A turn's answer and tool calls come from here, so every attempt is
+        held to the generation gate (#3552): a route's response is returned
+        only when its stop reason is a natural end. A rejected attempt fails
+        like any other route error; another route may answer instead, on its
+        own, except after a rejected response whose route already ran tools
+        inside its call: those may have acted, so the call fails instead
+        (:class:`~kestrel_sovereign.llm.generation_gate.UnfinishedAfterInlineToolsError`).
+
         Returns:
             String content or LLMResponse
         """
@@ -5338,6 +5348,9 @@ No other text or formatting.
                         error_message_override=(
                             self._managed_remote_failure_message
                         ),
+                    )
+                    self._require_finished_generation(
+                        remote_response, provider_name="remote_gpu", model=model,
                     )
                 except Exception as exc:
                     self._raise_managed_remote_failure(exc)
@@ -5512,6 +5525,9 @@ No other text or formatting.
                     response_format=response_format,
                     force_local_only=force_local_only,
                 )
+                self._require_finished_generation(
+                    response, provider_name=provider["name"], model=model,
+                )
                 if tools is not None or response_format is not None:
                     return self._annotate_and_return(span, response, redact=_redact)
                 if isinstance(response, LLMResponse):
@@ -5525,6 +5541,8 @@ No other text or formatting.
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 self._maybe_disable_route(provider, e)
+                if isinstance(e, UnfinishedAfterInlineToolsError):
+                    raise
                 last_error = e
                 route_errors.append(e)
                 if explicit_selection:
@@ -5552,8 +5570,8 @@ No other text or formatting.
                         f"Underlying error: {e}"
                     )
                     # This too is an aggregate of every attempted route: its
-                    # verdict is the common decline, not this route's error.
-                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    # verdicts describe them all, not this route's error.
+                    state_aggregate_verdicts(exhausted, route_errors)
                     raise exhausted from e
                 logger.warning(
                     "Falling through from %s in generate_with_messages: %s",
@@ -5565,7 +5583,7 @@ No other text or formatting.
             f"All providers failed for generate_with_messages "
             f"(last: {last_provider_name}): {last_error}"
         )
-        aggregate.declined_wait = common_declined_wait(route_errors)
+        state_aggregate_verdicts(aggregate, route_errors)
         raise aggregate from last_error
 
     # generate_stream, stream_with_messages, and stream_with_tool_detection

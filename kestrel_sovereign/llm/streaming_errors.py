@@ -66,13 +66,14 @@ _ROUTE_ERROR = (
 )
 
 # A model call that ended without a finished response (#3552): it stopped at
-# its route's output cap, or went silent past the orchestrator's inactivity
-# bound. Which of the two, and on which route, stays in the operator log.
+# its route's output cap, went silent past the orchestrator's inactivity
+# bound, or its stream failed after part of the response was sent. Which one,
+# and on which route, stays in the operator log.
 _INCOMPLETE_GENERATION_ERROR = (
     "The model did not finish its response.",
-    "It stopped at its output limit or went silent for too long, so no answer "
-    "was recorded. Try again, or pick a different model/route from the "
-    "dropdown. The specific cause is in the server logs.",
+    "It stopped at its output limit, went silent for too long, or its stream "
+    "failed partway, so no answer was recorded. Try again, or pick a different "
+    "model/route from the dropdown. The specific cause is in the server logs.",
 )
 
 

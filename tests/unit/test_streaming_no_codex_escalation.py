@@ -25,6 +25,8 @@ from kestrel_sovereign.llm.codex_app_server import (
     CodexAppServerFrameTooLarge,
     CodexAppServerTransportError,
 )
+from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.llm.output_ceiling import attach_stop_reason
 from kestrel_sovereign.llm.streaming import (
     LLMStreamingError,
     RoutingResolution,
@@ -260,6 +262,9 @@ class _OkAdapter:
     async def get_streaming_response_with_tools(self, **kwargs) -> AsyncIterator[Any]:
         self._host.attempted.append(self._name)
         yield self._text
+        # A finished stream ends with its stop reason: the evidence the
+        # generation gate accepts (#3552).
+        yield attach_stop_reason(LLMResponse(content=self._text), "end_turn")
 
 
 def _build_host(first_exc: BaseException) -> _RecordingHost:
@@ -480,7 +485,8 @@ async def test_stream_with_tool_detection_rotates_on_generic_exception():
     ):
         chunks.append(chunk)
     assert host.attempted == ["openai:plan", "anthropic:api"]
-    assert chunks == ["ok"]
+    # The stream ends with its terminal response after the text.
+    assert [c for c in chunks if isinstance(c, str)] == ["ok"]
 
 
 # ---------------------------------------------------------------------------
@@ -817,7 +823,8 @@ async def test_unconfigured_vendor_before_configured_skipped_stream_with_tool_de
     ):
         chunks.append(chunk)
     assert host.attempted == ["openai:plan", "openai:api"], host.attempted
-    assert chunks == ["ok"]
+    # The stream ends with its terminal response after the text.
+    assert [c for c in chunks if isinstance(c, str)] == ["ok"]
 
 
 def test_skip_unconfigured_route_helper():

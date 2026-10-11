@@ -8,7 +8,7 @@ import json
 from datetime import datetime, timedelta
 
 import pytest
-from unittest.mock import Mock, AsyncMock, PropertyMock
+from unittest.mock import Mock, AsyncMock
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import (
     PrivacyEnforcingStorage,
@@ -250,6 +250,19 @@ class TestAnonymousMode:
         metadata = args[0][2]  # Third positional arg
 
         assert metadata["privacy_mode"] == "anonymous"
+
+    @pytest.mark.asyncio
+    async def test_the_callers_metadata_is_not_mutated(self, anonymous_storage, mock_storage):
+        """#3552: callers pass shared dicts (a module-level checkpoint); the
+        privacy stamp goes on a copy, never back into theirs."""
+        shared = {"tool_batch_checkpoint": {"status": "completed"}}
+
+        await anonymous_storage.add_conversation("assistant", "Done.", shared)
+
+        assert shared == {"tool_batch_checkpoint": {"status": "completed"}}
+        stored = mock_storage.add_conversation.call_args[0][2]
+        assert stored["privacy_mode"] == "anonymous"
+        assert stored["tool_batch_checkpoint"] == {"status": "completed"}
 
 
 class TestNormalMode:

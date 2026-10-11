@@ -16,6 +16,8 @@ import asyncio
 import shutil
 from pathlib import Path
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.llm.generation_gate import failure_summary
+from kestrel_sovereign.llm.output_ceiling import incomplete_generation
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
 from tests.shared import no_llm_credentials, no_docker
@@ -155,20 +157,31 @@ async def test_orchestrator_natural_language_tool_use(kestrel_agent):
     crashing or entering safe mode, and ideally invoke ModelManagerTool.
 
     Hard failures (these always fail the test):
-      - The call raises.
+      - The call raises, other than as below.
       - Response is missing / empty / not a string.
       - Agent enters safe mode (constitution audit failure or similar).
 
-    Soft failure (xfail, never green-lit silently):
+    Soft failures (xfail, never green-lit silently):
       - The local LLM does not produce any of the keywords we expect from
         the tool's formatted output. This is recorded as ``xfail`` so it
         stays visible in test reports rather than disappearing into a log
         line, but does not break CI on flaky local models.
+      - The local LLM does not finish its response: a small model caught in
+        a repetition loop stops at its route's output cap, and the turn fails
+        as designed rather than answering (#3552).
     """
     logger.info("Testing Natural Language Tool Use...")
 
     query = "Please list all available AI models."
-    response = await kestrel_agent.process_input(query)
+    try:
+        response = await kestrel_agent.process_input(query)
+    except Exception as exc:
+        unfinished = incomplete_generation(exc)
+        if unfinished is None:
+            raise
+        pytest.xfail(
+            f"Local LLM did not finish its response: it {failure_summary(unfinished)}."
+        )
     logger.info(f"NL Response: {response}")
 
     assert isinstance(response, str), f"Expected str response, got {type(response)}"

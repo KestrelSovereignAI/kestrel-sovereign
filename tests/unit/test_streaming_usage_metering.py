@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.llm.output_ceiling import attach_stop_reason
 from kestrel_sovereign.llm.streaming import RoutingResolution, StreamingMixin
 from tests.utils.anthropic_client import models_api
 
@@ -192,8 +193,11 @@ class _FakeStreamAdapter:
     ):
         yield "hello "
         yield "world"
-        yield LLMResponse(content="hello world", tool_calls=None, raw=None,
-                          input_tokens=11, output_tokens=22, total_tokens=33)
+        # A finished stream ends with its stop reason (#3552).
+        yield attach_stop_reason(LLMResponse(
+            content="hello world", tool_calls=None, raw=None,
+            input_tokens=11, output_tokens=22, total_tokens=33,
+        ), "end_turn")
 
 
 class _RoutingService(StreamingMixin):

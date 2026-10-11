@@ -37,10 +37,8 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.llm.call_progress import call_progress_listener
-from kestrel_sovereign.llm.output_ceiling import (
-    IncompleteGenerationError,
-    incomplete_generation,
-)
+from kestrel_sovereign.llm.generation_gate import failure_summary, judge_generation
+from kestrel_sovereign.llm.output_ceiling import IncompleteGenerationError
 from kestrel_sovereign.turn_completion import (
     confirm_unfinished,
     confirms_complete,
@@ -74,6 +72,7 @@ from kestrel_sovereign.agent.streaming import (
     _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
     _build_revise_sentinel,
     _build_tool_sentinel,
+    _stopped_generation,
     INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT,
     STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
 )
@@ -890,12 +889,76 @@ class OrchestratorEngineMixin:
             force_local_only=bool(call_kwargs.get("force_local_only")),
             streaming=False,
         )
-        return await watchdog.call(self.llm_service.generate_with_messages(
-            tool_executor=self._make_inline_tool_executor(
-                executor_session_id, watchdog=watchdog,
-            ),
-            **call_kwargs,
-        ))
+        try:
+            return await watchdog.call(self.llm_service.generate_with_messages(
+                tool_executor=self._make_inline_tool_executor(
+                    executor_session_id, watchdog=watchdog,
+                ),
+                **call_kwargs,
+            ))
+        except Exception as exc:
+            await OrchestratorEngineMixin._settle_failed_generation(
+                self, exc, session_id=call_kwargs.get("session_id"),
+            )
+            raise
+
+    async def _stream_with_tool_detection_bounded(
+        self,
+        watchdog: LLMCallWatchdog,
+        **call_kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        """``llm_service.stream_with_tool_detection`` under ``watchdog``.
+
+        The streamed counterpart of :meth:`_generate_with_messages_bounded`:
+        the turn's first streamed call and each tool-loop follow-up go through
+        here, bounded by the same inactivity watchdog (#3552), and a call that
+        raises is settled by :meth:`_settle_failed_generation` before the
+        error reaches the turn.
+        """
+        try:
+            async with aclosing(watchdog.watch(
+                self.llm_service.stream_with_tool_detection(**call_kwargs)
+            )) as stream:
+                async for item in stream:
+                    yield item
+        except Exception as exc:
+            await OrchestratorEngineMixin._settle_failed_generation(
+                self, exc, session_id=call_kwargs.get("session_id"),
+            )
+            raise
+
+    async def _settle_failed_generation(
+        self,
+        error: BaseException,
+        *,
+        session_id: Optional[str],
+    ) -> BaseException:
+        """Settle a turn's model call that raised; return the gate's verdict.
+
+        A call that raised is never accepted
+        (:func:`~kestrel_sovereign.llm.generation_gate.judge_generation`), so
+        the turn records no answer (#3552). If tools already acted in this
+        turn and nothing has recorded that yet, the fixed checkpoint is
+        persisted, so the next turn does not repeat them: the Stop checkpoint
+        when the request was stopped meanwhile, else the incomplete-generation
+        one. Every turn model call, first or follow-up, streamed or not, is
+        settled here.
+        """
+        failure = judge_generation(error=error)
+        state = current_invocation_effect_checkpoint()
+        if state is not None and state.completed and not state.checkpointed:
+            request_id = current_invocation_id()
+            stopped = _stopped_generation(self, request_id) is not None
+            await OrchestratorEngineMixin._persist_completed_tool_stop_checkpoint(
+                self,
+                session_id=session_id or state.session_id,
+                request_id=request_id,
+                checkpoint=(
+                    STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT if stopped
+                    else INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT
+                ),
+            )
+        return failure
 
     def _make_inline_tool_executor(
         self,
@@ -2823,22 +2886,6 @@ class OrchestratorEngineMixin:
                     state.checkpointed = True
                 setattr(error, "_kestrel_completed_effect_checkpointed", True)
             raise
-        except Exception as error:
-            # #3552: a follow-up that ended unfinished fails the turn, which
-            # records no answer. Effects it already completed still need their
-            # anti-repeat checkpoint.
-            if incomplete_generation(error) is None:
-                raise
-            state = current_invocation_effect_checkpoint()
-            if (had_inline_effect or captured_results) and not (
-                state is not None and state.checkpointed
-            ):
-                await self._persist_completed_tool_stop_checkpoint(
-                    session_id=session_id,
-                    request_id=current_invocation_id(),
-                    checkpoint=INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT,
-                )
-            raise
 
     async def _handle_orchestrator_response_impl(
         self,
@@ -3565,8 +3612,10 @@ class OrchestratorEngineMixin:
                 force_local_only=force_local_only,
             )
             try:
-                async with aclosing(watchdog.watch(
-                    self.llm_service.stream_with_tool_detection(
+                async with aclosing(
+                    OrchestratorEngineMixin._stream_with_tool_detection_bounded(
+                        self,
+                        watchdog,
                         messages=messages,
                         tools=all_tools or None,
                         force_local_only=force_local_only,
@@ -3586,7 +3635,7 @@ class OrchestratorEngineMixin:
                             if request_id else None
                         ),
                     )
-                )) as followup_stream:
+                ) as followup_stream:
                     async for item in followup_stream:
                         if _cancelled():
                             break
@@ -3638,10 +3687,10 @@ class OrchestratorEngineMixin:
                         elif isinstance(item, LLMResponse):
                             response = item
             except Exception as exc:
-                # #3552: the follow-up ended unfinished — silent past the
-                # watchdog, or stopped at its route's output cap.
-                if incomplete_generation(exc) is None:
-                    raise
+                # #3552: the follow-up was not accepted — it went silent past
+                # the watchdog, stopped without a natural end, or failed. The
+                # bounded call already settled it (its completed tool batch is
+                # checkpointed).
                 incomplete = exc
 
             if _cancelled():
@@ -3649,15 +3698,14 @@ class OrchestratorEngineMixin:
 
             if incomplete is not None:
                 # The attempt failed: raise it out of the turn, which persists
-                # no answer, only the completed tool batch's checkpoint. Its
-                # partial prose is never recorded as one. #1659: shown live as
-                # an error tool card, not response prose; under an enforcing
-                # audit (#2674) nothing unreviewed is emitted, and the failure
-                # reaches the client as the stream's own error notice.
+                # no answer. Its partial prose is never recorded as one.
+                # #1659: shown live as an error tool card, not response prose;
+                # under an enforcing audit (#2674) nothing unreviewed is
+                # emitted, and the failure reaches the client as the stream's
+                # own error notice.
                 if not buffer_audit:
                     yield _build_tool_sentinel(
-                        'error', 'llm',
-                        detail=incomplete_generation(incomplete).summary,
+                        'error', 'llm', detail=failure_summary(incomplete),
                     )
                 raise incomplete
 
@@ -3696,16 +3744,13 @@ class OrchestratorEngineMixin:
                             original_delivered=bool(streamed_text),
                         )
                     except Exception as exc:
-                        # The repair is part of this follow-up: one that ends
-                        # unfinished fails it the same way (#3552).
-                        if incomplete_generation(exc) is None:
-                            raise
+                        # The repair is part of this follow-up: one that is
+                        # not accepted fails it the same way (#3552).
                         if _cancelled():
                             return
                         if not buffer_audit:
                             yield _build_tool_sentinel(
-                                'error', 'llm',
-                                detail=incomplete_generation(exc).summary,
+                                'error', 'llm', detail=failure_summary(exc),
                             )
                         raise
                     if isinstance(response, str):

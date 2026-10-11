@@ -20,6 +20,7 @@ second; only the provider calls are scripted.
 from __future__ import annotations
 
 import asyncio
+import copy
 import os
 from contextlib import asynccontextmanager
 from typing import Any, List
@@ -34,6 +35,7 @@ from kestrel_sovereign.agent.orchestrator_engine import (
     OrchestratorEngineMixin,
 )
 from kestrel_sovereign.agent.streaming import (
+    _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
     INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT,
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
@@ -512,6 +514,7 @@ async def test_a_follow_up_that_never_answers_hits_the_same_bound(
             agent.llm_service, "stream_with_tool_detection",
             provider.stream_with_tool_detection,
         )
+        checkpoint_metadata = copy.deepcopy(_STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA)
 
         text = await asyncio.wait_for(_failed_streamed_turn(agent, "Look it up."), 30)
 
@@ -531,6 +534,8 @@ async def test_a_follow_up_that_never_answers_hits_the_same_bound(
         assert await _assistant_rows(agent, "s1") == [
             INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT,
         ]
+        # Persisting it left the shared checkpoint metadata as it was.
+        assert _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA == checkpoint_metadata
         assert await asyncio.wait_for(_turn(agent, "And now?"), 30) == "Noted."
 
 
@@ -672,6 +677,110 @@ async def test_a_stalled_non_streaming_follow_up_records_only_its_checkpoint(
                 INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT,
             ]
             assert (await _invoke(client, "And now?")).status_code == 200
+
+
+#: A model no discovery has described, so the service passes the turn's tools.
+_LOCAL_MODEL = "kestrel-watchdog-local:1b"
+
+
+def _ollama_route(agent, route: str, respond) -> dict:
+    """A real Ollama route, built as the registry builds one, whose daemon is
+    ``respond`` running in-process: what reaches the turn is what the real
+    adapter and the real service make of the daemon's replies."""
+    import json
+
+    import httpx
+    import ollama
+
+    from kestrel_sovereign.llm.provider_registry import ProviderRegistry
+
+    info = ProviderRegistry({})._build_route(
+        "ollama", route, {"is_cloud": False},
+        {"adapter": "OllamaAdapter", "host": "http://ollama.test:11434",
+         "model": _LOCAL_MODEL, "max_output_tokens": 64},
+    )
+    [provider] = agent.llm_service._convert_providers_format([info])
+    requests: List[dict] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/api/chat":
+            # Retrieval embeds the turn on the same route; this daemon has no
+            # embedding model, as a chat-only local install would not.
+            return httpx.Response(404, json={"error": "model not found"})
+        body = json.loads(request.content)
+        requests.append(body)
+        return respond(body)
+
+    provider["client"] = ollama.AsyncClient(
+        host="http://ollama.test:11434", transport=httpx.MockTransport(handle),
+    )
+    provider["requests"] = requests
+    return provider
+
+
+def _ollama_reply(message: dict, done_reason: str):
+    import httpx
+
+    return httpx.Response(200, json={
+        "model": _LOCAL_MODEL, "message": message, "done": True,
+        "done_reason": done_reason, "prompt_eval_count": 11, "eval_count": 64,
+    })
+
+
+def _tool_call_then_capped(body: dict):
+    """The incident's route: a tool call, then a continuation that loops
+    until the route's cap stops it."""
+    if body["messages"][-1]["role"] == "tool":
+        return _ollama_reply(
+            {"role": "assistant", "content": "Your employer is is is is"}, "length",
+        )
+    return _ollama_reply({
+        "role": "assistant", "content": "",
+        "tool_calls": [{"function": {"name": "state_of_mind", "arguments": {}}}],
+    }, "stop")
+
+
+def _model_not_found(_body: dict):
+    import httpx
+
+    return httpx.Response(404, json={"error": f"model '{_LOCAL_MODEL}' not found"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("isolated_process_rate_limiter")
+async def test_a_capped_follow_up_on_spent_routes_records_only_its_checkpoint(
+    tmp_path, monkeypatch,
+):
+    """Routing that may fall back raises the service's aggregate when every
+    route fails, never the capped route's own error. Here the capped route is
+    not even the last one tried: the fallback after it fails for another
+    reason, which is what the aggregate's links lead to. The aggregate still
+    says an attempt ended unfinished, so the completed tool batch gets its
+    checkpoint and the caller is told the model did not finish."""
+    async with _booted_agent(tmp_path) as agent:
+        capped = _ollama_route(agent, "local", _tool_call_then_capped)
+        fallback = _ollama_route(agent, "spare", _model_not_found)
+        service = agent.llm_service
+        monkeypatch.setattr(service, "providers", [capped, fallback])
+        monkeypatch.setattr(
+            service, "config",
+            {**(service.config or {}), "route_priority": ["ollama:local", "ollama:spare"]},
+        )
+        monkeypatch.setattr(service, "_mandate_preference", {})
+        async with _invoke_client(agent) as client:
+            failed = await _invoke(client, "Look it up.")
+
+            assert failed.status_code == 502, failed.text
+            assert failed.json()["error"]["code"] == "generation_incomplete"
+            # The tool ran, its continuation hit the cap, and the fallback
+            # was tried after it: the turn saw the service's aggregate.
+            assert len(capped["requests"]) == 2
+            assert capped["requests"][-1]["options"]["num_predict"] == 64
+            assert len(fallback["requests"]) == 1
+            assert _conversation_holder(agent) is None
+            rows = await _assistant_rows(agent, "inv-1")
+            assert rows == [INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT]
+            assert not any("employer" in row for row in rows)
 
 
 @pytest.mark.asyncio

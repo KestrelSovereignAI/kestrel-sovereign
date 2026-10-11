@@ -22,6 +22,8 @@ import pytest
 
 ollama = pytest.importorskip("ollama")
 
+from kestrel_sdk.llm import RequestOptions  # noqa: E402
+
 from kestrel_sovereign.llm.adapter import LLMResponse  # noqa: E402
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter  # noqa: E402
 from kestrel_sovereign.llm.output_ceiling import (  # noqa: E402
@@ -224,20 +226,164 @@ async def test_a_stream_stopped_by_the_route_cap_is_a_failure_not_an_answer():
 
 
 @pytest.mark.asyncio
-async def test_a_stop_on_a_callers_own_budget_keeps_its_text():
-    """A caller that asked for fewer tokens chose where the response ends; its
-    text stands, and the stop reason records that it was cut."""
+async def test_a_stop_on_a_callers_lower_budget_is_a_failure_too():
+    """A caller's smaller ``max_tokens`` sets where the model must stop, not
+    what counts as finished: a response cut there is still unfinished, and is
+    never returned as an answer."""
     daemon = _replying("partial summary", done_reason="length")
 
-    response = await _get_response(OllamaAdapter(), daemon, max_tokens=32)
+    with pytest.raises(OutputCapReachedError) as raised:
+        await _get_response(OllamaAdapter(max_output_tokens=128), daemon, max_tokens=32)
 
-    assert response.content == "partial summary"
-    assert response_stop_reason(response) == "length"
+    assert daemon.num_predict == 32
+    assert raised.value.cap == 32 and raised.value.route_cap == 128
+    assert "partial" not in str(raised.value)
 
-    streamed = await _stream(OllamaAdapter(), _replying("partial", done_reason="length"),
-                             max_tokens=32)
-    [terminal] = [i for i in streamed if isinstance(i, LLMResponse)]
-    assert response_stop_reason(terminal) == "length"
+
+@pytest.mark.asyncio
+async def test_a_streamed_stop_on_a_callers_lower_budget_is_a_failure_too():
+    daemon = _replying("partial", done_reason="length")
+
+    with pytest.raises(OutputCapReachedError) as raised:
+        await _stream(OllamaAdapter(max_output_tokens=128), daemon, max_tokens=32)
+
+    assert daemon.num_predict == 32
+    assert raised.value.cap == 32
+
+
+# --------------------------------------------------------------------------
+# RequestOptions.raw cannot remove or raise the cap
+# --------------------------------------------------------------------------
+
+
+def _raw(options: Any) -> RequestOptions:
+    return RequestOptions(raw={"options": options})
+
+
+#: Raw ``num_predict`` values that are not a budget below the cap: Ollama reads
+#: ``-1`` as "no limit", and the rest are not positive integers or exceed it.
+_NOT_A_LOWER_BUDGET = [-1, 0, 100_000, None, "64", 2.5, True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_value", _NOT_A_LOWER_BUDGET)
+async def test_a_raw_num_predict_cannot_remove_or_raise_the_cap(raw_value):
+    daemon = _replying("ok")
+
+    await _get_response(
+        OllamaAdapter(max_output_tokens=512), daemon,
+        request_options=_raw({"num_predict": raw_value, "num_ctx": 2048}),
+    )
+
+    assert daemon.num_predict == 512
+    # The rest of the raw options still reach the daemon.
+    assert daemon.requests[-1]["options"]["num_ctx"] == 2048
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_value", _NOT_A_LOWER_BUDGET)
+async def test_a_streamed_raw_num_predict_cannot_remove_or_raise_the_cap(raw_value):
+    daemon = _replying("ok")
+
+    await _stream(
+        OllamaAdapter(max_output_tokens=512), daemon,
+        request_options=_raw({"num_predict": raw_value}),
+    )
+
+    assert daemon.num_predict == 512
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_options", [None, {}])
+async def test_raw_options_that_replace_or_omit_num_predict_still_carry_the_cap(raw_options):
+    daemon = _replying("ok")
+
+    await _get_response(
+        OllamaAdapter(max_output_tokens=512), daemon, request_options=_raw(raw_options),
+    )
+
+    assert daemon.num_predict == 512
+
+
+@pytest.mark.asyncio
+async def test_raw_ollama_options_model_carries_the_effective_budget():
+    daemon = _replying("ok")
+
+    await _get_response(
+        OllamaAdapter(max_output_tokens=512), daemon,
+        request_options=_raw(ollama.Options(num_predict=-1, temperature=0.1)),
+    )
+
+    assert daemon.num_predict == 512
+    assert daemon.requests[-1]["options"]["temperature"] == 0.1
+
+
+@pytest.mark.asyncio
+async def test_raw_options_that_are_not_ollama_options_fail_the_call():
+    daemon = _replying("ok")
+
+    with pytest.raises(TypeError, match="Ollama chat options"):
+        await _get_response(
+            OllamaAdapter(), daemon, request_options=_raw("num_predict=-1"),
+        )
+
+    assert daemon.requests == []
+
+
+@pytest.mark.asyncio
+async def test_a_lower_raw_num_predict_is_honoured():
+    daemon = _replying("short")
+
+    response = await _get_response(
+        OllamaAdapter(max_output_tokens=512), daemon,
+        request_options=_raw({"num_predict": 64}),
+    )
+
+    assert daemon.num_predict == 64
+    assert response.content == "short"
+
+    streamed = _replying("short")
+    await _stream(
+        OllamaAdapter(max_output_tokens=512), streamed,
+        request_options=_raw({"num_predict": 64}),
+    )
+    assert streamed.num_predict == 64
+
+
+@pytest.mark.asyncio
+async def test_the_smallest_positive_budget_wins():
+    daemon = _replying("ok")
+
+    await _get_response(
+        OllamaAdapter(max_output_tokens=512), daemon,
+        max_tokens=100, request_options=_raw({"num_predict": 200}),
+    )
+    assert daemon.num_predict == 100
+
+    await _get_response(
+        OllamaAdapter(max_output_tokens=512), daemon,
+        max_tokens=200, request_options=_raw({"num_predict": 100}),
+    )
+    assert daemon.num_predict == 100
+
+
+@pytest.mark.asyncio
+async def test_a_stop_on_a_lower_raw_budget_is_a_failure():
+    daemon = _replying("partial", done_reason="length")
+
+    with pytest.raises(OutputCapReachedError) as raised:
+        await _get_response(
+            OllamaAdapter(max_output_tokens=512), daemon,
+            request_options=_raw({"num_predict": 64}),
+        )
+    assert raised.value.cap == 64
+
+    with pytest.raises(OutputCapReachedError):
+        await _stream(
+            OllamaAdapter(max_output_tokens=512),
+            _replying("partial", done_reason="length"),
+            request_options=_raw({"num_predict": 64}),
+        )
 
 
 class _EndlessGeneration(httpx.AsyncByteStream):
@@ -288,6 +434,31 @@ async def test_a_server_that_streams_forever_is_cut_at_the_cap_and_disconnected(
     assert len(text) <= 32
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_value,bound", [(-1, 32), (0, 32), (100_000, 32), (8, 8)])
+async def test_the_stream_guard_bounds_by_the_effective_budget(raw_value, bound):
+    """The guard reads the same budget the request sends: a raw ``-1`` (no
+    limit to Ollama) or a larger value cannot unbound it, and a lower one
+    tightens it."""
+    endless = _EndlessGeneration()
+    daemon = _Daemon(lambda _body: httpx.Response(200, stream=endless))
+
+    async def consume() -> None:
+        async for _item in OllamaAdapter(max_output_tokens=32).get_streaming_response_with_tools(
+            client=daemon.client(), model=MODEL, messages=MESSAGES,
+            request_options=_raw({"num_predict": raw_value}),
+        ):
+            pass
+
+    with pytest.raises(OutputCapReachedError) as raised:
+        await asyncio.wait_for(consume(), 10)
+
+    assert daemon.num_predict == bound
+    assert raised.value.cap == bound
+    assert endless.closed, "the HTTP response to Ollama was left open"
+    assert endless.sent <= bound + 2
+
+
 def test_incomplete_generation_is_found_through_the_service_wrappers():
     """The service reports a selected route's failure wrapped; the transports
     must still recognize the cap underneath to say what happened."""
@@ -304,8 +475,43 @@ def test_incomplete_generation_is_found_through_the_service_wrappers():
     assert incomplete_generation(streamed) is cap
     assert incomplete_generation(non_streamed) is cap
 
-    # An aggregate over several routes states its own verdict.
-    aggregate = LLMStreamingError("All providers failed", underlying=cap)
-    aggregate.declined_wait = None
-    assert incomplete_generation(aggregate) is None
     assert incomplete_generation(RuntimeError("unrelated")) is None
+
+
+def test_an_aggregate_states_whether_an_attempt_ended_unfinished():
+    """An aggregate over several routes links to the LAST route's error, which
+    describes neither the routes before it nor the call. Its own verdict is
+    read instead: the first route that ended unfinished, wherever it came in
+    the chain, and nothing when none did, whatever the links hold."""
+    from kestrel_sovereign.llm.retry import state_aggregate_verdicts
+    from kestrel_sovereign.llm.service import LLMServiceError
+    from kestrel_sovereign.llm.streaming import LLMStreamingError
+
+    cap = OutputCapReachedError(provider="ollama", model=MODEL, cap=4096)
+    capped_route = LLMStreamingError("route ollama:local failed", underlying=cap)
+    reset = ConnectionError("reset by peer")
+
+    aggregate = state_aggregate_verdicts(
+        LLMStreamingError("All providers failed", underlying=reset),
+        [capped_route, reset],
+    )
+    assert incomplete_generation(aggregate) is cap
+    # The decline verdict is stated alongside it: not every route declined.
+    assert aggregate.declined_wait is None
+    # Wrapped again on its way to a transport, the verdict still reads.
+    try:
+        raise LLMServiceError("turn failed") from aggregate
+    except LLMServiceError as exc:
+        assert incomplete_generation(exc) is cap
+
+    # No route ended unfinished: a cap reachable through the links is not
+    # the call's outcome.
+    aggregate = state_aggregate_verdicts(
+        LLMStreamingError("All providers failed", underlying=cap), [reset],
+    )
+    assert incomplete_generation(aggregate) is None
+
+    # An aggregate built without the verdict says nothing either.
+    bare = LLMStreamingError("All providers failed", underlying=cap)
+    bare.declined_wait = None
+    assert incomplete_generation(bare) is None
