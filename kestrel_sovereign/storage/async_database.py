@@ -797,7 +797,8 @@ CREATE TABLE IF NOT EXISTS pending_a2a_questions (
     retry_state TEXT,
     retry_reply_text TEXT,
     receiver_settlement TEXT,
-    receiver_settlement_lease_until TIMESTAMP,
+    claim_token TEXT,
+    claim_lease_until TIMESTAMP,
     receiver_late_state TEXT,
     receiver_late_reply_text TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1522,21 +1523,37 @@ class AsyncDatabase:
         # #3440: an expired question records whether the recipient's task is
         # confirmed terminal, so the sweep can keep withdrawing it (or relay
         # its late answer) until both stores agree. A late answer is held on
-        # the row until its wake is delivered, and each settlement pass works
-        # under a lease that lapses if the pass dies.
+        # the row until its wake is delivered. Every pass that wakes the asker
+        # or settles the recipient works under a claim (an opaque token every
+        # later mutation names) whose lease lapses if the pass dies.
         await self._migrate_add_column(
             "pending_a2a_questions", "receiver_settlement", "TEXT DEFAULT NULL"
         )
         await self._migrate_add_column(
-            "pending_a2a_questions",
-            "receiver_settlement_lease_until",
-            "TIMESTAMP DEFAULT NULL",
+            "pending_a2a_questions", "claim_token", "TEXT DEFAULT NULL"
+        )
+        await self._migrate_add_column(
+            "pending_a2a_questions", "claim_lease_until", "TIMESTAMP DEFAULT NULL"
         )
         await self._migrate_add_column(
             "pending_a2a_questions", "receiver_late_state", "TEXT DEFAULT NULL"
         )
         await self._migrate_add_column(
             "pending_a2a_questions", "receiver_late_reply_text", "TEXT DEFAULT NULL"
+        )
+        # A question that expired before #3440 never had its recipient's task
+        # settled: the recipient may still hold it live (and re-deliver it),
+        # or have answered after the asker gave up. Adopt every such row as
+        # PENDING so the settlement sweep withdraws it or relays the answer.
+        # This runs on every initialization rather than once with the column:
+        # an expiry since #3440 always records a settlement, so only a release
+        # before it writes EXPIRED with none, and an older replica sharing
+        # this database during a rolling upgrade can still do so after the
+        # column exists.
+        await self.execute(
+            "UPDATE pending_a2a_questions SET receiver_settlement = 'PENDING' "
+            "WHERE status = 'EXPIRED' AND receiver_settlement IS NULL",
+            (),
         )
         # Decay-aware forgetting (#1674): memory_episodes need a decay signal
         # before they can be deleted by importance rather than raw age. Stamp

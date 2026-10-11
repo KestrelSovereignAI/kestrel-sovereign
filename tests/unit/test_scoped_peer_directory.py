@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Mapping, Optional, Sequence
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -185,6 +185,9 @@ def _feature_for_scope(router: ScopedRouter, scope: object) -> PeersFeature:
         pending_a2a_questions=MagicMock(
             insert=AsyncMock(return_value=None),
             mark_resolved=AsyncMock(return_value=True),
+            # The pass that resolved the row still holds it when it wakes the
+            # asker (#3440).
+            renew_claim_lease=AsyncMock(return_value=True),
         ),
         dispatcher=MagicMock(enqueue_signal=AsyncMock()),
         _track_background_task=lambda coro, *, name="": coro.close() or MagicMock(),
@@ -2090,6 +2093,9 @@ async def test_subscription_reauthorizes_after_resolution_and_hides_revocation_d
         assert router.subscribed_to == []
         feature.agent.pending_a2a_questions.mark_resolved.assert_awaited_once_with(
             submitted.data["task_id"],
+            state="failed",
+            reply_text="Peer task subscription is no longer authorized.",
+            claim=ANY,
         )
         signal = feature.agent.dispatcher.enqueue_signal.await_args.args[0]
         assert signal.payload["state"] == "failed"

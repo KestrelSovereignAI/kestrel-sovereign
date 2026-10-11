@@ -28,7 +28,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -174,6 +174,11 @@ def _make_feature(
     agent.pending_a2a_questions.mark_resolved = AsyncMock(
         return_value=mark_resolved_returns,
     )
+    # The claim surface every wake goes through (#3440).
+    agent.pending_a2a_questions.renew_claim_lease = AsyncMock(return_value=True)
+    agent.pending_a2a_questions.confirm_wake_delivered = AsyncMock(
+        return_value=True,
+    )
     dispatcher_enqueue = AsyncMock(return_value=_DeliveredSignalHandle())
     agent.dispatcher = MagicMock()
     agent.dispatcher.enqueue_signal = dispatcher_enqueue
@@ -298,7 +303,7 @@ class TestSupervisorHappyPath:
             "final": True,
         })
         sse_response = _FakeStreamResponse([
-            f"event: status",
+            "event: status",
             f"data: {terminal_frame}",
             "",
         ])
@@ -315,8 +320,19 @@ class TestSupervisorHappyPath:
             causation_chain=None,
         )
 
-        agent.pending_a2a_questions.mark_resolved.assert_awaited_once_with("t-1")
+        store = agent.pending_a2a_questions
+        store.mark_resolved.assert_awaited_once_with(
+            "t-1",
+            state="completed",
+            reply_text="Rome is the capital of Italy.",
+            claim=ANY,
+        )
         enqueue.assert_awaited_once()
+        # Delivered, the answer is retired under the claim that resolved it
+        # (#3440): until then a crash would leave it owed on the row.
+        store.confirm_wake_delivered.assert_awaited_once_with(
+            "t-1", claim=store.mark_resolved.await_args.kwargs["claim"],
+        )
         # The signal carries the reply text inline.
         sent_signal = enqueue.await_args.args[0]
         assert sent_signal.source == "a2a.question_answered"
@@ -328,6 +344,50 @@ class TestSupervisorHappyPath:
             "What is the capital of Italy?"
         )
         assert sent_signal.target_agent == "did:test:sender"
+
+    @pytest.mark.asyncio
+    async def test_failed_claim_write_still_fires_the_answer_unfenced(
+        self, monkeypatch,
+    ):
+        """The write that resolves the row raised, so whether the claim took
+        is unknown and it cannot vouch for this pass (#3440). The answer is
+        fired anyway, as before, with no ownership check or retirement under
+        that claim."""
+        terminal_frame = json.dumps({
+            "id": "t-blip",
+            "status": {
+                "state": "completed",
+                "message": {"parts": [{"type": "text", "text": "42"}]},
+            },
+            "final": True,
+        })
+        feature, agent, enqueue, _ = _make_feature(
+            sse_responses=[
+                _FakeStreamResponse([
+                    "event: status",
+                    f"data: {terminal_frame}",
+                    "",
+                ])
+            ],
+            monkeypatch=monkeypatch,
+        )
+        store = agent.pending_a2a_questions
+        store.mark_resolved.side_effect = RuntimeError("DB blip")
+        store.renew_claim_lease.return_value = False
+
+        await feature._supervise_a2a_question(
+            task_id="t-blip",
+            recipient="Meridian",
+            original_question="?",
+            sess_id="s-blip",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(minutes=5),
+            causation_chain=None,
+        )
+
+        enqueue.assert_awaited_once()
+        assert enqueue.await_args.args[0].payload["reply_text"] == "42"
+        store.renew_claim_lease.assert_not_awaited()
+        store.confirm_wake_delivered.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_terminal_enqueue_failure_restores_waiting_with_reply_payload(
@@ -367,14 +427,20 @@ class TestSupervisorHappyPath:
             causation_chain=None,
         )
 
-        agent.pending_a2a_questions.mark_resolved.assert_awaited_once_with(
-            "t-retry-answer",
-        )
-        agent.pending_a2a_questions.mark_waiting_for_retry.assert_awaited_once_with(
+        store = agent.pending_a2a_questions
+        store.mark_resolved.assert_awaited_once_with(
             "t-retry-answer",
             state="completed",
             reply_text="Preserve me",
+            claim=ANY,
         )
+        store.mark_waiting_for_retry.assert_awaited_once_with(
+            "t-retry-answer",
+            claim=store.mark_resolved.await_args.kwargs["claim"],
+            state="completed",
+            reply_text="Preserve me",
+        )
+        store.confirm_wake_delivered.assert_not_awaited()
         assert agent.tracked_background
         assert "a2a_question_answered_retry" in agent.tracked_background[0][1]
 
@@ -571,7 +637,7 @@ class TestSupervisorDeadlineAccurateExpiry:
         )
 
         agent.pending_a2a_questions.mark_expired.assert_awaited_once_with(
-            "t-deadline", receiver_settled=False,
+            "t-deadline", claim=ANY, receiver_settled=False,
         )
         enqueue.assert_awaited_once()
         sig = enqueue.await_args.args[0]
@@ -620,10 +686,13 @@ class TestSupervisorDeadlineAccurateExpiry:
         )
 
         agent.pending_a2a_questions.mark_expired.assert_awaited_once_with(
-            "t-deadline-retry", receiver_settled=False,
+            "t-deadline-retry", claim=ANY, receiver_settled=False,
         )
         agent.pending_a2a_questions.mark_waiting_for_retry.assert_awaited_once_with(
             "t-deadline-retry",
+            claim=agent.pending_a2a_questions.mark_expired.await_args.kwargs[
+                "claim"
+            ],
             state="expired",
             reply_text="",
         )
@@ -729,7 +798,7 @@ class TestSupervisorDeadlineInsideStreamLoop:
         )
 
         agent.pending_a2a_questions.mark_expired.assert_awaited_once_with(
-            "t-deadline-stream", receiver_settled=False,
+            "t-deadline-stream", claim=ANY, receiver_settled=False,
         )
         enqueue.assert_awaited_once()
         sig = enqueue.await_args.args[0]
@@ -797,7 +866,7 @@ class TestSupervisorStalledStream:
         )
 
         agent.pending_a2a_questions.mark_expired.assert_awaited_once_with(
-            "t-stalled", receiver_settled=False,
+            "t-stalled", claim=ANY, receiver_settled=False,
         )
         enqueue.assert_awaited_once()
         sig = enqueue.await_args.args[0]

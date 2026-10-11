@@ -16,6 +16,9 @@ Pins:
   - Already-terminal rows (raced by another resumption path) drop
     silently rather than firing a duplicate signal — the WAITING-only
     semantics of ``mark_expired`` carry this guarantee.
+  - A wake claimed out of WAITING stays owed on its row until its delivery
+    is confirmed under that claim; replay and the sweep deliver wakes whose
+    claim lapsed first (#3440).
   - Terminal delivery, not enqueue acceptance, is what retires the durable
     WAITING row (#2532). Every dispatch here therefore hands back a REAL
     ``SignalHandle`` resolving to a REAL ``SignalResult`` — a truthy handle
@@ -27,7 +30,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from kestrel_sdk.signals import SignalHandle, SignalMode, SignalResult, Status
@@ -128,6 +131,23 @@ def _make_feature_for_replay(*, run_tracked_tasks: bool = False):
     return feature, agent, tracked
 
 
+def _question_store() -> MagicMock:
+    """A pending-question store double with the claim surface every wake
+    goes through (#3440): a wake claimed out of WAITING is retired only by
+    ``confirm_wake_delivered``, renewed while in flight, and lapsed wakes are
+    reclaimed by replay and the sweep. Tests set the rest per case."""
+    store = MagicMock()
+    store.renew_claim_lease = AsyncMock(return_value=True)
+    store.confirm_wake_delivered = AsyncMock(return_value=True)
+    store.reclaim_abandoned_wakes = AsyncMock(return_value=[])
+    return store
+
+
+def _claim_of(mock) -> str:
+    """The claim token the last await of a store transition passed."""
+    return mock.await_args.kwargs["claim"]
+
+
 async def _drain(tracked, prefix: str) -> None:
     """Await every started task whose name begins with ``prefix``."""
     for task, name in tracked:
@@ -203,7 +223,7 @@ class TestStartupReplay:
         future = datetime.now(timezone.utc) + timedelta(minutes=10)
         row = _row("task-fresh", deadline=future)
 
-        store = MagicMock()
+        store = _question_store()
         store.list_waiting = AsyncMock(return_value=[row])
         store.mark_expired = AsyncMock(return_value=True)
         agent.pending_a2a_questions = store
@@ -224,6 +244,9 @@ class TestStartupReplay:
         # Expired rows still owed a recipient settlement are retried at
         # every boot, off the boot path (#3440).
         assert "a2a_question_receiver_settlement:replay" in spawn_names
+        # And the wakes the previous process left claimed are delivered once
+        # its claims lapse.
+        assert "a2a_question_wake_recovery:replay" in spawn_names
 
     @pytest.mark.asyncio
     async def test_replay_passes_persisted_stable_recipient_identity(self):
@@ -242,7 +265,7 @@ class TestStartupReplay:
             created_at=datetime.now(timezone.utc).isoformat(),
             resolved_at=None,
         )
-        store = MagicMock()
+        store = _question_store()
         store.list_waiting = AsyncMock(return_value=[row])
         feature._supervise_a2a_question = AsyncMock()
 
@@ -270,7 +293,7 @@ class TestStartupReplay:
             retry_reply_text="Captured reply",
         )
 
-        store = MagicMock()
+        store = _question_store()
         store.list_waiting = AsyncMock(return_value=[row])
         store.mark_resolved = AsyncMock(return_value=True)
         store.mark_expired = AsyncMock(return_value=True)
@@ -278,7 +301,12 @@ class TestStartupReplay:
 
         await feature.post_all_features_loaded(agent)
 
-        store.mark_resolved.assert_awaited_once_with("task-retry-answer")
+        store.mark_resolved.assert_awaited_once_with(
+            "task-retry-answer",
+            state="completed",
+            reply_text="Captured reply",
+            claim=ANY,
+        )
         store.mark_expired.assert_not_awaited()
         agent.dispatcher.enqueue_signal.assert_awaited_once()
         sig = agent.dispatcher.enqueue_signal.await_args.args[0]
@@ -300,6 +328,113 @@ class TestStartupReplay:
         ), spawn_names
 
     @pytest.mark.asyncio
+    async def test_replay_reclaims_abandoned_wakes_before_listing(self):
+        """A wake an earlier process claimed and never confirmed is returned
+        to WAITING first, so the replay below delivers it (#3440)."""
+        feature, agent, tracked = _make_feature_for_replay()
+        calls: list = []
+        future = datetime.now(timezone.utc) + timedelta(minutes=10)
+        reclaimed = PendingA2AQuestion(
+            task_id="task-reclaimed",
+            recipient="Meridian",
+            original_question="q",
+            origin_turn_id=None,
+            origin_session_id="sess-1",
+            deadline=future.isoformat(),
+            status="WAITING",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            resolved_at=None,
+            retry_state="completed",
+            retry_reply_text="Owed answer",
+        )
+        store = _question_store()
+
+        async def _reclaim(**_kwargs):
+            calls.append("reclaim")
+            return [reclaimed]
+
+        async def _list_waiting():
+            calls.append("list_waiting")
+            return [reclaimed]
+        store.reclaim_abandoned_wakes = AsyncMock(side_effect=_reclaim)
+        store.list_waiting = AsyncMock(side_effect=_list_waiting)
+        store.mark_resolved = AsyncMock(return_value=True)
+
+        await feature._replay_pending_a2a_questions(store)
+
+        assert calls == ["reclaim", "list_waiting"]
+        store.mark_resolved.assert_awaited_once_with(
+            "task-reclaimed", state="completed", reply_text="Owed answer",
+            claim=ANY,
+        )
+        sig = agent.dispatcher.enqueue_signal.await_args.args[0]
+        assert sig.payload["reply_text"] == "Owed answer"
+
+    @pytest.mark.asyncio
+    async def test_replay_continues_when_reclaim_fails(self):
+        """A failed reclaim leaves those wakes to the hourly sweep; it must
+        not stop replay of every other WAITING row."""
+        feature, _agent, _tracked = _make_feature_for_replay()
+        feature._supervise_a2a_question = AsyncMock()
+        store = _question_store()
+        store.reclaim_abandoned_wakes = AsyncMock(
+            side_effect=RuntimeError("DB blip"),
+        )
+        future = datetime.now(timezone.utc) + timedelta(minutes=10)
+        store.list_waiting = AsyncMock(
+            return_value=[_row("task-fresh", deadline=future)],
+        )
+
+        await feature._replay_pending_a2a_questions(store)
+
+        store.list_waiting.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_boot_recovers_wakes_once_the_last_process_claims_lapse(
+        self, monkeypatch,
+    ):
+        """At boot the previous process's claims may still be leased. A
+        lease after boot every one of them has lapsed, and the wakes they
+        held are delivered then (#3440)."""
+        from kestrel_sovereign.storage.async_pending_a2a_question_store import (
+            QUESTION_CLAIM_LEASE,
+        )
+
+        feature, agent, _tracked = _make_feature_for_replay()
+        future = datetime.now(timezone.utc) + timedelta(hours=2)
+        abandoned = PendingA2AQuestion(
+            task_id="abandoned-at-crash",
+            recipient="Meridian",
+            original_question="q",
+            origin_turn_id=None,
+            origin_session_id="sess-1",
+            deadline=future.isoformat(),
+            status="WAITING",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            resolved_at=None,
+            retry_state="completed",
+            retry_reply_text="Owed answer",
+        )
+        store = _question_store()
+        store.reclaim_abandoned_wakes = AsyncMock(return_value=[abandoned])
+        store.mark_resolved = AsyncMock(return_value=True)
+        sleeps: list = []
+
+        async def _record_sleep(secs):
+            sleeps.append(secs)
+        monkeypatch.setattr(asyncio, "sleep", _record_sleep)
+
+        await feature._redeliver_abandoned_wakes_after_boot(store)
+
+        assert sleeps == [QUESTION_CLAIM_LEASE.total_seconds()]
+        store.reclaim_abandoned_wakes.assert_awaited_once_with(now=None)
+        sig = agent.dispatcher.enqueue_signal.await_args.args[0]
+        assert sig.payload["reply_text"] == "Owed answer"
+        store.confirm_wake_delivered.assert_awaited_once_with(
+            "abandoned-at-crash", claim=_claim_of(store.mark_resolved),
+        )
+
+    @pytest.mark.asyncio
     async def test_past_deadline_row_fires_expired_signal(self):
         feature, agent, tracked = _make_feature_for_replay(
             run_tracked_tasks=True,
@@ -307,7 +442,7 @@ class TestStartupReplay:
         past = datetime.now(timezone.utc) - timedelta(hours=2)
         row = _row("task-stale", deadline=past)
 
-        store = MagicMock()
+        store = _question_store()
         store.list_waiting = AsyncMock(return_value=[row])
         store.mark_expired = AsyncMock(return_value=True)
         agent.pending_a2a_questions = store
@@ -323,7 +458,7 @@ class TestStartupReplay:
         )
         feature._settle_question_with_receiver.assert_awaited_once()
         store.mark_expired.assert_awaited_once_with(
-            "task-stale", receiver_settled=False,
+            "task-stale", claim=ANY, receiver_settled=False,
         )
         agent.dispatcher.enqueue_signal.assert_awaited_once()
         sig = agent.dispatcher.enqueue_signal.await_args.args[0]
@@ -348,7 +483,7 @@ class TestStartupReplay:
             created_at=datetime.now(timezone.utc).isoformat(),
             resolved_at=None,
         )
-        store = MagicMock()
+        store = _question_store()
         store.list_waiting = AsyncMock(return_value=[bad_row])
         store.mark_expired = AsyncMock(return_value=True)
         agent.pending_a2a_questions = store
@@ -360,7 +495,7 @@ class TestStartupReplay:
         await _drain(tracked, "a2a_question_expiry:replay:")
 
         store.mark_expired.assert_awaited_once_with(
-            "task-bad", receiver_settled=False,
+            "task-bad", claim=ANY, receiver_settled=False,
         )
         agent.dispatcher.enqueue_signal.assert_awaited_once()
         assert (
@@ -384,7 +519,7 @@ class TestStartupReplay:
             _row("fresh-2",
                  deadline=datetime.now(timezone.utc) + timedelta(minutes=15)),
         ]
-        store = MagicMock()
+        store = _question_store()
         store.list_waiting = AsyncMock(return_value=rows)
         store.mark_expired = AsyncMock(return_value=True)
         agent.pending_a2a_questions = store
@@ -405,7 +540,7 @@ class TestStartupReplay:
             n for _, n in tracked if n.startswith("a2a_question_expiry:")
         ] == ["a2a_question_expiry:replay:Meridian:stale-1"]
         store.mark_expired.assert_awaited_once_with(
-            "stale-1", receiver_settled=False,
+            "stale-1", claim=ANY, receiver_settled=False,
         )
         # Exactly one expired signal.
         assert agent.dispatcher.enqueue_signal.await_count == 1
@@ -426,7 +561,7 @@ class TestHourlySweep:
         past = datetime.now(timezone.utc) - timedelta(hours=2)
         rows = [_row("e1", deadline=past), _row("e2", deadline=past)]
 
-        store = MagicMock()
+        store = _question_store()
         store.mark_expired = AsyncMock(return_value=True)
         store.list_expired_awaiting_receiver = AsyncMock(return_value=[])
         # First call returns the expired rows; second raises Cancelled
@@ -453,6 +588,49 @@ class TestHourlySweep:
         assert states == ["expired", "expired"]
 
     @pytest.mark.asyncio
+    async def test_sweep_redelivers_abandoned_wakes_first(self):
+        """Each tick first delivers the wakes whose claim lapsed before
+        their delivery was confirmed (#3440), whatever their deadline."""
+        feature, agent, tracked = _make_feature_for_replay()
+        future = datetime.now(timezone.utc) + timedelta(hours=2)
+        reclaimed = PendingA2AQuestion(
+            task_id="abandoned",
+            recipient="Meridian",
+            original_question="q",
+            origin_turn_id=None,
+            origin_session_id="sess-1",
+            deadline=future.isoformat(),
+            status="WAITING",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            resolved_at=None,
+            retry_state="completed",
+            retry_reply_text="Owed answer",
+        )
+        store = _question_store()
+        store.reclaim_abandoned_wakes = AsyncMock(return_value=[reclaimed])
+        store.mark_resolved = AsyncMock(return_value=True)
+        store.list_expired_awaiting_receiver = AsyncMock(return_value=[])
+        store.list_waiting_past_deadline = AsyncMock(
+            side_effect=asyncio.CancelledError(),
+        )
+        feature.EXPIRY_SWEEP_INTERVAL_SECONDS = 0  # tick immediately
+
+        with pytest.raises(asyncio.CancelledError):
+            await feature._hourly_expiry_sweep_loop(store)
+
+        store.reclaim_abandoned_wakes.assert_awaited_once_with(now=None)
+        store.mark_resolved.assert_awaited_once_with(
+            "abandoned", state="completed", reply_text="Owed answer", claim=ANY,
+        )
+        sig = agent.dispatcher.enqueue_signal.await_args.args[0]
+        assert (sig.payload["state"], sig.payload["reply_text"]) == (
+            "completed", "Owed answer",
+        )
+        store.confirm_wake_delivered.assert_awaited_once_with(
+            "abandoned", claim=_claim_of(store.mark_resolved),
+        )
+
+    @pytest.mark.asyncio
     async def test_settlement_failure_does_not_hold_back_deadline_expiries(
         self, monkeypatch,
     ):
@@ -462,7 +640,7 @@ class TestHourlySweep:
         feature, agent, tracked = _make_feature_for_replay()
         past = datetime.now(timezone.utc) - timedelta(hours=2)
 
-        store = MagicMock()
+        store = _question_store()
         store.mark_expired = AsyncMock(return_value=True)
         store.list_expired_awaiting_receiver = AsyncMock(
             side_effect=RuntimeError("settlement DB blip"),
@@ -494,17 +672,37 @@ class TestHourlySweep:
         assert 60 not in sleeps, "a settlement failure must not back off"
 
     @pytest.mark.asyncio
+    async def test_listing_failure_does_not_hold_back_settlement(self):
+        """A store that cannot list this tick's expiries must not skip the
+        tick's receiver settlement (#3440): a persistent listing failure
+        would otherwise stop every withdrawal and late-answer relay."""
+        feature, agent, tracked = _make_feature_for_replay()
+        store = _question_store()
+        store.list_expired_awaiting_receiver = AsyncMock(return_value=[])
+        store.list_waiting_past_deadline = AsyncMock(side_effect=[
+            RuntimeError("listing DB blip"),
+            asyncio.CancelledError(),
+        ])
+        agent.pending_a2a_questions = store
+        feature.EXPIRY_SWEEP_INTERVAL_SECONDS = 0  # tick immediately
+
+        with pytest.raises(asyncio.CancelledError):
+            await feature._hourly_expiry_sweep_loop(store)
+
+        assert store.list_expired_awaiting_receiver.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_sweep_survives_transient_store_failure(self):
         """A failing ``list_waiting_past_deadline`` call must NOT kill
         the loop — it's the deadline backstop and runs as long as the
-        agent. Logs + backoff + continues."""
+        agent. Logs + continues."""
         feature, agent, tracked = _make_feature_for_replay()
         past = datetime.now(timezone.utc) - timedelta(hours=2)
         rows = [_row("e-after-fail", deadline=past)]
 
         # First tick: store explodes. Second tick: returns one expired
         # row. Third tick: CancelledError to stop the loop.
-        store = MagicMock()
+        store = _question_store()
         store.mark_expired = AsyncMock(return_value=True)
         store.list_expired_awaiting_receiver = AsyncMock(return_value=[])
         store.list_waiting_past_deadline = AsyncMock(side_effect=[
@@ -551,7 +749,7 @@ class TestHandleExpiredRow:
         path got there first), the synthetic expired signal must NOT
         fire — that would double-resume the asking turn."""
         feature, agent, _ = _make_feature_for_replay()
-        store = MagicMock()
+        store = _question_store()
         store.mark_expired = AsyncMock(return_value=False)
         past = datetime.now(timezone.utc) - timedelta(hours=2)
         row = _row("already-resolved", deadline=past)
@@ -559,14 +757,14 @@ class TestHandleExpiredRow:
         await feature._handle_expired_row(store, row)
 
         store.mark_expired.assert_awaited_once_with(
-            "already-resolved", receiver_settled=False,
+            "already-resolved", claim=ANY, receiver_settled=False,
         )
         agent.dispatcher.enqueue_signal.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_retry_payload_past_deadline_preserves_captured_answer(self):
         feature, agent, _ = _make_feature_for_replay()
-        store = MagicMock()
+        store = _question_store()
         store.mark_resolved = AsyncMock(return_value=True)
         store.mark_expired = AsyncMock(return_value=True)
         store.mark_waiting_for_retry = AsyncMock(return_value=True)
@@ -587,7 +785,12 @@ class TestHandleExpiredRow:
 
         await feature._handle_expired_row(store, row)
 
-        store.mark_resolved.assert_awaited_once_with("retry-past-deadline")
+        store.mark_resolved.assert_awaited_once_with(
+            "retry-past-deadline",
+            state="completed",
+            reply_text="Late but real",
+            claim=ANY,
+        )
         store.mark_expired.assert_not_awaited()
         agent.dispatcher.enqueue_signal.assert_awaited_once()
         sig = agent.dispatcher.enqueue_signal.await_args.args[0]
@@ -597,7 +800,7 @@ class TestHandleExpiredRow:
     @pytest.mark.asyncio
     async def test_expired_retry_payload_uses_expired_terminal_transition(self):
         feature, agent, _ = _make_feature_for_replay()
-        store = MagicMock()
+        store = _question_store()
         store.mark_resolved = AsyncMock(return_value=True)
         store.mark_expired = AsyncMock(return_value=True)
         past = datetime.now(timezone.utc) - timedelta(hours=2)
@@ -617,7 +820,9 @@ class TestHandleExpiredRow:
 
         await feature._handle_expired_row(store, row)
 
-        store.mark_expired.assert_awaited_once_with("retry-expired")
+        store.mark_expired.assert_awaited_once_with(
+            "retry-expired", claim=ANY, receiver_settled=False,
+        )
         store.mark_resolved.assert_not_awaited()
         agent.dispatcher.enqueue_signal.assert_awaited_once()
         sig = agent.dispatcher.enqueue_signal.await_args.args[0]
@@ -628,7 +833,7 @@ class TestHandleExpiredRow:
     async def test_retry_payload_enqueue_failure_restores_payload_again(self):
         feature, agent, _ = _make_feature_for_replay()
         agent.dispatcher.enqueue_signal.side_effect = RuntimeError("still down")
-        store = MagicMock()
+        store = _question_store()
         store.mark_resolved = AsyncMock(return_value=True)
         store.mark_waiting_for_retry = AsyncMock(return_value=True)
         agent.pending_a2a_questions = store
@@ -650,7 +855,7 @@ class TestHandleExpiredRow:
         await feature._handle_expired_row(store, row)
 
         store.mark_waiting_for_retry.assert_awaited_once_with(
-            "retry-still-down",
+            "retry-still-down", claim=ANY,
             state="completed",
             reply_text="Keep carrying this",
         )
@@ -658,7 +863,7 @@ class TestHandleExpiredRow:
     @pytest.mark.asyncio
     async def test_near_term_retry_refires_restored_payload(self, monkeypatch):
         feature, agent, _ = _make_feature_for_replay()
-        store = MagicMock()
+        store = _question_store()
         store.mark_resolved = AsyncMock(side_effect=[True, True])
         store.mark_waiting_for_retry = AsyncMock(return_value=True)
         agent.pending_a2a_questions = store
@@ -683,7 +888,7 @@ class TestHandleExpiredRow:
 
         assert store.mark_resolved.await_count == 2
         store.mark_waiting_for_retry.assert_awaited_once_with(
-            "retry-soon",
+            "retry-soon", claim=ANY,
             state="completed",
             reply_text="Recovered answer",
         )
@@ -696,7 +901,7 @@ class TestHandleExpiredRow:
     @pytest.mark.asyncio
     async def test_near_term_expired_retry_uses_mark_expired(self, monkeypatch):
         feature, agent, _ = _make_feature_for_replay()
-        store = MagicMock()
+        store = _question_store()
         store.mark_expired = AsyncMock(return_value=True)
         store.mark_resolved = AsyncMock(return_value=True)
         agent.pending_a2a_questions = store
@@ -715,7 +920,9 @@ class TestHandleExpiredRow:
             causation_chain=None,
         )
 
-        store.mark_expired.assert_awaited_once_with("retry-expired-soon")
+        store.mark_expired.assert_awaited_once_with(
+            "retry-expired-soon", claim=ANY, receiver_settled=False,
+        )
         store.mark_resolved.assert_not_awaited()
         agent.dispatcher.enqueue_signal.assert_awaited_once()
         assert (
@@ -741,7 +948,7 @@ class TestTerminalDeliveryGatesWaitingRow:
         async def _enqueue(_sig):
             return handle_factory()
         agent.dispatcher.enqueue_signal = AsyncMock(side_effect=_enqueue)
-        store = MagicMock()
+        store = _question_store()
         store.mark_expired = AsyncMock(return_value=True)
         store.mark_waiting_for_retry = AsyncMock(return_value=True)
         agent.pending_a2a_questions = store
@@ -764,8 +971,13 @@ class TestTerminalDeliveryGatesWaitingRow:
             lambda: _signal_handle(status)
         )
         store.mark_waiting_for_retry.assert_awaited_once_with(
-            "gate-1", state="expired", reply_text="",
+            "gate-1", claim=ANY, state="expired", reply_text="",
         )
+        # Restored under the claim that expired it; never retired.
+        assert _claim_of(store.mark_waiting_for_retry) == _claim_of(
+            store.mark_expired
+        )
+        store.confirm_wake_delivered.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_ok_terminal_state_keeps_row_retired(self):
@@ -773,6 +985,10 @@ class TestTerminalDeliveryGatesWaitingRow:
             lambda: _signal_handle(Status.OK)
         )
         store.mark_waiting_for_retry.assert_not_awaited()
+        # The delivered wake is retired from the row under its own claim.
+        store.confirm_wake_delivered.assert_awaited_once_with(
+            "gate-1", claim=_claim_of(store.mark_expired),
+        )
 
     @pytest.mark.asyncio
     async def test_cancelled_dispatch_restores_waiting_row(self):
@@ -780,7 +996,7 @@ class TestTerminalDeliveryGatesWaitingRow:
         row must go back to WAITING — this caller is healthy."""
         _f, _a, store, _t = await self._expire_with(_cancelled_signal_handle)
         store.mark_waiting_for_retry.assert_awaited_once_with(
-            "gate-1", state="expired", reply_text="",
+            "gate-1", claim=ANY, state="expired", reply_text="",
         )
 
     @pytest.mark.asyncio
@@ -789,7 +1005,7 @@ class TestTerminalDeliveryGatesWaitingRow:
         Unobservable is undelivered, never success."""
         _f, _a, store, _t = await self._expire_with(lambda: object())
         store.mark_waiting_for_retry.assert_awaited_once_with(
-            "gate-1", state="expired", reply_text="",
+            "gate-1", claim=ANY, state="expired", reply_text="",
         )
 
     @pytest.mark.asyncio
@@ -800,7 +1016,7 @@ class TestTerminalDeliveryGatesWaitingRow:
 
         _f, _a, store, _t = await self._expire_with(_ExplodingHandle)
         store.mark_waiting_for_retry.assert_awaited_once_with(
-            "gate-1", state="expired", reply_text="",
+            "gate-1", claim=ANY, state="expired", reply_text="",
         )
 
     @pytest.mark.asyncio
@@ -824,7 +1040,7 @@ class TestTerminalDeliveryGatesWaitingRow:
             )
         agent.dispatcher.enqueue_signal = AsyncMock(side_effect=_enqueue)
 
-        store = MagicMock()
+        store = _question_store()
         store.mark_expired = AsyncMock(return_value=True)
         store.mark_waiting_for_retry = AsyncMock(return_value=True)
         agent.pending_a2a_questions = store
@@ -840,7 +1056,10 @@ class TestTerminalDeliveryGatesWaitingRow:
             await task
 
         store.mark_waiting_for_retry.assert_awaited_once_with(
-            "gate-cancel", state="expired", reply_text="",
+            "gate-cancel", claim=ANY, state="expired", reply_text="",
+        )
+        assert _claim_of(store.mark_waiting_for_retry) == _claim_of(
+            store.mark_expired
         )
 
 
@@ -883,7 +1102,7 @@ class TestBootReplayDeliverySupervisor:
         async def _enqueue(_sig):
             return handle_factory()
         agent.dispatcher.enqueue_signal = AsyncMock(side_effect=_enqueue)
-        store = MagicMock()
+        store = _question_store()
         store.mark_expired = AsyncMock(return_value=True)
         store.mark_waiting_for_retry = AsyncMock(return_value=True)
         store.list_waiting = AsyncMock(
@@ -920,7 +1139,7 @@ class TestBootReplayDeliverySupervisor:
             )
         agent.dispatcher.enqueue_signal = AsyncMock(side_effect=_enqueue)
 
-        store = MagicMock()
+        store = _question_store()
         store.mark_expired = AsyncMock(return_value=True)
         store.mark_waiting_for_retry = AsyncMock(return_value=True)
         store.list_waiting = AsyncMock(
@@ -956,7 +1175,7 @@ class TestBootReplayDeliverySupervisor:
         feature._settle_question_with_receiver = AsyncMock(
             side_effect=_slow_settlement,
         )
-        store = MagicMock()
+        store = _question_store()
         store.mark_expired = AsyncMock(return_value=True)
         past = datetime.now(timezone.utc) - timedelta(hours=2)
         store.list_waiting = AsyncMock(
@@ -975,7 +1194,7 @@ class TestBootReplayDeliverySupervisor:
         gate.set()
         await _drain(tracked, "a2a_question_expiry:replay:")
         store.mark_expired.assert_awaited_once_with(
-            "boot-settle", receiver_settled=True,
+            "boot-settle", claim=ANY, receiver_settled=True,
         )
         sig = agent.dispatcher.enqueue_signal.await_args.args[0]
         assert sig.payload["state"] == "expired"
@@ -986,8 +1205,12 @@ class TestBootReplayDeliverySupervisor:
             lambda: _signal_handle(Status.FAILED, error="turn blew up")
         )
         store.mark_waiting_for_retry.assert_awaited_once_with(
-            "boot-1", state="expired", reply_text="",
+            "boot-1", claim=ANY, state="expired", reply_text="",
         )
+        assert _claim_of(store.mark_waiting_for_retry) == _claim_of(
+            store.mark_expired
+        )
+        store.confirm_wake_delivered.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_supervisor_restores_row_on_dropped_delivery(self):
@@ -995,7 +1218,7 @@ class TestBootReplayDeliverySupervisor:
             lambda: _signal_handle(Status.DROPPED_CYCLE)
         )
         store.mark_waiting_for_retry.assert_awaited_once_with(
-            "boot-1", state="expired", reply_text="",
+            "boot-1", claim=ANY, state="expired", reply_text="",
         )
 
     @pytest.mark.asyncio
@@ -1004,6 +1227,10 @@ class TestBootReplayDeliverySupervisor:
             lambda: _signal_handle(Status.OK)
         )
         store.mark_waiting_for_retry.assert_not_awaited()
+        # The boot path's delivery supervisor retires the delivered wake.
+        store.confirm_wake_delivered.assert_awaited_once_with(
+            "boot-1", claim=_claim_of(store.mark_expired),
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,15 @@ Pins:
       * that late answer is held on the sender's row until its wake is
         delivered, so a crash after it is learned and before it is relayed
         loses nothing, and a concurrent pass cannot relay it twice;
+      * so is the asker's first wake, whichever it is (the answer the expiry
+        found, the ``expired`` of a withdrawn or unreached question, or the
+        supervisor's on-time answer): a crash before it is delivered delays
+        it until the dead process's claim lapses, never loses it, and no
+        late answer overtakes an ``expired`` still owed;
+      * a pass that stalls past its lease and is overtaken by another can
+        no longer renew, confirm, or relay: each claim fences out the last;
+      * questions that expired on a release before settlement existed are
+        settled after the upgrade: withdrawn, or their late answer relayed;
       * settlement has no age cutoff: a recipient returning a month later,
         with its submission wake still retained in its durable ledger, has
         that submission withdrawn before it can run.
@@ -32,9 +41,10 @@ Pins:
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from kestrel_sdk.signals import SignalMode, SignalResult, Status
@@ -44,6 +54,7 @@ from kestrel_sovereign.a2a.outbound_store import (
     ensure_a2a_outbound_tasks_table,
     get_outbound_task,
     record_outbound_dispatch,
+    update_outbound_terminal_state,
 )
 from kestrel_sovereign.a2a.task_manager import create_task_manager
 from kestrel_sovereign.a2a.types import Message, TaskSendParams, TaskState, TextPart
@@ -82,9 +93,9 @@ from kestrel_sovereign.signals.sources.a2a_task_submitted import (
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_pending_a2a_question_store import (
+    QUESTION_CLAIM_LEASE,
     RECEIVER_SETTLEMENT_CONFIRMED,
     RECEIVER_SETTLEMENT_LATE_ANSWER,
-    RECEIVER_SETTLEMENT_LEASE,
     RECEIVER_SETTLEMENT_PENDING,
     PendingA2AQuestionStore,
 )
@@ -134,6 +145,14 @@ class _BlockedHandle:
 
 class _ProcessDied(BaseException):
     """The sender's process ends at this point: nothing after it runs."""
+
+
+class _DiesInFlight:
+    """A wake whose cognition turn is under way when the sender's process
+    ends: neither its delivery nor its failure is ever observed."""
+
+    async def wait(self) -> SignalResult:
+        raise _ProcessDied()
 
 
 class _SenderDispatcher:
@@ -344,6 +363,8 @@ class TestExpiryWakeFollowsSettlement:
         store = MagicMock()
         store.mark_expired = AsyncMock(return_value=True)
         store.mark_resolved = AsyncMock(return_value=True)
+        store.renew_claim_lease = AsyncMock(return_value=True)
+        store.confirm_wake_delivered = AsyncMock(return_value=True)
         feature.agent = SimpleNamespace(
             did=SENDER, dispatcher=dispatcher, pending_a2a_questions=store,
         )
@@ -372,12 +393,18 @@ class TestExpiryWakeFollowsSettlement:
             )
         )
 
-        store.mark_resolved.assert_awaited_once_with("q-1")
+        store.mark_resolved.assert_awaited_once_with(
+            "q-1", state="completed", reply_text="the real answer", claim=ANY,
+        )
         store.mark_expired.assert_not_awaited()
         [signal] = dispatcher.signals
         assert signal.payload["state"] == "completed"
         assert signal.payload["reply_text"] == "the real answer"
         assert signal.payload["late"] is False
+        assert signal.payload["withdrawn"] is False
+        # Delivered, the answer is retired under the claim that resolved it.
+        claim = store.mark_resolved.await_args.kwargs["claim"]
+        store.confirm_wake_delivered.assert_awaited_once_with("q-1", claim=claim)
 
     @pytest.mark.asyncio
     async def test_withdrawn_question_expires_with_the_recipient_settled(self):
@@ -386,11 +413,14 @@ class TestExpiryWakeFollowsSettlement:
         )
 
         store.mark_expired.assert_awaited_once_with(
-            "q-1", receiver_settled=True,
+            "q-1", claim=ANY, receiver_settled=True,
         )
         [signal] = dispatcher.signals
         assert signal.payload["state"] == "expired"
         assert signal.payload["reply_text"] == ""
+        assert signal.payload["withdrawn"] is True
+        claim = store.mark_expired.await_args.kwargs["claim"]
+        store.confirm_wake_delivered.assert_awaited_once_with("q-1", claim=claim)
 
     @pytest.mark.asyncio
     async def test_unreached_recipient_still_wakes_the_asker_at_the_deadline(self):
@@ -399,10 +429,48 @@ class TestExpiryWakeFollowsSettlement:
         )
 
         store.mark_expired.assert_awaited_once_with(
-            "q-1", receiver_settled=False,
+            "q-1", claim=ANY, receiver_settled=False,
         )
         [signal] = dispatcher.signals
         assert signal.payload["state"] == "expired"
+        # The recipient's task may still be live: not reported withdrawn.
+        assert signal.payload["withdrawn"] is False
+        claim = store.mark_expired.await_args.kwargs["claim"]
+        store.confirm_wake_delivered.assert_awaited_once_with("q-1", claim=claim)
+
+    @pytest.mark.asyncio
+    async def test_failed_claim_write_still_wakes_the_asker_unfenced(self):
+        """A claim whose write raised may or may not have taken, so it cannot
+        vouch for this pass: the wake fires anyway, without the ownership
+        check or a retirement under that claim."""
+        feature = PeersFeature.__new__(PeersFeature)
+        feature._own_name = "Emma"
+        dispatcher = _SenderDispatcher()
+        store = MagicMock()
+        store.mark_expired = AsyncMock(side_effect=RuntimeError("DB blip"))
+        store.renew_claim_lease = AsyncMock(return_value=False)
+        store.confirm_wake_delivered = AsyncMock(return_value=False)
+        feature.agent = SimpleNamespace(
+            did=SENDER, dispatcher=dispatcher, pending_a2a_questions=store,
+        )
+        feature._settle_question_with_receiver = AsyncMock(
+            return_value=ReceiverSettlement(ReceiverSettlementOutcome.UNCONFIRMED),
+        )
+
+        await feature._expire_pending_question(
+            store,
+            task_id="q-1",
+            recipient="Nellie",
+            recipient_agent_id=RECIPIENT,
+            original_question="How many?",
+            sess_id="s",
+            causation_chain=None,
+        )
+
+        [signal] = dispatcher.signals
+        assert signal.payload["state"] == "expired"
+        store.renew_claim_lease.assert_not_awaited()
+        store.confirm_wake_delivered.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -521,10 +589,17 @@ class _Fleet:
 
     async def settle(self) -> None:
         """One settlement pass, the sweep's (and boot's)."""
-        self.clock += RECEIVER_SETTLEMENT_LEASE + timedelta(seconds=1)
+        self.clock += QUESTION_CLAIM_LEASE + timedelta(seconds=1)
         await self.feature._settle_expired_questions_with_receivers(
             self.store, now=self.clock,
         )
+
+    async def recover(self) -> None:
+        """The hourly sweep's first step, a lease after the last pass: wakes
+        whose claim lapsed before their delivery was confirmed are
+        delivered again."""
+        self.clock += QUESTION_CLAIM_LEASE + timedelta(seconds=1)
+        await self.feature._redeliver_abandoned_wakes(self.store, now=self.clock)
 
     async def restart_sender(self) -> None:
         """Emma's process is replaced: fresh connection, store, and feature
@@ -649,6 +724,7 @@ async def test_expiry_terminates_the_recipients_task_and_it_is_never_redelivered
 
     [wake] = fleet.wakes
     assert wake.payload["state"] == "expired"
+    assert wake.payload["withdrawn"] is True
     assert await fleet.recipient_state("q-expired") is TaskState.CANCELED
     row = await fleet.store.get("q-expired")
     assert row.status == "EXPIRED"
@@ -711,6 +787,7 @@ async def test_late_answer_from_unreached_recipient_wakes_the_asker(fleet):
 
     [expired] = fleet.wakes
     assert expired.payload["state"] == "expired"
+    assert expired.payload["withdrawn"] is False
     row = await fleet.store.get("q-late")
     assert row.status == "EXPIRED"
     assert row.receiver_settlement == RECEIVER_SETTLEMENT_PENDING
@@ -862,6 +939,198 @@ async def test_crash_while_the_late_wake_is_in_flight_is_relayed_again(fleet):
     )
 
 
+# ---------------------------------------------------------------------------
+# The asker's first wake survives a crash before it is delivered
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_answer_found_at_expiry_survives_a_crash_before_its_wake(fleet):
+    """The expiry finds the recipient already answered and resolves the row,
+    then the process dies before the answer's wake is enqueued. The answer
+    is still owed on the row, and once the dead process's claim lapses the
+    restarted process delivers it: on time, not late (#3440)."""
+    await fleet.ask("q-answered-crash", "How many?")
+    await fleet.answer("q-answered-crash", "1022 characters of real answer")
+    fleet.feature.agent.dispatcher.die_on_enqueue = True
+
+    with pytest.raises(_ProcessDied):
+        await fleet.expire("q-answered-crash")
+
+    assert fleet.wakes == []
+    row = await fleet.store.get("q-answered-crash")
+    assert row.status == "RESOLVED"
+    assert (row.retry_state, row.retry_reply_text) == (
+        "completed", "1022 characters of real answer",
+    )
+
+    await fleet.restart_sender()
+    # The dead process's claim may still have the wake in flight: neither
+    # boot replay nor a settlement pass delivers it yet.
+    await fleet.feature._replay_pending_a2a_questions(fleet.store)
+    await fleet.settle()
+    assert fleet.wakes == []
+
+    await fleet.recover()
+
+    [wake] = fleet.wakes
+    assert wake.payload["state"] == "completed"
+    assert wake.payload["reply_text"] == "1022 characters of real answer"
+    assert wake.payload["late"] is False
+    row = await fleet.store.get("q-answered-crash")
+    assert row.status == "RESOLVED"
+    assert row.retry_state is None
+
+    await fleet.recover()
+    await fleet.settle()
+    assert len(fleet.wakes) == 1
+
+
+@pytest.mark.asyncio
+async def test_withdrawal_wake_survives_a_crash_before_it_is_enqueued(fleet):
+    """The expiry withdraws the question and confirms the recipient settled,
+    then the process dies before the ``expired`` wake is enqueued. Nothing is
+    left to settle, but the asker is still owed that wake."""
+    await fleet.ask("q-withdrawn-crash", "Numbers?")
+    fleet.feature.agent.dispatcher.die_on_enqueue = True
+
+    with pytest.raises(_ProcessDied):
+        await fleet.expire("q-withdrawn-crash")
+
+    assert fleet.wakes == []
+    assert await fleet.recipient_state("q-withdrawn-crash") is TaskState.CANCELED
+    row = await fleet.store.get("q-withdrawn-crash")
+    assert row.status == "EXPIRED"
+    assert row.receiver_settlement == RECEIVER_SETTLEMENT_CONFIRMED
+    assert row.retry_state == "expired"
+
+    await fleet.restart_sender()
+    await fleet.recover()
+
+    [wake] = fleet.wakes
+    assert wake.payload["state"] == "expired"
+    assert wake.payload["reply_text"] == ""
+    assert wake.payload["late"] is False
+    assert wake.payload["withdrawn"] is True
+    row = await fleet.store.get("q-withdrawn-crash")
+    assert row.status == "EXPIRED"
+    assert row.receiver_settlement == RECEIVER_SETTLEMENT_CONFIRMED
+    assert row.retry_state is None
+    assert await fleet.recipient_state("q-withdrawn-crash") is TaskState.CANCELED
+
+    await fleet.recover()
+    await fleet.settle()
+    assert len(fleet.wakes) == 1
+
+
+@pytest.mark.asyncio
+async def test_unsettled_expiry_wake_survives_a_crash_ahead_of_the_late_answer(
+    fleet,
+):
+    """The expiry cannot reach the recipient and the process dies before its
+    ``expired`` wake is enqueued. The recipient answers meanwhile. The asker
+    must hear ``expired`` first and the answer second, flagged late: no
+    settlement pass relays the answer while the ``expired`` wake is owed."""
+    await fleet.ask("q-unsettled-crash", "Numbers?")
+    fleet.router.reachable = False
+    fleet.feature.agent.dispatcher.die_on_enqueue = True
+
+    with pytest.raises(_ProcessDied):
+        await fleet.expire("q-unsettled-crash")
+
+    answered = await fleet.answer("q-unsettled-crash", "the numbers")
+    assert answered.status is ToolResultStatus.OK
+    fleet.router.reachable = True
+    await fleet.restart_sender()
+    # The dead expiry's claim has lapsed, yet settlement leaves the row alone.
+    await fleet.settle()
+    assert fleet.wakes == []
+    assert (await fleet.store.get("q-unsettled-crash")).receiver_settlement == (
+        RECEIVER_SETTLEMENT_PENDING
+    )
+
+    await fleet.recover()
+    await fleet.settle()
+
+    assert [(w.payload["state"], w.payload["late"]) for w in fleet.wakes] == [
+        ("expired", False), ("completed", True),
+    ]
+    # Recovered from the row, the ``expired`` wake still says unconfirmed.
+    assert fleet.wakes[0].payload["withdrawn"] is False
+    assert fleet.wakes[1].payload["reply_text"] == "the numbers"
+    row = await fleet.store.get("q-unsettled-crash")
+    assert row.receiver_settlement == RECEIVER_SETTLEMENT_CONFIRMED
+    assert row.retry_state is None
+
+
+@pytest.mark.asyncio
+async def test_supervisor_answer_survives_a_crash_before_its_wake(fleet):
+    """The supervisor's own on-time answer is claimed the same way: a crash
+    between resolving the row and enqueueing the answer's wake delays the
+    answer, and does not lose it."""
+    await fleet.ask("q-on-time", "How many?")
+
+    async def _answered(*_args, **_kwargs):
+        yield SimpleNamespace(
+            event="status",
+            data=json.dumps({
+                "id": "q-on-time",
+                "status": {
+                    "state": "completed",
+                    "message": {"parts": [{"text": "42"}]},
+                },
+            }),
+        )
+    fleet.router.subscribe_a2a_task = _answered
+    fleet.feature.agent.dispatcher.die_on_enqueue = True
+
+    with pytest.raises(_ProcessDied):
+        await fleet.feature._supervise_a2a_question(
+            task_id="q-on-time",
+            recipient="Nellie",
+            recipient_agent_id=RECIPIENT,
+            original_question="How many?",
+            sess_id="session-q-on-time",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(minutes=5),
+            causation_chain=None,
+        )
+
+    assert (await fleet.store.get("q-on-time")).retry_state == "completed"
+    await fleet.restart_sender()
+    await fleet.recover()
+
+    [wake] = fleet.wakes
+    assert (wake.payload["state"], wake.payload["reply_text"]) == ("completed", "42")
+    assert wake.payload["late"] is False
+    assert (await fleet.store.get("q-on-time")).retry_state is None
+
+
+@pytest.mark.asyncio
+async def test_crash_while_an_answer_wake_is_in_flight_delivers_it_again(fleet):
+    """The answer's wake was enqueued and its turn was running when the
+    process died, so its delivery was never confirmed. The restarted process
+    delivers it again. A duplicate is the price of never losing it."""
+    await fleet.ask("q-in-flight", "How many?")
+    await fleet.answer("q-in-flight", "42")
+    fleet.feature.agent.dispatcher.next_handles.append(_DiesInFlight())
+
+    with pytest.raises(_ProcessDied):
+        await fleet.expire("q-in-flight")
+
+    [first] = fleet.wakes
+    assert first.payload["reply_text"] == "42"
+    assert (await fleet.store.get("q-in-flight")).retry_state == "completed"
+
+    await fleet.restart_sender()
+    await fleet.recover()
+
+    [again] = fleet.wakes
+    assert (again.payload["state"], again.payload["reply_text"]) == (
+        "completed", "42",
+    )
+    assert (await fleet.store.get("q-in-flight")).retry_state is None
+
+
 @pytest.mark.asyncio
 async def test_concurrent_pass_does_not_relay_a_late_answer_twice(fleet):
     """Boot's settlement pass and the hourly sweep can overlap while a late
@@ -883,6 +1152,140 @@ async def test_concurrent_pass_does_not_relay_a_late_answer_twice(fleet):
     assert (await fleet.store.get("q-race")).receiver_settlement == (
         RECEIVER_SETTLEMENT_CONFIRMED
     )
+
+
+@pytest.mark.asyncio
+async def test_late_relay_answers_to_the_store_that_claimed_its_row(fleet):
+    """The relay's ownership check and lease renewals go to the store whose
+    claim it holds, not to whichever store the agent exposes when it
+    relays."""
+    await _late_answer_after_unreached_expiry(fleet, "q-own-store")
+    fleet.feature.agent.pending_a2a_questions = None
+
+    await fleet.settle()
+
+    [expired, late] = fleet.wakes
+    assert (expired.payload["state"], late.payload["late"]) == ("expired", True)
+    assert (await fleet.store.get("q-own-store")).receiver_settlement == (
+        RECEIVER_SETTLEMENT_CONFIRMED
+    )
+
+@pytest.mark.asyncio
+async def test_pass_overtaken_while_stalled_neither_relays_nor_confirms(fleet):
+    """Replica A learns the recipient's late answer, records it, and stalls
+    before relaying it. Its lease lapses, and replica B claims the row and
+    starts relaying the held answer. When A resumes it must not renew the
+    lease, confirm the row, or wake the asker a second time."""
+    await _late_answer_after_unreached_expiry(fleet, "q-takeover")
+    store_a, feature_a = fleet.store, fleet.feature
+    claims_a: list = []
+    renewals_a: list = []
+    stalled, resume = asyncio.Event(), asyncio.Event()
+    real_claim = store_a.claim_receiver_settlement
+    real_record = store_a.record_late_answer
+    real_renew = store_a.renew_claim_lease
+
+    async def _claim(task_id, **kwargs):
+        claim = await real_claim(task_id, **kwargs)
+        claims_a.append(claim)
+        return claim
+
+    async def _record_then_stall(task_id, **kwargs):
+        recorded = await real_record(task_id, **kwargs)
+        stalled.set()
+        await resume.wait()
+        return recorded
+
+    async def _renew(task_id, **kwargs):
+        renewed = await real_renew(task_id, **kwargs)
+        renewals_a.append(renewed)
+        return renewed
+    store_a.claim_receiver_settlement = _claim
+    store_a.record_late_answer = _record_then_stall
+    store_a.renew_claim_lease = _renew
+
+    pass_a = asyncio.create_task(fleet.settle())
+    await asyncio.wait_for(stalled.wait(), timeout=30)
+    # Replica B over the same database, a lease later.
+    await fleet.restart_sender()
+    in_flight = _BlockedHandle()
+    fleet.feature.agent.dispatcher.next_handles.append(in_flight)
+    pass_b = asyncio.create_task(fleet.settle())
+    await asyncio.wait_for(in_flight.waiting.wait(), timeout=30)
+
+    resume.set()
+    await asyncio.wait_for(pass_a, timeout=30)
+
+    assert [w.payload["state"] for w in feature_a.agent.dispatcher.signals] == [
+        "expired",
+    ]
+    assert renewals_a == [False]
+    [claim_a] = claims_a
+    assert not await store_a.confirm_late_answer_delivered(
+        "q-takeover", claim=claim_a.token,
+    )
+    assert (await fleet.store.get("q-takeover")).receiver_settlement == (
+        RECEIVER_SETTLEMENT_LATE_ANSWER
+    )
+
+    in_flight.release.set()
+    await asyncio.wait_for(pass_b, timeout=30)
+    [late] = fleet.wakes
+    assert late.payload["late"] is True
+    assert late.payload["reply_text"] == "valid live numbers"
+    assert (await fleet.store.get("q-takeover")).receiver_settlement == (
+        RECEIVER_SETTLEMENT_CONFIRMED
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["answered", "unreached"])
+async def test_wake_overtaken_while_stalled_is_never_enqueued(fleet, outcome):
+    """Replica A's expiry claims the row to wake the asker (with the answer
+    it found, or ``expired``) and stalls before enqueueing. Its lease lapses,
+    and replica B takes the wake over and is delivering it. When A resumes it
+    must not wake the asker too, nor pull the row back from under B."""
+    task_id = f"q-stalled-{outcome}"
+    await fleet.ask(task_id, "How many?")
+    if outcome == "answered":
+        await fleet.answer(task_id, "42")
+        claim_method, expected = "mark_resolved", ("completed", "42")
+    else:
+        fleet.router.reachable = False
+        claim_method, expected = "mark_expired", ("expired", "")
+    store_a, feature_a = fleet.store, fleet.feature
+    stalled, resume = asyncio.Event(), asyncio.Event()
+    real_claim = getattr(store_a, claim_method)
+
+    async def _claim_then_stall(*args, **kwargs):
+        claimed = await real_claim(*args, **kwargs)
+        stalled.set()
+        await resume.wait()
+        return claimed
+    setattr(store_a, claim_method, _claim_then_stall)
+
+    pass_a = asyncio.create_task(fleet.expire(task_id))
+    await asyncio.wait_for(stalled.wait(), timeout=30)
+    # Replica B over the same database, once A's lease has lapsed.
+    await fleet.restart_sender()
+    in_flight = _BlockedHandle()
+    fleet.feature.agent.dispatcher.next_handles.append(in_flight)
+    pass_b = asyncio.create_task(fleet.recover())
+    await asyncio.wait_for(in_flight.waiting.wait(), timeout=30)
+
+    resume.set()
+    await asyncio.wait_for(pass_a, timeout=30)
+
+    assert feature_a.agent.dispatcher.signals == []
+    row = await fleet.store.get(task_id)
+    assert row.status in ("RESOLVED", "EXPIRED")
+    assert (row.retry_state, row.retry_reply_text or "") == expected
+
+    in_flight.release.set()
+    await asyncio.wait_for(pass_b, timeout=30)
+    [wake] = fleet.wakes
+    assert (wake.payload["state"], wake.payload["reply_text"]) == expected
+    assert (await fleet.store.get(task_id)).retry_state is None
 
 
 @pytest.mark.asyncio
@@ -973,7 +1376,7 @@ async def test_rows_behind_a_hung_row_are_reached_on_the_next_pass(
 
 
 # ---------------------------------------------------------------------------
-# The settlement lease is renewed while a wake for the row is in flight
+# A row's claim lease is renewed while a wake for the row is in flight
 # ---------------------------------------------------------------------------
 
 
@@ -996,16 +1399,16 @@ class _RecordingRenewal:
         return self.results.pop(0) if self.results else True
 
 
-class TestSettlementLeaseRenewingHandle:
+class TestClaimLeaseRenewingHandle:
     @pytest.mark.asyncio
     async def test_renews_until_the_wake_lands_and_returns_its_result(self):
         from kestrel_sovereign.features.peers.feature import (
-            _SettlementLeaseRenewingHandle,
+            _ClaimLeaseRenewingHandle,
         )
 
         inner = _BlockedHandle()
         renew = _RecordingRenewal([])
-        handle = _SettlementLeaseRenewingHandle(inner, interval=0.01, renew=renew)
+        handle = _ClaimLeaseRenewingHandle(inner, interval=0.01, renew=renew)
         waiting = asyncio.create_task(handle.wait())
         await _eventually(lambda: renew.calls >= 3)
         inner.release.set()
@@ -1021,12 +1424,12 @@ class TestSettlementLeaseRenewingHandle:
     async def test_renews_as_soon_as_the_wait_begins(self):
         """Holding starts with the wait, not one interval later."""
         from kestrel_sovereign.features.peers.feature import (
-            _SettlementLeaseRenewingHandle,
+            _ClaimLeaseRenewingHandle,
         )
 
         inner = _BlockedHandle()
         renew = _RecordingRenewal([])
-        handle = _SettlementLeaseRenewingHandle(inner, interval=3600, renew=renew)
+        handle = _ClaimLeaseRenewingHandle(inner, interval=3600, renew=renew)
         waiting = asyncio.create_task(handle.wait())
         await _eventually(lambda: renew.calls >= 1)
         inner.release.set()
@@ -1037,12 +1440,12 @@ class TestSettlementLeaseRenewingHandle:
     @pytest.mark.asyncio
     async def test_delegates_other_handle_attributes(self):
         from kestrel_sovereign.features.peers.feature import (
-            _SettlementLeaseRenewingHandle,
+            _ClaimLeaseRenewingHandle,
         )
 
         inner = _DeliveredHandle()
         inner.signal_id = "sig-1"
-        handle = _SettlementLeaseRenewingHandle(
+        handle = _ClaimLeaseRenewingHandle(
             inner, interval=3600, renew=_RecordingRenewal([]),
         )
 
@@ -1051,12 +1454,12 @@ class TestSettlementLeaseRenewingHandle:
     @pytest.mark.asyncio
     async def test_stops_renewing_when_nothing_is_left_to_hold(self):
         from kestrel_sovereign.features.peers.feature import (
-            _SettlementLeaseRenewingHandle,
+            _ClaimLeaseRenewingHandle,
         )
 
         inner = _BlockedHandle()
         renew = _RecordingRenewal([True, False])
-        handle = _SettlementLeaseRenewingHandle(inner, interval=0.01, renew=renew)
+        handle = _ClaimLeaseRenewingHandle(inner, interval=0.01, renew=renew)
         waiting = asyncio.create_task(handle.wait())
         await _eventually(lambda: renew.calls >= 2)
         await asyncio.sleep(0.05)
@@ -1068,7 +1471,7 @@ class TestSettlementLeaseRenewingHandle:
     @pytest.mark.asyncio
     async def test_cancelling_the_waiter_cancels_the_wait(self):
         from kestrel_sovereign.features.peers.feature import (
-            _SettlementLeaseRenewingHandle,
+            _ClaimLeaseRenewingHandle,
         )
 
         inner_cancelled = asyncio.Event()
@@ -1081,7 +1484,7 @@ class TestSettlementLeaseRenewingHandle:
                     inner_cancelled.set()
                     raise
 
-        handle = _SettlementLeaseRenewingHandle(
+        handle = _ClaimLeaseRenewingHandle(
             _Inner(), interval=0.01, renew=_RecordingRenewal([]),
         )
         waiting = asyncio.create_task(handle.wait())
@@ -1096,7 +1499,7 @@ class TestSettlementLeaseRenewingHandle:
         """``await_terminal_delivery`` tells "the dispatch died" from "we are
         being cancelled"; the wrapper must not blur the two."""
         from kestrel_sovereign.features.peers.feature import (
-            _SettlementLeaseRenewingHandle,
+            _ClaimLeaseRenewingHandle,
         )
         from kestrel_sovereign.signals.delivery import (
             STATUS_DISPATCH_CANCELLED,
@@ -1107,7 +1510,7 @@ class TestSettlementLeaseRenewingHandle:
             async def wait(self):
                 raise asyncio.CancelledError()
 
-        handle = _SettlementLeaseRenewingHandle(
+        handle = _ClaimLeaseRenewingHandle(
             _DispatchDied(), interval=0.01, renew=_RecordingRenewal([]),
         )
 
@@ -1119,21 +1522,21 @@ class TestSettlementLeaseRenewingHandle:
 
 async def _spy_renewals(fleet) -> list:
     """Record each renewal of the real store's lease and its result."""
-    real = fleet.store.renew_receiver_settlement_lease
+    real = fleet.store.renew_claim_lease
     results: list = []
 
     async def _spy(task_id, **kwargs):
         renewed = await real(task_id, **kwargs)
         results.append((task_id, renewed))
         return renewed
-    fleet.store.renew_receiver_settlement_lease = _spy
-    fleet.feature.QUESTION_SETTLEMENT_LEASE_RENEW_SECONDS = 0.01
+    fleet.store.renew_claim_lease = _spy
+    fleet.feature.QUESTION_CLAIM_LEASE_RENEW_SECONDS = 0.01
     return results
 
 
 async def _lease_until(fleet, task_id: str):
     [(value,)] = await fleet.db.fetchall(
-        "SELECT receiver_settlement_lease_until FROM pending_a2a_questions "
+        "SELECT claim_lease_until FROM pending_a2a_questions "
         "WHERE task_id = ?",
         (task_id,),
     )
@@ -1145,7 +1548,7 @@ async def test_late_relay_keeps_its_lease_for_the_whole_turn(fleet):
     await _late_answer_after_unreached_expiry(fleet, "q-long")
     # Real-clock passes here: the expiry's own lease has lapsed.
     await fleet.db.execute(
-        "UPDATE pending_a2a_questions SET receiver_settlement_lease_until = NULL "
+        "UPDATE pending_a2a_questions SET claim_lease_until = NULL "
         "WHERE task_id = ?",
         ("q-long",),
     )
@@ -1157,11 +1560,16 @@ async def test_late_relay_keeps_its_lease_for_the_whole_turn(fleet):
         fleet.feature._settle_expired_questions_with_receivers(fleet.store),
     )
     await asyncio.wait_for(in_flight.waiting.wait(), timeout=30)
-    claimed_lease = await _lease_until(fleet, "q-long")
-    await _eventually(lambda: len(renewals) >= 2)
+    claimed_lease = str(await _lease_until(fleet, "q-long"))
 
-    assert renewals[:2] == [("q-long", True), ("q-long", True)]
-    assert str(await _lease_until(fleet, "q-long")) > str(claimed_lease)
+    async def _lease_grows() -> None:
+        while str(await _lease_until(fleet, "q-long")) <= claimed_lease:
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(_lease_grows(), timeout=30)
+
+    # The relay's own ownership check, then the in-flight renewals.
+    assert len(renewals) >= 2
+    assert all(renewal == ("q-long", True) for renewal in renewals)
     in_flight.release.set()
     await asyncio.wait_for(relay, timeout=30)
     assert (await fleet.store.get("q-long")).receiver_settlement == (
@@ -1186,6 +1594,88 @@ async def test_expired_wake_keeps_the_rows_lease_while_in_flight(fleet):
     assert renewals[0] == ("q-slow", True)
     in_flight.release.set()
     await asyncio.wait_for(expiry, timeout=30)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry", ["sweep", "near_term"])
+async def test_retried_expired_wake_holds_a_claim_of_its_own(fleet, retry):
+    """An ``expired`` wake that was not delivered returns its row to WAITING.
+    Whichever retry expires it again claims the row afresh and holds that
+    claim while the retried wake is in flight, so the recipient's late answer
+    cannot overtake it."""
+    await fleet.ask("q-retried", "Numbers?")
+    fleet.router.reachable = False
+    # The expiry's ``expired`` wake is not delivered, so the expiry restores
+    # its row to WAITING with that wake. The near-term retry it schedules is
+    # dropped here: this test drives the retry itself.
+    fleet.feature.agent.dispatcher.next_handles.append(_UndeliveredHandle())
+    fleet.feature.agent._track_background_task = (
+        lambda coro, *, name: coro.close() or MagicMock()
+    )
+    await fleet.expire("q-retried")
+    row = await fleet.store.get("q-retried")
+    assert (row.status, row.retry_state, row.receiver_settlement) == (
+        "WAITING", "expired", RECEIVER_SETTLEMENT_PENDING,
+    )
+    await fleet.answer("q-retried", "the numbers")
+    fleet.router.reachable = True
+    renewals = await _spy_renewals(fleet)
+    in_flight = _BlockedHandle()
+    fleet.feature.agent.dispatcher.next_handles.append(in_flight)
+
+    if retry == "sweep":
+        retried = asyncio.create_task(fleet.expire("q-retried"))
+    else:
+        retried = asyncio.create_task(
+            fleet.feature._retry_restored_question_answered_signal(
+                task_id="q-retried",
+                recipient="Nellie",
+                original_question="Numbers?",
+                sess_id="session-q-retried",
+                state="expired",
+                reply_text="",
+                causation_chain=None,
+            )
+        )
+    await asyncio.wait_for(in_flight.waiting.wait(), timeout=30)
+    await _eventually(lambda: bool(renewals))
+    # A pass on the real clock, inside the retried wake's lease.
+    await fleet.feature._settle_expired_questions_with_receivers(fleet.store)
+
+    assert renewals[0] == ("q-retried", True)
+    assert [w.payload["state"] for w in fleet.wakes] == ["expired", "expired"]
+    in_flight.release.set()
+    await asyncio.wait_for(retried, timeout=30)
+    # Delivered, the retried wake makes way for the late answer, once.
+    await fleet.settle()
+    await fleet.settle()
+    assert [(w.payload["state"], w.payload["late"]) for w in fleet.wakes] == [
+        ("expired", False), ("expired", False), ("completed", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_near_term_retry_of_a_withdrawn_expiry_still_says_withdrawn(fleet):
+    """The question was withdrawn but its ``expired`` wake failed, so the
+    expiry restored the row and scheduled a near-term retry. The retried wake
+    must say what the first one said."""
+    await fleet.ask("q-withdrawn-retry", "Numbers?")
+    fleet.feature.agent.dispatcher.next_handles.append(_UndeliveredHandle())
+    scheduled: list = []
+    fleet.feature.agent._track_background_task = (
+        lambda coro, *, name: scheduled.append(coro) or MagicMock()
+    )
+
+    await fleet.expire("q-withdrawn-retry")
+    [retry] = scheduled
+    await asyncio.wait_for(retry, timeout=30)
+
+    assert [(w.payload["state"], w.payload["withdrawn"]) for w in fleet.wakes] == [
+        ("expired", True), ("expired", True),
+    ]
+    row = await fleet.store.get("q-withdrawn-retry")
+    assert (row.status, row.retry_state) == ("EXPIRED", None)
+    assert row.receiver_settlement == RECEIVER_SETTLEMENT_CONFIRMED
 
 
 class _DurableRecipient(EventManagerMixin):
@@ -1319,6 +1809,67 @@ async def test_late_answer_a_month_after_expiry_still_wakes_the_asker(fleet):
     late = fleet.wakes[-1]
     assert late.payload["late"] is True
     assert late.payload["reply_text"] == "numbers, a month on"
+
+
+async def _expire_on_a_release_before_3440(fleet, *task_ids: str) -> None:
+    """What a release before #3440 left behind: each question expired on the
+    sender alone, its recipient never told, and the asker woken ``expired``.
+    That release's table had no settlement columns at all."""
+    for task_id in task_ids:
+        await fleet.db.execute(
+            "UPDATE pending_a2a_questions "
+            "SET status = 'EXPIRED', resolved_at = CURRENT_TIMESTAMP "
+            "WHERE task_id = ?",
+            (task_id,),
+        )
+        await update_outbound_terminal_state(
+            fleet.db, agent_id=SENDER, task_id=task_id, terminal_state="expired",
+        )
+    for column in (
+        "receiver_settlement",
+        "claim_token",
+        "claim_lease_until",
+        "receiver_late_state",
+        "receiver_late_reply_text",
+    ):
+        await fleet.db.execute(
+            f"ALTER TABLE pending_a2a_questions DROP COLUMN {column}",
+        )
+
+
+@pytest.mark.asyncio
+async def test_questions_expired_before_the_upgrade_are_settled(fleet):
+    """The 2026-10-02 incidents expired on a release that never told the
+    recipient: one question stayed live at Nellie and was re-delivered, and
+    another was answered after Emma gave up. After the upgrade, Emma's first
+    settlement pass withdraws the first and relays the second's answer."""
+    await fleet.ask("q-238234", "What are the live numbers?")
+    await fleet.ask("q-ea48db1e", "Live numbers, again?")
+    await _expire_on_a_release_before_3440(fleet, "q-238234", "q-ea48db1e")
+    answered = await fleet.answer("q-ea48db1e", "valid live numbers")
+    assert answered.status is ToolResultStatus.OK
+
+    await fleet.restart_sender()  # the upgraded process
+    await fleet.settle()
+
+    assert await fleet.recipient_state("q-238234") is TaskState.CANCELED
+    task = await fleet.task_manager.get_task_for_recipient("q-238234", RECIPIENT)
+    stale = build_signal_for_submitted_task(task, target_agent=RECIPIENT, sender=SENDER)
+    assert await fleet.recipient.validate_cognition_signal_execution(stale)
+    [late] = fleet.wakes
+    assert late.payload["task_id"] == "q-ea48db1e"
+    assert late.payload["state"] == "completed"
+    assert late.payload["reply_text"] == "valid live numbers"
+    assert late.payload["late"] is True
+    for task_id in ("q-238234", "q-ea48db1e"):
+        assert (await fleet.store.get(task_id)).receiver_settlement == (
+            RECEIVER_SETTLEMENT_CONFIRMED
+        )
+    outbound = await get_outbound_task(fleet.db, agent_id=SENDER, task_id="q-ea48db1e")
+    assert outbound.terminal_state == "completed"
+
+    await fleet.settle()
+    assert len(fleet.wakes) == 1
 
 
 @pytest.mark.asyncio

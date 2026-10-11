@@ -1287,6 +1287,7 @@ async def test_question_answered_retry_is_feature_owned_and_cancelled_on_shutdow
 
     await feature._restore_pending_question_waiting(
         "t-retry",
+        claim=feature._new_question_claim(store),
         state="completed",
         reply_text="the answer",
         recipient="claw",
