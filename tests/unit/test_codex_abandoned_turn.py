@@ -63,6 +63,9 @@ class FakeCodexAppServer:
     async def ensure_started(self) -> None:
         return None
 
+    async def aclose(self) -> None:
+        self._running.clear()
+
     async def request(
         self, method: str, params: Optional[dict] = None, *, timeout: float = 120,
     ) -> Any:
@@ -316,19 +319,21 @@ def _plan_route(agent, app: FakeCodexAppServer, monkeypatch, tmp_path) -> dict:
     return provider
 
 
-async def _streamed_turns(agent) -> List[str]:
+async def _streamed_turns(agent, monkeypatch) -> List[str]:
     """Answer, stall, then the same session's next turn; the stall must fail."""
     from tests.unit.test_llm_call_watchdog import _conversation_holder, _turn
 
     answers = [await asyncio.wait_for(_turn(agent, "Hello."), 30)]
+    monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", BOUND)
     with pytest.raises(LLMCallInactivityTimeout):
         await asyncio.wait_for(_turn(agent, "Where do I work?"), 30)
+    monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", 30)
     assert _conversation_holder(agent) is None
     answers.append(await asyncio.wait_for(_turn(agent, "And now?"), 30))
     return answers
 
 
-async def _invoked_turns(agent) -> List[str]:
+async def _invoked_turns(agent, monkeypatch) -> List[str]:
     """The same three turns through ``/api/agent/invoke``."""
     from tests.unit.test_llm_call_watchdog import (
         _conversation_holder,
@@ -338,10 +343,12 @@ async def _invoked_turns(agent) -> List[str]:
 
     async with _invoke_client(agent) as client:
         first = await _invoke(client, "Hello.")
+        monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", BOUND)
         stalled = await _invoke(client, "Where do I work?")
         assert stalled.status_code == 502, stalled.text
         assert stalled.json()["error"]["code"] == "generation_incomplete"
         assert _conversation_holder(agent) is None
+        monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", 30)
         last = await _invoke(client, "And now?")
     for response in (first, last):
         assert response.status_code == 200, response.text
@@ -361,12 +368,15 @@ async def test_a_stalled_plan_turn_times_out_and_the_next_starts_a_new_thread(
     abandoned turn is still running."""
     from tests.unit.test_llm_call_watchdog import _booted_agent
 
-    monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", BOUND)
+    # A short deadline belongs to the deliberately silent turn only. A normal
+    # first call may include lazy local setup and is not a 200ms performance
+    # contract. The stall remains bounded and must invalidate its exact thread.
+    monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", 30)
     app = FakeCodexAppServer("answer", "stall", "answer")
     async with _booted_agent(tmp_path) as agent:
         _plan_route(agent, app, monkeypatch, tmp_path)
 
-        assert await turns(agent) == ["Noted.", "Noted."]
+        assert await turns(agent, monkeypatch) == ["Noted.", "Noted."]
 
         assert app.turns == ["thread-1", "thread-2", "thread-3"]
         assert app.rejected == []

@@ -128,7 +128,9 @@ from kestrel_sovereign.security.input_guardrails import (
     append_security_addendum,
 )
 from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
-from kestrel_sovereign.execution_custody import execution_work_operation
+from kestrel_sovereign.execution_custody import (
+    execution_work_operation, execution_terminal_error, is_execution_control_error,
+)
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
@@ -337,43 +339,24 @@ async def await_lifecycle_task_completion(
     terminal outcome without confusing a task-cancellation with a fresh
     cancellation of the lifecycle owner.
     """
-    # A ``CancelledError`` raised by ``shield(task)`` is ambiguous when both
-    # tasks are cancelled in the same loop turn: it can report the owned task's
-    # terminal cancellation, this joiner's cancellation, or both.  Only the
-    # joiner itself can authoritatively tell us whether its cancellation was
-    # requested.  Do not infer that from the owned task's terminal state.
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    # The completion-only waiter never consumes the task's first cancellation
+    # exception. That first retrieval may carry irreversible control evidence.
     joiner = asyncio.current_task()
     cancelled = bool(joiner is not None and joiner.cancelling())
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if joiner is not None and joiner.cancelling():
-                cancelled = True
-        except BaseExceptionGroup as error:
-            # A lifecycle owner can deliberately retain cancellation and an
-            # ordinary cleanup failure in one group.  Like an Exception, that
-            # is the owned task's terminal outcome, not a reason to abandon
-            # later cleanup owners that the caller must still join.
-            # Process-control exceptions are not lifecycle failure data.
-            # Preserve their grouping and propagate them immediately.
-            _raise_unexpected_lifecycle_exception_group(error)
-            assert task.done()
-        except Exception:
-            # ``shield`` re-raises the owned task's terminal exception into
-            # this joiner.  The lifecycle contract returns that outcome as
-            # data so a staged owner can drain every later resource before it
-            # reports or aggregates the failure.  It is terminal at this
-            # point; fetch it below exactly once from the task itself.
-            assert task.done()
-
-    if task.cancelled():
-        return cancelled, asyncio.CancelledError()
-    failure = task.exception()
+    outcome = await await_owned_task(task)
+    cancelled = cancelled or outcome.cancellation is not None
+    failure = outcome.error
+    if any(error is not None and is_execution_control_error(error)
+           for error in (failure, outcome.cancellation)):
+        failure = execution_terminal_error(failure, outcome.cancellation)
     if isinstance(failure, BaseExceptionGroup):
         # A task can already be terminal when this helper is entered, in which
         # case the loop above never observes its raised group.
         _raise_unexpected_lifecycle_exception_group(failure)
+    elif failure is not None and not isinstance(failure, (Exception, asyncio.CancelledError)):
+        raise failure
     return cancelled, failure
 
 
@@ -8383,6 +8366,7 @@ Expected Duration: {expected_duration}
 
         await custody.release("signal_dispatcher", release_dispatcher)
         await custody.release("storage", close_storage)
+        self._raise_shutdown_control()
         self._release_serving_record()
 
     async def _ensure_durable_shutdown_continuation(self, dispatcher) -> asyncio.Task:
@@ -8410,11 +8394,30 @@ Expected Duration: {expected_duration}
             # Always retrieve an unjoined failure.  The task remains retained
             # for a later lifecycle retry, rather than disappearing as an
             # unobserved "Task exception was never retrieved" warning.
-            continuation.add_done_callback(
-                lambda task: None if task.cancelled() else task.exception()
-            )
+            def retain_terminal(task):
+                try:
+                    failure = task.exception()
+                except asyncio.CancelledError as cancellation:
+                    failure = cancellation
+                self._remember_shutdown_control(failure)
+            continuation.add_done_callback(retain_terminal)
             self._durable_shutdown_continuation = continuation
             return continuation
+
+    def _remember_shutdown_control(self, error: BaseException | None) -> None:
+        """Retain original terminal evidence until its lifetime is reconciled."""
+        if error is None or not is_execution_control_error(error):
+            return
+        failures = vars(self).setdefault("_shutdown_control_failures", [])
+        if all(existing is not error for existing in failures):
+            failures.append(error)
+
+    def _raise_shutdown_control(self) -> None:
+        terminal = execution_terminal_error(
+            *vars(self).get("_shutdown_control_failures", ()),
+        )
+        if terminal is not None:
+            raise terminal
 
     async def wait_for_shutdown_completion(self) -> None:
         """Join deferred durable cleanup before releasing this agent.
@@ -8429,11 +8432,15 @@ Expected Duration: {expected_duration}
         while True:
             continuation = self._durable_shutdown_continuation
             if continuation is None:
+                self._raise_shutdown_control()
                 return
             try:
                 await asyncio.shield(continuation)
+                self._raise_shutdown_control()
                 return
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cancellation:
+                self._remember_shutdown_control(cancellation)
+                self._raise_shutdown_control()
                 # A continuation can itself be cancelled (for example while
                 # releasing the runtime owner).  That is a retryable cleanup
                 # failure.  A cancellation of *this* waiter, on the other
@@ -8443,6 +8450,8 @@ Expected Duration: {expected_duration}
                     raise
                 failure: BaseException = asyncio.CancelledError()
             except Exception as exc:
+                self._remember_shutdown_control(exc)
+                self._raise_shutdown_control()
                 failure = exc
 
             if retried_failure:
@@ -8879,7 +8888,10 @@ Expected Duration: {expected_duration}
 
             try:
                 await custody.release(resource, step)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cancellation:
+                if is_execution_control_error(cancellation):
+                    self._remember_shutdown_control(cancellation)
+                    return reported
                 # Whole-agent shutdown is being cancelled. Stop the sweep and
                 # propagate to the durable tail via ``finally``.
                 logging.warning(
@@ -8888,13 +8900,22 @@ Expected Duration: {expected_duration}
                     label,
                 )
                 raise
-            except asyncio.TimeoutError:
+            except BaseExceptionGroup as failure:
+                if is_execution_control_error(failure):
+                    self._remember_shutdown_control(failure)
+                elif isinstance(failure, Exception):
+                    logging.warning("Error during %s shutdown: %s", label, failure, exc_info=True)
+                else:
+                    raise
+            except asyncio.TimeoutError as timeout:
+                self._remember_shutdown_control(timeout)
                 logging.warning(
                     "%s shutdown exceeded %.2fs; abandoning and continuing sweep",
                     label,
                     budget,
                 )
             except Exception as e:
+                self._remember_shutdown_control(e)
                 logging.warning(
                     "Error during %s shutdown: %s", label, e, exc_info=True
                 )
@@ -9053,7 +9074,8 @@ Expected Duration: {expected_duration}
                     self.task_manager.close,
                     _step_budget(),
                 )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
+            self._remember_shutdown_control(cancellation)
             shutdown_cancelled = True
         finally:
             # Re-read the actual cache at the tail boundary.  The original
@@ -9093,8 +9115,14 @@ Expected Duration: {expected_duration}
         if not shutdown_cancelled and not dispatcher_owner_fenced:
             try:
                 await self.wait_for_shutdown_completion()
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cancellation:
+                self._remember_shutdown_control(cancellation)
                 shutdown_cancelled = True
+            except (Exception, BaseExceptionGroup) as failure:
+                self._remember_shutdown_control(failure)
+                if not is_execution_control_error(failure):
+                    raise
+                tail_degraded = True
         elif dispatcher_owner_fenced:
             # The continuation owns storage close after the hostile cognition
             # task settles. Returning degraded keeps shutdown bounded without
@@ -9112,6 +9140,7 @@ Expected Duration: {expected_duration}
         context_cancelled, context_failure = await self._close_standalone_hold_context()
         shutdown_cancelled = shutdown_cancelled or context_cancelled
         if context_failure is not None:
+            self._remember_shutdown_control(context_failure)
             tail_degraded = True
             logging.warning(
                 "Standalone Hold context shutdown failed: %s",
@@ -9123,6 +9152,9 @@ Expected Duration: {expected_duration}
                 ),
             )
 
+        # Physical retirement still runs for every owner. Its completion does
+        # not turn an unresolved COMMIT/authority receipt into successful Stop.
+        self._raise_shutdown_control()
         if shutdown_cancelled:
             # Never report success after cancellation: re-raise so the outer
             # asyncio.wait_for surfaces the timeout/cancellation. Report the
@@ -9320,10 +9352,13 @@ Expected Duration: {expected_duration}
             defer_failure_report: bool = False,
         ) -> str:
             """Read a completed task's outcome, recording degradation."""
-            if task.cancelled():
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError as cancellation:
+                self._remember_shutdown_control(cancellation)
                 state["cancelled"] = True
                 return "cancelled"
-            exc = task.exception()
+            self._remember_shutdown_control(exc)
             if exc is None:
                 return "ok"
             if not defer_failure_report:
@@ -9353,12 +9388,16 @@ Expected Duration: {expected_duration}
             if coro is not None:
                 try:
                     coro.close()  # hard stop — GeneratorExit cannot be suppressed
-                except Exception:
-                    pass
+                except Exception as failure:
+                    self._remember_shutdown_control(failure)
             # Retrieve the eventual exception once the task reconciles to done.
-            task.add_done_callback(
-                lambda t: None if t.cancelled() else t.exception()
-            )
+            def retain_terminal(completed):
+                try:
+                    failure = completed.exception()
+                except asyncio.CancelledError as cancellation:
+                    failure = cancellation
+                self._remember_shutdown_control(failure)
+            task.add_done_callback(retain_terminal)
 
         async def _bounded(
             coro,

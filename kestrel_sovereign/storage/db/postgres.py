@@ -37,6 +37,7 @@ from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
     ExecutionCommitOutcomeError,
     execution_commit_outcome,
+    execution_terminal_error,
     current_execution_custody,
     lock_execution_authority,
     require_execution_backend,
@@ -782,17 +783,23 @@ class PostgresBackend(DatabaseBackend):
         # state through that await so a release failure cannot imply rollback.
         state = _ExecutionCommitState()
         state.remember(current_execution_custody(self))
+        body_failure: BaseException | None = None
         try:
             async with pool.acquire() as connection:
-                yield connection, state
+                try:
+                    yield connection, state
+                except BaseException as error:
+                    body_failure = error
+                    raise
         except BaseException as exc:
-            outcome = execution_commit_outcome(exc) or state.outcome
+            terminal = execution_terminal_error(body_failure, exc)
+            outcome = execution_commit_outcome(terminal) or state.outcome
             if outcome is not None:
                 for scope in state.scopes:
                     scope.preserve_commit_uncertainty(outcome)
-                if execution_commit_outcome(exc) is None:
-                    raise ExecutionCommitOutcomeError(outcome) from exc
-            raise
+                if execution_commit_outcome(terminal) is None:
+                    raise ExecutionCommitOutcomeError(outcome) from terminal
+            raise terminal
         # Release/reset is an awaited part of the operation, not an
         # authority-free epilogue. Never publish a stale read/RETURNING value
         # or imply rollback when revocation raced a successful COMMIT/reset.
@@ -811,12 +818,19 @@ class PostgresBackend(DatabaseBackend):
         if commit_state is not None:
             commit_state.remember(scopes)
         committing = False
+        body_failure: BaseException | None = None
         try:
             async with connection.transaction():
-                await lock_execution_authority(connection, "postgres", scopes)
-                yield
-                require_execution_backend("postgres", scopes)
-                self._require_transaction_custody()
+                try:
+                    await lock_execution_authority(connection, "postgres", scopes)
+                    yield
+                    require_execution_backend("postgres", scopes)
+                    self._require_transaction_custody()
+                except BaseException as error:
+                    # Native __aexit__ may replace this error during rollback.
+                    # Keep the explicit original receipt, not cleanup context.
+                    body_failure = error
+                    raise
                 committing = True
                 if commit_state is not None:
                     commit_state.outcome = "unknown"
@@ -825,7 +839,7 @@ class PostgresBackend(DatabaseBackend):
                 for scope in scopes:
                     scope.preserve_commit_uncertainty("unknown")
                 raise ExecutionCommitOutcomeError("unknown") from exc
-            raise
+            raise execution_terminal_error(body_failure, exc)
         if commit_state is not None:
             commit_state.outcome = "committed"
         self._require_after_authority_commit(scopes)
@@ -1120,10 +1134,18 @@ class PostgresBackend(DatabaseBackend):
         existing = self._current_txn_conn()
         if existing is not None:
             # Nested transaction (same task) - use savepoint on this task's conn.
-            async with existing.transaction():
-                await self._lock_transaction_custody(existing)
-                yield
-                self._require_transaction_custody()
+            body_failure: BaseException | None = None
+            try:
+                async with existing.transaction():
+                    try:
+                        await self._lock_transaction_custody(existing)
+                        yield
+                        self._require_transaction_custody()
+                    except BaseException as error:
+                        body_failure = error
+                        raise
+            except BaseException as cleanup:
+                raise execution_terminal_error(body_failure, cleanup)
             return
 
         operational = self._current_operational_lease()

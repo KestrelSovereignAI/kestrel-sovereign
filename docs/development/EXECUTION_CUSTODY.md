@@ -313,6 +313,18 @@ retry, completion wake, or successful projection. A durable terminal token
 permits ordinary transport reconciliation, never new authority after retirement.
 Store retirement still attempts every owner, selecting irreversible control
 ahead of an earlier ordinary close failure when reporting joined failures.
+Registered feature handlers and public task tools follow the same rule:
+neither a live parent admission nor a narrower child's completed native effect
+permits conversion of control into a fresh FAILED result or workflow retry.
+Config loading/persistence cannot normalize control as missing configuration
+or a best-effort write failure. PostgreSQL native rollback and physical pool
+release retain the original body receipt even if their cleanup raises another
+error or cancellation. Explicit exception-group members retain their strongest
+control evidence; incidental implicit handling context does not grant authority.
+Background task managers harvest original child cancellation before discarding
+completed tasks and retain unresolved receipts through subsequent drain/close.
+The real agent shutdown joins every later resource owner before reporting that
+receipt. Physical retirement is not reconciliation or an acknowledged Stop.
 Deferred OpenRouter provisioning validates the original admission after client
 acquisition and immediately before each POST, including retries after backoff.
 Cause-carried control errors bypass retry/error normalization; ordinary live

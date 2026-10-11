@@ -73,29 +73,22 @@ class DatabaseInitializationCleanupError(ConnectionError):
 async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseException | None = None) -> None:
     """Settle the one owned close through repeated cancellation on every exit."""
 
+    from kestrel_sovereign._async_ownership import await_owned_task
+
     cleanup = asyncio.create_task(
         db.close(), name="owned-database-retirement"
     )
-    cancelled = False
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            cancelled = True
-            continue
-        except Exception:  # noqa: BLE001 - deliver joined cleanup failure below
-            # Do not let the shield's exception obscure the lifecycle result.
-            # The joined task below distinguishes failed initialization from
-            # uncertain retirement, which must never permit file cleanup.
-            continue
-    try:
-        await cleanup
-    except (asyncio.CancelledError, Exception) as close_exc:
+    outcome = await await_owned_task(cleanup)
+    close_exc = outcome.error
+    if close_exc is not None:
+        if not isinstance(close_exc, (asyncio.CancelledError, Exception)):
+            raise close_exc
         # Keep the resource-retirement wrapper/owner AND the original control
         # cause. A failed close cannot turn uncertain COMMIT into plain error.
         cause = (
-            execution_terminal_error(operation_error, close_exc)
-            if operation_error is not None and is_execution_control_error(operation_error)
+            execution_terminal_error(operation_error, close_exc, outcome.cancellation)
+            if any(error is not None and is_execution_control_error(error)
+                   for error in (operation_error, close_exc, outcome.cancellation))
             else close_exc
         )
         raise DatabaseRetirementError(db, operation_error, close_exc) from cause
@@ -104,11 +97,12 @@ async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseExcept
         if operation_error is not None and is_execution_control_error(operation_error):
             raise failure from operation_error
         raise failure
-    if cancelled:
-        if operation_error is not None and is_execution_control_error(operation_error):
-            operation_error.add_note("Caller cancellation occurred during joined database retirement")
-            raise operation_error
-        raise asyncio.CancelledError()
+    if outcome.cancellation is not None:
+        terminal = execution_terminal_error(operation_error, outcome.cancellation)
+        if terminal is not None and is_execution_control_error(terminal):
+            terminal.add_note("Caller cancellation occurred during joined database retirement")
+            raise terminal
+        raise outcome.cancellation
 
 
 async def _close_failed_database_initialization(db: "AsyncDatabase", initialization_error: BaseException) -> None:

@@ -173,6 +173,9 @@ class TaskManager:
         self._execution_authorities: dict[
             asyncio.Task[None], tuple[str, str]
         ] = {}
+        # Completed children must not disappear with an unresolved receipt.
+        # Retirement joins physical owners but does not reconcile that receipt.
+        self._execution_control_failures: list[BaseException] = []
 
     async def initialize(self) -> None:
         """Initialize all stores."""
@@ -200,7 +203,13 @@ class TaskManager:
             asyncio.CancelledError: The caller was cancelled. The stores not
                 yet closed stay open for a later call.
         """
-        await self.drain_execution_tasks(cancel=True)
+        failures: list[tuple[str, BaseException]] = []
+        try:
+            await self.drain_execution_tasks(cancel=True)
+        except BaseException as error:
+            if not is_execution_control_error(error):
+                raise
+            failures.append(("execution_tasks", error))
 
         # Close all stores in reverse order of initialization
         stores = (
@@ -210,13 +219,14 @@ class TaskManager:
             ("session_service", self.session_service),
             ("task_store", self.task_store),
         )
-        failures: list[tuple[str, Exception]] = []
         for name, store in stores:
             if store is None:
                 continue
             try:
                 await store.close()
-            except Exception as e:
+            except BaseException as e:
+                if not isinstance(e, Exception) and not is_execution_control_error(e):
+                    raise
                 logger.warning("Error closing %s: %s", name, e, exc_info=True)
                 failures.append((name, e))
 
@@ -504,20 +514,29 @@ class TaskManager:
         self._execution_authorities[task] = (task_id, authority_agent_id)
 
         def _discard(done: asyncio.Task[None]) -> None:
+            try:
+                error = done.exception()
+            except asyncio.CancelledError as cancellation:
+                error = cancellation
+            if error is not None and is_execution_control_error(error):
+                self._remember_execution_control(error)
             self._execution_tasks.discard(done)
             self._execution_authorities.pop(done, None)
 
         task.add_done_callback(_discard)
         return task
 
+    def _remember_execution_control(self, error: BaseException) -> None:
+        if is_execution_control_error(error) and all(
+            existing is not error for existing in self._execution_control_failures
+        ):
+            self._execution_control_failures.append(error)
+
     async def drain_execution_tasks(self, *, cancel: bool = False) -> None:
         """Wait for tracked background executions, optionally cancelling them."""
         tasks = set(self._execution_tasks)
-        if not tasks:
-            return
-
+        terminal_errors: list[BaseException] = []
         if cancel:
-            caller_cancelled = False
             for task in tasks:
                 binding = self._execution_authorities.get(task)
                 if binding is not None:
@@ -528,11 +547,13 @@ class TaskManager:
                             reason="Task canceled during shutdown",
                             agent_name=authority_agent_id,
                         )
-                    except ValueError:
-                        pass
-                    except asyncio.CancelledError:
-                        caller_cancelled = True
-                    except Exception:
+                    except ValueError as error:
+                        self._remember_execution_control(error)
+                    except asyncio.CancelledError as cancellation:
+                        self._remember_execution_control(cancellation)
+                        terminal_errors.append(cancellation)
+                    except Exception as error:
+                        self._remember_execution_control(error)
                         # Shutdown must still stop the in-memory worker when its
                         # durable receipt cannot be persisted. The backend error
                         # is observable in logs, but cannot strand the worker or
@@ -546,10 +567,16 @@ class TaskManager:
                 else:
                     task.cancel()
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                self._remember_execution_control(result)
         self._execution_tasks.difference_update(tasks)
-        if cancel and caller_cancelled:
-            raise asyncio.CancelledError()
+        terminal = execution_terminal_error(
+            *self._execution_control_failures, *terminal_errors,
+        )
+        if terminal is not None:
+            raise terminal
 
     @staticmethod
     def _cancellation_reason(task: Task) -> str:
@@ -621,7 +648,9 @@ class TaskManager:
                     reason="Task canceled during shutdown",
                     agent_name=authority_agent_id,
                 )
-            except ValueError:
+            except ValueError as cancellation_error:
+                if is_execution_control_error(cancellation_error):
+                    raise
                 # An independently authorized cancellation or other terminal
                 # result won the race. Never narrate over that durable state.
                 pass

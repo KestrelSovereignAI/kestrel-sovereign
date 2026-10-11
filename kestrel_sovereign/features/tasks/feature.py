@@ -25,6 +25,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
@@ -150,6 +151,8 @@ class TaskFeature(Feature):
                 recipient_agent_id,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to fetch task {task_id}: {e}")
             return {"ok": False, "error": str(e)}
 
@@ -270,6 +273,8 @@ class TaskFeature(Feature):
                     "skills": skills,
                 }
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"list_available_skills failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -382,6 +387,8 @@ class TaskFeature(Feature):
                     skill_name=skill_name,
                 )
             except ValueError as e:
+                if is_execution_control_error(e):
+                    raise
                 results.append({
                     "step": i,
                     "feature": feature_name,
@@ -476,6 +483,8 @@ class TaskFeature(Feature):
                         break
 
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     last_error = e
                     if attempt < attempts - 1:
                         delay_s = retry_delay_ms / 1000.0
@@ -952,6 +961,8 @@ class TaskFeature(Feature):
                     "sender": sender_name,
                 })
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to list tasks: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -1124,6 +1135,8 @@ class TaskFeature(Feature):
                 self._recipient_agent_id(),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to fetch task {task_id} for respond: {e}")
             return ToolResult.failed(str(e))
         if not task:
@@ -1174,6 +1187,8 @@ class TaskFeature(Feature):
                     recipient_agent_id=actor_agent_id,
                 )
         except ValueError as e:
+            if is_execution_control_error(e):
+                raise
             # Transition validator caught an illegal sequence (rare —
             # only happens if another path mutates the task between
             # our get_task and update_status).
@@ -1182,6 +1197,8 @@ class TaskFeature(Feature):
                 data={"task_id": task_id, "state_before": current.value},
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(
                 f"Failed to respond to task {task_id}: {e}", exc_info=True,
             )
@@ -1289,11 +1306,15 @@ class TaskFeature(Feature):
                 recipient_agent_id=actor_agent_id,
             )
         except ValueError as e:
+            if is_execution_control_error(e):
+                raise
             return ToolResult.failed(
                 f"Failed to attach artifact to task {task_id}: {e}",
                 data={"task_id": task_id, "name": name, "index": index},
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(
                 "attach_artifact_to_a2a_task failed for task=%s: %s",
                 task_id, e, exc_info=True,
@@ -1356,6 +1377,8 @@ class TaskFeature(Feature):
                 actor_agent_id,
             )
         except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.error(
                 "Could not resolve task direction for %s: %s",
                 task_id,
@@ -1401,12 +1424,16 @@ class TaskFeature(Feature):
                 recipient_agent_id=actor_agent_id,
             )
         except ValueError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to cancel task {task_id}: {e}", exc_info=True)
             return ToolResult.failed(
                 str(e),
                 data={"task_id": task_id},
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to cancel task {task_id}: {e}", exc_info=True)
             return ToolResult.failed(
                 str(e),

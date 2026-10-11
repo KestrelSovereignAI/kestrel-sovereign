@@ -40,30 +40,39 @@ class ExecutionCommitOutcomeError(ExecutionAuthorityError, TransactionError):
         )
 
 
-def execution_commit_outcome(error: BaseException) -> str | None:
-    """Preserve the commit distinction through legacy storage error wrapping."""
+def _explicit_control_chain(error: BaseException) -> Iterator[BaseException]:
+    """Walk explicit carriers, never implicit cleanup/handling context."""
     seen: set[int] = set()
-    while id(error) not in seen:
-        seen.add(id(error))
-        if isinstance(error, ExecutionCommitOutcomeError):
-            return error.commit_outcome
-        if error.__cause__ is None:
-            return None
-        error = error.__cause__
-    return None
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if isinstance(current, BaseExceptionGroup):
+            # Lifecycle owners explicitly group child cancellation and close
+            # failures. Group members are evidence, unlike incidental context.
+            pending.extend(current.exceptions)
+
+
+def execution_commit_outcome(error: BaseException) -> str | None:
+    """Preserve the strongest commit distinction through explicit carriers."""
+    outcome = None
+    for current in _explicit_control_chain(error):
+        if isinstance(current, ExecutionCommitOutcomeError):
+            if current.commit_outcome == "unknown":
+                return "unknown"
+            outcome = current.commit_outcome
+    return outcome
 
 
 def is_execution_control_error(error: BaseException) -> bool:
     """Authority/commit control evidence must not become a tool error string."""
-    seen: set[int] = set()
-    while id(error) not in seen:
-        seen.add(id(error))
-        if isinstance(error, ExecutionAuthorityError):
-            return True
-        if error.__cause__ is None:
-            return False
-        error = error.__cause__
-    return False
+    return any(isinstance(current, ExecutionAuthorityError)
+               for current in _explicit_control_chain(error))
 
 
 def execution_terminal_error(*errors: BaseException | None) -> BaseException | None:

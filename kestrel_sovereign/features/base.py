@@ -1139,8 +1139,8 @@ class Feature(_SdkFeature):
                 if isinstance(disabled, list):
                     self.disabled_skills = set(disabled)
                 return config
-        except Exception:
-            if raise_on_error:
+        except Exception as error:
+            if is_execution_control_error(error) or raise_on_error:
                 raise
             logger.warning("Failed to load persisted config for %s", self.name)
         return None
@@ -1165,7 +1165,9 @@ class Feature(_SdkFeature):
         if callable(allows):
             try:
                 permitted = bool(allows())
-            except Exception:  # noqa: BLE001 - never let a policy probe block boot
+            except Exception as error:  # noqa: BLE001 - ordinary policy failure denies
+                if is_execution_control_error(error):
+                    raise
                 permitted = False
             if not permitted:
                 logger.debug(
@@ -1184,6 +1186,8 @@ class Feature(_SdkFeature):
             )
             await storage.add_node(node)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to persist config for {self.name}: {e}")
 
     # =========================================================================
@@ -1328,6 +1332,8 @@ class Feature(_SdkFeature):
             return task
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Feature {self.name} task handling failed: {e}")
             task.status = TaskStatus(
                 state=TaskState.FAILED,
