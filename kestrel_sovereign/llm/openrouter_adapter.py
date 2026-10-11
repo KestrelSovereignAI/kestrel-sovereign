@@ -20,6 +20,7 @@ Key features:
 import os
 import logging
 from kestrel_sovereign.execution_custody import (
+    owned_native_http_client,
     owned_execution_stream, retain_native_execution_http_client_close, is_execution_control_error,
 )
 from dataclasses import replace
@@ -334,7 +335,7 @@ class OpenRouterAdapter(OpenAIAdapter):
             return []
 
         try:
-            async with httpx.AsyncClient() as http_client:
+            async with owned_native_http_client(httpx.AsyncClient()) as http_client:
                 retain_native_execution_http_client_close(http_client)
                 response = await http_client.get(
                     f"{self.base_url}/models",
@@ -459,7 +460,7 @@ class OpenRouterAdapter(OpenAIAdapter):
             return []
 
         url = f"{self.base_url}/embeddings/models"
-        async with httpx.AsyncClient() as http_client:
+        async with owned_native_http_client(httpx.AsyncClient()) as http_client:
             retain_native_execution_http_client_close(http_client)
             response = await http_client.get(
                 url,
@@ -523,7 +524,7 @@ class OpenRouterAdapter(OpenAIAdapter):
         """
         if not self.api_key:
             return []
-        async with httpx.AsyncClient() as http_client:
+        async with owned_native_http_client(httpx.AsyncClient()) as http_client:
             retain_native_execution_http_client_close(http_client)
             response = await http_client.get(
                 f"{self.base_url}/models",

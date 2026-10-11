@@ -11,6 +11,7 @@ Adapter for local Ollama instance with support for:
 import json
 import logging
 from kestrel_sovereign.execution_custody import (
+    owned_native_http_client,
     owned_execution_stream, close_native_execution_stream, retain_native_execution_http_client_close,
     is_execution_control_error,
 )
@@ -386,7 +387,7 @@ class OllamaAdapter(LLMAdapter):
 
         url = f"{str(host).rstrip('/')}/api/tags"
         try:
-            async with httpx.AsyncClient(timeout=timeout) as http:
+            async with owned_native_http_client(httpx.AsyncClient(timeout=timeout)) as http:
                 retain_native_execution_http_client_close(http)
                 response = await http.get(url)
             return response.status_code < 500

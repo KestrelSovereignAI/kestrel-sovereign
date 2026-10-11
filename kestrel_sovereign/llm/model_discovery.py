@@ -7,6 +7,7 @@ Provides in-memory caching and disk-based cache for fast startup.
 """
 import asyncio
 from kestrel_sovereign.execution_custody import (
+    owned_native_http_client,
     await_execution_work,
     await_execution_work_group,
     execution_work_operation,
@@ -1776,7 +1777,7 @@ class ModelDiscoveryMixin:
         import httpx
         models_url = f"{base_url.rstrip('/')}/models"
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with owned_native_http_client(httpx.AsyncClient(timeout=5.0)) as client:
                 resp = await client.get(models_url)
                 resp.raise_for_status()
                 data = resp.json()
@@ -1846,7 +1847,7 @@ class ModelDiscoveryMixin:
         import httpx
         models_url = f"{base_url.rstrip('/')}/models"
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with owned_native_http_client(httpx.AsyncClient(timeout=10.0)) as client:
                 resp = await client.get(
                     models_url,
                     headers={"Authorization": f"Bearer {api_key}"},
@@ -1895,7 +1896,7 @@ class ModelDiscoveryMixin:
 
         for endpoint in ["/props", "/slots"]:
             try:
-                async with httpx_module.AsyncClient(timeout=3.0) as client:
+                async with owned_native_http_client(httpx_module.AsyncClient(timeout=3.0)) as client:
                     resp = await client.get(f"{stripped}{endpoint}")
                     if resp.status_code != 200:
                         continue

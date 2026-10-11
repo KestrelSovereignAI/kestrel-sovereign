@@ -95,11 +95,18 @@ before SDK error-body reads or other response observers. Native request hooks
 also reject a revoked copied admission; a shared client does not inherit its
 first caller's tenant scope.
 
+Temporary HTTP clients retain the entire pool/transport close, not only their
+responses. Stop during that retirement cannot replace an original request
+control receipt or leave a native pool close running after its owner returns.
+
 The maintained `google-genai` adapters use the SDK's HTTPX async transport and
 retain its nested stream handles in one request-local owner task. Closing a
 forwarding iterator physically joins the SDK layers and response body, rather
 than leaving cleanup to async-generator finalizers. An explicitly injected
 aiohttp transport is refused because it lacks this pre-body custody contract.
+Automatic Vertex mTLS is also explicitly refused before dispatch rather than
+silently disabling the SDK's certificate/endpoint configuration; deployments
+using certificates must supply an explicit certificate-capable HTTPX client.
 Provider shutdown joins `client.aio.aclose()` as well as synchronous close;
 any transport whose ownership Core made explicit is closed separately. A
 caller-injected HTTPX transport remains borrowed according to the SDK contract.

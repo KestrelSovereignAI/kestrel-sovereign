@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+from kestrel_sovereign.execution_custody import owned_native_http_client
 import json
 import logging
 import os
@@ -694,7 +695,7 @@ class CodexAppServerClient:
         client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
         try:
             import httpx
-            async with httpx.AsyncClient(timeout=20) as client:
+            async with owned_native_http_client(httpx.AsyncClient(timeout=20)) as client:
                 if cancellation_token is not None:
                     cancellation_token.raise_if_cancelled(self._auth_cancelled)
                 # OAuth token endpoints (including OpenAI's) require

@@ -81,6 +81,11 @@ def prepare_genai_client(client):
     if not is_genai_client(client) or getattr(client, "_kestrel_genai_custody", False):
         return
     api = client._api_client
+    if api._use_google_auth_async():
+        raise RuntimeError(
+            "Core google-genai HTTPX custody does not support automatic Vertex mTLS; "
+            "configure an explicit certificate-capable HTTPX transport"
+        )
     http = api._async_httpx_client
     if http is None:
         raise RuntimeError("Core google-genai requires an owned HTTPX async transport")

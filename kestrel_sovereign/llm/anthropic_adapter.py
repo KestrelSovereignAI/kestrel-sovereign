@@ -55,6 +55,7 @@ import asyncio
 import sys
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 from kestrel_sovereign.execution_custody import (
+    owned_native_http_client,
     retain_native_execution_http_client_close,
     is_execution_control_error,
 )
@@ -1977,7 +1978,7 @@ class AnthropicAdapter(LLMAdapter):
                 logger.warning("ANTHROPIC_API_KEY not set, returning empty model list")
                 return []
 
-            async with httpx.AsyncClient() as client:
+            async with owned_native_http_client(httpx.AsyncClient()) as client:
                 retain_native_execution_http_client_close(client)
                 response = await client.get(
                     "https://api.anthropic.com/v1/models",

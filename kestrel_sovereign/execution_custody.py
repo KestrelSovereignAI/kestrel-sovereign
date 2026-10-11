@@ -557,6 +557,32 @@ async def close_native_execution_stream(stream: Any, owner: Any = None) -> None:
         raise execution_terminal_error(original, outcome.error, outcome.cancellation)
 
 
+@asynccontextmanager
+async def owned_native_http_client(client: Any):
+    """Own a temporary client through physical pool/transport retirement.
+
+    HTTPX's context exit is separate from response closure. Retain the whole
+    client close, so interrupted pool cleanup cannot erase a request receipt.
+    """
+    if not isinstance(client, _NativeHTTPXAsyncClient):
+        async with client as entered:
+            yield entered
+        return
+    original = None
+    try:
+        await client.__aenter__()
+        retain_native_execution_http_client_close(client)
+        yield client
+    except BaseException as error:
+        original = error
+    try:
+        await close_native_execution_stream(client)
+    except BaseException as cleanup:
+        original = execution_terminal_error(original, cleanup)
+    if original is not None:
+        raise original
+
+
 def execution_work_operation(function: Callable) -> Callable:
     """Keep finalization and its children inside the original runtime scope."""
     @wraps(function)
