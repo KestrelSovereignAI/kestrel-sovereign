@@ -341,8 +341,14 @@ receipt. Physical retirement is not reconciliation or an acknowledged Stop.
 The earlier durable-admission Future also preserves original control instead
 of publishing retryable NOT_ADMITTED: channel cognition/terminal ingress and
 the isolated producer cannot issue a provider retry or ACK from that error.
-Completed detached ingress retains one strongest receipt through physical
-proxy retirement. Model/embedding preference callbacks do not swallow native
+All four isolated ingress owners (detached, deferred, legacy queue and provider
+ACK/retry completion) harvest the same first owned-task receipt before removing
+their task/client references. One strongest control receipt survives physical
+proxy retirement and denies later ingress/completion; successful provider RPCs
+recheck the original admission before publishing their result. Terminal joins
+harvest completed owners independently of callback scheduling. Ordinary live
+provider failures retain their existing bounded retry behavior.
+Model/embedding preference callbacks do not swallow native
 control, and their completed-task drainer retains one strongest original task
 receipt. Late unbound modality accounting keeps its existing two-second caller
 deadline, but a native COMMIT/ACK failure afterward survives task removal and

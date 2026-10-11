@@ -67,6 +67,7 @@ from kestrel_sdk.isolated_feature import (
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
 
 from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
+from kestrel_sovereign._async_ownership import owned_task_error
 from kestrel_sovereign.execution_custody import (
     bind_execution_custody_snapshot,
     current_execution_custody,
@@ -8687,6 +8688,30 @@ class ProxyFeature(Feature):
         self._has_running_terminal_health_probe_task()
         return True
 
+    def _retain_event_ingress_task_control(self, task: asyncio.Task[Any]) -> None:
+        """Harvest every ingress owner before removal, retaining one receipt.
+
+        Routing, deferred routing, legacy queues and ACK/NACK completion are
+        four producers of the same ownership contract. Cancellation retrieval
+        must use the shared first-receipt cache; a second Task.result() can
+        otherwise erase the original cause. Ordinary provider failures stay
+        best effort and no completed task/client collection is retained here.
+        """
+        if not task.done():
+            return
+        error = owned_task_error(task)
+        if error is not None and is_execution_control_error(error):
+            self._event_ingress_control = execution_terminal_error(
+                vars(self).get("_event_ingress_control"), error,
+            )
+
+    def _require_event_ingress_work(self) -> None:
+        """A retained unknown/denied effect cannot authorize later ingress."""
+        error = vars(self).get("_event_ingress_control")
+        if error is not None:
+            raise error
+        require_execution_work(self.agent)
+
     async def _cancel_terminal_event_ingress_tasks(self) -> bool:
         """Fence inbound, ACK, and deferred-ingress workers before retirement.
 
@@ -8698,15 +8723,18 @@ class ProxyFeature(Feature):
         """
 
         current = asyncio.current_task()
-        tasks = tuple(
+        owned_tasks = tuple(
             task
             for task in (
                 *self._event_ack_tasks,
                 *self._event_ingress_tasks,
                 *self._deferred_acknowledged_event_tasks,
             )
-            if task is not current and not task.done()
+            if task is not current
         )
+        for task in owned_tasks:
+            self._retain_event_ingress_task_control(task)
+        tasks = tuple(task for task in owned_tasks if not task.done())
         for task in tasks:
             task.cancel()
         if not tasks:
@@ -8719,6 +8747,11 @@ class ProxyFeature(Feature):
         except asyncio.TimeoutError:
             self._terminal_cleanup_uncertain = True
             return False
+        finally:
+            # A join can settle before its queued completion callback runs.
+            # Public retirement must not depend on that scheduling order.
+            for task in owned_tasks:
+                self._retain_event_ingress_task_control(task)
         return True
 
     def _has_running_terminal_lifecycle_task(self, client: Any) -> bool:
@@ -14637,12 +14670,7 @@ class ProxyFeature(Feature):
         self._event_ingress_clients.append((source_client, task))
 
         def consume_route(completed: asyncio.Task[None]) -> None:
-            from kestrel_sovereign._async_ownership import owned_task_error
-            error = owned_task_error(completed)
-            if error is not None and is_execution_control_error(error):
-                self._event_ingress_control = execution_terminal_error(
-                    vars(self).get("_event_ingress_control"), error,
-                )
+            self._retain_event_ingress_task_control(completed)
             self._event_ingress_tasks.discard(completed)
             self._event_ingress_clients = [
                 (client, owned_task)
@@ -14699,6 +14727,7 @@ class ProxyFeature(Feature):
                         *,
                         entry: _NonCursorIngressQueue = queue_entry,
                     ) -> None:
+                        self._retain_event_ingress_task_control(completed)
                         self._event_ingress_tasks.discard(completed)
                         self._non_cursor_event_ingress_queues = [
                             candidate
@@ -14706,12 +14735,6 @@ class ProxyFeature(Feature):
                             if candidate.worker is not completed
                         ]
                         entry.retired.set()
-                        if completed.cancelled():
-                            return
-                        try:
-                            completed.result()
-                        except BaseException:  # noqa: BLE001 - worker logs its route errors
-                            return
 
                     task.add_done_callback(consume)
 
@@ -14774,7 +14797,9 @@ class ProxyFeature(Feature):
                 retire_worker = True
             except asyncio.CancelledError:
                 raise
-            except BaseException:  # noqa: BLE001 - legacy provider has no retry path
+            except BaseException as error:  # noqa: BLE001 - legacy provider has no retry path
+                if is_execution_control_error(error):
+                    raise
                 logger.warning(
                     "Detached legacy inbound ingress from isolated feature %s failed",
                     self.name,
@@ -15171,7 +15196,9 @@ class ProxyFeature(Feature):
                 return
             except asyncio.CancelledError:
                 raise
-            except BaseException:  # noqa: BLE001 - producer retains its cursor
+            except BaseException as error:  # noqa: BLE001 - producer retains its cursor
+                if is_execution_control_error(error):
+                    raise
                 logger.warning(
                     "Deferred acknowledged ingress from isolated feature %s failed",
                     self.name,
@@ -15192,13 +15219,8 @@ class ProxyFeature(Feature):
         self._deferred_acknowledged_event_tasks.add(task)
 
         def consume_deferred_event(completed: asyncio.Task[None]) -> None:
+            self._retain_event_ingress_task_control(completed)
             self._deferred_acknowledged_event_tasks.discard(completed)
-            if completed.cancelled():
-                return
-            try:
-                completed.result()
-            except BaseException:  # noqa: BLE001 - failure already logged
-                return
 
         task.add_done_callback(consume_deferred_event)
 
@@ -15293,10 +15315,7 @@ class ProxyFeature(Feature):
                     await asyncio.shield(predecessor)
                 except asyncio.CancelledError as error:
                     if predecessor.done():
-                        try:
-                            predecessor.result()
-                        except BaseException as original:
-                            error = execution_terminal_error(error, original)
+                        error = execution_terminal_error(error, owned_task_error(predecessor))
                     if is_execution_control_error(error):
                         raise error
                     if (
@@ -15319,7 +15338,7 @@ class ProxyFeature(Feature):
             for attempt in range(_EVENT_INGRESS_ACK_ATTEMPTS):
                 if self._terminal_lifecycle_latched or source_client is not self._client:
                     return
-                require_execution_work(self.agent)
+                self._require_event_ingress_work()
                 settled, result = await self._await_event_ingress_ack_attempt(
                     call, request, source_client
                 )
@@ -15357,18 +15376,13 @@ class ProxyFeature(Feature):
         self._event_ack_clients.append((source_client, task))
 
         def consume_acknowledgement(completed: asyncio.Task[None]) -> None:
+            self._retain_event_ingress_task_control(completed)
             self._event_ack_tasks.discard(completed)
             self._event_ack_clients = [
                 (client, owned_task)
                 for client, owned_task in self._event_ack_clients
                 if owned_task is not completed
             ]
-            if completed.cancelled():
-                return
-            try:
-                completed.result()
-            except BaseException:  # noqa: BLE001 - completion already logged
-                return
 
         task.add_done_callback(consume_acknowledgement)
 
@@ -15380,7 +15394,7 @@ class ProxyFeature(Feature):
     ) -> tuple[bool, Any]:
         """Run one ACK with a bounded owned timeout."""
 
-        require_execution_work(self.agent)
+        self._require_event_ingress_work()
         operation = _create_host_owned_facade_task(
             _maybe_await(call(request.name, request.payload)),
             name=f"isolated-event-ingress-ack-rpc:{self.name}",
@@ -15401,7 +15415,7 @@ class ProxyFeature(Feature):
             result = await asyncio.wait_for(
                 operation.shield(), timeout=_EVENT_INGRESS_ACK_TIMEOUT
             )
-            require_execution_work(self.agent)
+            self._require_event_ingress_work()
             return True, result
         except asyncio.TimeoutError as error:
             if is_execution_control_error(error):
@@ -15671,6 +15685,7 @@ class ProxyFeature(Feature):
         )
 
     async def _route_inbound(self, payload: Any) -> Any:
+        self._require_event_ingress_work()
         channel = self._channel_feature()
         terminal_disposition = _telegram_terminal_inbound_disposition.get()
         expected_method = (
