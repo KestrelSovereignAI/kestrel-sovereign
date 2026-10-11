@@ -203,6 +203,9 @@ async def verify_llm_providers_reachable(
                 timeout=timeout,
             )
         except Exception as exc:  # defensive: probes should not crash startup obscurely
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(exc):
+                raise
             ok = False
             result["error"] = str(exc)
 
@@ -307,6 +310,9 @@ async def warn_stale_bootstrap_pending(
         try:
             agent_node = await storage.get_node(getattr(agent, "agent_id", None))
         except Exception as exc:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(exc):
+                raise
             logger.debug("Could not load agent node for bootstrap timeout check: %s", exc)
 
     stale = await bootstrap_service.check_pending_timeout(
