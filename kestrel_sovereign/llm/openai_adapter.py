@@ -719,6 +719,9 @@ class OpenAIAdapter(LLMAdapter):
                 **extra_kwargs
             )
 
+            from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
+            retain_native_execution_stream_close(stream, self)
+
             splitter = _ThinkingContentSplitter(provider=self.name)
             chunk_count = 0
             finish_reason = None
@@ -859,6 +862,9 @@ class OpenAIAdapter(LLMAdapter):
                 acquired_result_cleanup=close_native_execution_stream,
                 **extra_kwargs
             )
+
+            from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
+            retain_native_execution_stream_close(stream, self)
 
             # Accumulator for tool calls - keyed by index
             # Each tool call arrives in chunks with the same index

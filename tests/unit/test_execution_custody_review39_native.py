@@ -204,7 +204,8 @@ async def test_cancellation_harvests_original_native_child_receipt(tmp_path, kin
 
 
 @pytest.mark.asyncio
-async def test_host_care_ack_fans_out_native_delivery_without_cognition_or_upgrade(tmp_path):
+@pytest.mark.parametrize("privacy", ["normal", "ephemeral", "isolated", "anonymous"])
+async def test_host_care_ack_fans_out_native_delivery_without_cognition_or_upgrade(tmp_path, privacy):
     from tests.unit.test_durable_signal_delivery import _channel_dispatcher, _close
     from kestrel_sovereign.features.channels.feature import ChannelFeature
     from kestrel_sovereign.features.isolated_runtime import ProxyFeature
@@ -215,6 +216,8 @@ async def test_host_care_ack_fans_out_native_delivery_without_cognition_or_upgra
         DURABLE_COGNITION_MARKER, DURABLE_COGNITION_MARKER_VALUE,
     )
     backend, agent, dispatcher = await _channel_dispatcher(tmp_path / "care.db", "did:care")
+    from kestrel_sovereign.privacy import get_privacy_preset
+    agent.privacy_config = get_privacy_preset(privacy)
     agent.dispatcher = dispatcher
     channel = ChannelFeature(agent)
     from kestrel_sovereign.features.channels.registry import ChannelRegistry
@@ -243,7 +246,8 @@ async def test_host_care_ack_fans_out_native_delivery_without_cognition_or_upgra
     event = {"channel_type": "telegram", "direction": "inbound", "sender": "555",
         "recipient": "42", "content": "  ok  ", "id": "telegram:v2:bot:42:update:45",
         "metadata": {"dedupe_key": "telegram:v2:bot:42:update:45",
-                     "chat_id": "123", "reply_to_message_id": "777"}}
+                     "chat_id": "123", "reply_to_message_id": "777",
+                     "contact": "alice@example.com"}}
     try:
         for consumer, selector in (
             (DURABLE_TERMINAL_CONSUMER_ID, f"payload.{DURABLE_TERMINAL_MARKER}={DURABLE_TERMINAL_MARKER_VALUE}"),
@@ -269,6 +273,7 @@ async def test_host_care_ack_fans_out_native_delivery_without_cognition_or_upgra
             {**event, "content": "ordinary cognition"},
             {**event, "sender": "999"},
             {**event, "metadata": {**event["metadata"], "reply_to_message_id": "778"}},
+            {**event, "metadata": {**event["metadata"], "contact": "bob@example.com"}},
         ):
             denied = await proxy.admit_hosted_telegram_ingress(tampered)
             assert not denied.durably_admitted

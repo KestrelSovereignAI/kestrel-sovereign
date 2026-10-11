@@ -828,6 +828,9 @@ class SignalDispatcher:
         # cancelled-before-start reservation reconciled) before storage closes.
         self._outcome_log_tasks: set[asyncio.Task] = set()
         self._outcome_log_tasks_by_signal: dict[str, set[asyncio.Task]] = {}
+        # One bounded, strongest receipt survives completion callbacks and
+        # fences this dispatcher until its storage outcome is reconciled.
+        self._outcome_log_control_error: BaseException | None = None
         # Cursor-owned cognition must not write a route-level outcome before
         # its exact durable ACK/NACK decision.  The task-local collector lets
         # the normal routing code continue constructing its audited result
@@ -1148,6 +1151,8 @@ class SignalDispatcher:
         admission_error = None
         try:
             async with self._admit_durable_operation():
+                if self._outcome_log_control_error is not None:
+                    raise self._outcome_log_control_error
                 result = await self._run(
                     signal,
                     start,
@@ -2517,8 +2522,10 @@ class SignalDispatcher:
         try:
             await asyncio.shield(completion)
         except BaseException as error:
+            from kestrel_sovereign._async_ownership import owned_task_error
             debt = tuple(original for _, original in self._retained_cognition_control_debt.values())
-            raise execution_terminal_error(*debt, error)
+            completed_error = owned_task_error(completion) if completion.done() else None
+            raise execution_terminal_error(*debt, self._outcome_log_control_error, completed_error, error)
 
     def _start_durable_shutdown_completion(self) -> asyncio.Task[None]:
         """Close durable admission and return the one owned teardown task.
@@ -2553,9 +2560,8 @@ class SignalDispatcher:
     @staticmethod
     def _observe_durable_shutdown_completion(task: asyncio.Task[None]) -> None:
         """Harvest detached teardown failures without changing retry semantics."""
-        if task.cancelled():
-            return
-        task.exception()
+        from kestrel_sovereign._async_ownership import owned_task_error
+        owned_task_error(task)
 
     async def _complete_durable_shutdown(self) -> None:
         """Reconcile durable state once, leaving failures available for retry."""
@@ -2587,8 +2593,16 @@ class SignalDispatcher:
         # committed reservation task created immediately before its parent
         # completed.
         await self._durable_admissions_drained.wait()
-        await self._drain_outcome_log_tasks()
-        await self._drain_post_commit_reservation_repairs()
+        cleanup_error = None
+        for drain in (self._drain_outcome_log_tasks, self._drain_post_commit_reservation_repairs):
+            try:
+                await drain()
+            except BaseException as error:
+                cleanup_error = execution_terminal_error(cleanup_error, error)
+        if cleanup_error is not None:
+            # Still join every accepted writer/repair, but uncertain storage
+            # control is not permission to publish an ordinary owner release.
+            raise cleanup_error
         retained = await self._wait_for_retained_durable_cognition_cancellation()
         if retained:
             await self._activate_retained_durable_shutdown_fence()
@@ -2726,18 +2740,26 @@ class SignalDispatcher:
         """
         while self._outcome_log_tasks:
             tasks = tuple(self._outcome_log_tasks)
-            await asyncio.gather(
-                *(asyncio.shield(task) for task in tasks),
-                return_exceptions=True,
-            )
+            await self._join_outcome_log_tasks(tasks)
+        if self._outcome_log_control_error is not None:
+            raise self._outcome_log_control_error
 
     async def _drain_outcome_logs_for_signal(self, signal_id: str) -> None:
         """Join this dispatch's outcome writers before returning its result."""
         while tasks := self._outcome_log_tasks_by_signal.get(signal_id):
-            await asyncio.gather(
-                *(asyncio.shield(task) for task in tuple(tasks)),
-                return_exceptions=True,
-            )
+            await self._join_outcome_log_tasks(tuple(tasks))
+        if self._outcome_log_control_error is not None:
+            raise self._outcome_log_control_error
+
+    async def _join_outcome_log_tasks(self, tasks) -> None:
+        from kestrel_sovereign._async_ownership import await_owned_task
+        error = None
+        for task in tasks:
+            outcome = await await_owned_task(task)
+            error = execution_terminal_error(error, outcome.error, outcome.cancellation)
+        error = execution_terminal_error(self._outcome_log_control_error, error)
+        if error is not None:
+            raise error
 
     def shutdown(self) -> None:
         """Compatibility teardown for embeddings that cannot await shutdown.
@@ -2863,18 +2885,11 @@ class SignalDispatcher:
         )
         self._post_commit_reservation_repairs.add(repair_task)
         repair_task.add_done_callback(self._post_commit_reservation_repairs.discard)
-        while not repair_task.done():
-            try:
-                await asyncio.shield(repair_task)
-            except asyncio.CancelledError:
-                # The original failure is retained by the caller.  A repeated
-                # cancellation must not strand a committed reservation.
-                continue
-        # Do not catch a database repair error here.  The caller that is
-        # already preserving a persistence/activation exception records the
-        # cleanup fault explicitly, while normal callers must see the repair
-        # error rather than silently proceeding with an unsafe handoff.
-        repair_task.result()
+        from kestrel_sovereign._async_ownership import await_owned_task
+        outcome = await await_owned_task(repair_task)
+        error = execution_terminal_error(outcome.error, outcome.cancellation)
+        if error is not None:
+            raise error
 
     async def _drain_post_commit_reservation_repairs(self) -> None:
         """Await every dispatcher-owned committed-reservation repair.
@@ -2886,9 +2901,13 @@ class SignalDispatcher:
         """
         while self._post_commit_reservation_repairs:
             repairs = tuple(self._post_commit_reservation_repairs)
-            await asyncio.gather(
-                *(asyncio.shield(repair) for repair in repairs),
-            )
+            from kestrel_sovereign._async_ownership import await_owned_task
+            error = None
+            for repair in repairs:
+                outcome = await await_owned_task(repair)
+                error = execution_terminal_error(error, outcome.error, outcome.cancellation)
+            if error is not None:
+                raise error
 
     def _runtime_owner_cleanup_required(self) -> bool:
         """Keep exact owner protection until retained cognition has joined."""
@@ -3914,7 +3933,12 @@ class SignalDispatcher:
                 )
                 volatile_integrity_binding = (
                     self._volatile_source_integrity_binding(signal, source_event_id)
-                    if durable_projection.payload_elided
+                    if durable_projection.payload_elided or (
+                        signal.source == "channel.message"
+                        and durable_terminal_consumer_id is not None
+                        and (config := resolve_agent_privacy_config(self._agent)) is not None
+                        and config.requires_anonymization()
+                    )
                     else None
                 )
                 # Persisted caller identity is independent of the audit log's
@@ -4020,7 +4044,7 @@ class SignalDispatcher:
                                 durable_projection.signal,
                                 **persistence_kwargs,
                             )
-                        except BaseException:
+                        except BaseException as exc:
                             # The before-commit hook already gave us the
                             # capability set. If cancellation arrives after
                             # commit but before this await returns, use it to
@@ -4044,6 +4068,7 @@ class SignalDispatcher:
                                         "failure: %s",
                                         cleanup_exc,
                                     )
+                                    raise execution_terminal_error(exc, cleanup_exc)
                             raise
                         if persisted.created:
                             try:
@@ -4068,6 +4093,9 @@ class SignalDispatcher:
                                         "failure: %s",
                                         cleanup_exc,
                                     )
+                                    raise execution_terminal_error(exc, cleanup_exc)
+                                if is_execution_control_error(exc):
+                                    raise
                                 if isinstance(exc, Exception):
                                     logger.error(
                                         "Durable signal event %s committed but "
@@ -4095,6 +4123,8 @@ class SignalDispatcher:
                         **persistence_kwargs,
                     )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.exception(
                 "Failed to persist durable signal event %s (source=%s)",
                 signal.id,
@@ -4132,14 +4162,50 @@ class SignalDispatcher:
         # keyed-MAC-verified live envelope.
         recorded_binding = None
         use_verified_live_signal = False
+        verified_terminal_retry = False
         if not persisted.created:
             recorded_binding = await self._durable_store.get_event_integrity(
                 agent_id=self._agent.did, event_id=persisted.event_id
             )
+            integrity_signal = signal
+            if (
+                signal.source == "channel.message"
+                and durable_delivery_consumer_id == DURABLE_COGNITION_CONSUMER_ID
+            ):
+                terminal = await self.get_durable_delivery_for_event(
+                    consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
+                    event_id=persisted.event_id,
+                )
+                if terminal is not None and terminal.status == TERMINAL_ACKABLE:
+                    expected = dict(signal.payload)
+                    expected.pop(DURABLE_COGNITION_MARKER, None)
+                    expected[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
+                    candidate = replace(signal, payload=expected)
+                    if recorded_binding is not None:
+                        # The provider retried the same envelope through the
+                        # normal door. Reassert ONLY the retained terminal
+                        # marker before comparing its original keyed binding.
+                        integrity_signal = candidate
+                        verified_terminal_retry = secrets.compare_digest(
+                            recorded_binding,
+                            self._volatile_source_integrity_binding(candidate, source_event_id),
+                        )
+                    else:
+                        # Legacy non-elided receipts still require their
+                        # privacy-safe persisted projection to match exactly.
+                        projection = self._signal_for_durable_persistence(candidate, registration)
+                        retained = self._signal_from_durable_event(terminal.event, dispatch_signal=signal)
+                        verified_terminal_retry = not projection.payload_elided and projection.signal.payload == candidate.payload and (
+                            retained.source == candidate.source
+                            and retained.target_agent == candidate.target_agent
+                            and retained.kind == candidate.kind
+                            and retained.caller == candidate.caller
+                            and retained.dedupe_key == candidate.dedupe_key
+                            and retained.payload == projection.signal.payload
+                        )
             if recorded_binding is not None:
                 live_integrity_binding = (
-                    volatile_integrity_binding
-                    or self._volatile_source_integrity_binding(signal, source_event_id)
+                    self._volatile_source_integrity_binding(integrity_signal, source_event_id)
                 )
                 if not secrets.compare_digest(recorded_binding, live_integrity_binding):
                     return self._fail(
@@ -4176,7 +4242,7 @@ class SignalDispatcher:
             legacy_signal = self._legacy_channel_cognition_signal(
                 signal, consumer_id=durable_delivery_consumer_id or ""
             )
-            if legacy_signal is not None and source_event_id is not None:
+            if legacy_signal is not None and source_event_id is not None and not verified_terminal_retry:
                 try:
                     upgraded_legacy_delivery = await self._durable_store.upgrade_legacy_delivery_for_redelivery(
                         agent_id=self._agent.did,
@@ -4201,7 +4267,9 @@ class SignalDispatcher:
                             "requiring selected delivery proof: event=%s",
                             persisted.event_id,
                         )
-                except Exception:
+                except Exception as error:
+                    if is_execution_control_error(error):
+                        raise
                     logger.exception(
                         "Could not upgrade legacy durable channel redelivery: event=%s",
                         persisted.event_id,
@@ -4232,6 +4300,7 @@ class SignalDispatcher:
                     durable_projection.payload_elided and persisted.created
                 )
                 or use_verified_live_signal,
+                verified_terminal_retry=verified_terminal_retry,
             )
 
         if durable_terminal_consumer_id is not None:
@@ -4351,6 +4420,7 @@ class SignalDispatcher:
         durable_admission: asyncio.Future[DurableAdmissionResult] | None,
         durable_created: bool,
         use_live_signal: bool,
+        verified_terminal_retry: bool = False,
         claimed_delivery: DurableDelivery | None = None,
         retry_delay: timedelta = timedelta(),
     ) -> SignalResult:
@@ -4416,25 +4486,10 @@ class SignalDispatcher:
                     consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
                     event_id=persisted_event_id,
                 )
-                if terminal is not None and terminal.status == TERMINAL_ACKABLE:
-                    expected = dict(signal.payload)
-                    expected.pop(DURABLE_COGNITION_MARKER, None)
-                    expected[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
-                    retained = self._signal_from_durable_event(
-                        terminal.event, dispatch_signal=signal,
-                    )
-                    if (
-                        retained.source == signal.source
-                        and retained.target_agent == signal.target_agent
-                        and retained.kind == signal.kind
-                        and retained.caller == signal.caller
-                        and retained.dedupe_key == signal.dedupe_key
-                        and retained.payload == expected
-                    ):
-                        # A lost webhook response may redeliver after recovery
-                        # opens. ACK the exact retained terminal receipt; never
-                        # upgrade care-only/malformed content into cognition.
-                        existing = terminal
+                if terminal is not None and terminal.status == TERMINAL_ACKABLE and verified_terminal_retry:
+                    # The persistence boundary already checked this exact
+                    # original terminal envelope, including private-mode MAC.
+                    existing = terminal
             if existing is not None and existing.status in {
                 ACKNOWLEDGED,
                 TERMINAL_ACKABLE,
@@ -5865,6 +5920,17 @@ class SignalDispatcher:
 
         async def await_monitored_execution(execution):
             """Race cognition against source-owned durable withdrawal."""
+            from kestrel_sovereign._async_ownership import await_owned_task
+            import sys
+
+            async def join_sibling(task):
+                outcome = await await_owned_task(task)
+                error = outcome.error
+                # Our withdrawal/cleanup cancellation is expected only when
+                # the worker carries no stronger native control receipt.
+                if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(error):
+                    error = None
+                return execution_terminal_error(error, outcome.cancellation)
 
             async def execute_with_tracking():
                 from kestrel_sovereign.hold import source_owns_hold_disposition
@@ -5961,14 +6027,14 @@ class SignalDispatcher:
                     if withdrawal is not None:
                         if not execution_task.done():
                             execution_task.cancel()
-                        await asyncio.gather(
-                            execution_task,
-                            return_exceptions=True,
-                        )
+                        error = await join_sibling(execution_task)
+                        if error is not None:
+                            raise error
                         return None, str(withdrawal), None
                 result, tracking = await execution_task
                 return result, None, tracking
             finally:
+                error = sys.exc_info()[1]
                 tasks = tuple(
                     task for task in (execution_task, monitor_task)
                     if task is not None
@@ -5978,19 +6044,24 @@ class SignalDispatcher:
                 for task in tasks:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(
-                    *tasks,
-                    return_exceptions=True,
-                )
+                for task in tasks:
+                    error = execution_terminal_error(error, await join_sibling(task))
                 finish_execution = getattr(
                     self._agent,
                     "finish_cognition_signal_execution",
                     None,
                 )
                 if callable(finish_execution):
-                    finished = finish_execution(signal)
-                    if inspect.isawaitable(finished):
-                        await finished
+                    try:
+                        finished = finish_execution(signal)
+                        if inspect.isawaitable(finished):
+                            finished_task = asyncio.ensure_future(finished)
+                            outcome = await await_owned_task(finished_task)
+                            error = execution_terminal_error(error, outcome.error, outcome.cancellation)
+                    except BaseException as finish_error:
+                        error = execution_terminal_error(error, finish_error)
+                if error is not None:
+                    raise error
 
         # Resolve the constitution body for full-injection sources.
         # Codex round-5 P1 fix: the dispatcher UNCONDITIONALLY
@@ -6892,17 +6963,19 @@ class SignalDispatcher:
                 if not signal_tasks:
                     self._outcome_log_tasks_by_signal.pop(signal.id, None)
             self._release_durable_admission(reservation)
-            if task.cancelled():
-                return
-            try:
-                task.result()
-            except Exception:
+            from kestrel_sovereign._async_ownership import owned_task_error
+            error = owned_task_error(task)
+            if error is not None and is_execution_control_error(error):
+                self._outcome_log_control_error = execution_terminal_error(
+                    self._outcome_log_control_error, error,
+                )
+            elif error is not None and not isinstance(error, asyncio.CancelledError):
                 # _log_safe reports storage/UI errors itself.  This is a
                 # defensive harvest for an unexpected task-body failure.
                 logger.error(
                     "Signal outcome-log task failed for %s",
                     signal.id,
-                    exc_info=True,
+                    exc_info=(type(error), error, error.__traceback__),
                 )
 
         task.add_done_callback(_complete)
@@ -6924,32 +6997,10 @@ class SignalDispatcher:
             self._write_outcome_log(signal, registration, result, audit=audit),
             name=f"durable_signal_log_writer:{signal.source}:{signal.id}",
         )
-        cancelled = False
-        while not writer.done():
-            try:
-                await asyncio.shield(writer)
-            except asyncio.CancelledError:
-                # Preserve cancellation for the caller after the accepted
-                # write has reached a terminal outcome.  Repeated
-                # cancellation cannot create a post-close SQLite operation.
-                cancelled = True
-                continue
-            except Exception:
-                # ``asyncio.shield`` re-raises the writer's own failure here.
-                # Without this branch it escaped ``_log_safe`` entirely, so the
-                # handler below never ran: from #2713 (2026-07-24) until now a
-                # dropped signal_log row produced NO log line at all, because
-                # ``_track_background_task`` only discards and shutdown's
-                # ``gather(return_exceptions=True)`` swallows the rest.
-                #
-                # The failure is reported once, from ``writer.result()`` below,
-                # which is also where the loss is counted.  Break rather than
-                # handle it here so there is exactly one reporting path.
-                break
-
-        try:
-            writer.result()
-        except Exception as exc:
+        from kestrel_sovereign._async_ownership import await_owned_task
+        outcome = await await_owned_task(writer)
+        exc = outcome.error
+        if exc is not None:
             # A dropped audit row is a loss, and a loss that leaves no record
             # anyone reads is indistinguishable from no loss at all (#2660):
             # 3,323 of these accumulated in a log file over two months before
@@ -6961,9 +7012,15 @@ class SignalDispatcher:
             # backend that is unavailable. This is an observability signal,
             # not a second audit trail.
             self._record_log_write_failure(signal.id, exc)
-            logger.exception("Failed to write signal_log entry for %s", signal.id)
-        if cancelled:
-            raise asyncio.CancelledError()
+            logger.error("Failed to write signal_log entry for %s", signal.id,
+                         exc_info=(type(exc), exc, exc.__traceback__))
+            if is_execution_control_error(exc):
+                self._outcome_log_control_error = execution_terminal_error(self._outcome_log_control_error, exc)
+                raise execution_terminal_error(exc, outcome.cancellation)
+            if not isinstance(exc, Exception):
+                raise execution_terminal_error(exc, outcome.cancellation)
+        if outcome.cancellation is not None:
+            raise outcome.cancellation
 
     def _record_log_write_failure(
         self, signal_id: str, error: BaseException

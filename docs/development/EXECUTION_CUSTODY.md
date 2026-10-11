@@ -545,6 +545,26 @@ fence the current outstanding wait, reply identity, owner, route and config
 generation through admission. This does not bypass privacy, sender or Hold
 policy, or replace Workflows' signal/deadline CAS.
 
+SDK HTTP responses retain one native close owner before iteration, so an
+implicit SDK/HTTPX EOF close and explicit adapter teardown join the same
+physical resource retirement. A cancelled successful Codex session-lock
+acquisition releases that exact lock before reporting cancellation.
+
+Dispatcher withdrawal joins both monitor and cognition owners before reporting
+validation withdrawal; a worker's original uncertain/committed receipt wins
+over cancellation. Event persistence, activation, reservation repair, legacy
+upgrade and outcome writers preserve original control evidence rather than
+returning retryable failure. Outcome control is retained in one bounded
+dispatcher fence even when the writer completed before shutdown joined it;
+accepted writers and repairs settle before the owner can be released.
+
+Private terminal-only ACK retries bind the original normalized envelope with
+the existing per-agent keyed integrity mechanism. The terminal marker is
+reasserted only after proving the retained terminal consumer row; ANONYMOUS
+retains no extra plaintext, and privacy-elided channels use that verified
+terminal receipt without creating a cognition delivery. Unverifiable legacy
+private content and altered sender/content/correlation metadata fail closed.
+
 See the [canonical storage contract](../architecture/storage/STORAGE_ARCHITECTURE.md#hosted-execution-custody)
 for installation and limitations. Full independent review, repository/CI gates,
 immutable publication/verification and Frinz generation adoption/live acceptance

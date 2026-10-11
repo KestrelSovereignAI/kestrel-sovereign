@@ -1186,6 +1186,17 @@ class ChannelFeature(Feature):
                             )
                         else:
                             terminal_result = await wait_for_terminal()
+                            receipt = await wait_for_durable_admission()
+                            if getattr(receipt, "disposition", None) is DurableAdmissionDisposition.TERMINAL:
+                                # A verified retry can name an existing
+                                # terminal-only ledger row with no cognition
+                                # delivery by design. The dispatcher proved
+                                # its original envelope before this receipt.
+                                durable_admission = getattr(receipt, "acknowledged", False) is True
+                                if durable_admission:
+                                    return InboundAdmission(InboundAdmissionDisposition.DURABLY_ADMITTED)
+                            if getattr(receipt, "disposition", None) is DurableAdmissionDisposition.NOT_ADMITTED:
+                                return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
                             if (
                                 getattr(terminal_result, "status", None)
                                 is Status.COALESCED

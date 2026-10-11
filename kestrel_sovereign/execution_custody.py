@@ -468,10 +468,44 @@ async def await_execution_work(
         return result
 
 
+def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None:
+    """Give SDK-implicit and adapter-explicit HTTP close the SAME native owner.
+
+    HTTPX marks a response closed before awaiting its body retirement. A
+    cancelled first close therefore cannot safely be repaired by calling the
+    original close again. Retain its task before iteration can start it.
+    """
+    import httpx
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    response = getattr(stream, "response", None)
+    if not isinstance(response, httpx.Response):
+        return
+    if "kestrel.native_close_owner" in response.extensions:
+        return
+    native_close = response.aclose
+    captured = current_execution_custody(owner)
+    task = None
+
+    async def joined_close():
+        nonlocal task
+        original = sys.exc_info()[1]
+        if task is None:
+            with bind_execution_cleanup(owner, captured):
+                task = asyncio.create_task(native_close())
+        outcome = await await_owned_task(task)
+        if outcome.error is not None or outcome.cancellation is not None:
+            raise execution_terminal_error(original, outcome.error, outcome.cancellation)
+
+    response.extensions["kestrel.native_close_owner"] = joined_close
+    response.aclose = joined_close
+
+
 async def close_native_execution_stream(stream: Any, owner: Any = None) -> None:
     """Physically join an acquired SDK stream close under cleanup-only custody."""
     from kestrel_sovereign._async_ownership import await_owned_task
 
+    retain_native_execution_stream_close(stream, owner)
     close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
     if not callable(close):
         return  # Legacy in-memory iterators have no native response resource.

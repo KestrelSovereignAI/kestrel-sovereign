@@ -931,6 +931,16 @@ def _env_int(name: str) -> Optional[int]:
         return None
 
 
+async def _acquire_thread_turn_lock(lock: asyncio.Lock, cancel_token: Optional[CancelToken]) -> None:
+    """Retain the exact successful acquisition if Stop wins its handoff."""
+    async def release_abandoned(acquired):
+        if acquired:
+            lock.release()
+    await await_or_cancelled(
+        lock.acquire(), cancel_token, abandoned_result_cleanup=release_abandoned,
+    )
+
+
 class CodexAdapter(LLMAdapter):
     """OpenAI ChatGPT-subscription adapter backed by the codex app-server."""
 
@@ -2796,7 +2806,7 @@ class CodexAdapter(LLMAdapter):
         # (same session_id) must not race on the turn-sink / handler
         # registrations. ``setdefault`` keeps lock identity stable.
         lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
-        await await_or_cancelled(lock.acquire(), cancel_token)
+        await _acquire_thread_turn_lock(lock, cancel_token)
 
         # Defense against concurrent same-session idle-timeout invalidation:
         # while we were queued on this thread lock, another same-session
@@ -2831,7 +2841,7 @@ class CodexAdapter(LLMAdapter):
             )
             turn_input = _build_turn_input(input_messages, fresh_thread=fresh)
             lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
-            await await_or_cancelled(lock.acquire(), cancel_token)
+            await _acquire_thread_turn_lock(lock, cancel_token)
 
         # Per-turn record of every inline-executed tool call. Surfaced
         # on the final LLMResponse so the orchestrator can render

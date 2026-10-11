@@ -84,7 +84,7 @@ def anthropic_model_info(model_data: Any) -> ModelInfo:
 
 
 @asynccontextmanager
-async def _anthropic_stream_with_retry(client, api_params):
+async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
     """Open an Anthropic streaming response, retrying the OPEN on transient
     errors — especially a 429 throttle on the plan/OAuth route.
 
@@ -97,8 +97,12 @@ async def _anthropic_stream_with_retry(client, api_params):
     Mid-stream failures are not retried — partial text has already shipped.
     """
     async def _enter():
+        from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
+
         cm = client.messages.stream(**api_params)
-        return cm, await cm.__aenter__()
+        stream = await cm.__aenter__()
+        retain_native_execution_stream_close(stream)
+        return cm, stream
 
     async def close_acquired(pair):
         from kestrel_sovereign._async_ownership import await_owned_task
@@ -114,7 +118,13 @@ async def _anthropic_stream_with_retry(client, api_params):
         if outcome.error is not None or outcome.cancellation is not None:
             raise execution_terminal_error(original, outcome.error, outcome.cancellation)
 
-    stream_cm, stream = await with_retry(_enter, acquired_result_cleanup=close_acquired)
+    if retry_open:
+        stream_cm, stream = await with_retry(_enter, acquired_result_cleanup=close_acquired)
+    else:
+        from kestrel_sovereign.execution_custody import await_execution_work
+        stream_cm, stream = await await_execution_work(
+            None, _enter, acquired_result_cleanup=close_acquired,
+        )
     try:
         yield stream
     finally:
@@ -143,7 +153,9 @@ async def _anthropic_final_message(client, api_params):
     length of the answer.
     """
     async def _once():
-        async with client.messages.stream(**api_params) as stream:
+        # The outer retry still owns this whole non-incremental request; do
+        # not multiply its retry budget with a second open retry policy.
+        async with _anthropic_stream_with_retry(client, api_params, retry_open=False) as stream:
             async for _event in stream:
                 report_call_progress()
             return await stream.get_final_message()
