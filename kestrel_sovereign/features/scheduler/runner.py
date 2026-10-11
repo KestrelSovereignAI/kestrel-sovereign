@@ -467,11 +467,13 @@ class _SchedulerExecutionScope:
 
     execution: SchedulerExecution
     active: bool = True
+    occurrence_task: Optional[asyncio.Task] = None
 
     def revoke(self) -> None:
         """Make this occurrence unavailable from every copied context."""
 
         self.active = False
+        self.occurrence_task = None
 
 
 @dataclass
@@ -588,6 +590,24 @@ def capture_scheduler_execution_scope() -> Optional[_SchedulerExecutionScope]:
     """
 
     return _current_execution.get()
+
+
+def get_current_scheduler_occurrence_task(
+    *, agent_id: str, task_name: str,
+) -> Optional[asyncio.Task]:
+    """Exact original live task for an inspecting scheduled consumer.
+
+    The existing revocable execution scope crosses awaited dispatch tasks.
+    This identity is only for bookkeeping, never a new execution admission.
+    In particular a restart inspector can ignore its own parent occurrence
+    without hiding another schedule, same-named task or another agent.
+    """
+    execution = get_current_scheduler_execution()
+    if execution is None or execution.agent_id != agent_id or execution.task_name != task_name:
+        return None
+    scope = _current_execution.get()
+    task = scope.occurrence_task
+    return task if task is not None and not task.done() else None
 
 
 @contextlib.contextmanager
@@ -3264,6 +3284,7 @@ class SchedulerRunner:
         )
 
     async def _execute_claim(self, task: ScheduledTask) -> None:
+        occurrence_task = asyncio.current_task()
         if not await self._agent_is_currently_authorized(task.agent_id):
             logger.warning(
                 "Refusing to execute scheduler claim %s for unauthorized agent %s",
@@ -3393,7 +3414,7 @@ class SchedulerRunner:
                         outcome_signal: Optional[float] = None
                         pause_schedule = False
                         ran = True
-                        scope = _SchedulerExecutionScope(execution)
+                        scope = _SchedulerExecutionScope(execution, occurrence_task=occurrence_task)
                         token = _current_execution.set(scope)
                         try:
                             # This is the final effect boundary. Preparation is

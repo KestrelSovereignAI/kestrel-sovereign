@@ -25,7 +25,9 @@ from kestrel_sovereign.storage.async_database import (
     _close_failed_database_initialization,
 )
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-from kestrel_sovereign.storage.db.sqlite import _close_aiosqlite_connection
+from kestrel_sovereign.storage.db.sqlite import (
+    _close_aiosqlite_connection, _owned_script_statements,
+)
 
 
 _HOST_TABLES = frozenset({
@@ -124,8 +126,12 @@ class _ProcessHostBackend(SQLiteBackend):
         return result
 
     async def execute_script(self, script):
-        await super().execute_script(script)
-        self._after_commit()
+        # sqlite3.executescript auto-commits between statements. Use the
+        # canonical owning transaction so retirement before COMMIT rolls back
+        # every host statement rather than publishing a partial script.
+        async with self.transaction():
+            for statement in _owned_script_statements(script):
+                await self.execute(statement)
 
     @asynccontextmanager
     async def transaction(self, *, immediate=False, savepoint=False):

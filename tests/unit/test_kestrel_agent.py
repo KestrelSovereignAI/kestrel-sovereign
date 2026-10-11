@@ -1504,10 +1504,15 @@ class TestLifecycle:
         # a large interval means the loop parks in its first sleep and is
         # torn down purely by HealthFeature.shutdown()'s cancel path.
         health = HealthFeature(agent)
+        health._agent_id = agent.did
         health._interval_seconds = 3600
         health._running = False
         health._background_task = None
+        # This fixture bypasses normal initialize(). Publish the same READY
+        # barrier before asserting shutdown of a genuinely resident loop.
+        agent._runtime_publication_ready.set()
         health._start_background_loop()
+        await asyncio.sleep(0)
         assert health._background_task is not None
         assert not health._background_task.done()
 

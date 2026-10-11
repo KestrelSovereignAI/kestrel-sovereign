@@ -293,6 +293,19 @@ be migrated before runtime admission to avoid a blocking bootstrap index build.
 
 ## Delivery status
 
+Standalone host-key SQLite writes revalidate the original process custody
+after acquiring the actual writer lock and after native statement completion,
+before COMMIT. Host scripts use the existing owning transaction, so retirement
+cannot publish a partial multi-statement script. A successful COMMIT followed
+by loss still preserves committed evidence rather than permitting replay.
+
+Idle-restart inspection ignores only the exact original live occurrence of
+its own scheduled restart coordinator, carried by the existing revocable
+scheduler scope across awaited dispatch tasks. Other schedules, same-named
+tasks and co-hosted work still block. Delivery and health polling residents
+are infrastructure; actual delivery attempts, including their durable receipt,
+are separately tracked ordinary children and remain restart blockers.
+
 Forwarded streams establish their requested session before capturing the
 explicit turn/privacy-reentry carriers. They do not delegate the conversation
 hold: a child wake must queue for a distinct cognition turn. Scheduler cold

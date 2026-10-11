@@ -984,6 +984,7 @@ class SQLiteBackend(DatabaseBackend):
         """
         if self._txn_owner is not None and self._txn_owner is asyncio.current_task():
             self._require_native_transaction()
+            self._require_execution_backend()
             yield
             return
 
@@ -998,6 +999,7 @@ class SQLiteBackend(DatabaseBackend):
                 if self._cancelled_write_drain is not None:
                     continue
                 self._raise_cancelled_write_drain_error()
+                self._require_execution_backend()
                 yield
                 return
 
@@ -1297,6 +1299,7 @@ class SQLiteBackend(DatabaseBackend):
             with self._write_operation():
                 try:
                     cursor = await conn.execute(query, params)
+                    self._require_execution_backend()
                     if not self._in_transaction:
                         await conn.commit()
                     return cursor.rowcount
@@ -1325,6 +1328,7 @@ class SQLiteBackend(DatabaseBackend):
             with self._write_operation():
                 try:
                     cursor = await conn.executemany(query, params_list)
+                    self._require_execution_backend()
                     if not self._in_transaction:
                         await conn.commit()
                     return cursor.rowcount

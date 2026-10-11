@@ -193,6 +193,7 @@ class DeliveryQueue:
         batch_size: int = BATCH_SIZE,
         max_retries: int = DEFAULT_MAX_RETRIES,
         runtime_task_factory=None,
+        delivery_task_factory=None,
     ):
         """
         Args:
@@ -213,6 +214,7 @@ class DeliveryQueue:
         self._batch_size = batch_size
         self._max_retries = max_retries
         self._runtime_task_factory = runtime_task_factory
+        self._delivery_task_factory = delivery_task_factory
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
@@ -1196,7 +1198,15 @@ class DeliveryQueue:
         processed = 0
         for row in rows:
             entry = self._row_to_entry(row)
-            await self._attempt_delivery(entry)
+            if self._delivery_task_factory is None:
+                await self._attempt_delivery(entry)
+            else:
+                # The polling resident is restart infrastructure, but a real
+                # attempt (including its durable receipt) is ordinary work.
+                # Await it so cancellation/shutdown also joins this child.
+                await self._delivery_task_factory(
+                    self._attempt_delivery(entry), name=f"delivery-attempt:{entry.id}",
+                )
             processed += 1
 
         return processed

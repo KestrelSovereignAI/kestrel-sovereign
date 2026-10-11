@@ -37,6 +37,7 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
+from kestrel_sovereign.features.scheduler.runner import get_current_scheduler_occurrence_task
 from kestrel_sovereign.features.storage_access import (
     AgentIdentityUnavailable,
     resolve_feature_database,
@@ -320,10 +321,12 @@ _INFRA_TASK_PREFIXES = (
     "isolated-runtime-telemetry:",
     "wait_fallback_reconcile",
     "durable_signal_owner_heartbeat:",
+    "health-worker:",
 )
 _INFRA_TASK_NAMES = frozenset({
     "resume-monitor", "heartbeat-runtime", "scheduler-supervisor",
     "scheduler-runtime-telemetry",
+    "delivery-queue-worker",
 })
 
 
@@ -2343,6 +2346,9 @@ class RestartCoordinatorFeature(Feature):
         # marker is still excluded only on its owning agent (#1561).
         idle = self._fleet_idle(
             ignore_request_id=getattr(req, "requester_request_id", "") or "",
+            ignore_scheduled_task=get_current_scheduler_occurrence_task(
+                agent_id=getattr(self.agent, "did", ""), task_name="restart_coordinator",
+            ),
         )
         request_age = self._request_age_seconds(req, database_now)
         deferral_age = self._deferral_age_seconds(req, database_now)
@@ -2464,7 +2470,7 @@ class RestartCoordinatorFeature(Feature):
                 return f"{name} ({did})" if did else name
         return did or "?"
 
-    def _fleet_idle(self, ignore_request_id: str = "") -> Dict[str, Any]:
+    def _fleet_idle(self, ignore_request_id: str = "", *, ignore_scheduled_task=None) -> Dict[str, Any]:
         """Idleness across all agents before a whole-host restart (#F235).
 
         The multi-agent host installs ``agent._cohosted_agents_provider`` (a
@@ -2478,7 +2484,9 @@ class RestartCoordinatorFeature(Feature):
         if agents is None:
             # No fleet view — genuine single-agent host. Requester-only check
             # (behaviour-preserving).
-            return self._agent_appears_idle(ignore_request_id=ignore_request_id)
+            return self._agent_appears_idle(
+                ignore_request_id=ignore_request_id, ignore_scheduled_task=ignore_scheduled_task,
+            )
         for other in agents:
             excl = ignore_request_id if other is self.agent else ""
             # Name individual tasks only for OUR agent. This reason is
@@ -2494,6 +2502,7 @@ class RestartCoordinatorFeature(Feature):
                 ignore_request_id=excl,
                 agent=other,
                 name_tasks=(other is self.agent),
+                ignore_scheduled_task=ignore_scheduled_task if other is self.agent else None,
             )
             if not state["idle"]:
                 name = self._fleet_agent_label(other)
@@ -2512,6 +2521,7 @@ class RestartCoordinatorFeature(Feature):
     def _agent_appears_idle(
         self, ignore_request_id: str = "", agent: Any = None,
         name_tasks: bool = True,
+        *, ignore_scheduled_task=None,
     ) -> Dict[str, Any]:
         """Idle check against an agent's in-flight surface.
 
@@ -2662,7 +2672,8 @@ class RestartCoordinatorFeature(Feature):
                 # still counts.
                 alive = [
                     t for t in bg_tasks
-                    if not t.done() and not _is_infra_background_task(t)
+                    if t is not ignore_scheduled_task
+                    and not t.done() and not _is_infra_background_task(t)
                 ]
             except (TypeError, AttributeError):
                 alive = []
