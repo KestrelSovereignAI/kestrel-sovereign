@@ -103,27 +103,32 @@ class _ProcessHostBackend(SQLiteBackend):
                     "row/advisory-bound execution requires a native PostgreSQL host store"
                 )
 
-    def _after_commit(self):
+    def _after_commit(self, scopes):
         try:
             self._require_execution_backend()
+            for scope in scopes:
+                scope.require_work()
         except ExecutionAuthorityError as error:
             # SQLite auto-commit already succeeded; never claim rollback or
             # allow the caller to replay a provisioning write after retirement.
-            for scope in self._host_process_scopes:
+            for scope in scopes:
                 scope.preserve_commit_uncertainty("committed")
             raise ExecutionCommitOutcomeError("committed") from error
 
-    async def execute(self, query, params=()):
-        result = await super().execute(query, params)
-        if not self.owns_open_transaction:
-            self._after_commit()
-        return result
-
-    async def execute_many(self, query, params_list):
-        result = await super().execute_many(query, params_list)
-        if not self.owns_open_transaction:
-            self._after_commit()
-        return result
+    async def _commit_write(self, conn):
+        # Capture EVERY original scope at the native handoff, including the
+        # opener retained after its ContextVar has reset. Cancellation/error
+        # during this await cannot prove rollback: aiosqlite may already have
+        # committed on its worker. Latch before any cancellable cleanup.
+        self._require_execution_backend()
+        scopes = self._host_process_scopes + current_execution_custody()
+        try:
+            await super()._commit_write(conn)
+        except BaseException as error:
+            for scope in scopes:
+                scope.preserve_commit_uncertainty("unknown")
+            raise ExecutionCommitOutcomeError("unknown") from error
+        self._after_commit(scopes)
 
     async def execute_script(self, script):
         # sqlite3.executescript auto-commits between statements. Use the
@@ -135,12 +140,9 @@ class _ProcessHostBackend(SQLiteBackend):
 
     @asynccontextmanager
     async def transaction(self, *, immediate=False, savepoint=False):
-        nested = self.owns_open_transaction
         async with super().transaction(immediate=immediate, savepoint=savepoint):
             yield
             self._require_execution_backend()
-        if not nested:
-            self._after_commit()
 
     async def fetch_one(self, query, params=()):
         result = await super().fetch_one(query, params)

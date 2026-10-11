@@ -29,6 +29,9 @@ from typing import Optional, Literal
 
 import httpx
 
+from kestrel_sovereign.execution_custody import (
+    current_execution_custody, is_execution_control_error, require_execution_work,
+)
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 from kestrel_sovereign.kestrel_config.defaults import get_openrouter_api_base
 
@@ -157,6 +160,8 @@ class OpenRouterProvisioningService:
         Raises:
             OpenRouterProvisioningError: If key creation fails
         """
+        require_execution_work()
+        scopes = current_execution_custody()
         client = await self._get_client()
 
         payload = {
@@ -171,6 +176,12 @@ class OpenRouterProvisioningService:
         base_delay = 2.0
 
         for attempt in range(max_retries + 1):
+            # Client acquisition and each backoff are suspension boundaries.
+            # Validate the SAME original admission immediately before every
+            # irreversible POST, never a replacement runtime or retry scope.
+            require_execution_work()
+            for scope in scopes:
+                scope.require_work()
             try:
                 response = await client.post("/keys", json=payload)
                 response.raise_for_status()
@@ -192,6 +203,8 @@ class OpenRouterProvisioningService:
                 return key_info
 
             except httpx.HTTPStatusError as e:
+                if is_execution_control_error(e):
+                    raise
                 if e.response.status_code == 429 and attempt < max_retries:
                     delay = base_delay * (2 ** attempt)
                     logger.warning(
@@ -204,6 +217,8 @@ class OpenRouterProvisioningService:
                 logger.error(error_msg)
                 raise OpenRouterProvisioningError(error_msg) from e
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 error_msg = f"Unexpected error creating key for agent '{agent_name}': {e}"
                 logger.error(error_msg)
                 raise OpenRouterProvisioningError(error_msg) from e

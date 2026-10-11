@@ -298,6 +298,14 @@ after acquiring the actual writer lock and after native statement completion,
 before COMMIT. Host scripts use the existing owning transaction, so retirement
 cannot publish a partial multi-statement script. A successful COMMIT followed
 by loss still preserves committed evidence rather than permitting replay.
+Every host write form uses one native COMMIT handoff. An interrupted or failed
+acknowledgment preserves `unknown` evidence on every original retained/ambient
+scope before cleanup; a later rollback failure or repeated cancellation cannot
+erase that evidence. Rollback after COMMIT is not proof that the effect vanished.
+Deferred OpenRouter provisioning validates the original admission after client
+acquisition and immediately before each POST, including retries after backoff.
+Cause-carried control errors bypass retry/error normalization; ordinary live
+rate limits retain their existing bounded retry policy.
 
 Idle-restart inspection ignores only the exact original live occurrence of
 its own scheduled restart coordinator, carried by the existing revocable

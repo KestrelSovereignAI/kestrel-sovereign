@@ -26,7 +26,9 @@ from .interface import (
     TransactionError,
 )
 from .write_audit import record_write_query, record_write_script
-from kestrel_sovereign.execution_custody import require_execution_backend
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error, is_execution_control_error, require_execution_backend,
+)
 from .transaction_control import reject_transaction_control, sqlite_statements
 
 logger = logging.getLogger(__name__)
@@ -1280,14 +1282,26 @@ class SQLiteBackend(DatabaseBackend):
         return close_failure
 
     async def _rollback_after_failure(
-        self, conn: aiosqlite.Connection
+        self, conn: aiosqlite.Connection, *, error: BaseException | None = None,
     ) -> None:
         """Rollback inline, handing off if cancellation reaches cleanup."""
         try:
             await conn.rollback()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cleanup_error:
             self._handoff_cancelled_write(conn)
+            terminal = execution_terminal_error(error, cleanup_error)
+            if terminal is not cleanup_error:
+                raise terminal from cleanup_error
             raise
+        except BaseException as cleanup_error:
+            terminal = execution_terminal_error(error, cleanup_error)
+            if terminal is not cleanup_error:
+                raise terminal from cleanup_error
+            raise
+
+    async def _commit_write(self, conn: aiosqlite.Connection) -> None:
+        """The single native COMMIT handoff for writes and owning transactions."""
+        await conn.commit()
 
     async def execute(self, query: str, params: Params = ()) -> int:
         """Execute a write query."""
@@ -1301,7 +1315,7 @@ class SQLiteBackend(DatabaseBackend):
                     cursor = await conn.execute(query, params)
                     self._require_execution_backend()
                     if not self._in_transaction:
-                        await conn.commit()
+                        await self._commit_write(conn)
                     return cursor.rowcount
                 except asyncio.CancelledError:
                     if not self._in_transaction:
@@ -1309,7 +1323,9 @@ class SQLiteBackend(DatabaseBackend):
                     raise
                 except Exception as e:
                     if not self._in_transaction:
-                        await self._rollback_after_failure(conn)
+                        await self._rollback_after_failure(conn, error=e)
+                    if is_execution_control_error(e):
+                        raise
                     raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
                 except BaseException:
                     if not self._in_transaction:
@@ -1330,7 +1346,7 @@ class SQLiteBackend(DatabaseBackend):
                     cursor = await conn.executemany(query, params_list)
                     self._require_execution_backend()
                     if not self._in_transaction:
-                        await conn.commit()
+                        await self._commit_write(conn)
                     return cursor.rowcount
                 except asyncio.CancelledError:
                     if not self._in_transaction:
@@ -1338,7 +1354,9 @@ class SQLiteBackend(DatabaseBackend):
                     raise
                 except Exception as e:
                     if not self._in_transaction:
-                        await self._rollback_after_failure(conn)
+                        await self._rollback_after_failure(conn, error=e)
+                    if is_execution_control_error(e):
+                        raise
                     raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
                 except BaseException:
                     if not self._in_transaction:
@@ -1514,14 +1532,16 @@ class SQLiteBackend(DatabaseBackend):
                     else:
                         await conn.executescript(script)
                     if not self._in_transaction:
-                        await conn.commit()
+                        await self._commit_write(conn)
                 except asyncio.CancelledError:
                     if not self._in_transaction:
                         self._handoff_cancelled_write(conn)
                     raise
                 except Exception as e:
                     if not self._in_transaction:
-                        await self._rollback_after_failure(conn)
+                        await self._rollback_after_failure(conn, error=e)
+                    if is_execution_control_error(e):
+                        raise
                     raise QueryError(f"Script execution failed: {e}") from e
                 except BaseException:
                     if not self._in_transaction:
@@ -1577,12 +1597,14 @@ class SQLiteBackend(DatabaseBackend):
                     await conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
                     yield
                     self._require_native_transaction()
-                    await conn.commit()
+                    await self._commit_write(conn)
                 except asyncio.CancelledError:
                     self._handoff_cancelled_write(conn)
                     raise
                 except Exception as e:
-                    await self._rollback_after_failure(conn)
+                    await self._rollback_after_failure(conn, error=e)
+                    if is_execution_control_error(e):
+                        raise
                     raise TransactionError(f"Transaction failed: {e}") from e
                 except BaseException:
                     await self._rollback_after_failure(conn)
