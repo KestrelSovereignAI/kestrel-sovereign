@@ -4842,7 +4842,7 @@ class SignalDispatcher:
         except asyncio.CancelledError as error:
             error = execution_terminal_error(lease_loss_error, error)
             if is_execution_control_error(error):
-                await self._settle_cognition_control(delivery, error, routing_task)
+                error = await self._settle_cognition_control(delivery, error, routing_task)
                 raise error
             if routing_task is not None:
                 # A caller cancellation is not a durable receipt.  Never join
@@ -4856,7 +4856,7 @@ class SignalDispatcher:
         except BaseException as error:
             error = execution_terminal_error(lease_loss_error, error)
             if is_execution_control_error(error):
-                await self._settle_cognition_control(delivery, error, routing_task)
+                error = await self._settle_cognition_control(delivery, error, routing_task)
             raise error
 
         if result is None:
@@ -5227,6 +5227,7 @@ class SignalDispatcher:
                 from kestrel_sovereign.execution_custody import execution_terminal_error
                 error = execution_terminal_error(error, owned_task_error(routing_task))
             await self._terminalize_failed_cognition(delivery, error)
+        return error
 
     async def _terminalize_failed_cognition(
         self, delivery: DurableDelivery, error: BaseException,
@@ -5473,6 +5474,8 @@ class SignalDispatcher:
             if not await self._agent_is_held():
                 return None
         except HoldStateError as exc:
+            if is_execution_control_error(exc):
+                raise
             result = self._failure_result(
                 signal,
                 start,
@@ -5825,6 +5828,8 @@ class SignalDispatcher:
                 audit=audit,
             )
         except HoldStateError as exc:
+            if is_execution_control_error(exc):
+                raise
             # A final turn-start read can fail after the earlier source
             # snapshot. Durable routing recognizes this typed outage and
             # returns its lease attempt-neutrally below.

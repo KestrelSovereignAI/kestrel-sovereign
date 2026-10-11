@@ -78,16 +78,14 @@ class DatabaseInitializationCleanupError(ConnectionError):
 async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseException | None = None) -> None:
     """Settle the one owned close through repeated cancellation on every exit."""
 
-    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 
-    cleanup = asyncio.create_task(
+    cleanup = create_owned_task(
         db.close(), name="owned-database-retirement"
     )
     outcome = await await_owned_task(cleanup)
     close_exc = outcome.error
     if close_exc is not None:
-        if not isinstance(close_exc, (asyncio.CancelledError, Exception)):
-            raise close_exc
         # Keep the resource-retirement wrapper/owner AND the original control
         # cause. A failed close cannot turn uncertain COMMIT into plain error.
         cause = (

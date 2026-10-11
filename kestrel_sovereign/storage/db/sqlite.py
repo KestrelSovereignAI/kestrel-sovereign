@@ -178,7 +178,7 @@ def _retain_aiosqlite_close(
             # caller below. A cancellation of this reaper must not discard
             # lifecycle ownership while a non-daemon worker is still alive.
             pending_cancellation = exc
-        except Exception:
+        except BaseException:
             # The bounded caller already surfaces the close failure. Reaping
             # owns the remaining worker lifetime, not a second error channel.
             pass
@@ -253,7 +253,8 @@ async def _close_aiosqlite_connection(
     if deadline is None:
         deadline = loop.time() + _minimum_close_timeout_s()
     if close_task is None:
-        close_task = loop.create_task(connection.close())
+        from kestrel_sovereign._async_ownership import create_owned_task
+        close_task = create_owned_task(connection.close())
 
     try:
         await _finish_aiosqlite_connection_close(
@@ -319,11 +320,8 @@ async def _finish_aiosqlite_connection_close(
             raise error from interrupt_error
         raise error
 
-    close_error: Optional[BaseException] = None
-    try:
-        close_task.result()
-    except BaseException as exc:
-        close_error = exc
+    from kestrel_sovereign._async_ownership import owned_task_error
+    close_error = owned_task_error(close_task)
 
     remaining = max(0.0, deadline - loop.time())
     try:
@@ -332,11 +330,11 @@ async def _finish_aiosqlite_connection_close(
                 connection,
                 timeout_s=remaining,
             )
-        except ConnectionError:
+        except ConnectionError as exc:
             _retain_aiosqlite_close(
                 connection, close_task, retained_closes
             )
-            raise
+            raise execution_terminal_error(close_error, pending_cancellation, exc)
     except asyncio.CancelledError as exc:
         pending_cancellation = pending_cancellation or exc
         remaining = max(0.0, deadline - loop.time())
@@ -345,16 +343,15 @@ async def _finish_aiosqlite_connection_close(
                 connection,
                 timeout_s=remaining,
             )
-        except ConnectionError:
+        except ConnectionError as exc:
             _retain_aiosqlite_close(
                 connection, close_task, retained_closes
             )
-            raise
+            raise execution_terminal_error(close_error, pending_cancellation, exc)
 
-    if pending_cancellation is not None:
-        raise pending_cancellation
-    if close_error is not None:
-        raise close_error
+    terminal = execution_terminal_error(close_error, pending_cancellation)
+    if terminal is not None:
+        raise terminal
 
 
 class SQLiteBackend(DatabaseBackend):
@@ -437,7 +434,7 @@ class SQLiteBackend(DatabaseBackend):
         # allowing another writer to commit the abandoned statement (#2907).
         self._cancelled_write_drain: Optional[asyncio.Task[None]] = None
         self._cancelled_write_drain_started_at: Optional[float] = None
-        self._cancelled_write_drain_error: Optional[Exception] = None
+        self._cancelled_write_drain_error: Optional[BaseException] = None
         # A cancelled shared-connection read skips its inline cursor close, so
         # its statement can stay active and keep the drain's interrupt armed.
         # Every drain closes the ones still alive, before it retires its fence
@@ -782,11 +779,19 @@ class SQLiteBackend(DatabaseBackend):
     async def close(self) -> None:
         """Close database connection and wait for background thread to stop."""
         conn = self._connection
+        failure = (
+            self._cancelled_write_drain_error
+            if self._cancelled_write_drain_error is not None
+            and is_execution_control_error(self._cancelled_write_drain_error)
+            else None
+        )
         if conn is None:
             self._raise_if_connection_retirement_pending()
             self._cancelled_write_drain = None
             self._cancelled_write_drain_started_at = None
             self._cancelled_write_drain_error = None
+            if failure is not None:
+                raise failure
             return
 
         pending_cancellation: Optional[asyncio.CancelledError] = None
@@ -830,6 +835,8 @@ class SQLiteBackend(DatabaseBackend):
                         "Could not interrupt SQLite before close",
                         exc_info=True,
                     )
+                except BaseException as error:
+                    failure = execution_terminal_error(failure, error)
             if drain is not None and drain is not asyncio.current_task():
                 try:
                     async with asyncio.timeout(
@@ -858,13 +865,30 @@ class SQLiteBackend(DatabaseBackend):
                             pending_cancellation = (
                                 pending_cancellation or drain_cancelled
                             )
+                        if is_execution_control_error(drain_cancelled):
+                            failure = execution_terminal_error(failure, drain_cancelled)
+                    except BaseException as error:
+                        failure = execution_terminal_error(failure, error)
+                except BaseException as error:
+                    failure = execution_terminal_error(failure, error)
 
-            await _close_aiosqlite_connection(
-                conn,
-                retained_closes=self._retired_connection_closes,
-                deadline=close_deadline,
+            # A grouped drain failure cannot skip the independently owned
+            # native close, or erase its original carrier after the join.
+            failure = execution_terminal_error(
+                failure, self._cancelled_write_drain_error
+                if self._cancelled_write_drain_error is not None
+                and is_execution_control_error(self._cancelled_write_drain_error)
+                else None,
             )
-            self._raise_if_connection_retirement_pending()
+            try:
+                await _close_aiosqlite_connection(
+                    conn,
+                    retained_closes=self._retired_connection_closes,
+                    deadline=close_deadline,
+                )
+                self._raise_if_connection_retirement_pending()
+            except BaseException as error:
+                failure = execution_terminal_error(failure, error)
             logger.debug(f"Closed SQLite connection: {self.db_path}")
         finally:
             self._connection = None
@@ -875,8 +899,9 @@ class SQLiteBackend(DatabaseBackend):
             self._abandoned_read_cursors.clear()
             self._closing = False
 
-        if pending_cancellation is not None:
-            raise pending_cancellation
+        terminal = execution_terminal_error(failure, pending_cancellation)
+        if terminal is not None:
+            raise terminal
     
     def _require_execution_backend(self) -> None:
         require_execution_backend("sqlite", _identity_anchor_access=self._identity_anchor_access)
@@ -1039,6 +1064,8 @@ class SQLiteBackend(DatabaseBackend):
         """Fail closed after a detached rollback could not restore safety."""
         error = self._cancelled_write_drain_error
         if error is not None:
+            if is_execution_control_error(error):
+                raise error
             if isinstance(error, _CancelledWriteDrainDeadlineExceeded):
                 raise ConnectionError(
                     "SQLite write connection is unavailable because cancellation "
@@ -1175,8 +1202,10 @@ class SQLiteBackend(DatabaseBackend):
                     exc_info=True,
                 )
             await self._rollback_cancelled_write(conn, started_at=started_at)
-        except Exception as exc:
-            self._cancelled_write_drain_error = exc
+        except BaseException as exc:
+            self._cancelled_write_drain_error = execution_terminal_error(
+                self._cancelled_write_drain_error, exc,
+            )
             logger.exception(
                 "SQLite cancellation cleanup failed for %s", self.db_path
             )

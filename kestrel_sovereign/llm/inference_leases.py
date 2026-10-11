@@ -476,6 +476,7 @@ class InferenceLeaseCoordinator:
                 capability.satisfies(request) for capability in provider.capabilities()
             ):
                 return None
+            require_execution_work(self._llm_service)
             quote = await provider.quote(request)
             quote.validate_for(request)
             if quote.provider_name != provider.provider_name.strip().lower():

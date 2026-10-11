@@ -33,9 +33,14 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from kestrel_sovereign._async_ownership import create_owned_task, owned_task_error
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    create_owned_task,
+    owned_task_error,
+)
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
+    is_execution_control_error,
     refuse_unfenced_executor,
 )
 from kestrel_sovereign.storage.db.interface import ConnectionError
@@ -239,6 +244,7 @@ class SovereignSqlaSessionFactory:
                 "SQLAlchemy engine disposal failed during lifecycle retirement",
             ),
         )
+        unseen = []
         for owner, error, reported, message in errors:
             if error is None or reported:
                 continue
@@ -246,9 +252,10 @@ class SovereignSqlaSessionFactory:
                 self._session_close_error_reported = True
             else:
                 self._engine_dispose_error_reported = True
-            if isinstance(error, Exception):
-                raise error
-            raise ConnectionError(message) from error
+            unseen.append(error)
+        terminal = execution_terminal_error(*unseen)
+        if terminal is not None:
+            raise terminal
 
     def _track_sqlite_connection(self, dbapi_connection: Any, _record: Any) -> None:
         """Remember one raw aiosqlite connection opened by this engine."""
@@ -357,11 +364,10 @@ class SovereignSqlaSessionFactory:
                 )
                 for session_task in self._session_close_tasks:
                     self._capture_session_close_result(session_task)
-                lifecycle_error = (
-                    self._session_close_error
-                    or self._engine_dispose_error
+                lifecycle_error = execution_terminal_error(
+                    self._session_close_error, self._engine_dispose_error,
                 )
-        except (Exception, asyncio.CancelledError) as exc:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
             # ``AsyncEngine.dispose`` can fail before it visits all of its
             # connections (and deliberately leaves checked-out connections
             # alone).  The per-driver lifecycle tasks above remain independently
@@ -384,8 +390,20 @@ class SovereignSqlaSessionFactory:
         cleanup_error: BaseException | None = None
         try:
             await self._close_live_sqlite_connections(deadline=deadline)
-        except (Exception, asyncio.CancelledError) as exc:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
             cleanup_error = exc
+
+        terminal = execution_terminal_error(
+            lifecycle_error, cleanup_error,
+            self._session_close_error, self._engine_dispose_error,
+        )
+        if (terminal is not None and is_execution_control_error(terminal)
+                and terminal is not cleanup_error):
+            if terminal is self._session_close_error:
+                self._session_close_error_reported = True
+            elif terminal is self._engine_dispose_error:
+                self._engine_dispose_error_reported = True
+            raise terminal
 
         if cleanup_error is not None:
             # Do not erase a disposal failure when worker cleanup also fails.
@@ -412,7 +430,6 @@ class SovereignSqlaSessionFactory:
             return
 
         _prune_retained_aiosqlite_closes(self._retired_sqlite_closes)
-        loop = asyncio.get_running_loop()
         candidates = (
             self._sqlite_connections if connections is None else connections
         )
@@ -434,15 +451,15 @@ class SovereignSqlaSessionFactory:
             ) -> None:
                 try:
                     await asyncio.wait({owned_dispose_task})
-                    owned_dispose_task.result()
-                except (Exception, asyncio.CancelledError):
+                    owned_task_error(owned_dispose_task)
+                except BaseException:
                     # Disposal failure is surfaced by ``close``.  It cannot
                     # transfer ownership of a checked-out/raw driver.
                     pass
                 if _aiosqlite_worker_is_alive(owned_connection):
                     await owned_connection.close()
 
-            raw_close_task = loop.create_task(
+            raw_close_task = create_owned_task(
                 close_after_dispose(),
                 name=f"sqla-aiosqlite-driver-close:{id(connection)}",
             )
@@ -471,14 +488,13 @@ class SovereignSqlaSessionFactory:
         # later workers without retained lifecycle ownership when an outer
         # shutdown guard expired.
         self._begin_sqlite_connection_retirement()
-        loop = asyncio.get_running_loop()
         close_tasks: list[asyncio.Task[None]] = []
         for connection in self._sqlite_connections:
             retained = self._retired_sqlite_closes.get(connection)
             if retained is None:
                 continue
             close_tasks.append(
-                loop.create_task(
+                create_owned_task(
                     _close_aiosqlite_connection(
                         connection,
                         retained_closes=self._retired_sqlite_closes,
@@ -493,47 +509,14 @@ class SovereignSqlaSessionFactory:
         if not close_tasks:
             return
 
-        pending_cancellation: asyncio.CancelledError | None = None
-        try:
-            results = await asyncio.gather(
-                *close_tasks, return_exceptions=True
+        failure = None
+        for task in close_tasks:
+            outcome = await await_owned_task(task)
+            failure = execution_terminal_error(
+                failure, outcome.error, outcome.cancellation,
             )
-        except asyncio.CancelledError as exc:
-            # Preserve the existing cancellation contract: each connection
-            # gets the cancellation signal, then the factory waits within the
-            # shared lifecycle deadline so the helper can either finish or
-            # install retained ownership before cancellation reaches its
-            # caller.
-            pending_cancellation = exc
-            for task in close_tasks:
-                task.cancel()
-            try:
-                results = await asyncio.gather(
-                    *close_tasks, return_exceptions=True
-                )
-            except asyncio.CancelledError:
-                # Repeated caller cancellation may end this wait.  Each close
-                # helper retains any worker that is still alive in its
-                # BaseException guard, so no connection loses ownership.
-                for task in close_tasks:
-                    task.cancel()
-                raise
-
-        if pending_cancellation is not None:
-            raise pending_cancellation
-
-        cleanup_errors = [
-            result for result in results if isinstance(result, BaseException)
-        ]
-
-        if cleanup_errors:
-            primary_error = cleanup_errors[0]
-            for extra_error in cleanup_errors[1:]:
-                primary_error.add_note(
-                    "Additional SQLite SQLAlchemy driver close failure: "
-                    f"{extra_error!r}"
-                )
-            raise primary_error
+        if failure is not None:
+            raise failure
 
 
 # Attribute name used to cache the session factory on the

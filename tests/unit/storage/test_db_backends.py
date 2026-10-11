@@ -12,14 +12,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
+
 import kestrel_sovereign.storage.db.sqlite as sqlite_backend_module
 from kestrel_sovereign.storage.db import (
     ConnectionError,
     QueryError,
     SQLiteBackend,
-    sqlite_to_postgres,
-    postgres_to_sqlite,
     normalize_schema,
+    postgres_to_sqlite,
+    sqlite_to_postgres,
 )
 from tests.utils.aiosqlite_workers import (
     aiosqlite_worker,
@@ -27,7 +28,6 @@ from tests.utils.aiosqlite_workers import (
     wait_for_lifecycle_checkpoint,
     wait_until_aiosqlite_worker_exit_is_delayed,
 )
-
 
 # Bound for awaits that must finish promptly. Generous, so a GC pause on a
 # loaded xdist worker cannot fail a passing test.
@@ -2883,18 +2883,22 @@ class TestAsyncDatabase:
             "block_in_worker", 0, block_in_worker
         )
 
-        real_gather = asyncio.gather
-        gather_calls = 0
+        real_wait = asyncio.wait
+        wait_calls = 0
+        original_cancellation = None
 
-        def cancel_at_initial_gather(*awaitables, **kwargs):
-            nonlocal gather_calls
-            gather_calls += 1
-            gathered = real_gather(*awaitables, **kwargs)
-            if gather_calls == 1:
+        async def cancel_at_initial_wait(*awaitables, **kwargs):
+            nonlocal wait_calls, original_cancellation
+            wait_calls += 1
+            if wait_calls == 1:
                 current = asyncio.current_task()
                 assert current is not None
                 current.cancel()
-            return gathered
+            try:
+                return await real_wait(*awaitables, **kwargs)
+            except asyncio.CancelledError as error:
+                original_cancellation = error
+                raise
 
         async def skip_engine_dispose(_engine, close=True):
             return None
@@ -2914,12 +2918,17 @@ class TestAsyncDatabase:
             with patch.object(
                 type(factory.engine), "dispose", skip_engine_dispose,
             ), patch.object(
-                session_module.asyncio, "gather", new=cancel_at_initial_gather,
+                session_module.asyncio, "wait", new=cancel_at_initial_wait,
             ):
-                with pytest.raises(asyncio.CancelledError):
+                # A blocked native worker cannot be reported as cleanly
+                # cancelled. Its bounded retirement failure remains primary,
+                # with the original caller cancellation retained as cause.
+                with pytest.raises(ConnectionError) as failed_close:
                     await db.dispose_cached_sqla_factory()
 
-            assert gather_calls == 2
+            assert wait_calls >= 2
+            assert original_cancellation is not None
+            assert failed_close.value.__cause__ is original_cancellation
             assert worker.is_alive()
             assert db._sovereign_sqla_factory is None
             assert db._sovereign_sqla_retirement_owner is factory
@@ -3807,7 +3816,10 @@ class TestAsyncDatabase:
     
     @pytest.mark.asyncio
     async def test_context_manager(self, tmp_path):
-        from kestrel_sovereign.storage.async_database import AsyncDatabase, SQLiteBackend
+        from kestrel_sovereign.storage.async_database import (
+            AsyncDatabase,
+            SQLiteBackend,
+        )
         
         db_path = str(tmp_path / "test.db")
         backend = SQLiteBackend(db_path)
