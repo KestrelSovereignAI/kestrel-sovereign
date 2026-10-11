@@ -407,6 +407,10 @@ def test_every_model_call_is_on_an_answer_path_or_declared_not_to_be_one():
 TURN_BOUND = 1.0
 #: The inactivity bound of every case that does not need the short one.
 UNREACHED_BOUND = 60.0
+#: How long a turn may take to end once Stop lands. Stop is polled every
+#: 0.1 s; a turn that waits on its silent provider instead never ends before
+#: the bound.
+STOP_GRACE = 10.0
 #: A model no discovery has described, so the service passes the turn's tools.
 MODEL = "kestrel-gate-local:1b"
 #: The generation under test, in two streamed pieces.
@@ -456,17 +460,14 @@ REPAIRED = ("invoke_repair", "stream_repair")
 MARKUP = '<function_calls><invoke name="state_of_mind"></invoke></function_calls>'
 
 
-def _bound_for(path: str, cause: str) -> float:
+def _bound_for(cause: str) -> float:
     """The inactivity bound a table case runs under.
 
-    ``watchdog`` tests the bound. A Stop on a streamed turn whose provider is
-    silent also ends only when the bound trips: the Ollama adapter does not
-    honour the cancel token, and the streamed turn checks Stop between items
-    (#3572). The streamed fallback case is not silent: it streams its pieces.
+    Only ``watchdog`` tests the bound. A Stop never waits for it: the Ollama
+    adapter abandons a call its cancel token ends, on every path, so a Stop
+    on a provider that has sent nothing ends the turn at once.
     """
     if cause == "watchdog":
-        return TURN_BOUND
-    if cause == "cancel" and path in ("stream_first", "stream_follow_up", "stream_repair"):
         return TURN_BOUND
     return UNREACHED_BOUND
 
@@ -696,8 +697,16 @@ async def _run_turn(agent, path: str, session_id: str) -> Dict[str, Any]:
                 chunks.append(chunk)
         except Exception as exc:  # noqa: BLE001 - the outcome under test
             error = exc
+        except asyncio.CancelledError as exc:
+            # A model call Stop abandoned ends the stream with the cancellation
+            # its adapter raised, which the console door reads as the stopped
+            # end. A cancellation of this task itself is not one.
+            if asyncio.current_task().cancelling():
+                raise
+            error = exc
         return {
             "ok": error is None,
+            "stopped": isinstance(error, asyncio.CancelledError),
             "text": "".join(c for c in chunks if isinstance(c, str)),
             "error": error,
         }
@@ -720,7 +729,7 @@ async def _run_turn(agent, path: str, session_id: str) -> Dict[str, Any]:
 @pytest.mark.parametrize("cause", CAUSES)
 @pytest.mark.parametrize("path", PATHS)
 async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path, cause):
-    monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", _bound_for(path, cause))
+    monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", _bound_for(cause))
     # Retries of a transient provider error are not under test; without them
     # a provider timeout fails its attempt at once.
     from kestrel_sovereign.llm import ollama_adapter
@@ -732,9 +741,14 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
 
     session_id = f"gate-{path}-{cause}"
     async with _booted_agent(tmp_path) as agent:
-        route_a, route_b = _answers(
-            path, cause, stop=lambda: agent.cancel_current_request(),
-        )
+        loop = asyncio.get_running_loop()
+        stopped_at: List[float] = []
+
+        def stop() -> None:
+            stopped_at.append(loop.time())
+            agent.cancel_current_request()
+
+        route_a, route_b = _answers(path, cause, stop=stop)
         daemon_a, daemon_b = _Daemon(route_a), _Daemon(route_b)
         service = agent.llm_service
         providers = [_route(agent, "local", daemon_a)]
@@ -753,10 +767,10 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
                 lambda providers, tools, model_override: None,
             )
 
-        loop = asyncio.get_running_loop()
         started = loop.time()
         seen = await asyncio.wait_for(_run_turn(agent, path, session_id), 30)
-        elapsed = loop.time() - started
+        ended = loop.time()
+        elapsed = ended - started
         rows = await _assistant_rows(agent, session_id)
 
         # The turn released its lock, and no provider held it longer than a
@@ -789,9 +803,16 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
             return
         if cause == "cancel":
             # A Stop ends the turn as stopped rather than as an error: a
-            # stream just ends; the invoke door answers its stop notice.
+            # stream just ends, or ends with the abandoned call's
+            # cancellation; the invoke door answers its stop notice.
             if path.startswith("invoke"):
                 assert seen["text"] == STOPPED, seen
+            else:
+                assert seen["ok"] or seen["stopped"], seen
+            # It ended once Stop landed, not when its provider answered or
+            # the inactivity bound tripped.
+            assert stopped_at, "Stop never landed during the generation"
+            assert ended - stopped_at[0] < STOP_GRACE, ended - stopped_at[0]
         else:
             assert not seen["ok"], seen
         if path == "stream_fallback":

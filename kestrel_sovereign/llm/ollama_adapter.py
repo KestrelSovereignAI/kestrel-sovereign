@@ -39,6 +39,12 @@ from kestrel_sdk.llm.decisions import (
     DecisionTransportError,
     ValidatedDecisionRequest,
 )
+from .cancellation import (
+    CancelToken,
+    anext_or_cancelled,
+    await_or_cancelled,
+    raise_if_cancelled,
+)
 from .decisions.http import post_systemone, systemone_body
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import get_base64_only
@@ -533,11 +539,18 @@ class OllamaAdapter(LLMAdapter):
 
         Returns:
             LLMResponse with content and/or tool calls
+
+        Raises:
+            asyncio.CancelledError: ``cancel_token`` fired before the response
+                arrived (#3572). The pending request was cancelled, which
+                closed its HTTP response, so the daemon stops generating.
         """
         if not OLLAMA_AVAILABLE:
             raise RuntimeError("Ollama is not available in this environment")
 
+        cancel_token: Optional[CancelToken] = kwargs.pop("cancel_token", None)
         try:
+            raise_if_cancelled(cancel_token)
             extra_kwargs = {}
 
             # Handle structured output via Pydantic model
@@ -553,11 +566,16 @@ class OllamaAdapter(LLMAdapter):
 
             extra_kwargs, budget = self._chat_kwargs(extra_kwargs, kwargs, model)
 
-            response = await with_retry(
-                client.chat,
-                model=model,
-                messages=messages,
-                **extra_kwargs
+            # A non-streaming chat reads the whole body before it returns, so
+            # a Stop must not wait for it.
+            response = await await_or_cancelled(
+                with_retry(
+                    client.chat,
+                    model=model,
+                    messages=messages,
+                    **extra_kwargs
+                ),
+                cancel_token,
             )
 
             if isinstance(response, dict):
@@ -685,11 +703,18 @@ class OllamaAdapter(LLMAdapter):
         branch of :meth:`get_streaming_response_with_tools` (which forwards it
         so the service layer can meter streamed turns — #1684). Ollama reports
         ``prompt_eval_count`` / ``eval_count`` on the final (``done``) chunk.
+
+        A fired ``cancel_token`` ends the stream with ``CancelledError`` even
+        while the daemon sends nothing, as it does while it evaluates a long
+        prompt (#3572): the pending read is cancelled, which closes the HTTP
+        response, so the daemon stops generating.
         """
         if not OLLAMA_AVAILABLE:
             raise RuntimeError("Ollama is not available in this environment")
 
+        cancel_token: Optional[CancelToken] = kwargs.pop("cancel_token", None)
         try:
+            raise_if_cancelled(cancel_token)
             logger.info(f"Starting Ollama stream for model: {model}")
 
             extra_kwargs = {}
@@ -702,12 +727,15 @@ class OllamaAdapter(LLMAdapter):
             # a server that ignores ``num_predict`` must not stream without end.
             extra_kwargs, budget = self._chat_kwargs(extra_kwargs, kwargs, model)
 
-            stream = await with_retry(
-                client.chat,
-                model=model,
-                messages=messages,
-                stream=True,
-                **extra_kwargs
+            stream = await await_or_cancelled(
+                with_retry(
+                    client.chat,
+                    model=model,
+                    messages=messages,
+                    stream=True,
+                    **extra_kwargs
+                ),
+                cancel_token,
             )
 
             chunk_count = 0
@@ -719,7 +747,12 @@ class OllamaAdapter(LLMAdapter):
             output_tokens = None
             splitter = ThinkingContentSplitter(provider="ollama")
             try:
-                async for chunk in stream:
+                chunks = stream.__aiter__()
+                while True:
+                    try:
+                        chunk = await anext_or_cancelled(chunks, cancel_token)
+                    except StopAsyncIteration:
+                        break
                     # Usage and the stop reason arrive on the final (done)
                     # chunk; keep the latest.
                     if isinstance(chunk, dict):
