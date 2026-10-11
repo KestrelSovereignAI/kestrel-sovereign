@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import current_execution_custody
 from kestrel_sovereign.llm.lifecycle import drain_unpublished_llm_owners
 from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -15,9 +16,11 @@ from tests.unit.test_execution_custody_review32 import receipt
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["server", "manager"])
-@pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group", "pending", "ordinary"])
+@pytest.mark.parametrize("kind,late_receipt", [
+    (kind, False) for kind in ("unknown", "cancel_unknown", "group", "pending", "ordinary")
+] + [(kind, True) for kind in ("unknown", "cancel_unknown", "group")])
 async def test_actual_failed_constructor_retains_native_provider_cleanup(
-    monkeypatch, tmp_path, surface, kind,
+    monkeypatch, tmp_path, surface, kind, late_receipt,
 ):
     from kestrel_sovereign.llm import service as service_module
     from kestrel_sovereign.multi_agent import agent_manager as manager_module
@@ -29,13 +32,17 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
     entered, release = asyncio.Event(), asyncio.Event()
     scopes, calls = [], []
     failure = receipt(kind)
-    if kind != "pending":
+    if kind != "pending" and not late_receipt:
         release.set()
 
     async def close_adapter():
         # The actual native worker retires before its delayed receipt arrives.
         # Cleanup does not need (and must not mint) ordinary mutation authority.
-        await db.backend._connection.close()
+        # The injected receipt belongs to the physical native close, not to
+        # cancellation of the test's waiter before that close has completed.
+        native = asyncio.create_task(db.backend._connection.close())
+        outcome = await await_owned_task(native)
+        assert outcome.error is None
         calls.append(True)
         entered.set()
         while not release.is_set():
@@ -47,7 +54,10 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
             raise failure
 
     service.providers = [{"adapter": SimpleNamespace(aclose=close_adapter)}]
-    monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 0.01)
+    if kind == "pending" or late_receipt:
+        # Only delayed-receipt cases force a bounded startup handoff. Immediate
+        # receipts use the real production deadline, not a 10ms scheduling bet.
+        monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 0.01)
 
     def provider(**kwargs):
         scopes.extend(current_execution_custody())
@@ -83,7 +93,7 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
         state = manager
         owners_name = "_unpublished_llm_owners"
     try:
-        if kind in {"unknown", "cancel_unknown", "group"}:
+        if kind in {"unknown", "cancel_unknown", "group"} and not late_receipt:
             with pytest.raises(BaseException) as caught:
                 await initialize()
             assert caught.value is failure
@@ -92,7 +102,8 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
                 await initialize()
         else:
             await initialize()
-        assert entered.is_set() and calls == [True]
+        await asyncio.wait_for(entered.wait(), 5)
+        assert calls == [True]
         owners = getattr(state, owners_name, {})
         if kind == "ordinary":
             assert not owners
@@ -109,14 +120,24 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
                 with pytest.raises(Exception, match="retire|cleanup|provider"):
                     await manager._initialize_agent("child", config)
             assert calls == [True]
-            if kind == "pending":
+            if kind == "pending" or late_receipt:
                 drain = asyncio.create_task(drain_unpublished_llm_owners(owners))
                 done, _ = await asyncio.wait({drain}, timeout=0.4)
                 assert not done, "host drain must own the native join itself"
                 assert len(owners) == 1 and calls == [True]
                 release.set()
-                await drain
-                assert not owners and calls == [True]
+                if late_receipt:
+                    with pytest.raises(BaseException) as caught:
+                        await drain
+                    assert caught.value is failure
+                    assert len(owners) == 1 and calls == [True]
+                    with pytest.raises(BaseException) as caught:
+                        await drain_unpublished_llm_owners(owners)
+                    assert caught.value is failure
+                    assert calls == [True]
+                else:
+                    await drain
+                    assert not owners and calls == [True]
             else:
                 with pytest.raises(BaseException) as caught:
                     await drain_unpublished_llm_owners(owners)

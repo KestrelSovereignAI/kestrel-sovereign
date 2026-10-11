@@ -223,48 +223,60 @@ class RemoteBackendMixin:
 
         old_client: openai.AsyncOpenAI | None = None
         activation_error: str | None = None
-        async with self._remote_route_condition:
-            if vars(self).get("_llm_close_control") is not None:
-                activation_error = "native client retirement requires reconciliation"
-            elif self._remote_route_closed:
-                # ``close()`` won the race while this client was being built.
-                # Fall through to the error path so the new client is closed
-                # rather than leaked.
-                activation_error = (
-                    "LLM service is shutting down; the private inference route "
-                    "cannot be activated"
-                )
-            elif self._remote_lease is not None:
-                if not self._remote_accepting:
-                    activation_error = "private inference route is draining; release it first"
-                elif self._remote_lease.lease_id != lease.lease_id:
+        published = False
+        try:
+            async with self._remote_route_condition:
+                if vars(self).get("_llm_close_control") is not None:
+                    activation_error = "native client retirement requires reconciliation"
+                elif self._remote_route_closed:
+                    # ``close()`` won the race while this client was being built.
+                    # Fall through so the new client is closed rather than leaked.
                     activation_error = (
-                        "another inference lease is already active; release it first"
+                        "LLM service is shutting down; the private inference route "
+                        "cannot be activated"
                     )
-                else:
-                    # READY reconciliation can rotate signed URLs or auth
-                    # material. Drain snapshots pinned to the prior client,
-                    # then replace it atomically with the refreshed route.
-                    self._remote_accepting = False
-                    try:
-                        async with asyncio.timeout(HTTP_TIMEOUT_MEDIUM):
-                            while self._remote_inflight:
-                                await self._remote_route_condition.wait()
-                    except TimeoutError:
-                        self._remote_accepting = True
+                elif self._remote_lease is not None:
+                    if not self._remote_accepting:
+                        activation_error = "private inference route is draining; release it first"
+                    elif self._remote_lease.lease_id != lease.lease_id:
                         activation_error = (
-                            "timed out refreshing the active private inference route"
+                            "another inference lease is already active; release it first"
                         )
                     else:
-                        old_client = self._remote_client
-            if activation_error is None:
-                self._remote_lease = lease
-                self._remote_client = client
-                self._remote_capabilities = frozenset(capabilities)
-                self._remote_touch_lease = touch_lease
-                self._remote_accepting = True
-                self._backend = BackendType.REMOTE_GPU
-                self._last_remote_error = None
+                        # READY reconciliation can rotate signed URLs or auth
+                        # material. Drain snapshots pinned to the prior client,
+                        # then replace it atomically with the refreshed route.
+                        self._remote_accepting = False
+                        try:
+                            async with asyncio.timeout(HTTP_TIMEOUT_MEDIUM):
+                                while self._remote_inflight:
+                                    await self._remote_route_condition.wait()
+                        except TimeoutError:
+                            self._remote_accepting = True
+                            activation_error = (
+                                "timed out refreshing the active private inference route"
+                            )
+                        else:
+                            old_client = self._remote_client
+                if activation_error is None:
+                    self._remote_lease = lease
+                    self._remote_client = client
+                    self._remote_capabilities = frozenset(capabilities)
+                    self._remote_touch_lease = touch_lease
+                    self._remote_accepting = True
+                    self._backend = BackendType.REMOTE_GPU
+                    self._last_remote_error = None
+                    published = True
+        except BaseException as activation_failure:
+            # Construction precedes the condition/drain awaits. Cancellation
+            # there must retire the unpublished client through the SAME native
+            # close owner; the pinned old route remains fail-closed and owned.
+            if not published:
+                try:
+                    await self._close_remote_client(client, lease_id=lease.lease_id)
+                except BaseException as close_failure:
+                    raise execution_terminal_error(activation_failure, close_failure)
+            raise
 
         if activation_error is not None:
             await self._close_remote_client(client, lease_id=lease.lease_id)

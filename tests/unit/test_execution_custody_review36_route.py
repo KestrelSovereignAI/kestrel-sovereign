@@ -1,0 +1,91 @@
+"""Private-route cancellation owns the real unpublished SDK client."""
+import asyncio
+from dataclasses import replace
+
+import httpx
+import openai
+import pytest
+from pydantic import SecretStr
+
+from kestrel_sovereign._async_ownership import await_owned_task
+from tests.unit.test_execution_custody_review32 import receipt
+from tests.unit.test_private_inference_routing import _Host, _lease, _touch_current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["none", "unknown", "cancel_unknown", "group"])
+async def test_cancelled_rotation_retires_unpublished_native_client(monkeypatch, kind):
+    host = _Host()
+    entered, release, built = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    clients, closes = [], []
+    sdk_client = openai.AsyncOpenAI
+    failure = None if kind == "none" else receipt(kind)
+
+    async def request(request):
+        entered.set()
+        await release.wait()
+        return httpx.Response(200, json={"id": "offline", "object": "chat.completion",
+            "created": 1, "model": "local", "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": "ok"},
+                 "finish_reason": "stop"}]})
+
+    def construct(**kwargs):
+        http = httpx.AsyncClient(transport=httpx.MockTransport(request))
+        client = sdk_client(http_client=http, **kwargs)
+        index = len(clients)
+        original_close = client.close
+
+        async def close():
+            closes.append(index)
+            await original_close()
+            if index == 1 and failure is not None:
+                raise failure
+
+        monkeypatch.setattr(client, "close", close)
+        clients.append((client, http, original_close))
+        if index == 1:
+            built.set()
+        return client
+
+    monkeypatch.setattr("kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI", construct)
+    lease = _lease()
+    await host.activate_inference_lease(lease, capabilities=("chat",),
+                                        touch_lease=_touch_current(host))
+
+    async def invoke():
+        async with host._remote_route_attempt(force_local_only=False, model_override=None) as route:
+            await route.client.chat.completions.create(
+                model="local", messages=[{"role": "user", "content": "offline"}])
+
+    owner = asyncio.create_task(invoke())
+    rotation = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        rotated = replace(lease, route=replace(
+            lease.route, endpoint=SecretStr("https://rotated.invalid/v1")))
+        rotation = asyncio.create_task(host.activate_inference_lease(
+            rotated, capabilities=("chat",), touch_lease=_touch_current(host)))
+        await asyncio.wait_for(built.wait(), 5)
+        assert not host._remote_accepting and host._remote_inflight == 1
+        rotation.cancel("original rotation caller cancellation")
+        outcome = await await_owned_task(rotation)
+        assert clients[1][1].is_closed, "cancelled activation leaked its unpublished native client"
+        assert closes == [1]
+        assert not clients[0][1].is_closed, "rotation retired the pinned old client early"
+        assert host._remote_client is clients[0][0] and not host._remote_accepting
+        if failure is None:
+            assert isinstance(outcome.error, asyncio.CancelledError)
+        else:
+            assert outcome.error is failure, "activation demoted its original native close receipt"
+            repeated = await await_owned_task(asyncio.create_task(
+                host._close_remote_client(clients[1][0], lease_id=lease.lease_id)))
+            assert repeated.error is failure and closes == [1]
+    finally:
+        release.set()
+        await await_owned_task(owner)
+        if rotation is not None:
+            await await_owned_task(rotation)
+        await await_owned_task(asyncio.create_task(host.deactivate_inference_lease(lease.lease_id)))
+        for client, http, original_close in clients:
+            await original_close()
+            assert http.is_closed
