@@ -681,7 +681,7 @@ class SQLiteBackend(DatabaseBackend):
 
     async def connect(self) -> None:
         """Connect to SQLite database."""
-        require_execution_backend("sqlite")
+        self._require_execution_backend()
         if self.connection_retirement_pending:
             raise ConnectionError(
                 "Cannot reconnect SQLite while a previous connection worker "
@@ -862,9 +862,12 @@ class SQLiteBackend(DatabaseBackend):
         if pending_cancellation is not None:
             raise pending_cancellation
     
+    def _require_execution_backend(self) -> None:
+        require_execution_backend("sqlite")
+
     def _ensure_connected(self) -> aiosqlite.Connection:
         """Ensure we have an active connection."""
-        require_execution_backend("sqlite")
+        self._require_execution_backend()
         if self._connection is None:
             raise ConnectionError("Not connected to database. Call connect() first.")
         return self._connection

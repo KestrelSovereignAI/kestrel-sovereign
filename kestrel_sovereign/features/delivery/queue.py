@@ -192,6 +192,7 @@ class DeliveryQueue:
         poll_interval: int = POLL_INTERVAL_SECONDS,
         batch_size: int = BATCH_SIZE,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        runtime_task_factory=None,
     ):
         """
         Args:
@@ -211,6 +212,7 @@ class DeliveryQueue:
         self._poll_interval = poll_interval
         self._batch_size = batch_size
         self._max_retries = max_retries
+        self._runtime_task_factory = runtime_task_factory
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
@@ -223,7 +225,10 @@ class DeliveryQueue:
         await self._ensure_tables()
         await self._reclaim_in_flight()
         self._running = True
-        self._task = asyncio.create_task(self._loop(), name="delivery-queue-worker")
+        factory = self._runtime_task_factory or asyncio.create_task
+        self._task = factory(
+            self._loop(), name="delivery-queue-worker"
+        )
         logger.info(
             "DeliveryQueue started (poll every %ds, batch %d, max_retries %d)",
             self._poll_interval,

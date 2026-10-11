@@ -841,6 +841,13 @@ async def open_host_db(
 
     if host_db_path is None:
         return None
+    from kestrel_sovereign.execution_custody import current_execution_custody
+
+    if current_execution_custody():
+        from kestrel_sovereign.services.process_host_database import (
+            open_process_host_database,
+        )
+        return await open_process_host_database(str(host_db_path))
     return await AsyncDatabase.sqlite(str(host_db_path))
 
 

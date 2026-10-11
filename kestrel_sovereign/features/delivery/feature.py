@@ -63,6 +63,11 @@ class DeliveryFeature(Feature):
         self._queue = DeliveryQueue(
             db=self._db,
             agent_id=self._agent_id,
+            runtime_task_factory=(
+                self.agent._track_runtime_task
+                if callable(getattr(type(self.agent), "_track_runtime_task", None))
+                else None
+            ),
         )
         await self._queue.start()
         logger.info("DeliveryFeature initialized")

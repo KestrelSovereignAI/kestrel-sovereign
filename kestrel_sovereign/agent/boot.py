@@ -123,12 +123,14 @@ class BootContext:
         self,
         logger_: Optional[logging.Logger] = None,
         custody: Optional[ResourceCustody] = None,
+        before_rollback: Optional[Callable[[], None]] = None,
     ) -> None:
         self.logger = logger_ or logger
         #: The tracker of held resources. An agent passes its own, so what a
         #: rollback could not release stays held for its shutdown.
         self.custody = custody if custody is not None else ResourceCustody()
         self._undo: List[_Undo] = []
+        self._before_rollback = before_rollback
         #: Phases that fully committed, in order (the journal).
         self.committed_phases: List[str] = []
         #: Resources deliberately retained across a failure (audit trail).
@@ -215,6 +217,11 @@ class BootContext:
         still releases every acquired resource before the ``CancelledError``
         propagates out of :func:`run_boot_sequence`.
         """
+        # Failure retires ordinary work before even the first teardown await.
+        # The owner supplies only its local process lifetime; borrowed tenant
+        # generations must not be revoked by this agent-agnostic coordinator.
+        if self._before_rollback is not None:
+            self._before_rollback()
         task = asyncio.ensure_future(self._unwind())
         while True:
             try:

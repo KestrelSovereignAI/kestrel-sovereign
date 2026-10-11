@@ -538,9 +538,14 @@ class HealthFeature(Feature):
     # =========================================================================
 
     def _start_background_loop(self) -> None:
-        """Start the background loop via ``asyncio.create_task()``."""
+        """Publish a resident service under the original runtime generation."""
         self._running = True
-        self._background_task = asyncio.create_task(self._background_loop())
+        if callable(getattr(type(self.agent), "_track_runtime_task", None)):
+            self._background_task = self.agent._track_runtime_task(
+                self._background_loop(), name=f"health-worker:{self._agent_id}"
+            )
+        else:
+            self._background_task = asyncio.create_task(self._background_loop())
         logger.info(
             f"HealthFeature: background loop started "
             f"(interval={self._interval_seconds}s)"

@@ -307,6 +307,9 @@ class ProviderRegistry:
                         info.name,
                     )
             except Exception as e:
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "Failed to finalize OpenRouter route '%s': %s", name, e
                 )
@@ -948,6 +951,9 @@ async def _mint_bootstrap_openrouter_key(
                     )
                     return persisted
             except Exception as e:  # noqa: BLE001 — never block startup on this
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "Could not read persisted bootstrap OpenRouter key "
                     "(%s); will mint a fresh one", e,
@@ -981,6 +987,9 @@ async def _mint_bootstrap_openrouter_key(
                 await HostKeyStorage(host_db).store_key(provider_id, key_info.key)
                 persisted = True
             except Exception as e:  # noqa: BLE001
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "Could not persist bootstrap OpenRouter key (%s); it will "
                     "be re-minted on the next cold start", e,

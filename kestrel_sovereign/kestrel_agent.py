@@ -2048,7 +2048,7 @@ class KestrelAgent(
         from kestrel_sovereign.services.payer_resolver import load_policy_from_toml
         return load_policy_from_toml()
 
-    async def _resolve_host_db(self):
+    async def _resolve_host_db(self, *, required=True):
         """The host-level AsyncDatabase holding HostKeyStorage masters.
 
         Prefers an injected host db (multi-tenant embedding, #1649); otherwise
@@ -2058,8 +2058,38 @@ class KestrelAgent(
         """
         if self._injected_host_db is not None:
             return self._injected_host_db
+        if not required:
+            return None
+        existing = vars(self).get("_resolved_local_host_db")
+        if existing is not None:
+            return existing
         from kestrel_sovereign.services.payer_resolver import open_host_db
-        return await open_host_db(storage_path=self.storage_path)
+        db = await open_host_db(storage_path=self.storage_path)
+        if db is not None:
+            self._resolved_local_host_db = db
+            self._resource_custody().acquire("host_key_database")
+            ctx = vars(self).get("_boot_context")
+            if ctx is not None:
+                ctx.on_rollback("host_key_database", self._close_local_host_db)
+        return db
+
+    async def _close_local_host_db(self):
+        from kestrel_sovereign.storage.async_database import _close_owned_database
+
+        db = vars(self).get("_resolved_local_host_db")
+        if db is not None:
+            await _close_owned_database(db)
+            self._resolved_local_host_db = None
+        return ReleaseOutcome.RELEASED
+
+    async def _payer_host_db(self, spec):
+        from kestrel_sdk.payer_policy import PayerKind
+
+        return await self._resolve_host_db(required=spec.kind in {
+            PayerKind.HOST_MASTER_PROVISIONED,
+            PayerKind.USER_MASTER_PROVISIONED,
+            PayerKind.SPONSOR,
+        })
 
     async def _load_or_promote_soul_resource(
         self, agent_data_dir: Optional[str]
@@ -2135,7 +2165,7 @@ class KestrelAgent(
 
         # Re-resolve with the passphrase
         from kestrel_sovereign.services.payer_resolver import FoundationPayerResolver
-        host_db = await self._resolve_host_db()
+        host_db = await self._payer_host_db(policy.llm)
         resolver = FoundationPayerResolver(
             policy,
             db=self._raw_storage.db if self._raw_storage else None,
@@ -2195,9 +2225,14 @@ class KestrelAgent(
                 "back; construct a fresh agent (or shutdown() this one) before "
                 "retrying — a partial-state retry is refused."
             )
+        from kestrel_sovereign.execution_custody import retire_process_runtime_custody
+
         ctx = BootContext(
             logger_=logging.getLogger(__name__),
             custody=self._resource_custody(),
+            before_rollback=lambda: retire_process_runtime_custody(
+                getattr(self, "_execution_custody", None)
+            ),
         )
         self._boot_context = ctx
 
@@ -2775,7 +2810,9 @@ class KestrelAgent(
             # minting a new one every cold start. Resolve it (injected host
             # db, else the on-disk ``host.db``) so standalone/SQLite
             # deployments — not just multi-tenant embeddings — get the reuse.
-            await finalize_providers(host_db=await self._resolve_host_db())
+            registry = getattr(self.llm_service, "provider_registry", None)
+            needed = bool(getattr(registry, "_deferred_openrouter_routes", ()))
+            await finalize_providers(host_db=await self._resolve_host_db(required=needed))
 
 
     async def _boot_phase_a2a_observability_signals(self, ctx: BootContext) -> None:
@@ -3142,7 +3179,7 @@ class KestrelAgent(
                 # no host_service_keys rows → 'no host master' for delegated
                 # kinds). See #1649.
                 _policy = self._resolve_payer_policy()
-                _host_db = await self._resolve_host_db()
+                _host_db = await self._payer_host_db(_policy.storage)
                 _resolver = FoundationPayerResolver(
                     _policy,
                     db=self._raw_storage.db if self._raw_storage else None,
@@ -3805,7 +3842,7 @@ class KestrelAgent(
             # Injected policy/host-db (multi-tenant embedding) override the
             # standalone kestrel.toml / on-disk host.db. See #1649.
             _llm_policy = self._resolve_payer_policy()
-            _llm_host_db = await self._resolve_host_db()
+            _llm_host_db = await self._payer_host_db(_llm_policy.llm)
             _llm_resolver = FoundationPayerResolver(
                 _llm_policy,
                 db=self._raw_storage.db if self._raw_storage else None,
@@ -8772,6 +8809,7 @@ Expected Duration: {expected_duration}
         has_mcp = bool(self.mcp_agent and hasattr(self.mcp_agent, "shutdown"))
         has_llm = bool(self.llm_service and hasattr(self.llm_service, "close"))
         has_task_mgr = bool(self.task_manager and hasattr(self.task_manager, "close"))
+        has_host_db = vars(self).get("_resolved_local_host_db") is not None
 
         pending_ops = (
             int(has_ephemeral)
@@ -8783,6 +8821,7 @@ Expected Duration: {expected_duration}
             + int(has_mcp)
             + int(has_llm)
             + int(has_task_mgr)
+            + int(has_host_db)
         )
 
         def _step_budget() -> float:
@@ -8985,6 +9024,12 @@ Expected Duration: {expected_duration}
                     self.mcp_agent,
                     self.mcp_agent.shutdown,
                     _step_budget(),
+                )
+
+            if has_host_db:
+                await _release_within(
+                    "host_key_database", "Host key database",
+                    self._close_local_host_db, _step_budget(),
                 )
 
             # Close LLM service async clients

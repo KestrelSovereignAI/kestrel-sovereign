@@ -87,9 +87,26 @@ generation factory. Provider construction validates and binds the original
 custody first, and manager-supplied services reuse native agent usage storage.
 Both AgentManager and the no-manifest single-agent startup branch supply this
 original lifetime before provider construction. Failed single-agent startup
-retires it before awaiting the owned LLM-service close, including cancellation;
+retires it before the real boot coordinator's first rollback await and before
+awaiting the owned LLM-service close, including cancellation;
 SQLite startup remains unbound. Native startup regressions exercise this
 production selection rather than injecting an agent's custody afterward.
+
+Delivery and health workers use the same explicit first-party resident handoff
+as scheduler and peer services: they wait for READY and retain the original
+runtime, not the completed cold-start occurrence. Ordinary task children retain
+every ambient admission.
+
+Provider finalization opens the host-key store only for deferred routes that
+need it; non-master payer policies do not open it unnecessarily. Standalone
+process-only custody can access the existing operator-owned SQLite `host.db`
+through a private host-table accessor retaining the SAME process lifetime.
+Its native SQLite authorizer excludes agent/graph tables, database attachment,
+export and schema replacement; the ordinary SQLite executor remains forbidden.
+Retirement still denies reads/writes, and post-commit loss preserves committed
+evidence. Borrowed row/advisory/occurrence custody cannot use this accessor:
+multi-tenant hosts must inject their native PostgreSQL host database. The agent
+owns and closes a cached local host accessor on boot rollback or shutdown.
 
 The mandatory EPHEMERAL shutdown sweep has a fixed native cleanup entry point
 for that original retired standalone process only. It checks the canonical
