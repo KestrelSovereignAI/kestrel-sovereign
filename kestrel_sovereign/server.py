@@ -172,6 +172,23 @@ SSE_PATHS = {
 STOP_RECEIPT_POSTGRES_POOL_SIZE = 1
 
 
+def _standalone_runtime_execution_custody(name, did, config):
+    """Declare the built-in host's original PG runtime, not its wake claim.
+
+    Tenant hosts (including Frinz) install their own immutable generation
+    factory. The built-in server has process-owned runtimes, not tenant rows.
+    SQLite retains its existing unbound semantics.
+    """
+    if os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower() != "postgres":
+        return None
+    if not os.environ.get("KESTREL_DATABASE_URL"):
+        return None
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCustody, ProcessRuntimeExecutionFence,
+    )
+    return ExecutionCustody(ProcessRuntimeExecutionFence(agent_id=did))
+
+
 def resolve_multi_agent_path(env: dict | os._Environ) -> Path:
     """Compute the multi_agent.toml path the lifespan should load (#868).
 
@@ -3182,6 +3199,7 @@ async def _lifespan_startup(app: FastAPI):
             _apply_platform_host_port(config, os.environ)
             manager = AgentManager(
                 base_data_dir=multi_agent_runtime_base,
+                execution_custody_factory=_standalone_runtime_execution_custody,
                 startup_config_path=(
                     multi_agent_path if multi_agent_path.exists() else None
                 ),

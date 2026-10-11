@@ -25,13 +25,22 @@ ADVANCED MODE:
 import asyncio
 import contextvars
 import logging
-from collections.abc import Sequence as SequenceABC
+from collections.abc import Callable, Sequence as SequenceABC
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
 from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    ExecutionCustody,
+    ExecutionCommitOutcomeError,
+    execution_commit_outcome,
+    current_execution_custody,
+    lock_execution_authority,
+    require_execution_backend,
+)
 
 from .interface import (
     ConnectionError,
@@ -61,12 +70,89 @@ _ADVISORY_LOCK_POLL_INTERVAL_S = 0.05
 
 
 @dataclass
+class _ExecutionCommitState:
+    outcome: str | None = None
+    scopes: tuple[ExecutionCustody, ...] = ()
+
+    def remember(self, scopes: tuple[ExecutionCustody, ...]) -> None:
+        # A shared checkout can begin unbound and participate in several
+        # admitted operations. Retain each admission until physical release.
+        self.scopes += tuple(scope for scope in scopes if scope not in self.scopes)
+
+
+@dataclass
 class _OperationalSessionLease:
     """One pool connection shared only by a context and its owned children."""
 
     connection: Any
     lock: asyncio.Lock
     active: bool = True
+    commit_state: _ExecutionCommitState = field(default_factory=_ExecutionCommitState)
+
+
+class AdvisoryLease:
+    """Exact physical-session capability, never revived by reconnection.
+
+    Listeners are registered during acquisition, not by the body after entry.
+    PostgreSQL/asyncpg can queue a loss notification; retirement is monotonic
+    and a queued callback cannot turn normal completed retirement into loss.
+    The consumer must settle its owned work before leaving the lease context.
+    """
+
+    def __init__(
+        self, connection: Any,
+        on_loss: Callable[["AdvisoryLease"], None] | None,
+    ) -> None:
+        self.backend_pid: int = connection.get_server_pid()
+        self._connection = connection
+        self._on_loss = on_loss
+        self._state = "acquiring"
+
+    @property
+    def lost(self) -> bool:
+        return self._state == "lost"
+
+    def _connection_terminated(self, _connection: Any) -> None:
+        if self._state in ("acquiring", "held"):
+            self._state = "lost"
+            if self._on_loss is not None:
+                self._on_loss(self)
+
+    def require_live(self) -> None:
+        if self._state in ("acquiring", "held"):
+            try:
+                closed = self._connection.is_closed()
+            except asyncpg.InterfaceError:
+                # asyncpg detaches a dead physical session's public pool proxy
+                # before its queued termination listener necessarily runs.
+                closed = True
+            if closed:
+                self._connection_terminated(self._connection)
+        if self._state not in ("acquiring", "held"):
+            raise ExecutionAuthorityError(
+                f"PostgreSQL advisory authority session {self.backend_pid} "
+                f"is {self._state}"
+            )
+
+    def _admit(self) -> None:
+        self.require_live()
+        self._state = "held"
+
+    def _retire(self) -> None:
+        if self._state != "lost":
+            self._state = "retired"
+
+    def _remove_listener(self) -> bool:
+        """False means asyncpg already detached this dead session's proxy."""
+
+        try:
+            self._connection.remove_termination_listener(self._connection_terminated)
+        except asyncpg.InterfaceError:
+            # Physical session death clears its listeners and releases its
+            # pool holder. There is no live session to unlock/terminate, and
+            # probing that invalid proxy must not mask the original loss.
+            return False
+        return True
 
 
 def is_concurrent_update_error(exc: BaseException) -> bool:
@@ -133,6 +219,7 @@ class PostgresBackend(DatabaseBackend):
         min_pool_size: int = 2,
         max_pool_size: int = 10,
         advisory_max_pool_size: Optional[int] = None,
+        execution_custody: ExecutionCustody | None = None,
     ):
         """
         Initialize PostgreSQL backend.
@@ -158,6 +245,7 @@ class PostgresBackend(DatabaseBackend):
             )
         
         self._dsn = dsn
+        self._execution_custody = execution_custody
         self._host = host
         self._port = port
         self._database = database
@@ -218,6 +306,7 @@ class PostgresBackend(DatabaseBackend):
         advisory_connect_kwargs: Optional[dict[str, Any]] = None,
         advisory_backend: Optional["PostgresBackend"] = None,
         advisory_max_pool_size: Optional[int] = None,
+        execution_custody: ExecutionCustody | None = None,
     ) -> "PostgresBackend":
         """
         Create a PostgresBackend from an existing asyncpg pool.
@@ -271,6 +360,7 @@ class PostgresBackend(DatabaseBackend):
         # (for example SQLAlchemy session factories). The scheduler-only
         # dedicated advisory pool has its own explicit connection source.
         instance._dsn = None
+        instance._execution_custody = execution_custody
         instance._host = None
         instance._port = 5432
         instance._database = None
@@ -413,6 +503,43 @@ class PostgresBackend(DatabaseBackend):
             return conn
         return None
 
+    def _transaction_custody_context(self) -> contextvars.ContextVar:
+        """Per-backend, owner-task ledger of every admission touching a commit."""
+
+        var = getattr(self, "_txn_custody_var", None)
+        if not isinstance(var, contextvars.ContextVar):
+            var = contextvars.ContextVar("pg_transaction_execution_custody", default=None)
+            self._txn_custody_var = var
+        return var
+
+    def _transaction_custody(self) -> list[ExecutionCustody] | None:
+        entry = self._transaction_custody_context().get()
+        if entry is None or entry[0] is not asyncio.current_task():
+            return None
+        return entry[1]
+
+    def _remember_transaction_custody(self) -> tuple[ExecutionCustody, ...]:
+        current = current_execution_custody(self)
+        retained = self._transaction_custody()
+        if retained is None:
+            return current
+        if any(scope not in retained for scope in current):
+            # Authority must precede every graph/file lock. Adding an
+            # admission after the transaction began would invert that order
+            # and could both deadlock and erase a revoked child at commit.
+            raise ExecutionAuthorityError(
+                "execution admissions cannot be added inside an open transaction"
+            )
+        return tuple(retained)
+
+    async def _lock_transaction_custody(self, connection: Any) -> None:
+        await lock_execution_authority(
+            connection, "postgres", self._remember_transaction_custody(),
+        )
+
+    def _require_transaction_custody(self) -> None:
+        require_execution_backend("postgres", self._remember_transaction_custody())
+
     def _current_operational_lease(self) -> Optional[_OperationalSessionLease]:
         """Return the live operational lease inherited by this task, if any."""
 
@@ -468,6 +595,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def connect(self) -> None:
         """Connect to PostgreSQL and create connection pool."""
+        require_execution_backend("postgres", current_execution_custody(self))
         if self._pool is not None:
             return
         
@@ -559,6 +687,7 @@ class PostgresBackend(DatabaseBackend):
     
     def _ensure_connected(self) -> asyncpg.Pool:
         """Ensure we have an active pool."""
+        require_execution_backend("postgres", current_execution_custody(self))
         if self._pool is None:
             raise ConnectionError("Not connected to database. Call connect() first.")
         return self._pool
@@ -612,10 +741,105 @@ class PostgresBackend(DatabaseBackend):
     
     def _convert_query(self, query: str) -> str:
         """Convert SQLite-style ? placeholders to PostgreSQL $N style."""
-        if self._current_txn_conn() is not None:
+        if self._current_txn_conn() is not None or current_execution_custody(self):
             reject_transaction_control(query, dialect="postgres")
         converted, _ = sqlite_to_postgres(query)
         return converted
+
+    @asynccontextmanager
+    async def _execution_query_executor(self, executor: Any, commit_state: _ExecutionCommitState | None = None) -> AsyncIterator[Any]:
+        """Fence every native SQL surface on its own transaction/session.
+
+        Unfenced callers retain their normal autocommit path. A fenced read is
+        guarded too: SELECT can invoke mutating functions, and stale reads can
+        disclose old-owner data. Never classify authority from a SQL verb.
+        """
+
+        scopes = self._remember_transaction_custody()
+        if not scopes:
+            yield executor
+            return
+        require_execution_backend("postgres", scopes)
+        if self._current_txn_conn() is not None:
+            await lock_execution_authority(executor, "postgres", scopes)
+            yield executor
+            self._require_transaction_custody()
+            return
+        if executor is self._pool:
+            async with self._authority_pool_checkout(executor) as (connection, state):
+                async with self._execution_query_executor(connection, state) as checked:
+                    yield checked
+            return
+        operational = self._current_operational_lease()
+        if commit_state is None and operational is not None and executor is operational.connection:
+            commit_state = operational.commit_state
+        async with self._authority_transaction(executor, scopes, commit_state):
+            yield executor
+
+    @asynccontextmanager
+    async def _authority_pool_checkout(self, pool: Any) -> AsyncIterator[tuple[Any, _ExecutionCommitState]]:
+        # asyncpg release/reset is awaited after COMMIT. Carry the exact commit
+        # state through that await so a release failure cannot imply rollback.
+        state = _ExecutionCommitState()
+        state.remember(current_execution_custody(self))
+        try:
+            async with pool.acquire() as connection:
+                yield connection, state
+        except BaseException as exc:
+            outcome = execution_commit_outcome(exc) or state.outcome
+            if outcome is not None:
+                for scope in state.scopes:
+                    scope.preserve_commit_uncertainty(outcome)
+                if execution_commit_outcome(exc) is None:
+                    raise ExecutionCommitOutcomeError(outcome) from exc
+            raise
+        # Release/reset is an awaited part of the operation, not an
+        # authority-free epilogue. Never publish a stale read/RETURNING value
+        # or imply rollback when revocation raced a successful COMMIT/reset.
+        if state.outcome is not None:
+            self._require_after_authority_commit(state.scopes)
+        else:
+            require_execution_backend("postgres", state.scopes)
+
+    @asynccontextmanager
+    async def _authority_transaction(
+        self, connection: Any, scopes: tuple[ExecutionCustody, ...],
+        commit_state: _ExecutionCommitState | None = None,
+    ) -> AsyncIterator[None]:
+        # A failure in the body rolls back. Once the body/precommit checks
+        # finish, a failed commit acknowledgement must instead be reconciled.
+        if commit_state is not None:
+            commit_state.remember(scopes)
+        committing = False
+        try:
+            async with connection.transaction():
+                await lock_execution_authority(connection, "postgres", scopes)
+                yield
+                require_execution_backend("postgres", scopes)
+                self._require_transaction_custody()
+                committing = True
+                if commit_state is not None:
+                    commit_state.outcome = "unknown"
+        except BaseException as exc:
+            if committing:
+                for scope in scopes:
+                    scope.preserve_commit_uncertainty("unknown")
+                raise ExecutionCommitOutcomeError("unknown") from exc
+            raise
+        if commit_state is not None:
+            commit_state.outcome = "committed"
+        self._require_after_authority_commit(scopes)
+
+    @staticmethod
+    def _require_after_authority_commit(scopes: tuple[ExecutionCustody, ...]) -> None:
+        # Commit has completed. If loss raced its acknowledgement, denial here
+        # does not mean rollback; callers must reconcile their idempotent write.
+        try:
+            require_execution_backend("postgres", scopes)
+        except ExecutionAuthorityError as exc:
+            for scope in scopes:
+                scope.preserve_commit_uncertainty("committed")
+            raise ExecutionCommitOutcomeError("committed") from exc
 
     @staticmethod
     def _strip_tz(params: Params) -> Tuple[Any, ...]:
@@ -653,13 +877,12 @@ class PostgresBackend(DatabaseBackend):
             try:
                 txn = self._current_txn_conn()
                 if txn is not None:
-                    result = await txn.execute(pg_query, *params)
+                    async with self._execution_query_executor(txn) as checked:
+                        result = await checked.execute(pg_query, *params)
                 else:
                     async with self._operational_query_connection() as conn:
-                        if conn is None:
-                            result = await pool.execute(pg_query, *params)
-                        else:
-                            result = await conn.execute(pg_query, *params)
+                        async with self._execution_query_executor(conn or pool) as checked:
+                            result = await checked.execute(pg_query, *params)
 
                 # Parse affected rows from result (e.g., "INSERT 0 1" or "UPDATE 5")
                 if result:
@@ -694,14 +917,17 @@ class PostgresBackend(DatabaseBackend):
         try:
             txn = self._current_txn_conn()
             if txn is not None:
-                await txn.executemany(pg_query, params_list)
+                async with self._execution_query_executor(txn) as checked:
+                    await checked.executemany(pg_query, params_list)
             else:
                 async with self._operational_query_connection() as conn:
                     if conn is not None:
-                        await conn.executemany(pg_query, params_list)
+                        async with self._execution_query_executor(conn) as checked:
+                            await checked.executemany(pg_query, params_list)
                     else:
-                        async with pool.acquire() as acquired:
-                            await acquired.executemany(pg_query, params_list)
+                        async with self._authority_pool_checkout(pool) as (acquired, state):
+                            async with self._execution_query_executor(acquired, state) as checked:
+                                await checked.executemany(pg_query, params_list)
             return len(params_list)  # asyncpg doesn't return affected count
             
         except Exception as e:
@@ -717,13 +943,12 @@ class PostgresBackend(DatabaseBackend):
         try:
             txn = self._current_txn_conn()
             if txn is not None:
-                row = await txn.fetchrow(pg_query, *params)
+                async with self._execution_query_executor(txn) as checked:
+                    row = await checked.fetchrow(pg_query, *params)
             else:
                 async with self._operational_query_connection() as conn:
-                    if conn is None:
-                        row = await pool.fetchrow(pg_query, *params)
-                    else:
-                        row = await conn.fetchrow(pg_query, *params)
+                    async with self._execution_query_executor(conn or pool) as checked:
+                        row = await checked.fetchrow(pg_query, *params)
             
             if row is None:
                 return None
@@ -742,13 +967,12 @@ class PostgresBackend(DatabaseBackend):
         try:
             txn = self._current_txn_conn()
             if txn is not None:
-                rows = await txn.fetch(pg_query, *params)
+                async with self._execution_query_executor(txn) as checked:
+                    rows = await checked.fetch(pg_query, *params)
             else:
                 async with self._operational_query_connection() as conn:
-                    if conn is None:
-                        rows = await pool.fetch(pg_query, *params)
-                    else:
-                        rows = await conn.fetch(pg_query, *params)
+                    async with self._execution_query_executor(conn or pool) as checked:
+                        rows = await checked.fetch(pg_query, *params)
             
             return [tuple(row.values()) for row in rows]
             
@@ -765,18 +989,18 @@ class PostgresBackend(DatabaseBackend):
         try:
             txn = self._current_txn_conn()
             if txn is not None:
-                return await txn.fetchval(pg_query, *params)
+                async with self._execution_query_executor(txn) as checked:
+                    return await checked.fetchval(pg_query, *params)
             async with self._operational_query_connection() as conn:
-                if conn is None:
-                    return await pool.fetchval(pg_query, *params)
-                return await conn.fetchval(pg_query, *params)
+                async with self._execution_query_executor(conn or pool) as checked:
+                    return await checked.fetchval(pg_query, *params)
             
         except Exception as e:
             raise QueryError(f"Query failed: {e}\nQuery: {pg_query}") from e
     
     async def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script."""
-        if self._current_txn_conn() is not None:
+        if self._current_txn_conn() is not None or current_execution_custody(self):
             reject_transaction_control(script, dialect="postgres")
         record_write_script(script)
         pool = self._ensure_connected()
@@ -784,14 +1008,17 @@ class PostgresBackend(DatabaseBackend):
         try:
             txn = self._current_txn_conn()
             if txn is not None:
-                await txn.execute(script)
+                async with self._execution_query_executor(txn) as checked:
+                    await checked.execute(script)
             else:
                 async with self._operational_query_connection() as conn:
                     if conn is not None:
-                        await conn.execute(script)
+                        async with self._execution_query_executor(conn) as checked:
+                            await checked.execute(script)
                     else:
-                        async with pool.acquire() as acquired:
-                            await acquired.execute(script)
+                        async with self._authority_pool_checkout(pool) as (acquired, state):
+                            async with self._execution_query_executor(acquired, state) as checked:
+                                await checked.execute(script)
                     
         except Exception as e:
             raise QueryError(f"Script execution failed: {e}") from e
@@ -864,12 +1091,12 @@ class PostgresBackend(DatabaseBackend):
             return
 
         pool = self._ensure_connected()
-        async with pool.acquire() as conn:
+        async with self._authority_pool_checkout(pool) as (conn, commit_state):
             await self._verify_operational_cluster_identity(
                 conn,
                 expected_cluster_identity,
             )
-            lease = _OperationalSessionLease(conn, asyncio.Lock())
+            lease = _OperationalSessionLease(conn, asyncio.Lock(), commit_state=commit_state)
             token = self._operational_conn_var.set(lease)
             try:
                 yield
@@ -894,7 +1121,9 @@ class PostgresBackend(DatabaseBackend):
         if existing is not None:
             # Nested transaction (same task) - use savepoint on this task's conn.
             async with existing.transaction():
+                await self._lock_transaction_custody(existing)
                 yield
+                self._require_transaction_custody()
             return
 
         operational = self._current_operational_lease()
@@ -904,23 +1133,35 @@ class PostgresBackend(DatabaseBackend):
                     token = self._txn_conn_var.set(
                         (asyncio.current_task(), operational.connection)
                     )
+                    scopes = list(current_execution_custody(self))
+                    custody_var = self._transaction_custody_context()
+                    custody_token = custody_var.set((asyncio.current_task(), scopes))
                     try:
-                        async with operational.connection.transaction():
+                        async with self._authority_transaction(operational.connection, tuple(scopes), operational.commit_state):
                             yield
+                    except ExecutionCommitOutcomeError:
+                        raise
                     except Exception as e:
                         raise TransactionError(f"Transaction failed: {e}") from e
                     finally:
+                        custody_var.reset(custody_token)
                         self._txn_conn_var.reset(token)
                     return
 
-        async with pool.acquire() as conn:
+        async with self._authority_pool_checkout(pool) as (conn, commit_state):
             token = self._txn_conn_var.set((asyncio.current_task(), conn))
+            scopes = list(current_execution_custody(self))
+            custody_var = self._transaction_custody_context()
+            custody_token = custody_var.set((asyncio.current_task(), scopes))
             try:
-                async with conn.transaction():
+                async with self._authority_transaction(conn, tuple(scopes), commit_state):
                     yield
+            except ExecutionCommitOutcomeError:
+                raise
             except Exception as e:
                 raise TransactionError(f"Transaction failed: {e}") from e
             finally:
+                custody_var.reset(custody_token)
                 self._txn_conn_var.reset(token)
 
     @asynccontextmanager
@@ -930,7 +1171,8 @@ class PostgresBackend(DatabaseBackend):
         *,
         shared: bool = False,
         expected_cluster_identity: Optional[str] = None,
-    ) -> AsyncIterator[None]:
+        on_loss: Callable[[AdvisoryLease], None] | None = None,
+    ) -> AsyncIterator[AdvisoryLease | None]:
         """Hold multiple session advisory locks on one bounded-pool connection.
 
         A multi-tenant bootstrap can need to drain effects for more than one
@@ -958,7 +1200,9 @@ class PostgresBackend(DatabaseBackend):
             # A dynamic hosted scheduler can legitimately have no tenants
             # during bootstrap. Do not pin a spare pool connection just to
             # represent that empty exclusion set.
-            yield
+            if on_loss is not None:
+                raise ValueError("empty advisory keys cannot grant authority custody")
+            yield None
             return
         lock_function = "pg_advisory_lock_shared" if shared else "pg_advisory_lock"
         unlock_function = (
@@ -970,7 +1214,11 @@ class PostgresBackend(DatabaseBackend):
         # connection that an admitted effect still needs.
         async with advisory_pool.acquire() as conn:
             acquired: list[Tuple[int, int]] = []
+            capability = AdvisoryLease(conn, on_loss)
+            conn.add_termination_listener(capability._connection_terminated)
+            listener_attached = True
             try:
+                capability.require_live()
                 if expected_cluster_identity is not None:
                     actual_cluster_identity = await conn.fetchval(
                         "SELECT system_identifier::text "
@@ -990,16 +1238,26 @@ class PostgresBackend(DatabaseBackend):
                         f"SELECT {lock_function}($1, $2)", namespace, key
                     )
                     acquired.append((namespace, key))
-                yield
+                    capability.require_live()
+                capability._admit()
+                yield capability
+                capability.require_live()
             except BaseException:
                 # A cancellation can race PostgreSQL granting a blocking lock
                 # after asyncpg has sent the cancellation request. Terminating
                 # this dedicated connection is the only unconditional release
                 # in that race; the bounded pool discards it and never returns
                 # a possibly locked session to another scheduler operation.
-                conn.terminate()
+                capability._retire()
+                session_attached = capability._remove_listener()
+                listener_attached = False
+                if session_attached:
+                    conn.terminate()
                 raise
             else:
+                capability._retire()
+                capability._remove_listener()
+                listener_attached = False
                 try:
                     # ``pg_advisory_unlock`` must run on the same session that
                     # acquired the lock. The normal path returns the clean,
@@ -1009,8 +1267,18 @@ class PostgresBackend(DatabaseBackend):
                             f"SELECT {unlock_function}($1, $2)", namespace, key
                         )
                 except BaseException:
-                    conn.terminate()
+                    # asyncpg may already have detached the pooled proxy
+                    # after loss. Never replace the original loss/cancellation
+                    # with that secondary cleanup error.
+                    try:
+                        conn.terminate()
+                    except asyncpg.InterfaceError:
+                        pass
                     raise
+            finally:
+                capability._retire()
+                if listener_attached:
+                    capability._remove_listener()
 
     @asynccontextmanager
     async def polled_advisory_lock(
@@ -1074,3 +1342,213 @@ class PostgresBackend(DatabaseBackend):
             "SELECT to_regclass(?) IS NOT NULL",
             (table_name,),
         ))
+
+    async def settle_stop_invocation(self, generation_id: str, owner_id: str, disposition: Any) -> None:
+        """Only an existing exact Stop generation/owner may terminalize.
+
+        This fixed native operation is available after work-custody denial.
+        It neither clears the caller's denial nor exposes a connection or
+        generic SQL executor. Ordinary storage/tools remain denied throughout.
+        """
+        from kestrel_sovereign.stop.invocation import _settle_stop_on_connection
+
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("Stop terminal custody requires the original connected backend")
+        # A terminalizer must not wedge shutdown waiting for a saturated pool.
+        async with asyncio.timeout(5):
+            async with pool.acquire() as connection:
+                await _settle_stop_on_connection(
+                    connection, generation_id, owner_id, disposition,
+                )
+
+    async def release_initial_reservations(
+        self, *, agent_id: str, owner_id: str, now: datetime,
+        mark_owner_stopped: bool,
+    ) -> int:
+        """Retire one existing runtime owner without reopening ordinary work.
+
+        Fixed cleanup SQL on the original connected backend: no new owner,
+        lease, claim, provider cursor or arbitrary executor is exposed. The
+        same tenant-wide lock serializes this with canonical recovery.
+        """
+        from kestrel_sovereign.signals.durable import DurableSignalStore
+
+        if any(type(value) is not str or not value.strip() for value in (agent_id, owner_id)):
+            raise ValueError("runtime cleanup requires exact owner identities")
+        if type(mark_owner_stopped) is not bool or not isinstance(now, datetime) or now.tzinfo is None:
+            raise ValueError("runtime cleanup requires a typed disposition and UTC timestamp")
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("runtime cleanup requires the original backend")
+        async with asyncio.timeout(5):
+            async with pool.acquire() as connection:
+                async with connection.transaction():
+                    await connection.fetchval(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        DurableSignalStore.runtime_owner_lock_key(agent_id),
+                    )
+                    existing = await connection.fetchval(
+                        f"SELECT 1 FROM {DurableSignalStore.RUNTIME_OWNERS} "
+                        "WHERE agent_id=$1 AND owner_id=$2 FOR UPDATE",
+                        agent_id, owner_id,
+                    )
+                    if existing is None:
+                        return 0
+                    released = await connection.execute(
+                        f"UPDATE {DurableSignalStore.DELIVERIES} "
+                        "SET status='retry', lease_owner=NULL, lease_token=NULL, "
+                        "lease_expires_at=NULL, next_attempt_at=$3, "
+                        "last_error='initial reservation owner stopped before activation', "
+                        "updated_at=$3 WHERE agent_id=$1 AND lease_owner=$2 "
+                        "AND status='initial_reserved'",
+                        agent_id, owner_id, now,
+                    )
+                    if mark_owner_stopped:
+                        await connection.execute(
+                            f"UPDATE {DurableSignalStore.RUNTIME_OWNERS} "
+                            "SET heartbeat_at=GREATEST(heartbeat_at,$3), "
+                            "stopped_at=COALESCE(stopped_at,$3), updated_at=$3 "
+                            "WHERE agent_id=$1 AND owner_id=$2",
+                            agent_id, owner_id, now,
+                        )
+                    return int(released.rsplit(" ", 1)[-1])
+
+    async def abandon_initial_reservation(
+        self, *, agent_id: str, consumer_id: str, delivery_id: str,
+        owner_id: str, reservation_token: str, now: datetime, reason: str,
+    ) -> bool:
+        """Repair only an existing original raw-handoff owner/token CAS."""
+        from kestrel_sovereign.signals.durable import DurableSignalStore
+
+        identities = (agent_id, consumer_id, delivery_id, owner_id, reservation_token)
+        if any(type(value) is not str or not value.strip() for value in identities):
+            raise ValueError("initial reservation cleanup requires exact identities")
+        if not isinstance(reason, str):
+            raise ValueError("initial reservation cleanup requires a string reason")
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise ValueError("initial reservation cleanup requires a UTC timestamp")
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("initial reservation cleanup requires the original backend")
+        async with asyncio.timeout(5):
+            async with pool.acquire() as connection:
+                result = await connection.execute(
+                    f"UPDATE {DurableSignalStore.DELIVERIES} "
+                    "SET status='retry', lease_owner=NULL, lease_token=NULL, "
+                    "lease_expires_at=NULL, next_attempt_at=$6, last_error=$7, "
+                    "updated_at=$6 WHERE agent_id=$1 AND consumer_id=$2 "
+                    "AND delivery_id=$3 AND lease_owner=$4 AND lease_token=$5 "
+                    "AND status IN ('initial_reserved','leased')",
+                    agent_id, consumer_id, delivery_id, owner_id, reservation_token, now, reason,
+                )
+                return result == "UPDATE 1"
+
+    async def purge_retired_ephemeral_session(self, wrapper, *, reason: str):
+        """Run only the original standalone runtime's mandatory privacy purge.
+
+        The fixed operation cannot supply SQL, replace authority, initialize
+        storage, return an executor, or clean a borrowed tenant generation.
+        Reuse one checkout from the original pool and the existing scoped
+        purge algorithms, including lexical/graph/projection safety.
+        """
+        from kestrel_sovereign.execution_custody import ProcessRuntimeExecutionFence
+        from kestrel_sovereign.storage.async_storage import AsyncStorage
+        from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+        from .ephemeral_cleanup import _purge_original_ephemeral_session
+
+        scope = getattr(self, "_execution_custody", None)
+        if not isinstance(scope, ExecutionCustody) or not isinstance(scope.fence, ProcessRuntimeExecutionFence) or not scope.fence._retired:
+            raise ExecutionAuthorityError("privacy cleanup requires the original retired process runtime")
+        if type(wrapper) is not PrivacyEnforcingStorage or type(wrapper._storage) is not AsyncStorage:
+            raise ValueError("privacy cleanup requires canonical initialized storage")
+        storage = wrapper._storage
+        agent_id, since = wrapper.agent_id, wrapper._entered_ephemeral_at
+        if storage._backend is not self or not storage._initialized or agent_id != scope.fence.agent_id:
+            raise ValueError("privacy cleanup does not match original backend and agent")
+        if type(reason) is not str or not reason.strip():
+            raise ValueError("privacy cleanup requires its audit reason")
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("privacy cleanup requires the original connected backend")
+        async with asyncio.timeout(5):
+            async with pool.acquire() as connection:
+                return await _purge_original_ephemeral_session(
+                    self, connection, wrapper, reason=reason, agent_id=agent_id, since=since,
+                )
+
+    async def retain_cognition_cleanup_owner(self, *, agent_id: str, owner_id: str) -> bool:
+        """Retain an existing live owner with leased or receipt-pending cognition.
+
+        This cleanup-only metadata operation cannot insert/revive an owner,
+        grant a lease, acknowledge ingress, or reopen ordinary native work.
+        It serializes with canonical owner recovery using its exact key.
+        """
+        from kestrel_sovereign.signals.durable import DurableSignalStore
+        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+
+        if any(type(value) is not str or not value.strip() for value in (agent_id, owner_id)):
+            raise ValueError("cognition cleanup requires exact owner identities")
+        if not owner_id.startswith("dispatcher:"):
+            raise ValueError("cognition cleanup requires its managed owner")
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("cognition cleanup requires the original backend")
+        async with asyncio.timeout(5):
+            async with pool.acquire() as connection:
+                async with connection.transaction():
+                    await connection.fetchval(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        DurableSignalStore.runtime_owner_lock_key(agent_id),
+                    )
+                    result = await connection.execute(
+                        f"UPDATE {DurableSignalStore.RUNTIME_OWNERS} owner "
+                        "SET heartbeat_at = GREATEST(heartbeat_at, clock_timestamp()), "
+                        "updated_at = clock_timestamp() "
+                        "WHERE owner.agent_id = $1 AND owner.owner_id = $2 "
+                        "AND owner.stopped_at IS NULL AND EXISTS ("
+                        f"SELECT 1 FROM {DurableSignalStore.DELIVERIES} delivery "
+                        "WHERE delivery.agent_id = $1 AND delivery.lease_owner = $2 "
+                        "AND delivery.consumer_id = $3 "
+                        "AND delivery.status IN ('leased', 'retry') "
+                        "AND delivery.lease_token IS NOT NULL)",
+                        agent_id, owner_id, DURABLE_COGNITION_CONSUMER_ID,
+                    )
+                    return result == "UPDATE 1"
+
+    async def fail_cognition_delivery(
+        self, *, agent_id: str, consumer_id: str, delivery_id: str,
+        owner_id: str, lease_token: str, error: str,
+    ) -> bool:
+        """Terminalize only an existing exact cognition lease after control loss.
+
+        Like Stop settlement, this fixed cleanup operation neither admits work
+        nor exposes an executor. The original owner/token CAS cannot acquire a
+        new lease, acknowledge a provider cursor, or overwrite a successor.
+        """
+        from kestrel_sovereign.signals.durable import DurableSignalStore
+        from kestrel_sovereign.signals.sources.channels import (
+            DURABLE_COGNITION_CONSUMER_ID,
+        )
+
+        identities = (agent_id, consumer_id, delivery_id, owner_id, lease_token, error)
+        if any(type(value) is not str or not value.strip() for value in identities):
+            raise ValueError("cognition terminal custody requires exact identities")
+        if consumer_id != DURABLE_COGNITION_CONSUMER_ID or not owner_id.startswith("dispatcher:"):
+            raise ValueError("cognition terminal custody requires its managed consumer")
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("cognition terminal custody requires the original backend")
+        async with asyncio.timeout(5):
+            async with pool.acquire() as connection:
+                result = await connection.execute(
+                    f"UPDATE {DurableSignalStore.DELIVERIES} "
+                    "SET status = 'failed', next_attempt_at = NULL, "
+                    "lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, "
+                    "last_error = $1, terminal_at = NOW(), updated_at = NOW() "
+                    "WHERE agent_id = $2 AND consumer_id = $3 AND delivery_id = $4 "
+                    "AND status IN ('leased', 'retry') "
+                    "AND lease_owner = $5 AND lease_token = $6",
+                    error, agent_id, consumer_id, delivery_id, owner_id, lease_token,
+                )
+                return result == "UPDATE 1"

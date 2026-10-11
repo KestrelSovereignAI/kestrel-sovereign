@@ -32,6 +32,7 @@ operator notice is not a signal and does not belong in ``signal_log``.
 from __future__ import annotations
 
 import asyncio
+from kestrel_sovereign.execution_custody import close_execution_stream, is_execution_control_error, owned_execution_stream
 import logging
 import uuid
 from dataclasses import asdict, is_dataclass
@@ -538,11 +539,12 @@ class OperatorTurnInjectionResult(NamedTuple):
         """
         delivered = False
         try:
-            async for item in stream:
-                if not delivered:
-                    delivered = True
-                    await self.batch.settle_delivered()
-                yield item
+            async with owned_execution_stream(self, stream) as _owned_forwarder_542:
+                async for item in _owned_forwarder_542:
+                    if not delivered:
+                        delivered = True
+                        await self.batch.settle_delivered()
+                    yield item
         except (asyncio.CancelledError, GeneratorExit) as exc:
             # Awaiting during GeneratorExit is legal inside an async generator
             # (that is what ``aclose()`` is for); only yielding is not. When the
@@ -578,18 +580,20 @@ async def _aclose_quietly(stream: Any) -> None:
     alive past the moment the operator said "stop".
 
     Anything without ``aclose`` (a plain async iterator, a test double) is
-    skipped, and a failure to close is logged rather than raised — the stream
-    is already being abandoned, and turning cleanup noise into the turn's
-    exception would hide the real reason it ended.
+    skipped. Ordinary close noise is logged, but authority/commit control
+    evidence is propagated before invocation settlement. Closure is joined
+    despite repeated caller cancellation.
     """
     aclose = getattr(stream, "aclose", None)
     if aclose is None:
         return
     try:
-        await aclose()
+        await close_execution_stream(None, stream)
     except (asyncio.CancelledError, GeneratorExit):
         raise
     except Exception as exc:  # noqa: BLE001
+        if is_execution_control_error(exc):
+            raise
         logger.debug("Operator notice stream close failed: %s", exc)
 
 

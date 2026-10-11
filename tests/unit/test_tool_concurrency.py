@@ -6,6 +6,7 @@ remain sequential. All tools go through _dispatch_tool_call —
 nothing bypasses hooks, observability, or context_stats.
 """
 
+import asyncio
 import pytest
 from dataclasses import dataclass
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -146,3 +147,52 @@ class TestIsConcurrencySafe:
 class TestMaxConcurrency:
     def test_env_default(self):
         assert MAX_TOOL_CONCURRENCY == 10
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uncertain", [False, True])
+async def test_parallel_failure_joins_cancellation_resistant_sibling_before_return(uncertain):
+    """Exercise the native batch owner, not a detached gather substitute."""
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    drained = asyncio.Event()
+    finished = []
+
+    class Agent(OrchestratorEngineMixin):
+        _direct_tools = {"fail": FakeTool(safe=True), "slow": FakeTool(safe=True)}
+        _tool_to_feature = {}
+        features = {}
+
+        async def _dispatch_tool_call(self, call, *args, **kwargs):
+            if call.name == "fail":
+                await entered.wait()
+                raise ValueError("first child failed")
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await drained.wait()
+            finished.append("slow child joined")
+            if uncertain:
+                from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+                raise ExecutionCommitOutcomeError("unknown")
+
+    agent = Agent()
+    task = asyncio.create_task(agent._execute_tool_batch(
+        [FakeToolCall("1", "fail", {}), FakeToolCall("2", "slow", {})],
+        {}, set(), [], 0, "message",
+    ))
+    try:
+        await asyncio.wait_for(cancelled.wait(), timeout=2)
+        assert not task.done()
+        drained.set()
+        from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+        with pytest.raises(ExecutionCommitOutcomeError if uncertain else ValueError):
+            await task
+        assert finished == ["slow child joined"]
+    finally:
+        drained.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

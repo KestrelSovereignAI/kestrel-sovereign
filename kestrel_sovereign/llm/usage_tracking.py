@@ -3,6 +3,7 @@
 Uses the abstract data layer for both SQLite (local) and PostgreSQL (cloud) backends.
 """
 import asyncio
+from kestrel_sovereign.execution_custody import is_execution_control_error
 import logging
 import os
 import shutil
@@ -142,6 +143,8 @@ class UsageTrackingMixin:
             
             self._db_initialized = True
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to initialize usage tracking: {e}")
             self._usage_db = None
 
@@ -179,6 +182,8 @@ class UsageTrackingMixin:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - independent best-effort sink
+            if is_execution_control_error(exc):
+                raise
             logger.warning("Usage DB failed for %s LLM invocation: %s", label, exc)
 
     async def _track_model_usage(
@@ -301,6 +306,8 @@ class UsageTrackingMixin:
                     await write_usage_transaction()
                     break
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     retry_delay = concurrent_write_retry_delay(exc, retries_done)
                     if retry_delay is None:
                         raise
@@ -312,6 +319,8 @@ class UsageTrackingMixin:
                     )
                     await asyncio.sleep(retry_delay)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to track usage for {model_id}: {e}")
 
     async def get_storage_info(self, use_cache: bool = True) -> Dict[str, Any]:
@@ -353,6 +362,8 @@ class UsageTrackingMixin:
                 models_info.append(model_entry)
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to get model details: {e}")
 
         storage_info = {
@@ -419,6 +430,8 @@ class UsageTrackingMixin:
         except RuntimeError:
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Could not check disk space: {e}")
             if not auto_confirm:
                 raise RuntimeError(f"Cannot verify disk space: {e}")
@@ -455,6 +468,8 @@ class UsageTrackingMixin:
             return True
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to pull model {model_name}: {e}")
             raise RuntimeError(f"Failed to pull model: {e}")
 
@@ -594,6 +609,8 @@ class UsageTrackingMixin:
                     )
 
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Failed to delete model {model_id}: {e}")
 
         from .model_cache import get_shared_model_cache
@@ -625,6 +642,8 @@ class UsageTrackingMixin:
                 if deleted:
                     logger.info(f"Auto-cleanup freed space by deleting: {deleted}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Auto-cleanup failed: {e}")
 
     async def close_usage_db(self):
@@ -638,6 +657,8 @@ class UsageTrackingMixin:
                 await self._usage_db.close()
                 logger.info("Usage tracking database closed.")
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.debug(f"Error closing usage database: {e}")
             finally:
                 self._usage_db = None

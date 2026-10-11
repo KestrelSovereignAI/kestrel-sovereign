@@ -1,0 +1,606 @@
+"""Connection-free execution authority with irreversible task custody.
+
+The host supplies schema-specific transactional validation. Core carries the
+same mutable admission into owned children and foreign turn executors, and
+enforces it at native storage/tool boundaries. A retired admission is never an
+absent admission: copied children remain denied even after the owning ContextVar
+has been reset. Causation and telemetry are not consulted for authority.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from functools import wraps
+from typing import Any, Protocol, TYPE_CHECKING, TypeVar
+
+from kestrel_sovereign.turn_scope import capture_turn_scope, turn_scoped
+from kestrel_sdk.storage.database import TransactionError
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.storage.db.postgres import AdvisoryLease
+
+
+class ExecutionAuthorityError(RuntimeError):
+    """Execution no longer possesses its original admission authority."""
+
+
+class ExecutionCommitOutcomeError(ExecutionAuthorityError, TransactionError):
+    """Denial at commit is not evidence that the transaction rolled back."""
+
+    def __init__(self, outcome: str):
+        if outcome not in {"committed", "unknown"}:
+            raise ValueError("invalid execution commit outcome")
+        self.commit_outcome = outcome
+        super().__init__(
+            f"execution transaction outcome is {outcome}; the operation may have "
+            "committed; reconcile durable state before any retry"
+        )
+
+
+def execution_commit_outcome(error: BaseException) -> str | None:
+    """Preserve the commit distinction through legacy storage error wrapping."""
+    seen: set[int] = set()
+    while id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, ExecutionCommitOutcomeError):
+            return error.commit_outcome
+        if error.__cause__ is None:
+            return None
+        error = error.__cause__
+    return None
+
+
+def is_execution_control_error(error: BaseException) -> bool:
+    """Authority/commit control evidence must not become a tool error string."""
+    seen: set[int] = set()
+    while id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, ExecutionAuthorityError):
+            return True
+        if error.__cause__ is None:
+            return False
+        error = error.__cause__
+    return False
+
+
+def execution_terminal_error(*errors: BaseException | None) -> BaseException | None:
+    """Keep irreversible control evidence ahead of cancellation/cleanup noise."""
+    import asyncio
+    present = tuple(error for error in errors if error is not None)
+    for outcome in ("unknown", "committed"):
+        for error in present:
+            if execution_commit_outcome(error) == outcome:
+                return error
+    for error in present:
+        if is_execution_control_error(error):
+            return error
+    for error in present:
+        # OwnedAsyncIterator carries source cleanup debt as the explicit cause
+        # of cancellation. A failed checkpoint is not a successful Stop.
+        if isinstance(error, asyncio.CancelledError) and error.__cause__ is not None:
+            return error.__cause__
+    if present and isinstance(present[0], GeneratorExit):
+        # GeneratorExit is the source's ordinary close request, not caller
+        # cancellation. A later cancellation while joining that close must
+        # still reach the closer after cleanup settles. Control evidence was
+        # already selected above, so it cannot be demoted by this rule.
+        return next((error for error in present[1:] if not isinstance(error, GeneratorExit)), present[0])
+    if present and isinstance(present[0], (asyncio.CancelledError, GeneratorExit)):
+        for error in present[1:]:
+            if not isinstance(error, (asyncio.CancelledError, GeneratorExit)):
+                return error
+    return present[0] if present else None
+
+
+class ExecutionFence(Protocol):
+    """Trusted host's immutable binding; validation uses the mutation's session.
+
+    ``lock_and_validate`` must lock authority rows before native graph/file
+    locks, validate the original generation, and retain locks through commit.
+    The supplied executor is the actual backend connection, not a second
+    checkout. Validators must not publish effects or start/commit transactions.
+    """
+
+    backend_type: str
+
+    def require_work(self) -> None: ...
+
+    async def lock_and_validate(self, connection: Any) -> None: ...
+
+
+@dataclass(eq=False)
+class ProcessRuntimeExecutionFence:
+    """Original process-owned runtime lifetime for a standalone PG host.
+
+    This is NOT a tenant row, distributed generation, Hold grant or scheduler
+    occurrence. A trusted standalone host creates one per runtime construction;
+    shutdown irrevocably retires it. Tenant hosts must supply their own native
+    generation fence instead. Ordinary calls still retain ALL ambient leases.
+    """
+
+    agent_id: str
+    backend_type: str = field(default="postgres", init=False)
+    _retired: bool = field(default=False, init=False)
+
+    def retire(self) -> None:
+        self._retired = True
+
+    def require_work(self) -> None:
+        if self._retired:
+            raise ExecutionAuthorityError("original process runtime retired")
+
+    async def lock_and_validate(self, connection: Any) -> None:
+        # No authority rows exist for a standalone process lifetime. Validate
+        # this SAME local object on the mutation's session; never check out a
+        # replacement lease or pretend it is distributed row authority.
+        self.require_work()
+
+
+@dataclass(frozen=True)
+class AdvisoryExecutionFence:
+    """Carry a native advisory capability into storage and tool boundaries.
+
+    This does not implement another lease or claim validator. Its caller still
+    supplies its existing claim/owner checks; copied effect contexts retain
+    immediate denial when the exact exclusion session is lost or retired.
+    """
+
+    lease: AdvisoryLease
+    owner_live: Callable[[], bool] | None = None
+    backend_type: str = field(default="postgres", init=False)
+
+    def require_work(self) -> None:
+        self.lease.require_live()
+        if self.owner_live is not None and not self.owner_live():
+            raise ExecutionAuthorityError("execution owner lease lost")
+
+    async def lock_and_validate(self, connection: Any) -> None:
+        self.require_work()
+
+
+@dataclass(eq=False)
+class ExecutionCustody:
+    """One admission shared by reference across all captured task contexts."""
+
+    fence: ExecutionFence
+    _denial: str | None = field(default=None, init=False)
+    _uncertain_commit: str | None = field(default=None, init=False)
+
+    def preserve_commit_uncertainty(self, outcome: str) -> None:
+        if outcome not in {"committed", "unknown"}:
+            raise ValueError("invalid execution commit outcome")
+        if self._uncertain_commit is None or outcome == "unknown":
+            self._uncertain_commit = outcome
+
+    def revoke(self, reason: str) -> None:
+        if self._denial is None:
+            self._denial = reason or "execution authority revoked"
+
+    def require_work(self) -> None:
+        if self._uncertain_commit is not None:
+            raise ExecutionCommitOutcomeError(self._uncertain_commit)
+        if self._denial is not None:
+            raise ExecutionAuthorityError(self._denial)
+        try:
+            self.fence.require_work()
+        except ExecutionAuthorityError as error:
+            self.revoke(str(error))
+            raise
+
+
+def retire_process_runtime_custody(custody: ExecutionCustody | None) -> None:
+    """Retire only a locally owned standalone lifetime, never tenant authority."""
+    if isinstance(custody, ExecutionCustody) and isinstance(
+        custody.fence, ProcessRuntimeExecutionFence
+    ):
+        custody.fence.retire()
+
+
+_CURRENT_CUSTODY: ContextVar[tuple[ExecutionCustody, ...]] = ContextVar(
+    "kestrel_execution_custody", default=(),
+)
+_CLEANUP_ONLY: ContextVar[bool] = ContextVar("kestrel_execution_cleanup_only", default=False)
+
+
+@dataclass(eq=False)
+class _StreamCleanupState:
+    # Shared by reference with the producer and its children. The closer sets
+    # this BEFORE cancellation, which cannot mutate another task's ContextVars.
+    scopes: tuple[ExecutionCustody, ...]
+    requested: bool = False
+
+
+_STREAM_CLEANUP: ContextVar[tuple[_StreamCleanupState, ...]] = ContextVar(
+    "kestrel_execution_stream_cleanup", default=(),
+)
+
+
+def _execution_cleanup_requested() -> bool:
+    return _CLEANUP_ONLY.get() or any(
+        state.requested and bool(state.scopes) for state in _STREAM_CLEANUP.get()
+    )
+
+
+def current_execution_custody(owner: Any = None) -> tuple[ExecutionCustody, ...]:
+    """Capture immutable scope membership, retaining shared revocation state."""
+
+    ambient = _CURRENT_CUSTODY.get()
+    retained = getattr(owner, "_execution_custody", None)
+    if isinstance(retained, ExecutionCustody) and retained not in ambient:
+        return (retained, *ambient)
+    return ambient
+
+
+def require_execution_work(owner: Any = None) -> None:
+    if _execution_cleanup_requested():
+        raise ExecutionAuthorityError("execution is cleanup-only; ordinary work is denied")
+    for scope in current_execution_custody(owner):
+        scope.require_work()
+
+
+def refuse_unfenced_executor(owner: Any = None) -> None:
+    """SQLAlchemy cannot validate authority on its actual mutation session."""
+    if _execution_cleanup_requested() or current_execution_custody(owner):
+        raise ExecutionAuthorityError(
+            "custody-bound execution cannot use the unfenced SQLAlchemy executor"
+        )
+
+
+def require_execution_backend(
+    backend_type: str, scopes: tuple[ExecutionCustody, ...] | None = None,
+) -> None:
+    if _execution_cleanup_requested():
+        raise ExecutionAuthorityError("execution is cleanup-only; ordinary work is denied")
+    for scope in current_execution_custody() if scopes is None else scopes:
+        scope.require_work()
+        if scope.fence.backend_type != backend_type:
+            raise ExecutionAuthorityError(
+                f"execution authority requires {scope.fence.backend_type} backend, "
+                f"not {backend_type}"
+            )
+
+
+async def lock_execution_authority(
+    connection: Any, backend_type: str,
+    scopes: tuple[ExecutionCustody, ...] | None = None,
+) -> None:
+    captured = current_execution_custody() if scopes is None else scopes
+    require_execution_backend(backend_type, captured)
+    for scope in captured:
+        try:
+            await scope.fence.lock_and_validate(connection)
+        except ExecutionAuthorityError as error:
+            scope.revoke(str(error))
+            raise
+        # Cancellation-resistant validators must not republish a lost scope.
+        require_execution_backend(backend_type, captured)
+
+
+@contextmanager
+def bind_execution_custody(fence: ExecutionFence) -> Iterator[ExecutionCustody]:
+    require_execution_work()
+    if fence.backend_type != "postgres":
+        raise ExecutionAuthorityError(
+            "transaction-bound hosted execution authority requires postgres backend"
+        )
+    scope = ExecutionCustody(fence)
+    scope.require_work()
+    token = _CURRENT_CUSTODY.set((*current_execution_custody(), scope))
+    try:
+        yield scope
+    finally:
+        scope.revoke("execution admission retired")
+        _CURRENT_CUSTODY.reset(token)
+
+
+@contextmanager
+def _bind_captured_custody(
+    captured: tuple[ExecutionCustody, ...],
+) -> Iterator[None]:
+    # Binding a foreign turn may add its own scopes; never discard a denying
+    # ancestor that was already present on that task.
+    existing = current_execution_custody()
+    scopes = existing + tuple(scope for scope in captured if scope not in existing)
+    token = _CURRENT_CUSTODY.set(scopes)
+    try:
+        require_execution_work()
+        yield
+    finally:
+        _CURRENT_CUSTODY.reset(token)
+
+
+@contextmanager
+def bind_execution_runtime(owner: Any) -> Iterator[None]:
+    """Present retained runtime custody without minting a fresh admission."""
+    with _bind_captured_custody(current_execution_custody(owner)):
+        yield
+
+
+_Result = TypeVar("_Result")
+
+
+async def await_execution_work(owner: Any, operation: Callable[[], Awaitable[_Result]]) -> _Result:
+    """Dispatch a lazy provider operation under its original runtime custody.
+
+    The callable is evaluated only after admission, and its owned children
+    inherit the same scopes. A failed provider cannot turn authority loss into
+    a recoverable route failure; a successful provider cannot disclose a result
+    after loss. This does not recall an already submitted remote operation.
+    """
+    with bind_execution_runtime(owner):
+        try:
+            result = await operation()
+        except ExecutionAuthorityError:
+            raise
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            require_execution_work(owner)
+            raise
+        require_execution_work(owner)
+        return result
+
+
+def execution_work_operation(function: Callable) -> Callable:
+    """Keep finalization and its children inside the original runtime scope."""
+    @wraps(function)
+    async def guarded(self, *args, **kwargs):
+        return await await_execution_work(self, lambda: function(self, *args, **kwargs))
+    return guarded
+
+
+async def await_execution_work_group(
+    owner: Any,
+    operations: Iterable[Callable[[], Awaitable[Any]]],
+    *,
+    return_exceptions: bool = False,
+) -> list[Any]:
+    """Own all fan-out children and retain irreversible cleanup evidence.
+
+    Ordinary tolerant discovery may return ordinary failures as values, but
+    control failure and cancellation always cancel/join every sibling. Lazy
+    callables avoid creating undispatched coroutine objects after denial.
+    """
+    import asyncio
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    tasks = []
+
+    async def run(operation):
+        try:
+            return await await_execution_work(owner, operation)
+        except Exception as error:
+            if return_exceptions and not is_execution_control_error(error):
+                return error
+            raise
+
+    try:
+        require_execution_work(owner)
+        for operation in operations:
+            coroutine = run(operation)
+            try:
+                task = asyncio.create_task(coroutine)
+            except BaseException:
+                coroutine.close()
+                raise
+            tasks.append(task)
+        results = list(await asyncio.gather(*tasks))
+        require_execution_work(owner)
+        return results
+    except BaseException as error:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        outcomes = [await await_owned_task(task) for task in tasks]
+        terminal = execution_terminal_error(
+            error,
+            *(outcome.error for outcome in outcomes),
+            *(outcome.cancellation for outcome in outcomes),
+        )
+        assert terminal is not None
+        raise terminal
+
+
+def execution_work_stream(function: Callable) -> Callable:
+    """Monotonic custody across foreign consumers, errors, and fallback.
+
+    Context is installed only during an advance/close, never across yield to
+    the consumer. Every later consumer's admissions join the pinned union.
+    """
+    @wraps(function)
+    async def guarded(self, *args, **kwargs) -> AsyncIterator[Any]:
+        async with owned_execution_stream(self, function(self, *args, **kwargs)) as iterator:
+            async for item in iterator:
+                yield item
+    return guarded
+
+
+@contextmanager
+def bind_execution_custody_snapshot(captured: tuple[ExecutionCustody, ...]) -> Iterator[None]:
+    """Carry original live admissions to an already-owned control worker."""
+    with _bind_captured_custody(captured):
+        yield
+
+
+@contextmanager
+def bind_execution_cleanup(
+    owner: Any, captured: tuple[ExecutionCustody, ...] = (),
+) -> Iterator[None]:
+    """Retain original denials while closing hosted work, never admit work.
+
+    Standalone invocations without custody retain their existing semantics.
+    Hosted cleanup can use only native fixed exact-identity terminal operations;
+    storage, tools and provider calls still pass through ordinary work denial.
+    Children inherit this restriction even after their closer leaves the scope.
+    """
+    existing = current_execution_custody(owner)
+    scopes = existing + tuple(scope for scope in captured if scope not in existing)
+    custody_token = _CURRENT_CUSTODY.set(scopes)
+    cleanup_token = _CLEANUP_ONLY.set(_CLEANUP_ONLY.get() or bool(scopes))
+    try:
+        yield
+    finally:
+        _CLEANUP_ONLY.reset(cleanup_token)
+        _CURRENT_CUSTODY.reset(custody_token)
+
+
+class _ExecutionForwarder:
+    """One source task, monotonic consumer custody, and joined closure.
+
+    The source can hold ContextVar tokens across yields: its advances and
+    close always run in the SAME task/context. Consumers never hold those
+    bindings, and later foreign consumers may add but never discard custody.
+    """
+
+    def __init__(self, owner: Any, stream: AsyncIterator[Any]):
+        from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+
+        self._runtime_owner = owner
+        self._source = aiter(stream)
+        self._scopes = current_execution_custody(owner)
+        self._cleanup_state = _StreamCleanupState(self._scopes)
+        self._source_exhausted = False
+        # Task-relative capabilities (notably privacy-lock reentry) are not
+        # supplied by copy_context alone. Capture them on the lock owner.
+        self._turn_scope = capture_turn_scope(owner)
+        import contextvars
+        context = contextvars.copy_context()
+        # The turn/session and privacy-reentry carriers above suffice for
+        # source work. Do not delegate CONVERSATION: ordinary child wakes
+        # must queue for their own turn, not inherit the parent's live hold.
+        self._iterator = OwnedAsyncIterator(
+            self._produce, operation="execution-stream-forward", owner_context=context,
+        )
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        additional = current_execution_custody(self._runtime_owner)
+        self._scopes += tuple(scope for scope in additional if scope not in self._scopes)
+        self._cleanup_state.scopes = self._scopes
+        with _bind_captured_custody(self._scopes):
+            try:
+                item = await anext(self._iterator)
+            except BaseException as error:
+                if not is_execution_control_error(error):
+                    require_execution_work(self._runtime_owner)
+                raise
+            require_execution_work(self._runtime_owner)
+            return item
+
+    async def _produce(self):
+        with self._turn_scope.bind(), _bind_stream_cleanup((self._cleanup_state,)):
+            error = None
+            try:
+                while True:
+                    with _bind_captured_custody(self._scopes), bind_execution_runtime(self._runtime_owner):
+                        try:
+                            item = await anext(self._source)
+                        except StopAsyncIteration:
+                            require_execution_work(self._runtime_owner)
+                            self._source_exhausted = True
+                            return
+                        require_execution_work(self._runtime_owner)
+                    yield item
+            except BaseException as caught:
+                error = caught
+                self._cleanup_state.requested = True
+                raise
+            finally:
+                close = getattr(self._source, "aclose", None)
+                if callable(close):
+                    with bind_execution_cleanup(self._runtime_owner, self._scopes):
+                        try:
+                            await close()
+                        except BaseException as cleanup_error:
+                            self._source_exhausted = False
+                            self._cleanup_state.requested = True
+                            raise execution_terminal_error(error, cleanup_error)
+
+    async def aclose(self):
+        # Normal EOF completes this source, not a queued child's independent
+        # conversation turn. Aborted or failed closure still denies children
+        # synchronously before the source owner is cancelled.
+        if not self._source_exhausted:
+            self._cleanup_state.requested = True
+        await close_execution_stream(self._runtime_owner, self._iterator, self._scopes)
+
+
+async def close_execution_stream(
+    owner: Any, stream: Any, captured: tuple[ExecutionCustody, ...] = (),
+) -> None:
+    """Join an owned source's close despite repeated caller cancellation."""
+    import asyncio
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    close = getattr(stream, "aclose", None)
+    if callable(close):
+        with bind_execution_cleanup(owner, captured):
+            outcome = await await_owned_task(asyncio.create_task(close()))
+            error = execution_terminal_error(outcome.error, outcome.cancellation)
+            if error is not None:
+                raise error
+
+
+@asynccontextmanager
+async def owned_execution_stream(owner: Any, stream: AsyncIterator[Any]):
+    """Own every forwarding layer until the source's terminal classification."""
+    iterator = _ExecutionForwarder(owner, stream)
+    error = None
+    try:
+        yield iterator
+    except BaseException as caught:
+        error = caught
+        raise
+    finally:
+        try:
+            await iterator.aclose()
+        except BaseException as cleanup_error:
+            raise execution_terminal_error(error, cleanup_error)
+
+
+turn_scoped(
+    "execution_custody",
+    variables=(_CURRENT_CUSTODY,),
+    capture=current_execution_custody,
+    bind=_bind_captured_custody,
+)
+
+
+@contextmanager
+def _bind_cleanup_flag(captured: bool) -> Iterator[None]:
+    token = _CLEANUP_ONLY.set(_CLEANUP_ONLY.get() or captured)
+    try:
+        yield
+    finally:
+        _CLEANUP_ONLY.reset(token)
+
+
+turn_scoped(
+    "execution_cleanup_only",
+    variables=(_CLEANUP_ONLY,),
+    capture=lambda owner: _CLEANUP_ONLY.get(),
+    bind=_bind_cleanup_flag,
+)
+
+
+@contextmanager
+def _bind_stream_cleanup(captured: tuple[_StreamCleanupState, ...]) -> Iterator[None]:
+    existing = _STREAM_CLEANUP.get()
+    token = _STREAM_CLEANUP.set(existing + tuple(state for state in captured if state not in existing))
+    try:
+        yield
+    finally:
+        _STREAM_CLEANUP.reset(token)
+
+
+turn_scoped(
+    "execution_stream_cleanup",
+    variables=(_STREAM_CLEANUP,),
+    capture=lambda owner: _STREAM_CLEANUP.get(),
+    bind=_bind_stream_cleanup,
+)

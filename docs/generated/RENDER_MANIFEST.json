@@ -3929,6 +3929,18 @@
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
+      "path": "docs/development/EXECUTION_CUSTODY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Transaction-bound hosted execution custody",
+      "type": "Developer Guide"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/development/README.md",
       "privacy": "internal",
       "render": "internal",
@@ -4510,6 +4522,18 @@
       "render": "public",
       "status": "proposed",
       "title": "Core 0.53.27",
+      "type": "Release Note"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.53.28.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.53.28",
       "type": "Release Note"
     },
     {

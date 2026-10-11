@@ -150,6 +150,9 @@ class ResponseAuditHook(Hook):
             # ``mode == "strict"``, so advisory (warn) audits keep full telemetry.
             audit_result = await self._audit(response_text)
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Response audit failed: {e}")
             # Even with the LLM audit unavailable, a clean-cut
             # narration violation still fires the audit machinery.

@@ -1,5 +1,6 @@
 """Streaming response handling for Kestrel Agent."""
 import asyncio
+from kestrel_sovereign.execution_custody import owned_execution_stream
 import inspect
 import json
 import logging
@@ -78,7 +79,7 @@ def resolve_turn_invocation_context(
     the agent and service never disagree on precedence. A minimal service double
     without that resolver falls back to the explicit context merged with the
     session id.
-    """
+"""
     resolver = getattr(llm_service, "_resolve_invocation_context", None)
     if resolver is not None:
         return resolver(invocation_context, session_id=session_id)
@@ -1205,12 +1206,16 @@ class StreamingMixin:
                             invocation_context,
                             session_id=session_id,
                         ):
-                            async for chunk in self._process_input_streaming_traced_locked(
+                            # Establish the live session before capturing the
+                            # task-relative turn binding for the source task.
+                            self._active_session_id = session_id
+                            async with owned_execution_stream(self, self._process_input_streaming_traced_locked(
                                 user_input, model_override, session_id, _otel_span,
                                 request_id=request_id, attachments=attachments,
                                 invocation_context=invocation_context,
-                            ):
-                                yield chunk
+                            )) as _owned_forwarder_1209:
+                                async for chunk in _owned_forwarder_1209:
+                                    yield chunk
             except BaseException as exc:
                 _turn_error = exc
                 raise
@@ -1631,124 +1636,125 @@ class StreamingMixin:
             await operator_turn.settle_interrupted(exc)
             raise
 
-        async for item in operator_stream:
-            # #1256: Honor stop-button cancellation INSIDE the agent
-            # loop, not just at the HTTP response layer. Before this
-            # check existed, /api/agent/stop only set a flag that the
-            # endpoint generator inspected — the upstream LLM stream
-            # kept pulling tokens (and any tool-using turn kept
-            # dispatching tools with side effects) right through to
-            # completion. Breaking out here closes the underlying SDK
-            # stream and leaves ``tool_response is None`` so the
-            # has_tool_calls branch is skipped; partial text already in
-            # ``full_response`` flows through to the no-tools persist
-            # path below and the cancellation marker lands in metadata.
-            if request_id and self.is_request_cancelled(request_id):
-                # #2530: close the stream explicitly rather than dropping the
-                # reference and waiting on the async-generator finalizer. The
-                # provider stream holds the cancel token and the upstream
-                # connection, and ``operator_stream`` is a named local that
-                # stays alive to the end of this turn, so "stop" must release
-                # it here. This does NOT un-deliver the notice — it already
-                # settled ``delivered`` on the first chunk and the first
-                # terminal settle wins.
-                await operator_stream.aclose()
-                break
-            # #1914: accumulate any part an inline tool emitted while the adapter
-            # was resumed to produce THIS item. They flush right before the next
-            # VISIBLE text below — AFTER this item if it's a tool sentinel — so a
-            # component lands after its producing tool's card, not before it.
-            pending_parts.extend(drain_parts())
-            if isinstance(item, str):
-                # #1914: a component emitted by the tool that produced THIS
-                # visible text flushes here — after any tool done/error sentinel
-                # items already appended to full_response, before this answer
-                # prose — so it lands after its producing tool's card. A
-                # sentinel-only item (the tool's done marker) is NOT visible, so
-                # the parts wait for the real text that follows it.
-                if pending_parts and item.strip() and not is_only_sentinels(item):
-                    for _ps in _flush_part_list(pending_parts, full_response):
-                        if not buffer_audit:
-                            yield _ps
-                # #1547: materialize a pending revise boundary lazily —
-                # only when real post-marker text lands, and only when it
-                # would otherwise weld two non-whitespace chars. Mirrors
-                # the client weld so the persisted turn equals the render.
-                # #1659: a tool sentinel is wire bytes, not the visible
-                # text the weld waits for — never let it materialize (or
-                # clear) the boundary, and don't weld a \n\n in front of
-                # it (it'd survive the persist-time sentinel strip).
-                if (
-                    pending_visible_boundary
-                    and item.strip()
-                    and not is_only_sentinels(item)
-                ):
-                    acc = "".join(full_response)
-                    if acc and not acc[-1].isspace() and not item[:1].isspace():
-                        full_response.append("\n\n")
-                    pending_visible_boundary = False
-                # Text chunk - yield immediately for real-time streaming, or
-                # withhold it under an enforcing (strict) POST_RESPONSE audit so
-                # no unaudited byte reaches the client before the verdict (#2674).
-                # The text is still accumulated into ``full_response`` for the
-                # audit + persist regardless.
-                full_response.append(item)
-                if not buffer_audit:
-                    yield item
-            elif isinstance(item, ThinkingDelta):
-                if not buffer_audit:
-                    yield _build_thinking_sentinel(item)
-            elif isinstance(item, ToolCallStarted):
-                # Honesty-layer signal (#1042 layer 2 / #1045): the LLM
-                # has just begun emitting a tool call. Any pre-tool prose
-                # the user is currently watching is about to be obsolete
-                # — the agent will substitute the tool's actual result.
-                # Two idempotent retraction signals tell the client to
-                # clear the in-flight bubble: a Wave 5C "revising" SSE
-                # event (carries the request_id for pane routing and the
-                # marker's `index` for ordering) and a Wave 5E in-band
-                # sentinel on the chat stream itself (strictly ordered with
-                # the chunks, so the client can never race the post-tool
-                # synthesis; chat clients treat both as idempotent).
-                #
-                # #2674 finding 1: suppress BOTH under an enforcing
-                # (buffered) audit. The strict client never received the
-                # pre-tool prose — every visible byte was withheld pending
-                # the verdict — so there is nothing to retract. And both
-                # signals carry response-derived tool id/name the audit has
-                # NOT yet approved; the SSE event in particular is delivered
-                # (or buffered) on the PARALLEL notifications channel
-                # (``/api/agent/notifications/sse``), OUTSIDE the buffered
-                # chat stream, so firing it here would leak unaudited —
-                # possibly-to-be-denied — tool metadata past the fail-closed
-                # gate. Emit both only when streaming live (warn / no-audit),
-                # preserving the established behavior there exactly. The
-                # sentinel is likewise NOT appended to ``full_response`` (the
-                # persisted assistant turn must not contain wire-protocol
-                # bytes). The pre-tool accumulation below runs regardless of
-                # buffering — the audit + persist still need it.
-                if not buffer_audit:
-                    await self._emit_revising_event(
-                        item, session_id=session_id, request_id=request_id,
-                    )
-                    yield _build_revise_sentinel(item)
-                # Snapshot pre-tool prose at the FIRST marker only —
-                # subsequent markers arrive between tool calls of the
-                # same LLM turn and don't introduce new pre-tool text
-                # the user hadn't already seen. The narration check
-                # downstream wants the user-visible prose that
-                # PRECEDED any tool call, not the inter-tool prose.
-                if pre_tool_prose_snapshot is None:
-                    pre_tool_prose_snapshot = "".join(full_response)
-                # #1547: arm — do NOT eagerly write — a paragraph boundary
-                # at this revise point. It materializes when the next
-                # visible text arrives (lazy weld above, or the pre/post
-                # seam at the join below), so a turn that stops right here
-                # never persists a trailing `\n\n` the client never drew.
-                pending_visible_boundary = True
-            elif isinstance(item, LLMResponse):
-                # Tool calls detected at end of stream
-                tool_response = item
+        async with owned_execution_stream(self, operator_stream) as _owned_forwarder_1635:
+            async for item in _owned_forwarder_1635:
+                # #1256: Honor stop-button cancellation INSIDE the agent
+                # loop, not just at the HTTP response layer. Before this
+                # check existed, /api/agent/stop only set a flag that the
+                # endpoint generator inspected — the upstream LLM stream
+                # kept pulling tokens (and any tool-using turn kept
+                # dispatching tools with side effects) right through to
+                # completion. Breaking out here closes the underlying SDK
+                # stream and leaves ``tool_response is None`` so the
+                # has_tool_calls branch is skipped; partial text already in
+                # ``full_response`` flows through to the no-tools persist
+                # path below and the cancellation marker lands in metadata.
+                if request_id and self.is_request_cancelled(request_id):
+                    # #2530: close the stream explicitly rather than dropping the
+                    # reference and waiting on the async-generator finalizer. The
+                    # provider stream holds the cancel token and the upstream
+                    # connection, and ``operator_stream`` is a named local that
+                    # stays alive to the end of this turn, so "stop" must release
+                    # it here. This does NOT un-deliver the notice — it already
+                    # settled ``delivered`` on the first chunk and the first
+                    # terminal settle wins.
+                    await operator_stream.aclose()
+                    break
+                # #1914: accumulate any part an inline tool emitted while the adapter
+                # was resumed to produce THIS item. They flush right before the next
+                # VISIBLE text below — AFTER this item if it's a tool sentinel — so a
+                # component lands after its producing tool's card, not before it.
+                pending_parts.extend(drain_parts())
+                if isinstance(item, str):
+                    # #1914: a component emitted by the tool that produced THIS
+                    # visible text flushes here — after any tool done/error sentinel
+                    # items already appended to full_response, before this answer
+                    # prose — so it lands after its producing tool's card. A
+                    # sentinel-only item (the tool's done marker) is NOT visible, so
+                    # the parts wait for the real text that follows it.
+                    if pending_parts and item.strip() and not is_only_sentinels(item):
+                        for _ps in _flush_part_list(pending_parts, full_response):
+                            if not buffer_audit:
+                                yield _ps
+                    # #1547: materialize a pending revise boundary lazily —
+                    # only when real post-marker text lands, and only when it
+                    # would otherwise weld two non-whitespace chars. Mirrors
+                    # the client weld so the persisted turn equals the render.
+                    # #1659: a tool sentinel is wire bytes, not the visible
+                    # text the weld waits for — never let it materialize (or
+                    # clear) the boundary, and don't weld a \n\n in front of
+                    # it (it'd survive the persist-time sentinel strip).
+                    if (
+                        pending_visible_boundary
+                        and item.strip()
+                        and not is_only_sentinels(item)
+                    ):
+                        acc = "".join(full_response)
+                        if acc and not acc[-1].isspace() and not item[:1].isspace():
+                            full_response.append("\n\n")
+                        pending_visible_boundary = False
+                    # Text chunk - yield immediately for real-time streaming, or
+                    # withhold it under an enforcing (strict) POST_RESPONSE audit so
+                    # no unaudited byte reaches the client before the verdict (#2674).
+                    # The text is still accumulated into ``full_response`` for the
+                    # audit + persist regardless.
+                    full_response.append(item)
+                    if not buffer_audit:
+                        yield item
+                elif isinstance(item, ThinkingDelta):
+                    if not buffer_audit:
+                        yield _build_thinking_sentinel(item)
+                elif isinstance(item, ToolCallStarted):
+                    # Honesty-layer signal (#1042 layer 2 / #1045): the LLM
+                    # has just begun emitting a tool call. Any pre-tool prose
+                    # the user is currently watching is about to be obsolete
+                    # — the agent will substitute the tool's actual result.
+                    # Two idempotent retraction signals tell the client to
+                    # clear the in-flight bubble: a Wave 5C "revising" SSE
+                    # event (carries the request_id for pane routing and the
+                    # marker's `index` for ordering) and a Wave 5E in-band
+                    # sentinel on the chat stream itself (strictly ordered with
+                    # the chunks, so the client can never race the post-tool
+                    # synthesis; chat clients treat both as idempotent).
+                    #
+                    # #2674 finding 1: suppress BOTH under an enforcing
+                    # (buffered) audit. The strict client never received the
+                    # pre-tool prose — every visible byte was withheld pending
+                    # the verdict — so there is nothing to retract. And both
+                    # signals carry response-derived tool id/name the audit has
+                    # NOT yet approved; the SSE event in particular is delivered
+                    # (or buffered) on the PARALLEL notifications channel
+                    # (``/api/agent/notifications/sse``), OUTSIDE the buffered
+                    # chat stream, so firing it here would leak unaudited —
+                    # possibly-to-be-denied — tool metadata past the fail-closed
+                    # gate. Emit both only when streaming live (warn / no-audit),
+                    # preserving the established behavior there exactly. The
+                    # sentinel is likewise NOT appended to ``full_response`` (the
+                    # persisted assistant turn must not contain wire-protocol
+                    # bytes). The pre-tool accumulation below runs regardless of
+                    # buffering — the audit + persist still need it.
+                    if not buffer_audit:
+                        await self._emit_revising_event(
+                            item, session_id=session_id, request_id=request_id,
+                        )
+                        yield _build_revise_sentinel(item)
+                    # Snapshot pre-tool prose at the FIRST marker only —
+                    # subsequent markers arrive between tool calls of the
+                    # same LLM turn and don't introduce new pre-tool text
+                    # the user hadn't already seen. The narration check
+                    # downstream wants the user-visible prose that
+                    # PRECEDED any tool call, not the inter-tool prose.
+                    if pre_tool_prose_snapshot is None:
+                        pre_tool_prose_snapshot = "".join(full_response)
+                    # #1547: arm — do NOT eagerly write — a paragraph boundary
+                    # at this revise point. It materializes when the next
+                    # visible text arrives (lazy weld above, or the pre/post
+                    # seam at the join below), so a turn that stops right here
+                    # never persists a trailing `\n\n` the client never drew.
+                    pending_visible_boundary = True
+                elif isinstance(item, LLMResponse):
+                    # Tool calls detected at end of stream
+                    tool_response = item
 
         # #1914: flush any still-pending parts (a turn that ended on its tool
         # with no trailing visible text never hit the in-loop flush) plus parts
@@ -1866,7 +1872,7 @@ class StreamingMixin:
                     require_success=checkpointed_batch,
                 )
 
-            async for chunk in self._handle_orchestrator_response_streaming(
+            async with owned_execution_stream(self, self._handle_orchestrator_response_streaming(
                 response=tool_response,
                 feature_tools=feature_tools,
                 system_prompt=system_prompt,
@@ -1890,26 +1896,27 @@ class StreamingMixin:
                 # separate from ``user_message`` above, which stays raw user
                 # speech for dispatched subagents.
                 continuation_user_content=prompt + lazy_hint,
-            ):
-                if isinstance(chunk, _DeferredToolBatchCancellation):
-                    deferred_tool_batch_cancellation = chunk
-                    # Resume once so the inner async generator reaches its return
-                    # after the marker instead of leaving cleanup to finalization.
-                    continue
-                if isinstance(chunk, ThinkingDelta):
+            )) as _owned_forwarder_1870:
+                async for chunk in _owned_forwarder_1870:
+                    if isinstance(chunk, _DeferredToolBatchCancellation):
+                        deferred_tool_batch_cancellation = chunk
+                        # Resume once so the inner async generator reaches its return
+                        # after the marker instead of leaving cleanup to finalization.
+                        continue
+                    if isinstance(chunk, ThinkingDelta):
+                        if not buffer_audit:
+                            yield _build_thinking_sentinel(chunk)
+                        continue
+                    tool_response_chunks.append(chunk)
                     if not buffer_audit:
-                        yield _build_thinking_sentinel(chunk)
-                    continue
-                tool_response_chunks.append(chunk)
-                if not buffer_audit:
-                    yield chunk
-                # #1256: belt-and-suspenders cancel check at the outer
-                # boundary. The inner orchestrator generator also checks
-                # ``is_request_cancelled`` at iteration boundaries; this
-                # outer break stops accumulating tokens if a cancel
-                # arrives between the inner check and the next yield.
-                if request_id and self.is_request_cancelled(request_id):
-                    break
+                        yield chunk
+                    # #1256: belt-and-suspenders cancel check at the outer
+                    # boundary. The inner orchestrator generator also checks
+                    # ``is_request_cancelled`` at iteration boundaries; this
+                    # outer break stops accumulating tokens if a cancel
+                    # arrives between the inner check and the next yield.
+                    if request_id and self.is_request_cancelled(request_id):
+                        break
             # #2674 finding 2: a strict (buffered) POST-TOOL continuation stopped
             # before its reviewed release withheld every byte and never audited
             # the partial synthesis. Discard the whole withheld buffer (prose,
@@ -2667,6 +2674,14 @@ class StreamingMixin:
         )
         outcome = await await_owned_task(persistence)
         pending_cancellation = outcome.cancellation
+        from kestrel_sovereign.execution_custody import (
+            execution_terminal_error, is_execution_control_error,
+        )
+        terminal = execution_terminal_error(outcome.error, pending_cancellation)
+        if terminal is not None and is_execution_control_error(terminal):
+            # A best-effort checkpoint is not permission to discard explicit
+            # irreversible evidence, nor to start another ordinary SQL metric.
+            raise terminal
         if outcome.error is not None and not isinstance(
             outcome.error,
             asyncio.CancelledError,
@@ -2694,6 +2709,11 @@ class StreamingMixin:
                 pending_cancellation,
             )
             pending_cancellation = telemetry_outcome.cancellation
+            terminal = execution_terminal_error(
+                outcome.error, telemetry_outcome.error, pending_cancellation,
+            )
+            if terminal is not None and is_execution_control_error(terminal):
+                raise terminal
             if (
                 telemetry_outcome.error is not None
                 and not isinstance(telemetry_outcome.error, asyncio.CancelledError)

@@ -98,6 +98,7 @@ class OwnedAsyncIterator(Generic[_T]):
         *,
         operation: str,
         cleanup_requested: Callable[[], bool] | None = None,
+        owner_context: contextvars.Context | None = None,
     ) -> None:
         self._iterator_factory = iterator_factory
         self._operation = operation
@@ -111,13 +112,16 @@ class OwnedAsyncIterator(Generic[_T]):
         self._closed = False
         self._interrupted_by_cleanup = False
         self._cleanup_error: BaseException | None = None
+        # asyncio discards a cancelled task's original exception after its
+        # first retrieval. Both the reader and closer need the same evidence.
+        self._terminal_error: BaseException | None = None
         self._cancellation_watch_started = False
         self._consumer_close = _ConsumerCloseRecord()
         # The producer runs in a copy of the constructing context in which
         # this iterator's close record is bound, so the producer can find
         # the record of ITS consumer. The record's owner binding below is
         # what keeps tasks the producer spawns from claiming it.
-        owner_context = contextvars.copy_context()
+        owner_context = contextvars.copy_context() if owner_context is None else owner_context
         owner_context.run(_CONSUMER_CLOSE.set, self._consumer_close)
         self._owner = asyncio.create_task(
             self._run(),
@@ -144,6 +148,8 @@ class OwnedAsyncIterator(Generic[_T]):
 
         if not self._owner.done():
             return None
+        if self._terminal_error is not None:
+            return self._terminal_error
         try:
             return self._owner.exception()
         except asyncio.CancelledError as error:
@@ -188,6 +194,8 @@ class OwnedAsyncIterator(Generic[_T]):
         if marker is _ITERATOR_TERMINAL:
             self._closed = True
             outcome = await await_owned_task(self._owner)
+            if self._terminal_error is not None:
+                outcome = OwnedTaskOutcome(None, self._terminal_error, outcome.cancellation)
             raise_owned_outcome(outcome, operation=self._operation)
             raise StopAsyncIteration
 
@@ -270,6 +278,12 @@ class OwnedAsyncIterator(Generic[_T]):
                     if self._stop.is_set():
                         break
             except BaseException as error:
+                # Import lazily: execution_custody also uses this primitive.
+                # A cancellation carrying authority/commit evidence is not
+                # our private producer interrupt, even during requested close.
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(error):
+                    raise
                 # An exception raised while a requested close interrupts
                 # ``anext`` belongs to generator unwinding, not ordinary
                 # source execution. Preserve that distinction for lifecycle
@@ -303,6 +317,9 @@ class OwnedAsyncIterator(Generic[_T]):
                     self._items.put_nowait((_ITERATOR_INTERRUPTED, None))
                     return
                 raise
+        except BaseException as error:
+            self._terminal_error = error
+            raise
         finally:
             try:
                 if iterator is not None:
@@ -311,8 +328,12 @@ class OwnedAsyncIterator(Generic[_T]):
                         try:
                             await close_iterator()
                         except BaseException as error:
+                            from kestrel_sovereign.execution_custody import execution_terminal_error
                             self._cleanup_error = error
-                            raise
+                            self._terminal_error = execution_terminal_error(
+                                self._terminal_error, error,
+                            )
+                            raise self._terminal_error
             finally:
                 self._items.put_nowait((_ITERATOR_TERMINAL, None))
 
@@ -332,10 +353,14 @@ class OwnedAsyncIterator(Generic[_T]):
         if not self._owner.done() and not self._interrupted_by_cleanup:
             owner_cancelled_by_close = self._owner.cancel()
         outcome = await await_owned_task(self._owner)
+        if self._terminal_error is not None:
+            outcome = OwnedTaskOutcome(None, self._terminal_error, outcome.cancellation)
+        from kestrel_sovereign.execution_custody import is_execution_control_error
         if (
             owner_cancelled_by_close
             and isinstance(outcome.error, asyncio.CancelledError)
             and self._cleanup_error is None
+            and not is_execution_control_error(outcome.error)
         ):
             # Cancellation is the private interrupt used to wake a producer
             # blocked in ``anext``. Once the owner's finally block has closed
@@ -390,7 +415,16 @@ def raise_owned_outcome(
     *,
     operation: str,
 ) -> _T:
-    """Apply caller-cancellation precedence to a retrieved owned outcome."""
+    """Preserve control evidence before ordinary caller-cancellation precedence."""
+
+    from kestrel_sovereign.execution_custody import (
+        execution_terminal_error, is_execution_control_error,
+    )
+    if any(
+        error is not None and is_execution_control_error(error)
+        for error in (outcome.error, outcome.cancellation)
+    ):
+        raise execution_terminal_error(outcome.error, outcome.cancellation)
 
     if outcome.cancellation is not None:
         if outcome.error is not None:

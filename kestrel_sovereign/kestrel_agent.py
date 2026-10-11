@@ -128,6 +128,7 @@ from kestrel_sovereign.security.input_guardrails import (
     append_security_addendum,
 )
 from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
+from kestrel_sovereign.execution_custody import execution_work_operation
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
@@ -138,6 +139,7 @@ from kestrel_sovereign.telemetry import (
 )
 
 if TYPE_CHECKING:
+    from kestrel_sovereign.execution_custody import ExecutionCustody
     from kestrel_sovereign.a2a.agent_card import AgentCard
     from kestrel_sovereign.features.peers.directory import (
         PeerDirectoryRouter,
@@ -723,6 +725,7 @@ class KestrelAgent(
         database_url: Optional[str] = None,
         db_backend: Optional[str] = None,
         shared_postgres_advisory_backend: Optional["PostgresBackend"] = None,
+        execution_custody: Optional["ExecutionCustody"] = None,
         allowed_features: Optional[set] = None,
         sync_enabled: Optional[bool] = None,
         payer_policy=None,
@@ -864,6 +867,15 @@ class KestrelAgent(
                 complete maintenance snapshot for the active capability.
         """
         self.did = did
+        from kestrel_sovereign.execution_custody import ExecutionCustody, require_execution_work
+
+        if execution_custody is not None and not isinstance(execution_custody, ExecutionCustody):
+            raise TypeError("execution_custody must be Core ExecutionCustody")
+        self._execution_custody = execution_custody
+        require_execution_work(self)
+        # Resident services belong to the immutable runtime, not the short
+        # scheduler/request admission that happened to cause its cold boot.
+        self._runtime_publication_ready = asyncio.Event()
         # Production launchers bind the fleet control store before initialize.
         # Direct construction remains supported for embedding/tests; only an
         # explicit binding activates the durable turn-start admission seam.
@@ -881,6 +893,8 @@ class KestrelAgent(
         effective_db_backend = db_backend or os.environ.get(
             "KESTREL_DB_BACKEND", "sqlite"
         )
+        if execution_custody is not None and effective_db_backend.lower() != "postgres":
+            raise ValueError("custody-bound hosted runtime requires PostgreSQL")
         if type(isolated_runtime_hosted) is not bool:
             raise TypeError("isolated_runtime_hosted must be a bool")
         if isolated_feature_data_dir is not None and (
@@ -1497,6 +1511,9 @@ class KestrelAgent(
         ] = None
         self._host_authority_boot_expired = False
 
+        self._llm_service_needs_native_usage = (
+            llm_service is None and self._execution_custody is not None
+        )
         self.llm_service = llm_service or LLMService()
         from kestrel_sovereign.agent.operator_signals import OperatorSignalProducer
         self.operator_signal_producer = OperatorSignalProducer(self)
@@ -1511,7 +1528,21 @@ class KestrelAgent(
         # surface. Real LLMService instances always have attach_to_agent;
         # the invariant is enforced for them and silently waived for fakes.
         if hasattr(self.llm_service, "attach_to_agent"):
-            self.llm_service.attach_to_agent(did)
+            # Resolve the canonical type independently of the replaceable
+            # construction factory (hosts/tests may supply a callable there).
+            from kestrel_sovereign.llm.service import LLMService as NativeLLMService
+
+            if isinstance(self.llm_service, NativeLLMService):
+                self.llm_service.attach_to_agent(did, execution_custody=self._execution_custody)
+                # AgentManager supplies a service before native storage exists.
+                # It needs the same original-session usage executor as a
+                # directly constructed service, not a later SQLAlchemy pool.
+                self._llm_service_needs_native_usage = bool(
+                    self._execution_custody is not None
+                    and self.llm_service._usage_db is None
+                )
+            else:
+                self.llm_service.attach_to_agent(did)
         # Mirror the construction-time display name onto the LLMService so LLM
         # spans are attributed from the very first call — including the genesis
         # audit and feature-init calls that run inside initialize() before the
@@ -2137,6 +2168,7 @@ class KestrelAgent(
                 else self._explicit_advisory_dsn
             ),
             advisory_backend=self._shared_postgres_advisory_backend,
+            execution_custody=getattr(self, "_execution_custody", None),
         )
 
     async def initialize(self) -> None:
@@ -2170,10 +2202,22 @@ class KestrelAgent(
         self._boot_context = ctx
 
         def _set_state(new_state: BootPhaseState) -> None:
+            if new_state is BootPhaseState.READY:
+                from kestrel_sovereign.execution_custody import require_execution_work
+                require_execution_work(self)
             self._boot_state = new_state
+            ready = getattr(self, "_runtime_publication_ready", None)
+            if isinstance(ready, asyncio.Event):
+                if new_state is BootPhaseState.READY:
+                    ready.set()
+                else:
+                    ready.clear()
 
         try:
-            await run_boot_sequence(self._boot_phases(), ctx, _set_state)
+            from kestrel_sovereign.execution_custody import bind_execution_runtime
+
+            with bind_execution_runtime(self):
+                await run_boot_sequence(self._boot_phases(), ctx, _set_state)
         except asyncio.CancelledError as exc:
             if self._host_authority_boot_expired:
                 raise PersistedSpawnMandateExpiredError(
@@ -2543,8 +2587,15 @@ class KestrelAgent(
                 )
                 logging.info(f"Using shared PostgreSQL pool for Kestrel storage (agent: {self.did})")
             else:
+                postgres_backend: Any = "postgres"
+                if getattr(self, "_execution_custody", None) is not None:
+                    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+                    postgres_backend = PostgresBackend(
+                        self._database_url, execution_custody=self._execution_custody,
+                    )
                 self._raw_storage = AsyncStorage(
-                    backend="postgres",
+                    backend=postgres_backend,
                     dsn=self._database_url,
                     agent_id=self.did,
                     llm_service=self.llm_service,
@@ -2575,6 +2626,17 @@ class KestrelAgent(
         # stopped just before storage closes (#3522).
         ctx.on_rollback("background_tasks", self._boot_teardown_background_tasks)
         await self._raw_storage.initialize()
+
+        if getattr(self, "_llm_service_needs_native_usage", False):
+            # A directly supplied pool/DSN is not represented by process env.
+            # Reuse the now-initialized, custody-bound native agent database
+            # before embeddings, boot audits or any provider/accounting call.
+            # It remains storage-owned: LLM retirement must not close it.
+            from kestrel_sovereign.llm.service import LLMService as NativeLLMService
+
+            if isinstance(self.llm_service, NativeLLMService):
+                self.llm_service._init_usage_tracking(usage_db=self._raw_storage.db)
+            self._llm_service_needs_native_usage = False
 
         # Wrap storage with privacy-enforcing layer
         self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
@@ -2720,18 +2782,20 @@ class KestrelAgent(
         """Phase 2 — A2A stores, observability, and the signal spine. TaskManager + its stores, the observability/feedback sinks, the enablement store, the SignalDispatcher/registries, and the core (always-on) signal sources."""
         # Initialize TaskManager for A2A unified routing
         # All stores use the abstract data layer (SQLite for sovereign, PostgreSQL for multi-tenant)
-        if self._db_backend.lower() == "postgres" and self.pg_pool:
-            # PostgreSQL mode: use PostgreSQL stores with existing pool
+        if self._db_backend.lower() == "postgres":
+            # Reuse storage's guarded native backend in both shared-pool and
+            # DSN-only modes; wrappers must not drop its retained generation.
+            pg_backend = self._raw_storage._backend
             from kestrel_sovereign.a2a.stores.postgres import (
                 PostgresTaskStore, PostgresSessionService,
                 PostgresMemoryService, PostgresObservabilityStore,
                 PostgresFeedbackStore
             )
-            task_store = PostgresTaskStore(self.pg_pool)
-            session_service = PostgresSessionService(self.pg_pool)
-            observability_store = PostgresObservabilityStore(self.pg_pool)
-            memory_service = PostgresMemoryService(self.pg_pool)
-            feedback_store = PostgresFeedbackStore(self.pg_pool)
+            task_store = PostgresTaskStore(backend=pg_backend)
+            session_service = PostgresSessionService(backend=pg_backend)
+            observability_store = PostgresObservabilityStore(backend=pg_backend)
+            memory_service = PostgresMemoryService(backend=pg_backend)
+            feedback_store = PostgresFeedbackStore(backend=pg_backend)
             logging.info(f"Using PostgreSQL A2A stores for agent {self.did}")
         else:
             # SQLite mode: use SQLite stores with file path
@@ -4060,6 +4124,7 @@ class KestrelAgent(
             on_resume=_on_resume,
             tick_seconds=self._resume_monitor_config.tick_seconds,
             threshold_seconds=self._resume_monitor_config.threshold_seconds,
+            task_factory=self._track_runtime_task,
         )
         if self._resume_monitor_config.enabled:
             await self.resume_monitor.start()
@@ -4148,6 +4213,7 @@ class KestrelAgent(
         # the agent, opens the gate, then completes this same hook pass.
         await self._run_or_defer_agent_ready_hooks()
 
+    @execution_work_operation
     async def _notify_agent_ready_hooks(self) -> None:
         """Run the best-effort ready-phase hook once services are usable."""
 
@@ -4158,6 +4224,9 @@ class KestrelAgent(
             try:
                 await ready_hook(self)
             except (Exception, asyncio.CancelledError) as e:
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(e):
+                    raise
                 # Ready hooks are explicitly best-effort.  A hook can await a
                 # child task that was independently cancelled; on modern
                 # Python that outcome is a BaseException and used to cancel
@@ -4177,6 +4246,7 @@ class KestrelAgent(
                     getattr(feature, "name", type(feature).__name__), e,
                 )
 
+    @execution_work_operation
     async def _run_or_defer_agent_ready_hooks(self) -> None:
         """Run ready hooks now, or defer them behind host policy publication."""
 
@@ -4208,6 +4278,7 @@ class KestrelAgent(
             )
         self._agent_readiness_host_owned = True
 
+    @execution_work_operation
     async def complete_deferred_agent_readiness(self) -> None:
         """Complete the server-deferred ready hooks after host publication."""
 
@@ -4941,7 +5012,15 @@ class KestrelAgent(
         transition/shutdown, but a failure is always surfaced (report + audit).
         """
         try:
-            report = await self.storage.purge_ephemeral_session(reason=reason)
+            from kestrel_sovereign.execution_custody import ExecutionCustody, ProcessRuntimeExecutionFence
+            scope = getattr(self, "_execution_custody", None)
+            native = getattr(getattr(self.storage, "_storage", None), "_backend", None)
+            if (reason == "ephemeral-agent-shutdown" and isinstance(scope, ExecutionCustody)
+                    and isinstance(scope.fence, ProcessRuntimeExecutionFence) and scope.fence._retired
+                    and getattr(native, "backend_type", None) == "postgres"):
+                report = await native.purge_retired_ephemeral_session(self.storage, reason=reason)
+            else:
+                report = await self.storage.purge_ephemeral_session(reason=reason)
         except Exception as e:
             logging.error(
                 "ephemeral hard-purge raised; treating as an UNCERTIFIED purge "
@@ -8147,6 +8226,65 @@ Expected Duration: {expected_duration}
         task.add_done_callback(self._background_tasks.discard)
         return task
 
+    def _runtime_owner_context(self):
+        """Original resident context; also used by lifecycle-owned timers.
+
+        Durable owner heartbeat may run before READY to protect admitted boot
+        work. Resident effect loops use `_track_runtime_task`'s READY barrier.
+        """
+        from contextvars import Context
+        from kestrel_sovereign.execution_custody import (
+            ExecutionAuthorityError, ExecutionCustody, _CURRENT_CUSTODY,
+            current_execution_custody, require_execution_work,
+        )
+        require_execution_work(self)
+        scope = self._execution_custody
+        if current_execution_custody() and not isinstance(scope, ExecutionCustody):
+            raise ExecutionAuthorityError("resident handoff requires original runtime custody")
+        context = Context()
+        if isinstance(scope, ExecutionCustody):
+            context.run(_CURRENT_CUSTODY.set, (scope,))
+        return context
+
+    def _track_runtime_task(self, coro, *, name: str) -> asyncio.Task:
+        """Publish an explicit first-party resident owner, never an effect child.
+
+        Creation requires every current admission to be live; READY publication
+        checks them again. Only then does this service run under the original
+        runtime generation. Ordinary `_track_background_task` children retain
+        all denying ancestors and never receive this handoff.
+        """
+        from kestrel_sovereign.execution_custody import require_execution_work
+        try:
+            context = self._runtime_owner_context()
+        except BaseException:
+            coro.close()
+            raise
+        ready = self._runtime_publication_ready
+        started = False
+
+        async def resident():
+            nonlocal started
+            await ready.wait()
+            require_execution_work(self)
+            started = True
+            return await coro
+
+        # Do not inherit a cognition turn's caller, Hold grant or cleanup flag.
+        # This context carries the SAME irreversible original runtime object;
+        # it does not mint a replacement admission or refresh a generation.
+        task = asyncio.create_task(resident(), name=name, context=context)
+        task._kestrel_started_at = time.monotonic()
+        self._background_tasks.add(task)
+
+        def completed(done):
+            self._background_tasks.discard(done)
+            if not started:
+                coro.close()
+
+        task.add_done_callback(completed)
+        return task
+
     async def _shutdown_background_tasks(self) -> None:
         tasks = set(self._background_tasks)
         if not tasks:
@@ -8574,6 +8712,12 @@ Expected Duration: {expected_duration}
             raise RuntimeError(
                 "Cannot shut down an agent from a live durable signal operation"
             )
+        from kestrel_sovereign.execution_custody import (
+            retire_process_runtime_custody,
+        )
+        # Borrowed tenant/shared host authority must never be retired by
+        # shutting down one agent. Deny local children before any await.
+        retire_process_runtime_custody(getattr(self, "_execution_custody", None))
         storage_close_timeout = _minimum_storage_close_timeout(self.storage)
         # A feature may lazily create a file-backed SQLAlchemy factory during
         # its shutdown.  Reserve that backend-declared *potential* close

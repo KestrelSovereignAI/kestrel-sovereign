@@ -351,6 +351,44 @@ async def test_reanchor_rejects_oversized_artifact_before_storage(tmp_path):
 # --- Happy path with valid hash ---
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["committed", "unknown"])
+async def test_reanchor_commit_outcome_never_claims_rollback_or_invites_retry(tmp_path, outcome):
+    """Consumer policy only; native PostgreSQL proves the commit distinction."""
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    agent, _ = _make_agent()
+    artifact_path = _write_artifact(tmp_path)
+    original_transaction = agent._raw_storage.transaction
+
+    @asynccontextmanager
+    async def lost_at_commit():
+        async with original_transaction():
+            yield
+        raise ExecutionCommitOutcomeError(outcome)
+
+    agent._raw_storage.transaction = lost_at_commit
+    consumed = object()
+    with patch.object(ConstitutionMixin, "_consume_initial_anchor_custody", AsyncMock(return_value=consumed)), \
+         patch.object(ConstitutionMixin, "_publish_consumed_anchor_custody") as publish, \
+         patch("builtins.open", create=True) as mock_open:
+        mock_open.side_effect = _open_handles(FAKE_CONSTITUTION, artifact_path.read_bytes())
+        result = await agent.reanchor_constitution(
+            expected_hash=FAKE_HASH[:8], authorization="admin_command",
+            amendment_artifact_path=str(artifact_path),
+        )
+    assert f"outcome is {outcome}" in result
+    assert "do not retry" in result
+    assert "rolled back" not in result and "successfully" not in result
+    assert agent._safe_mode is True
+    assert "reconciliation" in agent._safe_mode_reason
+    if outcome == "committed":
+        publish.assert_called_once_with(agent, consumed)
+    else:
+        publish.assert_not_called()
+    agent.privacy_agent.add_conversation.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path):
     """Re-anchor stores new constitution when expected hash matches."""
     agent, node = _make_agent(stored_hash=ANCHORED_HASH, safe_mode=False)

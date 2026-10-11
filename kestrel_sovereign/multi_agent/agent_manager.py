@@ -810,6 +810,7 @@ class AgentManager:
             ]
         ] = None,
         shared_postgres_backend: object | None = None,
+        execution_custody_factory: Callable[[str, str, LocalAgentConfig], object | None] | None = None,
         hold_store: object | None = None,
     ):
         self._validate_shared_postgres_backend(shared_postgres_backend)
@@ -863,6 +864,7 @@ class AgentManager:
         # terminally drained every child. Each hosted child gets the exact same
         # operational pool and delegates advisory sessions back to this owner.
         self._shared_postgres_backend = shared_postgres_backend
+        self._execution_custody_factory = execution_custody_factory
         self._lock = asyncio.Lock()
         # Inbound hosted A2A verification/authorization/task persistence holds
         # a shared reader lease from DID resolution through create_task.
@@ -1134,6 +1136,28 @@ class AgentManager:
                 "shared PostgreSQL backend must be bound before agent initialization"
             )
         self._shared_postgres_backend = backend
+
+    def _execution_custody_for_agent(self, name: str, did: str, config: LocalAgentConfig):
+        """Resolve trusted custody before boot; never discard a bound pool owner.
+
+        Hosts with independent per-agent generations should pass an unbound
+        operational pool plus this factory. A bound shared backend cannot be
+        silently replaced by a different per-agent admission.
+        """
+        from kestrel_sovereign.execution_custody import ExecutionCustody, ExecutionAuthorityError
+
+        retained = getattr(self._shared_postgres_backend, "_execution_custody", None)
+        custody = (
+            self._execution_custody_factory(name, did, config)
+            if self._execution_custody_factory is not None else retained
+        )
+        if custody is not None and not isinstance(custody, ExecutionCustody):
+            raise TypeError("agent execution custody factory must return ExecutionCustody")
+        if retained is not None and custody is not retained:
+            raise ExecutionAuthorityError("AgentManager cannot discard shared-backend execution custody")
+        if custody is not None:
+            custody.require_work()
+        return custody
 
     def bind_hold_store(self, store: object) -> None:
         """Bind durable Hold admission before any hosted agent initializes."""
@@ -2618,11 +2642,6 @@ class AgentManager:
 
         db_path = str(resolved_dir / "kestrel_prime.db")
 
-        # Each agent gets its own LLMService (mutable model state). Bind it to
-        # THIS agent's data root: an in-process host shares one environment
-        # across every agent, so ``KESTREL_DB_PATH`` cannot name each agent's
-        # directory and usage rows would all land in one agent's DB (#2769).
-        llm_service = LLMService(agent_data_dir=resolved_dir)
         hosted_telegram_resolver = None
         if self._hosted_telegram_route_attestation_resolver_factory is not None:
             hosted_telegram_resolver = (
@@ -2705,10 +2724,21 @@ class AgentManager:
             )
 
         agent: Optional[KestrelAgent] = None
+        execution_custody = self._execution_custody_for_agent(name, agent_did, config)
+        if execution_custody is not None and not hosted_runtime_configured:
+            raise ValueError("execution custody requires a PostgreSQL hosted runtime")
+        from kestrel_sovereign.execution_custody import bind_execution_custody_snapshot
+        llm_service = None
         scheduler_registration: Optional[
             _DynamicSchedulerTenantRegistration
         ] = None
         try:
+            # Validate both the original host generation and every ambient
+            # admission before provider clients/plugins can be constructed.
+            # The service belongs to THIS agent's data root (#2769).
+            captured = () if execution_custody is None else (execution_custody,)
+            with bind_execution_custody_snapshot(captured):
+                llm_service = LLMService(agent_data_dir=resolved_dir)
             scheduler_registration = (
                 await self._begin_dynamic_scheduler_tenant_registration(
                     name,
@@ -2735,6 +2765,7 @@ class AgentManager:
                     database_url=database_url,
                     db_backend="postgres",
                     pg_pool=shared_postgres_pool,
+                    execution_custody=execution_custody,
                     shared_postgres_advisory_backend=(
                         self._shared_postgres_backend
                     ),
@@ -2961,6 +2992,8 @@ class AgentManager:
                         data_dir=config.resolve_data_dir(self._base_data_dir),
                     )
             else:
+                from kestrel_sovereign.execution_custody import retire_process_runtime_custody
+                retire_process_runtime_custody(execution_custody)
                 if scheduler_registration is not None:
                     rollback_task = asyncio.create_task(
                         scheduler_registration.rollback(),
@@ -2979,14 +3012,15 @@ class AgentManager:
                                 rollback_failure.__traceback__,
                             ),
                         )
-                try:
-                    await llm_service.close()
-                except Exception:
-                    logger.warning(
-                        "Failed to close LLM service for uninitialized agent %r",
-                        name,
-                        exc_info=True,
-                    )
+                if llm_service is not None:
+                    try:
+                        await llm_service.close()
+                    except Exception:
+                        logger.warning(
+                            "Failed to close LLM service for uninitialized agent %r",
+                            name,
+                            exc_info=True,
+                        )
             raise
         # Spawn-mandate enforcement (restricted_tools hook + spawn_mandate attach)
         # is reattached inside KestrelAgent.initialize() from the persisted

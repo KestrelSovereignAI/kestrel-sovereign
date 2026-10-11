@@ -12,6 +12,7 @@ from functools import wraps
 
 import openai
 import httpx
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, is_execution_control_error
 
 logger = logging.getLogger(__name__)
 
@@ -94,42 +95,56 @@ def handle_llm_errors(
             provider = provider_name or kwargs.get('provider_name', 'unknown')
             try:
                 return await func(*args, **kwargs)
+            except ExecutionAuthorityError:
+                raise
             except asyncio.TimeoutError as e:
+                if is_execution_control_error(e):
+                    raise
                 error = LLMProviderTimeoutError(provider, "Request timeout", e)
                 if log_errors:
                     logger.error(f"Timeout in {func.__name__} for provider {provider}: {e}")
                 if reraise_as:
                     raise reraise_as(str(error)) from e
-                raise error
+                raise error from e
             except openai.AuthenticationError as e:
+                if is_execution_control_error(e):
+                    raise
                 error = LLMProviderAuthError(provider, "Authentication failed", e)
                 if log_errors:
                     logger.error(f"Auth error in {func.__name__} for provider {provider}: {e}", exc_info=True)
                 if reraise_as:
                     raise reraise_as(str(error)) from e
-                raise error
+                raise error from e
             except openai.RateLimitError as e:
+                if is_execution_control_error(e):
+                    raise
                 error = LLMProviderQuotaError(provider, "Quota exceeded", e)
                 if log_errors:
                     logger.error(f"Rate limit in {func.__name__} for provider {provider}: {e}", exc_info=True)
                 if reraise_as:
                     raise reraise_as(str(error)) from e
-                raise error
+                raise error from e
             except (openai.APIConnectionError, httpx.HTTPError, ConnectionError) as e:
+                if is_execution_control_error(e):
+                    raise
                 error = LLMProviderError(provider, "Connection error", e)
                 if log_errors:
                     logger.error(f"Connection error in {func.__name__} for provider {provider}: {e}", exc_info=True)
                 if reraise_as:
                     raise reraise_as(str(error)) from e
-                raise error
+                raise error from e
             except openai.APIError as e:
+                if is_execution_control_error(e):
+                    raise
                 error = LLMProviderError(provider, "API error", e)
                 if log_errors:
                     logger.error(f"API error in {func.__name__} for provider {provider}: {e}", exc_info=True)
                 if reraise_as:
                     raise reraise_as(str(error)) from e
-                raise error
+                raise error from e
             except LLMError as e:
+                if is_execution_control_error(e):
+                    raise
                 # Already a classified LLM error (e.g. ModelNotAvailableForRoute
                 # raised to signal the outer fallback loop to skip a route). Do
                 # NOT re-wrap it into ``LLMProviderError(provider='unknown', ...)``
@@ -143,6 +158,8 @@ def handle_llm_errors(
                     raise reraise_as(str(e)) from e
                 raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 # Classify common provider errors from error message
                 error_msg = str(e).lower()
                 if any(keyword in error_msg for keyword in ['unauthorized', 'invalid key', 'authentication']):
@@ -159,42 +176,54 @@ def handle_llm_errors(
 
                 if reraise_as:
                     raise reraise_as(str(error)) from e
-                raise error
+                raise error from e
 
         @wraps(func)
         def sync_wrapper(*args, **kwargs):
             provider = provider_name or kwargs.get('provider_name', 'unknown')
             try:
                 return func(*args, **kwargs)
+            except ExecutionAuthorityError:
+                raise
             except openai.AuthenticationError as e:
+                if is_execution_control_error(e):
+                    raise
                 error = LLMProviderAuthError(provider, "Authentication failed", e)
                 if log_errors:
                     logger.error(f"Auth error in {func.__name__} for provider {provider}: {e}", exc_info=True)
                 if reraise_as:
                     raise reraise_as(str(error)) from e
-                raise error
+                raise error from e
             except openai.RateLimitError as e:
+                if is_execution_control_error(e):
+                    raise
                 error = LLMProviderQuotaError(provider, "Quota exceeded", e)
                 if log_errors:
                     logger.error(f"Rate limit in {func.__name__} for provider {provider}: {e}", exc_info=True)
                 if reraise_as:
                     raise reraise_as(str(error)) from e
-                raise error
+                raise error from e
             except (openai.APIConnectionError, httpx.HTTPError, ConnectionError) as e:
+                if is_execution_control_error(e):
+                    raise
                 error = LLMProviderError(provider, "Connection error", e)
                 if log_errors:
                     logger.error(f"Connection error in {func.__name__} for provider {provider}: {e}", exc_info=True)
                 if reraise_as:
                     raise reraise_as(str(error)) from e
-                raise error
+                raise error from e
             except openai.APIError as e:
+                if is_execution_control_error(e):
+                    raise
                 error = LLMProviderError(provider, "API error", e)
                 if log_errors:
                     logger.error(f"API error in {func.__name__} for provider {provider}: {e}", exc_info=True)
                 if reraise_as:
                     raise reraise_as(str(error)) from e
-                raise error
+                raise error from e
             except LLMError as e:
+                if is_execution_control_error(e):
+                    raise
                 # Already-classified LLM error — pass it through unchanged
                 # rather than re-wrapping as "Provider unknown" (#2352).
                 if log_errors:
@@ -203,6 +232,8 @@ def handle_llm_errors(
                     raise reraise_as(str(e)) from e
                 raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 # Same error classification as async version
                 error_msg = str(e).lower()
                 if any(keyword in error_msg for keyword in ['unauthorized', 'invalid key', 'authentication']):
@@ -219,7 +250,7 @@ def handle_llm_errors(
 
                 if reraise_as:
                     raise reraise_as(str(error)) from e
-                raise error
+                raise error from e
 
         # Return appropriate wrapper based on function type
         if asyncio.iscoroutinefunction(func):
@@ -245,12 +276,18 @@ def handle_observability_errors(func: Callable) -> Callable:
         try:
             return await func(*args, **kwargs)
         except (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Observability network/storage error in {func.__name__}: {e}", exc_info=True)
             return None  # Return None to indicate failure without raising
         except (ValueError, TypeError, KeyError, AttributeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Observability data error in {func.__name__}: {e}", exc_info=True)
             return None
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Observability operation failed in {func.__name__}: {e}", exc_info=True)
             return None  # Return None to indicate failure without raising
 
@@ -259,12 +296,18 @@ def handle_observability_errors(func: Callable) -> Callable:
         try:
             return func(*args, **kwargs)
         except (ConnectionError, OSError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Observability network/storage error in {func.__name__}: {e}", exc_info=True)
             return None
         except (ValueError, TypeError, KeyError, AttributeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Observability data error in {func.__name__}: {e}", exc_info=True)
             return None
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Observability operation failed in {func.__name__}: {e}", exc_info=True)
             return None
 
@@ -292,14 +335,20 @@ def handle_storage_errors(operation_name: str = "storage operation"):
             try:
                 return await func(*args, **kwargs)
             except (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError) as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Storage connection error in {operation_name} ({func.__name__}): {e}", exc_info=True)
                 # For storage errors, we usually want to continue operation
                 # but log the failure for investigation
                 return None
             except (KeyError, ValueError, TypeError, AttributeError) as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Storage data error in {operation_name} ({func.__name__}): {e}", exc_info=True)
                 return None
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Storage error in {operation_name} ({func.__name__}): {e}", exc_info=True)
                 # For storage errors, we usually want to continue operation
                 # but log the failure for investigation
@@ -310,12 +359,18 @@ def handle_storage_errors(operation_name: str = "storage operation"):
             try:
                 return func(*args, **kwargs)
             except (ConnectionError, OSError, TimeoutError) as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Storage connection error in {operation_name} ({func.__name__}): {e}", exc_info=True)
                 return None
             except (KeyError, ValueError, TypeError, AttributeError) as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Storage data error in {operation_name} ({func.__name__}): {e}", exc_info=True)
                 return None
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Storage error in {operation_name} ({func.__name__}): {e}", exc_info=True)
                 return None
 
@@ -343,13 +398,19 @@ def handle_crypto_errors(func: Callable) -> Callable:
         try:
             return await func(*args, **kwargs)
         except (ValueError, TypeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Cryptographic parameter error in {func.__name__}: {e}", exc_info=True)
             # Reraise crypto errors as they're usually critical
             raise
         except (OSError, IOError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Cryptographic I/O error in {func.__name__}: {e}", exc_info=True)
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Cryptographic operation failed in {func.__name__}: {e}", exc_info=True)
             # Reraise crypto errors as they're usually critical
             raise
@@ -359,12 +420,18 @@ def handle_crypto_errors(func: Callable) -> Callable:
         try:
             return func(*args, **kwargs)
         except (ValueError, TypeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Cryptographic parameter error in {func.__name__}: {e}", exc_info=True)
             raise
         except (OSError, IOError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Cryptographic I/O error in {func.__name__}: {e}", exc_info=True)
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Cryptographic operation failed in {func.__name__}: {e}", exc_info=True)
             raise
 
@@ -397,6 +464,8 @@ def with_retry(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0):
                 try:
                     return await func(*args, **kwargs)
                 except (openai.APIError, openai.APIConnectionError, httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+                    if is_execution_control_error(e):
+                        raise
                     last_error = e
                     if attempt < max_attempts - 1:  # Don't sleep on the last attempt
                         logger.debug(f"Attempt {attempt + 1} failed in {func.__name__}: {e}. Retrying in {current_delay}s...", exc_info=True)
@@ -405,6 +474,8 @@ def with_retry(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0):
                     else:
                         logger.error(f"All {max_attempts} attempts failed in {func.__name__}: {e}", exc_info=True)
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     last_error = e
                     if attempt < max_attempts - 1:  # Don't sleep on the last attempt
                         logger.debug(f"Attempt {attempt + 1} failed in {func.__name__}: {e}. Retrying in {current_delay}s...", exc_info=True)
@@ -424,6 +495,8 @@ def with_retry(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0):
                 try:
                     return func(*args, **kwargs)
                 except (openai.APIError, openai.APIConnectionError, httpx.HTTPError, ConnectionError, TimeoutError) as e:
+                    if is_execution_control_error(e):
+                        raise
                     last_error = e
                     if attempt < max_attempts - 1:
                         logger.debug(f"Attempt {attempt + 1} failed in {func.__name__}: {e}. Retrying in {current_delay}s...", exc_info=True)
@@ -432,6 +505,8 @@ def with_retry(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0):
                     else:
                         logger.error(f"All {max_attempts} attempts failed in {func.__name__}: {e}", exc_info=True)
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     last_error = e
                     if attempt < max_attempts - 1:
                         logger.debug(f"Attempt {attempt + 1} failed in {func.__name__}: {e}. Retrying in {current_delay}s...", exc_info=True)
@@ -475,16 +550,22 @@ def handle_provider_fallback(providers: list):
                     # Call the function with the current provider
                     return await func(provider_info, *args, **kwargs)
                 except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
+                    if is_execution_control_error(e):
+                        raise
                     provider_name = getattr(provider_info, 'name', str(provider_info))
                     errors[provider_name] = e
                     logger.warning(f"Provider {provider_name} API error: {e}", exc_info=True)
                     continue
                 except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+                    if is_execution_control_error(e):
+                        raise
                     provider_name = getattr(provider_info, 'name', str(provider_info))
                     errors[provider_name] = e
                     logger.warning(f"Provider {provider_name} network error: {e}", exc_info=True)
                     continue
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     provider_name = getattr(provider_info, 'name', str(provider_info))
                     errors[provider_name] = e
                     logger.warning(f"Provider {provider_name} failed: {e}", exc_info=True)
@@ -501,16 +582,22 @@ def handle_provider_fallback(providers: list):
                 try:
                     return func(provider_info, *args, **kwargs)
                 except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
+                    if is_execution_control_error(e):
+                        raise
                     provider_name = getattr(provider_info, 'name', str(provider_info))
                     errors[provider_name] = e
                     logger.warning(f"Provider {provider_name} API error: {e}", exc_info=True)
                     continue
                 except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+                    if is_execution_control_error(e):
+                        raise
                     provider_name = getattr(provider_info, 'name', str(provider_info))
                     errors[provider_name] = e
                     logger.warning(f"Provider {provider_name} network error: {e}", exc_info=True)
                     continue
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     provider_name = getattr(provider_info, 'name', str(provider_info))
                     errors[provider_name] = e
                     logger.warning(f"Provider {provider_name} failed: {e}", exc_info=True)

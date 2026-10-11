@@ -21,6 +21,7 @@ import secrets
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
+from functools import wraps
 from typing import (
     Any,
     AsyncContextManager,
@@ -1094,6 +1095,41 @@ def build_ingress_trust_receipt(
     return receipt
 
 
+def _owns_retry_release_receipt(method):
+    """Keep one resident store's exact retry unavailable until its ACK joins.
+
+    This is local custody, not a replacement database lease. The persisted
+    original owner/token still excludes siblings; stopped/stale owners retain
+    crash recovery. Only the canonical consumer needs this additional fence.
+    """
+    @wraps(method)
+    async def owned(self, **kwargs):
+        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        if kwargs["consumer_id"] != DURABLE_COGNITION_CONSUMER_ID:
+            return await method(self, **kwargs)
+        key = (kwargs["agent_id"], kwargs["consumer_id"], kwargs["delivery_id"])
+        self._pending_retry_release_receipts[key] = self._pending_retry_release_receipts.get(key, 0) + 1
+        try:
+            result = await method(self, **kwargs)
+        except BaseException as error:
+            # Failed receipt must not briefly reopen between this method's
+            # unwind and its caller's exact native terminalization.
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(error):
+                self._failed_retry_release_receipts.add(key)
+            raise
+        else:
+            self._failed_retry_release_receipts.discard(key)
+            return result
+        finally:
+            remaining = self._pending_retry_release_receipts[key] - 1
+            if remaining:
+                self._pending_retry_release_receipts[key] = remaining
+            else:
+                self._pending_retry_release_receipts.pop(key)
+    return owned
+
+
 class DurableSignalStore(UnifiedStoreBase):
     """Backend-neutral pending-delivery ledger.
 
@@ -1179,6 +1215,8 @@ class DurableSignalStore(UnifiedStoreBase):
         if not hasattr(backend, "fetch_all") and hasattr(backend, "backend"):
             native_backend = backend.backend
         super().__init__(native_backend)
+        self._pending_retry_release_receipts: dict[tuple[str, str, str], int] = {}
+        self._failed_retry_release_receipts: set[tuple[str, str, str]] = set()
 
     async def initialize(self) -> None:
         """Serialize PostgreSQL's transactional and autocommit schema phases."""
@@ -1500,7 +1538,7 @@ class DurableSignalStore(UnifiedStoreBase):
             # indexed lookup. The separately durable event work table orders
             # NULL rows by immutable event ID without repeatedly sorting the
             # wide event ledger.
-            await self._ensure_postgres_source_sequence_index_concurrently()
+            await self._ensure_postgres_source_sequence_index()
 
         if postgres_finalization_required:
             # Each PostgreSQL history batch is its own durable transaction.
@@ -3280,14 +3318,24 @@ class DurableSignalStore(UnifiedStoreBase):
             and not nulls_not_distinct
         )
 
-    async def _ensure_postgres_source_sequence_index_concurrently(self) -> None:
-        """Repair/build the exact index under initialize's session lock."""
+    async def _ensure_postgres_source_sequence_index(self) -> None:
+        """Repair/build the exact index under initialize's session lock.
+
+        A custody-bound boot uses transactional DDL so the native executor
+        retains authority-row locks through the actual index commit. Unbound
+        host maintenance uses concurrent DDL. Neither mode bypasses ordinary
+        storage custody; large existing ledgers should be migrated by the host
+        before admitting runtime work to avoid a blocking bootstrap build.
+        """
 
         if not self.is_postgres:
             raise RuntimeError("PostgreSQL source-sequence index requires postgres")
         catalog = await self._postgres_source_sequence_index_catalog()
         if self._postgres_source_sequence_index_catalog_valid(catalog):
             return
+        from kestrel_sovereign.execution_custody import current_execution_custody
+
+        concurrency = "" if current_execution_custody(self._backend) else " CONCURRENTLY"
         if catalog is not None:
             # CREATE INDEX CONCURRENTLY can leave an invalid/indisready shell
             # after cancellation or failure. IF NOT EXISTS would trust that
@@ -3305,11 +3353,11 @@ class DurableSignalStore(UnifiedStoreBase):
                 )
             else:
                 await self._backend.execute(
-                    "DROP INDEX CONCURRENTLY IF EXISTS "
+                    f"DROP INDEX{concurrency} IF EXISTS "
                     f"{_quoted_identifier(self.SOURCE_SEQUENCE_SCOPE_INDEX)}"
                 )
         await self._backend.execute(
-            "CREATE UNIQUE INDEX CONCURRENTLY "
+            f"CREATE UNIQUE INDEX{concurrency} "
             f"{_quoted_identifier(self.SOURCE_SEQUENCE_SCOPE_INDEX)} "
             f"ON {_quoted_identifier(self.EVENTS)} "
             "(agent_id, source, source_sequence)"
@@ -3969,15 +4017,16 @@ class DurableSignalStore(UnifiedStoreBase):
             if consumer is None or not consumer[4]:
                 return None
             recovery_now = explicit_now or self.now_utc()
+            stale_before = (
+                _as_utc(runtime_owner_stale_before)
+                if runtime_owner_stale_before is not None
+                else recovery_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
+            )
             await self._recover_expired_leases(
                 agent_id=agent_id,
                 consumer_id=consumer_id,
                 now=recovery_now,
-                runtime_owner_stale_before=(
-                    _as_utc(runtime_owner_stale_before)
-                    if runtime_owner_stale_before is not None
-                    else recovery_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
-                ),
+                runtime_owner_stale_before=stale_before,
             )
             # Backfill is idempotent because delivery identity is unique.
             await self._backfill_consumer(registration, now=recovery_now)
@@ -3985,8 +4034,12 @@ class DurableSignalStore(UnifiedStoreBase):
                 agent_id=agent_id,
                 consumer_id=consumer_id,
                 now=recovery_now,
+                executor_id=executor_id,
+                runtime_owner_stale_before=stale_before,
             )
             if delivery_id is None:
+                return None
+            if self._retry_release_receipt_pending(agent_id, consumer_id, delivery_id):
                 return None
             # A PostgreSQL row lock can wait behind a worker that is slower
             # than this consumer's entire lease.  Preserve an explicitly
@@ -4008,6 +4061,7 @@ class DurableSignalStore(UnifiedStoreBase):
                   AND status IN ('{PENDING}', '{RETRY}')
                   AND (max_attempts = 0 OR attempts < max_attempts)
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  AND {self._managed_retry_claim_sql()}
                 """,
                 (
                     LEASED,
@@ -4021,6 +4075,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     agent_id,
                     consumer_id,
                     self.to_timestamp_param(effective_now),
+                    *self._managed_retry_claim_params(executor_id, stale_before),
                 ),
             )
         if updated == 0:
@@ -4065,23 +4120,28 @@ class DurableSignalStore(UnifiedStoreBase):
             if consumer is None or not consumer[4]:
                 return None
             recovery_now = explicit_now or self.now_utc()
+            stale_before = (
+                _as_utc(runtime_owner_stale_before)
+                if runtime_owner_stale_before is not None
+                else recovery_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
+            )
             await self._recover_expired_leases(
                 agent_id=agent_id,
                 consumer_id=consumer_id,
                 now=recovery_now,
-                runtime_owner_stale_before=(
-                    _as_utc(runtime_owner_stale_before)
-                    if runtime_owner_stale_before is not None
-                    else recovery_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
-                ),
+                runtime_owner_stale_before=stale_before,
             )
             delivery_id = await self._lock_claimable_delivery(
                 agent_id=agent_id,
                 consumer_id=consumer_id,
                 event_id=event_id,
                 now=recovery_now,
+                executor_id=executor_id,
+                runtime_owner_stale_before=stale_before,
             )
             if delivery_id is None:
+                return None
+            if self._retry_release_receipt_pending(agent_id, consumer_id, delivery_id):
                 return None
             # See claim_delivery: do not publish an already-expired implicit
             # lease after waiting for this exact delivery row.
@@ -4099,6 +4159,7 @@ class DurableSignalStore(UnifiedStoreBase):
                   AND status IN ('{PENDING}', '{RETRY}')
                   AND (max_attempts = 0 OR attempts < max_attempts)
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  AND {self._managed_retry_claim_sql()}
                 """,
                 (
                     LEASED,
@@ -4113,6 +4174,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     consumer_id,
                     event_id,
                     self.to_timestamp_param(effective_now),
+                    *self._managed_retry_claim_params(executor_id, stale_before),
                 ),
             )
         if updated == 0:
@@ -4129,6 +4191,8 @@ class DurableSignalStore(UnifiedStoreBase):
         agent_id: str,
         consumer_id: str,
         now: datetime,
+        executor_id: str,
+        runtime_owner_stale_before: datetime,
         event_id: Optional[str] = None,
     ) -> Optional[str]:
         """Serialize one due delivery before assigning an implicit lease clock.
@@ -4152,6 +4216,11 @@ class DurableSignalStore(UnifiedStoreBase):
         if event_id is not None:
             where.insert(2, "event_id = ?")
             params.insert(2, event_id)
+        where.append(self._managed_retry_claim_sql())
+        params.extend(self._managed_retry_claim_params(executor_id, runtime_owner_stale_before))
+        receipt_sql, receipt_params = self._retry_receipt_exclusion_sql()
+        where.append(receipt_sql)
+        params.extend(receipt_params)
         lock_clause = " FOR UPDATE" if self.is_postgres else ""
         row = await self._backend.fetch_one(
             f"""
@@ -4163,6 +4232,68 @@ class DurableSignalStore(UnifiedStoreBase):
             tuple(params),
         )
         return str(row[0]) if row is not None else None
+
+    def _retry_release_receipt_pending(self, agent_id: str, consumer_id: str, delivery_id: str) -> bool:
+        key = (agent_id, consumer_id, delivery_id)
+        return key in self._pending_retry_release_receipts or key in self._failed_retry_release_receipts
+
+    def _retry_receipt_exclusion_sql(self, *, alias: str = "") -> tuple[str, tuple]:
+        keys = tuple(sorted(set(self._pending_retry_release_receipts) | self._failed_retry_release_receipts))
+        prefix = f"{alias}." if alias else ""
+        if not keys:
+            return "1 = 1", ()
+        predicate = f"({prefix}agent_id = ? AND {prefix}consumer_id = ? AND {prefix}delivery_id = ?)"
+        return "NOT (" + " OR ".join(predicate for _ in keys) + ")", tuple(value for key in keys for value in key)
+
+    def _managed_retry_claim_sql(self, *, alias: str = "") -> str:
+        """Do not transfer a retry whose original live owner still owns its ACK.
+
+        Claim/recovery already holds the canonical owner-liveness lock. A
+        successful release retains its old capability until a trusted retry
+        claim replaces it. Thus losing the COMMIT ACK cannot expose ordinary
+        retry work to a sibling while the original scope is fail-closed.
+        The same owner can retry normally under its unchanged custody; a dead
+        owner retains the ledger's existing at-least-once recovery semantics.
+        """
+        prefix = f"{alias}." if alias else ""
+        outer = alias or self.DELIVERIES
+        return f"""(
+            {prefix}consumer_id <> ? OR {prefix}status <> '{RETRY}'
+            OR {prefix}lease_owner IS NULL OR {prefix}lease_owner NOT LIKE 'dispatcher:%'
+            OR {prefix}lease_owner = ? OR NOT EXISTS (
+                SELECT 1 FROM {self.RUNTIME_OWNERS} owner
+                WHERE owner.agent_id = {outer}.agent_id
+                  AND owner.owner_id = {outer}.lease_owner
+                  AND owner.stopped_at IS NULL AND owner.heartbeat_at >= ?
+            )
+        )"""
+
+    def _managed_retry_claim_params(self, executor_id: str, stale_before: datetime) -> tuple:
+        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        return (DURABLE_COGNITION_CONSUMER_ID, executor_id, self.to_timestamp_param(stale_before))
+
+    @staticmethod
+    def _retry_identity_assignment_sql(*, terminal: bool = False, hold: bool = False) -> str:
+        """Retain only the original managed cognition retry capability.
+
+        No new lease is granted: expiry is cleared and ordinary lease actions
+        still require LEASED. Fixed native cleanup can settle this exact old
+        token even when the release committed before its ACK was lost.
+        """
+        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        if terminal:
+            return "lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL"
+        predicate = (
+            f"consumer_id = '{DURABLE_COGNITION_CONSUMER_ID}' "
+            "AND lease_owner LIKE 'dispatcher:%'"
+        )
+        if not hold:
+            predicate += " AND (max_attempts = 0 OR attempts < max_attempts)"
+        return (
+            f"lease_owner = CASE WHEN {predicate} THEN lease_owner ELSE NULL END, "
+            f"lease_token = CASE WHEN {predicate} THEN lease_token ELSE NULL END, "
+            "lease_expires_at = NULL"
+        )
 
     async def renew_delivery_lease(
         self,
@@ -4457,6 +4588,11 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("owner_id", owner_id)
         now = _as_utc(now or self.now_utc())
+        if self.is_postgres:
+            return await self._backend.release_initial_reservations(
+                agent_id=agent_id, owner_id=owner_id, now=now,
+                mark_owner_stopped=mark_owner_stopped,
+            )
         async with self._backend.transaction():
             await self._lock_runtime_owner_scope(agent_id=agent_id)
             released = await self._backend.execute(
@@ -4521,6 +4657,11 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("owner_id", owner_id)
         self._require_nonempty("reservation_token", reservation_token)
         now = _as_utc(now or self.now_utc())
+        if self.is_postgres:
+            return await self._backend.abandon_initial_reservation(
+                agent_id=agent_id, consumer_id=consumer_id, delivery_id=delivery_id,
+                owner_id=owner_id, reservation_token=reservation_token, now=now, reason=reason,
+            )
         async with self._backend.transaction():
             released = await self._backend.execute(
                 f"""
@@ -4820,6 +4961,7 @@ class DurableSignalStore(UnifiedStoreBase):
         )
         return updated == 1
 
+    @_owns_retry_release_receipt
     async def nack_delivery(
         self,
         *,
@@ -4855,7 +4997,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     WHEN ? OR (max_attempts > 0 AND attempts >= max_attempts) THEN ?
                     ELSE ?
                 END,
-                lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                {self._retry_identity_assignment_sql(terminal=terminal or terminal_ackable)},
                 next_attempt_at = CASE
                     WHEN ? OR ? OR (max_attempts > 0 AND attempts >= max_attempts)
                         THEN NULL ELSE {timestamp} END,
@@ -4896,6 +5038,7 @@ class DurableSignalStore(UnifiedStoreBase):
             agent_id=agent_id, consumer_id=consumer_id, delivery_id=delivery_id
         )
 
+    @_owns_retry_release_receipt
     async def release_delivery_for_hold(
         self,
         *,
@@ -4923,8 +5066,7 @@ class DurableSignalStore(UnifiedStoreBase):
             SET status = ?, attempts = CASE
                     WHEN attempts > 0 THEN attempts - 1 ELSE 0
                 END,
-                lease_owner = NULL, lease_token = NULL,
-                lease_expires_at = NULL, next_attempt_at = ?,
+                {self._retry_identity_assignment_sql(hold=True)}, next_attempt_at = ?,
                 last_error = 'hold_deferred', terminal_at = NULL,
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
@@ -4943,6 +5085,7 @@ class DurableSignalStore(UnifiedStoreBase):
         )
         return updated == 1
 
+    @_owns_retry_release_receipt
     async def release_managed_delivery_after_task(
         self,
         *,
@@ -4988,7 +5131,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     WHEN ? OR (max_attempts > 0 AND attempts >= max_attempts) THEN ?
                     ELSE ?
                 END,
-                lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                {self._retry_identity_assignment_sql(terminal=terminal or terminal_ackable)},
                 next_attempt_at = CASE
                     WHEN ? OR ? OR (max_attempts > 0 AND attempts >= max_attempts)
                         THEN NULL ELSE {timestamp}
@@ -5181,6 +5324,7 @@ class DurableSignalStore(UnifiedStoreBase):
         statuses: Optional[Iterable[str]] = None,
         limit: int = 100,
         rebuildable_sources: Optional[Iterable[str]] = None,
+        claim_executor_id: Optional[str] = None,
     ) -> list[DurableDelivery]:
         """List observable delivery state within one agent/tenant only.
 
@@ -5198,6 +5342,15 @@ class DurableSignalStore(UnifiedStoreBase):
         if consumer_id is not None:
             where.append("d.consumer_id = ?")
             params.append(consumer_id)
+        if claim_executor_id is not None:
+            self._require_nonempty("claim_executor_id", claim_executor_id)
+            where.append(self._managed_retry_claim_sql(alias="d"))
+            params.extend(self._managed_retry_claim_params(
+                claim_executor_id, self.now_utc() - _DEFAULT_RUNTIME_OWNER_STALE_AFTER,
+            ))
+            receipt_sql, receipt_params = self._retry_receipt_exclusion_sql(alias="d")
+            where.append(receipt_sql)
+            params.extend(receipt_params)
         if rebuildable_sources is not None:
             sources = tuple(sorted(set(rebuildable_sources)))
             if sources:
@@ -5629,6 +5782,11 @@ class DurableSignalStore(UnifiedStoreBase):
         )
         return sequence
 
+    @staticmethod
+    def runtime_owner_lock_key(agent_id: str) -> str:
+        """One native serialization key for liveness, cleanup and recovery."""
+        return f"durable-signal-runtime-owner:{agent_id}"
+
     async def _lock_runtime_owner_scope(self, *, agent_id: str) -> None:
         """Serialize liveness heartbeats and recovery for one tenant.
 
@@ -5644,7 +5802,7 @@ class DurableSignalStore(UnifiedStoreBase):
         if self.is_postgres:
             await self._backend.fetch_val(
                 "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
-                (f"durable-signal-runtime-owner:{agent_id}",),
+                (self.runtime_owner_lock_key(agent_id),),
             )
             return
         if self._backend.backend_type == "sqlite":

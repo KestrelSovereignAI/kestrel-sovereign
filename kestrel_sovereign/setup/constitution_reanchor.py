@@ -991,11 +991,18 @@ async def reanchor_constitution(
             governance_preflight=governance_preflight,
         )
     except Exception as exc:  # noqa: BLE001 — surface the underlying error verbatim
+        from kestrel_sovereign.execution_custody import execution_commit_outcome
+
+        outcome = execution_commit_outcome(exc)
         logger.exception(
             "Reanchor against %s failed; backup: %s",
             target.describe(), backup_path or "(none)",
         )
         recovery = (
+            f" Transaction outcome is {outcome}; do not retry the write. "
+            "Reload and reconcile the durable anchor before resuming work."
+            if outcome is not None
+            else
             f" DB backup at {backup_path}"
             if backup_path is not None
             else " The write was one transaction and rolled back; no file "

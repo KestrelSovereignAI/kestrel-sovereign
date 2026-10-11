@@ -33,6 +33,7 @@ Server→client requests come in two flavors:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -502,8 +503,11 @@ class CodexAppServerClient:
         # kestrel.
         self._closed_error = None
         self._stderr_tail = []
-        self._reader_task = asyncio.create_task(self._read_loop())
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
+        # The transport outlives individual occurrences. Per-turn handlers
+        # rebind their captured turn; the reader must not inherit the first
+        # occurrence's eventually retired authority/caller/lock contexts.
+        self._reader_task = asyncio.create_task(self._read_loop(), context=contextvars.Context())
+        self._stderr_task = asyncio.create_task(self._drain_stderr(), context=contextvars.Context())
 
     async def _handshake(
         self,
@@ -1154,6 +1158,13 @@ class CodexAppServerClient:
         except CodexAppServerCancelled:
             raise
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                sink = self._turn_sinks.get(tid)
+                if sink is not None:
+                    sink.put_nowait({"__bridge_error__": e})
+                self._send({"id": mid, "error": {"message": "execution requires authority/commit reconciliation"}})
+                return
             logger.warning("codex server-request %s failed: %s", method, e)
             try:
                 self._send({"id": mid, "error": {"message": str(e)}})
@@ -1305,6 +1316,9 @@ class CodexAppServerClient:
         """
         if cancellation_token is not None:
             cancellation_token.raise_if_cancelled(self._auth_cancelled)
+        if method in {"turn/start", "thread/start"}:
+            from kestrel_sovereign.execution_custody import require_execution_work
+            require_execution_work()
         mid = self._next_id
         self._next_id += 1
         fut: asyncio.Future = asyncio.get_event_loop().create_future()

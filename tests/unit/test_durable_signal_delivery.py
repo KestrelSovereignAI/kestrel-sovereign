@@ -3927,6 +3927,15 @@ async def test_renewal_loss_cancels_cognition_before_a_second_executor_retries(t
         await asyncio.wait_for(first_cancelled.wait(), timeout=1)
         assert (await dispatcher_a.list_durable_deliveries())[0].status == RETRY
 
+        # RETRY keeps the live original owner's receipt capability. A sibling
+        # must not race a still-unobserved release ACK; transfer is safe only
+        # after that owner has joined settlement and retired (or becomes stale).
+        assert await dispatcher_b.claim_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id, event_id=first.signal_id,
+            executor_id=dispatcher_b._durable_delivery_owner,
+        ) is None
+        await dispatcher_a.shutdown_durable_delivery()
+
         retry = await dispatcher_b.enqueue_durable_cognition(
             _channel_signal(agent_b.did, "renewal-loss"),
             source_event_id="telegram:update:renewal-loss",
@@ -4034,6 +4043,12 @@ async def test_renewal_loss_quarantines_cancellation_resistant_cognition_until_i
         await asyncio.wait_for(exact_release_finished.wait(), timeout=1)
         assert dispatcher_a.retained_durable_cognition_task_count == 0
         assert (await dispatcher_a.list_durable_deliveries())[0].status == RETRY
+
+        assert await dispatcher_b.claim_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id, event_id=first.signal_id,
+            executor_id=dispatcher_b._durable_delivery_owner,
+        ) is None
+        await dispatcher_a.shutdown_durable_delivery()
 
         retry = await dispatcher_b.enqueue_durable_cognition(
             _channel_signal(agent_b.did, "cancellation-resistant"),

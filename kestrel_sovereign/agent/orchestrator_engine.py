@@ -61,6 +61,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     held_transition_reentry_token,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_terminal_error, is_execution_control_error, require_execution_work
 from kestrel_sovereign.agent.streaming import (
     _DeferredToolBatchCancellation,
     _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
@@ -690,7 +691,10 @@ class OrchestratorEngineMixin:
         # executions — a telemetry-layer ``agent.tool_execution`` span would
         # double-instrument the call and root as the ``unknown`` agent.
         exec_start = time.time()
+        require_execution_work(self)
         result = await execute_fn(args)
+        mark_current_invocation_effect_completed(session_id)
+        require_execution_work(self)
         exec_duration_ms = int((time.time() - exec_start) * 1000)
 
         # #2641: envelope-carried parts → this turn's collector, BEFORE the
@@ -714,7 +718,7 @@ class OrchestratorEngineMixin:
             HookEvent.POST_TOOL_USE,
             post_hook_input,
         )
-
+        require_execution_work(self)
         return result
 
     def _make_inline_tool_executor(self, session_id: str):
@@ -758,6 +762,7 @@ class OrchestratorEngineMixin:
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,
                 )
+                require_execution_work(self)
             # The Codex reader owns this callback on an old task context.  Pass
             # the turn's captured mutable state explicitly: a ContextVar lookup
             # here would see the reader's stale pre-turn snapshot.
@@ -1158,7 +1163,10 @@ class OrchestratorEngineMixin:
         # OpenInference TOOL span is the one source of truth for tool
         # executions.
         exec_start = time.time()
+        require_execution_work(self)
         result = await found_tool.execute(**effective_args)
+        mark_current_invocation_effect_completed(session_id)
+        require_execution_work(self)
         exec_duration_ms = int((time.time() - exec_start) * 1000)
         # #2641: envelope-carried parts → the owning turn's collector. The
         # codex inline executor wraps this call in ``bind_part_collector``, so
@@ -1181,7 +1189,7 @@ class OrchestratorEngineMixin:
         await self.hooks_manager.execute_hooks_parallel(
             HookEvent.POST_TOOL_USE, post_input,
         )
-
+        require_execution_work(self)
         return result
 
     def _resolve_named_tool(self, tool_name: str) -> tuple[Any, Any]:
@@ -1385,6 +1393,7 @@ class OrchestratorEngineMixin:
         # that kills the whole stream. POST_SUBAGENT_CALL still fires
         # on the failure path so observability/audit hooks see every
         # dispatch outcome.
+        require_execution_work(self)
         try:
             with optional_span("agent.feature_dispatch", {
                 OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
@@ -1406,7 +1415,13 @@ class OrchestratorEngineMixin:
                 result = await feature.execute_as_subagent(
                     task=task, context=context, denied_tools=denied_tools,
                 )
+                mark_current_invocation_effect_completed(session_id)
+                require_execution_work(self)
+        except ExecutionAuthorityError:
+            raise
         except Exception as e:  # noqa: BLE001 — boundary catch is the contract
+            if is_execution_control_error(e):
+                raise
             logging.warning(
                 "[GOVERNED-DISPATCH] subagent execute raised source=%s feature=%s err=%s",
                 source, feature_name, e, exc_info=True,
@@ -1454,7 +1469,7 @@ class OrchestratorEngineMixin:
             feature_name=feature_name, effective_args=effective_args,
             result=result, exec_duration_ms=exec_duration_ms,
         )
-
+        require_execution_work(self)
         return result
 
     async def _fire_post_subagent_hook(
@@ -1504,6 +1519,8 @@ class OrchestratorEngineMixin:
                 "tools": tools,
             })
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Never let event emission break the tool execution path
             logging.warning(
                 "Failed to emit tools_updated event for session %s: %s",
@@ -1910,6 +1927,8 @@ class OrchestratorEngineMixin:
                 )
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             print(f"a2a_tool_dispatches dispatch wrapper failed: {exc}", file=sys.stderr)
 
     async def _dispatch_feature_tool(
@@ -2035,18 +2054,25 @@ class OrchestratorEngineMixin:
             await self.hooks_manager.execute_hooks_parallel(
                 HookEvent.POST_SUBAGENT_CALL, post_hook_input
             )
+            require_execution_work(self)
 
             if streaming and tool_events is not None:
                 tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
             return result
 
+        except ExecutionAuthorityError:
+            raise
         except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
+            if is_execution_control_error(e):
+                raise
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
                 session_id=session_id, dispatch_meta=dispatch_meta,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
@@ -2116,7 +2142,11 @@ class OrchestratorEngineMixin:
                     denied.add(tool_obj.name)
 
             return denied
+        except ExecutionAuthorityError:
+            raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.debug(f"[SECURITY] Could not check denied tools: {e}")
             return set()
 
@@ -2246,6 +2276,8 @@ class OrchestratorEngineMixin:
                 tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
             return result
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
             return await _failed(
                 str(e),
@@ -2401,16 +2433,41 @@ class OrchestratorEngineMixin:
                             effective_model=em,
                         )
 
-                await asyncio.gather(
-                    *[
+                children = [
+                    asyncio.create_task(
                         _run_one(
                             tc,
                             per_tool_messages[i],
                             per_tool_results[i] if per_tool_results is not None else None,
+                        ), name=f"orchestrator-parallel-tool:{i}",
+                    )
+                    for i, tc in enumerate(batch_tcs)
+                ]
+                primary_error = None
+                try:
+                    await asyncio.gather(*children)
+                except BaseException as error:
+                    primary_error = error
+                    raise
+                finally:
+                    # gather propagates its first child error without joining
+                    # siblings. A batch cannot retire while those siblings
+                    # still carry its admissions or publish effects/results.
+                    for child in children:
+                        if not child.done():
+                            child.cancel()
+                    terminal_error = primary_error
+                    for child in children:
+                        outcome = await await_owned_task(child)
+                        terminal_error = execution_terminal_error(
+                            terminal_error, outcome.error, outcome.cancellation,
                         )
-                        for i, tc in enumerate(batch_tcs)
-                    ]
-                )
+                    if terminal_error is not None:
+                        # Join every child, then apply the canonical control
+                        # precedence to the original error AND late outcomes.
+                        # Authority denial is control too, not only commit
+                        # uncertainty; it must never become an acknowledged Stop.
+                        raise terminal_error
 
                 # Append results in original request order
                 for i in range(len(batch_tcs)):
@@ -2860,6 +2917,8 @@ class OrchestratorEngineMixin:
             try:
                 qualified = (selection() or {}).get("model")
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 logging.debug(
                     "[ORCHESTRATOR] get_active_model_selection failed (%s); "
                     "falling back to get_active_model_id.", exc,
@@ -2872,6 +2931,8 @@ class OrchestratorEngineMixin:
             try:
                 resolved = active()
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 logging.warning(
                     "[ORCHESTRATOR] Could not resolve the active model for "
                     "continuation pruning (%s).", exc,
@@ -2927,6 +2988,8 @@ class OrchestratorEngineMixin:
                 if limit:
                     return int(limit)
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 # Never silently substitute a window we can't justify — say
                 # which model failed to resolve and that the default is a guess.
                 logging.warning(

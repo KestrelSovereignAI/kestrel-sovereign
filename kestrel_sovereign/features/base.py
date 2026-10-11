@@ -44,6 +44,7 @@ from kestrel_sovereign.turn_completion import (
     settle_repaired_content,
     turn_completion_repair_prompt,
 )
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_work_operation, is_execution_control_error, require_execution_work
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +317,7 @@ class Feature(_SdkFeature):
 
     def __init__(self, agent):
         self.agent = agent
+        self._execution_custody = getattr(agent, "_execution_custody", None)
         self.name = self.__class__.__name__
         self.disabled_skills: set = set()
 
@@ -410,6 +412,7 @@ class Feature(_SdkFeature):
             return response
         # The pattern is usually a finished answer's plan; confirm it first
         # when the decision check is on (#3527).
+        require_execution_work(self.agent)
         if not await confirm_unfinished(
             self.agent.llm_service, content, request=request, session_id=session_id,
         ):
@@ -419,6 +422,7 @@ class Feature(_SdkFeature):
             "[SUBAGENT %s] Model signaled continuation without tool_calls; issuing one repair turn",
             self.name,
         )
+        require_execution_work(self.agent)
         repaired = await self.agent.llm_service.generate_with_messages(
             messages=self._append_missing_tool_call_repair(messages, content),
             tools=tools if tools else None,
@@ -426,6 +430,7 @@ class Feature(_SdkFeature):
             model_override=model_override,
             invocation_context=_subagent_turn_identity(session_id),
         )
+        require_execution_work(self.agent)
         # A repair that neither calls a tool nor ran one inline either confirms
         # the message was the subagent's answer (keep it, followed by anything
         # the repair adds) or is a new answer. Settled on the response itself,
@@ -862,7 +867,9 @@ class Feature(_SdkFeature):
     # FULL agent shutdown, so without feature ownership a disabled feature's
     # loop keeps running against a torn-down feature.
     # ------------------------------------------------------------------
-    def _track_owned_background_task(self, coro, *, name: str) -> asyncio.Task:
+    def _track_owned_background_task(
+        self, coro, *, name: str, _resident_owner: bool = False,
+    ) -> asyncio.Task:
         """Start an agent-owned background task AND record it for feature
         teardown (#2522 P1).
 
@@ -874,7 +881,12 @@ class Feature(_SdkFeature):
         :meth:`_register_signal_sources` / :meth:`_register_wait_provider`.
         """
         agent = getattr(self, "agent", None)
-        track = getattr(agent, "_track_background_task", None)
+        runtime_track = getattr(type(agent), "_track_runtime_task", None)
+        track = (
+            agent._track_runtime_task
+            if _resident_owner and callable(runtime_track)
+            else getattr(agent, "_track_background_task", None)
+        )
         if not callable(track):
             # The agent owns background-task lifecycle; a feature can't safely
             # start an unreaped task. Fail loudly rather than leak the coroutine.
@@ -902,6 +914,19 @@ class Feature(_SdkFeature):
             )
         )
         return task
+
+    def _track_owned_runtime_task(self, coro, *, name: str) -> asyncio.Task:
+        """Own an explicit resident service through READY and feature teardown.
+
+        Only first-party lifecycle publication uses this handoff. Ordinary
+        effect children continue using `_track_owned_background_task` and keep
+        every caller admission. Core's resident tracker validates creation and
+        carries the same irreversible runtime generation, never a replacement.
+        Legacy standalone agents retain their existing background-task scope.
+        """
+        return self._track_owned_background_task(
+            coro, name=name, _resident_owner=True,
+        )
 
     async def _cancel_owned_background_tasks(self) -> None:
         """Cancel exactly the background tasks this feature started (#2522 P1).
@@ -1554,6 +1579,7 @@ class Feature(_SdkFeature):
             # binding, so re-resolving deeper in the loop would let a long run
             # start stamping None halfway through and split the band anyway.
             turn_session_id = self._turn_session_id()
+            require_execution_work(self.agent)
             response = await self.agent.llm_service.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
@@ -1566,6 +1592,7 @@ class Feature(_SdkFeature):
                 # so it carries no provider-continuation meaning to collide with.
                 session_id=turn_session_id,
             )
+            require_execution_work(self.agent)
 
             # Log what we got back
             if hasattr(response, 'tool_calls') and response.tool_calls:
@@ -1600,9 +1627,14 @@ class Feature(_SdkFeature):
             envelope: Dict[str, Any] = {"success": True, "result": result}
             if subagent_parts:
                 envelope["parts"] = subagent_parts
+            require_execution_work(self.agent)
             return envelope
 
+        except ExecutionAuthorityError:
+            raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Feature {self.name} subagent execution failed: {e}")
             err_envelope: Dict[str, Any] = {"success": False, "error": str(e)}
             # Parts emitted before the failure (e.g. a *_pending card) still
@@ -1678,7 +1710,8 @@ class Feature(_SdkFeature):
 
         async def _exec(name: str, args: Dict[str, Any]):
             with turn_scope.bind():
-                return await self._execute_subagent_tool(
+                require_execution_work(self.agent)
+                result = await self._execute_subagent_tool(
                     tool_name=name,
                     args=args or {},
                     tools_by_name={
@@ -1687,6 +1720,8 @@ class Feature(_SdkFeature):
                     return_with_effective_args=True,
                     parts_sink=parts_sink,
                 )
+                require_execution_work(self.agent)
+                return result
         return _exec
 
     async def _execute_subagent_tool(
@@ -1835,9 +1870,18 @@ class Feature(_SdkFeature):
                 # ``updated_input`` override) — see the comment block
                 # before the DENY/ASK branch.
 
+            require_execution_work(self.agent)
             try:
                 result = await selected_tool.execute(**effective_args)
+                from kestrel_sovereign.agent.invocation import mark_current_invocation_effect_completed
+
+                mark_current_invocation_effect_completed(None)
+                require_execution_work(self.agent)
+            except ExecutionAuthorityError:
+                raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "[SUBAGENT-TOOL] %s raised %s",
                     tool_name, e,
@@ -1856,6 +1900,7 @@ class Feature(_SdkFeature):
                 envelope_parts = serialized.get("parts")
                 if isinstance(envelope_parts, list) and envelope_parts:
                     parts_sink.extend(envelope_parts)
+            require_execution_work(self.agent)
             return _shape(effective_args, serialized)
 
     def _compose_subagent_runtime_tools(
@@ -2186,6 +2231,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             # turns don't hit the same "requires a tool_executor"
             # provider error the initial subagent call avoided
             # (codex round 1 P2 on #1461 follow-up).
+            require_execution_work(self.agent)
             response = await self.agent.llm_service.generate_with_messages(
                 messages=messages,
                 tools=tools if tools else None,
@@ -2196,6 +2242,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 # share its provider thread (:func:`_subagent_turn_identity`).
                 invocation_context=_subagent_turn_identity(session_id),
             )
+            require_execution_work(self.agent)
 
             effective_model = (
                 model_override or getattr(response, "model", None) or effective_model
@@ -2263,6 +2310,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                         self.func = func
                         self._schema_data = schema_data
                         self.agent_skill = agent_skill
+                        self._execution_custody = getattr(func.__self__.agent, "_execution_custody", None)
 
                     @property
                     def name(self) -> str:
@@ -2278,6 +2326,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             command_prefix=self._schema_data.get("command_prefix")
                         )
 
+                    @execution_work_operation
                     async def execute(self, **kwargs) -> Dict[str, Any]:
                         # #2641: bind a "tool result under construction"
                         # buffer for the duration of the wrapped call.
@@ -2292,9 +2341,20 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             tool_result_parts_buffer,
                         )
                         with tool_result_parts_buffer() as pending_parts:
+                            require_execution_work(self.func.__self__.agent)
                             try:
                                 result = await self.func(**kwargs)
+                                # Preserve effect evidence at the actual method
+                                # return, before a post-return denial can stop
+                                # the orchestrator from observing completion.
+                                from kestrel_sovereign.agent.invocation import mark_current_invocation_effect_completed
+                                mark_current_invocation_effect_completed(None)
+                                require_execution_work(self.func.__self__.agent)
+                            except ExecutionAuthorityError:
+                                raise
                             except Exception as e:
+                                if is_execution_control_error(e):
+                                    raise
                                 logger.error(f"Error executing tool {self.name}: {e}")
                                 response: Dict[str, Any] = {
                                     "success": False,

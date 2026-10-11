@@ -4,6 +4,7 @@ Embedding Service for Kestrel.
 Provides text embeddings using Ollama's embedding models.
 This replaces the need for local sentence-transformers installation.
 """
+import asyncio
 import hashlib
 import inspect
 import logging
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional
 import numpy as np
 
 from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
+from kestrel_sovereign.execution_custody import await_execution_work, bind_execution_cleanup, bind_execution_runtime, require_execution_work, is_execution_control_error, execution_commit_outcome, execution_terminal_error
 
 from .adapter import ReportedUsage
 from .modality_recording import ModalityCall
@@ -342,6 +344,8 @@ class EmbeddingService:
                 return embeddings[0]
             return None
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             self._handle_embed_error(e, "Embedding failed")
             return None
 
@@ -366,6 +370,8 @@ class EmbeddingService:
             )
             return response.get('embeddings', [None] * len(texts))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             self._handle_embed_error(e, "Batch embedding failed")
             return [None] * len(texts)
 
@@ -393,6 +399,8 @@ class EmbeddingService:
                 return embeddings[0]
             return None
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             self._handle_embed_error(e, "Async embedding failed")
             return None
 
@@ -413,6 +421,8 @@ class EmbeddingService:
             embeddings = response.get("embeddings", [])
             return embeddings[0] if embeddings else None
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             self._handle_embed_error(exc, "Async query embedding failed")
             return None
 
@@ -445,6 +455,8 @@ class EmbeddingService:
             )
             return response.get('embeddings', [None] * len(texts))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             self._handle_embed_error(e, "Async batch embedding failed")
             return [None] * len(texts)
 
@@ -595,6 +607,8 @@ class ProviderEmbeddingService:
                 try:
                     declared = adapter_space_id()
                 except Exception as exc:  # pragma: no cover - defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "adapter.embedding_space_id() failed for %s: %s",
                         type(self.adapter).__name__,
@@ -642,6 +656,16 @@ class ProviderEmbeddingService:
         payload: Any,
         input_count: int,
     ) -> Any:
+        with bind_execution_runtime(self._recorder or self):
+            return await self._dispatch_owned(operation, method, payload, input_count)
+
+    async def _dispatch_owned(
+        self,
+        operation: str,
+        method: Callable[..., Awaitable[Any]],
+        payload: Any,
+        input_count: int,
+    ) -> Any:
         """Call one adapter embed method and record the dispatch.
 
         The invocation context is frozen before the first await. The record is
@@ -651,7 +675,7 @@ class ProviderEmbeddingService:
         kwargs: dict[str, Any] = {"model": self.model, **self._embed_kwargs()}
         recorder = self._recorder
         if recorder is None:
-            return await method(self.client, payload, **kwargs)
+            return await await_execution_work(self, lambda: method(self.client, payload, **kwargs))
 
         context = recorder.snapshot_invocation_context()
         usage = ReportedUsage()
@@ -661,23 +685,35 @@ class ProviderEmbeddingService:
         result: Any = None
         error: Optional[BaseException] = None
         try:
-            result = await method(self.client, payload, **kwargs)
-            return result
+            result = await await_execution_work(recorder, lambda: method(self.client, payload, **kwargs))
         except BaseException as exc:
             error = exc
             raise
         finally:
-            await recorder.record_modality_call(
-                self._embedding_call(
-                    operation,
-                    input_count,
-                    result=result,
-                    error=error,
-                    usage=usage,
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                    context=context,
-                )
-            )
+            if error is None or not is_execution_control_error(error):
+                with (bind_execution_cleanup(recorder) if error is not None and (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error)) else bind_execution_runtime(recorder)):
+                    try:
+                        await recorder.record_modality_call(
+                            self._embedding_call(
+                                operation,
+                                input_count,
+                                result=result,
+                                error=error,
+                                usage=usage,
+                                duration_ms=int((time.monotonic() - started) * 1000),
+                                context=context,
+                            )
+                        )
+                    except Exception as accounting_error:
+                        if (
+                            error is None
+                            or not is_execution_control_error(accounting_error)
+                            or not (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error))
+                            or execution_commit_outcome(accounting_error) is not None
+                        ):
+                            raise execution_terminal_error(error, accounting_error)
+        require_execution_work(recorder)
+        return result
 
     def _embedding_call(
         self,
@@ -760,9 +796,9 @@ class ProviderEmbeddingService:
         ]
         if not prepared:
             # Nothing is dispatched for an empty batch, so nothing is recorded.
-            return await self.adapter.aembed_batch(
+            return await await_execution_work(self._recorder or self, lambda: self.adapter.aembed_batch(
                 self.client, prepared, model=self.model, **self._embed_kwargs()
-            )
+            ))
         return await self._dispatch(
             "batch", self.adapter.aembed_batch, prepared, len(prepared)
         )
@@ -805,6 +841,8 @@ class ProviderEmbeddingService:
                 ),
             )
         except ValueError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "Could not derive embedding profile for %s: %s",
                 provider_label, exc,
@@ -965,6 +1003,8 @@ def get_provider_embedding_service(llm_service: Optional[Any] = None) -> Optiona
 
         return LLMService().get_embedding_service()
     except ImportError as exc:
+        if is_execution_control_error(exc):
+            raise
         # A circular import here means provider embeddings are disabled by a
         # code-structure bug, not by configuration — surface it loudly (#1792).
         # Everything that depends on embeddings (RAG, memory retrieval) silently
@@ -978,6 +1018,8 @@ def get_provider_embedding_service(llm_service: Optional[Any] = None) -> Optiona
         )
         return None
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         logger.warning("Provider embedding service not available: %s", exc)
         return None
 

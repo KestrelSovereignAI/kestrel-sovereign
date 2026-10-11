@@ -304,6 +304,9 @@ def _tail(raw: Any) -> str:
 #     requeueing stale foreign leases, which a restart's own startup recovery
 #     repeats; any cognition it wakes runs as ``durable_cognition:*``, which
 #     still defers.
+# Runtime-owned periodic loops below are infrastructure, not perpetual user
+# work. Shutdown joins them. Actual scheduler occurrences are separately
+# tracked and still defer restart, as do active requests and signal dispatch.
 # None is user/signal work; real work (``signal_dispatch:*``) still
 # defers a restart. The name is already stamped on the task at creation —
 # it was just never read here. New long-lived/bookkeeping daemons must be
@@ -318,6 +321,10 @@ _INFRA_TASK_PREFIXES = (
     "wait_fallback_reconcile",
     "durable_signal_owner_heartbeat:",
 )
+_INFRA_TASK_NAMES = frozenset({
+    "resume-monitor", "heartbeat-runtime", "scheduler-supervisor",
+    "scheduler-runtime-telemetry",
+})
 
 
 def _is_infra_background_task(task) -> bool:
@@ -327,7 +334,7 @@ def _is_infra_background_task(task) -> bool:
         name = task.get_name() or ""
     except Exception:
         return False
-    return name.startswith(_INFRA_TASK_PREFIXES)
+    return name in _INFRA_TASK_NAMES or name.startswith(_INFRA_TASK_PREFIXES)
 
 
 # How many task KINDS to describe individually in a deferral reason before

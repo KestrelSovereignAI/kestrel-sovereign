@@ -31,6 +31,8 @@ from kestrel_sdk.llm.decisions import (
 )
 
 from kestrel_sovereign.config import load_section
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, bind_execution_cleanup, bind_execution_runtime, execution_work_operation, require_execution_work, is_execution_control_error, execution_commit_outcome, execution_terminal_error
+from kestrel_sovereign.execution_custody import await_execution_work_group
 
 from .adapter import ReportedUsage
 from .decisions.config import (
@@ -195,8 +197,9 @@ class DecisionServiceMixin:
         """
 
         routes = self._decision_routes()
-        await asyncio.gather(
-            *(self._discover_decision_route(p, force=not use_cache) for p in routes)
+        await await_execution_work_group(
+            self,
+            (lambda p=p: self._discover_decision_route(p, force=not use_cache) for p in routes),
         )
 
     async def _discover_decision_route(self, provider: Dict[str, Any], *, force: bool) -> None:
@@ -206,10 +209,14 @@ class DecisionServiceMixin:
             if not force and not state.needs_discovery:
                 return
             try:
-                discovered = await provider["adapter"].list_decision_models(provider.get("client"))
+                discovered = await await_execution_work(self, lambda: provider["adapter"].list_decision_models(provider.get("client")))
             except asyncio.CancelledError:
                 raise
+            except ExecutionAuthorityError:
+                raise
             except Exception as exc:  # noqa: BLE001 - any discovery failure marks the route stale
+                if is_execution_control_error(exc):
+                    raise
                 state.record_discovery_failure()
                 logger.warning(
                     "Decision discovery failed for %s (%s); keeping the last "
@@ -251,27 +258,43 @@ class DecisionServiceMixin:
         error: Optional[BaseException] = None
         try:
             async with asyncio.timeout(timeout):
-                body = await provider["adapter"].adecide(
+                body = await await_execution_work(self, lambda: provider["adapter"].adecide(
                     provider.get("client"), pin, CANARY_REQUEST, timeout=timeout
-                )
+                ))
             normalize_response(CANARY_REQUEST, body)
+        except ExecutionAuthorityError as exc:
+            error = exc
+            if is_execution_control_error(exc):
+                raise
+            raise
         except asyncio.CancelledError as exc:
             error = exc
             state.canary_stale_since = state.canary_stale_since or time.time()
             raise
         except DecisionProtocolError as exc:
             error = exc
+            if is_execution_control_error(exc):
+                raise
             self._mark_pin_unverified(state, name, f"canary answer invalid: {exc}")
         except DecisionHTTPError as exc:
             error = exc
+            if is_execution_control_error(exc):
+                raise
             if exc.status_code == 404:
                 self._mark_pin_unverified(state, name, "endpoint or model not found (HTTP 404)")
             else:
                 state.canary_stale_since = state.canary_stale_since or time.time()
         except (DecisionTransportError, TimeoutError) as exc:
             error = exc
+            if is_execution_control_error(exc):
+                raise
             state.canary_stale_since = state.canary_stale_since or time.time()
             logger.warning("Decision pin canary for %s did not complete (%s)", name, type(exc).__name__)
+        except BaseException as exc:
+            # Unlisted native/wrapped errors still reach the unconditional
+            # finalizer. Never mislabel those as a successful canary call.
+            error = exc
+            raise
         else:
             state.pin_status = PinStatus.VERIFIED
             state.pin_reason = None
@@ -301,6 +324,7 @@ class DecisionServiceMixin:
     # decide (§3.1, §5, §6, §8)
     # ------------------------------------------------------------------
 
+    @execution_work_operation
     async def decide(
         self,
         request: DecisionRequest,
@@ -327,6 +351,7 @@ class DecisionServiceMixin:
         ``DecisionResult.thresholds`` is always keyed by question id.
         """
 
+        require_execution_work(self)
         if not isinstance(caller, str) or not caller:
             raise ValueError("decide() requires a non-empty caller id")
         if timeout_seconds <= 0:
@@ -362,8 +387,9 @@ class DecisionServiceMixin:
             async with asyncio.timeout(timeout_seconds):
                 cold = [p for p in routes if _route_state(p).needs_discovery]
                 if cold:
-                    await asyncio.gather(
-                        *(self._discover_decision_route(p, force=False) for p in cold)
+                    await await_execution_work_group(
+                        self,
+                        (lambda p=p: self._discover_decision_route(p, force=False) for p in cold),
                     )
                 candidate = select_candidate(
                     routes,
@@ -380,15 +406,17 @@ class DecisionServiceMixin:
                 provider = candidate.provider
                 dispatched = True
                 started = time.monotonic()
-                body = await provider["adapter"].adecide(
+                body = await await_execution_work(self, lambda: provider["adapter"].adecide(
                     provider.get("client"),
                     candidate.info.id,
                     snapshot,
                     timeout=timeout_seconds,
-                )
+                ))
                 normalized = normalize_response(snapshot, body)
         except TimeoutError as exc:
             error = exc
+            if is_execution_control_error(exc):
+                raise
             raise DecisionTimeout(
                 f"decision for {caller!r} exceeded {timeout_seconds}s"
             ) from None
@@ -409,6 +437,7 @@ class DecisionServiceMixin:
                     context=context,
                 )
 
+        require_execution_work(self)
         provider = candidate.provider
         return DecisionResult(
             answers=normalized.answers,
@@ -444,26 +473,40 @@ class DecisionServiceMixin:
     ) -> None:
         """Record one dispatched decision through the shared recorder."""
 
+        if error is not None and is_execution_control_error(error):
+            # Irreversible control is not a successful/failed provider call.
+            # Even absent ambient custody, it must not start ordinary writes.
+            return
         usage = ReportedUsage()
         reported = body.get("usage") if isinstance(body, Mapping) else None
         if isinstance(reported, Mapping):
             usage.add(input_tokens=reported.get("input_tokens"), cost=reported.get("cost"))
-        await self.record_modality_call(
-            ModalityCall(
-                modality="decision",
-                provider=str(provider.get("name")),
-                model=model,
-                duration_ms=duration_ms,
-                success=error is None,
-                context=context,
-                error_class=type(error).__name__ if error is not None else None,
-                input_tokens=usage.input_tokens,
-                cost=usage.cost,
-                caller=caller,
-                metadata={
-                    "caller": caller,
-                    "question_count": question_count,
-                    "calibrated": calibrated,
-                },
-            )
-        )
+        with (bind_execution_cleanup(self) if error is not None and (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error)) else bind_execution_runtime(self)):
+            try:
+                await self.record_modality_call(
+                    ModalityCall(
+                        modality="decision",
+                        provider=str(provider.get("name")),
+                        model=model,
+                        duration_ms=duration_ms,
+                        success=error is None,
+                        context=context,
+                        error_class=type(error).__name__ if error is not None else None,
+                        input_tokens=usage.input_tokens,
+                        cost=usage.cost,
+                        caller=caller,
+                        metadata={
+                            "caller": caller,
+                            "question_count": question_count,
+                            "calibrated": calibrated,
+                        },
+                    )
+                )
+            except Exception as accounting_error:
+                if (
+                    error is None
+                    or not is_execution_control_error(accounting_error)
+                    or not (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error))
+                    or execution_commit_outcome(accounting_error) is not None
+                ):
+                    raise execution_terminal_error(error, accounting_error)
