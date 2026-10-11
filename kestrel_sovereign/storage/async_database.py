@@ -13,18 +13,15 @@ from contextlib import asynccontextmanager, closing
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
-from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
-
-from .db import (
-    ConnectionError,
-    DatabaseBackend,
-    SQLiteBackend,
-    get_backend,
-    normalize_schema,
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
 )
-from .db.sqlite import _minimum_close_timeout_s
+
 from .conversation_created_at import (
     CONSTRAINT_NAME as CREATED_AT_CONSTRAINT,
+)
+from .conversation_created_at import (
     UNDATED_DDL,
     UNDATED_TABLE,
     canonical_created_at,
@@ -35,6 +32,14 @@ from .conversation_created_at import (
     noncanonical_predicate,
     repairable_bulk_update,
 )
+from .db import (
+    ConnectionError,
+    DatabaseBackend,
+    SQLiteBackend,
+    get_backend,
+    normalize_schema,
+)
+from .db.sqlite import _minimum_close_timeout_s
 from .session_id_column import backfill_statement
 
 logger = logging.getLogger(__name__)
@@ -2614,27 +2619,27 @@ class AsyncDatabase:
         contract it implements and the column list the triggers watch. This
         method owns HOW to create things safely; that module owns WHAT.
         """
-        from .session_grouping import session_order_index_columns
         from .conversation_sessions import (
+            CHANGES_PRE_SLOT_TABLE,
+            CHANGES_SLOT_COLUMN,
             FUNCTION_NAME_PREFIX,
+            NON_NULL_PROJECTION_COLUMNS,
             TRIGGER_NAME_PREFIX,
+            WATERMARK_EPOCH_COLUMN,
+            WATERMARK_REVISION_COLUMN,
             active_history_predicate,
             archived_history_predicate,
             canonical_order_index_columns,
+            changes_slot_migration,
+            emptied_cache_invalidation,
             live_history_predicate,
             mutation_trigger_functions,
             mutation_triggers,
-            NON_NULL_PROJECTION_COLUMNS,
-            emptied_cache_invalidation,
-            publishing_agent_ledger_seed,
-            CHANGES_PRE_SLOT_TABLE,
-            CHANGES_SLOT_COLUMN,
-            changes_slot_migration,
-            WATERMARK_EPOCH_COLUMN,
-            WATERMARK_REVISION_COLUMN,
             projection_tables,
+            publishing_agent_ledger_seed,
             shape_change_invalidation,
         )
+        from .session_grouping import session_order_index_columns
 
         tables = projection_tables()
         triggers = mutation_triggers(self.backend_type)
@@ -3964,68 +3969,37 @@ class AsyncDatabase:
         Propagate cancellation only after those owned lifecycles have had their
         chance to complete.
         """
-        cancelled = False
-        factory_error: BaseException | None = None
-        try:
-            await self.dispose_cached_sqla_factory()
-        except asyncio.CancelledError as factory_cancellation:
-            cancelled = True
-            if is_execution_control_error(factory_cancellation):
-                factory_error = factory_cancellation
-        except Exception as exc:
-            # Keep going: the primary backend owns a separate aiosqlite worker
-            # and must always receive its close opportunity.  The failure is
-            # surfaced only after that attempt so callers never observe a
-            # successful close with an abandoned cached factory.
-            factory_error = exc
-
-        try:
-            await self._backend.close()
-        except asyncio.CancelledError as backend_error:
-            if is_execution_control_error(backend_error) or (
-                factory_error is not None and is_execution_control_error(factory_error)
-            ):
-                raise execution_terminal_error(backend_error, factory_error)
-            raise
-        except Exception as backend_error:
-            if factory_error is not None:
-                logger.error(
-                    "Cached SQLAlchemy session factory close failed after "
-                    "the primary backend close was attempted: %s",
-                    factory_error,
-                )
-            if is_execution_control_error(backend_error) or (
-                factory_error is not None and is_execution_control_error(factory_error)
-            ):
-                raise execution_terminal_error(backend_error, factory_error)
-            raise backend_error from factory_error
-        finally:
-            self._initialized = False
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task,
+            create_owned_task,
+        )
+        errors = []
+        # Independent resource retirement must finish even if an earlier owner
+        # reports grouped control or the caller is cancelled during a join.
+        for index, operation in enumerate((self.dispose_cached_sqla_factory, self._backend.close)):
+            outcome = await await_owned_task(
+                create_owned_task(operation()),
+                cancel_on_caller_cancellation=index == 0,
+            )
+            errors.extend((outcome.error, outcome.cancellation))
+        self._initialized = False
 
         retirement_owner = getattr(
             self, "_sovereign_sqla_retirement_owner", None
         )
         if retirement_owner is not None:
             if retirement_owner.retirement_pending:
-                if factory_error is None:
-                    raise ConnectionError(
+                if not any(error is not None for error in errors):
+                    errors.append(ConnectionError(
                         "SQLAlchemy engine or connection retirement is still "
                         "pending after the primary database connection closed"
-                    )
+                    ))
             else:
-                await self.finalize_retired_sqla_factory()
-
-        if cancelled:
-            if factory_error is not None and is_execution_control_error(factory_error):
-                raise factory_error
-            raise asyncio.CancelledError()
-        if factory_error is not None:
-            logger.error(
-                "Cached SQLAlchemy session factory close failed after the "
-                "primary backend close completed: %s",
-                factory_error,
-            )
-            raise factory_error
+                outcome = await await_owned_task(create_owned_task(self.finalize_retired_sqla_factory()))
+                errors.extend((outcome.error, outcome.cancellation))
+        terminal = execution_terminal_error(*errors)
+        if terminal is not None:
+            raise terminal
 
         logger.debug("Database connection closed")
     

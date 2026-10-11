@@ -537,12 +537,8 @@ class InferenceLeaseCoordinator:
                         "release the current inference lease before acquiring another"
                     )
 
-            quotes = await asyncio.gather(
-                *(
-                    self._quote_provider(provider, request)
-                    for _name, provider in sorted(self._providers.items())
-                )
-            )
+            from kestrel_sovereign._async_ownership import gather_owned
+            quotes = await gather_owned(self._quote_provider(provider, request) for _name, provider in sorted(self._providers.items()))
             valid_quotes = [quote for quote in quotes if quote is not None]
             if not valid_quotes:
                 raise InferenceLeaseProviderUnavailableError(
@@ -591,13 +587,19 @@ class InferenceLeaseCoordinator:
         return record
 
     async def status(self, lease_id: str) -> InferenceLease:
+        with bind_execution_runtime(self._llm_service):
+            return await self._status_under_runtime(lease_id)
+
+    async def _status_under_runtime(self, lease_id: str) -> InferenceLease:
         async with self._lock:
+            require_execution_work()
             record = self._record_for_lease(lease_id)
             assert record.lease is not None
             if record.lease.is_terminal:
                 return record.lease
             provider = self._provider(record.provider_name)
             try:
+                require_execution_work()
                 lease = await provider.status(self._owner_id, lease_id)
             except Exception as exc:
                 if is_execution_control_error(exc):

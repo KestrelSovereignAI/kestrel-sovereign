@@ -446,7 +446,9 @@ class HooksManager:
                         input.response_text = updated_input["response_text"]
 
             except asyncio.TimeoutError as error:
-                from kestrel_sovereign.execution_custody import is_execution_control_error
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
                 if is_execution_control_error(error):
                     raise
                 # FAIL CLOSED for enforcing hooks: a deny-capable hook that times
@@ -469,7 +471,9 @@ class HooksManager:
                 continue
 
             except Exception as e:
-                from kestrel_sovereign.execution_custody import is_execution_control_error
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
                 if is_execution_control_error(e):
                     raise
                 # FAIL CLOSED for enforcing hooks: a crashed deny-capable hook
@@ -531,17 +535,25 @@ class HooksManager:
                     hook.execute(input),
                     timeout=hook.timeout
                 )
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as error:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+                if is_execution_control_error(error):
+                    raise
                 logger.warning(f"Hook '{hook.name}' timed out (parallel)")
                 return None
             except Exception as e:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Hook '{hook.name}' failed (parallel): {e}")
                 return None
 
-        results = await asyncio.gather(
-            *[execute_with_timeout(hook) for hook in matching_hooks]
-        )
-
+        from kestrel_sovereign._async_ownership import gather_owned
+        results = await gather_owned(execute_with_timeout(hook) for hook in matching_hooks)
         return [r for r in results if r is not None]
 
     def _get_matching_hooks(

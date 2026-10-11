@@ -17,6 +17,16 @@ from typing import Any, AsyncIterator, Iterator, List, Literal, Optional, overlo
 
 import aiosqlite
 
+from kestrel_sovereign.execution_custody import (
+    ExecutionCommitOutcomeError,
+    _capture_host_identity_anchor_access,
+    current_execution_custody,
+    execution_commit_outcome,
+    execution_terminal_error,
+    is_execution_control_error,
+    require_execution_backend,
+)
+
 from .interface import (
     ConnectionError,
     DatabaseBackend,
@@ -25,13 +35,8 @@ from .interface import (
     Row,
     TransactionError,
 )
-from .write_audit import record_write_query, record_write_script
-from kestrel_sovereign.execution_custody import (
-    _capture_host_identity_anchor_access,
-    ExecutionCommitOutcomeError, current_execution_custody, execution_commit_outcome,
-    execution_terminal_error, is_execution_control_error, require_execution_backend,
-)
 from .transaction_control import reject_transaction_control, sqlite_statements
+from .write_audit import record_write_query, record_write_script
 
 logger = logging.getLogger(__name__)
 
@@ -441,6 +446,10 @@ class SQLiteBackend(DatabaseBackend):
         self._abandoned_read_cursors: weakref.WeakSet[aiosqlite.Cursor] = (
             weakref.WeakSet()
         )
+        # A cancelled execute can return a native cursor after its caller has
+        # unwound. Own that return explicitly; resetting the worker's last
+        # result cannot release a cursor still held by a queued result callback.
+        self._pending_read_executions: set[asyncio.Task] = set()
         self._retired_connection_closes: _RetainedAiosqliteCloses = {}
         self._closing = False
     
@@ -1227,7 +1236,9 @@ class SQLiteBackend(DatabaseBackend):
                     )
                 else:
                     rolled_back = True
-            close_failure = await self._release_abandoned_statements(conn)
+            close_failure = await self._release_abandoned_statements(
+                conn, started_at=started_at
+            )
             if rolled_back:
                 if close_failure is None:
                     return
@@ -1254,7 +1265,7 @@ class SQLiteBackend(DatabaseBackend):
         )
 
     async def _release_abandoned_statements(
-        self, conn: aiosqlite.Connection
+        self, conn: aiosqlite.Connection, *, started_at: float
     ) -> Optional[Exception]:
         """Reset the statements cancelled reads left active on ``conn``.
 
@@ -1269,6 +1280,39 @@ class SQLiteBackend(DatabaseBackend):
         it.
         """
         close_failure: Optional[Exception] = None
+        from kestrel_sovereign._async_ownership import await_owned_task
+        pending = set(self._pending_read_executions)
+        if pending:
+            # Rollback above is a native queue fence: execute's worker call
+            # has returned. A substituted executor may still be suspended
+            # after that return. Do not make physical receipt harvesting an
+            # unbounded wait; give it the existing drain deadline, then ask
+            # only those unfinished read owners to unwind once.
+            _, pending = await asyncio.wait(
+                pending,
+                timeout=max(0.0, self._cancelled_write_drain_remaining(started_at)),
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.sleep(0)
+        for task in tuple(self._pending_read_executions):
+            if not task.done():
+                close_failure = _CancelledWriteDrainDeadlineExceeded(
+                    "SQLite native read owner is still pending after its drain deadline"
+                )
+                continue
+            outcome = await await_owned_task(task)
+            if outcome.error is not None and is_execution_control_error(outcome.error):
+                raise outcome.error
+            cursor = outcome.result
+            if cursor is not None:
+                try:
+                    await cursor.close()
+                except (sqlite3.Error, ValueError) as exc:
+                    close_failure = exc
+                    continue
+            self._pending_read_executions.discard(task)
         for cursor in list(self._abandoned_read_cursors):
             try:
                 await cursor.close()
@@ -1368,9 +1412,9 @@ class SQLiteBackend(DatabaseBackend):
                     if is_execution_control_error(e):
                         raise
                     raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
-                except BaseException:
+                except BaseException as error:
                     if not self._in_transaction:
-                        await self._rollback_after_failure(conn)
+                        await self._rollback_after_failure(conn, error=error)
                     raise
 
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
@@ -1399,9 +1443,9 @@ class SQLiteBackend(DatabaseBackend):
                     if is_execution_control_error(e):
                         raise
                     raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
-                except BaseException:
+                except BaseException as error:
                     if not self._in_transaction:
-                        await self._rollback_after_failure(conn)
+                        await self._rollback_after_failure(conn, error=error)
                     raise
 
     @overload
@@ -1446,11 +1490,29 @@ class SQLiteBackend(DatabaseBackend):
             reject_transaction_control(query, dialect="sqlite")
         cancelled = False
         try:
-            cursor = await conn.execute(query, params)
+            if conn is self._connection:
+                from kestrel_sovereign._async_ownership import create_owned_task
+                execute_task = create_owned_task(conn.execute(query, params))
+                self._pending_read_executions.add(execute_task)
+                try:
+                    # Do not cancel the native cursor-return owner. If this
+                    # caller unwinds, the cancellation drain closes that exact
+                    # returned statement before permitting another write.
+                    cursor = await asyncio.shield(execute_task)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    self._pending_read_executions.discard(execute_task)
+                    raise
+                else:
+                    self._pending_read_executions.discard(execute_task)
+            else:
+                cursor = await conn.execute(query, params)
             result = await (cursor.fetchone() if one else cursor.fetchall())
-            cursor_to_close = cursor
+            # Retain the cursor until its close is acknowledged. Cancellation
+            # during queued close must hand this same statement to the drain.
+            await cursor.close()
             cursor = None
-            await cursor_to_close.close()
             if one:
                 return None if result is None else tuple(result)
             return [tuple(row) for row in result]
@@ -1591,9 +1653,9 @@ class SQLiteBackend(DatabaseBackend):
                     if is_execution_control_error(e):
                         raise
                     raise QueryError(f"Script execution failed: {e}") from e
-                except BaseException:
+                except BaseException as error:
                     if not self._in_transaction:
-                        await self._rollback_after_failure(conn)
+                        await self._rollback_after_failure(conn, error=error)
                     raise
 
     @asynccontextmanager
@@ -1622,14 +1684,14 @@ class SQLiteBackend(DatabaseBackend):
                 yield
                 self._require_native_transaction()
                 await conn.execute(f"RELEASE SAVEPOINT {name}")
-            except BaseException:
+            except BaseException as error:
                 if conn.in_transaction and not self._transaction_poisoned:
                     try:
                         await conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
                         await conn.execute(f"RELEASE SAVEPOINT {name}")
-                    except BaseException:
+                    except BaseException as cleanup_error:
                         self._transaction_poisoned = True
-                        raise
+                        raise execution_terminal_error(error, cleanup_error)
                 raise
             return
 
@@ -1654,8 +1716,8 @@ class SQLiteBackend(DatabaseBackend):
                     if is_execution_control_error(e):
                         raise
                     raise TransactionError(f"Transaction failed: {e}") from e
-                except BaseException:
-                    await self._rollback_after_failure(conn)
+                except BaseException as error:
+                    await self._rollback_after_failure(conn, error=error)
                     raise
                 finally:
                     self._in_transaction = False

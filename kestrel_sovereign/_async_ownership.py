@@ -14,11 +14,89 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Generic, TypeVar, cast
 
-
 _T = TypeVar("_T")
 _ITERATOR_TERMINAL = object()
 _ITERATOR_INTERRUPTED = object()
 _TASK_ERROR_UNSET = object()
+
+
+def create_owned_task(operation, *, name=None, context=None):
+    """Capture the original carrier inside a child before asyncio can erase it.
+
+    Creation retains normal copied-context semantics. The caller still owns
+    physical joining or a documented bounded retirement transfer.
+    """
+    started = False
+    async def run():
+        nonlocal started
+        started = True
+        try:
+            return await operation
+        except BaseException as error:
+            from kestrel_sovereign.execution_custody import (
+                execution_terminal_error,
+                retained_execution_error,
+            )
+            task = asyncio.current_task()
+            task._kestrel_owned_terminal_error = retained_execution_error(
+                execution_terminal_error(getattr(task, "_kestrel_owned_terminal_error", None), error)
+            )
+            raise
+    wrapper = run()
+    try:
+        task = asyncio.create_task(wrapper, name=name, context=context)
+    except BaseException:
+        wrapper.close()
+        close = getattr(operation, "close", None)
+        if callable(close):
+            close()
+        raise
+    def close_unstarted(_task):
+        if not started:
+            close = getattr(operation, "close", None)
+            if callable(close):
+                close()
+    task.add_done_callback(close_unstarted)
+    return task
+
+
+async def gather_owned(operations):
+    """Join a fan-out, cancelling siblings on failure without losing receipts."""
+    from kestrel_sovereign.execution_custody import (
+        execution_terminal_error,
+        is_execution_control_error,
+    )
+    children = []
+    pending = set()
+    primary = None
+    try:
+        for operation in operations:
+            children.append(create_owned_task(operation))
+        pending = set(children)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for child in done:
+                error = owned_task_error(child)
+                if error is not None:
+                    raise error
+    except BaseException as error:
+        primary = error
+    if primary is not None:
+        for child in children:
+            if not child.done():
+                child.cancel()
+    errors = [primary]
+    results = []
+    for child in children:
+        outcome = await await_owned_task(child)
+        results.append(outcome.result)
+        if outcome.error is not None and (not isinstance(outcome.error, asyncio.CancelledError) or is_execution_control_error(outcome.error)):
+            errors.append(outcome.error)
+        errors.append(outcome.cancellation)
+    terminal = execution_terminal_error(*errors)
+    if terminal is not None:
+        raise terminal
+    return results
 
 
 class _ConsumerCloseRecord:
@@ -282,7 +360,9 @@ class OwnedAsyncIterator(Generic[_T]):
                 # Import lazily: execution_custody also uses this primitive.
                 # A cancellation carrying authority/commit evidence is not
                 # our private producer interrupt, even during requested close.
-                from kestrel_sovereign.execution_custody import is_execution_control_error
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
                 if is_execution_control_error(error):
                     raise
                 # An exception raised while a requested close interrupts
@@ -329,7 +409,9 @@ class OwnedAsyncIterator(Generic[_T]):
                         try:
                             await close_iterator()
                         except BaseException as error:
-                            from kestrel_sovereign.execution_custody import execution_terminal_error
+                            from kestrel_sovereign.execution_custody import (
+                                execution_terminal_error,
+                            )
                             self._cleanup_error = error
                             self._terminal_error = execution_terminal_error(
                                 self._terminal_error, error,
@@ -394,6 +476,8 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
 async def await_owned_task(
     task: asyncio.Future[_T],
     pending_cancellation: asyncio.CancelledError | None = None,
+    *,
+    cancel_on_caller_cancellation: bool = False,
 ) -> OwnedTaskOutcome[_T]:
     """Retrieve ``task`` despite repeated cancellation of its caller.
 
@@ -406,6 +490,10 @@ async def await_owned_task(
     would make each ``shield`` raise at once, without yielding, so this loop
     would spin and ``task`` could never finish. Nothing but this function
     holds the future, so only ``task`` completing resolves it.
+
+    ``cancel_on_caller_cancellation`` forwards the first caller cancellation
+    once to an operation that needs it to begin unwinding. Subsequent caller
+    cancellations remain shielded until that same owner physically settles.
     """
 
     completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -414,6 +502,7 @@ async def await_owned_task(
         if not completion.done():
             completion.set_result(None)
 
+    cancellation_forwarded = False
     task.add_done_callback(mark_complete)
     try:
         while not task.done():
@@ -422,6 +511,11 @@ async def await_owned_task(
             except asyncio.CancelledError as error:
                 if pending_cancellation is None:
                     pending_cancellation = error
+                if cancel_on_caller_cancellation and not cancellation_forwarded:
+                    # Interrupt the operation once, then own its entire unwind.
+                    # Repeated caller cancellation must not interrupt cleanup.
+                    cancellation_forwarded = True
+                    task.cancel()
     finally:
         task.remove_done_callback(mark_complete)
 
@@ -439,7 +533,8 @@ def raise_owned_outcome(
     """Preserve control evidence before ordinary caller-cancellation precedence."""
 
     from kestrel_sovereign.execution_custody import (
-        execution_terminal_error, is_execution_control_error,
+        execution_terminal_error,
+        is_execution_control_error,
     )
     if any(
         error is not None and is_execution_control_error(error)
@@ -472,6 +567,9 @@ __all__ = [
     "OwnedAsyncIterator",
     "OwnedTaskOutcome",
     "await_owned_task",
+    "create_owned_task",
+    "gather_owned",
+    "owned_task_error",
     "raise_owned_outcome",
     "run_blocking_operation",
 ]

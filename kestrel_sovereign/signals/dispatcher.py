@@ -98,8 +98,6 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, List, Optional, Protocol
 from zoneinfo import ZoneInfo
 
-from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
-
 from kestrel_sdk.signals import (
     AttentionPolicy,
     CausationFrame,
@@ -115,6 +113,10 @@ from kestrel_sdk.signals import (
     Visibility,
 )
 
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
 from kestrel_sovereign.hold import HoldStateError, HoldTurnRefusal
 from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
@@ -146,8 +148,8 @@ from kestrel_sovereign.signals.durable import (
     DurableConsumerRegistration,
     DurableDelivery,
     DurableIngressAttestation,
-    DurableSourceBoundary,
     DurableSignalStore,
+    DurableSourceBoundary,
 )
 from kestrel_sovereign.signals.in_flight_control import (
     InFlightControlActionRegistration,
@@ -176,11 +178,11 @@ from kestrel_sovereign.storage.privacy_wrapper import (
 )
 from kestrel_sovereign.storage.session_id_column import new_session_id
 from kestrel_sovereign.telemetry import (
-    capture_turn_ids,
     KESTREL_AGENT_NAME,
     KESTREL_TURN_ID,
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
+    capture_turn_ids,
     optional_span,
     session_span_attributes,
 )
@@ -1384,9 +1386,8 @@ class SignalDispatcher:
                 guard.operation.cancelling() > 0 or guard.operation.cancelled()
             )
             owner_abandoned_settlement = completed_owner.cancelled()
-            owner_error = (
-                None if owner_abandoned_settlement else completed_owner.exception()
-            )
+            from kestrel_sovereign._async_ownership import owned_task_error
+            owner_error = owned_task_error(completed_owner)
             unresolved_control = (
                 owner_error is not None and is_execution_control_error(owner_error)
             )
@@ -4775,7 +4776,8 @@ class SignalDispatcher:
                         finally:
                             self._durable_cognition_route.reset(route_token)
 
-                    routing_task = asyncio.create_task(
+                    from kestrel_sovereign._async_ownership import create_owned_task
+                    routing_task = create_owned_task(
                         route_durable_cognition(),
                         name=f"durable_cognition_route:{delivery.delivery_id}",
                     )
@@ -5220,6 +5222,10 @@ class SignalDispatcher:
             routing_task.cancel()
             self._retain_durable_cognition_task(routing_task, delivery=delivery, control_error=error)
         else:
+            if routing_task is not None:
+                from kestrel_sovereign._async_ownership import owned_task_error
+                from kestrel_sovereign.execution_custody import execution_terminal_error
+                error = execution_terminal_error(error, owned_task_error(routing_task))
             await self._terminalize_failed_cognition(delivery, error)
 
     async def _terminalize_failed_cognition(
@@ -5936,8 +5942,9 @@ class SignalDispatcher:
 
         async def await_monitored_execution(execution):
             """Race cognition against source-owned durable withdrawal."""
-            from kestrel_sovereign._async_ownership import await_owned_task
             import sys
+
+            from kestrel_sovereign._async_ownership import await_owned_task
 
             async def join_sibling(task):
                 outcome = await await_owned_task(task)

@@ -5,13 +5,25 @@ import json
 import logging
 import os
 import re
-from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Type,
+    Union,
+    runtime_checkable,
+)
 
 if TYPE_CHECKING:
     from kestrel_sdk.hooks.base import Hook
 from abc import ABC, abstractmethod
-from kestrel_sdk.tools.base import ToolSchema, ToolParameter, ToolCategory, AgentTool
-from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+
 # Import the A2A types from the SDK directly rather than the
 # ``kestrel_sovereign.a2a`` re-export package. Importing the sovereign a2a
 # package runs its ``__init__`` which eagerly pulls in task_manager/task_worker
@@ -22,15 +34,23 @@ from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 # the half-built module and raises a circular ImportError that silently disables
 # provider embeddings (#1792). The sovereign modules are pure re-exports of
 # these same SDK symbols, so importing them from the SDK is equivalent.
-from kestrel_sdk.a2a.agent_card import AgentCard, AgentSkill, AgentCapabilities
-from kestrel_sdk.a2a.types import Task, TaskState, TaskStatus, Artifact, DataPart, Message, TextPart
+from kestrel_sdk.a2a.agent_card import AgentCapabilities, AgentCard, AgentSkill
+from kestrel_sdk.a2a.types import (
+    Artifact,
+    DataPart,
+    Message,
+    Task,
+    TaskState,
+    TaskStatus,
+    TextPart,
+)
 
 # The SDK Feature is the canonical base class for feature packages.
 # Sovereign's richer Feature inherits from it so extracted packages that
 # subclass kestrel_sdk.features.base.Feature are also recognized as
 # kestrel_sovereign.features.base.Feature at runtime (issubclass passes).
 from kestrel_sdk.features.base import Feature as _SdkFeature
-from kestrel_sdk.features.ui import UIContributions
+
 # One source of truth for tool-schema generation: the @tool decorator and its
 # docstring parser live in the SDK. Sovereign re-exports them (not a second
 # copy) so both in-tree and external features share the SDK's annotation
@@ -38,13 +58,22 @@ from kestrel_sdk.features.ui import UIContributions
 # real JSON types instead of silently degrading to "string" (review finding
 # F003). The two former in-tree copies were verified behaviourally identical to
 # these across every feature docstring in the tree before removal.
-from kestrel_sdk.features.base import tool, parse_docstring_params
+from kestrel_sdk.features.base import parse_docstring_params, tool
+from kestrel_sdk.features.ui import UIContributions
+from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    execution_work_operation,
+    is_execution_control_error,
+    require_execution_work,
+)
 from kestrel_sovereign.turn_completion import (
     confirm_unfinished,
     settle_repaired_content,
     turn_completion_repair_prompt,
 )
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_work_operation, is_execution_control_error, require_execution_work
 
 logger = logging.getLogger(__name__)
 
@@ -487,7 +516,7 @@ class Feature(_SdkFeature):
             try:
                 await release()
             except BaseException as error:
-                if not is_execution_control_error(error):
+                if not is_execution_control_error(error) and not isinstance(error, asyncio.CancelledError):
                     raise
                 failures.append(error)
         if failures:
@@ -963,14 +992,20 @@ class Feature(_SdkFeature):
         pending = [task for task in tasks if not task.done()]
         for task in pending:
             task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        from kestrel_sovereign._async_ownership import owned_task_error
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task,
+            owned_task_error,
+        )
         from kestrel_sovereign.execution_custody import execution_terminal_error
+        cancellations = []
+        for task in tasks:
+            outcome = await await_owned_task(task)
+            if outcome.cancellation is not None:
+                cancellations.append(outcome.cancellation)
         for task in tasks:
             self._remember_background_control(owned_task_error(task))
         self._owned_background_tasks = []
-        terminal = execution_terminal_error(vars(self).get("_owned_background_control"))
+        terminal = execution_terminal_error(vars(self).get("_owned_background_control"), *cancellations)
         if terminal is not None:
             raise terminal
 
@@ -1831,7 +1866,9 @@ class Feature(_SdkFeature):
             effective_args = args
             if hooks_manager is not None:
                 from kestrel_sdk.hooks.base import (
-                    HookEvent, HookInput, PermissionDecision,
+                    HookEvent,
+                    HookInput,
+                    PermissionDecision,
                 )
                 hook_input = HookInput(
                     session_id="subagent",
@@ -1905,7 +1942,9 @@ class Feature(_SdkFeature):
             require_execution_work(self.agent)
             try:
                 result = await selected_tool.execute(**effective_args)
-                from kestrel_sovereign.agent.invocation import mark_current_invocation_effect_completed
+                from kestrel_sovereign.agent.invocation import (
+                    mark_current_invocation_effect_completed,
+                )
 
                 mark_current_invocation_effect_completed(None)
                 require_execution_work(self.agent)
@@ -2379,7 +2418,9 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                                 # Preserve effect evidence at the actual method
                                 # return, before a post-return denial can stop
                                 # the orchestrator from observing completion.
-                                from kestrel_sovereign.agent.invocation import mark_current_invocation_effect_completed
+                                from kestrel_sovereign.agent.invocation import (
+                                    mark_current_invocation_effect_completed,
+                                )
                                 mark_current_invocation_effect_completed(None)
                                 require_execution_work(self.func.__self__.agent)
                             except ExecutionAuthorityError:

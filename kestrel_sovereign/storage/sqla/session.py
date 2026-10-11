@@ -33,16 +33,20 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from kestrel_sovereign._async_ownership import create_owned_task, owned_task_error
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    refuse_unfenced_executor,
+)
 from kestrel_sovereign.storage.db.interface import ConnectionError
-from kestrel_sovereign.execution_custody import refuse_unfenced_executor
 from kestrel_sovereign.storage.db.sqlite import (
     SQLiteBackend,
-    _RetainedAiosqliteCloses,
     _aiosqlite_worker_is_alive,
     _close_aiosqlite_connection,
     _minimum_close_timeout_s,
     _prune_retained_aiosqlite_closes,
     _retain_aiosqlite_close,
+    _RetainedAiosqliteCloses,
 )
 
 
@@ -191,29 +195,19 @@ class SovereignSqlaSessionFactory:
         database lifecycle owner surface a late failure before it permits
         replacement resources.
         """
-        if task.cancelled():
-            if self._engine_dispose_error is None:
-                self._engine_dispose_error = ConnectionError(
-                    "SQLAlchemy engine disposal was cancelled before completion"
-                )
-            return
-        error = task.exception()
-        if error is not None and self._engine_dispose_error is None:
-            self._engine_dispose_error = error
+        error = owned_task_error(task)
+        if not task.cancelled():
+            task.exception()
+        self._engine_dispose_error = execution_terminal_error(self._engine_dispose_error, error)
 
     def _capture_session_close_result(
         self, task: asyncio.Task[None]
     ) -> None:
         """Retrieve and retain a late active-session close failure."""
-        if task.cancelled():
-            if self._session_close_error is None:
-                self._session_close_error = ConnectionError(
-                    "SQLAlchemy session close was cancelled before completion"
-                )
-            return
-        error = task.exception()
-        if error is not None and self._session_close_error is None:
-            self._session_close_error = error
+        error = owned_task_error(task)
+        if not task.cancelled():
+            task.exception()
+        self._session_close_error = execution_terminal_error(self._session_close_error, error)
 
     def finalize_retirement(self) -> None:
         """Validate completion and surface any previously unseen failure."""
@@ -312,7 +306,7 @@ class SovereignSqlaSessionFactory:
         if not self._close_started:
             self._close_started = True
             for session in tuple(self._active_sessions):
-                close_task = loop.create_task(
+                close_task = create_owned_task(
                     session.close(),
                     name=f"sqla-session-close:{id(session)}",
                 )
@@ -321,7 +315,7 @@ class SovereignSqlaSessionFactory:
                 )
                 self._session_close_tasks.add(close_task)
         if self._engine_dispose_task is None:
-            self._engine_dispose_task = loop.create_task(
+            self._engine_dispose_task = create_owned_task(
                 self._engine.dispose(),
                 name=f"sqla-engine-dispose:{id(self)}",
             )

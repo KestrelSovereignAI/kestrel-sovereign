@@ -1,10 +1,4 @@
 """Agent invoke and streaming endpoints."""
-from collections import defaultdict
-from collections.abc import Mapping
-from dataclasses import dataclass
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response, UploadFile, File
-from fastapi.responses import StreamingResponse
-from typing import Any, Dict, List, Optional
 import asyncio
 import inspect
 import json
@@ -13,40 +7,24 @@ import os
 import re
 import sys
 import time
+from collections import defaultdict
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
-from kestrel_sovereign.streams.tap import AgentStreamTap
-from kestrel_sovereign.execution_custody import (
-    execution_terminal_error, execution_work_operation, is_execution_control_error, require_execution_work,
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
 )
+from fastapi.responses import StreamingResponse
 
-from kestrel_sovereign.kestrel_config.constants import (
-    MAX_SSE_CONNECTIONS_PER_CLIENT,
-    SSE_PING_INTERVAL_SECONDS,
-)
-from kestrel_sovereign.rate_limit import (
-    durable_stop_rate_limit_key,
-    limiter,
-    stop_admission_rate_limit,
-)
-from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
-from kestrel_sovereign.endpoints.agent_helpers import (
-    caller_is_sovereign,
-    get_agent,
-    invocation_was_self_fenced,
-    prime_durable_stop_fence,
-    reject_reserved_session_id,
-    request_invocation_provenance,
-    resolve_request_invocation_id,
-    self_fenced_invocation_http_error,
-    validate_request_invocation_id,
-)
-from kestrel_sovereign.api_errors import (
-    ApiHTTPException,
-    generation_incomplete,
-    rate_limited_until,
-)
-from kestrel_sovereign.llm.output_ceiling import incomplete_generation
-from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
+from kestrel_sovereign._async_ownership import OwnedAsyncIterator
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
@@ -61,22 +39,51 @@ from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
     bind_request_operation_if_supported,
 )
-from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+from kestrel_sovereign.api_errors import (
+    ApiHTTPException,
+    generation_incomplete,
+    rate_limited_until,
+)
+from kestrel_sovereign.endpoints.agent_helpers import (
+    caller_is_sovereign,
+    get_agent,
+    invocation_was_self_fenced,
+    prime_durable_stop_fence,
+    reject_reserved_session_id,
+    request_invocation_provenance,
+    resolve_request_invocation_id,
+    self_fenced_invocation_http_error,
+    validate_request_invocation_id,
+)
 from kestrel_sovereign.endpoints.closing_streaming_response import (
     ClosingStreamingResponse,
 )
-from kestrel_sovereign.hold import HoldTurnRefusal
-from kestrel_sovereign.storage.privacy_wrapper import (
-    PRIVACY_TRANSITION_RETRY_MESSAGE,
-    PrivacyViolationError,
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    execution_work_operation,
+    is_execution_control_error,
+    require_execution_work,
 )
+from kestrel_sovereign.hold import HoldTurnRefusal
+from kestrel_sovereign.kestrel_config.constants import (
+    MAX_SSE_CONNECTIONS_PER_CLIENT,
+    SSE_PING_INTERVAL_SECONDS,
+)
+from kestrel_sovereign.llm.output_ceiling import incomplete_generation
+from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
+from kestrel_sovereign.rate_limit import (
+    durable_stop_rate_limit_key,
+    limiter,
+    stop_admission_rate_limit,
+)
+from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.stop import (
+    MAX_STOP_CORRELATION_ID_BYTES,
     AuthoritativeStopDescendant,
     CancellationAuthority,
     CooperativeStopTarget,
-    MAX_STOP_CORRELATION_ID_BYTES,
-    StopDisposition,
     StopCleanupRegistry,
+    StopDisposition,
     StopDoor,
     StopRequest,
     StopScope,
@@ -86,6 +93,12 @@ from kestrel_sovereign.stop.runtime_target import (
     build_runtime_stop_target,
     resolve_runtime_stop_identity,
 )
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    PrivacyViolationError,
+)
+from kestrel_sovereign.streams.tap import AgentStreamTap
+
 logger = logging.getLogger(__name__)
 
 # SSE connection tracking: maps (client_ip, agent_id) -> active connection count
@@ -236,7 +249,9 @@ async def _kite_runtime_observation(
 
     from kestrel_sovereign.agent.invocation import invocation_scope
     from kestrel_sovereign.knowledge.kite_evidence_signing import (
-        KiteEvidenceNonceReplay, KiteEvidenceSigningError, consume_kite_evidence_nonce,
+        KiteEvidenceNonceReplay,
+        KiteEvidenceSigningError,
+        consume_kite_evidence_nonce,
     )
     try:
         nonce_receipt = consume_kite_evidence_nonce(
@@ -2024,8 +2039,8 @@ async def _acquire_context_status_measurement(
 ) -> _ContextStatusMeasurement:
     """Acquire one dry-run production plan for a session."""
 
-    from kestrel_sovereign.agent.token_counter import get_token_counter
     from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
+    from kestrel_sovereign.agent.token_counter import get_token_counter
 
     privacy_agent = getattr(agent, "privacy_agent", None)
     history_reader = getattr(
@@ -2263,8 +2278,8 @@ async def compute_context_status(
       relevance gates and retrieval path execute read-only.
     """
     try:
-        from kestrel_sovereign.agent.token_counter import get_token_counter
         from kestrel_sovereign.agent.token_budget import RESPONSE_RESERVE
+        from kestrel_sovereign.agent.token_counter import get_token_counter
 
         # 1. No active session → return an idle shape.  Previously passing
         # session_id=None into get_conversation_history leaked the agent's
@@ -3338,14 +3353,14 @@ async def send_task(request: Request):
             detail="TaskManager not available — agent cannot accept A2A tasks",
         )
 
+    from kestrel_sovereign.a2a.local_submission import (
+        HOST_ATTESTED_LOCAL_SUBMISSION_METADATA,
+    )
     from kestrel_sovereign.a2a.types import (
         Artifact,
         Message,
-        TextPart,
         TaskSendParams,
-    )
-    from kestrel_sovereign.a2a.local_submission import (
-        HOST_ATTESTED_LOCAL_SUBMISSION_METADATA,
+        TextPart,
     )
     try:
         # Parse body into TaskSendParams. Sender-side already validated
@@ -4039,6 +4054,9 @@ async def heartbeat_trigger(request: Request):
         result = await runner.run_once()
         return result.to_dict()
     except Exception as e:
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Heartbeat trigger error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error triggering heartbeat.")
 

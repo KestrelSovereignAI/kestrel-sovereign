@@ -13,30 +13,30 @@ This is the primary API for working with A2A tasks.
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, AsyncGenerator, Callable, Coroutine, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Callable,
+    Coroutine,
+    Optional,
+    Protocol,
+    runtime_checkable,
+)
+from uuid import uuid4
 
-from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
-
-from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
-
-from kestrel_sovereign.a2a.types import (
-    Task,
-    TaskState,
-    TaskStatus,
-    TaskSendParams,
-    Message,
-    TextPart,
-    Artifact,
-    TaskStatusUpdateEvent,
-    TaskArtifactUpdateEvent,
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    create_owned_task,
+    raise_owned_outcome,
 )
 from kestrel_sovereign.a2a.agent_card import AgentCard
 from kestrel_sovereign.a2a.stores import (
-    TaskStore,
-    SessionService,
+    FeedbackStore,
     MemoryService,
     ObservabilityStore,
-    FeedbackStore,
+    SessionService,
+    TaskStore,
 )
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskCancellationSnapshot,
@@ -44,13 +44,22 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskMutationAuthorizationError,
     without_reserved_cancellation_receipt,
 )
-from typing import Protocol, runtime_checkable, TYPE_CHECKING
-from uuid import uuid4
-
-from kestrel_sovereign._async_ownership import (
-    await_owned_task,
-    raise_owned_outcome,
+from kestrel_sovereign.a2a.types import (
+    Artifact,
+    Message,
+    Task,
+    TaskArtifactUpdateEvent,
+    TaskSendParams,
+    TaskState,
+    TaskStatus,
+    TaskStatusUpdateEvent,
+    TextPart,
 )
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
+from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 
 if TYPE_CHECKING:
     from kestrel_sovereign.hooks import HooksManager
@@ -223,9 +232,12 @@ class TaskManager:
             if store is None:
                 continue
             try:
-                await store.close()
+                outcome = await await_owned_task(create_owned_task(store.close()))
+                error = execution_terminal_error(outcome.error, outcome.cancellation)
+                if error is not None:
+                    raise error
             except BaseException as e:
-                if not isinstance(e, Exception) and not is_execution_control_error(e):
+                if not isinstance(e, (Exception, asyncio.CancelledError)) and not is_execution_control_error(e):
                     raise
                 logger.warning("Error closing %s: %s", name, e, exc_info=True)
                 failures.append((name, e))
@@ -509,7 +521,7 @@ class TaskManager:
         authority_agent_id: str,
     ) -> asyncio.Task[None]:
         """Own background task execution so close() can cancel and await it."""
-        task = asyncio.create_task(coro, name=f"a2a-task-{task_id}")
+        task = create_owned_task(coro, name=f"a2a-task-{task_id}")
         self._execution_tasks.add(task)
         self._execution_authorities[task] = (task_id, authority_agent_id)
 
@@ -548,8 +560,10 @@ class TaskManager:
                     except asyncio.CancelledError as cancellation:
                         self._remember_execution_control(cancellation)
                         terminal_errors.append(cancellation)
-                    except Exception as error:
+                    except BaseException as error:
                         self._remember_execution_control(error)
+                        if not isinstance(error, Exception) and not is_execution_control_error(error):
+                            terminal_errors.append(error)
                         # Shutdown must still stop the in-memory worker when its
                         # durable receipt cannot be persisted. The backend error
                         # is observable in logs, but cannot strand the worker or
@@ -563,10 +577,12 @@ class TaskManager:
                 else:
                     task.cancel()
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, BaseException):
-                self._remember_execution_control(result)
+        for task in tasks:
+            result = await await_owned_task(task)
+            if result.error is not None:
+                self._remember_execution_control(result.error)
+            if result.cancellation is not None:
+                terminal_errors.append(result.cancellation)
         self._execution_tasks.difference_update(tasks)
         terminal = execution_terminal_error(
             self._execution_control, *terminal_errors,
@@ -2035,11 +2051,11 @@ async def create_task_manager(
         Initialized TaskManager
     """
     from kestrel_sovereign.a2a.stores import (
-        SQLiteTaskStore,
-        SQLiteSessionService,
-        SQLiteObservabilityStore,
-        SQLiteMemoryService,
         SQLiteFeedbackStore,
+        SQLiteMemoryService,
+        SQLiteObservabilityStore,
+        SQLiteSessionService,
+        SQLiteTaskStore,
     )
 
     task_store = SQLiteTaskStore(db_path)

@@ -66,12 +66,12 @@ from kestrel_sdk.isolated_feature import (
 )
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
 
-from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
     owned_task_error,
     raise_owned_outcome,
 )
+from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCommitOutcomeError,
@@ -80,8 +80,8 @@ from kestrel_sovereign.execution_custody import (
     execution_commit_outcome,
     execution_terminal_error,
     is_execution_control_error,
-    retained_execution_error,
     require_execution_work,
+    retained_execution_error,
 )
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.base import Feature, UIContributions
@@ -13802,7 +13802,9 @@ class ProxyFeature(Feature):
             try:
                 task = tracker(coro, name=name)
             except Exception as error:  # noqa: BLE001
-                from kestrel_sovereign.execution_custody import is_execution_control_error
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
                 if is_execution_control_error(error):
                     raise
                 task = None
@@ -13851,7 +13853,9 @@ class ProxyFeature(Feature):
             try:
                 tracked = tracker(coro, name=name)
             except Exception as error:  # noqa: BLE001 - test doubles may reject tracking
-                from kestrel_sovereign.execution_custody import is_execution_control_error
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
                 if is_execution_control_error(error):
                     raise
                 tracked = None
@@ -14363,7 +14367,8 @@ class ProxyFeature(Feature):
                                         task, client
                                     ),
                                 )
-                        except asyncio.CancelledError:
+                        except asyncio.CancelledError as stop_error:
+                            self._retain_execution_control(stop_error)
                             # A real caller cancellation can arrive while a
                             # facade stop itself fails/cancels.  Keep only a
                             # callback-proven completion for terminal cleanup;
@@ -14378,7 +14383,8 @@ class ProxyFeature(Feature):
                                     stop_completion
                                 )
                             raise
-                        except BaseException:  # noqa: BLE001 - fence hostile stop failures
+                        except BaseException as stop_error:  # noqa: BLE001 - fence hostile stop failures
+                            self._retain_execution_control(stop_error)
                             self._discard_terminal_stop_completion(stop_completion)
                             # Never reopen traffic to a client whose stop
                             # outcome is unknown.  The terminal transaction
@@ -14395,10 +14401,15 @@ class ProxyFeature(Feature):
                                 # would cancel and later join its own owner
                                 # while that owner awaits the cleanup task.
                                 self._supervision_task = None
-                            await self._complete_terminal_cleanup(
-                                best_effort=True,
-                                lifecycle_lock_held=True,
-                            )
+                            try:
+                                await self._complete_terminal_cleanup(
+                                    best_effort=True,
+                                    lifecycle_lock_held=True,
+                                )
+                            except BaseException as cleanup_error:
+                                raise execution_terminal_error(stop_error, cleanup_error)
+                            if is_execution_control_error(stop_error):
+                                raise stop_error
                             break
                         try:
                             await self._drain_traffic_gate()
@@ -14729,7 +14740,9 @@ class ProxyFeature(Feature):
                 try:
                     async with self._traffic_gate.admit(wait_for_open=False):
                         for predecessor in completion_predecessors:
-                            from kestrel_sovereign._async_ownership import owned_task_error
+                            from kestrel_sovereign._async_ownership import (
+                                owned_task_error,
+                            )
                             try:
                                 await asyncio.shield(predecessor)
                             except asyncio.CancelledError as interruption:

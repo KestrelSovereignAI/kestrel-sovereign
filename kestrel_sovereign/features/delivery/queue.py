@@ -29,6 +29,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.features.delivery.models import (
     DeliveryResult,
     DeliveryStatus,
@@ -227,7 +229,7 @@ class DeliveryQueue:
         await self._ensure_tables()
         await self._reclaim_in_flight()
         self._running = True
-        factory = self._runtime_task_factory or asyncio.create_task
+        factory = self._runtime_task_factory or create_owned_task
         self._task = factory(
             self._loop(), name="delivery-queue-worker"
         )
@@ -241,12 +243,18 @@ class DeliveryQueue:
     async def stop(self):
         """Gracefully stop the background worker."""
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        terminal = getattr(self, "_worker_control", None)
+        if self._task:
+            if not self._task.done():
+                self._task.cancel()
+            outcome = await await_owned_task(self._task)
+            terminal = execution_terminal_error(terminal,
+                outcome.error if outcome.error is not None and is_execution_control_error(outcome.error) else None,
+                outcome.cancellation)
+        if terminal is not None:
+            if is_execution_control_error(terminal):
+                self._worker_control = terminal
+            raise terminal
         logger.info("DeliveryQueue stopped")
 
     async def _reclaim_in_flight(self) -> int:
@@ -1692,7 +1700,9 @@ class DeliveryQueue:
                     logger.debug("Delivery worker processed %d messages", processed)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.exception("DeliveryQueue worker tick error")
             try:
                 await asyncio.sleep(self._poll_interval)
@@ -1722,6 +1732,8 @@ class DeliveryQueue:
                     entry.channel_type, entry.recipient, entry.content,
                 )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 result = DeliveryResult(success=False, error=str(e))
         elif self._allow_noop_delivery:
             result = DeliveryResult(
