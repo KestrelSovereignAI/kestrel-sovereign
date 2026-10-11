@@ -1143,6 +1143,7 @@ class SignalDispatcher:
         )
 
         ctx_token = set_current_signal(signal)
+        admission_error = None
         try:
             async with self._admit_durable_operation():
                 result = await self._run(
@@ -1180,10 +1181,20 @@ class SignalDispatcher:
                 # this await cannot create a storage-close gap.
                 await self._drain_outcome_logs_for_signal(signal.id)
                 return result
-        except _DurableDeliveryShuttingDownError:
+        except _DurableDeliveryShuttingDownError as error:
+            if is_execution_control_error(error):
+                admission_error = error
+                raise
             return self._durable_shutdown_signal_result(signal, start)
-        except Exception as e:
+        except asyncio.CancelledError as error:
+            if is_execution_control_error(error):
+                admission_error = error
+            raise
+        except BaseException as e:
             if is_execution_control_error(e):
+                admission_error = e
+                raise
+            if not isinstance(e, Exception):
                 raise
             # Defensive — every failure path inside _run should already
             # produce a SignalResult. If we land here, log it loudly.
@@ -1202,15 +1213,20 @@ class SignalDispatcher:
             )
         finally:
             if _durable_admission is not None and not _durable_admission.done():
-                # Cancellation and unexpected pipeline failure are not a
-                # durable receipt.  Resolve the waiter so its source can retry
-                # rather than waiting forever on an abandoned task.
-                _durable_admission.set_result(
-                    DurableAdmissionResult(
-                        DurableAdmissionDisposition.NOT_ADMITTED,
-                        signal.id,
+                # Control/uncertain commit is not proven retryable absence.
+                # Keep the original receipt in BOTH public completion lanes.
+                if admission_error is not None:
+                    _durable_admission.set_exception(admission_error)
+                    # Terminal-only callers need not consume this second lane.
+                    # Harvest without changing what admission waiters receive.
+                    _durable_admission.exception()
+                else:
+                    _durable_admission.set_result(
+                        DurableAdmissionResult(
+                            DurableAdmissionDisposition.NOT_ADMITTED,
+                            signal.id,
+                        )
                     )
-                )
             reset_current_signal(ctx_token)
             self._deferred_outcome_logs.reset(deferred_token)
             self._durable_cognition_route.reset(durable_route_token)

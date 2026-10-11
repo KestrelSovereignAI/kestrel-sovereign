@@ -338,6 +338,17 @@ turn it into an automatic retry. Ordinary delivery failure and control-free
 shutdown still retain their documented restore/retry behavior.
 The real agent shutdown joins every later resource owner before reporting that
 receipt. Physical retirement is not reconciliation or an acknowledged Stop.
+The earlier durable-admission Future also preserves original control instead
+of publishing retryable NOT_ADMITTED: channel cognition/terminal ingress and
+the isolated producer cannot issue a provider retry or ACK from that error.
+Completed detached ingress retains one strongest receipt through physical
+proxy retirement. Model/embedding preference callbacks do not swallow native
+control, and their completed-task drainer retains one strongest original task
+receipt. Late unbound modality accounting keeps its existing two-second caller
+deadline, but a native COMMIT/ACK failure afterward survives task removal and
+is reported by drain/close. LLM close joins every writer, adapter, client,
+remote-route and usage-database owner before propagating strongest control;
+closing physical resources never certifies reconciliation of an uncertain write.
 Deferred OpenRouter provisioning validates the original admission after client
 acquisition and immediately before each POST, including retries after backoff.
 Cause-carried control errors bypass retry/error normalization; ordinary live

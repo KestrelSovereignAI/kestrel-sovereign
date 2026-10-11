@@ -26,6 +26,7 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_agent_privacy_config,
@@ -743,6 +744,8 @@ class ChannelFeature(Feature):
                 ),
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error("Failed to log channel message: %s", exc)
 
     async def _log_outbound(
@@ -1016,7 +1019,9 @@ class ChannelFeature(Feature):
                 consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
             )
             receipt = await handle.wait_for_durable_admission()
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.exception(
                 "Failed to durably record terminal Telegram update id=%s", message.id
             )
@@ -1206,7 +1211,9 @@ class ChannelFeature(Feature):
                         durable_admission = (
                             getattr(receipt, "acknowledged", False) is True
                         )
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.exception(
                     "Failed to durably admit channel.message signal for message id=%s",
                     message.id,

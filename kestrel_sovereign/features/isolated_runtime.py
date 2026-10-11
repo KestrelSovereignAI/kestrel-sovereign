@@ -9059,7 +9059,12 @@ class ProxyFeature(Feature):
             # Do not expose a hostile facade's message/type/traceback.  This
             # fresh public lifecycle error says only that the sealed proxy has
             # not reached a state in which success would be honest.
-            raise RuntimeError("isolated feature terminal retirement is incomplete")
+            raise execution_terminal_error(
+                vars(self).get("_event_ingress_control"),
+                RuntimeError("isolated feature terminal retirement is incomplete"),
+            )
+        if not best_effort and vars(self).get("_event_ingress_control") is not None:
+            raise self._event_ingress_control
 
     async def _terminal_cleanup_uninterrupted(
         self,
@@ -14550,15 +14555,21 @@ class ProxyFeature(Feature):
                 try:
                     async with self._traffic_gate.admit(wait_for_open=False):
                         for predecessor in completion_predecessors:
+                            from kestrel_sovereign._async_ownership import owned_task_error
                             try:
                                 await asyncio.shield(predecessor)
-                            except asyncio.CancelledError:
+                            except asyncio.CancelledError as interruption:
+                                prior_error = owned_task_error(predecessor) if predecessor.done() else interruption
+                                if prior_error is not None and is_execution_control_error(prior_error):
+                                    raise prior_error
                                 if (
                                     asyncio.current_task() is not None
                                     and asyncio.current_task().cancelling()
                                 ):
                                     raise
-                            except BaseException:  # noqa: BLE001 - predecessor audited
+                            except BaseException as error:  # noqa: BLE001 - predecessor audited
+                                if is_execution_control_error(error):
+                                    raise
                                 logger.warning(
                                     "Prior inbound completion from isolated feature %s "
                                     "failed; rechecking the queued callback against "
@@ -14602,7 +14613,9 @@ class ProxyFeature(Feature):
                     self._schedule_event_ingress_retry(source_client, retry)
             except asyncio.CancelledError:
                 raise
-            except BaseException:  # noqa: BLE001 - producer retains its cursor
+            except BaseException as error:  # noqa: BLE001 - producer retains its cursor
+                if is_execution_control_error(error):
+                    raise
                 logger.warning(
                     "Detached inbound ingress from isolated feature %s failed",
                     self.name,
@@ -14624,18 +14637,18 @@ class ProxyFeature(Feature):
         self._event_ingress_clients.append((source_client, task))
 
         def consume_route(completed: asyncio.Task[None]) -> None:
+            from kestrel_sovereign._async_ownership import owned_task_error
+            error = owned_task_error(completed)
+            if error is not None and is_execution_control_error(error):
+                self._event_ingress_control = execution_terminal_error(
+                    vars(self).get("_event_ingress_control"), error,
+                )
             self._event_ingress_tasks.discard(completed)
             self._event_ingress_clients = [
                 (client, owned_task)
                 for client, owned_task in self._event_ingress_clients
                 if owned_task is not completed
             ]
-            if completed.cancelled():
-                return
-            try:
-                completed.result()
-            except BaseException:  # noqa: BLE001 - already logged by route
-                return
 
         task.add_done_callback(consume_route)
 

@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 
 class ModelPreferenceMixin:
     """Mixin providing model preference and solvency methods for KestrelAgent."""
@@ -96,6 +98,8 @@ class ModelPreferenceMixin:
                 (self.agent_id, self.MODEL_PREFERENCE_KEY, value, datetime.now(timezone.utc)),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.warning(f"Failed to persist model preference: {e}")
         # With an auto embedding_route, embeddings follow the chat route.
         await self.record_active_embedding_profile()
@@ -133,6 +137,8 @@ class ModelPreferenceMixin:
                         use_cache=True
                     )
                 except Exception as e:  # pragma: no cover - never block boot
+                    if is_execution_control_error(e):
+                        raise
                     logging.debug(
                         "embedding capability reconcile skipped at boot: %s", e
                     )
@@ -157,6 +163,8 @@ class ModelPreferenceMixin:
             else:
                 logging.info("Loaded persisted embedding_route: auto (follow chat)")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.warning(f"Failed to load embedding_route: {e}")
 
     async def _persist_embedding_route(self, route: str | None) -> None:
@@ -169,6 +177,8 @@ class ModelPreferenceMixin:
                 (self.agent_id, self.EMBEDDING_ROUTE_KEY, value, datetime.now(timezone.utc)),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.warning(f"Failed to persist embedding_route: {e}")
         await self.record_active_embedding_profile()
 
@@ -210,6 +220,8 @@ class ModelPreferenceMixin:
             if profile_id:
                 logging.info("Recorded active embedding profile: %s", profile_id)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.warning(f"Failed to record active embedding profile: {e}")
 
     async def _dominant_embedding_profile(self) -> Optional[Dict[str, Any]]:
@@ -233,6 +245,8 @@ class ModelPreferenceMixin:
                 db, agent_id=getattr(self, "agent_id", None)
             )
         except Exception as e:  # pragma: no cover - never break resolution
+            if is_execution_control_error(e):
+                raise
             logging.debug(f"dominant embedding profile lookup failed: {e}")
             return None
 
@@ -274,10 +288,14 @@ class ModelPreferenceMixin:
                         f" @ {dim}" if dim is not None else "",
                     )
                 except Exception as e:  # pragma: no cover - never block boot
+                    if is_execution_control_error(e):
+                        raise
                     logging.warning(
                         "Skipping persisted embedding_model pin for %s: %s", route, e
                     )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.warning(f"Failed to load embedding_model overrides: {e}")
 
     async def _persist_route_embedding_models(self, overrides: dict) -> None:
@@ -295,6 +313,8 @@ class ModelPreferenceMixin:
                 ),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.warning(f"Failed to persist embedding_model overrides: {e}")
         await self.record_active_embedding_profile()
 
@@ -361,6 +381,8 @@ class ModelPreferenceMixin:
                 return self._get_local_model_fallback()
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.error(f"Solvency check failed: {e}", exc_info=True)
             return None
 
@@ -465,6 +487,8 @@ async def apply_persisted_model_preference(
             else:
                 logging.info("Loaded persisted model preference: %s", model)
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logging.warning(f"Failed to load model preference: {e}")
         # Record the drop for the health surface (#3190). A persisted pin
         # that fails to apply is an operator-visible degradation: the agent

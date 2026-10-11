@@ -18,8 +18,8 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Optional, Protocol, Set
 
 from .invocation_context import LLMInvocationContext, turn_invocation_for
-from kestrel_sovereign.execution_custody import current_execution_custody, execution_work_operation, is_execution_control_error
-from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import current_execution_custody, execution_work_operation, is_execution_control_error, execution_terminal_error
+from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
 
 logger = logging.getLogger(__name__)
 
@@ -125,12 +125,18 @@ class ModalityRecordingMixin:
         return self.__dict__.setdefault("_modality_record_tasks", set())
 
     def _modality_record_done(self, task: "asyncio.Task[None]") -> None:
+        exc = owned_task_error(task)
+        self._remember_modality_control(exc)
         self._pending_modality_records().discard(task)
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
+        if exc is not None and not isinstance(exc, asyncio.CancelledError):
             logger.warning("LLM telemetry record failed: %s", type(exc).__name__)
+
+    def _remember_modality_control(self, error: BaseException | None) -> None:
+        """One bounded, strongest native receipt outlives its completed writer."""
+        if error is not None and is_execution_control_error(error):
+            self._modality_record_control = execution_terminal_error(
+                getattr(self, "_modality_record_control", None), error,
+            )
 
     @execution_work_operation
     async def _write_modality_record(self, call: ModalityCall) -> None:
@@ -168,8 +174,17 @@ class ModalityRecordingMixin:
         )
 
     async def drain_modality_records(self) -> None:
-        """Wait for late decision/embedding records (called from ``close``)."""
+        """Join late writers and report completed native control to their owner."""
 
         tasks = set(self._pending_modality_records())
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        cancellation = None
+        for task in tasks:
+            outcome = await await_owned_task(task, cancellation)
+            cancellation = outcome.cancellation
+            self._remember_modality_control(outcome.error)
+        self._pending_modality_records().difference_update(tasks)
+        terminal = execution_terminal_error(
+            getattr(self, "_modality_record_control", None), cancellation,
+        )
+        if terminal is not None:
+            raise terminal

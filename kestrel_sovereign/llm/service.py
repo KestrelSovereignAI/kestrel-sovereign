@@ -72,7 +72,8 @@ from kestrel_sovereign.kestrel_config.constants import (
 )
 from kestrel_sovereign.config import load_config, load_section
 from kestrel_sovereign import telemetry
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, require_execution_work, execution_work_operation, is_execution_control_error
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, require_execution_work, execution_work_operation, is_execution_control_error, execution_terminal_error
+from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +115,19 @@ class AuditResult(BaseModel):
 
 
 async def _wait_for_close_result(result: Any) -> None:
-    """Await asynchronous close results while accepting synchronous close APIs."""
+    """Own async cleanup through timeout/cancellation before classifying it."""
     if inspect.isawaitable(result):
-        await asyncio.wait_for(asyncio.shield(result), timeout=CLIENT_CLOSE_TIMEOUT)
+        task = asyncio.ensure_future(result)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=CLIENT_CLOSE_TIMEOUT)
+        except BaseException as interruption:
+            if not task.done():
+                task.cancel()
+            outcome = await await_owned_task(
+                task,
+                interruption if isinstance(interruption, asyncio.CancelledError) else None,
+            )
+            raise execution_terminal_error(outcome.error, outcome.cancellation, interruption)
 
 
 def _redacted_content_marker(text: Any) -> str:
@@ -2120,32 +2131,42 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         return task
 
     def _handle_preference_persistence_done(self, task: asyncio.Task[None]) -> None:
+        exc = owned_task_error(task)
+        self._remember_preference_control(exc)
         self._preference_persistence_tasks.discard(task)
-        if task.cancelled():
-            return
-        try:
-            exc = task.exception()
-        except asyncio.CancelledError:
-            return
-        if exc:
+        if exc and not isinstance(exc, asyncio.CancelledError):
             logger.warning(
                 "Model preference persistence failed: %s",
                 exc,
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
 
+    def _remember_preference_control(self, error: BaseException | None) -> None:
+        """Retain one strongest receipt before its completed task is discarded."""
+        if error is not None and is_execution_control_error(error):
+            self._preference_persistence_control = execution_terminal_error(
+                getattr(self, "_preference_persistence_control", None), error,
+            )
+
     async def drain_preference_persistence(self, *, cancel: bool = False) -> None:
-        """Wait for scheduled model-preference persistence callbacks."""
+        """Join every writer, then report retained control even after completion."""
         tasks = set(self._preference_persistence_tasks)
-        if not tasks:
-            return
 
         if cancel:
             for task in tasks:
                 task.cancel()
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+        cancellation = None
+        for task in tasks:
+            outcome = await await_owned_task(task, cancellation)
+            cancellation = outcome.cancellation
+            self._remember_preference_control(outcome.error)
         self._preference_persistence_tasks.difference_update(tasks)
+        terminal = execution_terminal_error(
+            getattr(self, "_preference_persistence_control", None), cancellation,
+        )
+        if terminal is not None:
+            raise terminal
 
     def get_active_model_id(self) -> str:
         """Get the resolved model ID currently in use.
@@ -5116,89 +5137,55 @@ No other text or formatting.
     # get_streaming_response is provided by StreamingMixin
 
     async def close(self):
-        """Close all async HTTP clients properly."""
-        await self.drain_preference_persistence()
-        await self.drain_modality_records()
+        """Join every writer and resource before reporting retained control."""
+        terminal = None
 
+        async def retire(label, operation):
+            nonlocal terminal
+            # Own the entire operation: cancellation of this closer cannot skip
+            # a sibling resource or consume the child's original CancelledError.
+            task = asyncio.create_task(operation(), name=f"llm-close:{label}")
+            outcome = await await_owned_task(task)
+            error = outcome.error
+            if error is not None and is_execution_control_error(error):
+                terminal = execution_terminal_error(terminal, error)
+            elif error is not None:
+                logger.warning("LLM shutdown %s failed (%s)", label, type(error).__name__)
+            terminal = execution_terminal_error(terminal, outcome.cancellation)
+
+        await retire("preference-writers", self.drain_preference_persistence)
+        await retire("modality-writers", self.drain_modality_records)
         for provider in self.providers:
-            # Adapter-owned resources (e.g. CodexAdapter's app-server
-            # subprocess) — adapters that own external state should
-            # expose ``aclose``. The provider's ``client`` slot doesn't
-            # always carry that state (codex stores just the binary
-            # path), so consult the adapter directly.
             adapter = provider.get("adapter")
             if adapter is not None and hasattr(adapter, "aclose"):
-                try:
+                async def close_adapter(adapter=adapter):
                     await _wait_for_close_result(adapter.aclose())
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
-                except Exception as e:
-                    if is_execution_control_error(e):
-                        raise
-                    logger.warning(
-                        "Error closing %s adapter: %s",
-                        provider.get("name"), e, exc_info=True,
-                    )
+                await retire("adapter", close_adapter)
 
             client = provider.get("client")
             if client is None:
                 continue
-
-            try:
+            async def close_client(client=client):
                 if hasattr(client, "close") and callable(client.close):
-                    # Wrap in shield and timeout to handle cancellation gracefully
-                    try:
-                        await _wait_for_close_result(client.close())
-                    except asyncio.TimeoutError:
-                        logger.debug(f"Timeout closing {provider.get('name')} client")
-                    except asyncio.CancelledError:
-                        logger.debug(f"Cancelled while closing {provider.get('name')} client")
+                    await _wait_for_close_result(client.close())
                 elif hasattr(client, "_client") and hasattr(client._client, "aclose"):
-                    try:
-                        await _wait_for_close_result(client._client.aclose())
-                    except (asyncio.TimeoutError, asyncio.CancelledError):
-                        pass
-            except (ConnectionError, OSError) as e:
-                if is_execution_control_error(e):
-                    raise
-                logger.debug(f"Connection error closing {provider.get('name')} client: {e}")
-            except (RuntimeError, AttributeError) as e:
-                if is_execution_control_error(e):
-                    raise
-                logger.warning(f"Error closing {provider.get('name')} client: {e}", exc_info=True)
-            except Exception as e:
-                if is_execution_control_error(e):
-                    raise
-                logger.warning(f"Unexpected error closing {provider.get('name')} client: {e}", exc_info=True)
+                    await _wait_for_close_result(client._client.aclose())
+            await retire("client", close_client)
 
-        # Stop accepting remote calls and drain them before discarding route
-        # credentials. Provider capacity is deliberately NOT released here:
-        # the durable provider reconciler owns expiry/release after host death.
-        # Latch the closed flag first, under the route condition, so an
-        # in-flight traffic-driven renewal cannot re-activate the route behind
-        # the drain that is about to run.
-        async with self._remote_route_condition:
-            self._remote_route_closed = True
-        if self._remote_lease is not None:
-            try:
+        async def close_remote_route():
+            # Latch closed before renewal can reactivate it. Provider capacity
+            # remains owned by the durable reconciler, not this local closer.
+            async with self._remote_route_condition:
+                self._remote_route_closed = True
+            if self._remote_lease is not None:
                 await self.deactivate_inference_lease(
-                    self._remote_lease.lease_id,
-                    require_active=False,
-                )
-            except LLMServiceError as exc:
-                if is_execution_control_error(exc):
-                    raise
-                logger.warning(
-                    "Private inference route cleanup did not complete during "
-                    "LLMService shutdown (%s)",
-                    type(exc).__name__,
+                    self._remote_lease.lease_id, require_active=False,
                 )
 
-        # Close the async usage tracking database
-        try:
-            await self.close_usage_db()
-        except asyncio.CancelledError:
-            logger.debug("Cancelled while closing usage DB")
+        await retire("remote-route", close_remote_route)
+        await retire("usage-database", self.close_usage_db)
+        if terminal is not None:
+            raise terminal
 
     # Remote GPU Backend Methods are provided by RemoteBackendMixin
 
