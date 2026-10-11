@@ -1878,6 +1878,37 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             logger.debug("Ignoring model preference 'auto' — using default routing")
             return
 
+        self._mandate_preference = self.resolve_model_preference(
+            model, vendor, route, validate=validate
+        )
+        vendor = self._mandate_preference["vendor"]
+        # A mandate is in effect again — clear any recorded boot-time drop so
+        # the health surface stops reporting a condition the operator fixed
+        # (#3190). Without this the warning is sticky for the process lifetime.
+        self._mandate_load_error = None
+        if route:
+            logger.info("Model preference set: %s:%s/%s", vendor, route, model)
+        else:
+            logger.info("Model preference set: %s/%s", vendor, model)
+
+        if self._preference_persistence_callback:
+            self._schedule_preference_persistence(model, vendor, route)
+
+    def resolve_model_preference(
+        self,
+        model: str,
+        vendor: Optional[str] = None,
+        route: Optional[str] = None,
+        *,
+        validate: bool = True,
+    ) -> Dict[str, Optional[str]]:
+        """Return the mandate :meth:`set_model_preference` would install.
+
+        Resolves and validates exactly as ``set_model_preference`` does, and
+        raises the same ``ValueError``, but installs and persists nothing. A
+        caller that must record a mandate durably before it takes effect
+        (a privacy-mode transition, #3554) resolves it here first.
+        """
         if vendor is None:
             resolved = self._resolve_vendor_for_model(model)
             if isinstance(resolved, list):
@@ -1911,18 +1942,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             if validate:
                 self._validate_explicit_mandate(model, vendor, route)
 
-        self._mandate_preference = {"vendor": vendor, "model": model, "route": route}
-        # A mandate is in effect again — clear any recorded boot-time drop so
-        # the health surface stops reporting a condition the operator fixed
-        # (#3190). Without this the warning is sticky for the process lifetime.
-        self._mandate_load_error = None
-        if route:
-            logger.info("Model preference set: %s:%s/%s", vendor, route, model)
-        else:
-            logger.info("Model preference set: %s/%s", vendor, model)
-
-        if self._preference_persistence_callback:
-            self._schedule_preference_persistence(model, vendor, route)
+        return {"vendor": vendor, "model": model, "route": route}
 
     def _validate_explicit_mandate(
         self,

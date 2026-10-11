@@ -424,11 +424,36 @@ def replay_model_preference(
     actually loaded, so a populated local catalog that disagrees is evidence,
     not a discovery artefact.
     """
+    llm_service.set_model_preference(
+        model, vendor, route, validate=_revalidated_on_replay(vendor)
+    )
+
+
+def resolve_replayed_model_preference(
+    llm_service: Any,
+    model: str,
+    vendor: Optional[str],
+    route: Optional[str],
+) -> Dict[str, Optional[str]]:
+    """The mandate :func:`replay_model_preference` would install.
+
+    Validated the same way, and raising the same ``ValueError``, without
+    installing it: a privacy-mode exit records the mandate it restores before
+    it takes effect (#3554).
+    """
+    return llm_service.resolve_model_preference(
+        model, vendor, route, validate=_revalidated_on_replay(vendor)
+    )
+
+
+def _revalidated_on_replay(vendor: Optional[str]) -> bool:
+    """Whether a replayed mandate on ``vendor`` is checked against the catalog.
+
+    Only on a local model-ignoring route; see :func:`replay_model_preference`.
+    """
     from kestrel_sovereign.llm.service import _MODEL_IGNORING_VENDORS
 
-    llm_service.set_model_preference(
-        model, vendor, route, validate=vendor in _MODEL_IGNORING_VENDORS
-    )
+    return vendor in _MODEL_IGNORING_VENDORS
 
 
 async def apply_persisted_model_preference(

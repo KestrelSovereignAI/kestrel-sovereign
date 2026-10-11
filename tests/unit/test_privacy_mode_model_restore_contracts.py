@@ -86,6 +86,9 @@ class _FakeLLMService:
     def get_model_preference(self):
         return dict(self._pref)
 
+    def resolve_model_preference(self, model, vendor=None, route=None, *, validate=True):
+        return {"vendor": vendor, "model": model, "route": route}
+
     def set_model_preference(self, model, vendor=None, route=None, *, validate=True):
         self.calls.append((model, vendor, route))
         self._pref = {"vendor": vendor, "model": model, "route": route}

@@ -384,6 +384,9 @@ class _UnwritableDatabase:
     def __init__(self):
         self.attempts = 0
 
+    async def fetchall(self, *_args, **_kwargs):
+        return []
+
     async def execute(self, *_args, **_kwargs):
         import sqlite3
 
@@ -399,6 +402,9 @@ class _RecordingLLM:
 
     def get_model_preference(self):
         return dict(self._pref)
+
+    def resolve_model_preference(self, model, vendor=None, route=None, *, validate=True):
+        return {"vendor": vendor, "model": model, "route": route}
 
     def set_model_preference(self, model, vendor=None, route=None, *, validate=True):
         self.calls.append((model, vendor, route))
@@ -566,6 +572,8 @@ class _StoredRows:
 
     async def execute(self, _sql, params):
         self.writes.append(params)
+        if params[1] == PRIVACY_STATE_KEY:
+            self.rows = [(params[2],)]
 
     def records(self) -> list[PrivacyState]:
         return [
@@ -633,7 +641,8 @@ async def test_write_binds_the_agent_and_key():
 @pytest.mark.asyncio
 async def test_transition_refused_by_a_fact_lease_records_the_mode_still_in_force():
     """The transition is recorded before anything flips; when the storage
-    wrapper then refuses it, the record goes back to the mode still in force."""
+    wrapper then refuses it, the mandate and the record go back to the state
+    still in force."""
     db = _StoredRows()
     agent = _bare_agent(db=db)
     agent.storage._acquire_explicit_fact_lease()
@@ -646,14 +655,136 @@ async def test_transition_refused_by_a_fact_lease_records_the_mode_still_in_forc
     assert result.applied is False
     _assert_consistent(agent, PrivacyMode.NORMAL)
     assert agent.llm_service.calls == []
+    saved = SavedModelPreference(**CLOUD)
+    pending = PrivacyState(PrivacyMode.ISOLATED, saved, transition_from=PrivacyMode.NORMAL)
     assert db.records() == [
-        PrivacyState(
-            mode=PrivacyMode.ISOLATED,
-            saved_preference=SavedModelPreference(**CLOUD),
-            transition_from=PrivacyMode.NORMAL,
-        ),
+        pending,
+        PrivacyState(PrivacyMode.ISOLATED, saved),
+        # Put back: the pending record, the mandate in force, the origin.
+        pending,
         PrivacyState(mode=PrivacyMode.NORMAL),
     ]
+    assert db.mandates() == [LOCAL, CLOUD]
+
+
+class _OriginUnwritableRows(_StoredRows):
+    """Refuses settled records of ``refused``; everything else is written."""
+
+    def __init__(self, refused):
+        super().__init__()
+        self.refused = refused
+
+    async def execute(self, sql, params):
+        import sqlite3
+
+        if params[1] == PRIVACY_STATE_KEY:
+            state = PrivacyState.decode(params[2])
+            if state.transition_from is None and state.mode is self.refused:
+                raise sqlite3.OperationalError("disk I/O error")
+        await super().execute(sql, params)
+
+
+@pytest.mark.asyncio
+async def test_guard_refused_exit_never_leaves_normal_on_the_local_route():
+    """The exit is recorded (settled NORMAL, mandate restored), then the
+    storage wrapper refuses it, and the record it started from cannot be put
+    back. The pending record is written again before the local route is, so
+    a restart resumes DEIDENTIFIED with the saved mandate, never NORMAL on
+    the local route with the saved mandate gone."""
+    db = _OriginUnwritableRows(PrivacyMode.DEIDENTIFIED)
+    agent = _bare_agent(mode=PrivacyMode.DEIDENTIFIED, preference=LOCAL, db=db)
+    saved = SavedModelPreference(**CLOUD)
+    agent._privacy_saved_preference = saved
+    # DEIDENTIFIED storage refuses explicit facts; an in-flight session
+    # projection read holds the same transition guard.
+    agent.storage._active_session_projection_leases += 1
+    try:
+        result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+    finally:
+        agent.storage._active_session_projection_leases -= 1
+
+    assert result.retryable_conflict is True
+    _assert_consistent(agent, PrivacyMode.DEIDENTIFIED)
+    pending = PrivacyState(
+        PrivacyMode.NORMAL, saved, transition_from=PrivacyMode.DEIDENTIFIED
+    )
+    assert db.records() == [pending, PrivacyState(PrivacyMode.NORMAL), pending]
+    assert db.mandates() == [CLOUD, LOCAL]
+    restored = await restore_privacy_state(
+        db, agent.did, initial_mode=PrivacyMode.NORMAL
+    )
+    assert (restored.mode, restored.saved_preference) == (PrivacyMode.DEIDENTIFIED, saved)
+
+
+@pytest.mark.asyncio
+async def test_endpoint_conflict_says_where_a_restart_resumes():
+    """An entry the storage wrapper refused, whose record could not be put
+    back: the 409 says a restart resumes in the mode the pending record names."""
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from tests.unit.test_privacy_mode_model_restore_contracts import (
+        _prepare_app,
+        _restore_app,
+    )
+
+    agent = _bare_agent(db=_OriginUnwritableRows(PrivacyMode.NORMAL))
+    agent.storage._acquire_explicit_fact_lease()
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/agent/privacy-mode",
+                    headers={
+                        "X-API-Key": "test-key",
+                        "X-Kestrel-Allow-Destructive": "test-rail-bypass",
+                    },
+                    json={"mode": "isolated"},
+                )
+        assert response.status_code == 409
+        assert response.json()["detail"].endswith(
+            "Until then, a restart resumes in isolated mode."
+        )
+    finally:
+        agent.storage._release_explicit_fact_lease()
+        _restore_app(app, original)
+
+
+@pytest.mark.asyncio
+async def test_nothing_changes_until_the_transition_is_recorded():
+    """Persist before mutating: at every write a transition makes, the live
+    mode, every state holder, the saved mandate and the model preference are
+    still those it started from."""
+    seen: list[tuple] = []
+
+    class _Watching(_StoredRows):
+        async def execute(self, sql, params):
+            seen.append(
+                (
+                    agent.privacy_mode,
+                    agent.storage.privacy_mode,
+                    agent.privacy_agent.privacy_mode,
+                    getattr(agent, "_privacy_saved_preference", None),
+                    agent.llm_service.get_model_preference(),
+                )
+            )
+            await super().execute(sql, params)
+
+    agent = _bare_agent(db=_Watching())
+    saved = SavedModelPreference(**CLOUD)
+
+    await agent.set_privacy_mode_with_effects(PrivacyMode.ISOLATED)
+    assert seen == [(PrivacyMode.NORMAL,) * 3 + (None, CLOUD)] * 3
+    _assert_consistent(agent, PrivacyMode.ISOLATED)
+    assert agent.llm_service.get_model_preference() == LOCAL
+
+    seen.clear()
+    await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+    assert seen == [(PrivacyMode.ISOLATED,) * 3 + (saved, LOCAL)] * 3
+    _assert_consistent(agent, PrivacyMode.NORMAL)
+    assert agent.llm_service.get_model_preference() == CLOUD
 
 
 @pytest.mark.asyncio
@@ -831,6 +962,216 @@ async def test_fail_closed_boot_keeps_the_saved_mandate_of_a_record_it_could_not
 
 
 @pytest.mark.asyncio
+async def test_fail_closed_boot_that_cannot_record_does_not_persist_the_forced_route(
+    tmp_path, monkeypatch
+):
+    """Boot cannot read the record, fails closed, and cannot record that
+    either. It still runs on the local route, but must not persist it as the
+    mandate: the next boot reads the old PUBLIC record, and would otherwise
+    come back PUBLIC on the local model with the cloud mandate gone."""
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    async def seed(agent):
+        await _seed_model_preference(agent, CLOUD)
+        await _seed_record(agent, PrivacyState(mode=PrivacyMode.PUBLIC).encode())
+
+    async with _booted_agent(tmp_path, before_initialize=seed) as agent:
+        _assert_consistent(agent, PrivacyMode.PUBLIC)
+
+    import sqlite3
+
+    execute = AsyncDatabase.execute
+
+    async def record_write_fails(self, sql, params=()):
+        if isinstance(params, (tuple, list)) and len(params) > 1 and params[1] == PRIVACY_STATE_KEY:
+            raise sqlite3.OperationalError("disk I/O error")
+        return await execute(self, sql, params)
+
+    with monkeypatch.context() as patched:
+        _first_read_fails(patched)
+        patched.setattr(AsyncDatabase, "execute", record_write_fails)
+        async with _booted_agent(tmp_path) as agent:
+            _assert_consistent(agent, FAIL_CLOSED_PRIVACY_MODE)
+            assert _mandate(agent) == LOCAL
+            await agent.llm_service.drain_preference_persistence()
+            assert await _persisted_preference(agent) == CLOUD
+
+    async with _booted_agent(tmp_path) as agent:
+        _assert_consistent(agent, PrivacyMode.PUBLIC)
+        assert _mandate(agent) == CLOUD
+
+
+@pytest.mark.asyncio
+async def test_exit_whose_saved_mandate_no_longer_resolves_keeps_the_current_one():
+    """A saved mandate the LLM service now refuses is neither installed nor
+    persisted. As when nothing was saved, the current preference stays and
+    the saved copy is cleared, but the user is told: holding it instead would
+    let a later transition replay it over a mandate set since."""
+    db = _StoredRows()
+    agent = _bare_agent(mode=PrivacyMode.DEIDENTIFIED, preference=LOCAL, db=db)
+    agent._privacy_saved_preference = SavedModelPreference(**CLOUD)
+
+    def refuse(model, vendor=None, route=None, *, validate=True):
+        raise ValueError(f"no configured route serves {model}")
+
+    agent.llm_service.resolve_model_preference = refuse
+
+    result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+
+    assert result.applied is True
+    assert result.model_switched is None
+    assert "anthropic:api/claude-haiku-4-5, could not be restored" in result.message
+    assert agent.llm_service.calls == []
+    assert agent.llm_service.get_model_preference() == LOCAL
+    assert agent._privacy_saved_preference is None
+    assert db.mandates() == [LOCAL]
+    assert db.records()[-1] == PrivacyState(mode=PrivacyMode.NORMAL)
+
+
+@pytest.mark.asyncio
+async def test_entering_from_a_cloud_mode_saves_the_mandate_in_force_not_a_stale_one():
+    """NORMAL still holds a saved mandate (boot restored it but could not
+    record that), and the operator has since set another model. Entering a
+    local-only mode saves the model in force, the operator's, not the stale
+    saved copy that leaving would otherwise replay over it."""
+    db = _StoredRows()
+    chosen = {"vendor": "openai", "route": "api", "model": "gpt-5-mini"}
+    agent = _bare_agent(mode=PrivacyMode.NORMAL, preference=chosen, db=db)
+    agent._privacy_saved_preference = SavedModelPreference(**CLOUD)
+
+    await agent.set_privacy_mode_with_effects(PrivacyMode.ISOLATED)
+    assert agent._privacy_saved_preference == SavedModelPreference(**chosen)
+
+    await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+    assert agent.llm_service.get_model_preference() == chosen
+
+
+@pytest.mark.asyncio
+async def test_a_diverged_record_does_not_replace_the_operators_mandate():
+    """A refused entry left the record DEIDENTIFIED, holding the mandate then
+    in force, while the agent stayed NORMAL; the operator then set another
+    model. Moving to PUBLIC records from DEIDENTIFIED (fail closed) but keeps
+    the operator's model: in NORMAL nothing was displaced to restore."""
+    db = _StoredRows()
+    chosen = {"vendor": "openai", "route": "api", "model": "gpt-5-mini"}
+    agent = _bare_agent(mode=PrivacyMode.NORMAL, preference=chosen, db=db)
+    await write_privacy_state(
+        db,
+        agent.agent_id,
+        PrivacyState(PrivacyMode.DEIDENTIFIED, SavedModelPreference(**CLOUD)),
+    )
+
+    result = await agent.set_privacy_mode_with_effects(PrivacyMode.PUBLIC)
+
+    assert result.applied is True
+    assert agent.llm_service.get_model_preference() == chosen
+    assert db.mandates() == [chosen]
+    assert db.records()[1] == PrivacyState(
+        PrivacyMode.PUBLIC,
+        SavedModelPreference(**CLOUD),
+        transition_from=PrivacyMode.DEIDENTIFIED,
+    )
+    assert db.records()[-1] == PrivacyState(mode=PrivacyMode.PUBLIC)
+
+
+@pytest.mark.asyncio
+async def test_without_an_llm_service_the_saved_mandate_is_carried_as_it_is():
+    """With no LLM service there is nothing to restore the saved mandate into,
+    so no transition drops it: a later boot with one restores it."""
+    db = _StoredRows()
+    agent = _bare_agent(mode=PrivacyMode.DEIDENTIFIED, db=db)
+    agent.llm_service = None
+    saved = SavedModelPreference(**CLOUD)
+    agent._privacy_saved_preference = saved
+
+    for mode in (PrivacyMode.NORMAL, PrivacyMode.PUBLIC):
+        result = await agent.set_privacy_mode_with_effects(mode)
+        assert result.applied is True
+        assert db.records()[-1] == PrivacyState(mode=mode, saved_preference=saved)
+    assert db.mandates() == []
+
+
+@pytest.mark.asyncio
+async def test_boot_that_cannot_read_the_record_at_all_leaves_it_intact(
+    tmp_path, monkeypatch
+):
+    """Both of boot's reads fail. It fails closed, but writes nothing over a
+    record it never saw: that record holds the mandate DEIDENTIFIED displaced,
+    and the next boot that can read it restores both."""
+    import sqlite3
+
+    from kestrel_sovereign.agent import privacy_state
+
+    saved = SavedModelPreference(**CLOUD)
+    async with _booted_agent(tmp_path) as agent:
+        await _pin_cloud_mandate(agent)
+        await agent.set_privacy_mode_with_effects(PrivacyMode.DEIDENTIFIED)
+
+    async def unreadable(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(privacy_state, "_fetch_record_rows", unreadable)
+        async with _booted_agent(tmp_path) as agent:
+            _assert_consistent(agent, FAIL_CLOSED_PRIVACY_MODE)
+            assert _mandate(agent) == LOCAL
+
+    async with _booted_agent(tmp_path) as agent:
+        _assert_consistent(agent, PrivacyMode.DEIDENTIFIED)
+        assert agent._privacy_saved_preference == saved
+        await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+        assert _mandate(agent) == CLOUD
+
+
+@pytest.mark.asyncio
+async def test_unreadable_boot_neither_overwrites_the_record_nor_shadows_its_mandate(
+    tmp_path, monkeypatch
+):
+    """The record holds the mandate ISOLATED displaced, but the persisted
+    preference is not a local route (it was lost), so boot's reconcile would
+    save that instead. With the record unreadable, reconcile writes nothing;
+    and once the record can be read, leaving restores the record's mandate,
+    not the one boot guessed."""
+    import sqlite3
+
+    from kestrel_sovereign.agent import privacy_state
+
+    saved = SavedModelPreference(**CLOUD)
+
+    async def seed(agent):
+        await _seed_model_preference(agent, CLOUD)
+        await _seed_record(
+            agent, PrivacyState(mode=PrivacyMode.ISOLATED, saved_preference=saved).encode()
+        )
+
+    async with _booted_agent(tmp_path, before_initialize=seed) as agent:
+        _assert_consistent(agent, PrivacyMode.ISOLATED)
+        first_boot = agent
+    await _seed_model_preference(first_boot, UNPINNED)
+
+    async def unreadable(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(privacy_state, "_fetch_record_rows", unreadable)
+        async with _booted_agent(tmp_path) as agent:
+            _assert_consistent(agent, FAIL_CLOSED_PRIVACY_MODE)
+            assert _mandate(agent) == LOCAL
+            patched.undo()
+
+            assert await _recorded(agent) == PrivacyState(
+                mode=PrivacyMode.ISOLATED, saved_preference=saved
+            )
+            assert await _persisted_preference(agent) == UNPINNED
+
+            result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+
+            assert result.applied is True
+            assert _mandate(agent) == CLOUD
+            assert await _recorded(agent) == PrivacyState(mode=PrivacyMode.NORMAL)
+
+
+@pytest.mark.asyncio
 async def test_malformed_record_is_repaired_keeping_a_saved_mandate_that_validates(
     tmp_path,
 ):
@@ -870,7 +1211,8 @@ async def test_restore_recovers_nothing_from_a_record_that_cannot_be_reread():
     )
     assert restored.mode is FAIL_CLOSED_PRIVACY_MODE
     assert restored.saved_preference is None
-    assert restored.rewrite is True
+    # Nothing is known about a record that cannot be read: it is not replaced.
+    assert restored.rewrite is False
 
 
 @pytest.mark.asyncio
@@ -889,7 +1231,7 @@ async def test_restore_marks_only_records_that_do_not_name_the_restored_state():
         assert restored.rewrite is rewrite
 
 
-# --- A mandate that is not persisted keeps the transition pending (P2) ------
+# --- A transition that cannot be recorded is refused (#3554 review) ---------
 
 
 def _is_mandate_write(params) -> bool:
@@ -900,43 +1242,67 @@ def _is_mandate_write(params) -> bool:
     )
 
 
-@pytest.mark.asyncio
-async def test_exit_whose_mandate_is_not_persisted_stays_pending_across_a_restart(
-    tmp_path, monkeypatch
-):
-    """Real ``LLMService`` and its real persistence callback, which logs a
-    failed write and returns. Before the fix the exit was recorded as applied
-    with nothing saved while storage still held the forced local model: the
-    restart came back NORMAL on it, and the original mandate was gone."""
+def _is_settled_record_write(params) -> bool:
+    return (
+        isinstance(params, (tuple, list))
+        and len(params) > 2
+        and params[1] == PRIVACY_STATE_KEY
+        and PrivacyState.decode(params[2]).transition_from is None
+    )
+
+
+def _fail_writes(patched, agent, failing) -> None:
+    """Fail every write the agent's real database is asked for that ``failing``
+    picks, as a full disk would. Reads, and every other write, go through."""
     import sqlite3
 
+    db = agent._raw_storage.db
+    execute = db.execute
+
+    async def execute_or_fail(sql, params=()):
+        if failing(params):
+            raise sqlite3.OperationalError("disk I/O error")
+        return await execute(sql, params)
+
+    patched.setattr(db, "execute", execute_or_fail)
+
+
+@pytest.mark.asyncio
+async def test_failed_exit_retried_and_failing_again_survives_a_restart(
+    tmp_path, monkeypatch
+):
+    """Failed exit, repeated exit (also failing), restart.
+
+    Real ``LLMService``; only the mandate write fails. Neither exit applies:
+    the agent stays in DEIDENTIFIED on its local route, holding the saved
+    mandate, and the pending record keeps both. Before the fix the first
+    failed exit had already flipped to NORMAL and dropped the saved copy, so
+    the second recorded ``normal -> normal`` with nothing saved, and the
+    restart came back NORMAL on the local model with the original mandate
+    gone."""
     saved = SavedModelPreference(**CLOUD)
+    pending = PrivacyState(
+        mode=PrivacyMode.NORMAL,
+        saved_preference=saved,
+        transition_from=PrivacyMode.DEIDENTIFIED,
+    )
     async with _booted_agent(tmp_path) as agent:
         await _pin_cloud_mandate(agent)
         await agent.set_privacy_mode_with_effects(PrivacyMode.DEIDENTIFIED)
 
-        db = agent._raw_storage.db
-        execute = db.execute
-
-        async def mandate_write_fails(sql, params=()):
-            if _is_mandate_write(params):
-                raise sqlite3.OperationalError("disk I/O error")
-            return await execute(sql, params)
-
         with monkeypatch.context() as patched:
-            patched.setattr(db, "execute", mandate_write_fails)
-            result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+            _fail_writes(patched, agent, _is_mandate_write)
+            for _ in range(2):
+                result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
 
-        assert result.applied is True
-        assert result.recorded is False
-        assert "resumes in deidentified mode" in result.message
-        assert _mandate(agent) == CLOUD
-        assert await _persisted_preference(agent) == LOCAL
-        assert await _recorded(agent) == PrivacyState(
-            mode=PrivacyMode.NORMAL,
-            saved_preference=saved,
-            transition_from=PrivacyMode.DEIDENTIFIED,
-        )
+                assert result.applied is False
+                assert result.persistence_failed is True
+                assert result.message == PRIVACY_STATE_UNRECORDED_MESSAGE
+                _assert_consistent(agent, PrivacyMode.DEIDENTIFIED)
+                assert _mandate(agent) == LOCAL
+                assert agent._privacy_saved_preference == saved
+                assert await _persisted_preference(agent) == LOCAL
+                assert await _recorded(agent) == pending
 
     async with _booted_agent(tmp_path) as agent:
         _assert_consistent(agent, PrivacyMode.DEIDENTIFIED)
@@ -944,10 +1310,118 @@ async def test_exit_whose_mandate_is_not_persisted_stays_pending_across_a_restar
         assert agent._privacy_saved_preference == saved
 
         result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
-        assert result.recorded is True
+
+        assert result.applied is True
         assert _mandate(agent) == CLOUD
         assert await _persisted_preference(agent) == CLOUD
         assert await _recorded(agent) == PrivacyState(mode=PrivacyMode.NORMAL)
+
+
+@pytest.mark.asyncio
+async def test_failed_exit_then_a_successful_retry_settles_to_normal(
+    tmp_path, monkeypatch
+):
+    """Failed exit, then a retry that succeeds: NORMAL, the original mandate
+    restored and persisted, and no pending record or saved copy left."""
+    async with _booted_agent(tmp_path) as agent:
+        await _pin_cloud_mandate(agent)
+        await agent.set_privacy_mode_with_effects(PrivacyMode.DEIDENTIFIED)
+
+        with monkeypatch.context() as patched:
+            _fail_writes(patched, agent, _is_mandate_write)
+            refused = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+        assert refused.applied is False
+
+        result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+
+        assert result.applied is True
+        assert result.model_switched == CLOUD
+        _assert_consistent(agent, PrivacyMode.NORMAL)
+        assert _mandate(agent) == CLOUD
+        assert agent._privacy_saved_preference is None
+        assert await _persisted_preference(agent) == CLOUD
+        assert await _recorded(agent) == PrivacyState(mode=PrivacyMode.NORMAL)
+
+    async with _booted_agent(tmp_path) as agent:
+        _assert_consistent(agent, PrivacyMode.NORMAL)
+        assert _mandate(agent) == CLOUD
+
+
+@pytest.mark.asyncio
+async def test_failed_settled_write_puts_back_the_state_the_exit_started_from(
+    tmp_path, monkeypatch
+):
+    """The exit's mandate is written, then its settled record fails. The
+    refused exit puts back the mandate still in force, then the record it
+    started from, so storage again names the state the agent stays in."""
+    saved = SavedModelPreference(**CLOUD)
+    async with _booted_agent(tmp_path) as agent:
+        await _pin_cloud_mandate(agent)
+        await agent.set_privacy_mode_with_effects(PrivacyMode.DEIDENTIFIED)
+
+        def settled_normal(params) -> bool:
+            return (
+                _is_settled_record_write(params)
+                and PrivacyState.decode(params[2]).mode is PrivacyMode.NORMAL
+            )
+
+        with monkeypatch.context() as patched:
+            _fail_writes(patched, agent, settled_normal)
+            result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+
+        assert result.applied is False
+        assert result.persistence_failed is True
+        _assert_consistent(agent, PrivacyMode.DEIDENTIFIED)
+        assert _mandate(agent) == LOCAL
+        assert await _persisted_preference(agent) == LOCAL
+        assert await _recorded(agent) == PrivacyState(
+            mode=PrivacyMode.DEIDENTIFIED, saved_preference=saved
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_later_failed_transition_keeps_what_a_pending_record_guarantees(
+    tmp_path, monkeypatch
+):
+    """A refused entry whose record could not be put back leaves a pending
+    record that resolves to DEIDENTIFIED, while the agent stays NORMAL. A
+    later transition that fails as well starts from that record, not from the
+    live state: its own pending record still resolves to DEIDENTIFIED and
+    keeps the mandate DEIDENTIFIED displaced, so a restart comes back
+    local-only, on its local route, and leaving restores the mandate."""
+    saved = SavedModelPreference(**CLOUD)
+    async with _booted_agent(tmp_path) as agent:
+        await _pin_cloud_mandate(agent)
+
+        with monkeypatch.context() as patched:
+            _fail_writes(patched, agent, _is_settled_record_write)
+            entry = await agent.set_privacy_mode_with_effects(PrivacyMode.DEIDENTIFIED)
+            assert entry.applied is False
+            assert entry.message == (
+                PRIVACY_STATE_UNRECORDED_MESSAGE
+                + " Until then, a restart resumes in deidentified mode."
+            )
+            _assert_consistent(agent, PrivacyMode.NORMAL)
+            assert _mandate(agent) == CLOUD
+            # The forced route was written, then the mandate in force put back.
+            assert await _persisted_preference(agent) == CLOUD
+
+            public = await agent.set_privacy_mode_with_effects(PrivacyMode.PUBLIC)
+            assert public.applied is False
+            _assert_consistent(agent, PrivacyMode.NORMAL)
+            assert await _recorded(agent) == PrivacyState(
+                mode=PrivacyMode.PUBLIC,
+                saved_preference=saved,
+                transition_from=PrivacyMode.DEIDENTIFIED,
+            )
+
+    async with _booted_agent(tmp_path) as agent:
+        _assert_consistent(agent, PrivacyMode.DEIDENTIFIED)
+        assert _mandate(agent) == LOCAL
+        assert agent._privacy_saved_preference == saved
+
+        await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
+        assert _mandate(agent) == CLOUD
 
 
 @pytest.mark.asyncio
@@ -1017,25 +1491,28 @@ def _deidentified_bare_agent_with_saved_mandate():
 
 
 @pytest.mark.asyncio
-async def test_transition_is_not_recorded_as_applied_until_its_mandate_is_written():
+async def test_transition_whose_mandate_cannot_be_written_is_refused():
     agent = _deidentified_bare_agent_with_saved_mandate()
 
     result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
 
-    assert result.applied is True
-    assert result.recorded is False
-    assert agent.llm_service.get_model_preference() == CLOUD
-    assert agent._raw_storage.db.records() == [
-        PrivacyState(
-            PrivacyMode.NORMAL,
-            SavedModelPreference(**CLOUD),
-            transition_from=PrivacyMode.DEIDENTIFIED,
-        )
-    ]
+    assert result.applied is False
+    assert result.persistence_failed is True
+    _assert_consistent(agent, PrivacyMode.DEIDENTIFIED)
+    assert agent.llm_service.calls == []
+    assert agent._privacy_saved_preference == SavedModelPreference(**CLOUD)
+    # The pending record stays: putting back the record it started from
+    # needs the mandate written first, and that write fails too.
+    pending = PrivacyState(
+        PrivacyMode.NORMAL,
+        SavedModelPreference(**CLOUD),
+        transition_from=PrivacyMode.DEIDENTIFIED,
+    )
+    assert agent._raw_storage.db.records() == [pending, pending]
 
 
 @pytest.mark.asyncio
-async def test_endpoint_reports_an_applied_transition_that_was_not_recorded():
+async def test_endpoint_reports_a_transition_whose_mandate_was_not_written_as_refused():
     from unittest.mock import patch
 
     from fastapi.testclient import TestClient
@@ -1060,9 +1537,91 @@ async def test_endpoint_reports_an_applied_transition_that_was_not_recorded():
                 )
         assert response.status_code == 200
         body = response.json()
-        assert body["success"] is True
-        assert body["mode"] == "normal"
-        assert body["recorded"] is False
-        assert "resumes in deidentified mode" in body["message"]
+        assert body["success"] is False
+        assert body["persistence_failed"] is True
+        assert body["mode"] == "deidentified"
+        assert body["message"] == PRIVACY_STATE_UNRECORDED_MESSAGE
     finally:
         _restore_app(app, original)
+
+
+# --- Where a transition starts from ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("live_mode", "live_saved", "recorded_mode", "recorded_saved", "expected"),
+    [
+        # Nothing went wrong: the record names the live state.
+        (
+            PrivacyMode.DEIDENTIFIED,
+            SavedModelPreference(**CLOUD),
+            PrivacyMode.DEIDENTIFIED,
+            SavedModelPreference(**CLOUD),
+            PrivacyState(PrivacyMode.DEIDENTIFIED, SavedModelPreference(**CLOUD)),
+        ),
+        # A refused entry left a pending record that resolves local-only.
+        (
+            PrivacyMode.NORMAL,
+            None,
+            PrivacyMode.DEIDENTIFIED,
+            SavedModelPreference(**CLOUD),
+            PrivacyState(PrivacyMode.DEIDENTIFIED, SavedModelPreference(**CLOUD)),
+        ),
+        # A refused exit left the target recorded: the live mode is stricter.
+        (
+            PrivacyMode.ISOLATED,
+            SavedModelPreference(**CLOUD),
+            PrivacyMode.NORMAL,
+            None,
+            PrivacyState(PrivacyMode.ISOLATED, SavedModelPreference(**CLOUD)),
+        ),
+        # The stricter side has no saved copy; the other side's is kept.
+        (
+            PrivacyMode.EPHEMERAL,
+            None,
+            PrivacyMode.NORMAL,
+            SavedModelPreference(**CLOUD),
+            PrivacyState(PrivacyMode.EPHEMERAL, SavedModelPreference(**CLOUD)),
+        ),
+        # Both hold one: the record's, not the one boot guessed while the
+        # record was unreadable.
+        (
+            PrivacyMode.EPHEMERAL,
+            SavedModelPreference(None, None, None),
+            PrivacyMode.ISOLATED,
+            SavedModelPreference(**CLOUD),
+            PrivacyState(PrivacyMode.EPHEMERAL, SavedModelPreference(**CLOUD)),
+        ),
+    ],
+    ids=["agree", "pending-entry", "refused-exit", "saved-fallback", "record-wins"],
+)
+def test_transition_starts_from_the_more_restrictive_of_live_and_recorded(
+    live_mode, live_saved, recorded_mode, recorded_saved, expected
+):
+    from kestrel_sovereign.agent.privacy_state import (
+        RestoredPrivacyState,
+        transition_origin,
+    )
+
+    recorded = RestoredPrivacyState(
+        mode=recorded_mode, saved_preference=recorded_saved, recorded=True
+    )
+    assert transition_origin(live_mode, live_saved, recorded) == expected
+
+
+@pytest.mark.asyncio
+async def test_transition_is_refused_when_the_record_cannot_be_read():
+    """The record is where a transition starts from; one it cannot read is
+    refused before anything is written."""
+    import sqlite3
+
+    db = _StoredRows(error=sqlite3.OperationalError("database is locked"))
+    agent = _bare_agent(db=db)
+
+    result = await agent.set_privacy_mode_with_effects(PrivacyMode.DEIDENTIFIED)
+
+    assert result.applied is False
+    assert result.persistence_failed is True
+    assert db.writes == []
+    _assert_consistent(agent, PrivacyMode.NORMAL)
+    assert agent.llm_service.calls == []

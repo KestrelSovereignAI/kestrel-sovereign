@@ -460,14 +460,19 @@ cloud routes by a restart.
   saved, the current preference stays and a warning is logged.
 - **After a restart** the mode and the mandate agree: a local-only mode comes
   back on its local route, and NORMAL comes back on the pre-mode mandate.
-- **Failing closed**: a transition is recorded before it applies and again
-  once it has, and only after the model mandate it implies has been written.
-  A process that stops in between, or a write that fails, leaves the first
-  record: a restart resumes in the more restrictive of the two modes, still
-  holding the saved mandate. A record that cannot be read restarts the agent
-  in EPHEMERAL, never NORMAL; boot then records EPHEMERAL, keeping any saved
-  mandate the old record still yields. A transition that cannot be recorded
-  before it applies is refused.
+- **Persisted before it applies**: a transition writes a pending record, then
+  the model mandate the new mode implies, then the settled record. Only then
+  does the agent switch mode or model. If any of these writes fails, the
+  change is refused: the agent stays in its current mode and keeps its saved
+  mandate, and the transition puts back the record it started from.
+- **Failing closed**: a process that stops mid-transition, or a refused one
+  whose record could not be put back, leaves the pending record. A restart
+  resumes in the more restrictive of its two modes, still holding the saved
+  mandate, and so does the next transition: it starts from the more
+  restrictive of the live mode and the recorded one, so retrying a refused
+  exit cannot overwrite the saved mandate. A record that cannot be read
+  restarts the agent in EPHEMERAL, never NORMAL; boot then records EPHEMERAL,
+  keeping any saved mandate the old record still yields.
 
 The record and its resolution live in `kestrel_sovereign.agent.privacy_state`.
 

@@ -329,11 +329,17 @@ async def _kite_runtime_observation(
     raise RuntimeError("Kite runtime command operation was not recognized")
 
 
-def _privacy_transition_conflict() -> HTTPException:
-    """Return the content-safe retry contract for an active fact lease."""
+def _privacy_transition_conflict(
+    message: str = PRIVACY_TRANSITION_RETRY_MESSAGE,
+) -> HTTPException:
+    """Return the content-safe retry contract for an active fact lease.
+
+    ``message`` is the refused transition's own, which may add which mode a
+    restart resumes in when the refusal could not be recorded (#3554).
+    """
     return HTTPException(
         status_code=409,
-        detail=PRIVACY_TRANSITION_RETRY_MESSAGE,
+        detail=message,
         headers={"Retry-After": "1"},
     )
 
@@ -1579,7 +1585,7 @@ async def set_privacy_mode(request: Request):
             }
 
         if getattr(transition, "retryable_conflict", False):
-            raise _privacy_transition_conflict()
+            raise _privacy_transition_conflict(transition.message)
 
         # The transition was REFUSED: an EPHEMERAL exit whose required no-trace
         # purge sweep failed (#2673), or a mode that could not be recorded
@@ -1602,19 +1608,11 @@ async def set_privacy_mode(request: Request):
         model_switched = getattr(transition, "model_switched", None)
         voice_switched = getattr(transition, "voice_switched", None)
         biometric_warning = getattr(transition, "biometric_warning", None)
-        # Applied, but not recorded as applied: a restart resumes in the more
-        # restrictive mode. The agent's message says which.
-        recorded = getattr(transition, "recorded", True)
 
         return {
             "success": True,
             "mode": new_mode.value,
-            "message": (
-                f"Privacy mode set to {new_mode.value}"
-                if recorded
-                else transition.message
-            ),
-            "recorded": recorded,
+            "message": f"Privacy mode set to {new_mode.value}",
             "allows_cloud_llm": config.allows_cloud_llm(),
             "model_switched": model_switched,
             "voice_switched": voice_switched,
@@ -1650,7 +1648,7 @@ async def confirm_privacy_mode(request: Request):
             raise HTTPException(status_code=400, detail="Agent does not support staged privacy transitions.")
         result = await agent.confirm_privacy_transition()
         if getattr(result, "retryable_conflict", False):
-            raise _privacy_transition_conflict()
+            raise _privacy_transition_conflict(result.message)
         # applied is False for a no-op confirm (nothing was pending) as well as
         # for a staged result — so a stale/double-click confirm reports success
         # False instead of masquerading as an applied transition.
