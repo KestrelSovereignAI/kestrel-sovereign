@@ -1594,7 +1594,9 @@ async def _await_owned_health_probe(
                 # but its cumulative count remains on the parent task.
                 remember_parent_cancellation(exc)
         if task.done():
-            _consume_late_lifecycle_task_outcome(task)
+            control = _consume_late_lifecycle_task_outcome(task)
+            if control is not None:
+                raise control
             return
         on_late_task(task)
 
@@ -1632,6 +1634,9 @@ async def _await_owned_health_probe(
             await fence_parent_cancellation()
             replay_parent_cancellation(cancellation_args)
         if task.cancelled():
+            control = _consume_late_lifecycle_task_outcome(task)
+            if control is not None:
+                raise control
             operation = None
             task = None
             on_started = None
@@ -1661,7 +1666,9 @@ async def _await_owned_health_probe(
     if cancellation_args is not None:
         await fence_parent_cancellation()
         replay_parent_cancellation(cancellation_args)
-    _consume_late_lifecycle_task_outcome(task)
+    control = _consume_late_lifecycle_task_outcome(task)
+    if control is not None:
+        raise control
     raise_authoritative_timeout()
 
 
@@ -14282,7 +14289,9 @@ class ProxyFeature(Feature):
                     if healthy:
                         backoff = 1.0
                         continue
-                except asyncio.TimeoutError:
+                except asyncio.TimeoutError as error:
+                    if is_execution_control_error(error):
+                        raise
                     logger.warning(
                         "Isolated feature %s health probe exceeded %ss — treating as "
                         "wedged and restarting",
@@ -14544,6 +14553,8 @@ class ProxyFeature(Feature):
         """
 
         require_execution_work(self.agent)
+        if vars(self).get("_event_ingress_control") is not None:
+            raise self._event_ingress_control
         return (
             not self._stopping
             and not self._terminal_lifecycle_latched
