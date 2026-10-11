@@ -15,28 +15,73 @@ class UnpublishedLLMOwner:
     provider: Any
     scopes: tuple[ExecutionCustody, ...]
     task: asyncio.Task | None = None
+    task_joins_native: bool = False
     control: BaseException | None = None
 
-    async def retire(self) -> None:
+    async def retire(self, *, join_native: bool = False) -> None:
         if self.task is None:
+            self.task_joins_native = join_native
             with bind_execution_cleanup(self.provider, self.scopes):
                 self.task = asyncio.create_task(
-                    self.provider.close(), name="unpublished-provider:close",
+                    self._close(join_native=join_native), name="unpublished-provider:close",
                 )
-        outcome = await await_owned_task(self.task)
-        self.task = None
+        task, joins_native = self.task, self.task_joins_native
+        outcome = await await_owned_task(task)
+        if self.task is task:
+            self.task = None
         terminal = execution_terminal_error(outcome.error, outcome.cancellation)
         if terminal is not None and is_execution_control_error(terminal):
             self.control = execution_terminal_error(self.control, terminal)
+        if join_native and not joins_native:
+            # A drain may encounter an in-flight bounded startup attempt. Its
+            # completion is not the terminal host join; upgrade the SAME owner
+            # after that attempt settles, retaining original control evidence.
+            await self.retire(join_native=True)
+            if outcome.cancellation is not None:
+                raise outcome.cancellation
+            return
         if self.control is not None:
             raise self.control
         if terminal is not None:
             raise terminal
 
+    async def _close(self, *, join_native: bool) -> None:
+        """Startup is bounded; terminal host drain owns the physical join."""
+        failure = None
+        try:
+            await self.provider.close()
+        except BaseException as error:
+            failure = error
+        pending = getattr(type(self.provider), "has_pending_close_owners", None)
+        retained = bool(callable(pending) and pending(self.provider))
+        waiter = getattr(type(self.provider), "wait_for_close_completion", None)
+        if join_native and callable(waiter):
+            try:
+                await waiter(self.provider)
+            except BaseException as error:
+                failure = execution_terminal_error(failure, error)
+            if retained:
+                # The first failure may only have reported bounded cleanup
+                # debt. Query the SAME idempotent owner after physical join;
+                # never discard an original authority/commit receipt.
+                original_control = (
+                    failure if failure is not None and is_execution_control_error(failure)
+                    else None
+                )
+                try:
+                    await self.provider.close()
+                except BaseException as error:
+                    failure = execution_terminal_error(original_control, error)
+                else:
+                    failure = original_control
+        if failure is not None:
+            raise failure
+
 
 async def retire_unpublished_llm(
     owners: dict[str, UnpublishedLLMOwner], name: str, provider: Any,
     scopes: tuple[ExecutionCustody, ...],
+    *, join_native: bool = False,
 ) -> None:
     """Register before awaiting; retain pending work or uncertain receipts."""
     owner = owners.get(name)
@@ -45,7 +90,7 @@ async def retire_unpublished_llm(
     elif owner.provider is not provider:
         raise RuntimeError("unpublished provider cleanup still owns this name")
     try:
-        await owner.retire()
+        await owner.retire(join_native=join_native)
     except BaseException as error:
         pending = getattr(type(provider), "has_pending_close_owners", None)
         if not is_execution_control_error(error) and not (
@@ -61,7 +106,9 @@ async def drain_unpublished_llm_owners(owners: dict[str, UnpublishedLLMOwner]) -
     failures = []
     for name, owner in tuple(owners.items()):
         try:
-            await retire_unpublished_llm(owners, name, owner.provider, owner.scopes)
+            await retire_unpublished_llm(
+                owners, name, owner.provider, owner.scopes, join_native=True,
+            )
         except BaseException as error:
             failures.append(error)
     if failures:

@@ -25,6 +25,8 @@ from typing import Any, Callable, Dict
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.hold import HoldTurnRefusal
+from kestrel_sovereign._async_ownership import owned_task_error
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -592,6 +594,10 @@ class SpawnFeature(Feature):
             if cancelled:
                 raise asyncio.CancelledError()
 
+        control = vars(self).get("_delegated_control")
+        if control is not None:
+            raise control
+
         # Runtime soft-disable stops descendants but deliberately leaves finite
         # restart witnesses under their signed deadline. Preserve the exact
         # private manager that owns those timers across re-enable; manufacturing
@@ -616,6 +622,7 @@ class SpawnFeature(Feature):
         # provider may suppress cancellation.  Retain every such turn until it
         # is terminal so standalone shutdown cannot close its runtime early.
         self._delegated_task_owners: set[asyncio.Task] = set()
+        self._delegated_control: BaseException | None = None
 
     def get_router(self):
         """Return the Spawn panel router for dynamic mounting.
@@ -1109,6 +1116,9 @@ class SpawnFeature(Feature):
             ERROR for no-AgentManager, child-not-running, and
             child-not-belonging-to-this-parent paths.
         """
+        control = vars(self).get("_delegated_control")
+        if control is not None:
+            raise control
         manager = await self._get_ready_agent_manager()
         if manager is None:
             return ToolResult.failed(error="No AgentManager available")
@@ -1180,7 +1190,14 @@ class SpawnFeature(Feature):
                         "refusal": exc.wire_payload(),
                         "completed_at": time.time(),
                     }
-            except Exception as e:
+            except BaseException as e:
+                if is_execution_control_error(e) or not isinstance(e, Exception):
+                    if self._child_tasks.get(child_name) is owner:
+                        self._child_results[child_name] = {
+                            "success": False, "control": e,
+                            "completed_at": time.time(),
+                        }
+                    raise
                 logger.error(f"Child '{child_name}' task failed: {e}")
                 if self._child_tasks.get(child_name) is owner:
                     self._child_results[child_name] = {
@@ -1200,7 +1217,16 @@ class SpawnFeature(Feature):
             owners = set()
             self._delegated_task_owners = owners
         owners.add(delegated)
-        delegated.add_done_callback(owners.discard)
+
+        def harvest_delegated(done):
+            failure = owned_task_error(done)
+            if failure is not None and is_execution_control_error(failure):
+                self._delegated_control = execution_terminal_error(
+                    vars(self).get("_delegated_control"), failure,
+                )
+            owners.discard(done)
+
+        delegated.add_done_callback(harvest_delegated)
 
         return ToolResult.ok(
             f"Delegated task to '{child_name}'. Use get_child_result to retrieve the result.",
@@ -1263,7 +1289,13 @@ class SpawnFeature(Feature):
                 },
             )
 
-        result = self._child_results.pop(child_name)
+        result = self._child_results[child_name]
+        control = result.get("control")
+        if control is not None:
+            # A native receipt is not a consumable tool-error string. Every
+            # reader sees the same outcome until host lifecycle reconciliation.
+            raise control
+        self._child_results.pop(child_name)
         # The stored result has ``success`` and either ``result`` (on
         # success) or ``error`` (on failure). Surface child-side
         # failures as ERROR so the LLM doesn't claim the delegated
@@ -1598,7 +1630,7 @@ class SpawnFeature(Feature):
             )
         return ToolResult.ok(f"Released this agent's hold on {target_did}.", data=data)
 
-    async def _shutdown_standalone_after_delegated_tasks(
+    async def _shutdown_after_delegated_tasks(
         self,
         manager,
         child_tasks: list[asyncio.Task],
@@ -1612,26 +1644,27 @@ class SpawnFeature(Feature):
         for task in child_tasks:
             cancelled, failure = await await_lifecycle_task_completion(task)
             caller_cancelled = caller_cancelled or cancelled
-            if failure is not None and not isinstance(
-                failure, asyncio.CancelledError
+            if failure is not None and (
+                not isinstance(failure, asyncio.CancelledError)
+                or is_execution_control_error(failure)
             ):
                 outcomes.append(failure)
 
-        descendant_shutdown = asyncio.create_task(
-            manager.shutdown_spawn_authority_tree(self.agent),
-            name="standalone_spawn_descendant_shutdown",
-        )
-        cancelled, failure = await await_lifecycle_task_completion(
-            descendant_shutdown
-        )
-        caller_cancelled = caller_cancelled or cancelled
-        if failure is not None:
-            outcomes.append(failure)
+        failure = None
+        if manager is not None:
+            descendant_shutdown = asyncio.create_task(
+                manager.shutdown_spawn_authority_tree(self.agent),
+                name="standalone_spawn_descendant_shutdown",
+            )
+            cancelled, failure = await await_lifecycle_task_completion(descendant_shutdown)
+            caller_cancelled = caller_cancelled or cancelled
+            if failure is not None:
+                outcomes.append(failure)
 
         # A failed descendant drain can still own live runtimes. Keep the exact
         # manager attached so the failure is observable and a later shutdown
         # can retry instead of manufacturing a fresh, lineage-empty manager.
-        if failure is None:
+        if manager is not None and failure is None:
             self._retained_standalone_manager = manager
             if vars(self.agent).get("_agent_manager") is manager:
                 self.agent._agent_manager = None
@@ -1644,6 +1677,9 @@ class SpawnFeature(Feature):
 
         if caller_cancelled:
             outcomes.append(asyncio.CancelledError())
+        control = execution_terminal_error(vars(self).get("_delegated_control"), *outcomes)
+        if control is not None and is_execution_control_error(control):
+            raise control
         if len(outcomes) == 1:
             raise outcomes[0]
         if outcomes:
@@ -1686,7 +1722,6 @@ class SpawnFeature(Feature):
             if not task.done():
                 task.cancel()
         self._child_tasks.clear()
-        delegated_owners.clear()
         self._child_results.clear()
 
         restore_task = getattr(self, "_standalone_restore_task", None)
@@ -1703,12 +1738,12 @@ class SpawnFeature(Feature):
                 self._standalone_restore_task = None
 
         manager = self._agent_manager
-        if (
-            getattr(self, "_standalone_manager_owned", False)
-            and isinstance(manager, AgentManager)
-        ):
+        if not (getattr(self, "_standalone_manager_owned", False)
+                and isinstance(manager, AgentManager)):
+            manager = None
+        if manager is not None or child_tasks:
             standalone_shutdown = asyncio.create_task(
-                self._shutdown_standalone_after_delegated_tasks(
+                self._shutdown_after_delegated_tasks(
                     manager,
                     child_tasks,
                 ),
@@ -1723,10 +1758,7 @@ class SpawnFeature(Feature):
                 # after this control-plane call returns.
                 def retain_shutdown_outcome(completed: asyncio.Task) -> None:
                     failure: BaseException | None
-                    if completed.cancelled():
-                        failure = asyncio.CancelledError()
-                    else:
-                        failure = completed.exception()
+                    failure = owned_task_error(completed)
                     self._standalone_shutdown_failure = failure
                     if failure is not None:
                         logger.error(
@@ -1752,6 +1784,9 @@ class SpawnFeature(Feature):
 
         if caller_cancelled:
             outcomes.append(asyncio.CancelledError())
+        control = execution_terminal_error(vars(self).get("_delegated_control"), *outcomes)
+        if control is not None and is_execution_control_error(control):
+            raise control
         if len(outcomes) == 1:
             raise outcomes[0]
         if outcomes:

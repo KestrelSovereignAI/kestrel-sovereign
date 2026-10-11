@@ -360,7 +360,9 @@ async def await_lifecycle_task_completion(
     return cancelled, failure
 
 
-async def await_agent_shutdown_completion(agent: object) -> bool:
+async def await_agent_shutdown_completion(
+    agent: object, *, prior_error: BaseException | None = None,
+) -> bool:
     """Join an agent's deferred durable cleanup without dropping it on cancel.
 
     ``KestrelAgent.shutdown`` may transfer dispatcher release and shared
@@ -372,17 +374,24 @@ async def await_agent_shutdown_completion(agent: object) -> bool:
     to re-raise after cleanup; either way the continuation has already reached
     a terminal result, so no SQLite worker or runtime owner is orphaned.
     """
+    # A child's terminal cancellation (including our own timeout request) is
+    # not evidence that the caller was cancelled while joining its cleanup.
+    cancelled = False
+    failure = prior_error
     waiter = getattr(agent, "wait_for_shutdown_completion", None)
-    if not callable(waiter):
-        return False
-    completion = waiter()
-    if not inspect.isawaitable(completion):
-        return False
-
-    task = asyncio.ensure_future(completion)
-    cancelled, failure = await await_lifecycle_task_completion(task)
+    if callable(waiter):
+        try:
+            completion = waiter()
+            if inspect.isawaitable(completion):
+                task = asyncio.ensure_future(completion)
+                join_cancelled, join_failure = await await_lifecycle_task_completion(task)
+                cancelled = join_cancelled or cancelled
+                failure = execution_terminal_error(failure, join_failure)
+        except BaseException as join_failure:
+            failure = execution_terminal_error(failure, join_failure)
     if failure is not None:
-        raise failure
+        if not isinstance(failure, asyncio.CancelledError) or is_execution_control_error(failure):
+            raise failure
     return cancelled
 
 
@@ -2047,7 +2056,21 @@ class KestrelAgent(
         if existing is not None:
             return existing
         from kestrel_sovereign.services.payer_resolver import open_host_db
-        db = await open_host_db(storage_path=self.storage_path)
+        from kestrel_sovereign.storage.async_database import DatabaseInitializationCleanupError
+        try:
+            db = await open_host_db(storage_path=self.storage_path)
+        except DatabaseInitializationCleanupError as error:
+            # The factory could not prove native retirement. Adopt its actual
+            # database before rollback can yield or forget the birth result.
+            db = error.retirement_owner
+            if db is not None:
+                self._resolved_local_host_db = db
+                self._resource_custody().acquire("host_key_database")
+                ctx = vars(self).get("_boot_context")
+                if ctx is not None:
+                    ctx.on_rollback("host_key_database", self._close_local_host_db)
+            self._remember_shutdown_control(error)
+            raise
         if db is not None:
             self._resolved_local_host_db = db
             self._resource_custody().acquire("host_key_database")
@@ -8576,12 +8599,11 @@ Expected Duration: {expected_duration}
             raise TypeError("shutdown reaper handoff requires an asyncio future")
 
         async def reap() -> None:
-            _cancelled, failure = await await_lifecycle_task_completion(shutdown_task)
-            if failure is not None and not isinstance(
-                failure, asyncio.CancelledError
-            ):
-                raise failure
-            await self.wait_for_shutdown_completion()
+            try:
+                _cancelled, failure = await await_lifecycle_task_completion(shutdown_task)
+            except BaseException as error:
+                failure = error
+            await await_agent_shutdown_completion(self, prior_error=failure)
 
         return asyncio.create_task(
             reap(), name=f"agent_shutdown_quarantine_reaper:{self.did}"

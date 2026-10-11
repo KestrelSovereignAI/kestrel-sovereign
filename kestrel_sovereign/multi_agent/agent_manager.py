@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, List, Mapping, Optional
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
+from kestrel_sovereign._async_ownership import owned_task_error
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
     read_anchor_agent_did,
@@ -920,6 +922,9 @@ class AgentManager:
         # Retain those tasks independently of ``_agents`` so removal/restart
         # has a finite control-plane bound without abandoning durable state.
         self._quarantined_shutdown_reapers: dict[str, QuarantinedShutdownReaper] = {}
+        # One strongest native receipt survives bounded metadata eviction and
+        # task-graph retirement; it is not an operator-facing error string.
+        self._quarantined_shutdown_control: BaseException | None = None
         # Completed asyncio tasks retain their coroutine frames and exception
         # tracebacks. Keep only bounded metadata after either safe completion
         # or an unsafe failure; active cleanup alone owns a live task.
@@ -3127,34 +3132,40 @@ class AgentManager:
             )
             cancelled = cancelled or rollback_cancelled
             delattr(agent, "_dynamic_scheduler_tenant_registration")
+        shutdown_failure: Optional[BaseException] = None
         try:
             await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             cancelled = True
+            shutdown_failure = error
             logger.warning(
                 "Unregistered agent %r shutdown was cancelled; "
                 "joining durable cleanup before propagating cancellation",
                 name,
             )
-        except (asyncio.TimeoutError, Exception) as exc:
+        except asyncio.TimeoutError as exc:
             logger.warning(
                 "Failed to clean up unregistered agent %r: %s",
                 name,
                 exc,
                 exc_info=True,
             )
+        except BaseException as error:
+            shutdown_failure = error
         # A bounded KestrelAgent shutdown can hand durable dispatcher release
         # plus storage close to its own shielded continuation.  This startup
         # cleanup path is still its lifecycle owner, so join that continuation
         # rather than dropping the only reference while its SQLite backend is
         # live. Lightweight test doubles do not expose this contract.
-        if _has_shutdown_completion_contract(agent):
-            cancelled = await await_agent_shutdown_completion(agent) or cancelled
-        if cancelled:
-            raise asyncio.CancelledError()
+        try:
+            cancelled = await await_agent_shutdown_completion(
+                agent, prior_error=shutdown_failure,
+            ) or cancelled
+        except BaseException as error:
+            shutdown_failure = error
         failures = [
             failure
-            for failure in (onboarding_failure, rollback_failure)
+            for failure in (onboarding_failure, rollback_failure, shutdown_failure)
             if failure is not None
         ]
         if failures:
@@ -3162,6 +3173,8 @@ class AgentManager:
                 "Unregistered agent integration rollback failed",
                 failures,
             )
+        if cancelled:
+            raise asyncio.CancelledError()
 
     def _withdraw_initialized_agent(self, name: str, agent: KestrelAgent) -> None:
         """Synchronously withdraw one initialized result from published state.
@@ -8467,7 +8480,11 @@ class AgentManager:
             )
 
         async def finish_shutdown_and_optional_offboarding() -> object:
-            await shutdown_reaper
+            cancelled, failure = await await_lifecycle_task_completion(shutdown_reaper)
+            if failure is not None:
+                raise failure
+            if cancelled:
+                raise asyncio.CancelledError()
             if offboard_runtime:
                 (
                     cleanup_cancelled,
@@ -8871,10 +8888,14 @@ class AgentManager:
 
         def observe_reaper_completion(task: "asyncio.Future[object]") -> None:
             record.completed_monotonic = time.monotonic()
+            failure = owned_task_error(task)
+            if failure is not None and is_execution_control_error(failure):
+                self._quarantined_shutdown_control = execution_terminal_error(
+                    self._quarantined_shutdown_control, failure,
+                )
             if task.cancelled():
                 record.failure = "shutdown reaper was cancelled"
             else:
-                failure = task.exception()
                 if failure is None and record.runtime_outcome_required:
                     failure = _runtime_offboarding_outcome_error(
                         agent_name=record.agent_name,
@@ -9436,6 +9457,9 @@ class AgentManager:
         # ExceptionGroup raises TypeError and loses the failures already
         # collected. A successful join retains the established ``True`` return
         # value so callers can choose when to re-raise cancellation themselves.
+        control = vars(self).get("_quarantined_shutdown_control")
+        if control is not None:
+            raise execution_terminal_error(control, *failures)
         if cancelled and failures:
             raise BaseExceptionGroup(
                 "Quarantined shutdown drain observed cancellation and failures",
@@ -9598,6 +9622,7 @@ class AgentManager:
             shutdown_task = asyncio.create_task(
                 agent.shutdown(), name=f"agent_shutdown:{name}"
             )
+            shutdown_task.add_done_callback(owned_task_error)
             caller_cancelled = False
             shutdown_timed_out = False
             shutdown_handed_off = False
@@ -9696,7 +9721,7 @@ class AgentManager:
                         "shutdown task before deciding removal.",
                         name,
                     )
-            except Exception as exc:
+            except BaseException as exc:
                 # A normal shutdown error has no general proof that the agent
                 # reached its cancellation tail.  Keep the historical safe
                 # behaviour for that case; timeouts/cancellation are handled
@@ -9708,6 +9733,11 @@ class AgentManager:
                     exc,
                     exc_info=True,
                 )
+                try:
+                    await await_agent_shutdown_completion(agent, prior_error=exc)
+                except BaseException as terminal:
+                    if is_execution_control_error(terminal) or not isinstance(terminal, Exception):
+                        raise
                 return False
 
             if not shutdown_handed_off:
@@ -9716,18 +9746,22 @@ class AgentManager:
                     shutdown_failure,
                 ) = await await_lifecycle_task_completion(shutdown_task)
                 caller_cancelled = caller_cancelled or join_cancelled
-                if shutdown_failure is not None and not isinstance(
-                    shutdown_failure, asyncio.CancelledError
-                ):
+                try:
+                    caller_cancelled = await await_agent_shutdown_completion(
+                        agent, prior_error=shutdown_failure,
+                    ) or caller_cancelled
+                except BaseException as terminal:
+                    if is_execution_control_error(terminal) or not isinstance(terminal, Exception):
+                        raise
                     logger.warning(
                         "Agent '%s' shutdown task failed; retaining it until "
                         "cleanup can be confirmed: %s",
                         name,
-                        shutdown_failure,
+                        terminal,
                         exc_info=(
-                            type(shutdown_failure),
-                            shutdown_failure,
-                            shutdown_failure.__traceback__,
+                            type(terminal),
+                            terminal,
+                            terminal.__traceback__,
                         ),
                     )
                     return False
@@ -9744,11 +9778,6 @@ class AgentManager:
                 # owner and closed storage. Legacy lifecycle implementations
                 # remain on this conservative path; KestrelAgent's explicit
                 # handoff contract above is what permits bounded removal.
-                if _has_shutdown_completion_contract(agent):
-                    caller_cancelled = (
-                        await await_agent_shutdown_completion(agent)
-                    ) or caller_cancelled
-
                 if offboard_runtime:
                     # Admit the destructive worker while the manager lock still
                     # linearizes this removal, but never await filesystem I/O
@@ -14430,13 +14459,16 @@ class AgentManager:
                             name,
                             offboard_runtime=False,
                         )
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as exc:
                 # The single-agent primitive completes its durable tail before
                 # propagating cancellation.  Continue sweeping later agents;
                 # only prune this name when the authoritative maps confirm it.
                 cancelled = True
                 removed = fully_removed(name)
-                if not removed:
+                if is_execution_control_error(exc):
+                    record_failure(name, exc)
+                    failure_recorded = True
+                elif not removed:
                     record_failure(
                         name,
                         RuntimeError("removal was interrupted before completion"),
@@ -14454,7 +14486,7 @@ class AgentManager:
                     raise unexpected
                 assert expected is not None
                 removed = fully_removed(name)
-                record_failure(name, expected)
+                record_failure(name, exc if is_execution_control_error(exc) else expected)
                 failure_recorded = True
                 if admitted_budget_release is not None:
                     reported_budget_release_failures.add(
@@ -14622,6 +14654,8 @@ class AgentManager:
                 )
             ) or cancelled
         except BaseExceptionGroup as exc:
+            if is_execution_control_error(exc):
+                failures.append(exc)
             drain_failures, non_failures = exc.split(Exception)
             cancellation_group: BaseExceptionGroup | None = None
             if non_failures is not None:
@@ -14631,15 +14665,17 @@ class AgentManager:
                 if unexpected is not None:
                     raise unexpected
             cancelled = cancelled or cancellation_group is not None
-            if drain_failures is not None:
+            if drain_failures is not None and not is_execution_control_error(exc):
                 failures.append(drain_failures)
             logger.warning(
                 "Quarantined agent shutdown cleanup retained cancellation or "
                 "failure outcomes",
                 exc_info=True,
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             cancelled = True
+            if is_execution_control_error(exc):
+                failures.append(exc)
         except Exception as exc:
             failures.append(exc)
             logger.warning(
@@ -14683,6 +14719,11 @@ class AgentManager:
         else:
             logger.info("All agents shut down")
 
+        terminal = execution_terminal_error(*failures)
+        if terminal is not None and is_execution_control_error(terminal):
+            # Aggregate only after the complete fleet sweep, but preserve the
+            # original strongest native receipt rather than a new wrapper.
+            raise terminal
         if cancelled and failures:
             raise BaseExceptionGroup(
                 "Fleet shutdown observed cancellation and agent failures",

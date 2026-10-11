@@ -34,6 +34,7 @@ from kestrel_sovereign.kestrel_agent import (
 from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.lifecycle import drain_unpublished_llm_owners, retire_unpublished_llm
+from kestrel_sovereign.execution_custody import execution_terminal_error
 from dotenv import load_dotenv
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
@@ -2117,6 +2118,14 @@ async def _supervise_phoenix_startup(app, supervisor) -> None:
 async def _shutdown_single_agent(agent: KestrelAgent) -> None:
     """Bound user-visible shutdown while retaining ownership of its tail."""
     cancelled = False
+    failure = None
+    # Failed initialization may already have handed native cleanup to the
+    # Agent. Join that exact owner before a fresh shutdown can touch providers.
+    if isinstance(getattr(agent, "_durable_shutdown_continuation", None), asyncio.Future):
+        try:
+            cancelled = await await_agent_shutdown_completion(agent)
+        except BaseException as error:
+            failure = error
     try:
         await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
         logger.info("Agent shutdown complete.")
@@ -2125,12 +2134,14 @@ async def _shutdown_single_agent(agent: KestrelAgent) -> None:
             "Agent shutdown timed out (%ss); waiting for durable cleanup",
             SHUTDOWN_TIMEOUT,
         )
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as error:
         cancelled = True
+        failure = execution_terminal_error(failure, error)
         logger.debug("Agent shutdown cancelled")
-    except Exception as e:
-        logger.warning(f"Error during agent shutdown: {e}")
-    cancelled = await await_agent_shutdown_completion(agent) or cancelled
+    except BaseException as error:
+        failure = execution_terminal_error(failure, error)
+        logger.warning("Error during agent shutdown (%s)", type(error).__name__)
+    cancelled = await await_agent_shutdown_completion(agent, prior_error=failure) or cancelled
     if cancelled:
         raise asyncio.CancelledError()
 
@@ -2533,6 +2544,7 @@ async def _shutdown_shared_agent_postgres_backend(app: FastAPI) -> None:
     if (
         getattr(app.state, "agent_manager", None) is not None
         or getattr(app.state, "startup_cleanup_agent_manager", None) is not None
+        or getattr(app.state, "startup_cleanup_agent", None) is not None
         or getattr(app.state, "unpublished_llm_owners", None)
     ):
         raise RuntimeError(
@@ -2872,8 +2884,9 @@ async def _shutdown_server_agents(app: FastAPI) -> None:
     for candidate in (manager, cleanup_manager):
         if candidate is not None and all(candidate is not known for known in managers):
             managers.append(candidate)
-    if managers:
-        for owned_manager in managers:
+    failures = []
+    for owned_manager in managers:
+        try:
             await owned_manager.shutdown_all()
             if getattr(app.state, "agent_manager", None) is owned_manager:
                 app.state.agent_manager = None
@@ -2882,12 +2895,25 @@ async def _shutdown_server_agents(app: FastAPI) -> None:
                 is owned_manager
             ):
                 app.state.startup_cleanup_agent_manager = None
+        except BaseException as error:
+            failures.append(error)
+    if managers and not failures:
         logger.info("All agents shutdown complete.")
-        return
-
-    agent = getattr(app.state, "agent", None)
-    if agent is not None:
-        await _shutdown_single_agent(agent)
+    owned_agents = []
+    for attribute in ("agent", "startup_cleanup_agent"):
+        agent = getattr(app.state, attribute, None)
+        if agent is not None and all(agent is not known for known in owned_agents):
+            owned_agents.append(agent)
+            try:
+                await _shutdown_single_agent(agent)
+            except BaseException as error:
+                failures.append(error)
+            else:
+                if getattr(app.state, attribute, None) is agent:
+                    setattr(app.state, attribute, None)
+    terminal = execution_terminal_error(*failures)
+    if terminal is not None:
+        raise terminal
 
 
 def _split_lifecycle_cancellation(
@@ -3054,8 +3080,9 @@ async def _build_host_control_context(app: FastAPI, host_config) -> object:
 @asynccontextmanager
 async def _lifespan_startup(app: FastAPI):
     """Initialize server resources; outer lifespan ownership handles teardown."""
-    if getattr(app.state, "unpublished_llm_owners", None):
-        raise RuntimeError("unpublished provider cleanup must retire before server restart")
+    if (getattr(app.state, "unpublished_llm_owners", None)
+            or getattr(app.state, "startup_cleanup_agent", None)):
+        raise RuntimeError("unpublished provider/agent cleanup must retire before server restart")
     logger.info("Server starting up...")
     _set_startup_error(app, None)
     app.state.mandatory_feature_failures = []
@@ -3065,6 +3092,7 @@ async def _lifespan_startup(app: FastAPI):
     # On a failed rollback this private owner remains reachable only to
     # teardown. It must never become the public routing manager.
     app.state.startup_cleanup_agent_manager = None
+    app.state.startup_cleanup_agent = None
     app.state.host_features = []
     app.state.host_context = None
     app.state.host_ui_manifest = []
@@ -3608,6 +3636,8 @@ async def _lifespan_startup(app: FastAPI):
         app.state.agent_manager = None
         llm_service = None
         execution_custody = None
+        constructed_agent = None
+        captured = ()
         try:
             db_backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite")
             database_url = os.environ.get("KESTREL_DATABASE_URL")
@@ -3659,6 +3689,8 @@ async def _lifespan_startup(app: FastAPI):
                 )
                 logger.info(f"Using SQLite backend for Kestrel: {db_path}")
 
+            constructed_agent = app.state.agent
+
             app.state.agent._hold_store = host_context.hold_store
 
             host_context_publication_gate = asyncio.Event()
@@ -3680,9 +3712,14 @@ async def _lifespan_startup(app: FastAPI):
             # Failed birth must deny surviving provider children BEFORE the
             # first cleanup await, including cancellation during initialize.
             retire_process_runtime_custody(execution_custody)
+            if constructed_agent is not None:
+                # Initialization owns more than its provider: rollback may
+                # retain cognition, storage, or a joinable native continuation.
+                # Withdraw routing but keep the actual Agent for host teardown.
+                app.state.startup_cleanup_agent = constructed_agent
             app.state.agent = None
             cleanup_cancelled = False
-            if llm_service is not None:
+            if llm_service is not None and constructed_agent is None:
                 owners = getattr(app.state, "unpublished_llm_owners", None)
                 if owners is None:
                     owners = app.state.unpublished_llm_owners = {}

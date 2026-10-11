@@ -380,6 +380,17 @@ blocks replacement birth and shared-pool release, and is retried by host teardow
 without recreating an uncertain native close. Ordinary settled close failures
 retain their compatibility behavior. Server cancellation/group handling cannot
 strip a native control cause or hide it behind an earlier ordinary failure.
+Terminal host drain joins the unpublished provider's physical close owner,
+not another bounded close attempt. If construction produced an Agent before
+initialization failed, the host retains that Agent privately instead of closing
+its provider beneath cognition, storage, or a rollback continuation. A failed
+host-key database factory likewise transfers its actual retirement owner into
+Agent custody before propagating the original initialization receipt.
+Every lifecycle consumer joins the exact continuation before reporting any
+outcome, including cancellation-containing groups. Child timeout cancellation
+does not manufacture caller cancellation. Fleet/quarantine retirement and
+delegated result reads retain the original strongest native control receipt;
+completed-task removal or bounded diagnostic eviction cannot acknowledge it.
 
 Durable owner-heartbeat failure re-arms bounded cleanup liveness even before a
 late cognition owner or terminalization debt is installed. Re-arm retains the

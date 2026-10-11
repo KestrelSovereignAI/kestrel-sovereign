@@ -110,12 +110,12 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
                     await manager._initialize_agent("child", config)
             assert calls == [True]
             if kind == "pending":
-                with pytest.raises(RuntimeError, match="incomplete|pending"):
-                    await drain_unpublished_llm_owners(owners)
+                drain = asyncio.create_task(drain_unpublished_llm_owners(owners))
+                done, _ = await asyncio.wait({drain}, timeout=0.4)
+                assert not done, "host drain must own the native join itself"
                 assert len(owners) == 1 and calls == [True]
                 release.set()
-                await service.wait_for_close_completion()
-                await drain_unpublished_llm_owners(owners)
+                await drain
                 assert not owners and calls == [True]
             else:
                 with pytest.raises(BaseException) as caught:

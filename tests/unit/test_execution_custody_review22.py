@@ -79,6 +79,7 @@ async def test_actual_single_pg_startup_owns_custody_before_provider_birth(monke
         agent = SimpleNamespace(
             did=kwargs["did"], _execution_custody=kwargs["execution_custody"],
             defer_agent_readiness_to_host=lambda: None, initialize=initialize,
+            shutdown=close,
         )
         candidates.append(agent)
         return agent
@@ -101,6 +102,11 @@ async def test_actual_single_pg_startup_owns_custody_before_provider_birth(monke
     else:
         with pytest.raises(ExecutionAuthorityError, match="retired"):
             scopes[0].require_work()
+        if failure in {"initialize", "cancel"}:
+            assert not close_denials
+            assert app.state.startup_cleanup_agent is candidates[0]
+            await server._shutdown_server_agents(app)
+            assert app.state.startup_cleanup_agent is None
         assert close_denials == ([] if failure == "provider" else [True])
         assert app.state.agent is None
 
