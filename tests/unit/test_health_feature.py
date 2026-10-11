@@ -1232,31 +1232,19 @@ class TestHeartbeatStatus:
         assert data["history"][0]["id"] == "mem-1"
 
 
-class _FakeTask:
-    """A fake asyncio.Task that supports await, cancel(), and done().
+class _FakeTask(asyncio.Future):
+    """A native Future with cancellation observation for legacy unit fixtures.
 
     Used in tests to replace asyncio.create_task() without starting a real loop.
     """
 
     def __init__(self):
-        self._done = False
-        self._cancelled = False
+        super().__init__()
         self.cancel_called = False
 
-    def done(self):
-        return self._done
-
-    def cancel(self):
+    def cancel(self, msg=None):
         self.cancel_called = True
-        self._cancelled = True
-        self._done = True
-
-    def __await__(self):
-        if self._cancelled:
-            raise asyncio.CancelledError()
-        # Yield nothing -- completes immediately
-        return
-        yield  # Make this a generator (required for __await__)
+        return super().cancel(msg)
 
 
 def _make_awaitable_task():
