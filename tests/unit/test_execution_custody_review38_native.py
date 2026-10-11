@@ -191,10 +191,9 @@ async def test_inference_tools_preserve_native_persistence_receipts(tmp_path, mo
         operation = (feature.acquire("qwen3:8b", "1.00", "0.50") if route == "acquire" else getattr(feature, route)(coordinator.current_record.lease.lease_id))
         outcome = await await_owned_task(asyncio.create_task(operation))
         assert outcome.error is not None and execution_commit_outcome(outcome.error) == "unknown", "tool normalized native persistence to a failed string"
-        if isinstance(error, Exception):
-            assert outcome.error.__cause__ is error
-        else:
-            assert outcome.error is error
+        # The coordinator now classifies before ordinary provisioning wraps.
+        # Preserve the original receipt itself, not merely an explicit cause.
+        assert outcome.error is error
         with sqlite3.connect(tmp_path / "native.db") as observer:
             assert observer.execute("SELECT COUNT(*) FROM agent_metadata").fetchone()[0] == 1
         if route == "acquire":

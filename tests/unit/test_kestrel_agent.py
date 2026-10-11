@@ -1510,6 +1510,8 @@ class TestLifecycle:
         health._background_task = None
         # This fixture bypasses normal initialize(). Publish the same READY
         # barrier before asserting shutdown of a genuinely resident loop.
+        health._health_persist_tasks = set()
+        health._health_persist_control = None
         agent._runtime_publication_ready.set()
         health._start_background_loop()
         await asyncio.sleep(0)
