@@ -1228,7 +1228,7 @@ class MemoryRetriever:
         self,
         message_id: int,
         agent_id: str,
-    ) -> None:
+    ) -> bool:
         """
         Record that a retrieved memory was demonstrably applied.
 
@@ -1249,26 +1249,31 @@ class MemoryRetriever:
         concurrent reflection hooks marking the same memory as applied
         can't lose increments to a read-modify-write race.
 
+        Unlike ``update_access``, a failed write propagates (#3544). An
+        attestation is a judgment its caller made and will not remake once
+        it has moved past the retrieval, so the caller must learn when the
+        increment was lost.
+
         Args:
             message_id: Database ID of the message
             agent_id: Agent ID for verification (currently unused; store
                 is already agent-scoped, parameter matches
                 ``update_access`` shape so the two write paths feel
                 symmetric to callers).
+
+        Returns:
+            ``True`` once the increment is written; ``False`` when
+            nothing was written: no store, no id, or no row of this agent
+            with that id.
         """
         if not self.conversations or message_id is None:
-            return
+            return False
 
-        try:
-            await self.conversations.atomic_increment_metadata_counter(
-                message_id,
-                counter_field="applied_count",
-                timestamp_field="last_applied",
-            )
-        except Exception as e:
-            # Same safety as update_access — bookkeeping must not
-            # break the calling loop.
-            logger.warning(f"update_applied failed for message {message_id}: {e}")
+        return await self.conversations.atomic_increment_metadata_counter(
+            message_id,
+            counter_field="applied_count",
+            timestamp_field="last_applied",
+        )
 
 
 def calculate_decay(

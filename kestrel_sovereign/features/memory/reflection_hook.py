@@ -8,6 +8,11 @@ then route positive attestations through ``MemorySystem.mark_applied``.
 Two backends (``[retrieval] memory_attestation_backend``): ``chat`` asks one
 ``generate`` call per memory; ``decision`` (#3424, #3495) asks one ``decide``
 call per memory, a single ``noul`` question ``applied``.
+
+Window (#3544). A pass attests the memories retrieved since the agent's
+watermark, where its last completed pass's window ended, and judges each one
+against the turn that retrieved it. Sleep runs once a day, so the 30-minute
+window before it that this replaced almost never held a retrieval.
 """
 
 from __future__ import annotations
@@ -19,15 +24,19 @@ import re
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
 from kestrel_sdk.llm.decisions import DecisionError, DecisionRequest, NoulQuestion
+from kestrel_sdk.storage.database.interface import TransactionError
 
 from kestrel_sovereign.agent.sleep import (
     SleepHookContract,
     SleepHookPhase,
     SleepHookStatus,
 )
+from kestrel_sovereign.storage.conversation_created_at import parse_stored_timestamp
+from kestrel_sovereign.storage.encryption import DecryptionError
 
 if TYPE_CHECKING:
     from kestrel_sovereign.llm.decisions.evaluation import Sample
@@ -40,6 +49,24 @@ _MAX_MEMORY_CHARS = 1200
 _MAX_CONTEXT_MESSAGES = 40
 _MAX_CONTEXT_CHARS = 6000
 _MAX_REASON_CHARS = 240
+
+#: One row per agent: the instant up to which retrievals have been attested.
+ATTESTATION_STATE_TABLE = "memory_attestation_state"
+#: The retrievals counted applied, kept until the watermark passes them, so
+#: neither a retry nor an overlapping pass counts one retrieval twice.
+ATTESTATION_MARKS_TABLE = "memory_attestation_marks"
+#: The window of an agent's first pass. Nothing the memory feature owns records
+#: when an agent slept before its first pass, so it looks back one daily sleep
+#: interval.
+ATTESTATION_BOOTSTRAP_LOOKBACK = timedelta(hours=24)
+#: A pass's window ends this long before it starts. ``last_accessed`` is
+#: stamped before its write commits, and a write can wait for its lock
+#: (SQLite's busy timeout is 30 s). A window ending at the pass's start would
+#: miss a stamp that committed after the pass read, and the next window would
+#: start after it.
+ATTESTATION_SETTLE = timedelta(minutes=5)
+#: Fixed width, so the stored text sorts as the instants do.
+_INSTANT_FORMAT = "%Y-%m-%dT%H:%M:%S.%f+00:00"
 
 #: Decision backend (#3424). Caller id keying ``[decisions.thresholds]``.
 ATTESTATION_CALLER = "memory_attestation"
@@ -97,6 +124,187 @@ class RetrievedMemoryCandidate:
     retrieved_at: str
     created_at: Any
     role: str
+    #: The turn that retrieved this memory, rendered (#3544).
+    session_context: str = ""
+
+
+def _format_instant(instant: datetime) -> str:
+    return instant.astimezone(timezone.utc).strftime(_INSTANT_FORMAT)
+
+
+@dataclass(frozen=True)
+class RetrievalMarks:
+    """The retrievals counted applied, one mark each (#3544).
+
+    A memory's ``last_accessed`` names its latest retrieval, so a mark is keyed
+    by that instant: a later retrieval of the same memory is a new one. A mark
+    is kept until the watermark passes its retrieval, so the retry of a failed
+    pass does not count a retrieval twice.
+
+    Passes can overlap: a scheduled and a manual sleep share the hook, and both
+    can select one retrieval before either counts it. So the mark is the claim
+    on the count. :meth:`record` inserts it and increments ``applied_count`` in
+    one transaction, and increments only when the insert won.
+    """
+
+    db: Any
+    agent_id: str
+
+    async def record(
+        self,
+        memory: Any,
+        candidate: RetrievedMemoryCandidate,
+        *,
+        reason: str,
+    ) -> bool:
+        """Mark ``candidate`` applied unless its retrieval was already counted.
+
+        The insert loses when another pass marked the retrieval, or when a
+        completed pass's watermark has passed it (and taken its mark with it).
+        Then nothing is written and this returns ``False``.
+
+        ``mark_applied`` writes through the agent's database, so its increment
+        joins this transaction. It raises when it wrote nothing or its write
+        failed; that rolls the mark back and is raised as ``mark_applied``
+        raised it.
+        """
+        retrieved_at = _format_instant(datetime.fromisoformat(candidate.retrieved_at))
+        failure: Optional[Exception] = None
+        try:
+            async with self.db.transaction():
+                if self.db.backend_type == "postgres":
+                    # ``_advance_watermark`` moves the watermark and drops the
+                    # marks behind it under this row's lock. Holding it, the
+                    # insert sees both of those or neither.
+                    await self.db.fetchone(
+                        f"SELECT attested_through FROM {ATTESTATION_STATE_TABLE} "
+                        "WHERE agent_id = ? FOR UPDATE",
+                        (self.agent_id,),
+                    )
+                claimed = await self.db.execute(
+                    f"""INSERT INTO {ATTESTATION_MARKS_TABLE}
+                            (agent_id, message_id, retrieved_at)
+                        SELECT ?, CAST(? AS INTEGER), ?
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM {ATTESTATION_STATE_TABLE}
+                            WHERE agent_id = ? AND attested_through > ?
+                        )
+                        ON CONFLICT (agent_id, message_id, retrieved_at) DO NOTHING""",
+                    (
+                        self.agent_id,
+                        candidate.message_id,
+                        retrieved_at,
+                        self.agent_id,
+                        retrieved_at,
+                    ),
+                )
+                if not claimed:
+                    return False
+                try:
+                    await memory.mark_applied(candidate.message_id, reason=reason)
+                except Exception as exc:
+                    failure = exc
+                    raise
+        except TransactionError:
+            if failure is None:
+                raise
+            # Rolled back. Raise what failed, not the transaction's wrapper.
+            raise failure from None
+        return True
+
+
+def retrieving_turn(
+    earlier: List[Dict[str, Any]],
+    later: List[Dict[str, Any]],
+    retrieved_second: datetime,
+) -> List[Dict[str, Any]]:
+    """The rows of the turn a retrieval served: its user row and the reply.
+
+    ``earlier`` and ``later`` are the rows before and at-or-after
+    ``retrieved_second``, the retrieval instant truncated to the second
+    stored timestamps carry (``get_messages_around``). A turn is a user row
+    and every row after it up to the next user row. An operator notice a
+    route without inline system messages stores as a ``user`` row is written
+    inside a turn, after its user row, and does not start one.
+
+    Context assembly retrieves memories just before it writes the turn's user
+    row, so the retrieval's turn is normally the first one at or after it. A
+    memory tool retrieves inside a turn whose user row was already written and
+    whose reply comes after. Within one stored second the order of a retrieval
+    and the rows around it is unknown, so a reply in the retrieval's own
+    second does not make an earlier turn the retrieval's when a later one
+    exists: a wake can start within the second the previous reply was written.
+    The user row follows its retrieval by however long embedding it takes, so
+    a later turn counts unless its user row is ``SESSION_GAP_MINUTES`` or more
+    after the retrieval. A retrieval whose turn failed before writing its user
+    row therefore has none only when no other turn starts within that gap; the
+    stored rows cannot tell such a turn from its own.
+    """
+
+    def second_of(row: Dict[str, Any]) -> Optional[datetime]:
+        stamp = parse_stored_timestamp(row.get("created_at"))
+        return None if stamp is None else stamp.replace(microsecond=0)
+
+    def starts_turn(row: Dict[str, Any]) -> bool:
+        return row.get("role") == "user" and not (row.get("metadata") or {}).get(
+            "operator_signal"
+        )
+
+    def through_reply(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        turn = rows[:1]
+        for row in rows[1:]:
+            if starts_turn(row):
+                break
+            turn.append(row)
+        return turn
+
+    def reply_of(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        return next((row for row in rows if row.get("role") == "assistant"), None)
+
+    later_user = next(
+        (index for index, row in enumerate(later) if starts_turn(row)), None
+    )
+    if later_user is not None:
+        written = second_of(later[later_user])
+        if written is None or written - retrieved_second >= timedelta(
+            minutes=SESSION_GAP_MINUTES
+        ):
+            later_user = None
+    earlier_user = next(
+        (
+            index
+            for index in range(len(earlier) - 1, -1, -1)
+            if starts_turn(earlier[index])
+        ),
+        None,
+    )
+    if earlier_user is not None and reply_of(earlier[earlier_user + 1:]) is None:
+        # Still open when the memory was retrieved: a tool retrieval. A turn
+        # that was never answered is not the one this retrieval served.
+        turn = through_reply(earlier[earlier_user:] + later)
+        reply = reply_of(turn)
+        if reply is not None and (
+            later_user is None or second_of(reply) != retrieved_second
+        ):
+            return turn
+
+    if later_user is not None:
+        return through_reply(later[later_user:])
+    return []
+
+
+def render_turn(turn: List[Dict[str, Any]]) -> str:
+    """``role: content`` lines of the turn's first rows, within the context
+    bounds; over the character bound, the end (the reply) is kept."""
+
+    lines: List[str] = []
+    for row in turn[:_MAX_CONTEXT_MESSAGES]:
+        if (row.get("metadata") or {}).get("excluded_from_context"):
+            continue
+        content = str(row.get("content") or "").strip()
+        if content:
+            lines.append(f"{row.get('role', 'unknown')}: {content}")
+    return "\n".join(lines)[-_MAX_CONTEXT_CHARS:]
 
 
 class ReflectionSleepHook:
@@ -178,27 +386,102 @@ class ReflectionSleepHook:
                 "applied_count": 0,
             })
 
-        cutoff = self._session_cutoff(agent)
+        # The pass covers retrievals in [watermark, window end). Its window end
+        # is the next watermark, so consecutive passes neither overlap nor
+        # leave a gap.
+        pass_started = datetime.now(timezone.utc)
+        window_end = pass_started - ATTESTATION_SETTLE
+        window_start = await self._begin_pass(
+            db, agent_id=agent_did, pass_started=pass_started
+        )
+        marks = RetrievalMarks(db, agent_did)
+        conversation = self._resolve_conversation(agent)
         candidates = await self._recently_retrieved_memories(
             db,
-            conversation=self._resolve_conversation(agent),
+            conversation=conversation,
             agent_id=agent_did,
-            cutoff=cutoff,
+            since=window_start,
+            until=window_end,
         )
         if not candidates:
-            return self._finish_pre_sleep(SleepHookStatus.SUCCESS, {
+            result = self._finish_pre_sleep(SleepHookStatus.SUCCESS, {
                 "success": True,
                 "skipped": False,
                 "insights_generated": 0,
                 "candidates": 0,
                 "applied_count": 0,
             })
+        else:
+            for candidate in candidates:
+                candidate.session_context = await self._retrieval_turn_context(
+                    conversation, candidate
+                )
+            if self.backend == "decision":
+                result = await self._attest_with_decisions(
+                    agent, memory, candidates, marks
+                )
+            else:
+                result = await self._attest_with_chat(agent, memory, candidates, marks)
+        return await self._complete_pass(
+            db, result, agent_id=agent_did, through=window_end
+        )
 
-        session_context = await self._session_context(agent, cutoff=cutoff)
-        if self.backend == "decision":
-            return await self._attest_with_decisions(
-                agent, memory, candidates, session_context
+    async def _complete_pass(
+        self,
+        db,
+        result: Dict[str, Any],
+        *,
+        agent_id: str,
+        through: datetime,
+    ) -> Dict[str, Any]:
+        """Advance the watermark when the pass succeeded.
+
+        A failed or interrupted pass leaves it where it was, so the next sleep
+        covers the same window again.
+        """
+        if self._pre_sleep_status.get() is not SleepHookStatus.SUCCESS:
+            return result
+        try:
+            await self._advance_watermark(db, agent_id=agent_id, through=through)
+        except BaseException:
+            # The pass is complete only once its watermark is durable.
+            self._pre_sleep_status.set(None)
+            raise
+        return result
+
+    async def _record_application(
+        self,
+        memory,
+        marks: RetrievalMarks,
+        candidate: RetrievedMemoryCandidate,
+        *,
+        reason: str,
+    ) -> bool:
+        """Count ``candidate`` applied, once per retrieval (:class:`RetrievalMarks`).
+
+        Returns ``False`` when another pass already counted the retrieval. A
+        write that was not committed raises, which ends the pass before its
+        watermark moves and leaves the retrieval unmarked, so the next sleep
+        judges it again.
+        """
+        try:
+            return await marks.record(memory, candidate, reason=reason)
+        except Exception as exc:
+            # Storage errors can carry row content; name only the type.
+            logger.warning(
+                "Memory attestation was not recorded: %s", type(exc).__name__
             )
+            raise
+
+    async def _attest_with_chat(
+        self,
+        agent,
+        memory,
+        candidates: List[RetrievedMemoryCandidate],
+        marks: RetrievalMarks,
+    ) -> Dict[str, Any]:
+        """Attest each candidate with its own ``generate`` call."""
+
         applied = 0
         attested_ids: List[int] = []
         for candidate in candidates:
@@ -206,7 +489,7 @@ class ReflectionSleepHook:
                 attestation = await self._attest_application(
                     agent,
                     candidate=candidate,
-                    session_context=session_context,
+                    session_context=candidate.session_context,
                 )
             except Exception:  # noqa: BLE001 - hook must not block sleep
                 # Provider exceptions can include prompt or response content.
@@ -224,9 +507,9 @@ class ReflectionSleepHook:
             if not attestation.get("applied"):
                 continue
             reason = self._clean_reason(attestation.get("reason"))
-            await memory.mark_applied(candidate.message_id, reason=reason)
-            applied += 1
-            attested_ids.append(candidate.message_id)
+            if await self._record_application(memory, marks, candidate, reason=reason):
+                applied += 1
+                attested_ids.append(candidate.message_id)
 
         return self._finish_pre_sleep(SleepHookStatus.SUCCESS, {
             "success": True,
@@ -242,7 +525,7 @@ class ReflectionSleepHook:
         agent,
         memory,
         candidates: List[RetrievedMemoryCandidate],
-        session_context: str,
+        marks: RetrievalMarks,
     ) -> Dict[str, Any]:
         """Attest each candidate with its own ``decide`` call (#3495).
 
@@ -256,7 +539,9 @@ class ReflectionSleepHook:
         async def attest(candidate: RetrievedMemoryCandidate):
             async with gate:
                 return await llm_service.decide(
-                    attestation_decision_request(session_context, candidate.content),
+                    attestation_decision_request(
+                        candidate.session_context, candidate.content
+                    ),
                     caller=ATTESTATION_CALLER,
                     timeout_seconds=ATTESTATION_DECISION_TIMEOUT_SECONDS,
                     model_override=self.decision_model,
@@ -288,9 +573,9 @@ class ReflectionSleepHook:
                 f"Decision attestation ({outcome.route}/{outcome.model}): "
                 f"p(applied)={p_applied:.2f}."
             )
-            await memory.mark_applied(candidate.message_id, reason=reason)
-            applied += 1
-            attested_ids.append(candidate.message_id)
+            if await self._record_application(memory, marks, candidate, reason=reason):
+                applied += 1
+                attested_ids.append(candidate.message_id)
 
         if errors:
             # Includes a privacy mode with no permitted (calibrated) local
@@ -389,23 +674,87 @@ class ReflectionSleepHook:
         memory_storage = getattr(memory, "storage", None)
         return getattr(memory_storage, "conversation", None)
 
-    def _session_cutoff(self, agent) -> datetime:
-        gap_minutes = 30
-        consolidator = getattr(
-            getattr(agent, "memory_system", None),
-            "consolidator",
-            None,
-        ) or getattr(agent, "memory_consolidator", None)
-        if consolidator is not None:
-            gap_minutes = getattr(consolidator, "SESSION_GAP_MINUTES", gap_minutes)
-        else:
-            try:
-                from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
+    async def _ensure_state_tables(self, db) -> None:
+        await db.execute(
+            f"""CREATE TABLE IF NOT EXISTS {ATTESTATION_STATE_TABLE} (
+                agent_id TEXT PRIMARY KEY,
+                attested_through TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        await db.execute(
+            f"""CREATE TABLE IF NOT EXISTS {ATTESTATION_MARKS_TABLE} (
+                agent_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                retrieved_at TEXT NOT NULL,
+                PRIMARY KEY (agent_id, message_id, retrieved_at)
+            )"""
+        )
 
-                gap_minutes = SESSION_GAP_MINUTES
-            except Exception:  # pragma: no cover - defensive fallback
-                pass
-        return datetime.now(timezone.utc) - timedelta(minutes=int(gap_minutes))
+    async def _begin_pass(
+        self,
+        db,
+        *,
+        agent_id: str,
+        pass_started: datetime,
+    ) -> datetime:
+        """The start of this pass's window: the agent's watermark.
+
+        An agent's first pass has none and looks back
+        :data:`ATTESTATION_BOOTSTRAP_LOOKBACK`. That boundary is stored now,
+        so a failed first pass is retried over the same window.
+        """
+        await self._ensure_state_tables(db)
+        row = await db.fetchone(
+            f"SELECT attested_through FROM {ATTESTATION_STATE_TABLE} "
+            "WHERE agent_id = ?",
+            (agent_id,),
+        )
+        if row is not None:
+            # Written only by ``_format_instant``: anything else is
+            # corruption, and guessing a window would attest the wrong memories.
+            return datetime.fromisoformat(row[0])
+        window_start = pass_started - ATTESTATION_BOOTSTRAP_LOOKBACK
+        await db.execute(
+            f"""INSERT INTO {ATTESTATION_STATE_TABLE}
+                    (agent_id, attested_through, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT (agent_id) DO NOTHING""",
+            (
+                agent_id,
+                _format_instant(window_start),
+                _format_instant(datetime.now(timezone.utc)),
+            ),
+        )
+        return window_start
+
+    async def _advance_watermark(
+        self, db, *, agent_id: str, through: datetime
+    ) -> None:
+        # Never backwards: an overlapping pass that started earlier and
+        # finished later must not reopen the window a later pass closed.
+        stamp = _format_instant(through)
+        # One transaction, so :meth:`RetrievalMarks.record` sees the new
+        # watermark whenever a mark it dropped is gone. On PostgreSQL the
+        # upsert locks the agent's row even when it does not move it.
+        async with db.transaction():
+            await db.execute(
+                f"""INSERT INTO {ATTESTATION_STATE_TABLE}
+                        (agent_id, attested_through, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT (agent_id) DO UPDATE SET
+                        attested_through = excluded.attested_through,
+                        updated_at = excluded.updated_at
+                    WHERE {ATTESTATION_STATE_TABLE}.attested_through
+                        < excluded.attested_through""",
+                (agent_id, stamp, _format_instant(datetime.now(timezone.utc))),
+            )
+            # Behind the watermark, no pass selects or counts these again.
+            await db.execute(
+                f"DELETE FROM {ATTESTATION_MARKS_TABLE} "
+                "WHERE agent_id = ? AND retrieved_at < ?",
+                (agent_id, stamp),
+            )
 
     async def _recently_retrieved_memories(
         self,
@@ -413,43 +762,75 @@ class ReflectionSleepHook:
         *,
         conversation,
         agent_id: str,
-        cutoff: datetime,
+        since: datetime,
+        until: datetime,
     ) -> List[RetrievedMemoryCandidate]:
+        """Memories last retrieved in ``[since, until)``, the most recent
+        :data:`_MAX_CANDIDATES`, oldest first.
+
+        ``last_accessed`` is rewritten on every retrieval, so it names only a
+        memory's latest one. A retrieval a failed pass already marked applied
+        (:class:`RetrievalMarks`) is not counted twice when its window is covered
+        again; a later retrieval of the same memory is new.
+        """
+        marked = {
+            (int(message_id), retrieved_at)
+            for message_id, retrieved_at in await db.fetchall(
+                f"SELECT message_id, retrieved_at FROM {ATTESTATION_MARKS_TABLE} "
+                "WHERE agent_id = ?",
+                (agent_id,),
+            )
+        }
         rows = await db.fetchall(
-            """SELECT id, role, content, metadata, created_at
+            """SELECT id, metadata
                FROM conversation_history
                WHERE agent_id = ?
                  AND deleted_at IS NULL
-                 AND metadata LIKE ?
-               ORDER BY id DESC
-               LIMIT ?""",
-            (agent_id, "%last_accessed%", _MAX_CANDIDATES * 4),
+                 AND metadata LIKE ?""",
+            (agent_id, "%last_accessed%"),
         )
 
-        candidates: List[RetrievedMemoryCandidate] = []
-        for row in rows:
-            msg_id, role, content, metadata_raw, created_at = row
+        retrieved: List[Tuple[datetime, int]] = []
+        for msg_id, metadata_raw in rows:
             metadata = self._parse_metadata(metadata_raw)
-            retrieved_at = metadata.get("last_accessed")
-            if not retrieved_at:
+            retrieved_dt = self._parse_datetime(metadata.get("last_accessed"))
+            if retrieved_dt is None or not since <= retrieved_dt < until:
                 continue
-            retrieved_dt = self._parse_datetime(retrieved_at)
-            if retrieved_dt is None or retrieved_dt < cutoff:
+            if (int(msg_id), _format_instant(retrieved_dt)) in marked:
                 continue
+            retrieved.append((retrieved_dt, int(msg_id)))
+        selected = sorted(retrieved, reverse=True)[:_MAX_CANDIDATES]
+        if not selected:
+            return []
+
+        placeholders = ",".join("?" for _ in selected)
+        rows = await db.fetchall(
+            f"""SELECT id, role, content, metadata, created_at
+                FROM conversation_history
+                WHERE agent_id = ?
+                  AND deleted_at IS NULL
+                  AND id IN ({placeholders})""",
+            (agent_id, *(msg_id for _, msg_id in selected)),
+        )
+        by_id = {int(row[0]): row for row in rows}
+
+        candidates: List[RetrievedMemoryCandidate] = []
+        for retrieved_dt, msg_id in sorted(selected):
+            row = by_id.get(msg_id)
+            if row is None:  # deleted between the two reads
+                continue
+            _, role, content, metadata_raw, created_at = row
+            metadata = self._parse_metadata(metadata_raw)
             content = await self._decode_content(conversation, content, metadata)
             candidates.append(
                 RetrievedMemoryCandidate(
-                    message_id=int(msg_id),
+                    message_id=msg_id,
                     role=role,
                     content=content or "",
                     retrieved_at=retrieved_dt.isoformat(),
                     created_at=created_at,
                 )
             )
-            if len(candidates) >= _MAX_CANDIDATES:
-                break
-
-        candidates.sort(key=lambda item: item.retrieved_at)
         return candidates
 
     async def _decode_content(
@@ -470,31 +851,34 @@ class ReflectionSleepHook:
             logger.debug("Could not decrypt retrieved memory candidate")
             return content or ""
 
-    async def _session_context(self, agent, *, cutoff: datetime) -> str:
-        conversation = self._resolve_conversation(agent)
+    async def _retrieval_turn_context(
+        self,
+        conversation,
+        candidate: RetrievedMemoryCandidate,
+    ) -> str:
+        """The turn that retrieved ``candidate``, rendered for its judge.
 
-        if conversation is None or not hasattr(conversation, "get_conversation_history"):
+        A storage failure propagates and fails the pass, so the watermark
+        stays and the next sleep judges the memory with its turn. Judging it
+        here without one would move the watermark past it for good.
+        """
+        reader = getattr(conversation, "get_messages_around", None)
+        if reader is None:
             return ""
-
+        retrieved_second = datetime.fromisoformat(candidate.retrieved_at).replace(
+            microsecond=0
+        )
         try:
-            history = await conversation.get_conversation_history(
-                limit=_MAX_CONTEXT_MESSAGES
+            earlier, later = await reader(
+                retrieved_second,
+                before=_MAX_CONTEXT_MESSAGES,
+                after=_MAX_CONTEXT_MESSAGES,
             )
-        except Exception:  # noqa: BLE001
-            logger.debug("Could not load session context for memory attestation")
+        except DecryptionError:
+            # No key opens these rows, now or at the next sleep.
+            logger.debug("Could not decrypt the turn of a retrieved memory")
             return ""
-
-        lines: List[str] = []
-        for msg in history:
-            created_at = self._parse_datetime(msg.get("created_at"))
-            if created_at is not None and created_at < cutoff:
-                continue
-            role = msg.get("role", "unknown")
-            content = str(msg.get("content", "")).strip()
-            if content:
-                lines.append(f"{role}: {content}")
-        context = "\n".join(lines)
-        return context[-_MAX_CONTEXT_CHARS:]
+        return render_turn(retrieving_turn(earlier, later, retrieved_second))
 
     async def _attest_application(
         self,
@@ -522,9 +906,8 @@ class ReflectionSleepHook:
             '{"applied": true|false, "reason": "one sentence"}.'
         )
         # No ``session_id`` on purpose (#2940). This attestation runs in the
-        # sleep cycle, over every memory retrieved since a time cutoff — which
-        # can span several chat windows and belongs to none of them. Naming any
-        # one of them would file the span in a band it did not happen in, and
+        # sleep cycle, hours after the turn it judges. Naming that turn's chat
+        # window would file the span in a band it did not happen in, and
         # #2916's rule is that the attribute stays absent rather than wrong.
         # Privacy (#3497): ``generate`` does not read the live privacy state,
         # so a local-only mode must be passed.

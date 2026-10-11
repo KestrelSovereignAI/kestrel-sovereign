@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -128,28 +128,43 @@ async def test_storage_without_artifact_sweep_capability_skips_it_as_unconfigure
     assert report.error is None
 
 
+_REFLECTION_DID = "did:test:reflection-phase"
+
+
 class _ReflectionMemory:
-    def __init__(self, db):
-        self.storage = type("Storage", (), {"db": db})()
+    """A memory system over real storage, recording attestations."""
+
+    def __init__(self, storage):
+        self.storage = storage
         self.marked_ids = []
 
     async def mark_applied(self, message_id, *, reason):
         self.marked_ids.append((message_id, reason))
 
 
-class _ReflectionDb:
-    def __init__(self, rows):
-        self.rows = rows
+@pytest.fixture
+async def reflection_storage(tmp_path):
+    from kestrel_sovereign.storage import AsyncStorage
 
-    async def fetchall(self, query, params):
-        return self.rows
+    async with AsyncStorage(
+        str(tmp_path / "reflection.db"), agent_id=_REFLECTION_DID
+    ) as storage:
+        yield storage
 
 
-def _reflection_agent(hooks, rows=(), *, consolidation_result=None):
+async def _add_retrieved_memory(storage, content, *, retrieved_at):
+    await storage.conversation.add_conversation("assistant", content)
+    (row,) = await storage.conversation.get_full_history_with_ids()
+    await storage.conversation.update_message_metadata(
+        row["id"], {"access_count": 1, "last_accessed": retrieved_at.isoformat()}
+    )
+
+
+def _reflection_agent(storage, hooks, *, consolidation_result=None):
     agent = _Agent(hooks, consolidation_result=consolidation_result)
-    agent.agent_id = "did:test:reflection-phase"
-    agent.did = "did:test:reflection-phase"
-    agent.memory_system = _ReflectionMemory(_ReflectionDb(rows))
+    agent.agent_id = _REFLECTION_DID
+    agent.did = _REFLECTION_DID
+    agent.memory_system = _ReflectionMemory(storage)
     return agent
 
 
@@ -624,7 +639,9 @@ def test_reflection_hook_declares_knowledge_extraction_contract():
 
 
 @pytest.mark.asyncio
-async def test_reflection_post_boundary_allows_a_real_declared_dependent():
+async def test_reflection_post_boundary_allows_a_real_declared_dependent(
+    reflection_storage,
+):
     """Reflection's advertised identity is a satisfiable post-stage barrier."""
     from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
 
@@ -639,9 +656,9 @@ async def test_reflection_post_boundary_allows_a_real_declared_dependent():
         ),
     )
 
-    report = await _reflection_agent([semantic_hook, ReflectionSleepHook()]).sleep(
-        skip_export=True
-    )
+    report = await _reflection_agent(
+        reflection_storage, [semantic_hook, ReflectionSleepHook()]
+    ).sleep(skip_export=True)
 
     post_results = [
         result
@@ -667,6 +684,7 @@ async def test_reflection_post_boundary_allows_a_real_declared_dependent():
 async def test_unavailable_consolidation_never_dispatches_post_dependencies(
     consolidation_result,
     expected_reason,
+    reflection_storage,
 ):
     """Structured consolidation failures are not a post-hook data boundary."""
     from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
@@ -683,6 +701,7 @@ async def test_unavailable_consolidation_never_dispatches_post_dependencies(
     )
 
     report = await _reflection_agent(
+        reflection_storage,
         [semantic_hook, ReflectionSleepHook()],
         consolidation_result=consolidation_result,
     ).sleep(skip_export=True)
@@ -712,7 +731,9 @@ async def test_unavailable_consolidation_never_dispatches_post_dependencies(
 
 
 @pytest.mark.asyncio
-async def test_failed_reflection_pre_stage_blocks_its_post_dependent():
+async def test_failed_reflection_pre_stage_blocks_its_post_dependent(
+    reflection_storage,
+):
     """A real provider failure cannot be acknowledged by the post barrier."""
     from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
 
@@ -731,18 +752,13 @@ async def test_failed_reflection_pre_stage_blocks_its_post_dependent():
         ),
     )
 
-    recently_retrieved = datetime.now(timezone.utc).isoformat()
+    await _add_retrieved_memory(
+        reflection_storage,
+        "private memory content",
+        retrieved_at=datetime.now(timezone.utc) - timedelta(hours=3),
+    )
     report = await _reflection_agent(
-        [semantic_hook, _FailingReflectionSleepHook()],
-        rows=[
-            (
-                1,
-                "assistant",
-                "private memory content",
-                json.dumps({"last_accessed": recently_retrieved}),
-                recently_retrieved,
-            )
-        ],
+        reflection_storage, [semantic_hook, _FailingReflectionSleepHook()]
     ).sleep(skip_export=True)
 
     reflection = next(
@@ -809,16 +825,18 @@ async def test_skipped_reflection_pre_stage_blocks_its_post_dependent():
 
 
 @pytest.mark.asyncio
-async def test_overlapping_sleep_cycles_keep_reflection_attestations_cycle_scoped():
+async def test_overlapping_sleep_cycles_keep_reflection_attestations_cycle_scoped(
+    reflection_storage,
+):
     """A scheduled and manual sleep cannot consume each other's pre-stage result."""
     from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
 
     class _InterleavingAgent(_Agent):
         def __init__(self, hook):
             super().__init__([hook])
-            self.agent_id = "did:test:reflection-overlap"
-            self.did = "did:test:reflection-overlap"
-            self.memory_system = _ReflectionMemory(_ReflectionDb(()))
+            self.agent_id = _REFLECTION_DID
+            self.did = _REFLECTION_DID
+            self.memory_system = _ReflectionMemory(reflection_storage)
             self.first_consolidation_started = asyncio.Event()
             self.release_first_consolidation = asyncio.Event()
             self._consolidation_calls = 0
