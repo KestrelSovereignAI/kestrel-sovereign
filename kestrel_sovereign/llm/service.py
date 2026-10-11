@@ -13,12 +13,13 @@ import json
 import time
 import asyncio
 import inspect
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
+from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign.llm.retry import state_aggregate_verdicts
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
-from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
+from typing import AsyncIterator, Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
 
 import openai
 import httpx
@@ -296,6 +297,25 @@ class LLMServiceAlreadyAttachedError(LLMServiceError):
     invariant is now enforced at construction time so it cannot
     silently regress.
     """
+
+
+class MandateChangeInProgressError(LLMServiceError):
+    """Another caller is changing the model mandate (#3554).
+
+    A change that must not interleave with another holds
+    :meth:`LLMService.mandate_change`: a model selection, or a privacy-mode
+    transition from planning the mandate its new mode implies through
+    persisting it. Setting or clearing the mandate outside that change while it
+    is held is refused, rather than landing between the change's writes and
+    being overwritten by them. Hold :meth:`LLMService.mandate_change` to wait
+    for it instead.
+    """
+
+
+# The mandate change the running task holds; see ``LLMService.mandate_change``.
+_MANDATE_CHANGE_HELD: ContextVar[Optional[object]] = ContextVar(
+    "kestrel_mandate_change_held", default=None
+)
 
 
 class ModelNotAvailableForRoute(LLMError):
@@ -1890,11 +1910,45 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 zero matches (unknown model) or multiple matches (ambiguous);
                 or if an explicit ``{vendor, route, model}`` triple names a
                 route that is not configured, or a model not serveable on it.
+            MandateChangeInProgressError: if another caller holds
+                :meth:`mandate_change`.
         """
         if model == "auto":
             logger.debug("Ignoring model preference 'auto' — using default routing")
             return
 
+        self._refuse_mandate_change_held_elsewhere()
+        self._mandate_preference = self.resolve_model_preference(
+            model, vendor, route, validate=validate
+        )
+        vendor = self._mandate_preference["vendor"]
+        # A mandate is in effect again — clear any recorded boot-time drop so
+        # the health surface stops reporting a condition the operator fixed
+        # (#3190). Without this the warning is sticky for the process lifetime.
+        self._mandate_load_error = None
+        if route:
+            logger.info("Model preference set: %s:%s/%s", vendor, route, model)
+        else:
+            logger.info("Model preference set: %s/%s", vendor, model)
+
+        if self._preference_persistence_callback:
+            self._schedule_preference_persistence(model, vendor, route)
+
+    def resolve_model_preference(
+        self,
+        model: str,
+        vendor: Optional[str] = None,
+        route: Optional[str] = None,
+        *,
+        validate: bool = True,
+    ) -> Dict[str, Optional[str]]:
+        """Return the mandate :meth:`set_model_preference` would install.
+
+        Resolves and validates exactly as ``set_model_preference`` does, and
+        raises the same ``ValueError``, but installs and persists nothing. A
+        caller that must record a mandate durably before it takes effect
+        (a privacy-mode transition, #3554) resolves it here first.
+        """
         if vendor is None:
             resolved = self._resolve_vendor_for_model(model)
             if isinstance(resolved, list):
@@ -1928,18 +1982,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             if validate:
                 self._validate_explicit_mandate(model, vendor, route)
 
-        self._mandate_preference = {"vendor": vendor, "model": model, "route": route}
-        # A mandate is in effect again — clear any recorded boot-time drop so
-        # the health surface stops reporting a condition the operator fixed
-        # (#3190). Without this the warning is sticky for the process lifetime.
-        self._mandate_load_error = None
-        if route:
-            logger.info("Model preference set: %s:%s/%s", vendor, route, model)
-        else:
-            logger.info("Model preference set: %s/%s", vendor, model)
-
-        if self._preference_persistence_callback:
-            self._schedule_preference_persistence(model, vendor, route)
+        return {"vendor": vendor, "model": model, "route": route}
 
     def _validate_explicit_mandate(
         self,
@@ -2080,7 +2123,12 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         return vendors
 
     def clear_model_preference(self) -> None:
-        """Clear any mandated model preference, returning to default behavior."""
+        """Clear any mandated model preference, returning to default behavior.
+
+        Raises ``MandateChangeInProgressError`` if another caller holds
+        :meth:`mandate_change`.
+        """
+        self._refuse_mandate_change_held_elsewhere()
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
         # Returning to automatic routing is a DELIBERATE unpinned state, so the
         # boot-failure notice must go with it (#3190 r3 P2). Only the set path
@@ -2137,6 +2185,79 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         if error is not None and is_execution_control_error(error):
             self._preference_persistence_control = execution_terminal_error(
                 getattr(self, "_preference_persistence_control", None), error,
+            )
+
+    def _get_mandate_lock(self) -> asyncio.Lock:
+        """The lock :meth:`mandate_change` holds, created on first use.
+
+        Lazily, like ``_response_identity_state``: lightweight test hosts build
+        the service without ``__init__``.
+        """
+        lock = getattr(self, "_mandate_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._mandate_lock = lock
+        return lock
+
+    def _held_mandate_change(self) -> Optional[object]:
+        """The mandate change in progress, or None when none is."""
+        return getattr(self, "_mandate_change_holder", None)
+
+    @asynccontextmanager
+    async def mandate_change(self) -> AsyncIterator[None]:
+        """Hold the model mandate for one change, from planning to persistence.
+
+        A model selection holds it around setting the mandate, and a privacy
+        transition around planning the mandate its new mode implies, recording
+        it durably and installing it (#3554). Changes therefore never
+        interleave: one that landed between another's writes would be
+        overwritten by them, leaving the live mandate and the persisted one
+        apart until a restart brought back the stale one.
+
+        A change begins only once every persistence write scheduled before it
+        has landed, the previous change's included, so none of them lands
+        inside it. Cancellation does not cut that wait short: it is raised
+        once the writes have landed, before the change begins. While it is
+        held, :meth:`set_model_preference` and :meth:`clear_model_preference`
+        refuse any caller outside it. Not reentrant: the task holding it that
+        asks again is a bug, and raises rather than waiting on itself; a task
+        it started waits like any other.
+        """
+        task = asyncio.current_task()
+        if task is not None and getattr(self, "_mandate_change_task", None) is task:
+            raise RuntimeError("LLMService.mandate_change() is not reentrant")
+        async with self._get_mandate_lock():
+            holder = object()
+            self._mandate_change_holder = holder
+            self._mandate_change_task = task
+            token = _MANDATE_CHANGE_HELD.set(holder)
+            try:
+                await self._settle_preference_persistence()
+                yield
+            finally:
+                self._mandate_change_holder = None
+                self._mandate_change_task = None
+                _MANDATE_CHANGE_HELD.reset(token)
+
+    async def _settle_preference_persistence(self) -> None:
+        """Wait until every scheduled preference write has landed.
+
+        :meth:`drain_preference_persistence`, owned: cancelling the caller
+        neither cancels the writes nor ends the wait, and is raised once they
+        have landed.
+        """
+        drain = asyncio.ensure_future(self.drain_preference_persistence())
+        raise_owned_outcome(
+            await await_owned_task(drain), operation="model preference persistence"
+        )
+
+    def _refuse_mandate_change_held_elsewhere(self) -> None:
+        """Refuse a mandate change made outside the one in progress, if any."""
+        held = self._held_mandate_change()
+        if held is not None and _MANDATE_CHANGE_HELD.get() is not held:
+            raise MandateChangeInProgressError(
+                "The model mandate is being changed by a model selection or a "
+                "privacy-mode transition; retry once it completes."
             )
 
     async def drain_preference_persistence(self, *, cancel: bool = False) -> None:

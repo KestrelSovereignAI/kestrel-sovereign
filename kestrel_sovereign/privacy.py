@@ -18,9 +18,11 @@ __all__ = [
     "PrivacyMode",
     "PrivacyConfig",
     "PRIVACY_PRESETS",
+    "PRIVACY_MODES_MOST_RESTRICTIVE_FIRST",
     "get_privacy_preset",
     "privacy_mode_to_config",
     "privacy_config_to_mode",
+    "most_restrictive_privacy_mode",
 ]
 
 
@@ -146,6 +148,29 @@ PRIVACY_PRESETS: Dict[str, PrivacyConfig] = {
         audit="required",
     ),
 }
+
+
+# Every mode, ordered by how little it lets leave the turn: nothing stored, then
+# temporary storage, then de-identified storage (no conversation rows until
+# Safe Harbor evidence exists), then PII-redacted storage, then full storage,
+# then full storage that may be shared. A choice between modes that has to fail
+# closed (a privacy record that cannot be read, or one left mid-transition)
+# takes the earliest.
+PRIVACY_MODES_MOST_RESTRICTIVE_FIRST: tuple[PrivacyMode, ...] = (
+    PrivacyMode.EPHEMERAL,
+    PrivacyMode.ISOLATED,
+    PrivacyMode.DEIDENTIFIED,
+    PrivacyMode.ANONYMOUS,
+    PrivacyMode.NORMAL,
+    PrivacyMode.PUBLIC,
+)
+
+
+def most_restrictive_privacy_mode(*modes: PrivacyMode) -> PrivacyMode:
+    """Return the most restrictive of ``modes``."""
+    if not modes:
+        raise ValueError("most_restrictive_privacy_mode needs at least one mode")
+    return min(modes, key=PRIVACY_MODES_MOST_RESTRICTIVE_FIRST.index)
 
 
 def get_privacy_preset(name: str) -> PrivacyConfig:
