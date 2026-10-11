@@ -85,6 +85,11 @@ Shutdown retires that local lifetime before yielding. It never retires borrowed
 tenant/shared-backend custody; multi-tenant hosts must supply their own native
 generation factory. Provider construction validates and binds the original
 custody first, and manager-supplied services reuse native agent usage storage.
+Both AgentManager and the no-manifest single-agent startup branch supply this
+original lifetime before provider construction. Failed single-agent startup
+retires it before awaiting the owned LLM-service close, including cancellation;
+SQLite startup remains unbound. Native startup regressions exercise this
+production selection rather than injecting an agent's custody afterward.
 
 The mandatory EPHEMERAL shutdown sweep has a fixed native cleanup entry point
 for that original retired standalone process only. It checks the canonical

@@ -3597,6 +3597,7 @@ async def _lifespan_startup(app: FastAPI):
         # --- Single-agent mode (original behavior) ---
         app.state.agent_manager = None
         llm_service = None
+        execution_custody = None
         try:
             db_backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite")
             database_url = os.environ.get("KESTREL_DATABASE_URL")
@@ -3620,7 +3621,17 @@ async def _lifespan_startup(app: FastAPI):
             verify_identity_isolation(agent_did)
             host_context = await _build_host_control_context(app, None)
 
-            llm_service = LLMService()
+            execution_custody = _standalone_runtime_execution_custody(
+                "default", agent_did, None,
+            )
+            from kestrel_sovereign.execution_custody import bind_execution_custody_snapshot
+
+            captured = () if execution_custody is None else (execution_custody,)
+            # Single-agent mode owns the same original process lifetime as
+            # AgentManager. Validate it and ambient admission before clients
+            # can be constructed; the agent retains this exact object.
+            with bind_execution_custody_snapshot(captured):
+                llm_service = LLMService()
             if db_backend.lower() == "postgres" and database_url:
                 app.state.agent = KestrelAgent(
                     did=agent_did,
@@ -3628,6 +3639,7 @@ async def _lifespan_startup(app: FastAPI):
                     llm_service=llm_service,
                     database_url=database_url,
                     db_backend="postgres",
+                    execution_custody=execution_custody,
                 )
             else:
                 app.state.agent = KestrelAgent(
@@ -3652,8 +3664,26 @@ async def _lifespan_startup(app: FastAPI):
             # the multi-agent AgentManager path above — gets the same check.
             await app.state.agent.initialize()
             logger.info(f"Kestrel Agent initialized and ready (backend: {db_backend})")
-        except Exception as e:
+        except BaseException as e:
+            from kestrel_sovereign.execution_custody import retire_process_runtime_custody
+
+            # Failed birth must deny surviving provider children BEFORE the
+            # first cleanup await, including cancellation during initialize.
+            retire_process_runtime_custody(execution_custody)
             app.state.agent = None
+            cleanup_cancelled = False
+            if llm_service is not None:
+                close_task = asyncio.create_task(
+                    llm_service.close(), name="server_startup:close_single_llm",
+                )
+                cleanup_cancelled, close_error = await await_lifecycle_task_completion(close_task)
+                if close_error is not None:
+                    logger.warning(
+                        "Could not close LLM service after failed single-agent startup (cause_type=%s)",
+                        type(close_error).__name__,
+                    )
+            if not isinstance(e, Exception):
+                raise
             mandatory_record = _mandatory_feature_failure_record("default", e)
             identity_record = _identity_readiness_failure_record("default", e)
             if identity_record is not None:
@@ -3664,20 +3694,13 @@ async def _lifespan_startup(app: FastAPI):
                     identity_record["cause_type"],
                 )
                 app.state.identity_readiness_failures = [identity_record]
-                if llm_service is not None:
-                    try:
-                        await llm_service.close()
-                    except Exception as close_error:  # noqa: BLE001
-                        logger.warning(
-                            "Could not close LLM service after blocked identity "
-                            "startup (cause_type=%s)",
-                            type(close_error).__name__,
-                        )
             else:
                 logger.error(f"Error during startup: {e}", exc_info=True)
             if mandatory_record is not None:
                 app.state.mandatory_feature_failures = [mandatory_record]
             _set_startup_error(app, e)
+            if cleanup_cancelled:
+                raise asyncio.CancelledError()
 
     # Per-feature static asset mounts (#2043). Done BEFORE router mounting so the
     # feature routers stay the trailing block _unmount_feature_routers deletes.
