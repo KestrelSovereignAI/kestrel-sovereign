@@ -14,7 +14,8 @@ from tests.unit.test_private_inference_routing import _Host, _lease, _touch_curr
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["none", "unknown", "cancel_unknown", "group"])
-async def test_cancelled_rotation_retires_unpublished_native_client(monkeypatch, kind):
+@pytest.mark.parametrize("boundary", ["publication_lock", "drain"])
+async def test_cancelled_rotation_retires_unpublished_native_client(monkeypatch, kind, boundary):
     host = _Host()
     entered, release, built = asyncio.Event(), asyncio.Event(), asyncio.Event()
     clients, closes = [], []
@@ -58,21 +59,40 @@ async def test_cancelled_rotation_retires_unpublished_native_client(monkeypatch,
                 model="local", messages=[{"role": "user", "content": "offline"}])
 
     owner = asyncio.create_task(invoke())
-    rotation = None
+    rotation = contender = None
+    held, release_lock = asyncio.Event(), asyncio.Event()
+
+    async def contend():
+        async with host._remote_route_condition:
+            held.set()
+            await release_lock.wait()
+
     try:
         await asyncio.wait_for(entered.wait(), 5)
         rotated = replace(lease, route=replace(
             lease.route, endpoint=SecretStr("https://rotated.invalid/v1")))
+        if boundary == "publication_lock":
+            await host._remote_route_condition.acquire()
         rotation = asyncio.create_task(host.activate_inference_lease(
             rotated, capabilities=("chat",), touch_lease=_touch_current(host)))
+        if boundary == "publication_lock":
+            # Queue the real lock owners in FIFO order: activation's initial
+            # check, then the contender, then activation's publication check.
+            await asyncio.sleep(0)
+            contender = asyncio.create_task(contend())
+            await asyncio.sleep(0)
+            host._remote_route_condition.release()
+            await asyncio.wait_for(held.wait(), 5)
         await asyncio.wait_for(built.wait(), 5)
-        assert not host._remote_accepting and host._remote_inflight == 1
+        assert host._remote_accepting is (boundary == "publication_lock")
+        assert host._remote_inflight == 1
         rotation.cancel("original rotation caller cancellation")
         outcome = await await_owned_task(rotation)
         assert clients[1][1].is_closed, "cancelled activation leaked its unpublished native client"
         assert closes == [1]
         assert not clients[0][1].is_closed, "rotation retired the pinned old client early"
-        assert host._remote_client is clients[0][0] and not host._remote_accepting
+        assert host._remote_client is clients[0][0]
+        assert host._remote_accepting is (boundary == "publication_lock")
         if failure is None:
             assert isinstance(outcome.error, asyncio.CancelledError)
         else:
@@ -81,6 +101,9 @@ async def test_cancelled_rotation_retires_unpublished_native_client(monkeypatch,
                 host._close_remote_client(clients[1][0], lease_id=lease.lease_id)))
             assert repeated.error is failure and closes == [1]
     finally:
+        release_lock.set()
+        if contender is not None:
+            await await_owned_task(contender)
         release.set()
         await await_owned_task(owner)
         if rotation is not None:

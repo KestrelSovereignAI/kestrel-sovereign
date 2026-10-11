@@ -406,7 +406,8 @@ ordinary providers; uncertain close is retained, never recreated on a retry.
 Cancellation while acquiring the publication lock or draining the prior route
 physically retires the newly constructed, unpublished client through that same
 registry before reporting the original strongest receipt. The pinned old route
-remains owned and fail-closed; cancellation never certifies its release.
+remains owned, and a started drain stays fail-closed; cancellation never
+certifies its release or silently re-arms it.
 
 Durable owner-heartbeat failure re-arms bounded cleanup liveness even before a
 late cognition owner or terminalization debt is installed. Re-arm retains the
