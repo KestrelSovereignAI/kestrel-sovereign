@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import pytest_asyncio
+from anthropic.types import Message as AnthropicMessage
 from kestrel_sdk.llm import (
     InferenceLease,
     InferenceLeaseState,
@@ -22,7 +23,8 @@ from kestrel_sdk.llm import (
 from pydantic import BaseModel, SecretStr
 
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
-from kestrel_sovereign.llm.output_ceiling import attach_stop_reason
+from kestrel_sovereign.llm.claude_max_adapter import ClaudeMaxAdapter
+from kestrel_sovereign.llm.output_ceiling import attach_stop_reason, response_stop_reason
 from kestrel_sovereign.llm.error_handling import (
     LLMAllProvidersFailedError,
     LLMProviderError,
@@ -34,6 +36,11 @@ from kestrel_sovereign.llm.service import (
     LLMService,
     LLMServiceError,
 )
+from kestrel_sovereign.storage.memory_answerability import (
+    AnswerabilityCandidate,
+    LLMAnswerabilityGate,
+)
+from tests.utils.anthropic_client import anthropic_client
 
 
 def _ready_remote_lease(*, expired: bool = False) -> InferenceLease:
@@ -1373,6 +1380,82 @@ class TestCoreGeneration:
         assert isinstance(response, str)
 
     @pytest.mark.asyncio
+    async def test_generate_return_response_keeps_the_routes_response(
+        self, llm_service, mock_adapter
+    ):
+        """#3436: a plain text call can keep the route's usage and stop
+        reason; without the flag it still returns only the text."""
+        text = await llm_service.generate(system_prompt="s", user_prompt="u")
+        response = await llm_service.generate(
+            system_prompt="s", user_prompt="u", return_response=True
+        )
+
+        assert text == "Hello! How can I help you?"
+        assert isinstance(response, LLMResponse)
+        assert response.content == text
+        assert response.output_tokens == 8
+        assert response_stop_reason(response) == "stop"
+        assert response.provider == "openai:api"
+        assert mock_adapter.get_response.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_answerability_judge_reads_a_reasoned_claude_reply_end_to_end(
+        self, llm_service, mock_adapter
+    ):
+        """#3436 regression through the real adapter, service and gate.
+
+        The message is a live ``anthropic:plan`` reply captured for the
+        shipped ``dentist-not-doctor`` case: a redacted thinking block, then
+        the model's reasoning, then its verdict. The gate failed it closed
+        ("invalid JSON: Expecting value: line 1 column 1") although the verdict
+        reached the gate intact.
+        """
+        reply = (
+            "The question asks for the identity of the user's doctor. \n\n"
+            "- c0 names a dentist, Dr. Lindqvist. A dentist is a different kind "
+            "of provider from a general doctor, so this is a different "
+            "attribute and doesn't answer the question.\n"
+            "- c1 mentions needing a physical, but it names no doctor.\n"
+            "- c2 mentions a clinic reminder, but it names no doctor.\n\n"
+            "None of the candidates identifies the user's doctor.\n\n"
+            '{"answerable_ids":[]}'
+        )
+        message = AnthropicMessage.model_validate({
+            "id": "msg_3436",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-5-5",
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "c2lnbmF0dXJl"},
+                {"type": "text", "text": reply, "citations": None},
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 569, "output_tokens": 154},
+        })
+        claude_client = anthropic_client(message)
+        plan = ClaudeMaxAdapter()
+
+        async def plan_route(**kwargs):
+            return await plan.get_response(**{**kwargs, "client": claude_client})
+
+        mock_adapter.get_response = AsyncMock(side_effect=plan_route)
+        gate = LLMAnswerabilityGate(llm_service, force_local_only_provider=lambda: False)
+
+        decision = await gate.filter(
+            "Who is my doctor?",
+            [
+                AnswerabilityCandidate("dentist", "My dentist is Dr. Lindqvist."),
+                AnswerabilityCandidate("physical", "I need a physical before the marathon."),
+                AnswerabilityCandidate("clinic", "The clinic sent a reminder."),
+            ],
+        )
+
+        assert decision.completed is True, decision.reason
+        assert decision.answerable_ids == frozenset()
+        claude_client.messages.stream.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_generate_with_messages(self, llm_service):
         """Test generate_with_messages for multi-turn conversations."""
         messages = [
@@ -2312,6 +2395,24 @@ class TestInvocationBoundary:
 
         finalizer.assert_awaited_once()
         assert finalizer.await_args.kwargs["path"] == expected_path
+
+    @pytest.mark.asyncio
+    async def test_remote_generate_return_response_keeps_the_routes_response(
+        self, llm_service
+    ):
+        """#3436: the remote route honours ``return_response`` as the provider
+        chain does."""
+        response = _finished(LLMResponse(content="remote answer", output_tokens=9))
+        self._activate_fake_remote(llm_service, response)
+
+        text = await llm_service.generate(system_prompt="s", user_prompt="u")
+        full = await llm_service.generate(
+            system_prompt="s", user_prompt="u", return_response=True
+        )
+
+        assert text == "remote answer"
+        assert full is response
+        assert response_stop_reason(full) == "stop"
 
     @pytest.mark.asyncio
     async def test_remote_prompt_success_records_complete_telemetry_once(

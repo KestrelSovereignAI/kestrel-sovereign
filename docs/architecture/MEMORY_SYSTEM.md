@@ -492,7 +492,11 @@ local-only privacy mode forces the judge onto a local route; cloud processing is
 used only when the active privacy policy already permits cloud LLM calls. The
 gate creates no new persisted copy of the query or candidates. Candidate text
 is framed as untrusted quoted data, outputs may reference only opaque candidate
-labels, and malformed/unknown labels fail closed.
+labels, and malformed/unknown labels fail closed. A judge may reason before its
+verdict: the verdict is the `answerable_ids` object that ends the reply, and a
+reply with text after it, or with none, fails closed (#3436). A rejected
+reply's reason (`empty_response` or `invalid_response`) names its length,
+output tokens, stop reason and route, never its text.
 
 This is an inline, turn-critical call: measured qualified local judges add
 roughly 4–9 seconds on this host, and cloud models may add cost on every
