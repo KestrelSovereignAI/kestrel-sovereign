@@ -11,12 +11,13 @@ The ruling: in the direct-tool dispatcher, drop ``task``/``context`` when the
 tool's schema does not accept them, and refuse any other argument it does not
 accept with an error that lists the tool's parameters and suggests a close
 match. A misspelt argument is never dropped, because that would run the tool
-with a default. "Accepts" is the schema's own answer, not membership of
-``properties``: an MCP schema that leaves ``additionalProperties`` open, or
-whose ``patternProperties`` match the name, accepts ``task``/``context`` as
-tool data, and they reach the tool unchanged. An isolated feature's tool is
-judged by the schema its service advertised, not by the parameter list
-derived from it, which keeps only ``properties``.
+with a default. Nor is a call ``task``/``context`` would leave incomplete
+when dropped (#3571, at the end of this file). "Accepts" is the schema's own
+answer, not membership of ``properties``: an MCP schema that leaves
+``additionalProperties`` open, or whose ``patternProperties`` match the name,
+accepts ``task``/``context`` as tool data, and they reach the tool unchanged.
+An isolated feature's tool is judged by the schema its service advertised, not
+by the parameter list derived from it, which keeps only ``properties``.
 
 Both direct-tool paths are driven: the chat loop's ``_dispatch_direct_tool``
 and ``execute_named_tool``, which the codex inline executor uses. The shell
@@ -32,6 +33,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from kestrel_sdk.features.base import Feature as SdkFeature, tool as sdk_tool
 from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
 from kestrel_sdk.isolated_feature import ToolMetadata
 from kestrel_sdk.tools.base import ToolCategory, ToolParameter, ToolSchema
@@ -1020,3 +1022,231 @@ async def test_an_unpromoted_tool_refuses_an_unknown_argument(chat_agent):
     assert tool.calls == []
     assert "Valid parameters: owner, repo, pull_number." in messages[-1]["content"]
     assert [row["action"] for row in chat_agent.audit.rows] == [ACTION_TOOL_VALIDATION]
+
+
+# --- a call whose request rode in task/context (#3571) --------------------------
+#
+# Emma's audit log showed GitHub tools running with no arguments and failing
+# ``GitHubFeature.get_github_issue_comments() missing 1 required positional
+# argument: 'issue_number'``. Her own records place the loss: the model's tool
+# call (``a2a_llm_calls``) and the dispatch row (``a2a_tool_dispatches``)
+# both carry the arguments below, so neither the provider nor the adapter
+# lost them. The promoted tool takes neither name, the #3396 rule dropped
+# both, and the tool ran with ``{}``. All 14 empty rows since 10-08 were
+# such calls. The tool's error then named a parameter the call had named
+# too, so the model was told it was missing without being told why.
+
+#: ``a2a_tool_dispatches`` row 9233, 2026-10-10T21:29:30Z, verbatim.
+EMMA_GET_COMMENTS_CALL = {
+    "task": (
+        "Get comments on issue #3552 in KestrelSovereignAI/kestrel-sovereign "
+        "(issue_number=3552), latest comments."
+    ),
+    "context": "repo=KestrelSovereignAI/kestrel-sovereign issue_number=3552",
+}
+
+EMMA_GET_COMMENTS_ERROR = (
+    "get_github_issue_comments is missing required argument 'issue_number'. "
+    "It does not accept 'task' or 'context', so what they described was not "
+    "passed: send each value as its own parameter. "
+    "Valid parameters: issue_number, repo, max_results."
+)
+
+
+class _GitHubIssueFeature(SdkFeature):
+    """Built on the SDK base with kestrel-feature-github 0.2.0's signature,
+    so the schema and the wrapper the dispatcher calls are the real ones."""
+
+    tool_name = "github"
+    tool_description = "GitHub issues"
+
+    def __init__(self, agent=None):
+        super().__init__(agent)
+        self.enabled = True
+        self.calls: list[dict] = []
+
+    async def initialize(self) -> None:
+        return None
+
+    @sdk_tool(
+        name="get_github_issue_comments",
+        description="Get comments on an issue.",
+        category=ToolCategory.DATA_ACCESS,
+    )
+    async def get_github_issue_comments(
+        self, issue_number: int, repo: str = "self", max_results: int = 30
+    ) -> dict:
+        self.calls.append(
+            {"issue_number": issue_number, "repo": repo, "max_results": max_results}
+        )
+        return {"comments": []}
+
+
+def _comments_tool(feature: _GitHubIssueFeature):
+    [tool] = feature.get_tools()
+    return tool
+
+
+def test_a_call_carried_in_task_and_context_names_the_missing_parameter():
+    tool = _comments_tool(_GitHubIssueFeature())
+
+    args, error = normalize_direct_tool_arguments(
+        tool.name, tool, EMMA_GET_COMMENTS_CALL
+    )
+
+    assert error == EMMA_GET_COMMENTS_ERROR
+    # Refused, not dropped: the caller gets back exactly what it sent.
+    assert args is EMMA_GET_COMMENTS_CALL
+
+
+def test_a_required_parameter_the_drop_leaves_missing_is_refused():
+    tool = _comments_tool(_GitHubIssueFeature())
+
+    _, error = normalize_direct_tool_arguments(
+        tool.name, tool, {"repo": "o/r", "task": "comments on issue 3552"}
+    )
+
+    assert error == (
+        "get_github_issue_comments is missing required argument 'issue_number'. "
+        "It does not accept 'task', so what it described was not passed: send "
+        "each value as its own parameter. "
+        "Valid parameters: issue_number, repo, max_results."
+    )
+
+
+def test_task_beside_every_required_parameter_is_still_dropped():
+    tool = _comments_tool(_GitHubIssueFeature())
+
+    args, error = normalize_direct_tool_arguments(
+        tool.name, tool, {"issue_number": 3552, **EMMA_GET_COMMENTS_CALL}
+    )
+
+    assert (args, error) == ({"issue_number": 3552}, None)
+
+
+def test_task_alone_does_not_run_a_tool_on_its_defaults():
+    """``a2a_tool_dispatches`` row 8925: ``git_log`` called with only
+    ``task="git log max_count=3 in repo_path <worktree>"`` reported success,
+    with the log of the default repository. Nothing it takes is required, so
+    only "nothing else was supplied" can tell that call from a real one."""
+    tool = _SchemaTool("git_log", "max_count", "repo_path")
+
+    supplied = {"task": "git log max_count=3 in repo_path /tmp/issue-50"}
+    args, error = normalize_direct_tool_arguments(tool.name, tool, supplied)
+
+    assert error == (
+        "git_log does not accept 'task', so what it described was not passed: "
+        "send each value as its own parameter, or call git_log with no "
+        "arguments for its defaults. Valid parameters: max_count, repo_path."
+    )
+    assert args is supplied
+    assert normalize_direct_tool_arguments(tool.name, tool, {}) == ({}, None)
+
+
+def test_a_closed_json_schema_names_what_it_requires():
+    tool = _JsonSchemaTool(
+        "mcp__api__call",
+        {
+            "properties": {"path": {"type": "string"}},
+            "patternProperties": {"^x-": {"type": "string"}},
+            # A name a server lists twice is still named once.
+            "required": ["path", "x-id", "x-id"],
+            "additionalProperties": False,
+        },
+    )
+
+    _, error = normalize_direct_tool_arguments(
+        tool.name, tool, {"path": "/", "context": "x-id is 7"}
+    )
+
+    assert error == (
+        "mcp__api__call is missing required argument 'x-id'. It does not accept "
+        "'context', so what it described was not passed: send each value as its "
+        "own parameter. Valid parameters: path, x-id."
+    )
+
+
+@pytest.mark.parametrize("required", ["url", [1], {"url": True}, None])
+def test_an_unreadable_required_list_refuses_nothing(required):
+    tool = _JsonSchemaTool(
+        "mcp__fetch__fetch",
+        _object_schema(additionalProperties=False, required=required),
+    )
+
+    assert normalize_direct_tool_arguments(
+        tool.name, tool, {"url": "u", "context": "c"}
+    ) == ({"url": "u"}, None)
+
+
+def test_an_isolated_tool_is_held_to_its_advertised_required_list():
+    tool = _isolated_tool(
+        _object_schema(additionalProperties=False, required=["url"])
+    )
+
+    _, error = normalize_direct_tool_arguments(
+        tool.name, tool, {"task": "fetch https://example.com"}
+    )
+
+    assert error.startswith("fetch_page is missing required argument 'url'.")
+
+
+@pytest.mark.asyncio
+async def test_emmas_call_reaches_the_model_as_a_correctable_refusal(chat_agent):
+    """The whole chat loop with a real SDK feature tool, promoted the way an
+    explored feature's tools are."""
+    feature = _GitHubIssueFeature(chat_agent)
+    chat_agent.features["GitHubFeature"] = feature
+    chat_agent.register_dynamic_tools("github", feature.get_tools())
+
+    result, messages = await _chat_dispatch(
+        chat_agent, "get_github_issue_comments", dict(EMMA_GET_COMMENTS_CALL)
+    )
+
+    assert result == {"success": False, "error": EMMA_GET_COMMENTS_ERROR}
+    assert feature.calls == []
+    assert chat_agent.hooks_manager.pre_calls == []
+    assert EMMA_GET_COMMENTS_ERROR in messages[-1]["content"]
+    # The audit row records what the model sent, where it used to record an
+    # empty argument summary.
+    [row] = chat_agent.audit.rows
+    assert row["action"] == ACTION_TOOL_VALIDATION
+    assert row["tool_name"] == "get_github_issue_comments"
+    assert EMMA_GET_COMMENTS_ERROR in row["args_summary"]
+    assert "issue_number=3552" in row["args_summary"]
+
+    # The retry the refusal asks for runs.
+    result, _ = await _chat_dispatch(
+        chat_agent,
+        "get_github_issue_comments",
+        {"repo": "KestrelSovereignAI/kestrel-sovereign", "issue_number": 3552},
+    )
+
+    assert result["success"] is True
+    assert feature.calls == [
+        {
+            "issue_number": 3552,
+            "repo": "KestrelSovereignAI/kestrel-sovereign",
+            "max_results": 30,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_emmas_call_is_refused_on_the_inline_executor_path():
+    feature = _GitHubIssueFeature()
+    agent = _Orchestrator(features={"GitHubFeature": feature})
+
+    result = await agent.execute_named_tool(
+        "get_github_issue_comments",
+        dict(EMMA_GET_COMMENTS_CALL),
+        session_id="s-3571",
+        source="codex_app_server",
+    )
+
+    assert result == {
+        "success": False,
+        "error": f"Invalid tool arguments: {EMMA_GET_COMMENTS_ERROR}",
+    }
+    assert feature.calls == []
+    assert agent.hooks_manager.pre_calls == []
+    assert [row["action"] for row in agent.audit.rows] == [ACTION_TOOL_VALIDATION]

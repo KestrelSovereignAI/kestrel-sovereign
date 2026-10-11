@@ -13,8 +13,16 @@ Every direct-tool dispatch path applies these rules, here and nowhere else.
 An argument the tool's schema accepts always passes through unchanged. For
 an argument it does not accept:
 
-* ``task`` and ``context`` are dropped. They are orchestration arguments,
-  not data.
+* ``task`` and ``context`` are dropped when the call also carries what the
+  tool needs. They are orchestration arguments, not data.
+* A call they would leave incomplete is refused instead (#3571): one that
+  supplies a parameter-taking tool nothing else, or one missing a required
+  parameter. Callers write the request itself into them
+  (``get_github_issue_comments(context="issue_number=3552")``), so dropping
+  them ran the tool without it: a required parameter failed as missing although
+  the call had named it, and an optional one silently took its default
+  (``git_log`` read the wrong repository). The error names the missing
+  required parameters and the tool's parameters.
 * Any other name refuses the call, with an error naming the tool's
   parameters and the nearest one when a close match exists. It is never
   dropped: a misspelt argument must not run the tool with a default.
@@ -38,7 +46,9 @@ tool's job. A tool carries its original schema in one of two places:
 Only a tool with no original schema is judged by its ``ToolSchema`` parameter
 list, and that list is closed: it is generated from a native ``@tool``
 method's signature, which takes nothing else. A tool with neither is passed
-its arguments unchanged, because nothing says what it accepts.
+its arguments unchanged, because nothing says what it accepts. Which
+parameters are required comes from the same place: a JSON Schema's
+``required`` list, or each listed parameter's ``required`` flag.
 
 A server's pattern is never run as a regular expression: ``(?:x?){4000000000}``
 exhausts memory matching even ``task``, and ``^(a+)+$`` backtracks for
@@ -60,7 +70,8 @@ from typing import Any, Dict, FrozenSet, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 #: Orchestration arguments a feature's subagent dispatcher takes. A direct
-#: tool whose schema does not accept one has it dropped rather than refused.
+#: tool whose schema does not accept one has it dropped rather than refused,
+#: unless dropping it would leave the call incomplete.
 GENERIC_ORCHESTRATION_ARGUMENTS = frozenset({"task", "context"})
 
 # Argument names come from the model and are echoed back to it, so a
@@ -88,6 +99,8 @@ class _DeclaredParameters:
     #: The names accepted beyond ``names``: ``None`` accepts every name;
     #: otherwise the ``patternProperties`` patterns that admit one.
     patterns: Optional[Tuple[str, ...]]
+    #: The names a call must supply.
+    required: Tuple[str, ...]
     _listed: FrozenSet[str] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -150,17 +163,32 @@ def _pattern_properties(pattern_properties: Any) -> Optional[Tuple[str, ...]]:
     return patterns
 
 
+def _json_schema_required(required: Any) -> Tuple[str, ...]:
+    """A JSON-Schema object's ``required`` names.
+
+    Empty when they cannot be read: nothing is then refused on their account,
+    and the tool reports what it is missing itself.
+    """
+    if not isinstance(required, (list, tuple)):
+        return ()
+    if not all(isinstance(name, str) for name in required):
+        return ()
+    return tuple(required)
+
+
 def _json_schema_parameters(schema: Dict[str, Any]) -> Optional[_DeclaredParameters]:
     """The names a JSON-Schema object accepts, or ``None`` when unknowable."""
     properties = schema.get("properties")
     names = tuple(properties) if isinstance(properties, dict) else ()
     if not all(isinstance(name, str) for name in names):
         return None
+    required = _json_schema_required(schema.get("required"))
     if schema.get("additionalProperties") is not False:
-        return _DeclaredParameters(names=names, patterns=None)
+        return _DeclaredParameters(names=names, patterns=None, required=required)
     return _DeclaredParameters(
         names=names,
         patterns=_pattern_properties(schema.get("patternProperties")),
+        required=required,
     )
 
 
@@ -190,7 +218,13 @@ def _declared_parameters(tool: Any) -> Optional[_DeclaredParameters]:
         names = tuple(getattr(parameter, "name", None) for parameter in parameters)
         if not all(isinstance(name, str) for name in names):
             return None
-        return _DeclaredParameters(names=names, patterns=())
+        # ``is True``: a test double answers every attribute with a truthy mock.
+        required = tuple(
+            parameter.name
+            for parameter in parameters
+            if getattr(parameter, "required", False) is True
+        )
+        return _DeclaredParameters(names=names, patterns=(), required=required)
     if isinstance(parameters, dict):
         return _json_schema_parameters(parameters)
     return None
@@ -248,6 +282,41 @@ def _unknown_arguments_error(
     )
 
 
+def _incomplete_call_error(
+    tool_name: str,
+    dropped: Sequence[str],
+    kept: Dict[str, Any],
+    declared: _DeclaredParameters,
+) -> Optional[str]:
+    """Why the call would be incomplete without ``dropped``, or ``None``.
+
+    Incomplete means a required parameter is missing, or a tool that takes
+    parameters would get none.
+    """
+    missing = [name for name in dict.fromkeys(declared.required) if name not in kept]
+    if not missing and (kept or not declared.names):
+        return None
+    dropped_names = " or ".join(repr(name) for name in dropped)
+    described = "what it described" if len(dropped) == 1 else "what they described"
+    # A JSON Schema may require a name its ``properties`` do not list. Never
+    # empty here: something is missing, or the tool lists parameters.
+    valid = ", ".join(dict.fromkeys(declared.names + declared.required))
+    if missing:
+        noun = "argument" if len(missing) == 1 else "arguments"
+        return (
+            f"{tool_name} is missing required {noun} "
+            f"{', '.join(repr(name) for name in missing)}. "
+            f"It does not accept {dropped_names}, so {described} was not "
+            f"passed: send each value as its own parameter. "
+            f"Valid parameters: {valid}."
+        )
+    return (
+        f"{tool_name} does not accept {dropped_names}, so {described} was not "
+        f"passed: send each value as its own parameter, or call {tool_name} "
+        f"with no arguments for its defaults. Valid parameters: {valid}."
+    )
+
+
 def normalize_direct_tool_arguments(
     tool_name: str,
     tool: Any,
@@ -258,8 +327,9 @@ def normalize_direct_tool_arguments(
     Returns:
         ``(arguments, error)``. ``error`` is ``None`` when the call may run
         with the returned arguments; otherwise it names the arguments the
-        schema does not accept and the tool's parameters, and the call must
-        not run.
+        schema does not accept or the call is missing, and the tool's
+        parameters, and the call must not run. A refused call gets back the
+        arguments it supplied.
     """
     declared = _declared_parameters(tool)
     if declared is None or not isinstance(arguments, dict):
@@ -276,11 +346,14 @@ def normalize_direct_tool_arguments(
             tool_name, unknown, declared.names, frozenset(arguments)
         )
 
+    kept = {name: value for name, value in arguments.items() if name not in rejected}
+    incomplete = _incomplete_call_error(tool_name, rejected, kept, declared)
+    if incomplete is not None:
+        return arguments, incomplete
+
     logger.info(
         "[DIRECT-TOOL] %s: dropped undeclared orchestration argument(s) %s",
         tool_name,
         ", ".join(sorted(rejected)),
     )
-    return {
-        name: value for name, value in arguments.items() if name not in rejected
-    }, None
+    return kept, None
