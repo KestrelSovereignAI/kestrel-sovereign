@@ -198,3 +198,8 @@ registered as infrastructure daemons, so their intentional residency does not it
 `idle_agents_only` restart.
 While retired, the supervisor waits on the child-publication event rather than
 polling once per second; a cold wake or terminal shutdown releases that wait.
+Immutable hosted BIN overrides have the same operator custody as immutable
+VENV overrides. A validated executable contained in the runtime workspace
+prevents both cleanup eligibility and deletion. Failed revalidation retains
+the prior executable identity and makes custody unproven; it never grants
+Core permission to reclaim the workspace after a failed wake.

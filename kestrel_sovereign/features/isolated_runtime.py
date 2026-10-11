@@ -6807,6 +6807,8 @@ class ProxyFeature(Feature):
         self._validated_hosted_immutable_venv_path: Optional[Path] = None
         self._validated_hosted_immutable_venv_setting: Optional[str] = None
         self._hosted_immutable_venv_custody_unproven = False
+        self._validated_hosted_immutable_bin_path: Optional[Path] = None
+        self._hosted_immutable_bin_custody_unproven = False
         # Hosted immutable console wrappers may themselves be operator-facing
         # symlinks. Preparation resolves and validates one exact regular target;
         # child construction must execute that target rather than re-following
@@ -6921,6 +6923,8 @@ class ProxyFeature(Feature):
                 and not self._stopping
                 and not self._immutable_venv_custody_is_unproven()
                 and not self._immutable_venv_override_is_inside_workspace()
+                and not self._hosted_immutable_bin_custody_unproven
+                and not self._immutable_bin_override_is_inside_workspace()
             ),
             "disk_telemetry_status": self._disk_telemetry_status,
         }
@@ -12341,6 +12345,7 @@ class ProxyFeature(Feature):
 
     def resolve_runtime_paths(self) -> tuple[Path, Optional[Path]]:
         hosted = self._runtime_is_hosted()
+        selected_bin = os.environ.get(_env_key(self.name, "BIN")) if hosted else None
         selected_setting = (
             self._hosted_immutable_venv_setting() if hosted else None
         )
@@ -12398,6 +12403,10 @@ class ProxyFeature(Feature):
                     resolved_venv = self._default_venv_path()
                 resolved_bin = None
         except Exception:
+            if selected_bin:
+                # An unsuccessful revalidation cannot grant deletion authority
+                # over either the old immutable runnable or its replacement.
+                self._hosted_immutable_bin_custody_unproven = True
             if selected_setting is not None:
                 # A failed cold re-resolution proves nothing about custody.
                 # Retain the last validated artifact but fail closed even when
@@ -12428,6 +12437,8 @@ class ProxyFeature(Feature):
             self._validated_hosted_immutable_venv_path,
             self._validated_hosted_immutable_venv_setting,
             self._hosted_immutable_venv_custody_unproven,
+            self._validated_hosted_immutable_bin_path,
+            self._hosted_immutable_bin_custody_unproven,
             self._validated_hosted_console_path,
         ) = (
             service_target,
@@ -12435,6 +12446,8 @@ class ProxyFeature(Feature):
             resolved_bin,
             validated_venv_path,
             validated_venv_setting,
+            False,
+            resolved_bin if hosted else None,
             False,
             None,
         )
@@ -12516,6 +12529,15 @@ class ProxyFeature(Feature):
         """Whether failed hosted resolution makes workspace custody unknown."""
 
         return self._hosted_immutable_venv_custody_unproven
+
+    def _immutable_bin_override_is_inside_workspace(self) -> bool:
+        """A validated operator runnable never acquires Core removal custody."""
+        selected = self._validated_hosted_immutable_bin_path
+        if selected is None:
+            return False
+        runtime_dir = Path(os.path.abspath(self._feature_runtime_dir()))
+        selected = Path(os.path.abspath(selected))
+        return selected == runtime_dir or runtime_dir in selected.parents
 
     def _process_venv_is_overridden(self) -> bool:
         """Whether this host selected a process-wide immutable venv artifact."""
@@ -14131,6 +14153,16 @@ class ProxyFeature(Feature):
                     raise IsolatedRuntimePreparationError(
                         "Hosted isolated feature workspace contains the immutable "
                         f"venv selected by {setting} and cannot be reclaimed."
+                    )
+                if self._hosted_immutable_bin_custody_unproven:
+                    raise IsolatedRuntimePreparationError(
+                        "Hosted isolated feature immutable BIN custody could not "
+                        "be proven; the workspace cannot be reclaimed."
+                    )
+                if self._immutable_bin_override_is_inside_workspace():
+                    raise IsolatedRuntimePreparationError(
+                        "Hosted isolated feature workspace contains the immutable "
+                        "BIN override and cannot be reclaimed."
                     )
                 # Stop advertising assets and completed byte counts before the
                 # no-follow deletion begins. The event loop remains available

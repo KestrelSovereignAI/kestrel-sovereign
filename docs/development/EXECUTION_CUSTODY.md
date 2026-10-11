@@ -615,3 +615,16 @@ See the [canonical storage contract](../architecture/storage/STORAGE_ARCHITECTUR
 for installation and limitations. Full independent review, repository/CI gates,
 immutable publication/verification and Frinz generation adoption/live acceptance
 remain required; a source check is not evidence of downstream rollout.
+## Native peer and constitutional receipts
+
+Temporary local-peer HTTP clients and their responses retain the original
+physical close owner. Repeated caller cancellation cannot discard a transport
+or response body merely because HTTPX has already marked its facade closed.
+Subscription deadlines may end ordinary waiting, but an explicit control
+receipt carried by the timeout is propagated, never normalized to EOF.
+
+Constitutional-state persistence likewise preserves native committed/unknown
+receipts. An authorized Safe Mode exit may have committed before its connection
+release acknowledgement fails; that is a reconciliation requirement, not proof
+that the state was never persisted. The in-memory Safe Mode remains closed until
+the original outcome has been reconciled.

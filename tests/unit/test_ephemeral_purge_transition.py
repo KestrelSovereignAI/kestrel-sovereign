@@ -347,7 +347,10 @@ async def test_shutdown_purge_timeout_records_durable_audit():
     # Replace the mock with a real hanging coroutine so wait_for times out.
     storage.purge_ephemeral_session = _never_returns
 
-    await agent._purge_ephemeral_on_shutdown(timeout=0.05)
+    # This case proves the durable audit path, not a scheduler's ability to
+    # dispatch both cancellation and the audit inside a 10ms reserved tail.
+    # The next test separately proves a hung audit remains deadline-bounded.
+    await agent._purge_ephemeral_on_shutdown(timeout=0.5)
 
     permission_store.log_decision.assert_awaited_once()
     kwargs = permission_store.log_decision.await_args.kwargs
