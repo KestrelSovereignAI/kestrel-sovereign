@@ -583,6 +583,15 @@ Keyless NORMAL channel receipts use the retained source payload's original
 sender as replay identity; their validated opaque caller label remains an
 audit identity and is never compared to a raw provider sender identifier.
 
+Inference acquisition/reconciliation captures original runtime membership before
+waiting for its coordinator lock and checks it before provider acquisition;
+replacing the service's current admission cannot rescue the waiting caller.
+Scheduler effect/watch/renewal retirement and Codex inline-tool checkpointing
+select the original strongest body/child receipt only after physical joins.
+Completed health writes retain control evidence before pending-owner removal,
+and repeated feature shutdown reports that same receipt. Delivery queue tools
+preserve native database control instead of converting it into a failed result.
+
 See the [canonical storage contract](../architecture/storage/STORAGE_ARCHITECTURE.md#hosted-execution-custody)
 for installation and limitations. Full independent review, repository/CI gates,
 immutable publication/verification and Frinz generation adoption/live acceptance

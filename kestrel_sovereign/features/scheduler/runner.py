@@ -19,20 +19,31 @@ import json
 import logging
 import os
 import secrets
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Collection
 from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Protocol, Union
-
-from kestrel_sovereign._async_ownership import await_owned_task, run_blocking_operation
-from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
-from kestrel_sovereign.features.scheduler.constants import (
-    ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Union,
 )
-from kestrel_sovereign.turn_scope import turn_scoped
+
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    owned_task_error,
+    run_blocking_operation,
+)
+from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.execution_custody import (
     AdvisoryExecutionFence,
     ExecutionAuthorityError,
@@ -40,13 +51,13 @@ from kestrel_sovereign.execution_custody import (
     bind_execution_custody_snapshot,
     bind_execution_runtime,
     current_execution_custody,
-    require_execution_work,
+    execution_terminal_error,
     is_execution_control_error,
+    require_execution_work,
+    retained_execution_error,
 )
-from kestrel_sovereign.storage.database_clock import (
-    database_backend_type as scheduler_database_backend_type,
-    database_clock as scheduler_database_clock,
-    database_now_sql as scheduler_database_now_sql,
+from kestrel_sovereign.features.scheduler.constants import (
+    ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
 )
 from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
@@ -58,6 +69,16 @@ from kestrel_sovereign.features.scheduler.status import (
     mark_runtime_owner_stopped,
     scheduler_tick_in_progress_limit_seconds,
 )
+from kestrel_sovereign.storage.database_clock import (
+    database_backend_type as scheduler_database_backend_type,
+)
+from kestrel_sovereign.storage.database_clock import (
+    database_clock as scheduler_database_clock,
+)
+from kestrel_sovereign.storage.database_clock import (
+    database_now_sql as scheduler_database_now_sql,
+)
+from kestrel_sovereign.turn_scope import turn_scoped
 
 logger = logging.getLogger(__name__)
 
@@ -1226,6 +1247,7 @@ class SchedulerRunner:
         self._is_agent_authorized = is_agent_authorized
         self._on_protocol_failure = on_protocol_failure
         self._readiness_failure: Optional[BaseException] = None
+        self._execution_control_error: Optional[BaseException] = None
         self._schema_provenance: Optional[str] = None
         # ``_task`` owns the supervisor; ``_worker_task`` is the replaceable
         # polling loop it watches.  A dead worker must never become an
@@ -1358,6 +1380,10 @@ class SchedulerRunner:
     def _latch_protocol_failure(self, error: BaseException) -> None:
         """Persist the first safety failure in process state and notify host."""
 
+        if is_execution_control_error(error):
+            self._execution_control_error = execution_terminal_error(
+                getattr(self, "_execution_control_error", None), error
+            )
         if self._readiness_failure is None:
             self._readiness_failure = error
         if self._on_protocol_failure is not None:
@@ -1536,6 +1562,8 @@ class SchedulerRunner:
             outcome = await await_owned_task(task, pending_cancellation)
             if outcome.cancellation is not None:
                 pending_cancellation = outcome.cancellation
+            if outcome.error is not None and is_execution_control_error(outcome.error):
+                self._latch_protocol_failure(outcome.error)
             if outcome.error is not None and not isinstance(
                 outcome.error, asyncio.CancelledError
             ):
@@ -1564,9 +1592,13 @@ class SchedulerRunner:
                 ),
             )
         except asyncio.CancelledError as error:
+            if is_execution_control_error(error):
+                self._latch_protocol_failure(error)
             if pending_cancellation is None:
                 pending_cancellation = error
         except Exception as error:
+            if is_execution_control_error(error):
+                self._latch_protocol_failure(error)
             logger.warning(
                 "SchedulerRunner %s runtime-status cleanup failed during stop",
                 self._owner_id,
@@ -1577,8 +1609,9 @@ class SchedulerRunner:
                 ),
             )
         logger.info("SchedulerRunner %s stopped", self._owner_id)
-        if pending_cancellation is not None:
-            raise pending_cancellation
+        terminal = execution_terminal_error(getattr(self, "_execution_control_error", None), pending_cancellation)
+        if terminal is not None:
+            raise terminal
 
     async def _publish_runtime_status(self, worker_state: str) -> None:
         agent_ids = await self._current_authorized_agent_ids()
@@ -1981,7 +2014,10 @@ class SchedulerRunner:
                     self._end_claim_phase(task.id)
                 if claimed is not None:
                     await self._execute_claim(claimed)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            asyncio.current_task()._kestrel_owned_terminal_error = retained_execution_error(error)
+            if is_execution_control_error(error):
+                self._latch_protocol_failure(error)
             logger.warning(
                 "Scheduled occurrence for task %s (%s) was cancelled",
                 task.id,
@@ -2015,6 +2051,11 @@ class SchedulerRunner:
     def _occurrence_finished(
         self, schedule_id: str, finished: asyncio.Task[None]
     ) -> None:
+        error = owned_task_error(finished)
+        if finished.done() and not finished.cancelled():
+            finished.exception()
+        if error is not None and is_execution_control_error(error):
+            self._latch_protocol_failure(error)
         occurrence = self._occurrences.get(schedule_id)
         if occurrence is not None and occurrence.task is finished:
             del self._occurrences[schedule_id]
@@ -3557,6 +3598,7 @@ class SchedulerRunner:
             raise
         except SchedulerFeatureUnavailable as error:
             if is_execution_control_error(error):
+                self._latch_protocol_failure(error)
                 logger.error("Scheduler preparation %s requires authority/commit reconciliation: %s", execution.id, error)
                 return
             # Cold preparation can discover that a globally disabled or
@@ -3578,6 +3620,7 @@ class SchedulerRunner:
             return
         except Exception as error:
             if is_execution_control_error(error):
+                self._latch_protocol_failure(error)
                 logger.error("Scheduler execution %s requires authority/commit reconciliation: %s", execution.id, error)
                 return
             if not in_preparation:
@@ -3616,19 +3659,29 @@ class SchedulerRunner:
                     ran=False,
                 )
         finally:
+            retirement_errors = [sys.exception()]
             try:
                 await self._stop_renewal(renewal, task, execution)
+            except BaseException as error:
+                retirement_errors.append(error)
             finally:
                 try:
                     if deadline_watch is not None:
                         deadline_watch.cancel()
                         outcome = await await_owned_task(deadline_watch)
-                        if outcome.cancellation is not None:
-                            raise outcome.cancellation
-                        if outcome.error is not None and not isinstance(outcome.error, asyncio.CancelledError):
-                            raise outcome.error
+                        retirement_errors.append(outcome.cancellation)
+                        if outcome.error is not None and (
+                            not isinstance(outcome.error, asyncio.CancelledError)
+                            or is_execution_control_error(outcome.error)
+                        ):
+                            retirement_errors.append(outcome.error)
                 finally:
                     _rollout_renewal_state.reset(rollout_token)
+            terminal = execution_terminal_error(*retirement_errors)
+            if terminal is not None:
+                if is_execution_control_error(terminal):
+                    self._latch_protocol_failure(terminal)
+                raise terminal
 
     def _prepared_executor_method(self) -> Optional[Callable[[SchedulerExecution], Any]]:
         """Return a structurally supplied preparation method, if any.
@@ -3829,10 +3882,14 @@ class SchedulerRunner:
         """
 
         async def invoke_dispatch() -> Any:
-            require_execution_work()
-            result = await dispatch()
-            require_execution_work()
-            return result
+            try:
+                require_execution_work()
+                result = await dispatch()
+                require_execution_work()
+                return result
+            except BaseException as error:
+                asyncio.current_task()._kestrel_owned_terminal_error = retained_execution_error(error)
+                raise
 
         effect = asyncio.create_task(
             invoke_dispatch(), name=f"scheduler-effect:{execution.id}"
@@ -3848,6 +3905,8 @@ class SchedulerRunner:
                 if not effect.done():
                     effect.cancel()
                 outcome = await await_owned_task(effect)
+                if outcome.error is not None and is_execution_control_error(outcome.error):
+                    raise outcome.error
                 if outcome.cancellation is not None:
                     raise outcome.cancellation
                 if outcome.error is not None and not isinstance(
@@ -3861,22 +3920,34 @@ class SchedulerRunner:
                 return False, None
 
             outcome = await await_owned_task(effect)
-            if outcome.cancellation is not None:
-                raise outcome.cancellation
-            if outcome.error is not None:
-                raise outcome.error
+            terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+            if terminal is not None:
+                raise terminal
             # Give a renewal completion that raced the effect task precedence:
             # even a completed effect must not terminalize under a lost lease.
             if not renewal_state.is_live():
                 return False, None
             return True, outcome.result
         finally:
+            original = sys.exception()
             if not effect.done():
                 effect.cancel()
-                await await_owned_task(effect)
+            effect_outcome = await await_owned_task(effect)
+            if not effect.cancelled():
+                effect.exception()
             if not lease_lost.done():
                 lease_lost.cancel()
-                await await_owned_task(lease_lost)
+            lease_outcome = await await_owned_task(lease_lost)
+            terminal = execution_terminal_error(
+                original, effect_outcome.error, effect_outcome.cancellation,
+                lease_outcome.error, lease_outcome.cancellation,
+            )
+            if terminal is not None and is_execution_control_error(terminal):
+                self._latch_protocol_failure(terminal)
+                raise terminal
+            cancellation = effect_outcome.cancellation or lease_outcome.cancellation
+            if cancellation is not None:
+                raise cancellation
 
     async def _run_executor(self, execution: SchedulerExecution) -> Any:
         # ``AsyncMock`` and similar dynamic proxies fabricate any attribute on
@@ -3908,6 +3979,10 @@ class SchedulerRunner:
 
         renewal.cancel()
         outcome = await await_owned_task(renewal)
+        terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+        if terminal is not None and is_execution_control_error(terminal):
+            self._latch_protocol_failure(terminal)
+            raise terminal
         if outcome.cancellation is not None:
             raise outcome.cancellation
         if outcome.error is not None and not isinstance(

@@ -48,32 +48,42 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
-    Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, Type, Union,
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    Union,
 )
 
+from kestrel_sdk.llm import (
+    ProviderCapabilities,
+    StructuredOutputMode,
+    ToolCallStarted,
+    ToolStreamingMode,
+    VisionInputMode,
+)
 from pydantic import BaseModel
 
-from kestrel_sdk.llm import ToolCallStarted
-
 from kestrel_sovereign._async_ownership import await_owned_task
-from kestrel_sovereign.execution_custody import owned_execution_stream, execution_terminal_error
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    owned_execution_stream,
+)
 
 from .adapter import LLMAdapter, LLMResponse, ThinkingDelta, ToolCall
 from .call_progress import report_call_progress
 from .cancellation import CancelToken, await_or_cancelled, raise_if_cancelled
-from .output_ceiling import attach_stop_reason
-from kestrel_sdk.llm import (
-    ProviderCapabilities,
-    StructuredOutputMode,
-    ToolStreamingMode,
-    VisionInputMode,
-)
 from .codex_app_server import (
+    _CODEX_DISABLED_NATIVE_FEATURES,
     CodexAppServerClient,
     CodexAppServerError,
     CodexAppServerFrameTooLarge,
     CodexAppServerTransportError,
-    _CODEX_DISABLED_NATIVE_FEATURES,
 )
 from .codex_reasoning import (
     normalize_codex_reasoning_effort,
@@ -82,6 +92,7 @@ from .codex_reasoning import (
 from .continuation_store import ContinuationStore, InMemoryContinuationStore
 from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo
+from .output_ceiling import attach_stop_reason
 
 if TYPE_CHECKING:
     from kestrel_sovereign.features.computer_use.policy import Decision
@@ -2042,7 +2053,9 @@ class CodexAdapter(LLMAdapter):
             try:
                 ret = await executor(name, args)
             except Exception as e:
-                from kestrel_sovereign.execution_custody import is_execution_control_error
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
                 if is_execution_control_error(e):
                     raise
                 logger.warning("tool_executor(%s) raised: %s", name, e)
@@ -2132,7 +2145,9 @@ class CodexAdapter(LLMAdapter):
                     raise control_error
                 return await _handle(params)
             except BaseException as error:
-                from kestrel_sovereign.execution_custody import is_execution_control_error
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
                 if is_execution_control_error(error):
                     control_error = error
                     # Reader dispatch deliberately turns this into a protocol
@@ -2361,7 +2376,8 @@ class CodexAdapter(LLMAdapter):
             if db is None:
                 return
             from kestrel_sovereign.llm.codex_decline_events import (
-                ensure_codex_decline_events_table, record_decline,
+                ensure_codex_decline_events_table,
+                record_decline,
             )
             await ensure_codex_decline_events_table(db)
             agent_id = (
@@ -3356,9 +3372,7 @@ class CodexAdapter(LLMAdapter):
                     app.close_turn_sink(thread_id)
                 finally:
                     lock.release()
-            terminal_error = execution_terminal_error(*inline_terminal_errors)
-            if terminal_error is not None:
-                raise terminal_error
+            checkpoint_error = None
             if pending_cleanup_cancellation is not None and executed_log:
                 checkpoint = getattr(
                     tool_executor,
@@ -3379,14 +3393,19 @@ class CodexAdapter(LLMAdapter):
                             "caller cancellation remained pending after an "
                             "inline tool effect completed"
                         )
-                        raise checkpoint_outcome.error
-                    setattr(
-                        pending_cleanup_cancellation,
-                        "_kestrel_completed_effect_checkpointed",
-                        True,
-                    )
-            if pending_cleanup_cancellation is not None:
-                raise pending_cleanup_cancellation
+                        checkpoint_error = checkpoint_outcome.error
+                    else:
+                        setattr(
+                            pending_cleanup_cancellation,
+                            "_kestrel_completed_effect_checkpointed",
+                            True,
+                        )
+            terminal_error = execution_terminal_error(
+                unwind_error, *inline_terminal_errors,
+                pending_cleanup_cancellation, checkpoint_error,
+            )
+            if terminal_error is not None:
+                raise terminal_error
 
     async def _run_turn_with_retry(
         self,

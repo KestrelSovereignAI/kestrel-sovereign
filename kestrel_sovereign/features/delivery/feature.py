@@ -19,11 +19,13 @@ Tools:
 import logging
 from typing import Any, Dict, Optional
 
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.delivery.queue import DeliveryQueue
 from kestrel_sovereign.features.storage_access import resolve_feature_database
-from kestrel_sdk.tools.base import ToolCategory
-from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +178,8 @@ class DeliveryFeature(Feature):
                 )
             return ToolResult.ok(confirmation, data=data)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to get delivery status: %s", e)
             return ToolResult.failed(error=str(e))
 
@@ -209,6 +213,8 @@ class DeliveryFeature(Feature):
                 },
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to list delivery queue: %s", e)
             return ToolResult.failed(error=str(e))
 
@@ -243,6 +249,8 @@ class DeliveryFeature(Feature):
                 },
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to list dead letter queue: %s", e)
             return ToolResult.failed(error=str(e))
 
@@ -274,6 +282,8 @@ class DeliveryFeature(Feature):
         try:
             payload = await self._queue.retry(message_id)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to retry delivery %s: %s", message_id, e)
             return ToolResult.failed(error=str(e))
 
@@ -321,5 +331,7 @@ class DeliveryFeature(Feature):
                 data={"purged": purged, "older_than_hours": older_than_hours},
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to purge delivered messages: %s", e)
             return ToolResult.failed(error=str(e))
