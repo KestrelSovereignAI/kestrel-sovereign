@@ -75,7 +75,7 @@ from kestrel_sovereign.kestrel_config.constants import (
 from kestrel_sovereign.config import load_config, load_section
 from kestrel_sovereign import telemetry
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, require_execution_work, execution_work_operation, is_execution_control_error, execution_terminal_error
-from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
+from kestrel_sovereign._async_ownership import owned_task_error
 
 logger = logging.getLogger(__name__)
 
