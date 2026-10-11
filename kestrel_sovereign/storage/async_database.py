@@ -13,6 +13,8 @@ from contextlib import asynccontextmanager, closing
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+
 from .db import (
     ConnectionError,
     DatabaseBackend,
@@ -89,10 +91,23 @@ async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseExcept
     try:
         await cleanup
     except (asyncio.CancelledError, Exception) as close_exc:
-        raise DatabaseRetirementError(db, operation_error, close_exc) from close_exc
+        # Keep the resource-retirement wrapper/owner AND the original control
+        # cause. A failed close cannot turn uncertain COMMIT into plain error.
+        cause = (
+            execution_terminal_error(operation_error, close_exc)
+            if operation_error is not None and is_execution_control_error(operation_error)
+            else close_exc
+        )
+        raise DatabaseRetirementError(db, operation_error, close_exc) from cause
     if db.connection_retirement_pending:
-        raise DatabaseRetirementError(db, operation_error)
+        failure = DatabaseRetirementError(db, operation_error)
+        if operation_error is not None and is_execution_control_error(operation_error):
+            raise failure from operation_error
+        raise failure
     if cancelled:
+        if operation_error is not None and is_execution_control_error(operation_error):
+            operation_error.add_note("Caller cancellation occurred during joined database retirement")
+            raise operation_error
         raise asyncio.CancelledError()
 
 
@@ -104,7 +119,12 @@ async def _close_failed_database_initialization(db: "AsyncDatabase", initializat
         failure = DatabaseInitializationCleanupError(
             initialization_error, retirement_error.cleanup_error, retirement_owner=db,
         )
-        raise failure from retirement_error.cleanup_error
+        cause = (
+            execution_terminal_error(initialization_error, retirement_error)
+            if is_execution_control_error(initialization_error) or is_execution_control_error(retirement_error)
+            else retirement_error.cleanup_error
+        )
+        raise failure from cause
 
 
 #: ``(name, table, columns)`` of the index that makes the #2959 projection worth
@@ -3951,11 +3971,13 @@ class AsyncDatabase:
         chance to complete.
         """
         cancelled = False
-        factory_error: Exception | None = None
+        factory_error: BaseException | None = None
         try:
             await self.dispose_cached_sqla_factory()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as factory_cancellation:
             cancelled = True
+            if is_execution_control_error(factory_cancellation):
+                factory_error = factory_cancellation
         except Exception as exc:
             # Keep going: the primary backend owns a separate aiosqlite worker
             # and must always receive its close opportunity.  The failure is
@@ -3965,6 +3987,12 @@ class AsyncDatabase:
 
         try:
             await self._backend.close()
+        except asyncio.CancelledError as backend_error:
+            if is_execution_control_error(backend_error) or (
+                factory_error is not None and is_execution_control_error(factory_error)
+            ):
+                raise execution_terminal_error(backend_error, factory_error)
+            raise
         except Exception as backend_error:
             if factory_error is not None:
                 logger.error(
@@ -3972,6 +4000,10 @@ class AsyncDatabase:
                     "the primary backend close was attempted: %s",
                     factory_error,
                 )
+            if is_execution_control_error(backend_error) or (
+                factory_error is not None and is_execution_control_error(factory_error)
+            ):
+                raise execution_terminal_error(backend_error, factory_error)
             raise backend_error from factory_error
         finally:
             self._initialized = False
@@ -3990,6 +4022,8 @@ class AsyncDatabase:
                 await self.finalize_retired_sqla_factory()
 
         if cancelled:
+            if factory_error is not None and is_execution_control_error(factory_error):
+                raise factory_error
             raise asyncio.CancelledError()
         if factory_error is not None:
             logger.error(

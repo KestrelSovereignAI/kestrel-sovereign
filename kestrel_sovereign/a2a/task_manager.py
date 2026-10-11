@@ -15,6 +15,8 @@ import logging
 from datetime import datetime
 from typing import Any, AsyncGenerator, Callable, Coroutine, Optional
 
+from kestrel_sovereign.execution_custody import execution_terminal_error
+
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 
 from kestrel_sovereign.a2a.types import (
@@ -1455,7 +1457,7 @@ class TaskManager:
             except BaseException as reconciliation_failure:
                 if rollback_local_intent is not None:
                     rollback_local_intent()
-                raise error from reconciliation_failure
+                raise execution_terminal_error(error, reconciliation_failure)
             if not committed_here:
                 if rollback_local_intent is not None:
                     rollback_local_intent()

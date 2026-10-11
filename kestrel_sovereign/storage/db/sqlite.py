@@ -1291,12 +1291,15 @@ class SQLiteBackend(DatabaseBackend):
             self._handoff_cancelled_write(conn)
             terminal = execution_terminal_error(error, cleanup_error)
             if terminal is not cleanup_error:
-                raise terminal from cleanup_error
+                # The selected error can itself be a legacy QueryError whose
+                # explicit cause carries authority/COMMIT evidence. Keep that
+                # chain; Python retains this cleanup failure as __context__.
+                raise terminal
             raise
         except BaseException as cleanup_error:
             terminal = execution_terminal_error(error, cleanup_error)
             if terminal is not cleanup_error:
-                raise terminal from cleanup_error
+                raise terminal
             raise
 
     async def _commit_write(self, conn: aiosqlite.Connection) -> None:

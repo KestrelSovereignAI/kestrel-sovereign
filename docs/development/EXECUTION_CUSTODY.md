@@ -302,6 +302,11 @@ Every host write form uses one native COMMIT handoff. An interrupted or failed
 acknowledgment preserves `unknown` evidence on every original retained/ambient
 scope before cleanup; a later rollback failure or repeated cancellation cannot
 erase that evidence. Rollback after COMMIT is not proof that the effect vanished.
+Selected legacy error wrappers retain their original explicit control cause:
+later rollback or A2A readback failures become context, not replacement causes.
+All database factories use the same joined retirement boundary; cancellation
+after uncertain initialization cannot supersede the original COMMIT receipt,
+and unsuccessful cleanup retains its database owner and both failure objects.
 Deferred OpenRouter provisioning validates the original admission after client
 acquisition and immediately before each POST, including retries after backoff.
 Cause-carried control errors bypass retry/error normalization; ordinary live
