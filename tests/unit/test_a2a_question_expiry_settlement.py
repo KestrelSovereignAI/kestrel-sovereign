@@ -35,7 +35,10 @@ Pins:
         settled after the upgrade: withdrawn, or their late answer relayed;
       * settlement has no age cutoff: a recipient returning a month later,
         with its submission wake still retained in its durable ledger, has
-        that submission withdrawn before it can run.
+        that submission withdrawn before it can run;
+      * a recipient that hangs or cannot be reached costs a settlement pass
+        one attempt, not one per question, so the recipients behind its
+        backlog are still settled in that pass (#3586).
 """
 
 from __future__ import annotations
@@ -61,10 +64,14 @@ from kestrel_sovereign.a2a.types import Message, TaskSendParams, TaskState, Text
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.features.peers.directory import (
     PeerIdentity,
+    PeerNotFoundError,
+    PeerProtocolError,
     PeerRequester,
     PeerTransportError,
+    PeerUnavailableError,
 )
 from kestrel_sovereign.features.peers.feature import (
+    RECIPIENT_UNREACHABLE_ERROR_TYPE,
     PeersFeature,
     ReceiverSettlement,
     ReceiverSettlementOutcome,
@@ -107,6 +114,8 @@ from tests.unit.test_durable_signal_delivery import _held_state, _HoldSnapshots
 SENDER = "did:test:emma"
 RECIPIENT = "did:test:nellie"
 PEER = PeerIdentity(agent_id=RECIPIENT, slug="nellie", routing_key="nellie")
+KITE = "did:test:kite"
+KITE_PEER = PeerIdentity(agent_id=KITE, slug="kite", routing_key="kite")
 
 
 class _DeliveredHandle:
@@ -208,6 +217,15 @@ def _conflict() -> ToolResult:
     )
 
 
+def _unreachable() -> ToolResult:
+    """What ``cancel_outbound_task`` returns when its request failed in
+    transport."""
+    return ToolResult.failed(
+        "Could not reach the task recipient",
+        data={"task_id": "q-1", "error_type": RECIPIENT_UNREACHABLE_ERROR_TYPE},
+    )
+
+
 class TestSettlementOutcomes:
     @pytest.mark.asyncio
     async def test_committed_cancellation_withdraws_without_a_read(self):
@@ -264,27 +282,93 @@ class TestSettlementOutcomes:
         feature = _settling_feature(
             task_read={"id": "q-1", "status": {"state": "working"}},
         )
-        feature.cancel_outbound_task = AsyncMock(
-            return_value=ToolResult.failed("Could not reach the task recipient"),
-        )
+        feature.cancel_outbound_task = AsyncMock(return_value=_unreachable())
 
         settlement = await _settle(feature)
 
         assert settlement.outcome is ReceiverSettlementOutcome.UNCONFIRMED
         assert not settlement.receiver_terminal
+        # The read reached the recipient, which answered: still working.
+        assert not settlement.recipient_unresponsive
 
     @pytest.mark.asyncio
-    async def test_unreadable_recipient_is_unconfirmed(self):
-        feature = _settling_feature(
-            read_error=PeerTransportError("Could not reach local peer host"),
-        )
-        feature.cancel_outbound_task = AsyncMock(
-            return_value=ToolResult.failed("Could not reach the task recipient"),
-        )
+    @pytest.mark.parametrize(
+        "read_error",
+        [
+            PeerTransportError("Could not reach local peer host"),
+            PeerUnavailableError("Peer is unavailable"),
+        ],
+        ids=["transport", "unavailable"],
+    )
+    async def test_unreachable_recipient_is_unconfirmed_and_unresponsive(
+        self, read_error,
+    ):
+        """The cancellation and the read both failed in transport, so the
+        recipient's other questions would fail the same way: the sweep is
+        told to leave them for its next pass (#3586)."""
+        feature = _settling_feature(read_error=read_error)
+        feature.cancel_outbound_task = AsyncMock(return_value=_unreachable())
 
         settlement = await _settle(feature)
 
         assert settlement.outcome is ReceiverSettlementOutcome.UNCONFIRMED
+        assert settlement.recipient_unresponsive
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("withdrawal", "task_read", "read_error"),
+        [
+            pytest.param(
+                _conflict(), None,
+                PeerTransportError("Could not reach local peer host"),
+                id="cancellation-conflicted",
+            ),
+            pytest.param(
+                ToolResult.failed(
+                    "Peer is not available in the automatic directory",
+                    data={"task_id": "q-1"},
+                ),
+                None,
+                PeerTransportError("Could not reach local peer host"),
+                id="cancellation-refused",
+            ),
+            pytest.param(
+                None, None,
+                PeerTransportError("Could not reach local peer host"),
+                id="no-outbound-route",
+            ),
+            pytest.param(
+                _unreachable(), None, PeerNotFoundError("gone"),
+                id="read-refused",
+            ),
+            pytest.param(
+                _unreachable(), None, PeerProtocolError("malformed"),
+                id="read-malformed",
+            ),
+            pytest.param(
+                _unreachable(), None, RuntimeError("provider bug"),
+                id="read-provider-fault",
+            ),
+            pytest.param(
+                _unreachable(), {"id": "q-1", "status": "submitted"}, None,
+                id="read-live-task",
+            ),
+        ],
+    )
+    async def test_recipient_reached_by_either_request_is_not_unresponsive(
+        self, withdrawal, task_read, read_error,
+    ):
+        """A recipient is deferred only when both requests failed in
+        transport. When either request got a decision, or failed for any
+        other reason, the settlement stays an ordinary unconfirmed one and
+        the sweep goes on to the recipient's next question (#3586)."""
+        feature = _settling_feature(task_read=task_read, read_error=read_error)
+        feature.cancel_outbound_task = AsyncMock(return_value=withdrawal)
+
+        settlement = await _settle(feature)
+
+        assert settlement.outcome is ReceiverSettlementOutcome.UNCONFIRMED
+        assert not settlement.recipient_unresponsive
 
     @pytest.mark.asyncio
     async def test_own_cancellation_with_lost_response_is_a_withdrawal(self):
@@ -304,9 +388,7 @@ class TestSettlementOutcomes:
                 },
             },
         )
-        feature.cancel_outbound_task = AsyncMock(
-            return_value=ToolResult.failed("Could not reach the task recipient"),
-        )
+        feature.cancel_outbound_task = AsyncMock(return_value=_unreachable())
 
         settlement = await _settle(feature)
 
@@ -614,32 +696,43 @@ class _Fleet:
     def wakes(self) -> list:
         return self.feature.agent.dispatcher.signals
 
-    async def ask(self, task_id: str, question: str) -> None:
-        """What ``send_a2a_question`` leaves behind, with a lapsed deadline."""
-        await self.task_manager.create_task(
+    async def ask(
+        self,
+        task_id: str,
+        question: str,
+        *,
+        recipient: str = "Nellie",
+        recipient_agent_id: str = RECIPIENT,
+        recipient_tasks=None,
+    ) -> None:
+        """What ``send_a2a_question`` leaves behind, with a lapsed deadline.
+
+        Asked of Nellie unless another recipient and its task manager are
+        named."""
+        await (recipient_tasks or self.task_manager).create_task(
             TaskSendParams(
                 id=task_id,
                 sessionId=f"session-{task_id}",
                 message=Message(role="user", parts=[TextPart(text=question)]),
                 metadata={"a2a_verb": "question", "reply_expected": True},
             ),
-            agent_name=RECIPIENT,
+            agent_name=recipient_agent_id,
             creator_agent_id=SENDER,
         )
         await record_outbound_dispatch(
             self.db,
             agent_id=SENDER,
             task_id=task_id,
-            recipient="Nellie",
-            recipient_agent_id=RECIPIENT,
+            recipient=recipient,
+            recipient_agent_id=recipient_agent_id,
             verb="question",
             session_id=f"session-{task_id}",
             dispatch_tool="send_a2a_question",
         )
         await self.store.insert(
             task_id=task_id,
-            recipient="Nellie",
-            recipient_agent_id=RECIPIENT,
+            recipient=recipient,
+            recipient_agent_id=recipient_agent_id,
             original_question=question,
             origin_turn_id=None,
             origin_session_id=f"session-{task_id}",
@@ -1373,6 +1466,124 @@ async def test_rows_behind_a_hung_row_are_reached_on_the_next_pass(
     assert (await fleet.store.get("q-b-fine")).receiver_settlement == (
         RECEIVER_SETTLEMENT_CONFIRMED
     )
+
+
+class _PerRecipientRouter:
+    """The host-attested router with each recipient's host able to go down
+    on its own. Records every request it is asked to carry, reached or not,
+    as ``(operation, recipient, task_id)``."""
+
+    def __init__(self, inner: _HostAttestedRouter):
+        self._inner = inner
+        self.down: set[str] = set()
+        self.requests: list[tuple[str, str, str]] = []
+
+    def _carry(self, operation: str, peer: PeerIdentity, task_id: str) -> None:
+        self.requests.append((operation, peer.agent_id, task_id))
+        if peer.agent_id in self.down:
+            raise PeerTransportError("Could not reach local peer host")
+
+    async def cancel_a2a_task(self, requester, peer, task_id, payload):
+        self._carry("cancel", peer, task_id)
+        return await self._inner.cancel_a2a_task(requester, peer, task_id, payload)
+
+    async def get_a2a_task(self, requester, peer, task_id):
+        self._carry("read", peer, task_id)
+        return await self._inner.get_a2a_task(requester, peer, task_id)
+
+
+def _add_kite(fleet, kite_tasks) -> _PerRecipientRouter:
+    """Publish a second recipient, Kite, on Nellie's host, and route Emma's
+    settlement through a router that can take either one down alone."""
+    manager = fleet.router._manager
+    kite = SimpleNamespace(did=KITE, agent_id=KITE, task_manager=kite_tasks)
+    manager._register_agent("kite", kite)
+    manager.install_a2a_hosted_policy(
+        kite,
+        resolver=object(),
+        authorizer=object(),
+        router=SimpleNamespace(authorize_inbound_sender=AsyncMock(return_value=True)),
+        requester=PeerRequester(KITE, object()),
+    )
+    router = _PerRecipientRouter(fleet.router)
+    peers = {RECIPIENT: PEER, KITE: KITE_PEER}
+
+    async def _resolve(_recipient, recipient_agent_id):
+        return router, fleet.requester, peers[recipient_agent_id]
+    fleet.feature._resolve_retained_automatic_peer = AsyncMock(side_effect=_resolve)
+    return router
+
+
+@pytest.mark.asyncio
+async def test_unreachable_recipient_costs_one_attempt_per_pass(fleet, tmp_path):
+    """#3586: a recipient whose host refuses every connection fails inside
+    the settlement bound, so the bound never deferred its other questions.
+    Each was tried in turn, at up to the bound apiece, and one dead peer's
+    backlog held up settlement for every recipient behind it.
+
+    One attempt (its cancellation and the read that follows it) now stands
+    for that recipient's whole pass: the healthy recipient behind it is
+    settled in the same pass, and the deferred questions are taken up by the
+    next one, until the host is back and they are all withdrawn."""
+    kite_tasks = await create_task_manager(str(tmp_path / "kite-tasks.db"))
+    try:
+        router = _add_kite(fleet, kite_tasks)
+        kite_questions = ("q-kite-1", "q-kite-2", "q-kite-3")
+        for task_id in kite_questions:
+            await fleet.ask(
+                task_id, "Anyone?",
+                recipient="Kite", recipient_agent_id=KITE,
+                recipient_tasks=kite_tasks,
+            )
+        await fleet.ask("q-nellie", "Numbers?")
+        # Both hosts are down at the deadlines: every question is left for
+        # the sweep, Kite's ahead of Nellie's.
+        router.down = {KITE, RECIPIENT}
+        for task_id in (*kite_questions, "q-nellie"):
+            await fleet.expire(task_id)
+        assert [w.payload["state"] for w in fleet.wakes] == ["expired"] * 4
+
+        # Nellie's host is back; Kite's is not.
+        router.down = {KITE}
+        router.requests.clear()
+        await fleet.settle()
+
+        assert router.requests[0][1] == KITE
+        kite_requests = [r for r in router.requests if r[1] == KITE]
+        assert kite_requests == [
+            ("cancel", KITE, "q-kite-1"), ("read", KITE, "q-kite-1"),
+        ]
+        assert await fleet.recipient_state("q-nellie") is TaskState.CANCELED
+        assert (await fleet.store.get("q-nellie")).receiver_settlement == (
+            RECEIVER_SETTLEMENT_CONFIRMED
+        )
+        for task_id in kite_questions:
+            assert (await fleet.store.get(task_id)).receiver_settlement == (
+                RECEIVER_SETTLEMENT_PENDING
+            )
+
+        # Still down: the next pass takes up a question this one deferred.
+        router.requests.clear()
+        await fleet.settle()
+
+        assert router.requests == [
+            ("cancel", KITE, "q-kite-2"), ("read", KITE, "q-kite-2"),
+        ]
+
+        # Kite's host is back: nothing deferred was lost.
+        router.down = set()
+        await fleet.settle()
+
+        for task_id in kite_questions:
+            task = await kite_tasks.get_task_for_recipient(task_id, KITE)
+            assert task.status.state is TaskState.CANCELED
+            assert (await fleet.store.get(task_id)).receiver_settlement == (
+                RECEIVER_SETTLEMENT_CONFIRMED
+            )
+        # Withdrawals are silent: the asker already holds each ``expired``.
+        assert len(fleet.wakes) == 4
+    finally:
+        await kite_tasks.close()
 
 
 # ---------------------------------------------------------------------------

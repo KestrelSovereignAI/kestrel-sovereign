@@ -125,6 +125,11 @@ class OutboundArtifactValidationError(ValueError):
 # A2A task lifecycle states after which the recipient does no further work.
 A2A_TERMINAL_TASK_STATES = ("completed", "failed", "canceled")
 
+# ``error_type`` of a creator cancellation that failed in transport or found
+# the recipient unavailable (#3586). No decision came back, so whether the
+# recipient acted on it is unknown.
+RECIPIENT_UNREACHABLE_ERROR_TYPE = "recipient_unreachable"
+
 
 class ReceiverSettlementOutcome(Enum):
     """Where a recipient's task stands once its asker's deadline passed."""
@@ -145,8 +150,9 @@ class ReceiverSettlement:
     outcome: ReceiverSettlementOutcome
     state: str = "expired"
     reply_text: str = ""
-    # The recipient did not answer within the settlement bound, so another
-    # attempt on the same recipient in the same pass would only wait again.
+    # The recipient did not answer within the settlement bound, or both
+    # requests to it failed in transport, so another attempt on the same
+    # recipient in the same pass would only wait or fail again.
     recipient_unresponsive: bool = False
 
     @property
@@ -2734,6 +2740,16 @@ class PeersFeature(Feature):
                 "Peer routing is not configured safely",
                 data={"task_id": task_id},
             )
+        except (PeerTransportError, PeerUnavailableError) as control_error:
+            if is_execution_control_error(control_error):
+                raise
+            return ToolResult.failed(
+                "Could not resolve the durable outbound task recipient",
+                data={
+                    "task_id": task_id,
+                    "error_type": RECIPIENT_UNREACHABLE_ERROR_TYPE,
+                },
+            )
         except PeerDirectoryError as control_error:
             if is_execution_control_error(control_error):
                 raise
@@ -2796,12 +2812,15 @@ class PeersFeature(Feature):
                 "Task cancellation conflicts with the recipient's terminal state",
                 data={"task_id": task_id, "error_type": "lifecycle_conflict"},
             )
-        except PeerTransportError as control_error:
+        except (PeerTransportError, PeerUnavailableError) as control_error:
             if is_execution_control_error(control_error):
                 raise
             return ToolResult.failed(
                 "Could not reach the task recipient",
-                data={"task_id": task_id},
+                data={
+                    "task_id": task_id,
+                    "error_type": RECIPIENT_UNREACHABLE_ERROR_TYPE,
+                },
             )
         except PeerDirectoryError as control_error:
             if is_execution_control_error(control_error):
@@ -3388,7 +3407,7 @@ class PeersFeature(Feature):
             recipient=recipient,
             recipient_agent_id=recipient_agent_id,
         )
-        if observed is not None:
+        if observed.receiver_terminal:
             return observed
         logger.info(
             "A2A question task=%s: recipient=%s task not confirmed terminal "
@@ -3396,7 +3415,21 @@ class PeersFeature(Feature):
             task_id, recipient,
             withdrawal.error if withdrawal is not None else "no route",
         )
-        return ReceiverSettlement(ReceiverSettlementOutcome.UNCONFIRMED)
+        # When both requests failed in transport (or found the recipient
+        # unavailable), its other questions would fail the same way, so the
+        # sweep leaves them for its next pass. A recipient that gave either
+        # request a decision keeps its classification (#3586).
+        unreachable = (
+            observed.recipient_unresponsive
+            and withdrawal is not None
+            and isinstance(withdrawal.data, Mapping)
+            and withdrawal.data.get("error_type")
+            == RECIPIENT_UNREACHABLE_ERROR_TYPE
+        )
+        return ReceiverSettlement(
+            ReceiverSettlementOutcome.UNCONFIRMED,
+            recipient_unresponsive=unreachable,
+        )
 
     async def _read_settled_peer_task(
         self,
@@ -3404,8 +3437,10 @@ class PeersFeature(Feature):
         task_id: str,
         recipient: str,
         recipient_agent_id: Optional[str],
-    ) -> Optional[ReceiverSettlement]:
-        """Read the recipient's task; ``None`` unless it is terminal."""
+    ) -> ReceiverSettlement:
+        """Read the recipient's task: ``UNCONFIRMED`` unless it is terminal,
+        flagged ``recipient_unresponsive`` when the read failed in transport
+        or found the recipient unavailable."""
         try:
             agent_id = await self._question_recipient_agent_id(
                 task_id, recipient_agent_id,
@@ -3421,7 +3456,12 @@ class PeersFeature(Feature):
                 "A2A question task=%s: recipient=%s task unreadable: %s",
                 task_id, recipient, type(exc).__name__,
             )
-            return None
+            return ReceiverSettlement(
+                ReceiverSettlementOutcome.UNCONFIRMED,
+                recipient_unresponsive=isinstance(
+                    exc, (PeerTransportError, PeerUnavailableError),
+                ),
+            )
         except Exception as exc:  # noqa: BLE001 - provider extension boundary
             if is_execution_control_error(exc):
                 raise
@@ -3429,12 +3469,12 @@ class PeersFeature(Feature):
                 "Peer router raised unexpectedly reading task %s from %r",
                 task_id, recipient,
             )
-            return None
+            return ReceiverSettlement(ReceiverSettlementOutcome.UNCONFIRMED)
         if not isinstance(data, Mapping):
-            return None
+            return ReceiverSettlement(ReceiverSettlementOutcome.UNCONFIRMED)
         parsed = self._parse_task_status_payload(data)
         if parsed is None or parsed[0] not in A2A_TERMINAL_TASK_STATES:
-            return None
+            return ReceiverSettlement(ReceiverSettlementOutcome.UNCONFIRMED)
         state, reply_text = parsed
         if state == "canceled" and self._canceled_by_this_agent(data):
             # Our own withdrawal committed even though its response was lost.
@@ -3591,9 +3631,10 @@ class PeersFeature(Feature):
         A row is retried on every pass, with no age cutoff, until the
         recipient's task is withdrawn or the recipient's own answer has woken
         the asker (see ``list_expired_awaiting_receiver``). A recipient that
-        does not answer within the settlement bound costs one attempt per
-        pass, not one per question: its other unsettled rows wait for the
-        next pass. ``now`` is the pass's clock for the claim lease."""
+        does not answer within the settlement bound, or whose cancellation
+        and read both fail in transport, costs one attempt per pass, not one
+        per question: its other unsettled rows wait for the next pass.
+        ``now`` is the pass's clock for the claim lease."""
         import asyncio
 
         from kestrel_sovereign.storage.async_pending_a2a_question_store import (
