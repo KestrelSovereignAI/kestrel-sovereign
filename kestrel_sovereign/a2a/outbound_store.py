@@ -375,7 +375,9 @@ async def update_outbound_terminal_state(
     Idempotent: updating with the same terminal_state twice is a no-op net of
     the ``terminal_at`` stamp. An authoritative remote cancellation may
     supersede sender-local provisional states (deadline expiry or a dispatch
-    failure); it may not overwrite a contradictory remote terminal result.
+    failure), and any remote terminal result supersedes a deadline expiry: a
+    recipient that answered after the sender gave up did answer (#3440). It
+    may not overwrite a contradictory remote terminal result.
     """
     now = datetime.now(timezone.utc).isoformat()
     affected = await db.execute(
@@ -389,9 +391,16 @@ async def update_outbound_terminal_state(
                   ? = 'canceled'
                   AND terminal_state IN ('expired', 'dispatch_failed')
               )
+              OR (
+                  ? IN ('completed', 'failed')
+                  AND terminal_state = 'expired'
+              )
           )
         """,
-        (terminal_state, now, error, agent_id, task_id, terminal_state),
+        (
+            terminal_state, now, error, agent_id, task_id,
+            terminal_state, terminal_state,
+        ),
     )
     # AsyncDatabase.execute returns rows-affected as int. Older test
     # doubles may return a cursor-like object with .rowcount, or None;

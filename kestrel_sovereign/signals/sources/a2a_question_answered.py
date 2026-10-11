@@ -126,6 +126,26 @@ def _a2a_question_answered_schema(payload: dict) -> dict:
         raise ValueError(
             "a2a.question_answered payload truncated must be a bool"
         )
+    if "late" in payload:
+        if not isinstance(payload["late"], bool):
+            raise ValueError(
+                "a2a.question_answered payload late must be a bool"
+            )
+        if payload["late"] and payload["state"] == "expired":
+            raise ValueError(
+                "a2a.question_answered late wake must carry the recipient's "
+                "terminal state, not 'expired'"
+            )
+    if "withdrawn" in payload:
+        if not isinstance(payload["withdrawn"], bool):
+            raise ValueError(
+                "a2a.question_answered payload withdrawn must be a bool"
+            )
+        if payload["withdrawn"] and payload["state"] != "expired":
+            raise ValueError(
+                "a2a.question_answered withdrawn wake must carry state "
+                "'expired': only an expiry withdraws the question"
+            )
     # Inject defaults for the prompt template's full placeholder set so
     # legacy callers (test fixtures, external integrations, future code
     # paths) building a payload with only required keys don't KeyError
@@ -133,6 +153,8 @@ def _a2a_question_answered_schema(payload: dict) -> dict:
     # codex round 2).
     payload.setdefault("origin_session_id", "")
     payload.setdefault("truncated", False)
+    payload.setdefault("late", False)
+    payload.setdefault("withdrawn", False)
     return payload
 
 
@@ -146,6 +168,8 @@ def _a2a_question_answered_redact(payload: dict) -> str:
         f"task_id={payload.get('task_id', '?')} "
         f"recipient={payload.get('recipient', '?')} "
         f"state={state} "
+        f"late={bool(payload.get('late', False))} "
+        f"withdrawn={bool(payload.get('withdrawn', False))} "
         f"reply_chars={len(payload.get('reply_text', ''))}"
     )
 
@@ -220,6 +244,8 @@ def build_signal_for_question_answered(
     target_agent: str,
     origin_session_id: str = "",
     causation_chain: Optional[list] = None,
+    late: bool = False,
+    withdrawn: bool = False,
 ) -> Signal:
     """Build the resumption signal.
 
@@ -234,6 +260,15 @@ def build_signal_for_question_answered(
     ``_deserialize_chain``). The caller (subscription supervisor) reads
     it from the receiver's terminal task metadata and threads it
     through here so the dispatcher's depth-2 cycle cap still applies.
+
+    ``late`` marks the recipient's own terminal answer arriving after the
+    asker was already woken with ``state='expired'`` (#3440). It gets its own
+    dedupe key: it is a second, distinct wake for the same question.
+
+    ``withdrawn`` marks an ``expired`` wake whose question is confirmed
+    withdrawn: the recipient's task is canceled and will be neither answered
+    nor re-delivered. An ``expired`` wake without it could not confirm the
+    withdrawal, so the recipient's task may still be live (#3440).
     """
     truncated = False
     if len(reply_text.encode("utf-8")) > REPLY_TEXT_INLINE_CAP_BYTES:
@@ -266,6 +301,8 @@ def build_signal_for_question_answered(
             "state": state,
             "origin_session_id": origin_session_id,
             "truncated": truncated,
+            "late": late,
+            "withdrawn": withdrawn,
         },
         target_agent=target_agent,
         # #1522: USER_VISIBLE (was INTERNAL) so the dispatcher emits a
@@ -291,7 +328,7 @@ def build_signal_for_question_answered(
         urgency=Urgency.NORMAL,
         # Dedupe key prevents subscription + startup-replay racing for
         # the same terminal event from waking two cognition turns.
-        dedupe_key=f"{task_id}:answered",
+        dedupe_key=f"{task_id}:answered:late" if late else f"{task_id}:answered",
         causation_chain=list(causation_chain or []),
     )
 

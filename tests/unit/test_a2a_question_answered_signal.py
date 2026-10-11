@@ -227,3 +227,144 @@ class TestPackagedTemplate:
             f"kestrel_sovereign package so it ships with the wheel. "
             f"Package root: {package_root}."
         )
+
+
+# ---------------------------------------------------------------------------
+# Late answers (#3440)
+# ---------------------------------------------------------------------------
+
+
+def test_late_answer_is_a_distinct_flagged_wake():
+    from kestrel_sovereign.signals.sources.a2a_question_answered import (
+        build_signal_for_question_answered,
+    )
+
+    on_time = build_signal_for_question_answered(
+        task_id="t-late", recipient="Nellie", original_question="q",
+        reply_text="", state="expired", target_agent="did:test:emma",
+    )
+    late = build_signal_for_question_answered(
+        task_id="t-late", recipient="Nellie", original_question="q",
+        reply_text="numbers", state="completed", target_agent="did:test:emma",
+        late=True,
+    )
+
+    assert on_time.payload["late"] is False
+    assert late.payload["late"] is True
+    assert on_time.dedupe_key == "t-late:answered"
+    assert late.dedupe_key == "t-late:answered:late"
+
+
+def test_schema_defaults_late_and_rejects_a_late_expiry():
+    from kestrel_sovereign.signals.sources.a2a_question_answered import (
+        _a2a_question_answered_schema,
+    )
+
+    base = {
+        "task_id": "t", "recipient": "Nellie", "original_question": "q",
+        "reply_text": "", "state": "expired",
+    }
+    assert _a2a_question_answered_schema(dict(base))["late"] is False
+    with pytest.raises(ValueError, match="late"):
+        _a2a_question_answered_schema({**base, "late": True})
+    with pytest.raises(ValueError, match="bool"):
+        _a2a_question_answered_schema(
+            {**base, "state": "completed", "late": "yes"}
+        )
+
+
+def test_prompt_template_renders_the_late_flag():
+    from kestrel_sovereign.signals.sources.a2a_question_answered import (
+        PROMPT_TEMPLATE,
+        _a2a_question_answered_schema,
+    )
+
+    payload = _a2a_question_answered_schema({
+        "task_id": "t", "recipient": "Nellie", "original_question": "q",
+        "reply_text": "numbers", "state": "completed", "late": True,
+    })
+    rendered = PROMPT_TEMPLATE.read_text().format(
+        payload=payload, source="a2a.question_answered",
+        target_agent="did:test:emma", arrived_at="now", urgency="normal",
+    )
+    assert "late: `True`" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Withdrawn expiries (#3440)
+# ---------------------------------------------------------------------------
+
+
+def test_schema_defaults_withdrawn_and_rejects_it_off_an_expiry():
+    from kestrel_sovereign.signals.sources.a2a_question_answered import (
+        _a2a_question_answered_schema,
+    )
+
+    base = {
+        "task_id": "t", "recipient": "Nellie", "original_question": "q",
+        "reply_text": "", "state": "expired",
+    }
+    assert _a2a_question_answered_schema(dict(base))["withdrawn"] is False
+    assert _a2a_question_answered_schema(
+        {**base, "withdrawn": True}
+    )["withdrawn"] is True
+    with pytest.raises(ValueError, match="withdrawn"):
+        _a2a_question_answered_schema(
+            {**base, "state": "completed", "withdrawn": True}
+        )
+    with pytest.raises(ValueError, match="bool"):
+        _a2a_question_answered_schema({**base, "withdrawn": "yes"})
+
+
+def test_builder_carries_withdrawn():
+    from kestrel_sovereign.signals.sources.a2a_question_answered import (
+        build_signal_for_question_answered,
+    )
+
+    withdrawn = build_signal_for_question_answered(
+        task_id="t", recipient="Nellie", original_question="q",
+        reply_text="", state="expired", target_agent="did:test:emma",
+        withdrawn=True,
+    )
+    unreached = build_signal_for_question_answered(
+        task_id="t", recipient="Nellie", original_question="q",
+        reply_text="", state="expired", target_agent="did:test:emma",
+    )
+
+    assert withdrawn.payload["withdrawn"] is True
+    assert unreached.payload["withdrawn"] is False
+    # Same wake for the same question either way.
+    assert withdrawn.dedupe_key == unreached.dedupe_key
+
+
+def _render(payload: dict) -> str:
+    from kestrel_sovereign.signals.sources.a2a_question_answered import (
+        PROMPT_TEMPLATE,
+        _a2a_question_answered_schema,
+    )
+
+    return PROMPT_TEMPLATE.read_text().format(
+        payload=_a2a_question_answered_schema(payload),
+        source="a2a.question_answered", target_agent="did:test:emma",
+        arrived_at="now", urgency="normal",
+    )
+
+
+def test_prompt_does_not_claim_an_unreached_recipients_task_was_canceled():
+    """An expiry that could not reach the recipient leaves its task live. The
+    resumed turn must be told the withdrawal is unconfirmed, not that the
+    task was canceled and cannot be re-delivered."""
+    expiry = {
+        "task_id": "t", "recipient": "Nellie", "original_question": "q",
+        "reply_text": "", "state": "expired",
+    }
+
+    unreached = _render({**expiry, "withdrawn": False})
+    withdrawn = _render({**expiry, "withdrawn": True})
+
+    assert "`withdrawn`, which is `False` here" in unreached
+    assert "`withdrawn`, which is `True` here" in withdrawn
+    # Neither states a cancellation as fact outside the ``withdrawn`` branch.
+    for rendered in (unreached, withdrawn):
+        assert "The question has been withdrawn" not in rendered
+        assert "could NOT be confirmed" in rendered
