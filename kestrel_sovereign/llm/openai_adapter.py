@@ -72,7 +72,9 @@ from .output_ceiling import (
     output_limit_cut_notice,
 )
 from .retry import with_retry
-from kestrel_sovereign.execution_custody import close_native_execution_stream
+from kestrel_sovereign.execution_custody import (
+    close_native_execution_stream, retain_native_execution_http_client_close, is_execution_control_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -361,9 +363,12 @@ class OpenAIAdapter(LLMAdapter):
         url = f"{root}/models" if root.endswith("/v1") else f"{root}/v1/models"
         try:
             async with httpx.AsyncClient(timeout=timeout) as http:
+                retain_native_execution_http_client_close(http)
                 response = await http.get(url)
             return response.status_code < 500
-        except httpx.HTTPError:
+        except httpx.HTTPError as error:
+            if is_execution_control_error(error):
+                raise
             return False
 
     @staticmethod
@@ -397,6 +402,7 @@ class OpenAIAdapter(LLMAdapter):
         usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         create_kwargs: Dict[str, Any] = {
             "model": model or self.DEFAULT_EMBEDDING_MODEL,
             "input": text,
@@ -427,6 +433,7 @@ class OpenAIAdapter(LLMAdapter):
         usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not texts:
             return []
         create_kwargs: Dict[str, Any] = {
@@ -504,6 +511,7 @@ class OpenAIAdapter(LLMAdapter):
         Returns:
             LLMResponse with content and/or tool calls
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -636,6 +644,8 @@ class OpenAIAdapter(LLMAdapter):
             logger.error(f"OpenAI API error: {e}")
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"OpenAI adapter failed: {e}", exc_info=True)
             raise
 
@@ -666,6 +676,7 @@ class OpenAIAdapter(LLMAdapter):
         Yields:
             Text chunks as they arrive
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -808,6 +819,7 @@ class OpenAIAdapter(LLMAdapter):
                             result = execute_tool(tc)
                             # Continue conversation with tool results
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -1115,6 +1127,7 @@ class OpenAIAdapter(LLMAdapter):
         requests: List[Any],
         **kwargs: Any,
     ) -> Any:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         lines = []
         for index, request in enumerate(requests):
             body = self._batch_request_body(request)
@@ -1151,10 +1164,12 @@ class OpenAIAdapter(LLMAdapter):
         return self._batch_handle(batch)
 
     async def batch_poll(self, client: Any, handle: Any, **kwargs: Any) -> Any:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         batch = await with_retry(client.batches.retrieve, getattr(handle, "id", handle))
         return self._batch_handle(batch)
 
     async def batch_results(self, client: Any, handle: Any, **kwargs: Any) -> List[Any]:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         raw_handle = getattr(handle, "raw", None) or handle
         output_file_id = (
             getattr(raw_handle, "output_file_id", None)
@@ -1204,6 +1219,7 @@ class OpenAIAdapter(LLMAdapter):
         return results
 
     async def batch_cancel(self, client: Any, handle: Any, **kwargs: Any) -> Any:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         batch = await with_retry(client.batches.cancel, getattr(handle, "id", handle))
         return self._batch_handle(batch)
 
@@ -1215,6 +1231,7 @@ class OpenAIAdapter(LLMAdapter):
         purpose: Optional[str] = None,
         **kwargs: Any,
     ) -> Any:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         uploaded = await with_retry(
             client.files.create,
             file=file,
@@ -1223,14 +1240,17 @@ class OpenAIAdapter(LLMAdapter):
         return self._file_ref(uploaded)
 
     async def file_list(self, client: Any, **kwargs: Any) -> List[Any]:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         response = await with_retry(client.files.list, **kwargs)
         return [self._file_ref(item) for item in getattr(response, "data", [])]
 
     async def file_get(self, client: Any, file_id: str, **kwargs: Any) -> Any:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         response = await with_retry(client.files.retrieve, file_id)
         return self._file_ref(response)
 
     async def file_delete(self, client: Any, file_id: str, **kwargs: Any) -> bool:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         response = await with_retry(client.files.delete, file_id)
         return bool(getattr(response, "deleted", False) or getattr(response, "id", None))
 
@@ -1356,6 +1376,7 @@ class OpenAIAdapter(LLMAdapter):
         path: Optional[str] = None,
         **kwargs: Any,
     ) -> Any:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         target: Any = client
         for part in operation.split("."):
             target = getattr(target, part)
@@ -1391,6 +1412,7 @@ class OpenAIAdapter(LLMAdapter):
         Returns:
             List of ModelInfo objects.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             if client is None:
                 # Legacy fallback. Modern callers always pass the route
@@ -1409,6 +1431,7 @@ class OpenAIAdapter(LLMAdapter):
                     "rebuilding from OPENAI_API_KEY (canonical OpenAI only)"
                 )
                 client = openai.AsyncOpenAI(api_key=api_key)
+                retain_native_execution_http_client_close(getattr(client, "_client", None))
 
             response = await client.models.list()
 
@@ -1474,6 +1497,7 @@ class OpenAIAdapter(LLMAdapter):
         once; failures propagate so the discovery layer can decide whether they
         are loud (route claims embedding support) or expected-unsupported.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         provider = getattr(self, "name", "openai") or "openai"
 
         if chat_models is not None:
@@ -1490,6 +1514,7 @@ class OpenAIAdapter(LLMAdapter):
                 )
                 return []
             client = openai.AsyncOpenAI(api_key=api_key)
+            retain_native_execution_http_client_close(getattr(client, "_client", None))
 
         response = await client.models.list()
         return self._embedding_models_from_ids(

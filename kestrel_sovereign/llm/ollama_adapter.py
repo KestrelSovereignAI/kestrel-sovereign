@@ -12,6 +12,7 @@ import json
 import logging
 from kestrel_sovereign.execution_custody import (
     owned_execution_stream, close_native_execution_stream, retain_native_execution_http_client_close,
+    is_execution_control_error,
 )
 from collections.abc import Mapping
 from typing import (
@@ -350,6 +351,7 @@ class OllamaAdapter(LLMAdapter):
         (e.g. ``pull``, ``show``, ``ps``). Routes a named ``operation`` through
         the initialized Ollama client so host/transport are reused. Path-based
         passthrough is unsupported (the typed client owns the endpoint mapping)."""
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not operation:
             raise ValueError(
                 "raw_request requires a named Ollama client operation "
@@ -385,9 +387,12 @@ class OllamaAdapter(LLMAdapter):
         url = f"{str(host).rstrip('/')}/api/tags"
         try:
             async with httpx.AsyncClient(timeout=timeout) as http:
+                retain_native_execution_http_client_close(http)
                 response = await http.get(url)
             return response.status_code < 500
-        except httpx.HTTPError:
+        except httpx.HTTPError as error:
+            if is_execution_control_error(error):
+                raise
             return False
 
     def embedding_space_id(self) -> Optional[str]:
@@ -448,6 +453,7 @@ class OllamaAdapter(LLMAdapter):
         usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             response = await client.embed(
                 model=model or self._embedding_model,
@@ -455,6 +461,8 @@ class OllamaAdapter(LLMAdapter):
                 **self._embed_kwargs(dimensions),
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning("Ollama embedding failed: %s", exc)
             return None
         self._report_embedding_usage(usage_sink, response)
@@ -471,6 +479,7 @@ class OllamaAdapter(LLMAdapter):
         usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not texts:
             return []
         try:
@@ -480,6 +489,8 @@ class OllamaAdapter(LLMAdapter):
                 **self._embed_kwargs(dimensions),
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning("Ollama batch embedding failed: %s", exc)
             return [None] * len(texts)
         self._report_embedding_usage(usage_sink, response)
@@ -548,6 +559,7 @@ class OllamaAdapter(LLMAdapter):
                 arrived (#3572). The pending request was cancelled, which
                 closed its HTTP response, so the daemon stops generating.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not OLLAMA_AVAILABLE:
             raise RuntimeError("Ollama is not available in this environment")
 
@@ -620,6 +632,8 @@ class OllamaAdapter(LLMAdapter):
                 except (json.JSONDecodeError, ValueError) as e:
                     logger.warning(f"Ollama structured output validation failed: {e}")
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.error(f"Unexpected error during Ollama structured output validation: {e}", exc_info=True)
                     # Return raw content if validation fails
 
@@ -712,6 +726,7 @@ class OllamaAdapter(LLMAdapter):
         prompt (#3572): the pending read is cancelled, which closes the HTTP
         response, so the daemon stops generating.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not OLLAMA_AVAILABLE:
             raise RuntimeError("Ollama is not available in this environment")
 
@@ -733,7 +748,6 @@ class OllamaAdapter(LLMAdapter):
             # Ollama returns an async generator rather than an SDK stream
             # exposing .response. Own its native HTTP response BEFORE the
             # generator can reach HTTPX's implicit EOF close.
-            retain_native_execution_http_client_close(getattr(client, "_client", None))
             stream = await await_or_cancelled(
                 with_retry(
                     client.chat,
@@ -825,6 +839,8 @@ class OllamaAdapter(LLMAdapter):
                 except (json.JSONDecodeError, ValueError) as e:
                     logger.warning(f"Ollama streaming structured output validation failed: {e}")
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.error(f"Unexpected error during Ollama streaming structured output validation: {e}", exc_info=True)
 
             total_tokens = None
@@ -844,6 +860,8 @@ class OllamaAdapter(LLMAdapter):
             logger.error(f"Ollama streaming API error: {e}")
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Ollama streaming failed: {e}", exc_info=True)
             raise
 
@@ -981,6 +999,8 @@ class OllamaAdapter(LLMAdapter):
             logger.error(f"Ollama streaming with tools API error: {e}")
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Ollama streaming with tools failed: {e}", exc_info=True)
             raise
 
@@ -1046,6 +1066,7 @@ class OllamaAdapter(LLMAdapter):
         Returns:
             True if the model advertises tool calling support.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             info = await client.show(model_name)
         except Exception as e:
@@ -1087,6 +1108,7 @@ class OllamaAdapter(LLMAdapter):
         Returns:
             List of ModelInfo objects for each available model
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not OLLAMA_AVAILABLE:
             logger.warning("Ollama library not available, returning empty model list")
             return []
@@ -1094,6 +1116,7 @@ class OllamaAdapter(LLMAdapter):
         try:
             # Use async client to list models
             client = ollama.AsyncClient()
+            retain_native_execution_http_client_close(getattr(client, "_client", None))
             response = await client.list()
 
             # Handle both dict response (older ollama) and Pydantic model (newer ollama)
@@ -1151,6 +1174,8 @@ class OllamaAdapter(LLMAdapter):
                 try:
                     show_info = await client.show(model_name)
                 except Exception as e:  # noqa: BLE001 - per-model metadata is best-effort
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(f"Could not read metadata for {model_name}: {e}")
                     show_info = None
                 if show_info is not None and self._is_decision_only(show_info):
@@ -1182,6 +1207,8 @@ class OllamaAdapter(LLMAdapter):
             logger.error(f"Ollama API error while listing models: {e}")
             return []
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to list Ollama models: {e}", exc_info=True)
             return []
 
@@ -1217,6 +1244,7 @@ class OllamaAdapter(LLMAdapter):
         with ``decision_context_limit``. Failures propagate so discovery can
         mark the route stale.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not OLLAMA_AVAILABLE or client is None:
             return []
         response = await client.list()
@@ -1257,6 +1285,7 @@ class OllamaAdapter(LLMAdapter):
         replaces the name-substring heuristic in :meth:`list_models`, so a
         differently-named embedding model is still discovered.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             info = await client.show(model_name)
             if isinstance(info, dict):
@@ -1265,6 +1294,8 @@ class OllamaAdapter(LLMAdapter):
                 capabilities = getattr(info, "capabilities", None) or []
             return "embedding" in capabilities
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Could not check embedding support for {model_name}: {e}")
             return False
 
@@ -1285,6 +1316,7 @@ class OllamaAdapter(LLMAdapter):
         when no client was passed — otherwise a route pointed at a remote or
         non-default Ollama would be silently probed against localhost (#2338).
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         from .embedding_discovery import EmbeddingModelInfo
 
         if not OLLAMA_AVAILABLE:
@@ -1296,6 +1328,7 @@ class OllamaAdapter(LLMAdapter):
         try:
             if client is None:
                 client = ollama.AsyncClient()
+                retain_native_execution_http_client_close(getattr(client, "_client", None))
             response = await client.list()
 
             if hasattr(response, "models"):

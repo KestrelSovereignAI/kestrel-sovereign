@@ -1152,7 +1152,7 @@ class SignalDispatcher:
         try:
             async with self._admit_durable_operation():
                 if self._outcome_log_control_error is not None:
-                    raise self._outcome_log_control_error
+                    raise execution_terminal_error(self._outcome_log_control_error)
                 result = await self._run(
                     signal,
                     start,
@@ -2742,14 +2742,14 @@ class SignalDispatcher:
             tasks = tuple(self._outcome_log_tasks)
             await self._join_outcome_log_tasks(tasks)
         if self._outcome_log_control_error is not None:
-            raise self._outcome_log_control_error
+            raise execution_terminal_error(self._outcome_log_control_error)
 
     async def _drain_outcome_logs_for_signal(self, signal_id: str) -> None:
         """Join this dispatch's outcome writers before returning its result."""
         while tasks := self._outcome_log_tasks_by_signal.get(signal_id):
             await self._join_outcome_log_tasks(tuple(tasks))
         if self._outcome_log_control_error is not None:
-            raise self._outcome_log_control_error
+            raise execution_terminal_error(self._outcome_log_control_error)
 
     async def _join_outcome_log_tasks(self, tasks) -> None:
         from kestrel_sovereign._async_ownership import await_owned_task

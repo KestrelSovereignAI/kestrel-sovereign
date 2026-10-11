@@ -19,7 +19,9 @@ Key features:
 """
 import os
 import logging
-from kestrel_sovereign.execution_custody import owned_execution_stream
+from kestrel_sovereign.execution_custody import (
+    owned_execution_stream, retain_native_execution_http_client_close, is_execution_control_error,
+)
 from dataclasses import replace
 import httpx
 from typing import List, Optional, Dict, Any, Type, AsyncIterator, TYPE_CHECKING, Union
@@ -333,6 +335,7 @@ class OpenRouterAdapter(OpenAIAdapter):
 
         try:
             async with httpx.AsyncClient() as http_client:
+                retain_native_execution_http_client_close(http_client)
                 response = await http_client.get(
                     f"{self.base_url}/models",
                     headers={"Authorization": f"Bearer {self.api_key}"},
@@ -409,9 +412,13 @@ class OpenRouterAdapter(OpenAIAdapter):
             return models
 
         except httpx.HTTPError as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"OpenRouter HTTP error during model discovery: {e}")
             return []
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"OpenRouter model discovery failed: {e}")
             return []
 
@@ -453,6 +460,7 @@ class OpenRouterAdapter(OpenAIAdapter):
 
         url = f"{self.base_url}/embeddings/models"
         async with httpx.AsyncClient() as http_client:
+            retain_native_execution_http_client_close(http_client)
             response = await http_client.get(
                 url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
@@ -516,6 +524,7 @@ class OpenRouterAdapter(OpenAIAdapter):
         if not self.api_key:
             return []
         async with httpx.AsyncClient() as http_client:
+            retain_native_execution_http_client_close(http_client)
             response = await http_client.get(
                 f"{self.base_url}/models",
                 params={"output_modalities": "decisions"},
