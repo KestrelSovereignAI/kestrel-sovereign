@@ -37,11 +37,19 @@ from kestrel_sovereign.features.tasks.feature import TaskFeature
 from kestrel_sovereign.features.peers.directory import (
     LocalHostPeerDirectory,
     PeerAccessDeniedError,
+    PeerDirectoryError,
     PeerIdentity,
+    PeerNotFoundError,
+    PeerProtocolError,
     PeerRequester,
     PeerTaskConflictError,
+    PeerTransportError,
+    PeerUnavailableError,
 )
-from kestrel_sovereign.features.peers.feature import PeersFeature
+from kestrel_sovereign.features.peers.feature import (
+    RECIPIENT_UNREACHABLE_ERROR_TYPE,
+    PeersFeature,
+)
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 
 
@@ -3456,6 +3464,100 @@ async def test_outbound_cancel_reports_lifecycle_conflict_not_transport(monkeypa
     assert result.status is ToolResultStatus.ERROR
     assert result.data["error_type"] == "lifecycle_conflict"
     assert "terminal state" in result.error
+
+
+def _routed_outbound_cancel(monkeypatch, *, resolve_error=None, cancel_error=None):
+    """A creator whose durable outbound route resolves (or fails to) and
+    whose router's cancellation raises ``cancel_error``."""
+    from kestrel_sovereign.a2a import outbound_store
+
+    actor = SimpleNamespace(did="did:test:creator", identity=None)
+    peers = PeersFeature(actor)
+    peers._db = object()
+    peers._outbound_route_store_ready = True
+    peers._own_name = "creator"
+    monkeypatch.setattr(
+        outbound_store,
+        "get_outbound_task",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                recipient="Recipient",
+                recipient_agent_id="did:test:recipient",
+                route_state=outbound_store.ROUTE_STATE_ROUTABLE,
+            )
+        ),
+    )
+    router = SimpleNamespace(cancel_a2a_task=AsyncMock(side_effect=cancel_error))
+    peers._resolve_retained_automatic_peer = AsyncMock(
+        return_value=(
+            router,
+            PeerRequester(actor.did, object()),
+            PeerIdentity(
+                agent_id="did:test:recipient",
+                slug="recipient",
+                routing_key="recipient-route",
+            ),
+        ),
+        side_effect=resolve_error,
+    )
+    peers._maybe_sign_outbound = MagicMock()
+    return peers, router
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step", ["resolve", "cancel"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        PeerTransportError("Could not reach local peer host"),
+        PeerUnavailableError("Peer is unavailable"),
+    ],
+    ids=["transport", "unavailable"],
+)
+async def test_outbound_cancel_marks_an_unreachable_recipient(
+    monkeypatch, step, failure,
+):
+    """A cancellation that failed in transport, or found the recipient
+    unavailable, says so: the expiry settlement sweep then leaves that
+    recipient's other questions for its next pass (#3586)."""
+    peers, router = _routed_outbound_cancel(
+        monkeypatch,
+        resolve_error=failure if step == "resolve" else None,
+        cancel_error=failure if step == "cancel" else None,
+    )
+
+    result = await peers.cancel_outbound_task("outbound-task")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["error_type"] == RECIPIENT_UNREACHABLE_ERROR_TYPE
+    if step == "resolve":
+        router.cancel_a2a_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        PeerTaskConflictError("already terminal"),
+        PeerNotFoundError("gone"),
+        PeerAccessDeniedError("denied"),
+        PeerProtocolError("malformed"),
+        PeerDirectoryError("failed"),
+        RuntimeError("provider bug"),
+    ],
+    ids=lambda failure: type(failure).__name__,
+)
+async def test_outbound_cancel_answered_by_the_route_is_not_unreachable(
+    monkeypatch, failure,
+):
+    """Only a transport failure or an unavailable recipient is marked
+    unreachable (#3586); every other failure keeps its own classification."""
+    peers, _router = _routed_outbound_cancel(monkeypatch, cancel_error=failure)
+
+    result = await peers.cancel_outbound_task("outbound-task")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data.get("error_type") != RECIPIENT_UNREACHABLE_ERROR_TYPE
 
 
 @pytest.mark.asyncio
