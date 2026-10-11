@@ -1193,6 +1193,37 @@ async def test_a_memory_whose_turn_was_never_written_is_judged_without_one(stora
     }
 
 
+async def test_a_tool_retrieval_answered_in_its_second_is_judged_in_its_turn(storage):
+    """Not in the next turn, started 30 seconds later in the session (#3583)."""
+    now = datetime.now(timezone.utc)
+    await _set_watermark(storage, now - timedelta(hours=24))
+    memory = "The user's sister lives in Lisbon."
+    retrieved_at = _second(now - timedelta(hours=2)) + timedelta(milliseconds=300)
+    await _add(
+        storage, "user", "Where should I stay in Portugal?",
+        at=retrieved_at - timedelta(seconds=8),
+    )
+    await _memory(storage, memory, retrieved_at=retrieved_at)
+    await _add(
+        storage, "assistant", "Your sister is in Lisbon; stay near her.",
+        at=retrieved_at,
+    )
+    await _turn(
+        storage, "What is the weather like there?", "Mild in spring.",
+        at=retrieved_at + timedelta(seconds=30),
+    )
+
+    judge = _ChatJudge()
+    agent = _Agent(storage, await _memory_system(storage), judge)
+    await ReflectionSleepHook().on_pre_sleep(agent)
+    assert judge.sessions == {
+        memory: (
+            "user: Where should I stay in Portugal?\n"
+            "assistant: Your sister is in Lisbon; stay near her."
+        )
+    }
+
+
 # --- the store read ----------------------------------------------------------
 
 
@@ -1270,31 +1301,36 @@ def test_turn_of_a_tool_retrieval_inside_an_open_turn():
     assert _contents(retrieving_turn(*_split(rows), _T)) == ["u1", "r1"]
 
 
-def test_a_wake_right_after_a_reply_is_its_own_turn():
-    rows = [
-        _row("user", "u0", at=_T - timedelta(seconds=30)),
-        _row("assistant", "r0", at=_T),
-        _row("user", "wake", at=_T),
-        _row("assistant", "r1", at=_T + timedelta(seconds=9)),
-    ]
-    assert _contents(retrieving_turn(*_split(rows), _T)) == ["wake", "r1"]
-
-
-def test_a_wake_whose_row_follows_a_reply_in_the_retrievals_second():
-    """The previous reply shares the retrieval's second; the wake does not."""
-    rows = [
-        _row("user", "u0", at=_T - timedelta(seconds=5)),
-        _row("assistant", "r0", at=_T),
-        _row("user", "wake", at=_T + timedelta(seconds=1)),
-        _row("assistant", "r1", at=_T + timedelta(seconds=9)),
-    ]
-    assert _contents(retrieving_turn(*_split(rows), _T)) == ["wake", "r1"]
-
-
 def test_a_tool_retrievals_turn_answered_within_its_second_is_kept():
     rows = [
         _row("user", "u1", at=_T - timedelta(seconds=8)),
         _row("assistant", "r1", at=_T),
+    ]
+    assert _contents(retrieving_turn(*_split(rows), _T)) == ["u1", "r1"]
+
+
+@pytest.mark.parametrize(
+    "lead",
+    [
+        timedelta(0),
+        timedelta(seconds=1),
+        timedelta(seconds=30),
+        timedelta(minutes=2),
+    ],
+    ids=["same second", "a second later", "30 s later", "2 min later"],
+)
+def test_a_same_second_reply_keeps_its_turn_however_soon_the_next_starts(lead):
+    """A tool retrieval answered in its second is its open turn's (#3583).
+
+    The next turn's start does not move it. A wake queued behind the open turn
+    whose context retrieval falls in that second stores the same rows, and is
+    judged with the open turn too: nothing stored names the retrieving path.
+    """
+    rows = [
+        _row("user", "u1", at=_T - timedelta(seconds=8)),
+        _row("assistant", "r1", at=_T),
+        _row("user", "u2", at=_T + lead),
+        _row("assistant", "r2", at=_T + lead + timedelta(seconds=6)),
     ]
     assert _contents(retrieving_turn(*_split(rows), _T)) == ["u1", "r1"]
 
