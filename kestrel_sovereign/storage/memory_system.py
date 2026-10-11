@@ -26,8 +26,9 @@ Usage:
 import asyncio
 import logging
 import math
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
+from typing import AsyncIterator, Dict, Any, List, Optional
 
 from .memory_models import MemoryMetadata, TemporalPattern, MemoryEpisode
 from .emotional_tagger import EmotionalTagger
@@ -70,6 +71,15 @@ class MemoryConsolidationTimeoutError(TimeoutError):
             f"{timeout_seconds:g} seconds; the pass was abandoned and "
             "in-flight database work may still be draining"
         )
+
+
+class MemoryApplicationNotRecorded(RuntimeError):
+    """``mark_applied`` wrote nothing (#3544).
+
+    There was no store to write to, or no row of this agent with the id. A
+    caller that took the call as done would count an attestation that never
+    reached the memory's decay protection.
+    """
 
 
 def _positive_timeout_seconds(
@@ -661,6 +671,21 @@ class MemorySystem:
             depth=depth
         )
 
+    @asynccontextmanager
+    async def durable_writes(self) -> AsyncIterator[bool]:
+        """Hold the privacy-transition lock; say whether a durable write may run.
+
+        The same permission and lock the consolidator's durable writes use
+        (#2672, #2856). A writer that checks the mode and then awaits its
+        write does both inside this block, so a transition to EPHEMERAL /
+        ISOLATED cannot land between them. Yields ``False`` in a mode that
+        forbids persistence: the block must then write nothing.
+        """
+        from .privacy_wrapper import optional_transition_lock, persistent_writes_allowed
+
+        async with optional_transition_lock(self._transition_lock):
+            yield persistent_writes_allowed(self._privacy_storage)
+
     async def mark_applied(
         self,
         message_id: int,
@@ -687,16 +712,29 @@ class MemorySystem:
                 reflection-side aggregation is a follow-up.  Logged
                 here so the application context is visible in agent
                 traces even pre-persistence.
+
+        Returns only once the increment is written (#3544): committed, or,
+        inside a caller's transaction, part of it. A caller that records the
+        attestation anywhere else (the sleep hook's marks) may rely on that.
+
+        Raises:
+            MemoryApplicationNotRecorded: Nothing was written: no retriever
+                or store, or no row of this agent with ``message_id``.
+            Exception: The store's write failed; raised as the store raised it.
         """
         if not self.retriever:
-            logger.warning("Memory retriever not initialized; mark_applied is a no-op")
-            return
+            raise MemoryApplicationNotRecorded(
+                "memory retriever not initialized; nothing to mark applied"
+            )
+        if not await self.retriever.update_applied(message_id, self.agent_id):
+            raise MemoryApplicationNotRecorded(
+                f"no memory {message_id} of agent {self.agent_id} to mark applied"
+            )
         if reason:
             logger.info(
                 "memory.mark_applied agent=%s message_id=%s reason=%s",
                 self.agent_id, message_id, reason,
             )
-        await self.retriever.update_applied(message_id, self.agent_id)
 
     async def consolidate(self) -> Dict[str, Any]:
         """

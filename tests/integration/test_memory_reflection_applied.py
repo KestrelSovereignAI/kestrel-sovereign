@@ -71,7 +71,8 @@ async def test_pre_sleep_marks_only_llm_attested_retrieved_memories(
         applied_id = history[0]["id"]
         unused_id = history[1]["id"]
 
-        retrieved_at = datetime.now(timezone.utc).isoformat()
+        # Retrieved during the day, hours before sleep (#3544).
+        retrieved_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
         for msg_id in (applied_id, unused_id):
             await storage.conversation.update_message_metadata(
                 msg_id,
@@ -145,7 +146,7 @@ async def test_decision_backend_attests_each_candidate_on_its_own(tmp_path, capl
         history = await storage.conversation.get_full_history_with_ids()
         applied_id = history[0]["id"]
         unused_id = history[1]["id"]
-        retrieved_at = datetime.now(timezone.utc).isoformat()
+        retrieved_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
         for msg_id in (applied_id, unused_id):
             await storage.conversation.update_message_metadata(
                 msg_id,

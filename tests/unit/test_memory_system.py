@@ -17,7 +17,6 @@ from kestrel_sovereign.storage import (
     MemoryMetadata,
     TemporalPattern,
     MemoryEpisode,
-    EmotionalCategory,
     EmotionalTagger,
     TemporalAnalyzer,
     AssociativeLinker,
@@ -447,10 +446,13 @@ class TestMemoryRetriever:
         )
 
     @pytest.mark.asyncio
-    async def test_update_applied_swallows_write_errors(self):
-        """Bookkeeping failures (DB down, disk full) must not propagate
-        — calling code (typically reflection / pre-sleep hook) doesn't
-        want a flaky write to abort its own work."""
+    async def test_update_applied_propagates_write_errors(self):
+        """An application write that failed reaches its caller (#3544).
+
+        The pre-sleep hook moves its watermark past every retrieval it
+        judged. A swallowed failure there loses the attestation for good,
+        so unlike ``update_access`` this write does not hide its errors.
+        """
         store = AsyncMock()
         store.agent_id = "test-agent"
         store.atomic_increment_metadata_counter = AsyncMock(
@@ -458,8 +460,53 @@ class TestMemoryRetriever:
         )
 
         retriever = MemoryRetriever(store, None)
-        # Must not raise.
-        await retriever.update_applied(message_id=1, agent_id="test-agent")
+        with pytest.raises(RuntimeError, match="disk full"):
+            await retriever.update_applied(message_id=1, agent_id="test-agent")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("written", [True, False])
+    async def test_update_applied_reports_whether_a_row_was_updated(self, written):
+        store = AsyncMock()
+        store.agent_id = "test-agent"
+        store.atomic_increment_metadata_counter = AsyncMock(return_value=written)
+
+        retriever = MemoryRetriever(store, None)
+        assert await retriever.update_applied(1, "test-agent") is written
+
+    @pytest.mark.asyncio
+    async def test_update_applied_without_a_store_reports_nothing_written(self):
+        retriever = MemoryRetriever(None, None)
+        assert await retriever.update_applied(1, "test-agent") is False
+
+    @pytest.mark.asyncio
+    async def test_mark_applied_returns_only_once_the_write_is_confirmed(self):
+        """``mark_applied`` raises unless the increment updated a row."""
+        from kestrel_sovereign.storage.memory_system import (
+            MemoryApplicationNotRecorded,
+            MemorySystem,
+        )
+
+        memory = MemorySystem.__new__(MemorySystem)
+        memory.agent_id = "test-agent"
+        memory.retriever = MagicMock()
+
+        memory.retriever.update_applied = AsyncMock(return_value=True)
+        await memory.mark_applied(7, reason="steered tool choice")
+        memory.retriever.update_applied.assert_awaited_once_with(7, "test-agent")
+
+        memory.retriever.update_applied = AsyncMock(return_value=False)
+        with pytest.raises(MemoryApplicationNotRecorded):
+            await memory.mark_applied(7, reason="steered tool choice")
+
+        memory.retriever.update_applied = AsyncMock(
+            side_effect=RuntimeError("disk full")
+        )
+        with pytest.raises(RuntimeError, match="disk full"):
+            await memory.mark_applied(7)
+
+        memory.retriever = None
+        with pytest.raises(MemoryApplicationNotRecorded):
+            await memory.mark_applied(7)
 
     @pytest.mark.asyncio
     async def test_update_access_also_uses_atomic_increment(self):
@@ -1376,6 +1423,8 @@ class TestMemoryConsolidatorEpisodeCreation:
         ]
         mock_db.execute = AsyncMock()
         mock_db.fetchval.return_value = 5  # COUNT(*) total_messages_processed
+        # No attestation pass has run: no watermark defers archival (#3544).
+        mock_db.table_exists.return_value = False
 
         consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
         report = await consolidator.run_consolidation()
@@ -1421,6 +1470,8 @@ class TestMemoryConsolidatorEpisodeCreation:
         ]
         mock_db.execute = AsyncMock()
         mock_db.fetchval.return_value = 5  # COUNT(*) total_messages_processed
+        # No attestation pass has run: no watermark defers archival (#3544).
+        mock_db.table_exists.return_value = False
 
         consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
         report = await consolidator.run_consolidation()

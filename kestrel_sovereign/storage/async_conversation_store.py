@@ -5019,6 +5019,46 @@ class AsyncConversationStore:
             history.append(entry)
         return history
 
+    async def get_messages_around(
+        self,
+        at: datetime,
+        *,
+        before: int,
+        after: int,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Live rows on either side of ``at``: ``(earlier, later)``.
+
+        ``earlier`` holds up to ``before`` rows created before ``at`` and
+        ``later`` up to ``after`` rows created at or after it, each in
+        :func:`canonical_order`, so rows inside one stored second fall to
+        ``id``. Rows are decrypted and canonicalized as search reads them, and
+        like search this read does not migrate what it reads.
+        """
+        from .conversation_sessions import canonical_order, live_history_predicate
+
+        backend = self.db.backend_type
+        select = (
+            "SELECT id, role, content, metadata, created_at, rendered_content "
+            "FROM conversation_history "
+            f"WHERE agent_id = ? AND {live_history_predicate()} AND "
+        )
+        boundary = self._timestamp_query_param(at)
+        earlier_rows = await self.db.fetchall(
+            select + self._timestamp_predicate("created_at", "<")
+            + f" {canonical_order(backend, descending=True)} LIMIT ?",
+            (self.agent_id, boundary, max(0, int(before))),
+        )
+        later_rows = await self.db.fetchall(
+            select + self._timestamp_predicate("created_at", ">=")
+            + f" {canonical_order(backend)} LIMIT ?",
+            (self.agent_id, boundary, max(0, int(after))),
+        )
+        earlier = [
+            await self._normalized_search_row(row) for row in reversed(earlier_rows)
+        ]
+        later = [await self._normalized_search_row(row) for row in later_rows]
+        return earlier, later
+
     async def get_salient_memory_candidates(
         self, limit: int = 100
     ) -> List[Dict[str, Any]]:

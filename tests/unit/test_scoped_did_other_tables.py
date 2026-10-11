@@ -21,6 +21,7 @@ not the site's own refusal.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -115,27 +116,52 @@ async def test_notice_retention_sweep_refuses_without_a_did(monkeypatch, caplog)
 
 # --- features/memory/reflection_hook.py --------------------------------------
 
+@asynccontextmanager
+async def _writes_allowed():
+    yield True
+
+
 def _hook_agent(**identity):
-    memory = SimpleNamespace(mark_applied=lambda *a, **k: None)
+    memory = SimpleNamespace(
+        mark_applied=lambda *a, **k: None, durable_writes=_writes_allowed
+    )
     return SimpleNamespace(memory=memory, memory_system=memory, **identity)
 
 
 @pytest.mark.asyncio
-async def test_reflection_hook_scopes_its_memory_read_by_the_did(monkeypatch):
-    from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
+async def test_reflection_hook_scopes_its_memory_read_by_the_did(monkeypatch, tmp_path):
+    from kestrel_sovereign.features.memory.reflection_hook import (
+        ATTESTATION_STATE_TABLE,
+        ReflectionSleepHook,
+    )
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
 
+    async def no_schema(_db):
+        return None
+
+    db = await AsyncDatabase.sqlite(
+        str(tmp_path / "reflection.db"), schema_initializer=no_schema
+    )
     hook = ReflectionSleepHook()
     seen = []
 
-    async def fake_recent(db, *, conversation, agent_id, cutoff):
+    async def fake_recent(db, *, conversation, agent_id, since, until):
         seen.append(agent_id)
         return []
 
-    monkeypatch.setattr(hook, "_resolve_db", lambda agent: MagicMock())
+    monkeypatch.setattr(hook, "_resolve_db", lambda agent: db)
     monkeypatch.setattr(hook, "_recently_retrieved_memories", fake_recent)
-    result = await hook.on_pre_sleep(_hook_agent(did=DID, agent_id=OTHER))
+    try:
+        result = await hook.on_pre_sleep(_hook_agent(did=DID, agent_id=OTHER))
+        # The attestation watermark (#3544) is the DID's too.
+        watermarks = await db.fetchall(
+            f"SELECT agent_id FROM {ATTESTATION_STATE_TABLE}"
+        )
+    finally:
+        await db.close()
     assert result["success"] is True
     assert seen == [DID]
+    assert [row[0] for row in watermarks] == [DID]
 
 
 @pytest.mark.asyncio

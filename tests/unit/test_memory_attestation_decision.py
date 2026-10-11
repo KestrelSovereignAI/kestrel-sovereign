@@ -58,10 +58,11 @@ def _service(p_by_memory, *, threshold=0.5, errors=None, local_only=False):
 
 
 def _candidates(*contents):
+    """Each with its own turn as context (#3544)."""
     return [
         RetrievedMemoryCandidate(
             message_id=100 + index, content=content, retrieved_at="", created_at=None,
-            role="assistant",
+            role="assistant", session_context=f"the turn that retrieved {content}",
         )
         for index, content in enumerate(contents)
     ]
@@ -71,6 +72,21 @@ def _memory():
     memory = MagicMock(spec=["mark_applied"])
     memory.mark_applied = AsyncMock()
     return memory
+
+
+def _marks():
+    """Counts each retrieval through ``mark_applied``, as the real marks do,
+    with no other pass having counted it (#3544)."""
+
+    async def record(memory, candidate, *, reason):
+        await memory.mark_applied(candidate.message_id, reason=reason)
+        return True
+
+    return SimpleNamespace(record=AsyncMock(side_effect=record))
+
+
+def _recorded(marks):
+    return [call.args[1].message_id for call in marks.record.await_args_list]
 
 
 def test_request_builder_shape():
@@ -90,10 +106,11 @@ async def test_decision_backend_asks_once_per_memory_and_marks_over_threshold():
     service = _service({"used": 0.9, "ignored": 0.4, "nearly": 0.6}, threshold=0.65)
     memory = _memory()
     hook = ReflectionSleepHook(backend="decision", decision_model="openrouter:api/liquid/d1")
+    marks = _marks()
 
     result = await hook._attest_with_decisions(
         SimpleNamespace(llm_service=service), memory,
-        _candidates("used", "ignored", "nearly"), "session text",
+        _candidates("used", "ignored", "nearly"), marks,
     )
 
     assert result["success"] is True
@@ -105,12 +122,16 @@ async def test_decision_backend_asks_once_per_memory_and_marks_over_threshold():
     assert args == (100,)
     # Content-free: the route, model and probability, never memory text.
     assert kwargs["reason"] == "Decision attestation (openrouter:api/liquid/d1): p(applied)=0.90."
+    assert _recorded(marks) == [100]
 
     assert service.decide.await_count == 3
     sent = sorted(call.args[0].state["memory"] for call in service.decide.await_args_list)
     assert sent == ["ignored", "nearly", "used"]
     for call in service.decide.await_args_list:
-        assert call.args[0].state["session"] == "session text"
+        request = call.args[0]
+        # Each memory is judged against its own turn, not one shared context.
+        assert request.state["session"] == (
+            f"the turn that retrieved {request.state['memory']}")
         assert call.kwargs["caller"] == ATTESTATION_CALLER
         assert call.kwargs["model_override"] == "openrouter:api/liquid/d1"
         assert call.kwargs["local_only"] is False
@@ -137,7 +158,7 @@ async def test_decision_backend_bounds_requests_in_flight():
     service.decide = AsyncMock(side_effect=decide)
     task = asyncio.create_task(ReflectionSleepHook(backend="decision")._attest_with_decisions(
         SimpleNamespace(llm_service=service), _memory(),
-        _candidates(*(f"m{i}" for i in range(10))), "s"))
+        _candidates(*(f"m{i}" for i in range(10))), _marks()))
     for _ in range(20):
         await asyncio.sleep(0)
     assert peak == ATTESTATION_DECISION_CONCURRENCY
@@ -150,13 +171,13 @@ async def test_decision_backend_bounds_requests_in_flight():
 async def test_decision_backend_carries_live_privacy_and_fails_closed_when_unknown():
     private = _service({"a": 0.9}, local_only=True)
     await ReflectionSleepHook(backend="decision")._attest_with_decisions(
-        SimpleNamespace(llm_service=private), _memory(), _candidates("a"), "s")
+        SimpleNamespace(llm_service=private), _memory(), _candidates("a"), _marks())
     assert private.decide.await_args.kwargs["local_only"] is True
 
     unknown = _service({"a": 0.9})
     del unknown._current_force_local_only
     await ReflectionSleepHook(backend="decision")._attest_with_decisions(
-        SimpleNamespace(llm_service=unknown), _memory(), _candidates("a"), "s")
+        SimpleNamespace(llm_service=unknown), _memory(), _candidates("a"), _marks())
     assert unknown.decide.await_args.kwargs["local_only"] is True
 
 
@@ -168,9 +189,10 @@ async def test_decision_backend_carries_live_privacy_and_fails_closed_when_unkno
 async def test_a_failed_decision_fails_the_stage_but_keeps_completed_marks(error):
     memory = _memory()
     hook = ReflectionSleepHook(backend="decision")
+    marks = _marks()
     result = await hook._attest_with_decisions(
         SimpleNamespace(llm_service=_service({"used": 0.9, "b": 0.9}, errors={"b": error})),
-        memory, _candidates("used", "b"), "s",
+        memory, _candidates("used", "b"), marks,
     )
     assert result["success"] is False
     assert result["reason"] == "attestation_failed"
@@ -179,16 +201,20 @@ async def test_a_failed_decision_fails_the_stage_but_keeps_completed_marks(error
     assert hook._pre_sleep_status.get() is SleepHookStatus.FAILED
     memory.mark_applied.assert_awaited_once()
     assert memory.mark_applied.await_args.args == (100,)
+    # Recorded, so the retry of this window does not count it again.
+    assert _recorded(marks) == [100]
 
 
 @pytest.mark.asyncio
 async def test_a_non_decision_error_propagates_without_marking():
     memory = _memory()
     service = _service({"a": 0.9, "b": 0.9}, errors={"b": RuntimeError("bug")})
+    marks = _marks()
     with pytest.raises(RuntimeError, match="bug"):
         await ReflectionSleepHook(backend="decision")._attest_with_decisions(
-            SimpleNamespace(llm_service=service), memory, _candidates("a", "b"), "s")
+            SimpleNamespace(llm_service=service), memory, _candidates("a", "b"), marks)
     memory.mark_applied.assert_not_awaited()
+    marks.record.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -196,7 +222,7 @@ async def test_decision_backend_without_decide_fails_the_hook():
     hook = ReflectionSleepHook(backend="decision")
     result = await hook._attest_with_decisions(
         SimpleNamespace(llm_service=MagicMock(spec=["generate"])), _memory(),
-        _candidates("a"), "s",
+        _candidates("a"), _marks(),
     )
     assert result["reason"] == "attestation_failed"
     assert result["error"] == "DecisionError"
