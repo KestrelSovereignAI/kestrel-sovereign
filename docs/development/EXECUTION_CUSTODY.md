@@ -86,6 +86,17 @@ tenant/shared-backend custody; multi-tenant hosts must supply their own native
 generation factory. Provider construction validates and binds the original
 custody first, and manager-supplied services reuse native agent usage storage.
 
+The mandatory EPHEMERAL shutdown sweep has a fixed native cleanup entry point
+for that original retired standalone process only. It checks the canonical
+initialized storage, original backend and agent identity, and freezes the
+original entry watermark before acquiring one original-pool connection. Private
+connection-bound copies run the existing conversation/lexical, graph ownership,
+channel and projection purge algorithms, preserving their destructive audit
+sink. No executor escapes, no provider or migration starts, and live storage
+and copied children keep their denying original custody. Borrowed tenant
+generations cannot use this local-process cleanup entry point. Failure remains
+an uncertified purge, not a clean no-trace receipt.
+
 Owned iterators retain the original terminal exception independently of
 asyncio task retrieval, which otherwise discards cancellation causes after the
 first read. Requested close consumes only a private, control-free interrupt.
@@ -286,6 +297,13 @@ An exact cognition terminalization or cleanup-liveness CAS returning no match
 is not proof of successful cleanup. Original control debt remains retained,
 shutdown remains fenced, and successor-owned deliveries are never overwritten.
 Only the original retry capability is eligible for exact terminal cleanup.
+The resident store also retains local release-receipt custody until its native
+ACK joins: neither its own drainer nor an exact-event callback may replace that
+token while the release is outstanding. Successful ACK restores normal
+same-owner retry; control-bearing failure retains exclusion until exact cleanup
+succeeds. Executable drain queries apply the same live-owner exclusions before
+their limit, and excluded rows trigger bounded liveness polling rather than a
+zero-delay database/task loop. No additional database lease or pool is created.
 Repeated retries retain bounded diagnostic notes rather than
 manufacturing another owner or acknowledgement. Operator reconciliation is
 required when the original lease can no longer establish terminal state.

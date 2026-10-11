@@ -305,7 +305,7 @@ async def test_control_terminalizer_failure_or_cancel_retains_exact_cleanup_debt
         raise OSError("terminal receipt unavailable")
 
     backend = SimpleNamespace(backend_type="postgres", fail_cognition_delivery=AsyncMock(side_effect=fail))
-    dispatcher._durable_store = SimpleNamespace(backend=backend)
+    dispatcher._durable_store = SimpleNamespace(backend=backend, _failed_retry_release_receipts=set())
     task = asyncio.create_task(dispatcher._terminalize_failed_cognition(delivery, error))
     try:
         await entered.wait()

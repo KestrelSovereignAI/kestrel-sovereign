@@ -53,7 +53,7 @@ def dispatcher_fixture(error):
     dispatcher._retained_durable_cognition_tasks = set()
     dispatcher._runtime_owner_fence_lock = asyncio.Lock()
     dispatcher._durable_shutdown_owner_fenced = False
-    dispatcher._durable_store = SimpleNamespace(backend=SimpleNamespace(
+    dispatcher._durable_store = SimpleNamespace(_failed_retry_release_receipts=set(), backend=SimpleNamespace(
         backend_type="postgres", fail_cognition_delivery=AsyncMock(return_value=False),
         retain_cognition_cleanup_owner=AsyncMock(return_value=False),
     ))

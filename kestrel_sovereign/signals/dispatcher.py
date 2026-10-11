@@ -1590,6 +1590,7 @@ class SignalDispatcher:
             statuses=[PENDING, RETRY],
             limit=limit,
             rebuildable_sources=self._durable_rebuildable_sources(),
+            claim_executor_id=self._durable_delivery_owner,
         )
 
     def _durable_rebuildable_sources(self) -> frozenset[str]:
@@ -1606,12 +1607,20 @@ class SignalDispatcher:
     async def _schedule_next_durable_cognition_drain(self, consumer_id: str) -> None:
         pending = await self._drainable_durable_deliveries(consumer_id, limit=1)
         if not pending:
-            return
+            # A live sibling's retry (or our own outstanding release receipt)
+            # is deliberately absent from the executable window. Poll its
+            # liveness at a bounded interval, never a zero-delay task loop.
+            pending = await self.list_durable_deliveries(
+                consumer_id=consumer_id, statuses=[PENDING, RETRY], limit=1,
+                rebuildable_sources=self._durable_rebuildable_sources(),
+            )
+            if not pending:
+                return
         next_attempt = pending[0].next_attempt_at
         delay = 0.0
         if next_attempt is not None:
             delay = max(0.0, (next_attempt - datetime.now(timezone.utc)).total_seconds())
-        self._schedule_durable_cognition_drain(consumer_id, delay=delay)
+        self._schedule_durable_cognition_drain(consumer_id, delay=max(1.0, delay))
 
     def _schedule_durable_cognition_drain(self, consumer_id: str, *, delay: float) -> None:
         if self._durable_shutdown:
@@ -2425,6 +2434,7 @@ class SignalDispatcher:
         statuses: Optional[List[str]] = None,
         limit: int = 100,
         rebuildable_sources: Optional[frozenset[str]] = None,
+        claim_executor_id: Optional[str] = None,
     ) -> List[DurableDelivery]:
         """Observe durable delivery state for this agent only."""
         async with self._admit_durable_operation():
@@ -2435,6 +2445,7 @@ class SignalDispatcher:
                 statuses=statuses,
                 limit=limit,
                 rebuildable_sources=rebuildable_sources,
+                claim_executor_id=claim_executor_id,
             )
 
     async def purge_expired_durable_deliveries(self) -> int:
@@ -5126,6 +5137,10 @@ class SignalDispatcher:
                 if note not in getattr(error, "__notes__", ()):
                     error.add_note(note)
                 raise error
+
+        self._durable_store._failed_retry_release_receipts.discard(
+            (self._agent.did, delivery.consumer_id, delivery.delivery_id)
+        )
 
     @staticmethod
     def _completed_durable_cognition_result(

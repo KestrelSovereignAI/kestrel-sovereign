@@ -5012,7 +5012,15 @@ class KestrelAgent(
         transition/shutdown, but a failure is always surfaced (report + audit).
         """
         try:
-            report = await self.storage.purge_ephemeral_session(reason=reason)
+            from kestrel_sovereign.execution_custody import ExecutionCustody, ProcessRuntimeExecutionFence
+            scope = getattr(self, "_execution_custody", None)
+            native = getattr(getattr(self.storage, "_storage", None), "_backend", None)
+            if (reason == "ephemeral-agent-shutdown" and isinstance(scope, ExecutionCustody)
+                    and isinstance(scope.fence, ProcessRuntimeExecutionFence) and scope.fence._retired
+                    and getattr(native, "backend_type", None) == "postgres"):
+                report = await native.purge_retired_ephemeral_session(self.storage, reason=reason)
+            else:
+                report = await self.storage.purge_ephemeral_session(reason=reason)
         except Exception as e:
             logging.error(
                 "ephemeral hard-purge raised; treating as an UNCERTIFIED purge "

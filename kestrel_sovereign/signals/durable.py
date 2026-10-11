@@ -21,6 +21,7 @@ import secrets
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
+from functools import wraps
 from typing import (
     Any,
     AsyncContextManager,
@@ -1094,6 +1095,41 @@ def build_ingress_trust_receipt(
     return receipt
 
 
+def _owns_retry_release_receipt(method):
+    """Keep one resident store's exact retry unavailable until its ACK joins.
+
+    This is local custody, not a replacement database lease. The persisted
+    original owner/token still excludes siblings; stopped/stale owners retain
+    crash recovery. Only the canonical consumer needs this additional fence.
+    """
+    @wraps(method)
+    async def owned(self, **kwargs):
+        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        if kwargs["consumer_id"] != DURABLE_COGNITION_CONSUMER_ID:
+            return await method(self, **kwargs)
+        key = (kwargs["agent_id"], kwargs["consumer_id"], kwargs["delivery_id"])
+        self._pending_retry_release_receipts[key] = self._pending_retry_release_receipts.get(key, 0) + 1
+        try:
+            result = await method(self, **kwargs)
+        except BaseException as error:
+            # Failed receipt must not briefly reopen between this method's
+            # unwind and its caller's exact native terminalization.
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(error):
+                self._failed_retry_release_receipts.add(key)
+            raise
+        else:
+            self._failed_retry_release_receipts.discard(key)
+            return result
+        finally:
+            remaining = self._pending_retry_release_receipts[key] - 1
+            if remaining:
+                self._pending_retry_release_receipts[key] = remaining
+            else:
+                self._pending_retry_release_receipts.pop(key)
+    return owned
+
+
 class DurableSignalStore(UnifiedStoreBase):
     """Backend-neutral pending-delivery ledger.
 
@@ -1179,6 +1215,8 @@ class DurableSignalStore(UnifiedStoreBase):
         if not hasattr(backend, "fetch_all") and hasattr(backend, "backend"):
             native_backend = backend.backend
         super().__init__(native_backend)
+        self._pending_retry_release_receipts: dict[tuple[str, str, str], int] = {}
+        self._failed_retry_release_receipts: set[tuple[str, str, str]] = set()
 
     async def initialize(self) -> None:
         """Serialize PostgreSQL's transactional and autocommit schema phases."""
@@ -4001,6 +4039,8 @@ class DurableSignalStore(UnifiedStoreBase):
             )
             if delivery_id is None:
                 return None
+            if self._retry_release_receipt_pending(agent_id, consumer_id, delivery_id):
+                return None
             # A PostgreSQL row lock can wait behind a worker that is slower
             # than this consumer's entire lease.  Preserve an explicitly
             # supplied timestamp exactly, but otherwise sample only after the
@@ -4101,6 +4141,8 @@ class DurableSignalStore(UnifiedStoreBase):
             )
             if delivery_id is None:
                 return None
+            if self._retry_release_receipt_pending(agent_id, consumer_id, delivery_id):
+                return None
             # See claim_delivery: do not publish an already-expired implicit
             # lease after waiting for this exact delivery row.
             effective_now = explicit_now or self.now_utc()
@@ -4176,6 +4218,9 @@ class DurableSignalStore(UnifiedStoreBase):
             params.insert(2, event_id)
         where.append(self._managed_retry_claim_sql())
         params.extend(self._managed_retry_claim_params(executor_id, runtime_owner_stale_before))
+        receipt_sql, receipt_params = self._retry_receipt_exclusion_sql()
+        where.append(receipt_sql)
+        params.extend(receipt_params)
         lock_clause = " FOR UPDATE" if self.is_postgres else ""
         row = await self._backend.fetch_one(
             f"""
@@ -4188,7 +4233,19 @@ class DurableSignalStore(UnifiedStoreBase):
         )
         return str(row[0]) if row is not None else None
 
-    def _managed_retry_claim_sql(self) -> str:
+    def _retry_release_receipt_pending(self, agent_id: str, consumer_id: str, delivery_id: str) -> bool:
+        key = (agent_id, consumer_id, delivery_id)
+        return key in self._pending_retry_release_receipts or key in self._failed_retry_release_receipts
+
+    def _retry_receipt_exclusion_sql(self, *, alias: str = "") -> tuple[str, tuple]:
+        keys = tuple(sorted(set(self._pending_retry_release_receipts) | self._failed_retry_release_receipts))
+        prefix = f"{alias}." if alias else ""
+        if not keys:
+            return "1 = 1", ()
+        predicate = f"({prefix}agent_id = ? AND {prefix}consumer_id = ? AND {prefix}delivery_id = ?)"
+        return "NOT (" + " OR ".join(predicate for _ in keys) + ")", tuple(value for key in keys for value in key)
+
+    def _managed_retry_claim_sql(self, *, alias: str = "") -> str:
         """Do not transfer a retry whose original live owner still owns its ACK.
 
         Claim/recovery already holds the canonical owner-liveness lock. A
@@ -4198,13 +4255,15 @@ class DurableSignalStore(UnifiedStoreBase):
         The same owner can retry normally under its unchanged custody; a dead
         owner retains the ledger's existing at-least-once recovery semantics.
         """
+        prefix = f"{alias}." if alias else ""
+        outer = alias or self.DELIVERIES
         return f"""(
-            consumer_id <> ? OR status <> '{RETRY}'
-            OR lease_owner IS NULL OR lease_owner NOT LIKE 'dispatcher:%'
-            OR lease_owner = ? OR NOT EXISTS (
+            {prefix}consumer_id <> ? OR {prefix}status <> '{RETRY}'
+            OR {prefix}lease_owner IS NULL OR {prefix}lease_owner NOT LIKE 'dispatcher:%'
+            OR {prefix}lease_owner = ? OR NOT EXISTS (
                 SELECT 1 FROM {self.RUNTIME_OWNERS} owner
-                WHERE owner.agent_id = {self.DELIVERIES}.agent_id
-                  AND owner.owner_id = {self.DELIVERIES}.lease_owner
+                WHERE owner.agent_id = {outer}.agent_id
+                  AND owner.owner_id = {outer}.lease_owner
                   AND owner.stopped_at IS NULL AND owner.heartbeat_at >= ?
             )
         )"""
@@ -4902,6 +4961,7 @@ class DurableSignalStore(UnifiedStoreBase):
         )
         return updated == 1
 
+    @_owns_retry_release_receipt
     async def nack_delivery(
         self,
         *,
@@ -4978,6 +5038,7 @@ class DurableSignalStore(UnifiedStoreBase):
             agent_id=agent_id, consumer_id=consumer_id, delivery_id=delivery_id
         )
 
+    @_owns_retry_release_receipt
     async def release_delivery_for_hold(
         self,
         *,
@@ -5024,6 +5085,7 @@ class DurableSignalStore(UnifiedStoreBase):
         )
         return updated == 1
 
+    @_owns_retry_release_receipt
     async def release_managed_delivery_after_task(
         self,
         *,
@@ -5262,6 +5324,7 @@ class DurableSignalStore(UnifiedStoreBase):
         statuses: Optional[Iterable[str]] = None,
         limit: int = 100,
         rebuildable_sources: Optional[Iterable[str]] = None,
+        claim_executor_id: Optional[str] = None,
     ) -> list[DurableDelivery]:
         """List observable delivery state within one agent/tenant only.
 
@@ -5279,6 +5342,15 @@ class DurableSignalStore(UnifiedStoreBase):
         if consumer_id is not None:
             where.append("d.consumer_id = ?")
             params.append(consumer_id)
+        if claim_executor_id is not None:
+            self._require_nonempty("claim_executor_id", claim_executor_id)
+            where.append(self._managed_retry_claim_sql(alias="d"))
+            params.extend(self._managed_retry_claim_params(
+                claim_executor_id, self.now_utc() - _DEFAULT_RUNTIME_OWNER_STALE_AFTER,
+            ))
+            receipt_sql, receipt_params = self._retry_receipt_exclusion_sql(alias="d")
+            where.append(receipt_sql)
+            params.extend(receipt_params)
         if rebuildable_sources is not None:
             sources = tuple(sorted(set(rebuildable_sources)))
             if sources:

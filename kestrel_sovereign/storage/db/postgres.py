@@ -1444,6 +1444,39 @@ class PostgresBackend(DatabaseBackend):
                 )
                 return result == "UPDATE 1"
 
+    async def purge_retired_ephemeral_session(self, wrapper, *, reason: str):
+        """Run only the original standalone runtime's mandatory privacy purge.
+
+        The fixed operation cannot supply SQL, replace authority, initialize
+        storage, return an executor, or clean a borrowed tenant generation.
+        Reuse one checkout from the original pool and the existing scoped
+        purge algorithms, including lexical/graph/projection safety.
+        """
+        from kestrel_sovereign.execution_custody import ProcessRuntimeExecutionFence
+        from kestrel_sovereign.storage.async_storage import AsyncStorage
+        from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+        from .ephemeral_cleanup import _purge_original_ephemeral_session
+
+        scope = getattr(self, "_execution_custody", None)
+        if not isinstance(scope, ExecutionCustody) or not isinstance(scope.fence, ProcessRuntimeExecutionFence) or not scope.fence._retired:
+            raise ExecutionAuthorityError("privacy cleanup requires the original retired process runtime")
+        if type(wrapper) is not PrivacyEnforcingStorage or type(wrapper._storage) is not AsyncStorage:
+            raise ValueError("privacy cleanup requires canonical initialized storage")
+        storage = wrapper._storage
+        agent_id, since = wrapper.agent_id, wrapper._entered_ephemeral_at
+        if storage._backend is not self or not storage._initialized or agent_id != scope.fence.agent_id:
+            raise ValueError("privacy cleanup does not match original backend and agent")
+        if type(reason) is not str or not reason.strip():
+            raise ValueError("privacy cleanup requires its audit reason")
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("privacy cleanup requires the original connected backend")
+        async with asyncio.timeout(5):
+            async with pool.acquire() as connection:
+                return await _purge_original_ephemeral_session(
+                    self, connection, wrapper, reason=reason, agent_id=agent_id, since=since,
+                )
+
     async def retain_cognition_cleanup_owner(self, *, agent_id: str, owner_id: str) -> bool:
         """Retain an existing live owner with leased or receipt-pending cognition.
 
