@@ -63,6 +63,7 @@ async def test_owned_native_cancel_receipt_is_repeatably_harvestable(tmp_path, k
         assert result.error is original
         assert owned_task_error(task) is original
         assert owned_task_error(task) is original
+        assert not task._log_traceback, "physically joined native exception remained unobserved"
         assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1
     finally:
         await db.close()

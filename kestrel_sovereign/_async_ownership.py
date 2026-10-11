@@ -462,6 +462,12 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
     """
     retained = getattr(task, "_kestrel_owned_terminal_error", _TASK_ERROR_UNSET)
     if retained is not _TASK_ERROR_UNSET:
+        if task.done() and not task.cancelled():
+            # Capturing inside the child preserves original evidence, but does
+            # not acknowledge asyncio's native exception notification. Harvest
+            # that completed result as well so a joined task cannot later emit
+            # an orphaned "exception was never retrieved" diagnostic.
+            task.exception()
         return retained
     if not task.done():
         raise RuntimeError("owned task has not reached terminal state")
