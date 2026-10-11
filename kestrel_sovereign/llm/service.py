@@ -5339,7 +5339,7 @@ No other text or formatting.
             if adapter is not None and hasattr(adapter, "aclose"):
                 async def close_adapter(adapter=adapter):
                     await _wait_for_close_result(adapter.aclose())
-                await retire("adapter", close_adapter, resource=adapter)
+                await retire("adapter", close_adapter, resource=adapter, cancel_on_timeout=False)
 
             client = provider.get("client")
             if client is None:
@@ -5349,7 +5349,7 @@ No other text or formatting.
                     await _wait_for_close_result(client.close())
                 elif hasattr(client, "_client") and hasattr(client._client, "aclose"):
                     await _wait_for_close_result(client._client.aclose())
-            await retire("client", close_client, resource=client)
+            await retire("client", close_client, resource=client, cancel_on_timeout=False)
 
         async def close_remote_route():
             # Latch closed before renewal can reactivate it. Provider capacity
@@ -5372,7 +5372,7 @@ No other text or formatting.
                     await await_owned_task(writer)
             await self.close_usage_db()
 
-        await retire("usage-database", close_usage_after_writers)
+        await retire("usage-database", close_usage_after_writers, cancel_on_timeout=False)
         terminal = execution_terminal_error(terminal, vars(self).get("_llm_close_control"))
         if terminal is not None:
             raise terminal

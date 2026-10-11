@@ -276,7 +276,7 @@ async def test_late_modality_native_effect_retains_control_after_task_discard(
     "kind", ["error", "unknown", "cancel", "cancel_unknown", "group"]
 )
 @pytest.mark.parametrize("stage", ["adapter", "client"])
-async def test_close_joins_timed_out_native_resource_before_later_owners(
+async def test_close_retains_timed_out_native_resource_and_joins_original_receipt(
     tmp_path, monkeypatch, kind, stage
 ):
     from kestrel_sovereign.llm import service as service_module
@@ -285,15 +285,14 @@ async def test_close_joins_timed_out_native_resource_before_later_owners(
     await db.execute("CREATE TABLE effects (id INTEGER PRIMARY KEY)")
     failure = carrier(kind)
     retired = []
+    release_native_close = asyncio.Event()
 
     class Resource:
         async def close(self):
             await db.execute("INSERT INTO effects VALUES (1)")
             native_close_entered.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                raise failure
+            await release_native_close.wait()
+            raise failure
 
         aclose = close
 
@@ -307,12 +306,12 @@ async def test_close_joins_timed_out_native_resource_before_later_owners(
     original_wait = asyncio.wait
 
     async def wait_after_native_setup(awaitable, *, timeout):
-        # This regression concerns the resource's cancellation receipt after
+        # This regression concerns the resource's terminal receipt after
         # a real write, not how quickly a SQLite worker can finish that write.
         # Keep the actual timeout owner, but arm its short test deadline only
         # after the intended resource boundary has positively been entered.
         if timeout == 0.01 and any(
-            task.get_name() == f"llm-close:{stage}" for task in awaitable
+            task.get_name().startswith(f"llm-close:('{stage}',") for task in awaitable
         ):
             await asyncio.wait_for(native_close_entered.wait(), timeout=5)
         return await original_wait(awaitable, timeout=timeout)
@@ -320,13 +319,27 @@ async def test_close_joins_timed_out_native_resource_before_later_owners(
     monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 0.01)
     monkeypatch.setattr(asyncio, "wait", wait_after_native_setup)
     try:
+        with pytest.raises(RuntimeError, match="retained cleanup owners"):
+            await service.close()
+        assert native_close_entered.is_set()
+        assert service.has_pending_close_owners()
+        assert retired == ["later"]
+        assert service._remote_route_closed is True
+        assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1
+        release_native_close.set()
+        with pytest.raises(BaseException) as caught:
+            await service.wait_for_close_completion()
+        assert caught.value is failure
+        assert not service.has_pending_close_owners()
         with pytest.raises(BaseException) as caught:
             await service.close()
         assert caught.value is failure
         assert retired == ["later"]
-        assert service._remote_route_closed is True
-        assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1
     finally:
+        release_native_close.set()
+        for task in tuple(vars(service).get("_llm_close_tasks", {}).values()):
+            if task is not None:
+                await await_owned_task(task)
         await db.close()
 
 

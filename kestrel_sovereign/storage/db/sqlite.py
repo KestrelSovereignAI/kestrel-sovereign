@@ -28,6 +28,7 @@ from .interface import (
 from .write_audit import record_write_query, record_write_script
 from kestrel_sovereign.execution_custody import (
     _capture_host_identity_anchor_access,
+    ExecutionCommitOutcomeError, current_execution_custody, execution_commit_outcome,
     execution_terminal_error, is_execution_control_error, require_execution_backend,
 )
 from .transaction_control import reject_transaction_control, sqlite_statements
@@ -1306,9 +1307,42 @@ class SQLiteBackend(DatabaseBackend):
                 raise terminal
             raise
 
+    def _execution_commit_scopes(self):
+        """Every original admission whose native file write this owner holds."""
+        scopes = current_execution_custody(self)
+        if self._identity_anchor_access is not None:
+            scopes = (*self._identity_anchor_access.scopes, *scopes)
+        return tuple(dict.fromkeys(scopes))
+
     async def _commit_write(self, conn: aiosqlite.Connection) -> None:
-        """The single native COMMIT handoff for writes and owning transactions."""
-        await conn.commit()
+        """One native COMMIT handoff, including host/local-anchor receipts."""
+        scopes = self._execution_commit_scopes()
+        if not scopes:
+            await conn.commit()
+            return
+        self._require_execution_backend()
+        try:
+            await conn.commit()
+        except BaseException as error:
+            # aiosqlite queues COMMIT on its native worker. A lost await/ACK
+            # cannot prove rollback; latch every original admission first.
+            outcome = execution_commit_outcome(error) or "unknown"
+            for scope in scopes:
+                scope.preserve_commit_uncertainty(outcome)
+            if execution_commit_outcome(error) is not None:
+                raise
+            raise ExecutionCommitOutcomeError(outcome) from error
+        try:
+            self._require_execution_backend()
+            for scope in scopes:
+                scope.require_work()
+        except BaseException as error:
+            outcome = execution_commit_outcome(error) or "committed"
+            for scope in scopes:
+                scope.preserve_commit_uncertainty(outcome)
+            if execution_commit_outcome(error) is not None:
+                raise
+            raise ExecutionCommitOutcomeError(outcome) from error
 
     async def execute(self, query: str, params: Params = ()) -> int:
         """Execute a write query."""
@@ -1527,6 +1561,13 @@ class SQLiteBackend(DatabaseBackend):
     
     async def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script."""
+        if self._execution_commit_scopes() and not self.owns_open_transaction:
+            # sqlite3.executescript implicitly commits outside our receipt
+            # handoff. Bound host/anchor writes use the SAME owning transaction.
+            async with self.transaction():
+                for statement in _owned_script_statements(script):
+                    await self.execute(statement)
+            return
         record_write_script(script)
         conn = self._ensure_connected()
         async with self._write_guard():

@@ -98,6 +98,13 @@ class ModalityRecordingMixin:
         try:
             await asyncio.wait_for(asyncio.shield(task), USAGE_RECORD_TIMEOUT)
         except (asyncio.TimeoutError, asyncio.CancelledError) as interruption:
+            # Shield/wait_for synthesizes cancellation for a cancelled writer.
+            # Harvest that writer's canonical native receipt before treating
+            # the interruption as caller cancellation, including unbound calls.
+            if task.done():
+                failure = owned_task_error(task)
+                if failure is not None and is_execution_control_error(failure):
+                    raise failure
             if current_execution_custody(self):
                 task.cancel()
                 outcome = await await_owned_task(

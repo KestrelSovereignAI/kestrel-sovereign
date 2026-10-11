@@ -2901,11 +2901,11 @@ class TestLifecycle:
             ) as workers, patch(
                 "kestrel_sovereign.storage.db.sqlite."
                 "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-                0.12,
+                1.0,
             ), patch(
                 "kestrel_sovereign.kestrel_agent."
                 "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
-                0.50,
+                3.0,
             ), patch(
                 "kestrel_sovereign.kestrel_agent."
                 "KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
@@ -2914,7 +2914,13 @@ class TestLifecycle:
                 "kestrel_sovereign.kestrel_agent."
                 "KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
                 0.01,
-            ):
+            ), patch.object(
+                agent, "_run_durable_shutdown_tail",
+                wraps=agent._run_durable_shutdown_tail,
+            ) as tail:
+                # Healthy worker scheduling is not a 130ms performance
+                # contract. Measure the composed reservations directly while
+                # retaining native blocked-worker and physical-join probes.
                 shutdown_task = asyncio.create_task(agent.shutdown())
                 await wait_for_lifecycle_checkpoint(
                     factory_created.wait(),
@@ -2939,15 +2945,21 @@ class TestLifecycle:
                 # the primary backend's subsequent worker close.
                 await asyncio.sleep(0.03)
                 assert not shutdown_task.done()
+                assert tail.call_args.kwargs["storage_close_timeout"] >= 1.0
+                assert tail.call_args.kwargs["storage_preclose_timeout"] >= 1.0
+                assert tail.call_args.args[0] >= (
+                    tail.call_args.kwargs["storage_close_timeout"]
+                    + tail.call_args.kwargs["storage_preclose_timeout"]
+                )
 
                 release_worker.set()
-                await asyncio.wait_for(shutdown_task, timeout=1.0)
+                await asyncio.wait_for(shutdown_task, timeout=4.0)
                 assert not factory_worker.is_alive()
                 assert not primary_worker.is_alive()
         finally:
             release_worker.set()
             if shutdown_task is not None and not shutdown_task.done():
-                await asyncio.wait_for(shutdown_task, timeout=1.0)
+                await asyncio.wait_for(shutdown_task, timeout=4.0)
             if factory_worker is not None:
                 factory_worker.join(timeout=1.0)
             primary_worker.join(timeout=1.0)

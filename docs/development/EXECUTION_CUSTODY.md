@@ -503,6 +503,23 @@ when only a child admission is denied and the outer claim remains live, the
 original executing occurrence stays unresolved; no failed finalization, claim
 clearance, or recurring schedule advancement can acknowledge that effect.
 
+Local identity anchors and process host keys use one SQLite native COMMIT
+handoff. It retains every original admission before queuing COMMIT, latches
+uncertain acknowledgements before rollback cleanup, and checks those same
+admissions after successful acknowledgement. Retirement after a successful
+COMMIT is reported as committed, never as rollback. Bound scripts use that
+owning transaction rather than sqlite3's implicit executescript commits.
+
+Native SDK, HTTP transport and usage-database close owners are not cancelled
+merely because a bounded caller's join expired. The original owner remains
+pending until physical close finishes; terminal host retirement joins it before
+closing borrowed storage. Provider is_closed flags alone are not physical-close
+evidence. Batch initializer recovery likewise owns its result collector through
+repeated cancellation before retiring all unpublished agents. Inception,
+embedding/recall compatibility fallbacks and modality accounting preserve native
+control receipts before ordinary error/cancellation normalization; uncertainty
+cannot authorize another INSERT, vector rewrite or legacy retrieval retry.
+
 See the [canonical storage contract](../architecture/storage/STORAGE_ARCHITECTURE.md#hosted-execution-custody)
 for installation and limitations. Full independent review, repository/CI gates,
 immutable publication/verification and Frinz generation adoption/live acceptance

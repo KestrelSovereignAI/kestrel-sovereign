@@ -136,3 +136,45 @@ async def test_actual_agent_replays_birth_to_fenced_pg_destination(native_pg, tm
             assert await control.fetchval("SELECT COUNT(*) FROM document_chunk_owners WHERE agent_id=$1", agent.did) > 0
     finally:
         await service.close()
+
+
+@pytest.mark.parametrize("boundary", ["ack_error", "ack_cancel", "post_ack_retirement"])
+async def test_local_anchor_commit_uncertainty_denies_same_native_pg_parent(native_pg, tmp_path, monkeypatch, boundary):
+    import sqlite3
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError, _host_identity_anchor_access, execution_commit_outcome,
+    )
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+    backend, control, schema = native_pg
+    await control.execute(f'SET search_path TO "{schema}"')
+    scopes = (ExecutionCustody(GenerationFence()), ExecutionCustody(GenerationFence()))
+    path = tmp_path / "kestrel_prime.db"
+    with bind_execution_custody_snapshot(scopes), _host_identity_anchor_access(path):
+        anchor = SQLiteBackend(path)
+        await anchor.connect()
+        await anchor.execute("CREATE TABLE native_birth(id INTEGER PRIMARY KEY)")
+        original_commit = anchor._connection.commit
+        async def native_then_ack_loss():
+            await original_commit()
+            if boundary == "post_ack_retirement":
+                scopes[-1].revoke("original parent retired after native commit")
+            elif boundary == "ack_cancel":
+                raise asyncio.CancelledError("native anchor COMMIT acknowledgement lost")
+            else:
+                raise OSError("native anchor COMMIT acknowledgement lost")
+        monkeypatch.setattr(anchor._connection, "commit", native_then_ack_loss)
+        try:
+            outcome = await await_owned_task(asyncio.create_task(anchor.execute("INSERT INTO native_birth VALUES(1)")))
+            expected = "committed" if boundary == "post_ack_retirement" else "unknown"
+            assert execution_commit_outcome(outcome.error) == expected
+            with sqlite3.connect(path) as observer:
+                assert observer.execute("SELECT COUNT(*) FROM native_birth").fetchone()[0] == 1
+            with pytest.raises(ExecutionCommitOutcomeError):
+                await backend.execute("INSERT INTO effects VALUES(102, 'must not replay')")
+            assert await control.fetchval("SELECT COUNT(*) FROM effects WHERE id=102") == 0
+            for scope in scopes:
+                with pytest.raises(ExecutionCommitOutcomeError) as caught:
+                    scope.require_work()
+                assert execution_commit_outcome(caught.value) == expected
+        finally:
+            await anchor.close()

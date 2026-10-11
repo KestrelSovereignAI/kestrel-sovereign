@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, List, Mapping, Optional
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
-from kestrel_sovereign._async_ownership import owned_task_error
+from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
 from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
@@ -7275,7 +7275,16 @@ class AgentManager:
                 # that already initialized are invisible to shutdown_all(), so
                 # this batch still owns their cleanup.  Cancellation wins only
                 # after all of those ownership transfers have settled.
-                settled = await collect_initializer_results()
+                # A second cancellation may land while recovery gather is
+                # delivering already-settled private agents. Retain and join
+                # this SAME collector before transferring their cleanup.
+                recovery = asyncio.create_task(
+                    collect_initializer_results(), name="agent-batch:recovery-results",
+                )
+                recovery_outcome = await await_owned_task(recovery)
+                if recovery_outcome.error is not None:
+                    raise execution_terminal_error(initial_failure, recovery_outcome.error)
+                settled = recovery_outcome.result
                 initialized = [
                     (name, result)
                     for (name, _, _), result in zip(admitted, settled)
@@ -10061,6 +10070,7 @@ class AgentManager:
         admission, owns_admission = await self._admit_agent_operation(
             name, kind="create"
         )
+        creation_failure: BaseException | None = None
         try:
             if mandate is not None and admission.kind not in {
                 "spawn",
@@ -10193,39 +10203,52 @@ class AgentManager:
                         name,
                         inspection_error,
                     )
-                if pending_id is not None and identity_birth_absent:
-                    self._spawn_authority_registry.withdraw_pending(
-                        reservation_id=pending_id,
-                        child_name=name,
+                try:
+                    if pending_id is not None and identity_birth_absent:
+                        self._spawn_authority_registry.withdraw_pending(
+                            reservation_id=pending_id,
+                            child_name=name,
+                        )
+                        admission.spawn_authority_pending_id = None
+                    elif pending_id is not None:
+                        # Retain ambiguous birth denial, but retire this
+                        # producer's liveness lock for durable reconciliation.
+                        self._spawn_authority_registry.release_pending_producer(
+                            reservation_id=pending_id,
+                        )
+                except BaseException as cleanup_failure:
+                    _raise_lifecycle_outcomes(
+                        "Inception and pending authority rollback failed",
+                        [error, cleanup_failure],
                     )
-                    admission.spawn_authority_pending_id = None
-                elif pending_id is not None:
-                    # The denial remains because durable birth is ambiguous,
-                    # but this producer has reached a terminal outcome.  Do not
-                    # advertise it as live until process exit: reconciliation
-                    # in this same host may now claim the liveness lock and reap
-                    # an ownerless, pre-birth SQLite shell.
-                    self._spawn_authority_registry.release_pending_producer(
-                        reservation_id=pending_id,
-                    )
-                self._reserved_ports.discard(port)
-                if not isinstance(error, Exception):
+                finally:
+                    self._reserved_ports.discard(port)
+                if not isinstance(error, Exception) or is_execution_control_error(error):
                     raise
-                raise ValueError(f"Inception failed for '{name}': {error}")
+                raise ValueError(f"Inception failed for '{name}': {error}") from error
             agent = await self.load_agent(name, config)
             # Retain only an actually published configuration for the endpoint
             # persistence handoff.  A stale pre-shutdown operation must not
             # leave an in-memory config which a later request could persist.
             self._created_configs[name] = config
             return agent
+        except BaseException as error:
+            creation_failure = error
+            raise
         finally:
             if owns_admission:
-                release_cancelled = await self._release_agent_operations([admission])
+                try:
+                    release_cancelled = await self._release_agent_operations([admission])
+                except BaseException as release_failure:
+                    terminal = execution_terminal_error(creation_failure, release_failure)
+                    raise terminal
                 # ``load_agent`` records publication on this outer admission,
                 # even when create owns it through the nested call. Do not
                 # turn that committed create into a false cancellation while
                 # merely retiring its now-terminal admission.
-                if release_cancelled and not admission.published:
+                if release_cancelled and not admission.published and not (
+                    creation_failure is not None and is_execution_control_error(creation_failure)
+                ):
                     raise asyncio.CancelledError()
 
     def _parent_feature_names(self, parent_agent: KestrelAgent) -> set[str]:

@@ -14,7 +14,6 @@ from contextlib import asynccontextmanager
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
-    ExecutionCommitOutcomeError,
     ProcessRuntimeExecutionFence,
     current_execution_custody,
     require_execution_work,
@@ -25,9 +24,7 @@ from kestrel_sovereign.storage.async_database import (
     _close_failed_database_initialization,
 )
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-from kestrel_sovereign.storage.db.sqlite import (
-    _close_aiosqlite_connection, _owned_script_statements,
-)
+from kestrel_sovereign.storage.db.sqlite import _close_aiosqlite_connection
 
 
 _HOST_TABLES = frozenset({
@@ -103,40 +100,10 @@ class _ProcessHostBackend(SQLiteBackend):
                     "row/advisory-bound execution requires a native PostgreSQL host store"
                 )
 
-    def _after_commit(self, scopes):
-        try:
-            self._require_execution_backend()
-            for scope in scopes:
-                scope.require_work()
-        except ExecutionAuthorityError as error:
-            # SQLite auto-commit already succeeded; never claim rollback or
-            # allow the caller to replay a provisioning write after retirement.
-            for scope in scopes:
-                scope.preserve_commit_uncertainty("committed")
-            raise ExecutionCommitOutcomeError("committed") from error
-
-    async def _commit_write(self, conn):
-        # Capture EVERY original scope at the native handoff, including the
-        # opener retained after its ContextVar has reset. Cancellation/error
-        # during this await cannot prove rollback: aiosqlite may already have
-        # committed on its worker. Latch before any cancellable cleanup.
-        self._require_execution_backend()
-        scopes = self._host_process_scopes + current_execution_custody()
-        try:
-            await super()._commit_write(conn)
-        except BaseException as error:
-            for scope in scopes:
-                scope.preserve_commit_uncertainty("unknown")
-            raise ExecutionCommitOutcomeError("unknown") from error
-        self._after_commit(scopes)
-
-    async def execute_script(self, script):
-        # sqlite3.executescript auto-commits between statements. Use the
-        # canonical owning transaction so retirement before COMMIT rolls back
-        # every host statement rather than publishing a partial script.
-        async with self.transaction():
-            for statement in _owned_script_statements(script):
-                await self.execute(statement)
+    def _execution_commit_scopes(self):
+        # Supply retained process memberships to the canonical SQLite handoff;
+        # host keys and local birth anchors must not have different ACK rules.
+        return tuple(dict.fromkeys((*self._host_process_scopes, *current_execution_custody())))
 
     @asynccontextmanager
     async def transaction(self, *, immediate=False, savepoint=False):
