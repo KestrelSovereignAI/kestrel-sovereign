@@ -295,7 +295,9 @@ async def test_actual_continuation_closes_unstarted_provider_only_after_dispatch
             ))
         await asyncio.wait_for(client_entered.wait(), 5)
         if delayed_close:
-            await asyncio.sleep(0.15)
+            # Outlast BOTH bounded close attempts: otherwise removing the
+            # native join can still appear pending on its second short close.
+            await asyncio.wait({task}, timeout=0.5)
             assert not task.done()
             assert not client.is_closed
             assert "llm_service" in custody.held and "storage" in custody.held
