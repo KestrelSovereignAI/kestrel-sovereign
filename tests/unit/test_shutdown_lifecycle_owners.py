@@ -716,6 +716,7 @@ async def test_lifespan_reaps_phoenix_after_agent_manager_cancellation(
     monkeypatch, tmp_path,
 ) -> None:
     """Agent cancellation cannot bypass the server's Phoenix teardown owner."""
+    monkeypatch.setenv("KESTREL_API_KEY", "provider-free-local-host-authority-test")
     from kestrel_sovereign import host_features as hf
     from kestrel_sovereign.a2a import did_registry
     from kestrel_sovereign.multi_agent import agent_manager, config as ma_config

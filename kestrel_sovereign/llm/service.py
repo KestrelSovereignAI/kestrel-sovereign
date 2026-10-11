@@ -5126,6 +5126,45 @@ No other text or formatting.
 
     # get_streaming_response is provided by StreamingMixin
 
+    def has_pending_close_owners(self) -> bool:
+        """Physical cleanup dependency, including writers on borrowed storage."""
+        owners = [
+            *vars(self).get("_preference_persistence_tasks", ()),
+            *vars(self).get("_modality_record_tasks", ()),
+            *(task for task in vars(self).get("_llm_close_tasks", {}).values()
+              if task is not None),
+        ]
+        return any(not task.done() for task in owners)
+
+    async def wait_for_close_completion(self) -> None:
+        """Join exact native owners before a host retires their borrowed storage.
+
+        This is the explicit lifecycle/reaper join, not another bounded close
+        attempt or permission for fresh work. It never repeats a native effect.
+        """
+        terminal = vars(self).get("_llm_close_control")
+        while True:
+            owners = set(vars(self).get("_preference_persistence_tasks", ()))
+            owners.update(vars(self).get("_modality_record_tasks", ()))
+            owners.update(task for task in vars(self).get("_llm_close_tasks", {}).values()
+                          if task is not None)
+            if not owners:
+                break
+            for task in owners:
+                outcome = await await_owned_task(task)
+                failure = execution_terminal_error(outcome.error, outcome.cancellation)
+                if failure is not None and is_execution_control_error(failure):
+                    terminal = execution_terminal_error(terminal, failure)
+            # Completion callbacks drop settled task graphs. Allow every
+            # already-queued canonical harvester to finish before resnapshot.
+            await asyncio.sleep(0)
+        terminal = execution_terminal_error(terminal, vars(self).get("_llm_close_control"),
+                                            vars(self).get("_preference_persistence_control"),
+                                            vars(self).get("_modality_record_control"))
+        if terminal is not None:
+            self._llm_close_control = terminal
+            raise terminal
+
     async def close(self):
         """Bound joins, retain unfinished owners, and attempt independent cleanup.
 

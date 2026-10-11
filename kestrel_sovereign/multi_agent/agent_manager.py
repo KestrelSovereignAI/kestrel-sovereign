@@ -44,6 +44,9 @@ from kestrel_sovereign.kestrel_agent import (
 )
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from kestrel_sovereign.llm.service import LLMService
+from kestrel_sovereign.llm.lifecycle import (
+    UnpublishedLLMOwner, drain_unpublished_llm_owners, retire_unpublished_llm,
+)
 from kestrel_sovereign.spawn.authority_registry import (
     PendingSpawnAuthority,
     SpawnAuthorityRegistry,
@@ -865,6 +868,7 @@ class AgentManager:
         # operational pool and delegates advisory sessions back to this owner.
         self._shared_postgres_backend = shared_postgres_backend
         self._execution_custody_factory = execution_custody_factory
+        self._unpublished_llm_owners: dict[str, UnpublishedLLMOwner] = {}
         self._lock = asyncio.Lock()
         # Inbound hosted A2A verification/authorization/task persistence holds
         # a shared reader lease from DID resolution through create_task.
@@ -2600,6 +2604,8 @@ class AgentManager:
         Raises:
             ValueError: If agent data directory is invalid.
         """
+        if name in self._unpublished_llm_owners:
+            raise RuntimeError("unpublished provider cleanup must retire before another birth")
         resolved_dir = config.resolve_data_dir(self._base_data_dir)
         identity_export_dir = (
             config.resolve_identity_export_dir(self._base_data_dir) or resolved_dir
@@ -2994,6 +3000,7 @@ class AgentManager:
             else:
                 from kestrel_sovereign.execution_custody import retire_process_runtime_custody
                 retire_process_runtime_custody(execution_custody)
+                cleanup_failure = None
                 if scheduler_registration is not None:
                     rollback_task = asyncio.create_task(
                         scheduler_registration.rollback(),
@@ -3003,6 +3010,7 @@ class AgentManager:
                         rollback_task
                     )
                     if rollback_failure is not None:
+                        cleanup_failure = rollback_failure
                         logger.error(
                             "Failed to roll back scheduler registration for %r",
                             name,
@@ -3014,13 +3022,22 @@ class AgentManager:
                         )
                 if llm_service is not None:
                     try:
-                        await llm_service.close()
-                    except Exception:
+                        await retire_unpublished_llm(
+                            self._unpublished_llm_owners, name, llm_service, captured,
+                        )
+                    except BaseException as error:
+                        from kestrel_sovereign.execution_custody import execution_terminal_error
+                        cleanup_failure = execution_terminal_error(cleanup_failure, error)
                         logger.warning(
                             "Failed to close LLM service for uninitialized agent %r",
                             name,
                             exc_info=True,
                         )
+                if cleanup_failure is not None:
+                    from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+                    terminal = execution_terminal_error(initialization_failure, cleanup_failure)
+                    if terminal is not None and is_execution_control_error(terminal):
+                        raise terminal
             raise
         # Spawn-mandate enforcement (restricted_tools hook + spawn_mandate attach)
         # is reattached inside KestrelAgent.initialize() from the persisted
@@ -14331,6 +14348,10 @@ class AgentManager:
         )
         cancelled = spawn_join_cancelled or cancelled
         failures: list[BaseException] = list(spawn_failures)
+        try:
+            await drain_unpublished_llm_owners(self._unpublished_llm_owners)
+        except BaseException as error:
+            failures.append(error)
         candidates = list(dict.fromkeys((*self._agents, *self._child_budgets)))
         # Freeze one verified authority graph after all pre-fence spawns have
         # joined.  The display/reconciliation cache can be stale or absent;

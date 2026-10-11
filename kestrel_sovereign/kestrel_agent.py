@@ -8347,6 +8347,22 @@ Expected Duration: {expected_duration}
         self._background_tasks.clear()
         self._raise_shutdown_control()
 
+    def _has_pending_llm_storage_dependents(self) -> bool:
+        service = getattr(self, "llm_service", None)
+        predicate = getattr(type(service), "has_pending_close_owners", None)
+        return bool(callable(predicate) and predicate(service))
+
+    async def _join_llm_storage_dependents(self) -> None:
+        service = getattr(self, "llm_service", None)
+        waiter = getattr(type(service), "wait_for_close_completion", None)
+        if callable(waiter):
+            try:
+                await waiter(service)
+            except BaseException as failure:
+                self._remember_shutdown_control(failure)
+                if not is_execution_control_error(failure):
+                    raise
+
     async def _complete_durable_shutdown_continuation(
         self,
         dispatcher,
@@ -8365,6 +8381,20 @@ Expected Duration: {expected_duration}
         the shutdown that started it found them still held (#3522).
         """
         custody = self._resource_custody()
+
+        async def release_llm() -> ReleaseOutcome:
+            await self._join_llm_storage_dependents()
+            return ReleaseOutcome.RELEASED
+
+        # Preference callbacks borrow raw agent storage; usage writers can
+        # borrow host storage. This retained physical join is upstream of
+        # EVERY storage release, not only the service's own usage DB close.
+        await custody.release("llm_service", release_llm)
+        if vars(self).get("_resolved_local_host_db") is not None:
+            async def release_host_db() -> ReleaseOutcome:
+                await self._close_local_host_db()
+                return ReleaseOutcome.RELEASED
+            await custody.release("host_key_database", release_host_db)
 
         async def release_dispatcher() -> ReleaseOutcome:
             delivered = await dispatcher.shutdown_durable_delivery()
@@ -8390,7 +8420,8 @@ Expected Duration: {expected_duration}
                 closed = reported_outcome(await storage.close())
             return closed if precloses is ReleaseOutcome.RELEASED else precloses
 
-        await custody.release("signal_dispatcher", release_dispatcher)
+        if dispatcher is not None and hasattr(dispatcher, "shutdown_durable_delivery"):
+            await custody.release("signal_dispatcher", release_dispatcher)
         await custody.release("storage", close_storage)
         self._raise_shutdown_control()
         self._release_serving_record()
@@ -8421,10 +8452,8 @@ Expected Duration: {expected_duration}
             # for a later lifecycle retry, rather than disappearing as an
             # unobserved "Task exception was never retrieved" warning.
             def retain_terminal(task):
-                try:
-                    failure = task.exception()
-                except asyncio.CancelledError as cancellation:
-                    failure = cancellation
+                from kestrel_sovereign._async_ownership import owned_task_error
+                failure = owned_task_error(task)
                 self._remember_shutdown_control(failure)
             continuation.add_done_callback(retain_terminal)
             self._durable_shutdown_continuation = continuation
@@ -9075,12 +9104,6 @@ Expected Duration: {expected_duration}
                     _step_budget(),
                 )
 
-            if has_host_db:
-                await _release_within(
-                    "host_key_database", "Host key database",
-                    self._close_local_host_db, _step_budget(),
-                )
-
             # Close LLM service async clients
             if self.llm_service and hasattr(self.llm_service, 'close'):
                 await _release_within(
@@ -9089,6 +9112,14 @@ Expected Duration: {expected_duration}
                     self.llm_service.close,
                     _step_budget(),
                 )
+
+            if has_host_db:
+                host_db_budget = _step_budget()
+                if not self._has_pending_llm_storage_dependents():
+                    await _release_within(
+                        "host_key_database", "Host key database",
+                        self._close_local_host_db, host_db_budget,
+                    )
 
             # Close TaskManager stores (critical for preventing thread leaks)
             if self.task_manager and hasattr(self.task_manager, 'close'):
@@ -9136,7 +9167,8 @@ Expected Duration: {expected_duration}
         dispatcher_owner_fenced = bool(
             getattr(dispatcher, "durable_shutdown_owner_fenced", False)
         )
-        if not shutdown_cancelled and not dispatcher_owner_fenced:
+        llm_owner_fenced = self._has_pending_llm_storage_dependents()
+        if not shutdown_cancelled and not dispatcher_owner_fenced and not llm_owner_fenced:
             try:
                 await self.wait_for_shutdown_completion()
             except asyncio.CancelledError as cancellation:
@@ -9147,7 +9179,7 @@ Expected Duration: {expected_duration}
                 if not is_execution_control_error(failure):
                     raise
                 tail_degraded = True
-        elif dispatcher_owner_fenced:
+        elif dispatcher_owner_fenced or llm_owner_fenced:
             # The continuation owns storage close after the hostile cognition
             # task settles. Returning degraded keeps shutdown bounded without
             # making that live task peer-reclaimable in this process.
@@ -9623,6 +9655,13 @@ Expected Duration: {expected_duration}
                 "after owner release."
             )
             return state["cancelled"], state["degraded"]
+
+        if self._has_pending_llm_storage_dependents():
+            await self._ensure_durable_shutdown_continuation(dispatcher)
+            # The finite shutdown boundary hands off to an explicit lifecycle
+            # join. Neither SQLAlchemy nor primary storage may close early.
+            return state["cancelled"], True
+        await self._join_llm_storage_dependents()
 
         # Dispose an optional cached SQLAlchemy engine as its own bounded
         # phase.  Otherwise a slow engine disposal can consume the guard that

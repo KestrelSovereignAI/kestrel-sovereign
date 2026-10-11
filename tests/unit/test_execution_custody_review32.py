@@ -1,0 +1,229 @@
+"""Review32 production-consumer regressions; finite, provider-free owners."""
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError, ExecutionCommitOutcomeError, ExecutionCustody,
+    bind_execution_runtime, require_execution_work,
+)
+from tests.unit.test_execution_custody import Authority
+from tests.unit.test_execution_custody_review29 import native_owner, retire
+from tests.unit.test_execution_custody_review30 import service_owner
+
+
+def receipt(kind):
+    error = ExecutionCommitOutcomeError("unknown")
+    if kind == "cancel_unknown":
+        wrapper = asyncio.CancelledError("original writer cancellation")
+        wrapper.__cause__ = error
+        return wrapper
+    if kind == "group":
+        return BaseExceptionGroup("original native receipt", [asyncio.CancelledError(), error])
+    if kind == "authority":
+        return ExecutionAuthorityError("original child authority denied")
+    if kind == "ordinary":
+        return OSError("ordinary writer failure")
+    return error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["model", "embedding", "overrides"])
+@pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group", "ordinary"])
+async def test_actual_agent_retains_storage_until_native_preference_writer_settles(
+    tmp_path, monkeypatch, route, kind,
+):
+    from kestrel_sovereign.llm import service as service_module
+
+    agent, db = await native_owner(tmp_path)
+    service = service_owner()
+    agent.llm_service = service
+    agent.privacy_agent = SimpleNamespace(privacy_config=SimpleNamespace(allows_cloud_llm=lambda: False))
+    await db.execute("CREATE TABLE IF NOT EXISTS agent_metadata(agent_id TEXT, key TEXT, value TEXT, updated_at TEXT, PRIMARY KEY(agent_id,key))")
+    monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 0.01)
+    committed, release, storage_closed = (asyncio.Event() for _ in range(3))
+    original_execute, original_close = db.execute, agent.storage.close
+    error = receipt(kind)
+    writes, closes = [], []
+    writer = shutdown = waiter = None
+
+    async def native_then_late_receipt(*args, **kwargs):
+        result = await original_execute(*args, **kwargs)
+        writes.append(result)
+        committed.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                pass
+        raise error
+
+    async def close_storage():
+        assert writer.done(), "agent retired the writer's borrowed storage early"
+        closes.append(True)
+        await original_close()
+        storage_closed.set()
+
+    monkeypatch.setattr(db, "execute", native_then_late_receipt)
+    monkeypatch.setattr(agent.storage, "close", close_storage)
+    if route == "model":
+        service.set_preference_persistence_callback(agent._persist_model_preference)
+        writer = service._schedule_preference_persistence("model", "local", "unit")
+    elif route == "embedding":
+        service.set_embedding_route_persistence_callback(agent._persist_embedding_route)
+        writer = service._schedule_embedding_route_persistence(None)
+    else:
+        service.set_route_embedding_model_persistence_callback(agent._persist_route_embedding_models)
+        writer = service._schedule_route_embedding_model_persistence()
+    try:
+        await asyncio.wait_for(committed.wait(), 5)
+        assert await db.fetchval("SELECT COUNT(*) FROM agent_metadata") == 1
+        shutdown = asyncio.create_task(agent.shutdown())
+        await asyncio.wait_for(asyncio.shield(shutdown), 2)
+        assert not storage_closed.is_set()
+        assert not writer.done()
+        assert agent._durable_shutdown_continuation is not None
+        waiter = asyncio.create_task(agent.wait_for_shutdown_completion())
+        await asyncio.sleep(0.01)
+        assert not waiter.done()
+        release.set()
+        if kind == "ordinary":
+            await asyncio.wait_for(waiter, 5)
+        else:
+            with pytest.raises(BaseException) as caught:
+                await asyncio.wait_for(waiter, 5)
+            assert caught.value is error
+            assert agent._shutdown_control is error
+        assert storage_closed.is_set()
+        assert len(writes) == 1 and closes == [True]
+        assert not service.has_pending_close_owners()
+    finally:
+        release.set()
+        for task in (writer, shutdown, waiter, agent._durable_shutdown_continuation):
+            if task is not None:
+                await await_owned_task(task)
+        await retire(agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group"])
+async def test_failed_heartbeat_rearms_before_and_after_revoked_route_retention(tmp_path, kind):
+    from tests.unit.test_durable_signal_delivery import _dispatcher, _close
+    from tests.unit.test_execution_custody_review10 import runtime_owner
+
+    backend, old_agent, dispatcher = await _dispatcher(tmp_path / "heartbeat.db", "did:test:rearm")
+    owner = runtime_owner()
+    owner.did = old_agent.did
+    owner._runtime_publication_ready.set()
+    dispatcher._agent = owner
+    owner._execution_custody.revoke("revoked before route retention")
+    release = asyncio.Event()
+    route = asyncio.create_task(release.wait())
+    dispatcher._release_retained_durable_cognition_task = AsyncMock()
+    error = receipt(kind)
+
+    async def fail():
+        raise error
+
+    failed = asyncio.create_task(fail())
+    await await_owned_task(failed)
+    try:
+        assert not dispatcher._runtime_owner_cleanup_required()
+        dispatcher._finish_runtime_owner_heartbeat(failed)
+        assert dispatcher._runtime_owner_heartbeat_timer is not None
+        context = dispatcher._resident_timer_context()
+        with pytest.raises(ExecutionAuthorityError):
+            context.run(require_execution_work, owner)
+        dispatcher._runtime_owner_heartbeat_timer.cancel()
+        dispatcher._runtime_owner_heartbeat_timer = None
+        dispatcher._retain_durable_cognition_task(route, delivery=SimpleNamespace(delivery_id="original"))
+        assert dispatcher._runtime_owner_heartbeat_timer is not None
+        assert dispatcher._runtime_owner_cleanup_required()
+        with pytest.raises(ExecutionAuthorityError):
+            require_execution_work(owner)
+    finally:
+        release.set()
+        await await_owned_task(route)
+        await asyncio.sleep(0)
+        await dispatcher._drain_retained_durable_cognition_cleanup_tasks()
+        await dispatcher._stop_runtime_owner_heartbeat()
+        await _close(backend, old_agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group", "ordinary"])
+async def test_late_native_cognition_carrier_is_harvested_before_owner_removal(tmp_path, kind):
+    from tests.unit.test_durable_signal_delivery import _dispatcher, _close
+
+    backend, agent, dispatcher = await _dispatcher(tmp_path / "late-cognition.db", "did:test:late-group")
+    await backend.execute("CREATE TABLE effects(id INTEGER PRIMARY KEY)")
+    release = asyncio.Event()
+    error = receipt(kind)
+    delivery = SimpleNamespace(delivery_id="original", consumer_id="consumer", lease_token="original-token")
+    dispatcher._terminalize_failed_cognition = AsyncMock()
+    dispatcher.release_durable_delivery_after_task = AsyncMock()
+
+    async def late_effect():
+        await backend.execute("INSERT INTO effects VALUES (1)")
+        await release.wait()
+        raise error
+
+    task = asyncio.create_task(late_effect())
+    dispatcher._retain_durable_cognition_task(task, delivery=delivery)
+    try:
+        release.set()
+        await await_owned_task(task)
+        await asyncio.sleep(0)
+        await dispatcher._drain_retained_durable_cognition_cleanup_tasks()
+        assert await backend.fetch_val("SELECT COUNT(*) FROM effects") == 1
+        assert not dispatcher._retained_durable_cognition_tasks
+        if kind == "ordinary":
+            dispatcher.release_durable_delivery_after_task.assert_awaited_once()
+            dispatcher._terminalize_failed_cognition.assert_not_awaited()
+        else:
+            dispatcher._terminalize_failed_cognition.assert_awaited_once_with(delivery, error)
+            dispatcher.release_durable_delivery_after_task.assert_not_awaited()
+    finally:
+        release.set()
+        await await_owned_task(task)
+        await dispatcher._stop_runtime_owner_heartbeat()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["authority", "unknown", "cancel_unknown", "group", "ordinary"])
+async def test_actual_spawn_tool_preserves_distinct_child_denial_with_live_parent(tmp_path, kind):
+    from tests.unit.test_spawn_feature import _make_spawn_feature
+
+    parent, _db = await native_owner(tmp_path)
+    parent._execution_custody = ExecutionCustody(Authority())
+    child = SimpleNamespace(_execution_custody=ExecutionCustody(Authority()))
+    child._execution_custody.revoke("original child generation retired")
+    error = receipt(kind)
+
+    async def spawn(**kwargs):
+        parent._execution_custody.require_work()
+        with pytest.raises(ExecutionAuthorityError):
+            require_execution_work(child)
+        raise error
+
+    manager = MagicMock()
+    manager.spawn_agent = AsyncMock(side_effect=spawn)
+    feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+    try:
+        with bind_execution_runtime(parent):
+            if kind == "ordinary":
+                result = await feature.spawn_agent(name="child", purpose="provider-free authority proof")
+                assert result.error == str(error)
+            else:
+                with pytest.raises(BaseException) as caught:
+                    await feature.spawn_agent(name="child", purpose="provider-free authority proof")
+                assert caught.value is error
+            parent._execution_custody.require_work()
+        manager.spawn_agent.assert_awaited_once()
+    finally:
+        parent._execution_custody.revoke("test retirement")
+        await retire(parent)

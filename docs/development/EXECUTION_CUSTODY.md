@@ -369,6 +369,25 @@ usage storage waits for physical writer settlement and never closes underneath
 a retained writer. Late completions harvest one strongest receipt, and retries
 join the same operation rather than duplicate an uncertain native effect;
 closing physical resources never certifies reconciliation of an uncertain write.
+Actual agent retirement also fences its borrowed preference/accounting storage
+and local host-key accessor behind these same native LLM owners. The bounded
+shutdown attempt hands the dependency to one durable continuation; the explicit
+host/reaper join settles the original owners before storage or serving-record
+release and reports their strongest original receipt. Failed construction
+registers the unpublished provider before cleanup awaits. Pending or uncertain
+cleanup keeps that exact provider and original scope in manager/server custody,
+blocks replacement birth and shared-pool release, and is retried by host teardown
+without recreating an uncertain native close. Ordinary settled close failures
+retain their compatibility behavior. Server cancellation/group handling cannot
+strip a native control cause or hide it behind an earlier ordinary failure.
+
+Durable owner-heartbeat failure re-arms bounded cleanup liveness even before a
+late cognition owner or terminalization debt is installed. Re-arm retains the
+denying original context, not a fresh admission. Cognition and cleanup callbacks
+harvest cancellation-containing exception groups before removing owners; native
+control terminalizes the original exact delivery rather than releasing it for
+retry. Spawn tools likewise preserve a distinct child's control denial when
+the parent's own admission is still live.
 Deferred OpenRouter provisioning validates the original admission after client
 acquisition and immediately before each POST, including retries after backoff.
 Cause-carried control errors bypass retry/error normalization; ordinary live

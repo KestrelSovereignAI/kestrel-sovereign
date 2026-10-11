@@ -33,6 +33,7 @@ from kestrel_sovereign.kestrel_agent import (
 )
 from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
 from kestrel_sovereign.llm.service import LLMService
+from kestrel_sovereign.llm.lifecycle import drain_unpublished_llm_owners, retire_unpublished_llm
 from dotenv import load_dotenv
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
@@ -2532,6 +2533,7 @@ async def _shutdown_shared_agent_postgres_backend(app: FastAPI) -> None:
     if (
         getattr(app.state, "agent_manager", None) is not None
         or getattr(app.state, "startup_cleanup_agent_manager", None) is not None
+        or getattr(app.state, "unpublished_llm_owners", None)
     ):
         raise RuntimeError(
             "refusing to close shared PostgreSQL pools while an agent manager "
@@ -2892,7 +2894,9 @@ def _split_lifecycle_cancellation(
     failure: BaseException | None,
 ) -> tuple[bool, BaseException | None]:
     """Separate cancellation leaves while preserving every ordinary failure."""
-
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    if failure is not None and is_execution_control_error(failure):
+        return False, failure
     if isinstance(failure, asyncio.CancelledError):
         return True, None
     if isinstance(failure, BaseExceptionGroup):
@@ -2959,6 +2963,7 @@ async def _run_lifespan_shutdown_phase(
 
 async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException | None]:
     """Drain every server-owned teardown phase before reporting an outcome."""
+    from kestrel_sovereign.execution_custody import execution_terminal_error
     logger.info("Server shutting down...")
     cancelled = False
     first_failure: BaseException | None = None
@@ -2969,6 +2974,9 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
         # surfaces while teardown proceeds. Finish application-owned Stop
         # tails before their agent instances are released.
         ("stop-cleanup", lambda: _shutdown_stop_cleanup(app)),
+        ("unpublished-providers", lambda: drain_unpublished_llm_owners(
+            getattr(app.state, "unpublished_llm_owners", {}),
+        )),
         ("agents", lambda: _shutdown_server_agents(app)),
         # HostContext owns the fleet Hold store. Agent heartbeats, signals and
         # feature cleanup may still enter the universal turn seam until agent
@@ -2995,12 +3003,8 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
             # ``_shutdown_phoenix`` records cancellation that it observed while
             # joining its app-owned work.
             cancelled = True
-        if (
-            failure is not None
-            and not isinstance(failure, asyncio.CancelledError)
-            and first_failure is None
-        ):
-            first_failure = failure
+        if failure is not None:
+            first_failure = execution_terminal_error(first_failure, failure)
 
     return cancelled, first_failure
 
@@ -3016,6 +3020,10 @@ async def _lifespan_teardown_owner(app: FastAPI):
         raise
     finally:
         cancelled, teardown_failure = await _shutdown_server_resources(app)
+        from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+        terminal = execution_terminal_error(body_failure, teardown_failure)
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
         # Preserve the original failure from startup/request lifespan body.  On
         # a normal exit, however, cleanup must make a terminal agent failure
         # visible only after Phoenix and every other phase have been drained.
@@ -3046,6 +3054,8 @@ async def _build_host_control_context(app: FastAPI, host_config) -> object:
 @asynccontextmanager
 async def _lifespan_startup(app: FastAPI):
     """Initialize server resources; outer lifespan ownership handles teardown."""
+    if getattr(app.state, "unpublished_llm_owners", None):
+        raise RuntimeError("unpublished provider cleanup must retire before server restart")
     logger.info("Server starting up...")
     _set_startup_error(app, None)
     app.state.mandatory_feature_failures = []
@@ -3673,11 +3683,21 @@ async def _lifespan_startup(app: FastAPI):
             app.state.agent = None
             cleanup_cancelled = False
             if llm_service is not None:
-                close_task = asyncio.create_task(
-                    llm_service.close(), name="server_startup:close_single_llm",
-                )
-                cleanup_cancelled, close_error = await await_lifecycle_task_completion(close_task)
+                owners = getattr(app.state, "unpublished_llm_owners", None)
+                if owners is None:
+                    owners = app.state.unpublished_llm_owners = {}
+                close_error = None
+                try:
+                    await retire_unpublished_llm(owners, "default", llm_service, captured)
+                except BaseException as error:
+                    close_error = error
                 if close_error is not None:
+                    from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+                    terminal = execution_terminal_error(e, close_error)
+                    if terminal is not None and is_execution_control_error(terminal):
+                        raise terminal
+                    if isinstance(close_error, asyncio.CancelledError):
+                        cleanup_cancelled = True
                     logger.warning(
                         "Could not close LLM service after failed single-agent startup (cause_type=%s)",
                         type(close_error).__name__,

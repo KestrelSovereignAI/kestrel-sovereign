@@ -984,6 +984,9 @@ class SpawnFeature(Feature):
                 },
             )
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to spawn child agent '{name}': {e}")
             return ToolResult.failed(error=str(e))
 

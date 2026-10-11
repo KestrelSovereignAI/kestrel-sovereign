@@ -2906,8 +2906,21 @@ class SignalDispatcher:
             return copy_context()
         factory = getattr(type(self._agent), "_runtime_owner_context", None)
         if callable(factory):
-            return self._agent._runtime_owner_context()
+            try:
+                return self._agent._runtime_owner_context()
+            except BaseException as error:
+                if not is_execution_control_error(error):
+                    raise
+                # Supervise timers across the revocation->retention window.
+                # Copying the original denied context grants no ordinary work;
+                # heartbeat admission itself still enforces that denial.
+                return copy_context()
         return copy_context()
+
+    def _rearm_cleanup_runtime_owner_heartbeat(self) -> None:
+        """Install supervision when initialized runtime cleanup debt changes."""
+        if "_runtime_owner_stale_after" in vars(self):
+            self._schedule_runtime_owner_heartbeat(retry=True)
 
     def _schedule_runtime_owner_heartbeat(self, *, retry: bool = False) -> None:
         """Keep owner liveness separate from delivery lease countdowns.
@@ -3073,7 +3086,9 @@ class SignalDispatcher:
     def _finish_runtime_owner_heartbeat(self, task: asyncio.Task) -> None:
         if self._runtime_owner_heartbeat_task is task:
             self._runtime_owner_heartbeat_task = None
-        if task.cancelled():
+        from kestrel_sovereign._async_ownership import owned_task_error
+        error = owned_task_error(task)
+        if isinstance(error, asyncio.CancelledError):
             if not self._durable_shutdown or self._runtime_owner_cleanup_required():
                 self._runtime_owner_heartbeat_failures += 1
                 logger.warning(
@@ -3082,15 +3097,13 @@ class SignalDispatcher:
                 )
                 self._schedule_runtime_owner_heartbeat(retry=True)
             return
-        try:
-            task.result()
-        except _DurableDeliveryShuttingDownError:
+        if isinstance(error, _DurableDeliveryShuttingDownError):
             # A queued timer callback can lose the lifecycle race after
             # shutdown closes admission.  That rejection is normal, but its
             # exception must still be retrieved before returning.
             return
-        except Exception:
-            logger.exception("Durable signal runtime-owner heartbeat failed")
+        if error is not None:
+            logger.error("Durable signal runtime-owner heartbeat failed (%s)", type(error).__name__)
             if not self._durable_shutdown or self._runtime_owner_cleanup_required():
                 self._runtime_owner_heartbeat_failures += 1
                 self._schedule_runtime_owner_heartbeat(retry=True)
@@ -4685,6 +4698,7 @@ class SignalDispatcher:
                         # cleanup cannot switch back to ordinary admission if
                         # that child refuses cancellation or returns normally.
                         self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, loss)
+                        self._rearm_cleanup_runtime_owner_heartbeat()
                         lease_loss_reason = str(loss)
                     else:
                         lease_loss_reason = loss
@@ -4996,25 +5010,25 @@ class SignalDispatcher:
         """Own and harvest a route task that outlives its ingress dispatch."""
 
         if task in self._retained_durable_cognition_tasks:
+            self._rearm_cleanup_runtime_owner_heartbeat()
             return
         self._retained_durable_cognition_tasks.add(task)
+        self._rearm_cleanup_runtime_owner_heartbeat()
 
         def completed(completed_task: asyncio.Task[SignalResult]) -> None:
-            self._retained_durable_cognition_tasks.discard(completed_task)
+            from kestrel_sovereign._async_ownership import owned_task_error
+            # First canonical harvest precedes releasing the physical owner;
+            # Task.result() can erase a cancellation cause on a second read.
+            error = owned_task_error(completed_task)
             debt = getattr(self, "_retained_cognition_control_debt", {}).get(delivery.delivery_id)
             retained_error = execution_terminal_error(control_error, debt[1] if debt else None)
-            try:
-                completed_task.result()
-            except asyncio.CancelledError as error:
-                if is_execution_control_error(error):
-                    retained_error = execution_terminal_error(retained_error, error)
-            except Exception as error:
-                if is_execution_control_error(error):
-                    retained_error = execution_terminal_error(retained_error, error)
+            if error is not None and is_execution_control_error(error):
+                retained_error = execution_terminal_error(retained_error, error)
+            elif error is not None and not isinstance(error, asyncio.CancelledError):
                 # The route's final disposition was already made visible when
                 # retention began.  Harvest this late exception so it cannot
                 # become an unobserved task failure or a second audit row.
-                logger.exception(
+                logger.error(
                     "Retained durable cognition task failed after lease loss: "
                     "delivery=%s",
                     delivery.delivery_id,
@@ -5025,11 +5039,14 @@ class SignalDispatcher:
                 # replacement's owner-aware recovery then owns requeueing;
                 # touching the closing backend from this late callback would
                 # violate the lifecycle admission boundary.
+                self._retained_durable_cognition_tasks.discard(completed_task)
                 return
             if retained_error is not None:
                 if not hasattr(self, "_retained_cognition_control_debt"):
                     self._retained_cognition_control_debt = {}
                 self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained_error)
+                self._rearm_cleanup_runtime_owner_heartbeat()
+            self._retained_durable_cognition_tasks.discard(completed_task)
             cleanup = asyncio.create_task(
                 self._release_retained_durable_cognition_task(delivery, retained_error),
                 name=(
@@ -5040,13 +5057,17 @@ class SignalDispatcher:
             self._retained_durable_cognition_cleanup_tasks.add(cleanup)
 
             def harvest_cleanup(cleanup_task: asyncio.Task[None]) -> None:
+                from kestrel_sovereign._async_ownership import owned_task_error
+                error = owned_task_error(cleanup_task)
                 self._retained_durable_cognition_cleanup_tasks.discard(cleanup_task)
-                if cleanup_task.cancelled():
-                    return
-                try:
-                    cleanup_task.result()
-                except Exception:
-                    logger.exception(
+                if error is not None and is_execution_control_error(error):
+                    debt = self._retained_cognition_control_debt.get(delivery.delivery_id)
+                    self._retained_cognition_control_debt[delivery.delivery_id] = (
+                        delivery, execution_terminal_error(debt[1] if debt else None, error),
+                    )
+                    self._rearm_cleanup_runtime_owner_heartbeat()
+                elif error is not None and not isinstance(error, asyncio.CancelledError):
+                    logger.error(
                         "Retained durable cognition cleanup failed: delivery=%s",
                         delivery.delivery_id,
                     )
@@ -5094,6 +5115,7 @@ class SignalDispatcher:
     async def _settle_cognition_control(self, delivery, error, routing_task):
         """Never terminalize a delivery while its original route can still act."""
         self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, error)
+        self._rearm_cleanup_runtime_owner_heartbeat()
         if routing_task is not None and not routing_task.done():
             # A late renewal control can replace cancellation of the context
             # body before the ordinary cancellation handler reaches this route.
@@ -5111,6 +5133,7 @@ class SignalDispatcher:
         from kestrel_sovereign.execution_custody import execution_terminal_error
 
         self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, error)
+        self._rearm_cleanup_runtime_owner_heartbeat()
         task = asyncio.create_task(
             self._apply_cognition_control_terminal(delivery, error),
             name=f"durable_cognition_control_terminal:{delivery.delivery_id}",
@@ -5122,7 +5145,11 @@ class SignalDispatcher:
         if outcome.error is None:
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
         if outcome.error is not None or outcome.cancellation is not None:
-            raise execution_terminal_error(error, outcome.error, outcome.cancellation)
+            terminal = execution_terminal_error(error, outcome.error, outcome.cancellation)
+            if outcome.error is not None:
+                self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, terminal)
+                self._rearm_cleanup_runtime_owner_heartbeat()
+            raise terminal
 
     async def _apply_cognition_control_terminal(self, delivery, error):
         reason = f"execution_control_unresolved: {type(error).__name__}: {error}"[:500]
