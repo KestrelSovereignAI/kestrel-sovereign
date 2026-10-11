@@ -23,8 +23,14 @@ from kestrel_sdk.llm import (
 )
 from kestrel_sdk.llm.types import BackendType
 
+from kestrel_sovereign._async_ownership import await_owned_task
+from .lifecycle import start_llm_close_task
+from kestrel_sovereign.execution_custody import (
+    await_execution_work, bind_execution_custody_snapshot,
+    current_execution_custody, execution_terminal_error,
+)
+
 from kestrel_sovereign.kestrel_config.constants import (
-    CLIENT_CLOSE_TIMEOUT,
     HTTP_TIMEOUT_MEDIUM,
 )
 
@@ -57,32 +63,30 @@ class RemoteBackendMixin:
 
     _managed_remote_failure_message = _MANAGED_REMOTE_FAILURE_MESSAGE
 
-    @staticmethod
     async def _close_remote_client(
+        self,
         client: openai.AsyncOpenAI,
         *,
         lease_id: str,
     ) -> None:
         """Close one route client without surfacing provider secret details."""
 
-        try:
-            await asyncio.wait_for(
-                client.close(),
-                timeout=CLIENT_CLOSE_TIMEOUT,
-            )
-        except TimeoutError:
-            logger.warning(
-                "Timed out closing private inference client for %s",
-                lease_id,
-            )
-        # Client implementations may raise transport-specific exceptions.
-        # The route has already been detached, so cleanup remains best-effort.
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Private inference client close failed for %s (%s)",
-                lease_id,
-                type(exc).__name__,
-            )
+        # Cancellation must not destroy the native close. The outer lifecycle
+        # owns its bounded admission; this dependency owns physical retirement.
+        key = ("client", id(client))
+        owner = start_llm_close_task(self, key, client.close)
+        outcome = await await_owned_task(owner) if owner is not None else None
+        terminal = execution_terminal_error(
+            vars(self).get("_llm_close_control"),
+            outcome.error if outcome is not None else None,
+            outcome.cancellation if outcome is not None else None,
+        )
+        if terminal is not None:
+            raise terminal
+        # Successful rotations need no permanent per-client tombstones. Native
+        # uncertainty instead retains its fixed disposition in the same host
+        # registry, and further route activation is denied below.
+        vars(self).get("_llm_close_tasks", {}).pop(key, None)
 
     def switch_backend(self, backend: BackendType, config: Any = None) -> None:
         """Switch ordinary backends; direct remote configuration is retired."""
@@ -164,6 +168,9 @@ class RemoteBackendMixin:
             ),
         )
         async with self._remote_route_condition:
+            terminal = execution_terminal_error(vars(self).get("_llm_close_control"))
+            if terminal is not None:
+                raise terminal
             if self._remote_route_closed:
                 # ``close()`` has already drained this route and will not run
                 # again. Building a client here would leak it and would restore
@@ -173,6 +180,8 @@ class RemoteBackendMixin:
                     "cannot be activated"
                 )
             active = self._remote_lease
+            if active is not None and not self._remote_accepting:
+                raise LLMServiceError("private inference route is draining; release it first")
             if active is not None and active.lease_id == lease.lease_id:
                 active_route = active.route
                 active_material = (
@@ -215,7 +224,9 @@ class RemoteBackendMixin:
         old_client: openai.AsyncOpenAI | None = None
         activation_error: str | None = None
         async with self._remote_route_condition:
-            if self._remote_route_closed:
+            if vars(self).get("_llm_close_control") is not None:
+                activation_error = "native client retirement requires reconciliation"
+            elif self._remote_route_closed:
                 # ``close()`` won the race while this client was being built.
                 # Fall through to the error path so the new client is closed
                 # rather than leaked.
@@ -224,7 +235,9 @@ class RemoteBackendMixin:
                     "cannot be activated"
                 )
             elif self._remote_lease is not None:
-                if self._remote_lease.lease_id != lease.lease_id:
+                if not self._remote_accepting:
+                    activation_error = "private inference route is draining; release it first"
+                elif self._remote_lease.lease_id != lease.lease_id:
                     activation_error = (
                         "another inference lease is already active; release it first"
                     )
@@ -291,7 +304,10 @@ class RemoteBackendMixin:
             self._remote_accepting = False
             self._backend = self._default_backend
             try:
-                async with asyncio.timeout(HTTP_TIMEOUT_MEDIUM):
+                # Terminal host cleanup is already a retained lifecycle owner:
+                # it must drain through physical client close, not time out and
+                # leave that dependency unowned. Public release stays bounded.
+                async with asyncio.timeout(None if self._remote_route_closed else HTTP_TIMEOUT_MEDIUM):
                     while self._remote_inflight:
                         await self._remote_route_condition.wait()
             except TimeoutError as exc:
@@ -301,14 +317,14 @@ class RemoteBackendMixin:
                 ) from exc
 
             client = self._remote_client
+            if client is not None:
+                await self._close_remote_client(client, lease_id=lease_id)
             self._remote_client = None
             self._remote_lease = None
             self._remote_capabilities = frozenset()
             self._remote_touch_lease = None
             self._remote_route_epoch += 1
 
-        if client is not None:
-            await self._close_remote_client(client, lease_id=lease_id)
         logger.info("Deactivated private inference lease %s", lease_id)
 
     @asynccontextmanager
@@ -327,6 +343,7 @@ class RemoteBackendMixin:
         selected_lease_id: str | None = None
         touch_lease: InferenceLeaseTouch | None = None
         selected_route_epoch: int | None = None
+        captured = current_execution_custody(self)
         async with self._remote_route_condition:
             lease = self._remote_lease
             client = self._remote_client
@@ -373,7 +390,10 @@ class RemoteBackendMixin:
             assert selected_route_epoch is not None
             touched: InferenceLease | None = None
             try:
-                touched = await touch_lease(selected_lease_id)
+                with bind_execution_custody_snapshot(captured):
+                    touched = await await_execution_work(
+                        self, lambda: touch_lease(selected_lease_id),
+                    )
             except Exception as exc:  # noqa: BLE001 - provider boundary
                 self._raise_managed_remote_failure(exc)
             if (

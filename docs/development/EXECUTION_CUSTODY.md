@@ -391,6 +391,18 @@ outcome, including cancellation-containing groups. Child timeout cancellation
 does not manufacture caller cancellation. Fleet/quarantine retirement and
 delegated result reads retain the original strongest native control receipt;
 completed-task removal or bounded diagnostic eviction cannot acknowledge it.
+Retained native receipts freeze their original explicit-carrier tracebacks:
+repeated CAS heartbeats or delegated-result reads preserve the same exception,
+cause/group and commit outcome without retaining every later reader frame.
+Batch startup, admission release and PostgreSQL pool/scheduler rollback select
+the strongest native receipt only after independent cleanup has settled; an
+ordinary startup failure or caller cancellation cannot replace that receipt.
+Failed single-agent birth records native control on the actual retained Agent.
+Private-route renewal carries the original runtime and ambient scopes across
+the coordinator lock and revalidates immediately before provider touch. A
+bounded host close cannot cancel the route's physical request/client drain.
+Rotated and unpublished route clients use the same native-close registry as
+ordinary providers; uncertain close is retained, never recreated on a retry.
 
 Durable owner-heartbeat failure re-arms bounded cleanup liveness even before a
 late cognition owner or terminalization debt is installed. Re-arm retains the

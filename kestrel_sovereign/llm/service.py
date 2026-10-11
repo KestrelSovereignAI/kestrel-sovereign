@@ -63,6 +63,7 @@ from .invocation_context import (
 )
 from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import BackendType, RemoteBackendMixin
+from .lifecycle import start_llm_close_task
 from .decision_service import DecisionServiceMixin
 from .modality_recording import ModalityRecordingMixin
 from .decisions.resolve import RouteDecisionState
@@ -5178,36 +5179,20 @@ No other text or formatting.
         terminal = vars(self).get("_llm_close_control")
         interrupted = False
 
-        def completed(key, task):
-            error = owned_task_error(task)
-            if error is not None and is_execution_control_error(error):
-                self._llm_close_control = execution_terminal_error(
-                    vars(self).get("_llm_close_control"), error,
-                )
-            if tasks.get(key) is task:
-                # Preserve a settled disposition, not a completed task/traceback
-                # list. Ordinary failure may retry; unknown native effects may not.
-                if error is None or is_execution_control_error(error):
-                    tasks[key] = None
-                else:
-                    tasks.pop(key)
-
-        async def retire(label, operation, *, resource=None):
+        async def retire(label, operation, *, resource=None, cancel_on_timeout=True):
             nonlocal terminal, interrupted
             key = (label, id(resource)) if resource is not None else label
             if key in tasks and tasks[key] is None:
                 return
-            task = tasks.get(key)
+            task = start_llm_close_task(self, key, operation)
             if task is None:
-                task = asyncio.create_task(operation(), name=f"llm-close:{label}")
-                tasks[key] = task
-                task.add_done_callback(lambda done: completed(key, done))
+                return
             try:
                 await asyncio.wait({task}, timeout=0 if interrupted else CLIENT_CLOSE_TIMEOUT)
             except asyncio.CancelledError as cancellation:
                 terminal = execution_terminal_error(terminal, cancellation)
                 interrupted = True
-            if not task.done() and not interrupted:
+            if not task.done() and not interrupted and cancel_on_timeout:
                 # Send cancellation only once. A retry joins the SAME pending
                 # operation and cannot interrupt a native commit a second time.
                 if not getattr(task, "_kestrel_llm_close_cancel_sent", False):
@@ -5220,7 +5205,6 @@ No other text or formatting.
                     interrupted = True
             if not task.done():
                 return
-            completed(key, task)
             error = owned_task_error(task)
             if error is not None and is_execution_control_error(error):
                 terminal = execution_terminal_error(terminal, error)
@@ -5256,7 +5240,7 @@ No other text or formatting.
                     self._remote_lease.lease_id, require_active=False,
                 )
 
-        await retire("remote-route", close_remote_route)
+        await retire("remote-route", close_remote_route, cancel_on_timeout=False)
 
         async def close_usage_after_writers():
             for key in ("preference-writers", "modality-writers"):

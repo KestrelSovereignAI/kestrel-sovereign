@@ -26,7 +26,9 @@ from typing import Any, Callable, Dict
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign._async_ownership import owned_task_error
-from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error, is_execution_control_error, retained_execution_error,
+)
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -596,7 +598,7 @@ class SpawnFeature(Feature):
 
         control = vars(self).get("_delegated_control")
         if control is not None:
-            raise control
+            raise retained_execution_error(control)
 
         # Runtime soft-disable stops descendants but deliberately leaves finite
         # restart witnesses under their signed deadline. Preserve the exact
@@ -1118,7 +1120,7 @@ class SpawnFeature(Feature):
         """
         control = vars(self).get("_delegated_control")
         if control is not None:
-            raise control
+            raise retained_execution_error(control)
         manager = await self._get_ready_agent_manager()
         if manager is None:
             return ToolResult.failed(error="No AgentManager available")
@@ -1194,7 +1196,7 @@ class SpawnFeature(Feature):
                 if is_execution_control_error(e) or not isinstance(e, Exception):
                     if self._child_tasks.get(child_name) is owner:
                         self._child_results[child_name] = {
-                            "success": False, "control": e,
+                            "success": False, "control": retained_execution_error(e),
                             "completed_at": time.time(),
                         }
                     raise
@@ -1294,7 +1296,7 @@ class SpawnFeature(Feature):
         if control is not None:
             # A native receipt is not a consumable tool-error string. Every
             # reader sees the same outcome until host lifecycle reconciliation.
-            raise control
+            raise retained_execution_error(control)
         self._child_results.pop(child_name)
         # The stored result has ``success`` and either ``result`` (on
         # success) or ``error`` (on failure). Surface child-side
@@ -1679,7 +1681,7 @@ class SpawnFeature(Feature):
             outcomes.append(asyncio.CancelledError())
         control = execution_terminal_error(vars(self).get("_delegated_control"), *outcomes)
         if control is not None and is_execution_control_error(control):
-            raise control
+            raise retained_execution_error(control)
         if len(outcomes) == 1:
             raise outcomes[0]
         if outcomes:
@@ -1786,7 +1788,7 @@ class SpawnFeature(Feature):
             outcomes.append(asyncio.CancelledError())
         control = execution_terminal_error(vars(self).get("_delegated_control"), *outcomes)
         if control is not None and is_execution_control_error(control):
-            raise control
+            raise retained_execution_error(control)
         if len(outcomes) == 1:
             raise outcomes[0]
         if outcomes:

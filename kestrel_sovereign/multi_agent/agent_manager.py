@@ -2516,6 +2516,8 @@ class AgentManager:
                 ),
             )
             cancelled, failure = await await_lifecycle_task_completion(task)
+            if failure is not None and is_execution_control_error(failure):
+                raise execution_terminal_error(failure)
             if isinstance(failure, asyncio.CancelledError):
                 # ``on_agent_ready`` is a best-effort post-publication phase.
                 # Real agents consume a hook-owned child cancellation inside
@@ -3334,11 +3336,16 @@ class AgentManager:
         cancelled = False
         failures: list[Exception] = []
         fatal: Optional[BaseException] = None
+        control = None
         for cleanup_task in cleanup_tasks:
-            cleanup_cancelled, cleanup_failure = (
-                await await_lifecycle_task_completion(cleanup_task)
-            )
+            try:
+                cleanup_cancelled, cleanup_failure = (
+                    await await_lifecycle_task_completion(cleanup_task)
+                )
+            except BaseException as error:
+                cleanup_cancelled, cleanup_failure = False, error
             cancelled = cancelled or cleanup_cancelled
+            control = execution_terminal_error(control, cleanup_failure)
             if cleanup_failure is None:
                 continue
             if isinstance(cleanup_failure, asyncio.CancelledError):
@@ -3347,10 +3354,11 @@ class AgentManager:
                 failures.append(cleanup_failure)
             elif fatal is None:
                 fatal = cleanup_failure
-        # The cleanup tasks are now terminal, so preserve the caller's
-        # cancellation in preference to any cleanup error.  Otherwise a batch
-        # onboarding failure can turn a later cancellation into an apparently
-        # ordinary startup failure after it already completed all cleanup.
+        # Every independent owner is terminal. Native control evidence must
+        # survive even a concurrent caller cancellation; ordinary cleanup
+        # failures retain the historical cancellation precedence below.
+        if control is not None and is_execution_control_error(control):
+            raise control
         if cancelled:
             raise asyncio.CancelledError()
         if fatal is not None:
@@ -6051,15 +6059,22 @@ class AgentManager:
 
         cancelled = False
         failures: list[BaseException] = []
+        control = None
         for task in tasks:
-            task_cancelled, failure = await await_lifecycle_task_completion(task)
+            try:
+                task_cancelled, failure = await await_lifecycle_task_completion(task)
+            except BaseException as error:
+                task_cancelled, failure = False, error
             cancelled = cancelled or task_cancelled
+            control = execution_terminal_error(control, failure)
             if failure is None:
                 continue
             if isinstance(failure, asyncio.CancelledError):
                 cancelled = True
             else:
                 failures.append(failure)
+        if control is not None and is_execution_control_error(control):
+            raise control
         if cancelled:
             return True
         if failures:
@@ -7135,6 +7150,7 @@ class AgentManager:
         # either published or completed its single cleanup attempt.  That makes
         # a concurrent dynamic create/load fail before duplicate initialization.
         admitted: list[tuple[str, LocalAgentConfig, AgentOperationAdmission]] = []
+        batch_failure = None
         try:
             for name, agent_cfg in pending:
                 try:
@@ -7226,15 +7242,28 @@ class AgentManager:
                 # phase. asyncio cannot run the new task until this loop yields,
                 # so the watchdog can never observe the earlier batch owner.
                 admission.owner_task = init_task
+                # gather synthesizes CancelledError for a cancelled child and
+                # may consume its native cause. Cache the canonical original
+                # before gather installs its own result callback.
+                init_task.add_done_callback(owned_task_error)
                 init_tasks.append(init_task)
+
+            async def collect_initializer_results():
+                gathered = await asyncio.gather(*init_tasks, return_exceptions=True)
+                return [
+                    (owned_task_error(task) or result)
+                    if isinstance(result, BaseException) else result
+                    for task, result in zip(init_tasks, gathered)
+                ]
+
             try:
-                results = await asyncio.gather(*init_tasks, return_exceptions=True)
+                results = await collect_initializer_results()
             except BaseException as initial_failure:
                 # ``gather`` cancellation cancels pending initializers.  Results
                 # that already initialized are invisible to shutdown_all(), so
                 # this batch still owns their cleanup.  Cancellation wins only
                 # after all of those ownership transfers have settled.
-                settled = await asyncio.gather(*init_tasks, return_exceptions=True)
+                settled = await collect_initializer_results()
                 initialized = [
                     (name, result)
                     for (name, _, _), result in zip(admitted, settled)
@@ -7244,10 +7273,22 @@ class AgentManager:
                     cleanup_cancelled = (
                         await self._discard_unpublished_initialized_agents(initialized)
                     )
-                except BaseException:
+                except BaseException as cleanup_failure:
+                    terminal = execution_terminal_error(
+                        initial_failure, *(
+                            result for result in settled if isinstance(result, BaseException)
+                        ), cleanup_failure,
+                    )
+                    if terminal is not None and is_execution_control_error(terminal):
+                        raise terminal
                     if isinstance(initial_failure, asyncio.CancelledError):
                         raise asyncio.CancelledError()
                     raise
+                terminal = execution_terminal_error(initial_failure, *(
+                    result for result in settled if isinstance(result, BaseException)
+                ))
+                if terminal is not None and is_execution_control_error(terminal):
+                    raise terminal
                 if isinstance(initial_failure, asyncio.CancelledError) or cleanup_cancelled:
                     raise asyncio.CancelledError()
                 raise initial_failure
@@ -7257,7 +7298,7 @@ class AgentManager:
                     result
                     for result in results
                     if isinstance(result, BaseException)
-                    and not isinstance(result, Exception)
+                    and (not isinstance(result, Exception) or is_execution_control_error(result))
                 ),
                 None,
             )
@@ -7271,10 +7312,18 @@ class AgentManager:
                     cleanup_cancelled = (
                         await self._discard_unpublished_initialized_agents(initialized)
                     )
-                except BaseException:
+                except BaseException as cleanup_failure:
+                    terminal = execution_terminal_error(fatal, cleanup_failure)
+                    if terminal is not None and is_execution_control_error(terminal):
+                        raise terminal
                     if isinstance(fatal, asyncio.CancelledError):
                         raise asyncio.CancelledError()
                     raise
+                terminal = execution_terminal_error(fatal, *(
+                    result for result in results if isinstance(result, BaseException)
+                ))
+                if terminal is not None and is_execution_control_error(terminal):
+                    raise terminal
                 if isinstance(fatal, asyncio.CancelledError) or cleanup_cancelled:
                     raise asyncio.CancelledError()
                 raise fatal
@@ -7376,6 +7425,9 @@ class AgentManager:
                                 )
                                 self._withdraw_initialized_agent(name, result)
                                 withdrawn_after_onboarding_failure = True
+                                terminal = execution_terminal_error(registration_failure, rollback_failure)
+                                if terminal is not None and is_execution_control_error(terminal):
+                                    raise terminal
                                 if rollback_failure is not None:
                                     _raise_lifecycle_outcomes(
                                         "Batch onboarding and serialized rollback failed",
@@ -7414,6 +7466,9 @@ class AgentManager:
                                 )
                             except BaseException as error:
                                 cleanup_failure = error
+                        terminal = execution_terminal_error(onboarding_failure, cleanup_failure)
+                        if terminal is not None and is_execution_control_error(terminal):
+                            raise terminal
                         if (
                             isinstance(onboarding_failure, asyncio.CancelledError)
                             or cleanup_cancelled
@@ -7469,6 +7524,9 @@ class AgentManager:
                         )
                     except BaseException as error:
                         cleanup_failure = error
+                terminal = execution_terminal_error(publication_failure, cleanup_failure)
+                if terminal is not None and is_execution_control_error(terminal):
+                    raise terminal
                 if (
                     isinstance(publication_failure, asyncio.CancelledError)
                     or cleanup_cancelled
@@ -7486,12 +7544,25 @@ class AgentManager:
                     raise cleanup_failure
                 raise
             return loaded
+        except BaseException as error:
+            batch_failure = error
+            raise
         finally:
             # No batch admission is reusable until all initialization,
             # publication, or claimed cleanup paths above have settled.
-            release_cancelled = await self._release_agent_operations(
-                [admission for _, _, admission in admitted]
-            )
+            release_failure = None
+            release_cancelled = False
+            try:
+                release_cancelled = await self._release_agent_operations(
+                    [admission for _, _, admission in admitted]
+                )
+            except BaseException as error:
+                release_failure = error
+            terminal = execution_terminal_error(batch_failure, release_failure)
+            if terminal is not None and is_execution_control_error(terminal):
+                raise terminal
+            if release_failure is not None:
+                raise release_failure
             if release_cancelled:
                 raise asyncio.CancelledError()
 

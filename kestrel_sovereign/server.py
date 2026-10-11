@@ -34,7 +34,7 @@ from kestrel_sovereign.kestrel_agent import (
 from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.lifecycle import drain_unpublished_llm_owners, retire_unpublished_llm
-from kestrel_sovereign.execution_custody import execution_terminal_error
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 from dotenv import load_dotenv
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
@@ -2239,7 +2239,7 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
         app.state.stop_receipt_store = store
         app.state.peer_stop_circuit = circuit
         app.state.distributed_invocation_registry = distributed_stop
-    except (Exception, asyncio.CancelledError) as error:
+    except BaseException as error:
         cleanup_cancelled = isinstance(error, asyncio.CancelledError)
         cleanup_failures: list[BaseException] = []
         if distributed_stop is not None:
@@ -2268,6 +2268,11 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
                 "Durable Stop startup cleanup also failed: "
                 f"{type(failure).__name__}: {failure}"
             )
+        terminal = execution_terminal_error(error, *cleanup_failures)
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
+        if not isinstance(error, (Exception, asyncio.CancelledError)):
+            raise
         if cleanup_cancelled:
             cancellation = (
                 error
@@ -2527,6 +2532,9 @@ async def _start_shared_agent_postgres_backend(app: FastAPI):
                 "Shared PostgreSQL startup cleanup also failed: "
                 f"{type(cleanup_failure).__name__}"
             )
+        terminal = execution_terminal_error(startup_failure, cleanup_failure)
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
         if cleanup_cancelled and not isinstance(
             startup_failure, asyncio.CancelledError
         ):
@@ -2657,6 +2665,9 @@ async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, con
         close_cancelled, close_failure = await await_lifecycle_task_completion(
             close_task
         )
+        terminal = execution_terminal_error(preflight_failure, close_failure)
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
         if close_failure is not None:
             if not isinstance(close_failure, asyncio.CancelledError):
                 logger.warning(
@@ -2841,6 +2852,9 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
                     cleanup_failure.__traceback__,
                 ),
             )
+        terminal = execution_terminal_error(startup_failure, cleanup_failure)
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
         if cleanup_cancelled and not isinstance(
             startup_failure, asyncio.CancelledError
         ):
@@ -2945,6 +2959,8 @@ async def _rollback_startup_agent_manager(manager) -> bool:
     cancelled, failure = await await_lifecycle_task_completion(rollback)
     failure_cancelled, failure = _split_lifecycle_cancellation(failure)
     cancelled = cancelled or failure_cancelled
+    if failure is not None and is_execution_control_error(failure):
+        raise execution_terminal_error(failure)
     if failure is not None:
         logger.warning(
             "Multi-agent startup rollback did not fully shut down loaded agents: %s",
@@ -3597,19 +3613,33 @@ async def _lifespan_startup(app: FastAPI):
             # runner only in that topology; SQLite installations retain the
             # longstanding agent-scoped runner and never share schedule rows.
             await _start_host_scheduler(app, manager, config)
-        except Exception as e:
+        except BaseException as e:
             rollback_cancelled = False
             rollback_complete = manager is None
+            rollback_failure = None
             if manager is not None:
-                rollback_cancelled = await _rollback_startup_agent_manager(manager)
+                try:
+                    rollback_cancelled = await _rollback_startup_agent_manager(manager)
+                except BaseException as error:
+                    rollback_failure = error
                 rollback_complete = not manager.list_agents()
-                if not rollback_complete:
+                terminal = execution_terminal_error(e, rollback_failure)
+                if not rollback_complete or (
+                    terminal is not None and is_execution_control_error(terminal)
+                ):
                     # Preserve the manager for the outer lifespan teardown to
                     # retry, but never leave it on the public routing surface:
                     # a startup error dominates readiness and these agents may
                     # still be draining their own cleanup.
                     app.state.startup_cleanup_agent_manager = manager
                     app.state.agent_manager = None
+            terminal = execution_terminal_error(e, rollback_failure)
+            if terminal is not None and is_execution_control_error(terminal):
+                raise terminal
+            if not isinstance(e, Exception):
+                raise
+            if rollback_failure is not None:
+                raise rollback_failure
             identity_record = _identity_readiness_failure_record("default", e)
             if identity_record is not None:
                 logger.error(
@@ -3717,6 +3747,8 @@ async def _lifespan_startup(app: FastAPI):
                 # retain cognition, storage, or a joinable native continuation.
                 # Withdraw routing but keep the actual Agent for host teardown.
                 app.state.startup_cleanup_agent = constructed_agent
+                if is_execution_control_error(e):
+                    constructed_agent._remember_shutdown_control(e)
             app.state.agent = None
             cleanup_cancelled = False
             if llm_service is not None and constructed_agent is None:
@@ -3729,7 +3761,6 @@ async def _lifespan_startup(app: FastAPI):
                 except BaseException as error:
                     close_error = error
                 if close_error is not None:
-                    from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
                     terminal = execution_terminal_error(e, close_error)
                     if terminal is not None and is_execution_control_error(terminal):
                         raise terminal

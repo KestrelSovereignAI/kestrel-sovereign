@@ -3,11 +3,40 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody, bind_execution_cleanup, execution_terminal_error,
     is_execution_control_error,
 )
+
+
+def start_llm_close_task(owner, key, operation):
+    """Own each native close once and harvest its canonical disposition.
+
+    All clients, including rotated/unpublished private routes, share this
+    lifecycle registry. Unknown native effects cannot acquire a new close
+    owner just because their caller or route was withdrawn.
+    """
+    tasks = vars(owner).setdefault("_llm_close_tasks", {})
+    if key in tasks:
+        return tasks[key]
+    task = asyncio.create_task(operation(), name=f"llm-close:{key}")
+    tasks[key] = task
+
+    def completed(done):
+        error = owned_task_error(done)
+        if error is not None and is_execution_control_error(error):
+            owner._llm_close_control = execution_terminal_error(
+                vars(owner).get("_llm_close_control"), error,
+            )
+        if tasks.get(key) is done:
+            if error is None or is_execution_control_error(error):
+                tasks[key] = None
+            else:
+                tasks.pop(key)
+
+    task.add_done_callback(completed)
+    return task
 
 
 @dataclass(slots=True)

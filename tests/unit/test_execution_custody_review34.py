@@ -172,9 +172,10 @@ async def test_actual_failed_agent_birth_is_not_provider_only_cleanup(monkeypatc
         assert not done
         release_close.set()
         release_agent.set()
-        await waiter
+        outcome = await await_owned_task(waiter)
+        assert outcome.error is failure
         assert client.is_closed and db.backend._connection is None
-        assert app.state.startup_cleanup_agent is None
+        assert app.state.startup_cleanup_agent is agent
     finally:
         release_close.set()
         release_agent.set()

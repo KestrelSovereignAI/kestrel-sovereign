@@ -75,6 +75,21 @@ def is_execution_control_error(error: BaseException) -> bool:
                for current in _explicit_control_chain(error))
 
 
+def retained_execution_error(error: BaseException) -> BaseException:
+    """Propagate the SAME receipt without retaining every subsequent reader.
+
+    Retention freezes each explicit carrier's original traceback once. Reusing
+    an exception otherwise prepends another consumer frame on every heartbeat
+    or result read. Identity, explicit causes/groups and commit evidence stay
+    unchanged; implicit context is neither authority nor a retention owner.
+    """
+    for carrier in _explicit_control_chain(error):
+        state = vars(carrier)
+        original = state.setdefault("_kestrel_retained_traceback", carrier.__traceback__)
+        carrier.__traceback__ = original
+    return error
+
+
 def execution_terminal_error(*errors: BaseException | None) -> BaseException | None:
     """Keep irreversible control evidence ahead of cancellation/cleanup noise."""
     import asyncio
@@ -82,10 +97,10 @@ def execution_terminal_error(*errors: BaseException | None) -> BaseException | N
     for outcome in ("unknown", "committed"):
         for error in present:
             if execution_commit_outcome(error) == outcome:
-                return error
+                return retained_execution_error(error)
     for error in present:
         if is_execution_control_error(error):
-            return error
+            return retained_execution_error(error)
     for error in present:
         # OwnedAsyncIterator carries source cleanup debt as the explicit cause
         # of cancellation. A failed checkpoint is not a successful Stop.
