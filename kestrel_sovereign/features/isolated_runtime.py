@@ -80,6 +80,7 @@ from kestrel_sovereign.execution_custody import (
     execution_commit_outcome,
     execution_terminal_error,
     is_execution_control_error,
+    retained_execution_error,
     require_execution_work,
 )
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
@@ -910,7 +911,7 @@ class _HostOwnedFacadeOperation:
             return target.result()
         error = owned_task_error(target)
         if error is not None:
-            raise error
+            raise retained_execution_error(error)
         return target.result()
 
     @property
@@ -1212,39 +1213,39 @@ async def _await_task_until_complete(
     owns a subprocess or an active traffic boundary.
     """
 
-    cancellation_args: tuple[Any, ...] | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as exc:
-            # A cancellation request is not a reason to abandon the child
-            # before it records its own SDK fence or cleanup outcome.
-            if task.done() and task.cancelled():
-                break
-            if not settle_on_cancellation:
-                # The shared task remains attached to its owner (for example
-                # ``_terminal_cleanup_task``).  A caller with a smaller
-                # whole-agent budget can therefore move on without cancelling
-                # an SDK stop coroutine that may own the sole process handle.
-                raise
-            # Preserve the first cancellation only.  A caller can receive
-            # further cancellation requests while this shielded cleanup
-            # drains; letting a later request replace the original loses the
-            # cancellation which actually interrupted the lifecycle owner and
-            # retains an exception traceback longer than necessary.
-            if cancellation_args is None:
-                cancellation_args = tuple(exc.args)
-            continue
-    # A child cancellation is a result of the child operation, not an empty
-    # successful result.  In particular, lifecycle callers must not mistake a
-    # cancelled terminal cleanup for a completed one and release ownership
-    # while its child or gate state remains uncertain.
-    if task.cancelled():
-        raise asyncio.CancelledError()
-    result = task.result()
-    if cancellation_args is not None and not preserve_cancellation:
-        raise asyncio.CancelledError(*cancellation_args)
-    return result
+    if settle_on_cancellation:
+        outcome = await await_owned_task(task)
+        terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
+        if outcome.error is not None:
+            raise retained_execution_error(outcome.error)
+        if outcome.cancellation is not None and not preserve_cancellation:
+            raise outcome.cancellation
+        return outcome.result
+
+    # Deadline owners may hand off a still-running child, but must never await
+    # a shield carrying its exception: asyncio consumes a cancelled child's
+    # original cause at that first retrieval. Settlement is neutral data.
+    settled = asyncio.Event()
+    # One source-error observer survives deadline handoff. Individual waiters
+    # remove their neutral completion callbacks even when interrupted, so
+    # repeated deadlines cannot retain an unbounded list of abandoned Events.
+    if not getattr(task, "_kestrel_owned_terminal_observer", False):
+        task.add_done_callback(owned_task_error)
+        task._kestrel_owned_terminal_observer = True
+    def completed(done: asyncio.Task[Any]) -> None:
+        settled.set()
+    task.add_done_callback(completed)
+    try:
+        if not task.done():
+            await settled.wait()
+    finally:
+        task.remove_done_callback(completed)
+    error = owned_task_error(task)
+    if error is not None:
+        raise retained_execution_error(error)
+    return task.result()
 
 
 async def _await_owned_facade_lifecycle_operation(
@@ -1446,8 +1447,10 @@ async def _await_owned_facade_lifecycle_operation(
         # Consume the post-fence terminal result even when a facade swallowed
         # cancellation and returned success.  The timeout itself remains the
         # authoritative lifecycle outcome.
-        _consume_late_lifecycle_task_outcome(task)
+        control = _consume_late_lifecycle_task_outcome(task)
         await observe_delivered_parent_cancellation()
+        if control is not None:
+            raise retained_execution_error(control)
         if cancellation_args is not None:
             replay_remembered_cancellation()
         raise_authoritative_timeout()
@@ -1457,6 +1460,10 @@ async def _await_owned_facade_lifecycle_operation(
     # classifying the child terminal state.  Historical cancellation counts do
     # not pass this admission fence.
     await observe_delivered_parent_cancellation()
+
+    control = _consume_late_lifecycle_task_outcome(task)
+    if control is not None:
+        raise retained_execution_error(control)
 
     if cancellation_args is not None:
         # A cancellation already observed by this owner is its public result.
@@ -8752,7 +8759,7 @@ class ProxyFeature(Feature):
         """A retained unknown/denied effect cannot authorize later ingress."""
         error = vars(self).get("_event_ingress_control")
         if error is not None:
-            raise error
+            raise retained_execution_error(error)
         require_execution_work(self.agent)
 
     async def _cancel_terminal_event_ingress_tasks(self) -> bool:
@@ -8848,7 +8855,7 @@ class ProxyFeature(Feature):
         self._terminal_lifecycle_tasks = retained_tasks
         return running
 
-    async def _retire_terminal_clients(self) -> bool:
+    async def _retire_terminal_clients(self, *, retry_retirement: bool = False) -> bool:
         """Attempt exact retained-client retirement without public policy.
 
         This is the only shared terminal ``stop()`` path.  It catches every
@@ -8860,6 +8867,11 @@ class ProxyFeature(Feature):
         """
 
         async with self._terminal_retirement_lock:
+            if retry_retirement:
+                # A concurrent owned quarantine may have failed while this
+                # explicit retry waited for the same client. Begin its fresh
+                # attempt only after acquiring physical retirement ownership.
+                self._terminal_cleanup_uncertain = False
             # A detached startup can retain another client while an existing
             # stop is awaited.  Keep selecting from the live identity list so
             # a successful pass cannot report retirement while that late exact
@@ -9033,7 +9045,9 @@ class ProxyFeature(Feature):
         task = self._terminal_cleanup_task
         if task is None or task.done():
             self._terminal_cleanup_task = asyncio.create_task(
-                self._terminal_cleanup_uninterrupted(lifecycle_lock_held=False),
+                self._terminal_cleanup_uninterrupted(
+                    lifecycle_lock_held=False, retry_retirement=True,
+                ),
                 name=f"isolated-terminal-cleanup:{self.name}",
             )
 
@@ -9093,6 +9107,7 @@ class ProxyFeature(Feature):
             task = asyncio.create_task(
                 self._terminal_cleanup_uninterrupted(
                     lifecycle_lock_held=True,
+                    retry_retirement=not best_effort,
                 ),
                 name=f"isolated-terminal-cleanup-owned:{self.name}",
             )
@@ -9106,6 +9121,7 @@ class ProxyFeature(Feature):
                 task = asyncio.create_task(
                     self._terminal_cleanup_uninterrupted(
                         lifecycle_lock_held=False,
+                        retry_retirement=not best_effort,
                     ),
                     name=f"isolated-terminal-cleanup:{self.name}",
                 )
@@ -9141,12 +9157,13 @@ class ProxyFeature(Feature):
                 RuntimeError("isolated feature terminal retirement is incomplete"),
             )
         if not best_effort and vars(self).get("_event_ingress_control") is not None:
-            raise self._event_ingress_control
+            raise retained_execution_error(self._event_ingress_control)
 
     async def _terminal_cleanup_uninterrupted(
         self,
         *,
         lifecycle_lock_held: bool,
+        retry_retirement: bool = False,
     ) -> None:
         """Run one shared cleanup attempt without exporting external failures.
 
@@ -9160,6 +9177,7 @@ class ProxyFeature(Feature):
         try:
             await self._terminal_cleanup_attempt(
                 lifecycle_lock_held=lifecycle_lock_held,
+                retry_retirement=retry_retirement,
             )
         except BaseException as error:  # noqa: BLE001 - ordinary facade failures stay private
             self._retain_execution_control(error)
@@ -9178,6 +9196,7 @@ class ProxyFeature(Feature):
         self,
         *,
         lifecycle_lock_held: bool,
+        retry_retirement: bool = False,
     ) -> None:
         """Seal, unpublish, stop, and drain without caller interruption.
 
@@ -9215,7 +9234,7 @@ class ProxyFeature(Feature):
             health_probe_running = not await self._cancel_terminal_health_probe()
         ingress_tasks_settled = await self._cancel_terminal_event_ingress_tasks()
         if (
-            self._terminal_cleanup_uncertain
+            (self._terminal_cleanup_uncertain and not retry_retirement)
             or health_probe_running
             or not ingress_tasks_settled
         ):
@@ -9227,7 +9246,7 @@ class ProxyFeature(Feature):
             # retry; this terminal path reports no false success or reopen.
             self._terminal_cleanup_uncertain = True
             return
-        if not await self._retire_terminal_clients():
+        if not await self._retire_terminal_clients(retry_retirement=retry_retirement):
             # Do not drain beneath a stop failure: a hostile facade can raise
             # while its admitted RPC is still wedged.  The retained exact
             # handle makes a later terminal attempt bounded and recoverable.
@@ -9666,6 +9685,7 @@ class ProxyFeature(Feature):
         durable active configuration.
         """
         cfg = dict(config) if isinstance(config, dict) else {}
+        self._require_event_ingress_work()
         # Idle retirement removes only the process, not the feature's lifecycle
         # contract. Recreate that child before staging so a negotiated
         # transition validator cannot be bypassed by ``_client is None``.
@@ -9895,6 +9915,10 @@ class ProxyFeature(Feature):
                 ) from authority_error
             except asyncio.CancelledError as cancellation_error:
                 body_error = cancellation_error
+                if is_execution_control_error(cancellation_error):
+                    await self._quarantine_unreconciled_client(
+                        lifecycle_lock_held=True, prior_error=cancellation_error,
+                    )
                 if transition is not None:
                     # Every await after staging enters this path. The cleanup
                     # task is shielded so a second cancellation cannot strand
@@ -9925,6 +9949,10 @@ class ProxyFeature(Feature):
                 raise
             except BaseException as transition_error:
                 body_error = transition_error
+                if is_execution_control_error(transition_error):
+                    await self._quarantine_unreconciled_client(
+                        lifecycle_lock_held=True, prior_error=transition_error,
+                    )
                 if transition is not None and not transition_settled:
                     if transition_attempted and not transition_succeeded:
                         if (
@@ -9990,8 +10018,14 @@ class ProxyFeature(Feature):
                     finalizer_error = exc
                 finally:
                     self._end_reload()
-                if finalizer_error is not None and body_error is None:
-                    raise finalizer_error
+                if finalizer_error is not None:
+                    terminal = execution_terminal_error(
+                        vars(self).get("_event_ingress_control"), body_error, finalizer_error,
+                    )
+                    if terminal is not None and is_execution_control_error(terminal):
+                        raise terminal
+                    if body_error is None:
+                        raise finalizer_error
             assert transition is not None
             return self._config_commit_receipt(transition)
 
@@ -10065,13 +10099,20 @@ class ProxyFeature(Feature):
             if promotion.error is not None:
                 self._raise_promotion_failure(promotion)
             return self._config_commit_receipt(transition)
-        except BaseException:
-            if transition is not None and not transition_settled:
-                await self._run_owned_transition_cleanup(
-                    transition,
-                    force=False,
-                    preserve_cancellation=False,
+        except BaseException as terminal_error:
+            if is_execution_control_error(terminal_error):
+                await self._quarantine_unreconciled_client(
+                    lifecycle_lock_held=True, prior_error=terminal_error,
                 )
+            if transition is not None and not transition_settled:
+                try:
+                    await self._run_owned_transition_cleanup(
+                        transition,
+                        force=False,
+                        preserve_cancellation=False,
+                    )
+                except BaseException as cleanup_error:
+                    raise execution_terminal_error(terminal_error, cleanup_error)
             raise
 
     async def set_config_with_secret_preservation(
@@ -10137,9 +10178,11 @@ class ProxyFeature(Feature):
                     transition,
                     force=force,
                 )
-            except BaseException:  # noqa: BLE001 - cancellation cleanup fences the proxy
+            except BaseException as error:  # noqa: BLE001 - cancellation cleanup fences the proxy
                 self._host_config_loaded = False
-                await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
+                await self._quarantine_unreconciled_client(
+                    lifecycle_lock_held=True, prior_error=error,
+                )
 
         task = asyncio.create_task(cleanup())
         # Shielding alone is insufficient: a *second* cancellation used to let
@@ -10194,8 +10237,12 @@ class ProxyFeature(Feature):
             # explicit initialize, then retire the potentially divergent child.
             self._host_config = dict(state.config)
             self._host_config_loaded = True
-        except BaseException:
+        except BaseException as authority_error:
             self._host_config_loaded = False
+            await self._quarantine_unreconciled_client(
+                lifecycle_lock_held=True, prior_error=authority_error,
+            )
+            return
         await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
 
     async def _assert_staged_transition_authority(
@@ -10244,10 +10291,20 @@ class ProxyFeature(Feature):
         )
         try:
             await _await_task_until_complete(task, preserve_cancellation=preserve_cancellation)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as recovery_error:
+            if is_execution_control_error(recovery_error):
+                await self._quarantine_unreconciled_client(
+                    lifecycle_lock_held=True,
+                    prior_error=execution_terminal_error(_original_error, recovery_error),
+                )
             raise
         except BaseException as recovery_error:
             self._fenced_recovery_failed = True
+            if is_execution_control_error(recovery_error):
+                await self._quarantine_unreconciled_client(
+                    lifecycle_lock_held=True,
+                    prior_error=execution_terminal_error(_original_error, recovery_error),
+                )
             # The uninterrupted body has already tried generation-scoped
             # cleanup.  Repeat through the standard fenced cleanup path so a
             # generic failure (including old-client stop failure) cannot leave
@@ -10334,7 +10391,7 @@ class ProxyFeature(Feature):
                 target_config = state.config
 
             await self._connect_client(target_config)
-        except BaseException:
+        except BaseException as recovery_error:
             # A partially restored old client must be visible only to the
             # cleanup/quarantine path, never to traffic (the gate is closed).
             if (
@@ -10346,8 +10403,20 @@ class ProxyFeature(Feature):
             # In particular, a failed old-client stop must not prevent the
             # generation's durable cleanup.  This happens before quarantine so
             # a later replica does not inherit a needless pending wedge.
-            await self._clear_owned_pending_before_quarantine(transition)
-            await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
+            cleanup_error = None
+            # A native control receipt forbids fresh CAS/readback recovery;
+            # physically quarantine first, retaining that original receipt.
+            if not is_execution_control_error(recovery_error):
+                try:
+                    await self._clear_owned_pending_before_quarantine(transition)
+                except BaseException as error:
+                    cleanup_error = error
+            await self._quarantine_unreconciled_client(
+                lifecycle_lock_held=True,
+                prior_error=execution_terminal_error(recovery_error, cleanup_error),
+            )
+            if cleanup_error is not None:
+                raise execution_terminal_error(recovery_error, cleanup_error)
             raise
 
         self._host_config = dict(target_config)
@@ -10389,13 +10458,17 @@ class ProxyFeature(Feature):
             if cleanup.cleared:
                 self._host_config = dict(cleanup.state.config)
                 self._host_config_loaded = True
-        except BaseException:  # noqa: BLE001 - quarantine remains the fallback
+        except BaseException as error:  # noqa: BLE001 - quarantine remains the fallback
             self._host_config_loaded = False
+            self._retain_execution_control(error)
+            if is_execution_control_error(error):
+                raise retained_execution_error(error)
 
     async def _quarantine_unreconciled_client(
         self,
         *,
         lifecycle_lock_held: bool = False,
+        prior_error: BaseException | None = None,
     ) -> None:
         """Fail closed when a recovery child cannot be reconciled to storage.
 
@@ -10410,11 +10483,23 @@ class ProxyFeature(Feature):
         # a cancellation delivered after seal cannot skip unpublication,
         # adapter removal, supervision cancellation, or best-effort retirement
         # while the task is still waiting on another lifecycle owner.
+        self._retain_execution_control(prior_error)
         self._latch_terminal_lifecycle()
-        await self._complete_terminal_cleanup(
-            best_effort=True,
-            lifecycle_lock_held=lifecycle_lock_held,
+        cleanup_error = None
+        try:
+            await self._complete_terminal_cleanup(
+                best_effort=True,
+                lifecycle_lock_held=lifecycle_lock_held,
+            )
+        except BaseException as error:
+            cleanup_error = error
+        terminal = execution_terminal_error(
+            vars(self).get("_event_ingress_control"), prior_error, cleanup_error,
         )
+        if prior_error is not None and terminal is not None and is_execution_control_error(terminal):
+            raise terminal
+        if cleanup_error is not None:
+            raise retained_execution_error(cleanup_error)
 
     async def _stage_pending_config(
         self,
@@ -10911,9 +10996,11 @@ class ProxyFeature(Feature):
                     )
             await self._reconcile_client_to_authoritative_config(state.config, force=force)
             return state
-        except BaseException:
+        except BaseException as error:
             self._host_config_loaded = False
-            await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
+            await self._quarantine_unreconciled_client(
+                lifecycle_lock_held=True, prior_error=error,
+            )
             raise
 
     async def _promote_config(
@@ -11069,6 +11156,9 @@ class ProxyFeature(Feature):
             # so it quarantines before any hook or traffic can continue.
             raise
         except BaseException as exc:
+            if is_execution_control_error(exc):
+                self._retain_execution_control(exc)
+                raise retained_execution_error(exc)
             # A write boundary may raise after commit. Its caller performs the
             # authoritative read needed to classify the result.
             return _ConfigWriteResult(committed=False, error=exc)
@@ -11132,6 +11222,9 @@ class ProxyFeature(Feature):
         except _ConfigAuthorityChanged:
             raise
         except Exception as exc:  # noqa: BLE001 - durable read is a hard boundary
+            if is_execution_control_error(exc):
+                self._retain_execution_control(exc)
+                raise retained_execution_error(exc)
             raise RuntimeError(
                 f"Cannot apply config for isolated feature {self.name}: "
                 "failed to load config transition state"
@@ -11218,7 +11311,10 @@ class ProxyFeature(Feature):
         except BaseException as read_error:
             # We cannot prove which config won, so no live child may remain.
             self._host_config_loaded = False
-            await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
+            await self._quarantine_unreconciled_client(
+                lifecycle_lock_held=True,
+                prior_error=execution_terminal_error(write_error, read_error),
+            )
             if isinstance(write_error, asyncio.CancelledError):
                 raise write_error
             raise RuntimeError(

@@ -92,6 +92,18 @@ awaiting the owned LLM-service close, including cancellation;
 SQLite startup remains unbound. Native startup regressions exercise this
 production selection rather than injecting an agent's custody afterward.
 
+Host inception and birth replay may open only their exact local
+`kestrel_prime.db` through a private lexical identity-anchor capability. It
+retains the SAME original admissions, never drops an ancestor, and expires
+irreversibly after the owned database closes; retained handles and copied
+children cannot reacquire it. Exact archive reads require the native cold-read
+backend. This does not authorize tenant SQLite, arbitrary paths, or general
+PostgreSQL bypass: runtime birth replication still validates the destination's
+original generation on its actual PostgreSQL transaction. Inception embedding
+and accounting consumers borrow the owned birth database, not a separately
+created usage database, and their native provider closure joins before that
+database retires. Physical closure never reconciles an uncertain native effect.
+
 Delivery and health workers use the same explicit first-party resident handoff
 as scheduler and peer services: they wait for READY and retain the original
 runtime, not the completed cold-start occurrence. Ordinary task children retain
@@ -353,6 +365,15 @@ cancellation grace, harvest the same first canonical receipt before removing
 their retained owner. Same-loop Future/Task receipts remain exact; foreign
 owner loops consume private source outcomes locally and export only a newly
 constructed fixed authority/commit category, never the private exception graph.
+Privacy mandates, state writes, restoration and recovery reads preserve these
+same native control carriers before ordinary refusal/best-effort handling.
+Constructed-Agent and batch rollback select original initializer receipts only
+after all independent cleanup joins. Isolated stage, promote, abort and legacy
+authority reconciliation likewise quarantine without retrying a native
+uncertainty as a fresh read/CAS. Lifecycle deadlines retain the first child
+receipt without accumulating abandoned waiter callbacks or reader tracebacks.
+Explicit terminal retirement retries serialize on the same exact-client lock;
+another owner's uncertain stop cannot silently skip that fresh bounded retry.
 Agent, Feature and A2A background owners retain one strongest control receipt
 (unknown commit before committed before authority, first identity at equal
 strength), not an append-only traceback list. Completed task graphs are released.

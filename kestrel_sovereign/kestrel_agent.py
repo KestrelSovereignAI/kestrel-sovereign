@@ -3526,107 +3526,117 @@ class KestrelAgent(
                     "birth_record", cause_type="BirthRecordReplayRefused"
                 ) from exc
 
-        anchor_db = None
-        copy_committed = False
-        try:
-            # Opening the anchor brings its schema up to date, exactly as a
-            # SQLite host would at every boot. Its birth record is only read.
-            anchor_db = await AsyncDatabase.sqlite(str(anchor))
-            if not await anchor_holds_birth_record(
-                anchor_db=anchor_db, agent_did=self.agent_id
-            ):
-                # Nothing to copy. The verdict is decided by WHAT is short, not
-                # by whether an anchor happens to exist — identical damage must
-                # not boot on one host and refuse on another.
+        from kestrel_sovereign.execution_custody import _host_identity_anchor_access
+
+        with _host_identity_anchor_access(anchor):
+            anchor_db = None
+            copy_committed = False
+            try:
+                # Opening the anchor brings its schema up to date, exactly as a
+                # SQLite host would at every boot. Its birth record is only read.
+                anchor_db = await AsyncDatabase.sqlite(str(anchor))
+                if not await anchor_holds_birth_record(
+                    anchor_db=anchor_db, agent_did=self.agent_id
+                ):
+                    # Nothing to copy. The verdict is decided by WHAT is short, not
+                    # by whether an anchor happens to exist — identical damage must
+                    # not boot on one host and refuse on another.
+                    logging.warning(
+                        "Birth record for %s is incomplete in the runtime database "
+                        "(%s) and the local anchor %s holds no record to repair it "
+                        "from.",
+                        self.agent_id, shortfall.describe(), anchor,
+                    )
+                    self._record_birth_record_shortfall(shortfall)
+                    return
+
+                # The shortfall drives the repair; this comparison is for the
+                # operator, naming which rows the anchor can supply. Gating on it
+                # instead would silently skip the one condition only the runtime
+                # check detects — a governing edge whose node is unreadable.
+                divergence = await diagnose_birth_record(
+                    runtime_db=runtime_db,
+                    anchor_db=anchor_db,
+                    agent_did=self.agent_id,
+                )
                 logging.warning(
                     "Birth record for %s is incomplete in the runtime database "
-                    "(%s) and the local anchor %s holds no record to repair it "
-                    "from.",
-                    self.agent_id, shortfall.describe(), anchor,
+                    "(%s); against the local anchor %s: %s. Replicating "
+                    "(backend=%s).",
+                    self.agent_id,
+                    shortfall.describe(),
+                    anchor,
+                    divergence.describe() or "no rows missing",
+                    self._db_backend,
                 )
-                self._record_birth_record_shortfall(shortfall)
-                return
+                result = await replicate_birth_record(
+                    runtime_db=runtime_db,
+                    anchor_db=anchor_db,
+                    agent_did=self.agent_id,
+                )
+                copy_committed = True
+                logging.info(
+                    "Replicated birth record for %s into the runtime database: %s",
+                    self.agent_id,
+                    result.describe(),
+                )
 
-            # The shortfall drives the repair; this comparison is for the
-            # operator, naming which rows the anchor can supply. Gating on it
-            # instead would silently skip the one condition only the runtime
-            # check detects — a governing edge whose node is unreadable.
-            divergence = await diagnose_birth_record(
-                runtime_db=runtime_db,
-                anchor_db=anchor_db,
-                agent_did=self.agent_id,
-            )
-            logging.warning(
-                "Birth record for %s is incomplete in the runtime database "
-                "(%s); against the local anchor %s: %s. Replicating "
-                "(backend=%s).",
-                self.agent_id,
-                shortfall.describe(),
-                anchor,
-                divergence.describe() or "no rows missing",
-                self._db_backend,
-            )
-            result = await replicate_birth_record(
-                runtime_db=runtime_db,
-                anchor_db=anchor_db,
-                agent_did=self.agent_id,
-            )
-            copy_committed = True
-            logging.info(
-                "Replicated birth record for %s into the runtime database: %s",
-                self.agent_id,
-                result.describe(),
-            )
+                # Verify rather than assume. A pass that reports success but left
+                # the record incomplete is precisely the failure this whole cluster
+                # of issues is about — a durable claim nobody observed.
+                #
+                # Asked of the runtime alone, deliberately: the question is whether
+                # this agent can now be who it is, not whether it matches a frozen
+                # snapshot. Re-comparing against the anchor would refuse forever
+                # over differences replication correctly declines to make — a
+                # reanchored constitution, chunks already indexed here.
+                remaining = await diagnose_runtime_birth_record(
+                    runtime_db=runtime_db, agent_did=self.agent_id,
+                )
+                self._record_birth_record_shortfall(remaining)
+            except IdentityReadinessError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
+                # A failed copy is judged by the same rule as a completed one: what
+                # is the runtime database actually short of? Every raise site in
+                # replicate_birth_record is an ANCHOR-integrity problem — an
+                # unwitnessed edge, a file row with no bytes, the anchor failing to
+                # open — and so is a transient fault mid-copy. Refusing on all of
+                # them unconditionally would brick an agent whose own identity is
+                # intact and which boots on origin/main today, and would tell its
+                # operator to "re-incept against this backend", which for a dropped
+                # connection is destructive advice.
+                #
+                # ``shortfall`` is the pre-replication diagnosis, so it describes
+                # the runtime as this pass found it. Identity gaps still refuse.
+                logging.error(
+                    "Could not replicate the birth record for %s from %s into the "
+                    "configured runtime database (backend=%s): %s",
+                    self.agent_id, anchor, self._db_backend, exc, exc_info=True,
+                )
+                # ``shortfall`` is the pre-replication diagnosis. It is exact for a
+                # raise inside the copy's transaction, which rolled back; for one
+                # after the commit it can name something already repaired, so
+                # re-diagnose when the copy is known to have landed.
+                verdict = shortfall
+                if copy_committed:
+                    try:
+                        verdict = await diagnose_runtime_birth_record(
+                            runtime_db=runtime_db, agent_did=self.agent_id,
+                        )
+                    except Exception as error:  # noqa: BLE001 - keep the older, safe verdict
+                        if is_execution_control_error(error):
+                            raise
+                        pass
+                self._record_birth_record_shortfall(verdict, retryable=True)
+            finally:
+                if anchor_db is not None:
+                    import sys
+                    from kestrel_sovereign.storage.async_database import _close_owned_database
 
-            # Verify rather than assume. A pass that reports success but left
-            # the record incomplete is precisely the failure this whole cluster
-            # of issues is about — a durable claim nobody observed.
-            #
-            # Asked of the runtime alone, deliberately: the question is whether
-            # this agent can now be who it is, not whether it matches a frozen
-            # snapshot. Re-comparing against the anchor would refuse forever
-            # over differences replication correctly declines to make — a
-            # reanchored constitution, chunks already indexed here.
-            remaining = await diagnose_runtime_birth_record(
-                runtime_db=runtime_db, agent_did=self.agent_id,
-            )
-            self._record_birth_record_shortfall(remaining)
-        except IdentityReadinessError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            # A failed copy is judged by the same rule as a completed one: what
-            # is the runtime database actually short of? Every raise site in
-            # replicate_birth_record is an ANCHOR-integrity problem — an
-            # unwitnessed edge, a file row with no bytes, the anchor failing to
-            # open — and so is a transient fault mid-copy. Refusing on all of
-            # them unconditionally would brick an agent whose own identity is
-            # intact and which boots on origin/main today, and would tell its
-            # operator to "re-incept against this backend", which for a dropped
-            # connection is destructive advice.
-            #
-            # ``shortfall`` is the pre-replication diagnosis, so it describes
-            # the runtime as this pass found it. Identity gaps still refuse.
-            logging.error(
-                "Could not replicate the birth record for %s from %s into the "
-                "configured runtime database (backend=%s): %s",
-                self.agent_id, anchor, self._db_backend, exc, exc_info=True,
-            )
-            # ``shortfall`` is the pre-replication diagnosis. It is exact for a
-            # raise inside the copy's transaction, which rolled back; for one
-            # after the commit it can name something already repaired, so
-            # re-diagnose when the copy is known to have landed.
-            verdict = shortfall
-            if copy_committed:
-                try:
-                    verdict = await diagnose_runtime_birth_record(
-                        runtime_db=runtime_db, agent_did=self.agent_id,
-                    )
-                except Exception:  # noqa: BLE001 - keep the older, safe verdict
-                    pass
-            self._record_birth_record_shortfall(verdict, retryable=True)
-        finally:
-            if anchor_db is not None:
-                await anchor_db.close()
+                    await _close_owned_database(anchor_db, sys.exception())
 
     def _record_birth_record_shortfall(self, divergence, *, retryable=False) -> None:
         """Decide the verdict on WHAT is short, and leave a trace either way.
@@ -5259,6 +5269,8 @@ class KestrelAgent(
                 preference["model"], preference["vendor"], preference["route"]
             )
         except Exception as exc:  # noqa: BLE001 - the caller refuses the transition
+            if is_execution_control_error(exc):
+                raise
             logging.error(
                 "Could not persist the model mandate %s (%s: %s)",
                 dict(preference),
@@ -5280,6 +5292,8 @@ class KestrelAgent(
         try:
             await write_privacy_state(db, self.agent_id, state)
         except Exception as exc:  # noqa: BLE001 - the caller refuses the transition
+            if is_execution_control_error(exc):
+                raise
             logging.error(
                 "Could not record privacy mode %s (%s: %s)",
                 state.mode.value,
@@ -5308,6 +5322,8 @@ class KestrelAgent(
                 db, self.agent_id, initial_mode=self._privacy_mode
             )
         except Exception as exc:  # noqa: BLE001 - the caller refuses the transition
+            if is_execution_control_error(exc):
+                raise
             logging.error(
                 "Could not read the recorded privacy mode (%s: %s); refusing the "
                 "privacy transition",

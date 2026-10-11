@@ -2988,8 +2988,20 @@ class AgentManager:
                     active_boot_semaphore.release()
                     active_boot_slot_held = False
         except BaseException as initialization_failure:
+            from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
             if agent is not None:
-                await self._discard_unpublished_initialized_agent(name, agent)
+                # The constructed candidate owns the initialization receipt as
+                # well as its native resources. Rollback cannot replace that
+                # receipt with a weaker cancellation/cleanup failure.
+                if is_execution_control_error(initialization_failure):
+                    agent._remember_shutdown_control(initialization_failure)
+                try:
+                    await self._discard_unpublished_initialized_agent(name, agent)
+                except BaseException as cleanup_failure:
+                    terminal = execution_terminal_error(initialization_failure, cleanup_failure)
+                    if terminal is not None and is_execution_control_error(terminal):
+                        raise terminal
+                    raise
                 if isinstance(
                     initialization_failure,
                     PersistedSpawnMandateExpiredError,
@@ -7313,7 +7325,9 @@ class AgentManager:
                         await self._discard_unpublished_initialized_agents(initialized)
                     )
                 except BaseException as cleanup_failure:
-                    terminal = execution_terminal_error(fatal, cleanup_failure)
+                    terminal = execution_terminal_error(fatal, *(
+                        result for result in results if isinstance(result, BaseException)
+                    ), cleanup_failure)
                     if terminal is not None and is_execution_control_error(terminal):
                         raise terminal
                     if isinstance(fatal, asyncio.CancelledError):

@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
+from pathlib import Path
 from typing import Any, Protocol, TYPE_CHECKING, TypeVar
 
 from kestrel_sovereign.turn_scope import capture_turn_scope, turn_scoped
@@ -230,6 +231,65 @@ _CLEANUP_ONLY: ContextVar[bool] = ContextVar("kestrel_execution_cleanup_only", d
 
 
 @dataclass(eq=False)
+class _HostIdentityAnchorAccess:
+    """Lexical host file custody, NOT replacement execution/tenant authority."""
+
+    path: Path
+    scopes: tuple[ExecutionCustody, ...]
+    read_only: bool
+    active: bool = True
+
+    def require_live(self) -> None:
+        if not self.active:
+            raise ExecutionAuthorityError("host identity-anchor access retired")
+        for scope in self.scopes:
+            scope.require_work()
+
+
+_HOST_IDENTITY_ANCHOR_ACCESS: ContextVar[_HostIdentityAnchorAccess | None] = ContextVar(
+    "kestrel_host_identity_anchor_access", default=None,
+)
+
+
+@contextmanager
+def _host_identity_anchor_access(path: Path, *, read_only: bool = False) -> Iterator[None]:
+    """Authorize ONLY this host-owned inception/replay file until joined close.
+
+    Core's two host identity consumers use this capability to open their local
+    birth anchor while original PostgreSQL execution custody remains bound.
+    Every original scope still governs liveness; destination PG writes retain
+    their native transactional validators. No ordinary tenant SQLite database
+    is authorized, and copied children/retained handles share irreversible
+    retirement. Archives are exact read-only files, never directory grants.
+    """
+    require_execution_work()
+    path = Path(path)
+    if path.is_symlink() or not (
+        path.name == "kestrel_prime.db"
+        or (read_only and path.name.startswith("kestrel_prime.db.backup-"))
+    ):
+        raise ExecutionAuthorityError("host identity-anchor access requires an exact native anchor")
+    access = _HostIdentityAnchorAccess(path.resolve(), current_execution_custody(), read_only)
+    token = _HOST_IDENTITY_ANCHOR_ACCESS.set(access)
+    try:
+        yield
+    finally:
+        access.active = False
+        _HOST_IDENTITY_ANCHOR_ACCESS.reset(token)
+
+
+def _capture_host_identity_anchor_access(path: Path | None, *, cold_read: bool) -> _HostIdentityAnchorAccess | None:
+    """Bind file custody once at native backend construction, never reacquire."""
+    access = _HOST_IDENTITY_ANCHOR_ACCESS.get()
+    if access is None or path != access.path:
+        return None
+    access.require_live()
+    if access.read_only and not cold_read:
+        raise ExecutionAuthorityError("archived identity custody permits only a cold read")
+    return access
+
+
+@dataclass(eq=False)
 class _StreamCleanupState:
     # Shared by reference with the producer and its children. The closer sets
     # this BEFORE cancellation, which cannot mutate another task's ContextVars.
@@ -275,12 +335,21 @@ def refuse_unfenced_executor(owner: Any = None) -> None:
 
 def require_execution_backend(
     backend_type: str, scopes: tuple[ExecutionCustody, ...] | None = None,
+    *, _identity_anchor_access: _HostIdentityAnchorAccess | None = None,
 ) -> None:
     if _execution_cleanup_requested():
         raise ExecutionAuthorityError("execution is cleanup-only; ordinary work is denied")
+    if _identity_anchor_access is not None:
+        _identity_anchor_access.require_live()
     for scope in current_execution_custody() if scopes is None else scopes:
         scope.require_work()
         if scope.fence.backend_type != backend_type:
+            if (
+                backend_type == "sqlite"
+                and _identity_anchor_access is not None
+                and scope in _identity_anchor_access.scopes
+            ):
+                continue
             raise ExecutionAuthorityError(
                 f"execution authority requires {scope.fence.backend_type} backend, "
                 f"not {backend_type}"

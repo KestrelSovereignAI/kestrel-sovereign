@@ -27,6 +27,7 @@ from .interface import (
 )
 from .write_audit import record_write_query, record_write_script
 from kestrel_sovereign.execution_custody import (
+    _capture_host_identity_anchor_access,
     execution_terminal_error, is_execution_control_error, require_execution_backend,
 )
 from .transaction_control import reject_transaction_control, sqlite_statements
@@ -392,6 +393,9 @@ class SQLiteBackend(DatabaseBackend):
         #: governance state as current.
         self._resolved_path = (
             None if db_path == ":memory:" else Path(db_path).resolve()
+        )
+        self._identity_anchor_access = _capture_host_identity_anchor_access(
+            self._resolved_path, cold_read=cold_read,
         )
         #: Whether the cold-read connection was opened ``immutable=1`` and is
         #: therefore blind to a WAL that appears while it is open.
@@ -865,7 +869,7 @@ class SQLiteBackend(DatabaseBackend):
             raise pending_cancellation
     
     def _require_execution_backend(self) -> None:
-        require_execution_backend("sqlite")
+        require_execution_backend("sqlite", _identity_anchor_access=self._identity_anchor_access)
 
     def _ensure_connected(self) -> aiosqlite.Connection:
         """Ensure we have an active connection."""

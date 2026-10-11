@@ -25,11 +25,16 @@ from dataclasses import dataclass
 from contextlib import asynccontextmanager, AsyncExitStack
 from cryptography.hazmat.primitives.asymmetric import ec
 from kestrel_sovereign.storage import GraphNode
-from kestrel_sovereign.storage.async_database import AsyncDatabase, DatabaseInitializationCleanupError
+from kestrel_sovereign.storage.async_database import AsyncDatabase, DatabaseInitializationCleanupError, _close_owned_database
 from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+from kestrel_sovereign.execution_custody import (
+    _host_identity_anchor_access, current_execution_custody,
+    execution_terminal_error, is_execution_control_error,
+)
 from kestrel_sovereign.security.key_storage import secure_delete
 import argparse
+import sys
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -501,15 +506,16 @@ async def _assert_local_inception_lifetimes(output_dir: Path, identity: str, *, 
         for suffix in ("-wal", "-shm"):
             if path.name != "kestrel_prime.db" and os.path.lexists(output_dir / f"kestrel_prime.db{suffix}.backup-{stamp}"):
                 raise ValueError("Inception archive has uncheckpointed sidecar evidence; use authorized recovery")
-        archive = await AsyncDatabase.sqlite(str(path), schema_initializer=retain_schema, cold_read=True)
-        try:
-            await _assert_fresh_inception_lifetime(archive, identity, retain=False)
-            archive._backend.assert_cold_read_still_valid()
-            after = path.lstat()
-            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
-                raise ValueError("Inception archive evidence changed while inspected; use authorized recovery")
-        finally:
-            await archive.close()
+        with _host_identity_anchor_access(path, read_only=True):
+            archive = await AsyncDatabase.sqlite(str(path), schema_initializer=retain_schema, cold_read=True)
+            try:
+                await _assert_fresh_inception_lifetime(archive, identity, retain=False)
+                archive._backend.assert_cold_read_still_valid()
+                after = path.lstat()
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                    raise ValueError("Inception archive evidence changed while inspected; use authorized recovery")
+            finally:
+                await _close_owned_database(archive, sys.exception())
 
 
 @asynccontextmanager
@@ -915,17 +921,36 @@ async def create_kestrel_identity_async(
         output_dir = get_default_agent_data_dir()
 
     owned_database = None
+    owned_embeddings = None
 
     async def retire_owned_database(operation_error=None):
-        nonlocal owned_database
+        nonlocal owned_database, owned_embeddings
+        # The inception embedding borrower uses this exact birth database for
+        # accounting. Physically retire it BEFORE that database; never lazily
+        # open a process-global usage SQLite under a parent's PG authority.
+        provider_error = None
+        if owned_embeddings is not None:
+            from kestrel_sovereign.llm.lifecycle import UnpublishedLLMOwner
+
+            owner = UnpublishedLLMOwner(owned_embeddings, current_execution_custody())
+            try:
+                await owner.retire(join_native=True)
+            except BaseException as error:
+                provider_error = error
+            finally:
+                owned_embeddings = None
         if owned_database is not None:
             from kestrel_sovereign.storage.async_database import _close_owned_database
 
-            await _close_owned_database(owned_database, operation_error)
+            await _close_owned_database(
+                owned_database, execution_terminal_error(operation_error, provider_error),
+            )
             owned_database = None
+        if provider_error is not None:
+            raise execution_terminal_error(operation_error, provider_error)
 
     async def publish_owned_attempt():
-        nonlocal output_dir, owned_database
+        nonlocal output_dir, owned_database, owned_embeddings
         # Determine if we're using external database or creating SQLite
         using_external_db = database is not None
         db_path = None
@@ -1381,6 +1406,12 @@ async def create_kestrel_identity_async(
 
         _discard_identity_staging(identity_stage_dir, staged_identity_paths)
 
+        if genesis_audit.get("status") == "passed" or not defer_test_audit:
+            from kestrel_sovereign.llm.service import LLMService
+
+            owned_embeddings = LLMService(usage_db=db)
+            owned_embeddings.attach_to_agent(agent_did)
+
         # A completed audit has two durable witnesses: the structured node receipt
         # and a conversation/audit event. Pending is already explicit on the node
         # and intentionally emits no misleading completion event.
@@ -1389,7 +1420,7 @@ async def create_kestrel_identity_async(
                 AsyncConversationStore,
             )
 
-            conversation = AsyncConversationStore(db, agent_id=agent_did)
+            conversation = AsyncConversationStore(db, agent_id=agent_did, llm_service=owned_embeddings)
             from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 
             try:
@@ -1403,6 +1434,8 @@ async def create_kestrel_identity_async(
                     metadata={"event": "genesis_audit", "result": genesis_audit},
                 )
             except (QueryError, TransactionError) as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logging.error("Committed inception genesis notification failed: %s", type(exc).__name__)
 
         # 6b. If spawned by a parent, record the delegation relationship
@@ -1432,7 +1465,7 @@ async def create_kestrel_identity_async(
 
         # 8. Index constitution for RAG (enables Constitutional RAG)
         from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
-        rag = AsyncRAGStore(db, agent_id=agent_did)
+        rag = AsyncRAGStore(db, agent_id=agent_did, llm_service=owned_embeddings)
         constitution_text = constitution_content.decode('utf-8') if isinstance(constitution_content, bytes) else constitution_content
         chunks_created = await rag.chunk_document(
             file_hash=constitution_hash,
@@ -1464,6 +1497,8 @@ async def create_kestrel_identity_async(
                 )
                 logging.info(f"Indexed US Constitution for RAG: {us_chunks} chunks created")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.warning(f"Could not index US Constitution: {e}")
 
         # Close database connection only if we created it (SQLite mode)
@@ -1492,7 +1527,7 @@ async def create_kestrel_identity_async(
         )
 
 
-    with exclusive_private_file_lock(Path(output_dir) / ".inception.lock", label="inception", blocking=False):
+    with exclusive_private_file_lock(Path(output_dir) / ".inception.lock", label="inception", blocking=False), _host_identity_anchor_access(Path(output_dir) / "kestrel_prime.db"):
         operation_error = None
         try:
             return await publish_owned_attempt()
