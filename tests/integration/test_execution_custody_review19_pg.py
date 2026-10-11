@@ -62,16 +62,10 @@ async def test_native_late_retained_release_preserves_original_control(native_pg
             await dispatcher._release_retained_durable_cognition_task(delivery)
         assert caught.value is error
         state = await controller.fetchval("SELECT status FROM durable_signal_deliveries WHERE delivery_id='delivery1'")
-        if receipt_committed:
-            assert state == "retry"
-            assert dispatcher._retained_cognition_control_debt == {delivery.delivery_id: (delivery, error)}
-            with pytest.raises(BaseException) as blocked:
-                await dispatcher.shutdown_durable_delivery()
-            assert blocked.value is error
-            assert await controller.fetchval("SELECT stopped_at IS NULL FROM durable_signal_runtime_owners WHERE owner_id='dispatcher:original'")
-        else:
-            assert state == "failed"
-            assert not dispatcher._retained_cognition_control_debt
+        # Exact cleanup also covers retry releases that committed before
+        # their original control evidence was delivered to the caller.
+        assert state == "failed"
+        assert not dispatcher._retained_cognition_control_debt
     finally:
         await join_owned(agent, dispatcher)
 

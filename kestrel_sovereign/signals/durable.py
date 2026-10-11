@@ -3979,15 +3979,16 @@ class DurableSignalStore(UnifiedStoreBase):
             if consumer is None or not consumer[4]:
                 return None
             recovery_now = explicit_now or self.now_utc()
+            stale_before = (
+                _as_utc(runtime_owner_stale_before)
+                if runtime_owner_stale_before is not None
+                else recovery_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
+            )
             await self._recover_expired_leases(
                 agent_id=agent_id,
                 consumer_id=consumer_id,
                 now=recovery_now,
-                runtime_owner_stale_before=(
-                    _as_utc(runtime_owner_stale_before)
-                    if runtime_owner_stale_before is not None
-                    else recovery_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
-                ),
+                runtime_owner_stale_before=stale_before,
             )
             # Backfill is idempotent because delivery identity is unique.
             await self._backfill_consumer(registration, now=recovery_now)
@@ -3995,6 +3996,8 @@ class DurableSignalStore(UnifiedStoreBase):
                 agent_id=agent_id,
                 consumer_id=consumer_id,
                 now=recovery_now,
+                executor_id=executor_id,
+                runtime_owner_stale_before=stale_before,
             )
             if delivery_id is None:
                 return None
@@ -4018,6 +4021,7 @@ class DurableSignalStore(UnifiedStoreBase):
                   AND status IN ('{PENDING}', '{RETRY}')
                   AND (max_attempts = 0 OR attempts < max_attempts)
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  AND {self._managed_retry_claim_sql()}
                 """,
                 (
                     LEASED,
@@ -4031,6 +4035,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     agent_id,
                     consumer_id,
                     self.to_timestamp_param(effective_now),
+                    *self._managed_retry_claim_params(executor_id, stale_before),
                 ),
             )
         if updated == 0:
@@ -4075,21 +4080,24 @@ class DurableSignalStore(UnifiedStoreBase):
             if consumer is None or not consumer[4]:
                 return None
             recovery_now = explicit_now or self.now_utc()
+            stale_before = (
+                _as_utc(runtime_owner_stale_before)
+                if runtime_owner_stale_before is not None
+                else recovery_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
+            )
             await self._recover_expired_leases(
                 agent_id=agent_id,
                 consumer_id=consumer_id,
                 now=recovery_now,
-                runtime_owner_stale_before=(
-                    _as_utc(runtime_owner_stale_before)
-                    if runtime_owner_stale_before is not None
-                    else recovery_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
-                ),
+                runtime_owner_stale_before=stale_before,
             )
             delivery_id = await self._lock_claimable_delivery(
                 agent_id=agent_id,
                 consumer_id=consumer_id,
                 event_id=event_id,
                 now=recovery_now,
+                executor_id=executor_id,
+                runtime_owner_stale_before=stale_before,
             )
             if delivery_id is None:
                 return None
@@ -4109,6 +4117,7 @@ class DurableSignalStore(UnifiedStoreBase):
                   AND status IN ('{PENDING}', '{RETRY}')
                   AND (max_attempts = 0 OR attempts < max_attempts)
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  AND {self._managed_retry_claim_sql()}
                 """,
                 (
                     LEASED,
@@ -4123,6 +4132,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     consumer_id,
                     event_id,
                     self.to_timestamp_param(effective_now),
+                    *self._managed_retry_claim_params(executor_id, stale_before),
                 ),
             )
         if updated == 0:
@@ -4139,6 +4149,8 @@ class DurableSignalStore(UnifiedStoreBase):
         agent_id: str,
         consumer_id: str,
         now: datetime,
+        executor_id: str,
+        runtime_owner_stale_before: datetime,
         event_id: Optional[str] = None,
     ) -> Optional[str]:
         """Serialize one due delivery before assigning an implicit lease clock.
@@ -4162,6 +4174,8 @@ class DurableSignalStore(UnifiedStoreBase):
         if event_id is not None:
             where.insert(2, "event_id = ?")
             params.insert(2, event_id)
+        where.append(self._managed_retry_claim_sql())
+        params.extend(self._managed_retry_claim_params(executor_id, runtime_owner_stale_before))
         lock_clause = " FOR UPDATE" if self.is_postgres else ""
         row = await self._backend.fetch_one(
             f"""
@@ -4173,6 +4187,54 @@ class DurableSignalStore(UnifiedStoreBase):
             tuple(params),
         )
         return str(row[0]) if row is not None else None
+
+    def _managed_retry_claim_sql(self) -> str:
+        """Do not transfer a retry whose original live owner still owns its ACK.
+
+        Claim/recovery already holds the canonical owner-liveness lock. A
+        successful release retains its old capability until a trusted retry
+        claim replaces it. Thus losing the COMMIT ACK cannot expose ordinary
+        retry work to a sibling while the original scope is fail-closed.
+        The same owner can retry normally under its unchanged custody; a dead
+        owner retains the ledger's existing at-least-once recovery semantics.
+        """
+        return f"""(
+            consumer_id <> ? OR status <> '{RETRY}'
+            OR lease_owner IS NULL OR lease_owner NOT LIKE 'dispatcher:%'
+            OR lease_owner = ? OR NOT EXISTS (
+                SELECT 1 FROM {self.RUNTIME_OWNERS} owner
+                WHERE owner.agent_id = {self.DELIVERIES}.agent_id
+                  AND owner.owner_id = {self.DELIVERIES}.lease_owner
+                  AND owner.stopped_at IS NULL AND owner.heartbeat_at >= ?
+            )
+        )"""
+
+    def _managed_retry_claim_params(self, executor_id: str, stale_before: datetime) -> tuple:
+        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        return (DURABLE_COGNITION_CONSUMER_ID, executor_id, self.to_timestamp_param(stale_before))
+
+    @staticmethod
+    def _retry_identity_assignment_sql(*, terminal: bool = False, hold: bool = False) -> str:
+        """Retain only the original managed cognition retry capability.
+
+        No new lease is granted: expiry is cleared and ordinary lease actions
+        still require LEASED. Fixed native cleanup can settle this exact old
+        token even when the release committed before its ACK was lost.
+        """
+        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        if terminal:
+            return "lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL"
+        predicate = (
+            f"consumer_id = '{DURABLE_COGNITION_CONSUMER_ID}' "
+            "AND lease_owner LIKE 'dispatcher:%'"
+        )
+        if not hold:
+            predicate += " AND (max_attempts = 0 OR attempts < max_attempts)"
+        return (
+            f"lease_owner = CASE WHEN {predicate} THEN lease_owner ELSE NULL END, "
+            f"lease_token = CASE WHEN {predicate} THEN lease_token ELSE NULL END, "
+            "lease_expires_at = NULL"
+        )
 
     async def renew_delivery_lease(
         self,
@@ -4875,7 +4937,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     WHEN ? OR (max_attempts > 0 AND attempts >= max_attempts) THEN ?
                     ELSE ?
                 END,
-                lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                {self._retry_identity_assignment_sql(terminal=terminal or terminal_ackable)},
                 next_attempt_at = CASE
                     WHEN ? OR ? OR (max_attempts > 0 AND attempts >= max_attempts)
                         THEN NULL ELSE {timestamp} END,
@@ -4943,8 +5005,7 @@ class DurableSignalStore(UnifiedStoreBase):
             SET status = ?, attempts = CASE
                     WHEN attempts > 0 THEN attempts - 1 ELSE 0
                 END,
-                lease_owner = NULL, lease_token = NULL,
-                lease_expires_at = NULL, next_attempt_at = ?,
+                {self._retry_identity_assignment_sql(hold=True)}, next_attempt_at = ?,
                 last_error = 'hold_deferred', terminal_at = NULL,
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
@@ -5008,7 +5069,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     WHEN ? OR (max_attempts > 0 AND attempts >= max_attempts) THEN ?
                     ELSE ?
                 END,
-                lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                {self._retry_identity_assignment_sql(terminal=terminal or terminal_ackable)},
                 next_attempt_at = CASE
                     WHEN ? OR ? OR (max_attempts > 0 AND attempts >= max_attempts)
                         THEN NULL ELSE {timestamp}

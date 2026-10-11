@@ -92,16 +92,10 @@ async def test_native_failure_receipt_control_settles_or_retains_exact_delivery(
                 await route(dispatcher, delivery, signal)
         assert caught.value is error
         state = await controller.fetchval("SELECT status FROM durable_signal_deliveries WHERE delivery_id='delivery1'")
-        if receipt == "committed-nack":
-            assert state == "retry"
-            assert dispatcher._retained_cognition_control_debt == {delivery.delivery_id: (delivery, error)}
-            with pytest.raises(BaseException) as blocked:
-                await dispatcher.shutdown_durable_delivery()
-            assert blocked.value is error
-            assert await controller.fetchval("SELECT stopped_at IS NULL FROM durable_signal_runtime_owners WHERE owner_id='dispatcher:original'")
-        else:
-            assert state == "failed"
-            assert not dispatcher._retained_cognition_control_debt
+        # The exact original retry capability now survives a committed NACK,
+        # so fixed cleanup can settle it without granting ordinary authority.
+        assert state == "failed"
+        assert not dispatcher._retained_cognition_control_debt
         assert await controller.fetchrow("SELECT * FROM durable_signal_deliveries WHERE delivery_id='delivery2'") == foreign_before
     finally:
         continuation = dispatcher._fenced_durable_shutdown_completion

@@ -2939,7 +2939,8 @@ class SignalDispatcher:
     async def _retain_runtime_owner_cleanup_liveness(self) -> None:
         """Refresh only the already-owned shutdown/terminalization metadata."""
         if self._durable_store.backend.backend_type == "postgres":
-            # False means the original live owner no longer has a leased
+            # False means the original live owner no longer has a leased or
+            # receipt-pending retry
             # cognition. Never insert or revive it to manufacture protection.
             retained = await self._durable_store.backend.retain_cognition_cleanup_owner(
                 agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
@@ -5088,9 +5089,13 @@ class SignalDispatcher:
             name=f"durable_cognition_control_terminal:{delivery.delivery_id}",
         )
         outcome = await await_owned_task(task)
+        # Caller cancellation is not a failed receipt. The owned child has
+        # been joined, so clear confirmed settlement before propagating it;
+        # otherwise every retry loses the now-cleared original-token CAS.
+        if outcome.error is None:
+            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
         if outcome.error is not None or outcome.cancellation is not None:
             raise execution_terminal_error(error, outcome.error, outcome.cancellation)
-        self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
 
     async def _apply_cognition_control_terminal(self, delivery, error):
         reason = f"execution_control_unresolved: {type(error).__name__}: {error}"[:500]

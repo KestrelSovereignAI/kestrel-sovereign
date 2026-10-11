@@ -178,16 +178,21 @@ is failed, non-ACKable and non-retryable, including retained late completions.
 Renewal loss carries its original exception through cooperative cancellation
 or retained late route completion, rather than reducing control to a reason
 string. Exact-token failure NACKs and fallback releases use the same control
-settlement as success ACKs. A committed receipt whose terminal CAS no longer
-matches remains explicit cleanup debt: it is not permission to stop the owner
+settlement as success ACKs. Managed cognition retry releases (including Hold)
+retain the original owner/token, without a live lease. Both polling and exact
+event claims exclude a sibling while that owner is live; the original live
+scope may retry normally, and stopped/stale owners keep ordinary at-least-once
+crash recovery. Lost release ACKs can therefore be settled by the fixed
+original-token terminal CAS without exposing work to a sibling. A receipt
+whose terminal CAS no longer matches remains explicit cleanup debt: it is not permission to stop the owner
 or manufacture another delivery. No terminal receipt is written while a
 retained route can still perform effects.
 Renewal retirement joins the original child even under repeated cancellation
 of the context body or its closer. Late native commit/control evidence is
 selected before the body's cancellation can bypass receipt settlement. A
 retained ordinary route also classifies failures from its eventual native
-lease release; a committed release whose token no longer matches terminal
-CAS retains exact debt and prevents clean owner retirement.
+lease release. Confirmed joined terminalization clears debt before propagating
+caller cancellation; a failed child retains exact debt and blocks retirement.
 Detached ingress completion pins its publication-time custody and rechecks
 before every RPC, including after retry backoff; a replacement runtime cannot
 authorize an old callback. Cause-carried control from a cancelled facade is
@@ -216,7 +221,8 @@ original agent/consumer/delivery/owner/token CAS on the existing backend, not a
 generic SQL executor or new admission. No new provider cursor acknowledgement
 is inferred. Failed terminal writes remain exact-identity cleanup debt and block
 clean owner release. Cleanup liveness can update only an existing unstopped
-managed owner that still holds a leased cognition, under the canonical recovery
+managed owner that still holds a leased or receipt-pending retry cognition,
+under the canonical recovery
 serialization key; it cannot insert or revive an owner or authorize ordinary
 work. This is live-process debt ownership, not a new guarantee of durable
 terminal evidence while PostgreSQL is unreachable or after process loss.
@@ -278,8 +284,9 @@ explicitly unsupported under custody; rollback/close remain available.
 
 An exact cognition terminalization or cleanup-liveness CAS returning no match
 is not proof of successful cleanup. Original control debt remains retained,
-shutdown remains fenced, and successor-owned/retryable deliveries are never
-overwritten. Repeated retries retain bounded diagnostic notes rather than
+shutdown remains fenced, and successor-owned deliveries are never overwritten.
+Only the original retry capability is eligible for exact terminal cleanup.
+Repeated retries retain bounded diagnostic notes rather than
 manufacturing another owner or acknowledgement. Operator reconciliation is
 required when the original lease can no longer establish terminal state.
 

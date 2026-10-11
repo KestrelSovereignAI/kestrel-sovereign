@@ -1445,7 +1445,7 @@ class PostgresBackend(DatabaseBackend):
                 return result == "UPDATE 1"
 
     async def retain_cognition_cleanup_owner(self, *, agent_id: str, owner_id: str) -> bool:
-        """Retain only an existing live managed owner with a leased cognition.
+        """Retain an existing live owner with leased or receipt-pending cognition.
 
         This cleanup-only metadata operation cannot insert/revive an owner,
         grant a lease, acknowledge ingress, or reopen ordinary native work.
@@ -1476,7 +1476,9 @@ class PostgresBackend(DatabaseBackend):
                         "AND owner.stopped_at IS NULL AND EXISTS ("
                         f"SELECT 1 FROM {DurableSignalStore.DELIVERIES} delivery "
                         "WHERE delivery.agent_id = $1 AND delivery.lease_owner = $2 "
-                        "AND delivery.consumer_id = $3 AND delivery.status = 'leased')",
+                        "AND delivery.consumer_id = $3 "
+                        "AND delivery.status IN ('leased', 'retry') "
+                        "AND delivery.lease_token IS NOT NULL)",
                         agent_id, owner_id, DURABLE_COGNITION_CONSUMER_ID,
                     )
                     return result == "UPDATE 1"
@@ -1512,7 +1514,8 @@ class PostgresBackend(DatabaseBackend):
                     "lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, "
                     "last_error = $1, terminal_at = NOW(), updated_at = NOW() "
                     "WHERE agent_id = $2 AND consumer_id = $3 AND delivery_id = $4 "
-                    "AND status = 'leased' AND lease_owner = $5 AND lease_token = $6",
+                    "AND status IN ('leased', 'retry') "
+                    "AND lease_owner = $5 AND lease_token = $6",
                     error, agent_id, consumer_id, delivery_id, owner_id, lease_token,
                 )
                 return result == "UPDATE 1"
