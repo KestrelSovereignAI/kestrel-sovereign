@@ -517,8 +517,10 @@ class ModelAgent(Feature):
                 except Exception as e:
                     logger.warning(f"consent recording failed (non-blocking): {e}")
 
-            # Safe to switch
-            self.llm_service.set_model_preference(model_name, vendor, route)
+            # Safe to switch. One mandate change, serialized with a
+            # privacy-mode transition recording the mandate (#3554).
+            async with self.llm_service.mandate_change():
+                self.llm_service.set_model_preference(model_name, vendor, route)
             if vendor and route:
                 full_model = f"{vendor}:{route}/{model_name}"
             elif vendor:

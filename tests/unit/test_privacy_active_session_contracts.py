@@ -1,6 +1,7 @@
 """Active-session privacy transition contracts."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -73,6 +74,10 @@ class _LLMService:
 
     def get_model_preference(self):
         return {"provider": "openai", "model": "gpt-5-mini"}
+
+    @asynccontextmanager
+    async def mandate_change(self):
+        yield
 
     def set_model_preference(self, model, vendor=None, route=None):
         self.model_preference = {"provider": provider, "model": model}

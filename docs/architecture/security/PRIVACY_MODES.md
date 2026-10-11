@@ -445,6 +445,43 @@ Note: Transitions support app layers—e.g., switch to Isolated for reviewing hu
 - **Backward Compatibility**: Existing stored data remains accessible in all modes
 - **Isolation Integrity**: Isolated sessions cannot accidentally leak into permanent storage
 
+### Durability Across Restarts
+
+The privacy mode is recorded per agent and restored at boot, before the first
+turn runs (#3554). A Sovereign who chose a local-only mode is never returned to
+cloud routes by a restart.
+
+- **Entering a local-only mode** (EPHEMERAL, ISOLATED, ANONYMOUS, DEIDENTIFIED)
+  saves the model mandate in force just before it, alongside the mode, and
+  forces a local route. Moving between local-only modes keeps the mandate saved
+  on entry; the forced local model is never saved in its place.
+- **Leaving a local-only mode** restores the saved mandate and clears the saved
+  copy. An agent that had no mandate returns to default routing. If nothing was
+  saved, the current preference stays and a warning is logged.
+- **After a restart** the mode and the mandate agree: a local-only mode comes
+  back on its local route, and NORMAL comes back on the pre-mode mandate.
+- **Persisted before it applies**: a transition writes a pending record, then
+  the model mandate the new mode implies, then the settled record. Only then
+  does the agent switch mode or model. If any of these writes fails, the
+  change is refused: the agent stays in its current mode and keeps its saved
+  mandate, and the transition puts back the record it started from.
+- **Failing closed**: a process that stops mid-transition, or a refused one
+  whose record could not be put back, leaves the pending record. A restart
+  resumes in the more restrictive of its two modes, still holding the saved
+  mandate, and so does the next transition: it starts from the more
+  restrictive of the live mode and the recorded one, so retrying a refused
+  exit cannot overwrite the saved mandate. A record that cannot be read
+  restarts the agent in EPHEMERAL, never NORMAL; boot then records EPHEMERAL,
+  keeping any saved mandate the old record still yields. A transition that
+  cannot read the record is refused and writes nothing: an unreadable record
+  never stands for one with no saved mandate.
+- **Serialized with model selection**: a model selection (`/api/model/set`,
+  `!model-set`) and a privacy transition never interleave. Each waits until
+  the other has recorded the mandate, so the mandate in force is the one a
+  restart restores.
+
+The record and its resolution live in `kestrel_sovereign.agent.privacy_state`.
+
 ## 7. Implementation Details
 
 ### Storage Layer Integration

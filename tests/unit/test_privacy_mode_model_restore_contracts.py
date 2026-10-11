@@ -1,10 +1,11 @@
 """Contracts for model preservation across privacy-mode transitions."""
 
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
+from kestrel_sovereign.agent.privacy_state import SavedModelPreference
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.features.privacy import PrivacyAgent
 from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -80,15 +81,25 @@ class _FakeLLMService:
              "model": "llama3.2:3b", "is_cloud": False, "is_local": True},
         ]
         self._pref = {"vendor": None, "model": None, "route": None}
-        self._pre_ephemeral_preference = None
         self.calls = []
 
     def get_model_preference(self):
         return dict(self._pref)
 
-    def set_model_preference(self, model, vendor=None, route=None):
+    def resolve_model_preference(self, model, vendor=None, route=None, *, validate=True):
+        return {"vendor": vendor, "model": model, "route": route}
+
+    def set_model_preference(self, model, vendor=None, route=None, *, validate=True):
         self.calls.append((model, vendor, route))
         self._pref = {"vendor": vendor, "model": model, "route": route}
+
+    def clear_model_preference(self):
+        self.calls.append(None)
+        self._pref = {"vendor": None, "model": None, "route": None}
+
+    @asynccontextmanager
+    async def mandate_change(self):
+        yield
 
     def get_active_model_id(self):
         if self._pref.get("model"):
@@ -244,45 +255,51 @@ def test_privacy_confirm_endpoint_preserves_pending_target_during_fact_lease():
         _restore_app(app, original)
 
 
-def test_privacy_mode_restores_default_cloud_model_after_local_only_transition():
-    llm_service = _FakeLLMService()
-    privacy_agent = MagicMock()
-    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-    agent = MagicMock(llm_service=llm_service, privacy_agent=privacy_agent)
-    agent.set_privacy_mode = AsyncMock()
-
+def _post_privacy_modes(agent, *modes):
     app, original = _prepare_app(agent)
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                isolated_response = client.post(
-                    "/api/agent/privacy-mode",
-                    headers={"X-API-Key": "test-key", "X-Kestrel-Allow-Destructive": "test-rail-bypass"},
-                    json={"mode": "isolated"},
-                )
-                normal_response = client.post(
-                    "/api/agent/privacy-mode",
-                    headers={"X-API-Key": "test-key", "X-Kestrel-Allow-Destructive": "test-rail-bypass"},
-                    json={"mode": "normal"},
-                )
-        assert isolated_response.status_code == 200
-        assert isolated_response.json()["model_switched"] == {
-            "vendor": "ollama",
-            "route": "local",
-            "model": "llama3.2:3b",
-        }
-        assert normal_response.status_code == 200
-        assert normal_response.json()["model_switched"] == {
-            "vendor": "openai",
-            "route": "api",
-            "model": "gpt-5-mini",
-        }
-        assert llm_service.calls == [
-            ("llama3.2:3b", "ollama", "local"),
-            ("gpt-5-mini", "openai", "api"),
-        ]
+                return [
+                    client.post(
+                        "/api/agent/privacy-mode",
+                        headers={
+                            "X-API-Key": "test-key",
+                            "X-Kestrel-Allow-Destructive": "test-rail-bypass",
+                        },
+                        json={"mode": mode},
+                    )
+                    for mode in modes
+                ]
     finally:
         _restore_app(app, original)
+
+
+def test_privacy_mode_endpoint_returns_unpinned_agent_to_default_routing():
+    """An agent with no mandate goes back to default routing on leaving a
+    local-only mode (#3554): neither the first configured route nor the
+    forced local model is invented as the mandate it returns to."""
+    llm_service = _FakeLLMService()
+    agent = _make_agent_with_privacy_transition(llm_service)
+
+    isolated_response, normal_response = _post_privacy_modes(
+        agent, "isolated", "normal"
+    )
+
+    assert isolated_response.status_code == 200
+    assert isolated_response.json()["model_switched"] == {
+        "vendor": "ollama",
+        "route": "local",
+        "model": "llama3.2:3b",
+    }
+    assert normal_response.status_code == 200
+    assert normal_response.json()["model_switched"] is None
+    assert llm_service.calls == [("llama3.2:3b", "ollama", "local"), None]
+    assert llm_service.get_model_preference() == {
+        "vendor": None,
+        "model": None,
+        "route": None,
+    }
 
 
 def test_privacy_mode_endpoint_reports_deidentified_storage_fail_closed():
@@ -310,34 +327,17 @@ def test_privacy_mode_endpoint_reports_deidentified_storage_fail_closed():
 def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transition():
     llm_service = _FakeLLMService()
     llm_service._pref = {"vendor": "anthropic", "model": "claude-sonnet-4-5", "route": "api"}
-    privacy_agent = MagicMock()
-    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-    agent = MagicMock(llm_service=llm_service, privacy_agent=privacy_agent)
-    agent.set_privacy_mode = AsyncMock()
+    agent = _make_agent_with_privacy_transition(llm_service)
 
-    app, original = _prepare_app(agent)
-    try:
-        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
-                client.post(
-                    "/api/agent/privacy-mode",
-                    headers={"X-API-Key": "test-key", "X-Kestrel-Allow-Destructive": "test-rail-bypass"},
-                    json={"mode": "isolated"},
-                )
-                response = client.post(
-                    "/api/agent/privacy-mode",
-                    headers={"X-API-Key": "test-key", "X-Kestrel-Allow-Destructive": "test-rail-bypass"},
-                    json={"mode": "normal"},
-                )
-        assert response.status_code == 200
-        assert response.json()["model_switched"] == {
-            "vendor": "anthropic",
-            "route": "api",
-            "model": "claude-sonnet-4-5",
-        }
-        assert llm_service.calls[-1] == ("claude-sonnet-4-5", "anthropic", "api")
-    finally:
-        _restore_app(app, original)
+    _, response = _post_privacy_modes(agent, "isolated", "normal")
+
+    assert response.status_code == 200
+    assert response.json()["model_switched"] == {
+        "vendor": "anthropic",
+        "route": "api",
+        "model": "claude-sonnet-4-5",
+    }
+    assert llm_service.calls[-1] == ("claude-sonnet-4-5", "anthropic", "api")
 
 
 def test_agent_level_privacy_transition_switches_to_local_model():
@@ -355,11 +355,8 @@ def test_agent_level_privacy_transition_switches_to_local_model():
         "model": "llama3.2:3b",
     }
     assert llm_service.calls == [("llama3.2:3b", "ollama", "local")]
-    assert llm_service._pre_ephemeral_preference == {
-        "vendor": "openai",
-        "route": "api",
-        "model": "gpt-5-mini",
-    }
+    # No mandate was in force: that is what is saved, not the first route.
+    assert agent._privacy_saved_preference == SavedModelPreference(None, None, None)
 
 
 def test_agent_level_anonymous_transition_switches_to_local_model():
