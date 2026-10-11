@@ -556,31 +556,34 @@ async def test_a_pass_completes_only_when_its_watermark_is_written(
     assert post["reason"] == "pre_sleep_reflection_not_completed"
 
 
-_FAILING_APPLICATION_TRIGGER = "attestation_test_application_write_fails"
+def _fail_next_application_write(storage, monkeypatch):
+    """The store's next ``applied_count`` increment raises; later ones write.
 
-
-async def _fail_application_writes(storage):
-    """Make every ``applied_count`` increment fail in the database itself.
-
-    SQLite only: on PostgreSQL the trigger would sit on a table that other
-    cases share.
+    ``mark_applied`` reaches the store's ``atomic_increment_metadata_counter``
+    through the real ``MemorySystem`` and its retriever. The failure is raised
+    there, as the database would raise it, and nothing is written. Returns the
+    ids whose write failed.
     """
-    if storage.db.backend_type != "sqlite":
-        pytest.skip(
-            "a failing application write needs a trigger on conversation_history, "
-            "which PostgreSQL cases share"
+    conversation = storage.conversation
+    write = conversation.atomic_increment_metadata_counter
+    failed = []
+
+    async def fail_once(message_id, counter_field, timestamp_field=None):
+        if counter_field == "applied_count" and not failed:
+            failed.append(message_id)
+            raise QueryError("application write failed")
+        return await write(
+            message_id, counter_field=counter_field, timestamp_field=timestamp_field
         )
-    await storage.db.execute(
-        f"""CREATE TRIGGER {_FAILING_APPLICATION_TRIGGER}
-            BEFORE UPDATE OF metadata ON conversation_history
-            WHEN json_extract(NEW.metadata, '$.applied_count')
-                IS NOT json_extract(OLD.metadata, '$.applied_count')
-            BEGIN SELECT RAISE(ABORT, 'application write failed'); END"""
-    )
+
+    monkeypatch.setattr(conversation, "atomic_increment_metadata_counter", fail_once)
+    return failed
 
 
 @pytest.mark.parametrize("backend", ["chat", "decision"])
-async def test_an_application_write_that_fails_is_judged_again(storage, backend):
+async def test_an_application_write_that_fails_is_judged_again(
+    storage, backend, monkeypatch
+):
     """A failed ``applied_count`` write is not recorded as an attestation.
 
     ``mark_applied`` used to log the storage error and return, and the pass
@@ -594,22 +597,23 @@ async def test_an_application_write_that_fails_is_judged_again(storage, backend)
     first_id = await _memory(storage, first, retrieved_at=now - timedelta(hours=9))
     second_id = await _memory(storage, second, retrieved_at=now - timedelta(hours=4))
     memory_system = await _memory_system(storage)
-    await _fail_application_writes(storage)
+    failed_writes = _fail_next_application_write(storage, monkeypatch)
 
     hook = ReflectionSleepHook(backend=backend)
     agent = _Agent(storage, memory_system, _JUDGES[backend](applied={first, second}))
     with pytest.raises(QueryError, match="application write failed"):
         await hook.on_pre_sleep(agent)
 
+    assert failed_writes == [first_id]
     assert hook._pre_sleep_status.get() is None
     assert await _watermark(storage) == previous_pass
     assert await _marks(storage) == []
     assert "applied_count" not in await _metadata(storage, first_id)
+    assert "applied_count" not in await _metadata(storage, second_id)
     post = await hook.on_post_consolidation(agent, {})
     assert post["reason"] == "pre_sleep_reflection_not_completed"
 
     # The write works again: the next sleep judges both retrievals.
-    await storage.db.execute(f"DROP TRIGGER {_FAILING_APPLICATION_TRIGGER}")
     retry = _JUDGES[backend](applied={first, second})
     result = await hook.on_pre_sleep(_Agent(storage, memory_system, retry))
     assert result["success"] is True
