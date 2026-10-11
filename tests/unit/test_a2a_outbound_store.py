@@ -264,6 +264,62 @@ async def test_authoritative_cancellation_supersedes_provisional_expiry(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("remote_state", ["completed", "failed"])
+async def test_remote_answer_supersedes_provisional_expiry(tmp_path, remote_state):
+    """A recipient that answered after the sender's deadline did answer
+    (#3440): the audit row records the remote result, not ``expired``."""
+    db = await _backend(tmp_path)
+    try:
+        await record_outbound_dispatch(
+            db,
+            agent_id="emma",
+            task_id="late-answer",
+            recipient="nellie",
+            verb="question",
+            session_id="s",
+            dispatch_tool="send_a2a_question",
+        )
+        await update_outbound_terminal_state(
+            db, agent_id="emma", task_id="late-answer", terminal_state="expired",
+        )
+
+        assert await update_outbound_terminal_state(
+            db, agent_id="emma", task_id="late-answer",
+            terminal_state=remote_state,
+        ) == 1
+        row = (await list_outbound_tasks(db, agent_id="emma"))[0]
+        assert row.terminal_state == remote_state
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_answer_does_not_overwrite_a_remote_cancellation(tmp_path):
+    db = await _backend(tmp_path)
+    try:
+        await record_outbound_dispatch(
+            db,
+            agent_id="emma",
+            task_id="withdrawn",
+            recipient="nellie",
+            verb="question",
+            session_id="s",
+            dispatch_tool="send_a2a_question",
+        )
+        await update_outbound_terminal_state(
+            db, agent_id="emma", task_id="withdrawn", terminal_state="canceled",
+        )
+
+        assert await update_outbound_terminal_state(
+            db, agent_id="emma", task_id="withdrawn", terminal_state="completed",
+        ) == 0
+        row = (await list_outbound_tasks(db, agent_id="emma"))[0]
+        assert row.terminal_state == "canceled"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_rekey_outbound_task_moves_only_its_reserved_stable_binding(tmp_path):
     db = await _backend(tmp_path)
     reserved = await record_outbound_dispatch(

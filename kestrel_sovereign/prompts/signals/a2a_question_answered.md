@@ -6,7 +6,7 @@
 {payload[original_question]}
 ```
 
-**Their reply** (state: `{payload[state]}`):
+**Their reply** (state: `{payload[state]}`, late: `{payload[late]}`):
 
 ```
 {payload[reply_text]}
@@ -16,7 +16,9 @@ If the reply block above contains the text `[truncated; call get_peer_task_resul
 
 If the reply block above says something like "See attached artifacts (N segments)", `{payload[recipient]}` chunked a long body into Artifacts because the per-tool argument cap (10K chars) wouldn't fit it inline. Call `get_peer_task_result("{payload[recipient]}", "{payload[task_id]}")` — the returned `artifact_body` field is the full reassembled body (artifacts walked in `index` order). Check `artifact_body_complete=true` before using it; if it's `false`, `{payload[recipient]}` is still mid-stream and you should wait or re-fetch later.
 
-If `state` is `expired`, your subscription deadline passed without `{payload[recipient]}` reaching a terminal state. The reply block will be empty. Decide whether to give up, re-ask via a fresh `send_a2a_question`, or escalate — do NOT claim you got an answer when state is `expired`.
+If `state` is `expired`, your subscription deadline passed without `{payload[recipient]}` reaching a terminal state. The reply block will be empty. The question has been withdrawn: `{payload[recipient]}`'s task was canceled, so they will not answer it or have it re-delivered. Decide whether to give up, re-ask via a fresh `send_a2a_question`, or escalate — do NOT claim you got an answer when state is `expired`. If `{payload[recipient]}` could not be reached to withdraw it and answers anyway, you will be woken again with that answer and `late` set to `True`.
+
+If `late` is `True`, you were already woken once for this question with `state` `expired`, and `{payload[recipient]}` answered afterwards. This reply is that answer and supersedes the expiry. If you re-asked, escalated, or described `{payload[recipient]}` as unresponsive in the meantime, correct that now: they did answer.
 
 If `state` is `failed` or `canceled`, the recipient transitioned the task into a non-success terminal state. Their reply text (if any) typically carries the reason.
 

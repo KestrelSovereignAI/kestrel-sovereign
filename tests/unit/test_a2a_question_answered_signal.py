@@ -227,3 +227,64 @@ class TestPackagedTemplate:
             f"kestrel_sovereign package so it ships with the wheel. "
             f"Package root: {package_root}."
         )
+
+
+# ---------------------------------------------------------------------------
+# Late answers (#3440)
+# ---------------------------------------------------------------------------
+
+
+def test_late_answer_is_a_distinct_flagged_wake():
+    from kestrel_sovereign.signals.sources.a2a_question_answered import (
+        build_signal_for_question_answered,
+    )
+
+    on_time = build_signal_for_question_answered(
+        task_id="t-late", recipient="Nellie", original_question="q",
+        reply_text="", state="expired", target_agent="did:test:emma",
+    )
+    late = build_signal_for_question_answered(
+        task_id="t-late", recipient="Nellie", original_question="q",
+        reply_text="numbers", state="completed", target_agent="did:test:emma",
+        late=True,
+    )
+
+    assert on_time.payload["late"] is False
+    assert late.payload["late"] is True
+    assert on_time.dedupe_key == "t-late:answered"
+    assert late.dedupe_key == "t-late:answered:late"
+
+
+def test_schema_defaults_late_and_rejects_a_late_expiry():
+    from kestrel_sovereign.signals.sources.a2a_question_answered import (
+        _a2a_question_answered_schema,
+    )
+
+    base = {
+        "task_id": "t", "recipient": "Nellie", "original_question": "q",
+        "reply_text": "", "state": "expired",
+    }
+    assert _a2a_question_answered_schema(dict(base))["late"] is False
+    with pytest.raises(ValueError, match="late"):
+        _a2a_question_answered_schema({**base, "late": True})
+    with pytest.raises(ValueError, match="bool"):
+        _a2a_question_answered_schema(
+            {**base, "state": "completed", "late": "yes"}
+        )
+
+
+def test_prompt_template_renders_the_late_flag():
+    from kestrel_sovereign.signals.sources.a2a_question_answered import (
+        PROMPT_TEMPLATE,
+        _a2a_question_answered_schema,
+    )
+
+    payload = _a2a_question_answered_schema({
+        "task_id": "t", "recipient": "Nellie", "original_question": "q",
+        "reply_text": "numbers", "state": "completed", "late": True,
+    })
+    rendered = PROMPT_TEMPLATE.read_text().format(
+        payload=payload, source="a2a.question_answered",
+        target_agent="did:test:emma", arrived_at="now", urgency="normal",
+    )
+    assert "late: `True`" in rendered

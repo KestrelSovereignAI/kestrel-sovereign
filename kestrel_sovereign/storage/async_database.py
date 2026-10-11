@@ -796,6 +796,10 @@ CREATE TABLE IF NOT EXISTS pending_a2a_questions (
     ),
     retry_state TEXT,
     retry_reply_text TEXT,
+    receiver_settlement TEXT,
+    receiver_settlement_lease_until TIMESTAMP,
+    receiver_late_state TEXT,
+    receiver_late_reply_text TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     resolved_at TIMESTAMP,
     PRIMARY KEY (agent_id, task_id)
@@ -1514,6 +1518,25 @@ class AsyncDatabase:
         # later name reassignment cannot retarget an in-flight question.
         await self._migrate_add_column(
             "pending_a2a_questions", "recipient_agent_id", "TEXT DEFAULT NULL"
+        )
+        # #3440: an expired question records whether the recipient's task is
+        # confirmed terminal, so the sweep can keep withdrawing it (or relay
+        # its late answer) until both stores agree. A late answer is held on
+        # the row until its wake is delivered, and each settlement pass works
+        # under a lease that lapses if the pass dies.
+        await self._migrate_add_column(
+            "pending_a2a_questions", "receiver_settlement", "TEXT DEFAULT NULL"
+        )
+        await self._migrate_add_column(
+            "pending_a2a_questions",
+            "receiver_settlement_lease_until",
+            "TIMESTAMP DEFAULT NULL",
+        )
+        await self._migrate_add_column(
+            "pending_a2a_questions", "receiver_late_state", "TEXT DEFAULT NULL"
+        )
+        await self._migrate_add_column(
+            "pending_a2a_questions", "receiver_late_reply_text", "TEXT DEFAULT NULL"
         )
         # Decay-aware forgetting (#1674): memory_episodes need a decay signal
         # before they can be deleted by importance rather than raw age. Stamp

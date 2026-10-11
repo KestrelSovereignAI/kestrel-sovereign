@@ -14,6 +14,10 @@ import pytest
 
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_pending_a2a_question_store import (
+    RECEIVER_SETTLEMENT_CONFIRMED,
+    RECEIVER_SETTLEMENT_LATE_ANSWER,
+    RECEIVER_SETTLEMENT_LEASE,
+    RECEIVER_SETTLEMENT_PENDING,
     PendingA2AQuestionStore,
 )
 
@@ -411,3 +415,282 @@ async def test_mark_expired_terminal_transition(tmp_path):
 
     # Already-expired second call is benign.
     assert await store.mark_expired("task-exp") is False
+
+
+# ---------------------------------------------------------------------------
+# Receiver settlement (#3440)
+# ---------------------------------------------------------------------------
+
+
+async def _insert_past(store, task_id):
+    await store.insert(
+        task_id=task_id, recipient="Meridian",
+        original_question="q", origin_turn_id=None, origin_session_id=None,
+        deadline=datetime.now(timezone.utc) - timedelta(hours=2),
+    )
+
+
+@pytest.mark.asyncio
+async def test_expiry_records_whether_the_recipient_is_settled(tmp_path):
+    store = await _make_store(tmp_path)
+    await _insert_past(store, "settled")
+    await _insert_past(store, "unsettled")
+    await _insert_past(store, "answered")
+
+    assert await store.mark_expired("settled", receiver_settled=True) is True
+    assert await store.mark_expired("unsettled") is True
+    assert await store.mark_resolved("answered") is True
+
+    assert (await store.get("settled")).receiver_settlement == (
+        RECEIVER_SETTLEMENT_CONFIRMED
+    )
+    assert (await store.get("unsettled")).receiver_settlement == (
+        RECEIVER_SETTLEMENT_PENDING
+    )
+    assert (await store.get("answered")).receiver_settlement is None
+
+    awaiting = await store.list_expired_awaiting_receiver()
+    assert [row.task_id for row in awaiting] == ["unsettled"]
+
+
+@pytest.mark.asyncio
+async def test_re_expiry_after_a_failed_wake_keeps_its_settlement(tmp_path):
+    """An expired wake that was not delivered restores the row to WAITING and
+    the retry re-expires it without settling again. A confirmed recipient
+    must stay confirmed; an unconfirmed one stays owed."""
+    store = await _make_store(tmp_path)
+    await _insert_past(store, "confirmed")
+    await _insert_past(store, "owed")
+    await store.mark_expired("confirmed", receiver_settled=True)
+    await store.mark_expired("owed")
+
+    for task_id in ("confirmed", "owed"):
+        assert await store.mark_waiting_for_retry(
+            task_id, state="expired", reply_text="",
+        ) is True
+        assert await store.mark_expired(task_id) is True
+
+    assert (await store.get("confirmed")).receiver_settlement == (
+        RECEIVER_SETTLEMENT_CONFIRMED
+    )
+    assert (await store.get("owed")).receiver_settlement == (
+        RECEIVER_SETTLEMENT_PENDING
+    )
+
+
+@pytest.mark.asyncio
+async def test_unsettled_rows_have_no_age_cutoff(tmp_path):
+    """The recipient keeps an undelivered submission for as long as it stays
+    undelivered, so an unsettled row is never aged out of settlement."""
+    store = await _make_store(tmp_path)
+    await _insert_past(store, "ancient")
+    await store.mark_expired("ancient")
+    await store._db.execute(
+        "UPDATE pending_a2a_questions SET resolved_at = ? WHERE task_id = ?",
+        (datetime(2025, 1, 1), "ancient"),
+    )
+
+    assert [
+        row.task_id for row in await store.list_expired_awaiting_receiver()
+    ] == ["ancient"]
+
+
+@pytest.mark.asyncio
+async def test_unsettled_expiry_holds_the_lease_until_it_lapses(tmp_path):
+    """The expiry's own ``expired`` wake reaches the asker before any pass
+    can relay a late answer."""
+    store = await _make_store(tmp_path)
+    expired_at = datetime.now(timezone.utc)
+    await _insert_past(store, "owed")
+    await _insert_past(store, "settled")
+    await store.mark_expired("owed", now=expired_at)
+    await store.mark_expired("settled", receiver_settled=True, now=expired_at)
+
+    assert await store.claim_receiver_settlement("owed", now=expired_at) is None
+    lapsed = expired_at + RECEIVER_SETTLEMENT_LEASE
+    claimed = await store.claim_receiver_settlement("owed", now=lapsed)
+    assert claimed is not None
+    assert claimed.task_id == "owed"
+    assert claimed.receiver_settlement == RECEIVER_SETTLEMENT_PENDING
+    # A confirmed row is never claimed.
+    assert await store.claim_receiver_settlement("settled", now=lapsed) is None
+
+
+@pytest.mark.asyncio
+async def test_settlement_claim_is_single_winner_until_it_lapses(tmp_path):
+    store = await _make_store(tmp_path)
+    expired_at = datetime.now(timezone.utc) - 2 * RECEIVER_SETTLEMENT_LEASE
+    await _insert_past(store, "row")
+    await store.mark_expired("row", now=expired_at)
+    now = datetime.now(timezone.utc)
+
+    assert await store.claim_receiver_settlement("row", now=now) is not None
+    assert await store.claim_receiver_settlement("row", now=now) is None
+    # A pass that died holding the lease is resumed once it lapses.
+    assert await store.claim_receiver_settlement(
+        "row", now=now + RECEIVER_SETTLEMENT_LEASE,
+    ) is not None
+
+
+@pytest.mark.asyncio
+async def test_renewal_extends_an_unsettled_lease_until_settled(tmp_path):
+    """Whoever is waiting on a wake for the row keeps its lease; once the row
+    is settled there is nothing left to renew."""
+    store = await _make_store(tmp_path)
+    t0 = datetime.now(timezone.utc)
+    await _insert_past(store, "row")
+    await store.mark_expired("row", now=t0)
+
+    renewed_at = t0 + RECEIVER_SETTLEMENT_LEASE - timedelta(minutes=1)
+    assert await store.renew_receiver_settlement_lease("row", now=renewed_at)
+    # Past the original lease, still held.
+    assert await store.claim_receiver_settlement(
+        "row", now=t0 + RECEIVER_SETTLEMENT_LEASE,
+    ) is None
+    # A renewal never shortens a lease, and an unsettled row is still worth
+    # holding when it is already leased for longer.
+    assert await store.renew_receiver_settlement_lease("row", now=t0)
+    assert await store.claim_receiver_settlement(
+        "row", now=t0 + RECEIVER_SETTLEMENT_LEASE,
+    ) is None
+    assert await store.claim_receiver_settlement(
+        "row", now=renewed_at + RECEIVER_SETTLEMENT_LEASE,
+    ) is not None
+
+    assert await store.confirm_receiver_withdrawn("row")
+    assert not await store.renew_receiver_settlement_lease(
+        "row", now=renewed_at + 2 * RECEIVER_SETTLEMENT_LEASE,
+    )
+
+
+@pytest.mark.asyncio
+async def test_unsettled_rows_are_listed_least_recently_leased_first(tmp_path):
+    """A row a pass just attempted goes to the back of the next pass."""
+    store = await _make_store(tmp_path)
+    t0 = datetime.now(timezone.utc)
+    for task_id in ("a", "b"):
+        await _insert_past(store, task_id)
+        await store.mark_expired(task_id, now=t0)
+    await store.claim_receiver_settlement(
+        "a", now=t0 + 2 * RECEIVER_SETTLEMENT_LEASE,
+    )
+
+    assert [r.task_id for r in await store.list_expired_awaiting_receiver()] == [
+        "b", "a",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_late_answer_is_held_on_the_row_until_delivered(tmp_path):
+    store = await _make_store(tmp_path)
+    await _insert_past(store, "late")
+    await store.mark_expired("late")
+
+    assert await store.record_late_answer(
+        "late", state="completed", reply_text="the numbers",
+    ) is True
+    # One recording wins; a racing pass cannot overwrite the held answer.
+    assert await store.record_late_answer(
+        "late", state="failed", reply_text="other",
+    ) is False
+    held = await store.get("late")
+    assert held.receiver_settlement == RECEIVER_SETTLEMENT_LATE_ANSWER
+    assert held.receiver_late_state == "completed"
+    assert held.receiver_late_reply_text == "the numbers"
+    # Still owed: it stays in the settlement set, and a withdrawal cannot
+    # retire it.
+    assert [r.task_id for r in await store.list_expired_awaiting_receiver()] == [
+        "late"
+    ]
+    assert await store.confirm_receiver_withdrawn("late") is False
+
+    assert await store.confirm_late_answer_delivered("late") is True
+    assert await store.confirm_late_answer_delivered("late") is False
+    confirmed = await store.get("late")
+    assert confirmed.receiver_settlement == RECEIVER_SETTLEMENT_CONFIRMED
+    assert confirmed.receiver_late_state is None
+    assert confirmed.receiver_late_reply_text is None
+    assert await store.list_expired_awaiting_receiver() == []
+
+
+@pytest.mark.asyncio
+async def test_empty_late_reply_is_held_as_empty_not_missing(tmp_path):
+    store = await _make_store(tmp_path)
+    await _insert_past(store, "terse")
+    await store.mark_expired("terse")
+
+    await store.record_late_answer("terse", state="failed", reply_text="")
+
+    held = await store.get("terse")
+    assert held.receiver_late_state == "failed"
+    assert held.receiver_late_reply_text == ""
+
+
+@pytest.mark.asyncio
+async def test_withdrawal_confirms_a_pending_row_once(tmp_path):
+    store = await _make_store(tmp_path)
+    await _insert_past(store, "withdrawn")
+    await store.mark_expired("withdrawn")
+
+    assert await store.confirm_receiver_withdrawn("withdrawn") is True
+    assert await store.confirm_receiver_withdrawn("withdrawn") is False
+    assert await store.record_late_answer(
+        "withdrawn", state="completed", reply_text="too late",
+    ) is False
+    assert (await store.get("withdrawn")).receiver_settlement == (
+        RECEIVER_SETTLEMENT_CONFIRMED
+    )
+
+
+@pytest.mark.asyncio
+async def test_held_answer_survives_a_restored_expiry(tmp_path):
+    """A failed ``expired`` wake restores its row to WAITING; the late answer
+    held on it must still be owed after the retry re-expires it."""
+    store = await _make_store(tmp_path)
+    await _insert_past(store, "late")
+    await store.mark_expired("late")
+    await store.record_late_answer("late", state="completed", reply_text="42")
+
+    assert await store.mark_waiting_for_retry(
+        "late", state="expired", reply_text="",
+    ) is True
+    assert await store.mark_expired("late") is True
+
+    row = await store.get("late")
+    assert row.receiver_settlement == RECEIVER_SETTLEMENT_LATE_ANSWER
+    assert (row.receiver_late_state, row.receiver_late_reply_text) == (
+        "completed", "42",
+    )
+
+
+@pytest.mark.asyncio
+async def test_settlement_ignores_rows_that_are_not_expired(tmp_path):
+    store = await _make_store(tmp_path)
+    await _insert_past(store, "waiting")
+    later = datetime.now(timezone.utc) + 2 * RECEIVER_SETTLEMENT_LEASE
+
+    assert await store.claim_receiver_settlement("waiting", now=later) is None
+    assert await store.confirm_receiver_withdrawn("waiting") is False
+    assert await store.record_late_answer(
+        "waiting", state="completed", reply_text="x",
+    ) is False
+    assert (await store.get("waiting")).receiver_settlement is None
+
+
+@pytest.mark.asyncio
+async def test_settlement_rows_are_scoped_to_their_agent(tmp_path):
+    db = await AsyncDatabase.sqlite(str(tmp_path / "shared-settlement.db"))
+    emma = PendingA2AQuestionStore(db, agent_id="did:test:emma")
+    other = PendingA2AQuestionStore(db, agent_id="did:test:other")
+    await _insert_past(emma, "shared-id")
+    await emma.mark_expired("shared-id")
+    later = datetime.now(timezone.utc) + 2 * RECEIVER_SETTLEMENT_LEASE
+
+    assert await other.list_expired_awaiting_receiver() == []
+    assert await other.claim_receiver_settlement("shared-id", now=later) is None
+    assert await other.confirm_receiver_withdrawn("shared-id") is False
+    assert await other.record_late_answer(
+        "shared-id", state="completed", reply_text="x",
+    ) is False
+    assert len(await emma.list_expired_awaiting_receiver()) == 1
+    await db.close()

@@ -1143,9 +1143,12 @@ async def test_replay_supervisor_is_feature_owned_and_cancelled_on_shutdown():
 
 @pytest.mark.asyncio
 async def test_replay_past_deadline_row_spawns_no_supervisor():
-    """A past-deadline WAITING row is expired in place (synthetic signal), never
-    resubscribed — so no supervisor task is owned. Guards the replay branch that
+    """A past-deadline WAITING row is expired (synthetic signal), never
+    resubscribed — so no supervisor task is owned. Its expiry settles with the
+    recipient over the network (#3440), so it runs in a FEATURE-owned expiry
+    task rather than inline on the boot path. Guards the replay branch that
     feeds the ownership fix so a regression can't silently spawn nothing."""
+    import asyncio
     from datetime import datetime, timedelta, timezone
 
     agent = _TrackingAgent()
@@ -1169,8 +1172,13 @@ async def test_replay_past_deadline_row_spawns_no_supervisor():
 
     await feature._replay_pending_a2a_questions(store)
 
-    feature._handle_expired_row.assert_awaited_once()
-    assert getattr(feature, "_owned_background_tasks", []) == []
+    owned = list(feature._owned_background_tasks)
+    assert len(owned) == 1
+    assert owned[0] in agent._background_tasks
+    await asyncio.wait_for(asyncio.gather(*owned), timeout=5)
+
+    feature._handle_expired_row.assert_awaited_once_with(store, row)
+    assert feature._owned_background_tasks == []
     assert agent._background_tasks == set()
 
 

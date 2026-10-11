@@ -40,7 +40,11 @@ from kestrel_sovereign.features.peers.directory import (
     PeerTransportError,
     iter_sse_events,
 )
-from kestrel_sovereign.features.peers.feature import PeersFeature
+from kestrel_sovereign.features.peers.feature import (
+    PeersFeature,
+    ReceiverSettlement,
+    ReceiverSettlementOutcome,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +185,11 @@ def _make_feature(
         return MagicMock()
     agent._track_background_task = _track_bg
     feature.agent = agent
+    # These tests pin the SSE supervisor; settling an expired question with
+    # its recipient (#3440) is covered by test_a2a_question_expiry_settlement.
+    feature._settle_question_with_receiver = AsyncMock(
+        return_value=ReceiverSettlement(ReceiverSettlementOutcome.UNCONFIRMED),
+    )
 
     if monkeypatch is not None:
         monkeypatch.setattr(
@@ -562,7 +571,7 @@ class TestSupervisorDeadlineAccurateExpiry:
         )
 
         agent.pending_a2a_questions.mark_expired.assert_awaited_once_with(
-            "t-deadline",
+            "t-deadline", receiver_settled=False,
         )
         enqueue.assert_awaited_once()
         sig = enqueue.await_args.args[0]
@@ -611,7 +620,7 @@ class TestSupervisorDeadlineAccurateExpiry:
         )
 
         agent.pending_a2a_questions.mark_expired.assert_awaited_once_with(
-            "t-deadline-retry",
+            "t-deadline-retry", receiver_settled=False,
         )
         agent.pending_a2a_questions.mark_waiting_for_retry.assert_awaited_once_with(
             "t-deadline-retry",
@@ -720,7 +729,7 @@ class TestSupervisorDeadlineInsideStreamLoop:
         )
 
         agent.pending_a2a_questions.mark_expired.assert_awaited_once_with(
-            "t-deadline-stream",
+            "t-deadline-stream", receiver_settled=False,
         )
         enqueue.assert_awaited_once()
         sig = enqueue.await_args.args[0]
@@ -788,7 +797,7 @@ class TestSupervisorStalledStream:
         )
 
         agent.pending_a2a_questions.mark_expired.assert_awaited_once_with(
-            "t-stalled",
+            "t-stalled", receiver_settled=False,
         )
         enqueue.assert_awaited_once()
         sig = enqueue.await_args.args[0]

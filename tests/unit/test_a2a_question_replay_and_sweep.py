@@ -4,8 +4,10 @@
 Pins:
 
   - Startup replay: each WAITING row triggers either a fresh supervisor
-    (within-deadline) or a synthetic ``state='expired'`` signal
-    (past-deadline). No row gets both — that would double-resume.
+    (within-deadline) or a feature-owned expiry task that fires the
+    synthetic ``state='expired'`` signal (past-deadline). No row gets
+    both — that would double-resume. Expiry never runs inline on boot:
+    it settles with the recipient over the network first (#3440).
   - Unparseable deadline strings are treated as expired (safer than
     spawning a forever-running supervisor).
   - Hourly sweep: expired rows get the synthetic signal exactly once,
@@ -30,7 +32,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from kestrel_sdk.signals import SignalHandle, SignalMode, SignalResult, Status
 
-from kestrel_sovereign.features.peers.feature import PeersFeature
+from kestrel_sovereign.features.peers.feature import (
+    PeersFeature,
+    ReceiverSettlement,
+    ReceiverSettlementOutcome,
+)
 from kestrel_sovereign.storage.async_pending_a2a_question_store import (
     PendingA2AQuestion,
 )
@@ -113,6 +119,12 @@ def _make_feature_for_replay(*, run_tracked_tasks: bool = False):
         return MagicMock()
     agent._track_background_task = _track_bg
     feature.agent = agent
+    # These tests pin replay/sweep mechanics; settling an expired question
+    # with its recipient (#3440) is covered by
+    # test_a2a_question_expiry_settlement.
+    feature._settle_question_with_receiver = AsyncMock(
+        return_value=ReceiverSettlement(ReceiverSettlementOutcome.UNCONFIRMED),
+    )
     return feature, agent, tracked
 
 
@@ -209,6 +221,9 @@ class TestStartupReplay:
             f"{spawn_names}."
         )
         assert "a2a_question_expiry_sweep" in spawn_names
+        # Expired rows still owed a recipient settlement are retried at
+        # every boot, off the boot path (#3440).
+        assert "a2a_question_receiver_settlement:replay" in spawn_names
 
     @pytest.mark.asyncio
     async def test_replay_passes_persisted_stable_recipient_identity(self):
@@ -286,7 +301,9 @@ class TestStartupReplay:
 
     @pytest.mark.asyncio
     async def test_past_deadline_row_fires_expired_signal(self):
-        feature, agent, tracked = _make_feature_for_replay()
+        feature, agent, tracked = _make_feature_for_replay(
+            run_tracked_tasks=True,
+        )
         past = datetime.now(timezone.utc) - timedelta(hours=2)
         row = _row("task-stale", deadline=past)
 
@@ -295,17 +312,18 @@ class TestStartupReplay:
         store.mark_expired = AsyncMock(return_value=True)
         agent.pending_a2a_questions = store
 
-        await feature.post_all_features_loaded(agent)
+        await feature._replay_pending_a2a_questions(store)
+        await _drain(tracked, "a2a_question_expiry:replay:")
 
-        store.mark_expired.assert_awaited_once_with("task-stale")
-        # NO replay supervisor for stale rows (just the sweep loop).
-        replay_supervisors = [
-            n for _, n in tracked
-            if "a2a_question_supervisor:replay" in n
-        ]
-        assert replay_supervisors == [], (
-            "Past-deadline rows must NOT spawn a supervisor — that's "
-            "what the expired signal is for."
+        assert [n for _, n in tracked] == [
+            "a2a_question_expiry:replay:Meridian:task-stale",
+        ], (
+            "Past-deadline rows must NOT spawn a supervisor — they are "
+            "expired by a feature-owned expiry task."
+        )
+        feature._settle_question_with_receiver.assert_awaited_once()
+        store.mark_expired.assert_awaited_once_with(
+            "task-stale", receiver_settled=False,
         )
         agent.dispatcher.enqueue_signal.assert_awaited_once()
         sig = agent.dispatcher.enqueue_signal.await_args.args[0]
@@ -316,7 +334,9 @@ class TestStartupReplay:
     async def test_unparseable_deadline_treated_as_expired(self):
         """Unparseable deadline string is safer to expire than to
         spawn a supervisor that might run forever (no terminal cap)."""
-        feature, agent, tracked = _make_feature_for_replay()
+        feature, agent, tracked = _make_feature_for_replay(
+            run_tracked_tasks=True,
+        )
         bad_row = PendingA2AQuestion(
             task_id="task-bad",
             recipient="Meridian",
@@ -333,9 +353,15 @@ class TestStartupReplay:
         store.mark_expired = AsyncMock(return_value=True)
         agent.pending_a2a_questions = store
 
-        await feature.post_all_features_loaded(agent)
+        await feature._replay_pending_a2a_questions(store)
+        assert [n for _, n in tracked] == [
+            "a2a_question_expiry:replay:Meridian:task-bad",
+        ]
+        await _drain(tracked, "a2a_question_expiry:replay:")
 
-        store.mark_expired.assert_awaited_once_with("task-bad")
+        store.mark_expired.assert_awaited_once_with(
+            "task-bad", receiver_settled=False,
+        )
         agent.dispatcher.enqueue_signal.assert_awaited_once()
         assert (
             agent.dispatcher.enqueue_signal.await_args.args[0]
@@ -346,7 +372,10 @@ class TestStartupReplay:
     async def test_mixed_rows_route_independently(self):
         """A boot snapshot with both fresh and stale rows must route
         each correctly — no batch decision masks the mixed state."""
-        feature, agent, tracked = _make_feature_for_replay()
+        feature, agent, tracked = _make_feature_for_replay(
+            run_tracked_tasks=True,
+        )
+        feature._supervise_a2a_question = AsyncMock()
         rows = [
             _row("fresh-1",
                  deadline=datetime.now(timezone.utc) + timedelta(minutes=5)),
@@ -360,9 +389,10 @@ class TestStartupReplay:
         store.mark_expired = AsyncMock(return_value=True)
         agent.pending_a2a_questions = store
 
-        await feature.post_all_features_loaded(agent)
+        await feature._replay_pending_a2a_questions(store)
+        await _drain(tracked, "a2a_question_")
 
-        # Two supervisor spawns, one expired signal, one sweep loop.
+        # Two supervisor spawns and one expiry task.
         replay_supervisors = [
             n for _, n in tracked
             if "a2a_question_supervisor:replay" in n
@@ -371,7 +401,12 @@ class TestStartupReplay:
             "a2a_question_supervisor:replay:Meridian:fresh-1",
             "a2a_question_supervisor:replay:Meridian:fresh-2",
         ])
-        store.mark_expired.assert_awaited_once_with("stale-1")
+        assert [
+            n for _, n in tracked if n.startswith("a2a_question_expiry:")
+        ] == ["a2a_question_expiry:replay:Meridian:stale-1"]
+        store.mark_expired.assert_awaited_once_with(
+            "stale-1", receiver_settled=False,
+        )
         # Exactly one expired signal.
         assert agent.dispatcher.enqueue_signal.await_count == 1
 
@@ -393,6 +428,7 @@ class TestHourlySweep:
 
         store = MagicMock()
         store.mark_expired = AsyncMock(return_value=True)
+        store.list_expired_awaiting_receiver = AsyncMock(return_value=[])
         # First call returns the expired rows; second raises Cancelled
         # to break the loop deterministically.
         store.list_waiting_past_deadline = AsyncMock(
@@ -404,6 +440,9 @@ class TestHourlySweep:
         with pytest.raises(asyncio.CancelledError):
             await feature._hourly_expiry_sweep_loop(store)
 
+        # Each tick also resumes recipient settlement (#3440), after its
+        # expiries; the second tick was cancelled before reaching it.
+        assert store.list_expired_awaiting_receiver.await_count == 1
         assert store.mark_expired.await_count == 2
         assert agent.dispatcher.enqueue_signal.await_count == 2
         states = [
@@ -412,6 +451,47 @@ class TestHourlySweep:
             for i in range(2)
         ]
         assert states == ["expired", "expired"]
+
+    @pytest.mark.asyncio
+    async def test_settlement_failure_does_not_hold_back_deadline_expiries(
+        self, monkeypatch,
+    ):
+        """Receiver settlement (#3440) runs after the tick's expiries and in
+        its own guard: a failing settlement pass neither skips nor delays the
+        deadline backstop, and the loop does not back off for it."""
+        feature, agent, tracked = _make_feature_for_replay()
+        past = datetime.now(timezone.utc) - timedelta(hours=2)
+
+        store = MagicMock()
+        store.mark_expired = AsyncMock(return_value=True)
+        store.list_expired_awaiting_receiver = AsyncMock(
+            side_effect=RuntimeError("settlement DB blip"),
+        )
+        store.list_waiting_past_deadline = AsyncMock(
+            side_effect=[
+                [_row("t1", deadline=past)],
+                [_row("t2", deadline=past)],
+                asyncio.CancelledError(),
+            ],
+        )
+        agent.pending_a2a_questions = store
+        feature.EXPIRY_SWEEP_INTERVAL_SECONDS = 0  # tick immediately
+        sleeps = []
+        real_sleep = asyncio.sleep
+
+        async def _record_sleep(secs):
+            sleeps.append(secs)
+            await real_sleep(0)
+        monkeypatch.setattr(asyncio, "sleep", _record_sleep)
+
+        with pytest.raises(asyncio.CancelledError):
+            await feature._hourly_expiry_sweep_loop(store)
+
+        assert [
+            call.args[0] for call in store.mark_expired.await_args_list
+        ] == ["t1", "t2"]
+        assert store.list_expired_awaiting_receiver.await_count == 2
+        assert 60 not in sleeps, "a settlement failure must not back off"
 
     @pytest.mark.asyncio
     async def test_sweep_survives_transient_store_failure(self):
@@ -426,6 +506,7 @@ class TestHourlySweep:
         # row. Third tick: CancelledError to stop the loop.
         store = MagicMock()
         store.mark_expired = AsyncMock(return_value=True)
+        store.list_expired_awaiting_receiver = AsyncMock(return_value=[])
         store.list_waiting_past_deadline = AsyncMock(side_effect=[
             RuntimeError("transient DB blip"),
             rows,
@@ -477,7 +558,9 @@ class TestHandleExpiredRow:
 
         await feature._handle_expired_row(store, row)
 
-        store.mark_expired.assert_awaited_once_with("already-resolved")
+        store.mark_expired.assert_awaited_once_with(
+            "already-resolved", receiver_settled=False,
+        )
         agent.dispatcher.enqueue_signal.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -766,9 +849,30 @@ class TestTerminalDeliveryGatesWaitingRow:
 #
 # Startup replay runs inline inside feature init: the cognition turn it is
 # dispatching cannot start until boot finishes, so awaiting terminal delivery
-# there would deadlock. The wait is handed to a feature-owned supervisor that
-# owns the restore instead — and that supervisor must actually run.
+# there would deadlock. A row carrying a captured terminal payload is re-fired
+# inline and its wait is handed to a feature-owned supervisor that owns the
+# restore instead — and that supervisor must actually run. A past-deadline row
+# is expired off the boot path entirely (#3440).
 # ---------------------------------------------------------------------------
+
+
+def _expired_payload_row(task_id: str) -> PendingA2AQuestion:
+    """A WAITING row whose captured ``expired`` wake was never delivered."""
+    past = datetime.now(timezone.utc) - timedelta(hours=2)
+    return PendingA2AQuestion(
+        task_id=task_id,
+        recipient="Meridian",
+        original_question=f"q-for-{task_id}",
+        origin_turn_id=None,
+        origin_session_id="sess-1",
+        deadline=past.isoformat(),
+        status="WAITING",
+        created_at=datetime.now(timezone.utc).isoformat(),
+        resolved_at=None,
+        retry_state="expired",
+        retry_reply_text="",
+    )
+
 
 class TestBootReplayDeliverySupervisor:
     async def _replay_with(self, handle_factory):
@@ -782,9 +886,8 @@ class TestBootReplayDeliverySupervisor:
         store = MagicMock()
         store.mark_expired = AsyncMock(return_value=True)
         store.mark_waiting_for_retry = AsyncMock(return_value=True)
-        past = datetime.now(timezone.utc) - timedelta(hours=2)
         store.list_waiting = AsyncMock(
-            return_value=[_row("boot-1", deadline=past)]
+            return_value=[_expired_payload_row("boot-1")]
         )
         agent.pending_a2a_questions = store
 
@@ -820,9 +923,8 @@ class TestBootReplayDeliverySupervisor:
         store = MagicMock()
         store.mark_expired = AsyncMock(return_value=True)
         store.mark_waiting_for_retry = AsyncMock(return_value=True)
-        past = datetime.now(timezone.utc) - timedelta(hours=2)
         store.list_waiting = AsyncMock(
-            return_value=[_row("boot-nonblock", deadline=past)]
+            return_value=[_expired_payload_row("boot-nonblock")]
         )
         agent.pending_a2a_questions = store
 
@@ -837,6 +939,46 @@ class TestBootReplayDeliverySupervisor:
         gate.set()
         await _drain(tracked, "a2a_question_answered_delivery:")
         store.mark_waiting_for_retry.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_boot_replay_does_not_block_on_recipient_settlement(self):
+        """A past-deadline row is expired in a feature-owned task: replay
+        returns while its settlement with the recipient is still in flight,
+        and the row is not claimed until settlement finishes (#3440)."""
+        feature, agent, tracked = _make_feature_for_replay(
+            run_tracked_tasks=True,
+        )
+        gate = asyncio.Event()
+
+        async def _slow_settlement(**_kwargs):
+            await gate.wait()
+            return ReceiverSettlement(ReceiverSettlementOutcome.WITHDRAWN)
+        feature._settle_question_with_receiver = AsyncMock(
+            side_effect=_slow_settlement,
+        )
+        store = MagicMock()
+        store.mark_expired = AsyncMock(return_value=True)
+        past = datetime.now(timezone.utc) - timedelta(hours=2)
+        store.list_waiting = AsyncMock(
+            return_value=[_row("boot-settle", deadline=past)]
+        )
+        agent.pending_a2a_questions = store
+
+        await asyncio.wait_for(
+            feature._replay_pending_a2a_questions(store), timeout=5,
+        )
+        expiries = _started_tasks(tracked, "a2a_question_expiry:replay:")
+        assert len(expiries) == 1
+        assert not expiries[0].done()
+        store.mark_expired.assert_not_awaited()
+
+        gate.set()
+        await _drain(tracked, "a2a_question_expiry:replay:")
+        store.mark_expired.assert_awaited_once_with(
+            "boot-settle", receiver_settled=True,
+        )
+        sig = agent.dispatcher.enqueue_signal.await_args.args[0]
+        assert sig.payload["state"] == "expired"
 
     @pytest.mark.asyncio
     async def test_supervisor_restores_row_on_failed_delivery(self):

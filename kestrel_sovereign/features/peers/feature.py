@@ -25,13 +25,16 @@ import json
 import logging
 import os
 from collections.abc import Sequence as SequenceABC
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import httpx
 
 from kestrel_sdk.tools.base import ToolCategory
-from kestrel_sdk.tools.result import ToolResult
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.peers.directory import (
@@ -105,6 +108,76 @@ class OutboundArtifactValidationError(ValueError):
         super().__init__(message)
         self.field = field
         self.code = code
+
+
+# A2A task lifecycle states after which the recipient does no further work.
+A2A_TERMINAL_TASK_STATES = ("completed", "failed", "canceled")
+
+
+class ReceiverSettlementOutcome(Enum):
+    """Where a recipient's task stands once its asker's deadline passed."""
+
+    # This sender's cancellation holds the task: it is terminal and will not
+    # be answered or re-delivered.
+    WITHDRAWN = "withdrawn"
+    # The recipient reached a terminal state of its own; the asker is owed it.
+    ANSWERED = "answered"
+    # Neither could be confirmed (the recipient was unreachable).
+    UNCONFIRMED = "unconfirmed"
+
+
+@dataclass(frozen=True)
+class ReceiverSettlement:
+    """Result of settling an expired question with its recipient (#3440)."""
+
+    outcome: ReceiverSettlementOutcome
+    state: str = "expired"
+    reply_text: str = ""
+    # The recipient did not answer within the settlement bound, so another
+    # attempt on the same recipient in the same pass would only wait again.
+    recipient_unresponsive: bool = False
+
+    @property
+    def receiver_terminal(self) -> bool:
+        return self.outcome is not ReceiverSettlementOutcome.UNCONFIRMED
+
+
+class _SettlementLeaseRenewingHandle:
+    """A wake handle that keeps its question's settlement lease while the
+    wake's cognition turn runs (#3440).
+
+    Renewal lives inside ``wait`` so it lasts exactly as long as someone is
+    waiting for the wake, inline or in a delivery supervisor, and ends with
+    that waiter whether the wake lands, fails, or the waiter is cancelled. It
+    renews once as the wait begins, then every ``interval``. ``renew`` returns
+    False once the row is no longer unsettled: nothing is left to hold."""
+
+    def __init__(self, handle: Any, *, interval: float, renew) -> None:
+        self._handle = handle
+        self._interval = interval
+        self._renew = renew
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._handle, name)
+
+    async def wait(self) -> Any:
+        import asyncio
+
+        waiter = asyncio.ensure_future(self._handle.wait())
+        try:
+            renewing = await self._renew()
+            while renewing:
+                done, _ = await asyncio.wait({waiter}, timeout=self._interval)
+                if done:
+                    break
+                renewing = await self._renew()
+            return await waiter
+        finally:
+            # Undone only when this wait is abandoned (its waiter cancelled):
+            # cancelling the inner wait then cancels the dispatch it awaits,
+            # as abandoning a direct await of it would.
+            if not waiter.done():
+                waiter.cancel()
 
 
 class OutboundSigningError(RuntimeError):
@@ -1914,8 +1987,11 @@ class PeersFeature(Feature):
             "When the recipient's task reaches a terminal state, the "
             "``a2a.question_answered`` signal fires a fresh COGNITION "
             "turn on your dispatcher with the reply text inline — "
-            "respond there. Do NOT block your turn waiting for the "
-            "answer; the supervisor will wake you. For fire-and-forget "
+            "respond there. If ``timeout_seconds`` passes first, the "
+            "question is withdrawn (the recipient's task is canceled) "
+            "and you are woken with ``state='expired'``. Do NOT block "
+            "your turn waiting for the answer; the supervisor will wake "
+            "you. For fire-and-forget "
             "use send_a2a_message; for tracked work you'll check on "
             "later use send_a2a_task.\n\n"
             "SEND-SIDE ARTIFACTS: pass ``artifacts`` and/or "
@@ -1968,17 +2044,21 @@ class PeersFeature(Feature):
            inline.
         4. Auto-reconnects with backoff (1s/2s/5s/10s capped) on
            transient httpx failures until terminal or deadline.
+        5. At the deadline, withdraws the question from the recipient
+           (#3440) — see :meth:`_expire_pending_question`.
 
         Args:
             recipient: Peer agent name (e.g. "Meridian").
             message: The question / prompt.
             session_id: Optional A2A session id.
-            timeout_seconds: Wall-clock cap on the supervisor. The
-                hourly expiry sweep marks any WAITING row past this
-                deadline as EXPIRED and fires a synthetic
+            timeout_seconds: Wall-clock cap on the supervisor. Past this
+                deadline the question is withdrawn from the recipient
+                (its task is canceled, so it is neither answered nor
+                re-delivered) and the asker is woken by a synthetic
                 ``a2a.question_answered`` signal with
-                ``state='expired'`` so the asking lineage still
-                resumes cleanly. Default 300s.
+                ``state='expired'`` — or with the recipient's own answer
+                if it arrived first. The hourly expiry sweep is the
+                backstop when the supervisor is gone. Default 300s.
             artifacts: Optional send-side handoff payload attached to the
                 question. Each item is a dict with ``name`` and a body
                 (``text`` for raw text, ``data`` for a structured dict, or
@@ -2256,7 +2336,7 @@ class PeersFeature(Feature):
         # replies — we look there first, falling back to whatever
         # single group exists. Codex round 2 P2 on the artifact PR.
         artifacts_raw = data.get("artifacts") or []
-        terminal_states = ("completed", "failed", "canceled")
+        terminal_states = A2A_TERMINAL_TASK_STATES
         groups: dict[str, list[dict]] = {}
         for art in artifacts_raw:
             if not isinstance(art, dict):
@@ -2725,33 +2805,16 @@ class PeersFeature(Feature):
         import asyncio
         from datetime import datetime, timezone
 
-        terminal_states = ("completed", "failed", "canceled")
+        terminal_states = A2A_TERMINAL_TASK_STATES
         backoffs = [1.0, 2.0, 5.0, 10.0]
         backoff_idx = 0
         state: Optional[str] = None
         reply_text = ""
 
-        # Pending-question rows are correlation/audit state, not route
-        # authority.  Re-read the outbound route whenever it exists rather
-        # than trusting a value passed by the immediate-send path or a restart
-        # replay row.  Hosted sends require this route; local sends with a
-        # persisted reservation use the same check so a failed divergent-id
-        # rekey cannot subscribe to a replacement peer after restart.  A
-        # no-store legacy local send remains compatible by falling back to its
-        # already-recorded recipient identity/name below.
         try:
-            durable_recipient_agent_id = (
-                await self._outbound_recipient_agent_id(task_id)
+            recipient_agent_id = await self._question_recipient_agent_id(
+                task_id, recipient_agent_id,
             )
-            if durable_recipient_agent_id is not None:
-                if (
-                    recipient_agent_id is not None
-                    and recipient_agent_id != durable_recipient_agent_id
-                ):
-                    raise PeerNotFoundError(
-                        "Pending question recipient does not match outbound route"
-                    )
-                recipient_agent_id = durable_recipient_agent_id
         except (
             PeerNotFoundError,
             PeerAccessDeniedError,
@@ -2875,54 +2938,26 @@ class PeersFeature(Feature):
             await asyncio.sleep(min(backoff, _remaining()))
 
         if state not in terminal_states:
-            # Deadline passed without terminal. Fire the synthetic
-            # ``state='expired'`` signal NOW (deadline-accurate) rather
-            # than letting the caller wait up to an hour for the hourly
-            # sweep — promised wake-by-deadline must actually happen at
-            # the deadline (codex round 2 P2a on PR #1453). Mark-expired
-            # FIRST so a racing hourly sweep that's also walking this row
-            # gets a False return and drops its duplicate signal.
+            # Deadline passed without terminal. Expire NOW
+            # (deadline-accurate) rather than letting the caller wait up to
+            # an hour for the hourly sweep — promised wake-by-deadline must
+            # actually happen at the deadline (codex round 2 P2a on PR
+            # #1453).
             logger.info(
                 "A2A subscription supervisor for task=%s recipient=%s "
-                "exited at deadline without terminal frame. Firing "
-                "deadline-accurate expired signal.",
+                "exited at deadline without terminal frame. Expiring the "
+                "question.",
                 task_id, recipient,
             )
-            store = getattr(self.agent, "pending_a2a_questions", None)
-            if store is not None:
-                try:
-                    was_waiting = await store.mark_expired(task_id)
-                except Exception as e:
-                    logger.warning(
-                        "Failed to mark pending_a2a_question task=%s "
-                        "expired: %s. Firing signal anyway — better a "
-                        "possible duplicate than a missed resumption.",
-                        task_id, e,
-                    )
-                    was_waiting = True
-                if not was_waiting:
-                    # Someone else (hourly sweep that beat us by a tick)
-                    # got there first — drop our duplicate signal.
-                    return
-            fired = await self._fire_question_answered_signal(
+            await self._expire_pending_question(
+                getattr(self.agent, "pending_a2a_questions", None),
                 task_id=task_id,
                 recipient=recipient,
+                recipient_agent_id=recipient_agent_id,
                 original_question=original_question,
                 sess_id=sess_id,
-                state="expired",
-                reply_text="",
                 causation_chain=causation_chain,
             )
-            if not fired and store is not None and was_waiting:
-                await self._restore_pending_question_waiting(
-                    task_id,
-                    state="expired",
-                    reply_text="",
-                    recipient=recipient,
-                    original_question=original_question,
-                    sess_id=sess_id,
-                    causation_chain=causation_chain,
-                )
             return
 
         # Terminal: mark resolved + fire local signal. Resolve-first so
@@ -2970,6 +3005,399 @@ class PeersFeature(Feature):
                 causation_chain=causation_chain,
             )
 
+    async def _question_recipient_agent_id(
+        self, task_id: str, recipient_agent_id: Optional[str],
+    ) -> Optional[str]:
+        """Return the stable recipient identity a question may be routed to.
+
+        Pending-question rows are correlation/audit state, not route
+        authority.  Re-read the outbound route whenever it exists rather than
+        trusting a value passed by the immediate-send path or a restart replay
+        row.  Hosted sends require this route; local sends with a persisted
+        reservation use the same check so a failed divergent-id rekey cannot
+        reach a replacement peer after restart.  A no-store legacy local send
+        remains compatible by falling back to its already-recorded recipient
+        identity/name.
+        """
+        durable_recipient_agent_id = await self._outbound_recipient_agent_id(
+            task_id,
+        )
+        if durable_recipient_agent_id is None:
+            return recipient_agent_id
+        if (
+            recipient_agent_id is not None
+            and recipient_agent_id != durable_recipient_agent_id
+        ):
+            raise PeerNotFoundError(
+                "Pending question recipient does not match outbound route"
+            )
+        return durable_recipient_agent_id
+
+    # ------------------------------------------------------------------
+    # Expiry is propagated to the recipient (#3440)
+    #
+    # A question whose deadline passes is withdrawn from the recipient with
+    # the creator's signed cancellation before the asker is told ``expired``.
+    # The recipient's store then agrees with the sender's: its queued wake is
+    # suppressed, a stale re-delivery is refused at execution, and a late
+    # ``respond_to_a2a_task`` is refused as a terminal-state transition. If
+    # the recipient answered first, the cancellation conflicts and the asker
+    # is woken with that answer instead of ``expired``. A recipient that
+    # cannot be reached is settled later by the sweep, which relays its late
+    # answer if one arrives. Both stores must agree before a row is retired,
+    # however long the recipient is away: it keeps an undelivered submission
+    # wake for as long as that wake stays undelivered.
+    # ------------------------------------------------------------------
+
+    # Bound on settling one question with its recipient. The deadline wake
+    # waits for it, so it must stay short; an unreached recipient is retried
+    # by the sweep.
+    QUESTION_SETTLEMENT_TIMEOUT_SECONDS = 15.0
+    # Seconds between renewals of a question's settlement lease while a wake
+    # for it is in flight. ``None`` renews three times per lease.
+    QUESTION_SETTLEMENT_LEASE_RENEW_SECONDS: Optional[float] = None
+    QUESTION_EXPIRY_CANCEL_REASON = (
+        "The asking agent's deadline for this question passed before an "
+        "answer arrived, so it withdrew the question."
+    )
+
+    async def _settle_question_with_receiver(
+        self,
+        *,
+        task_id: str,
+        recipient: str,
+        recipient_agent_id: Optional[str] = None,
+    ) -> ReceiverSettlement:
+        """Make the recipient's task terminal, or learn the terminal state it
+        already reached. Bounded by ``QUESTION_SETTLEMENT_TIMEOUT_SECONDS``."""
+        import asyncio
+
+        try:
+            return await asyncio.wait_for(
+                self._settle_question_with_receiver_unbounded(
+                    task_id=task_id,
+                    recipient=recipient,
+                    recipient_agent_id=recipient_agent_id,
+                ),
+                timeout=self.QUESTION_SETTLEMENT_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "A2A question task=%s: could not settle with recipient=%s "
+                "within %.0fs; leaving the recipient's task unconfirmed.",
+                task_id, recipient, self.QUESTION_SETTLEMENT_TIMEOUT_SECONDS,
+            )
+            return ReceiverSettlement(
+                ReceiverSettlementOutcome.UNCONFIRMED,
+                recipient_unresponsive=True,
+            )
+
+    async def _settle_question_with_receiver_unbounded(
+        self,
+        *,
+        task_id: str,
+        recipient: str,
+        recipient_agent_id: Optional[str],
+    ) -> ReceiverSettlement:
+        withdrawal = await self.cancel_outbound_task(
+            task_id, reason=self.QUESTION_EXPIRY_CANCEL_REASON,
+        )
+        if withdrawal is not None and withdrawal.status in (
+            ToolResultStatus.OK, ToolResultStatus.PARTIAL,
+        ):
+            # PARTIAL is a committed cancellation whose sender-side audit
+            # stamp failed; the recipient's task is canceled either way.
+            return ReceiverSettlement(ReceiverSettlementOutcome.WITHDRAWN)
+        # The cancellation did not take. Either the recipient already reached
+        # a terminal state (a lifecycle conflict) or it could not be reached;
+        # one read tells the two apart and carries a real answer to the asker.
+        observed = await self._read_settled_peer_task(
+            task_id=task_id,
+            recipient=recipient,
+            recipient_agent_id=recipient_agent_id,
+        )
+        if observed is not None:
+            return observed
+        logger.info(
+            "A2A question task=%s: recipient=%s task not confirmed terminal "
+            "(withdrawal: %s).",
+            task_id, recipient,
+            withdrawal.error if withdrawal is not None else "no route",
+        )
+        return ReceiverSettlement(ReceiverSettlementOutcome.UNCONFIRMED)
+
+    async def _read_settled_peer_task(
+        self,
+        *,
+        task_id: str,
+        recipient: str,
+        recipient_agent_id: Optional[str],
+    ) -> Optional[ReceiverSettlement]:
+        """Read the recipient's task; ``None`` unless it is terminal."""
+        try:
+            agent_id = await self._question_recipient_agent_id(
+                task_id, recipient_agent_id,
+            )
+            router, requester, peer = await self._resolve_retained_automatic_peer(
+                recipient, agent_id,
+            )
+            data = await router.get_a2a_task(requester, peer, task_id)
+        except PeerDirectoryError as exc:
+            logger.debug(
+                "A2A question task=%s: recipient=%s task unreadable: %s",
+                task_id, recipient, type(exc).__name__,
+            )
+            return None
+        except Exception:  # noqa: BLE001 - provider extension boundary
+            logger.exception(
+                "Peer router raised unexpectedly reading task %s from %r",
+                task_id, recipient,
+            )
+            return None
+        if not isinstance(data, Mapping):
+            return None
+        parsed = self._parse_task_status_payload(data)
+        if parsed is None or parsed[0] not in A2A_TERMINAL_TASK_STATES:
+            return None
+        state, reply_text = parsed
+        if state == "canceled" and self._canceled_by_this_agent(data):
+            # Our own withdrawal committed even though its response was lost.
+            return ReceiverSettlement(ReceiverSettlementOutcome.WITHDRAWN)
+        return ReceiverSettlement(
+            ReceiverSettlementOutcome.ANSWERED,
+            state=state,
+            reply_text=reply_text,
+        )
+
+    def _canceled_by_this_agent(self, task_data: Mapping[str, Any]) -> bool:
+        metadata = task_data.get("metadata")
+        receipt = (
+            metadata.get("cancellation_receipt")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        own_id = getattr(self.agent, "did", None)
+        return (
+            isinstance(receipt, Mapping)
+            and isinstance(own_id, str)
+            and receipt.get("actor_agent_id") == own_id
+        )
+
+    async def _expire_pending_question(
+        self,
+        store,
+        *,
+        task_id: str,
+        recipient: str,
+        original_question: str,
+        sess_id: str,
+        causation_chain: Optional[list],
+        recipient_agent_id: Optional[str] = None,
+    ) -> None:
+        """Settle a question whose deadline passed, then wake the asker once.
+
+        The asker is woken with the recipient's own terminal state when the
+        recipient answered first, and with ``expired`` otherwise. Settlement
+        runs BEFORE the WAITING row is claimed: a crash in between leaves the
+        row for replay, and a racing expiry that settles too only repeats an
+        idempotent cancellation before losing the claim. The claim then gates
+        the wake, so a racing hourly sweep or supervisor drops its duplicate.
+        """
+        settlement = await self._settle_question_with_receiver(
+            task_id=task_id,
+            recipient=recipient,
+            recipient_agent_id=recipient_agent_id,
+        )
+        answered = settlement.outcome is ReceiverSettlementOutcome.ANSWERED
+        state = settlement.state if answered else "expired"
+        reply_text = settlement.reply_text if answered else ""
+        if store is not None:
+            try:
+                if answered:
+                    was_waiting = await store.mark_resolved(task_id)
+                else:
+                    was_waiting = await store.mark_expired(
+                        task_id,
+                        receiver_settled=settlement.receiver_terminal,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to mark pending_a2a_question task=%s %s: %s. "
+                    "Firing signal anyway — better a possible duplicate "
+                    "than a missed resumption.",
+                    task_id, state, e,
+                )
+                was_waiting = True
+            if not was_waiting:
+                # Someone else (the hourly sweep or the supervisor that beat
+                # us by a tick) got there first — drop our duplicate signal.
+                return
+        fired = await self._fire_question_answered_signal(
+            task_id=task_id,
+            recipient=recipient,
+            original_question=original_question,
+            sess_id=sess_id,
+            state=state,
+            reply_text=reply_text,
+            causation_chain=causation_chain,
+        )
+        if not fired and store is not None:
+            await self._restore_pending_question_waiting(
+                task_id,
+                state=state,
+                reply_text=reply_text,
+                recipient=recipient,
+                original_question=original_question,
+                sess_id=sess_id,
+                causation_chain=causation_chain,
+            )
+
+    async def _settle_expired_questions_with_receivers(
+        self, store, *, now: Optional[datetime] = None,
+    ) -> None:
+        """Settle every expired question its recipient does not yet agree on.
+
+        A row is retried on every pass, with no age cutoff, until the
+        recipient's task is withdrawn or the recipient's own answer has woken
+        the asker (see ``list_expired_awaiting_receiver``). A recipient that
+        does not answer within the settlement bound costs one attempt per
+        pass, not one per question: its other unsettled rows wait for the
+        next pass. ``now`` is the pass's clock for the settlement lease."""
+        import asyncio
+
+        from kestrel_sovereign.storage.async_pending_a2a_question_store import (
+            RECEIVER_SETTLEMENT_LATE_ANSWER,
+        )
+
+        rows = await store.list_expired_awaiting_receiver()
+        unresponsive: set[str] = set()
+        for row in rows:
+            recipient_key = row.recipient_agent_id or row.recipient
+            owes_answer = (
+                row.receiver_settlement == RECEIVER_SETTLEMENT_LATE_ANSWER
+            )
+            if recipient_key in unresponsive and not owes_answer:
+                continue
+            try:
+                settlement = await self._settle_expired_row_with_receiver(
+                    store, row, now=now,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "a2a receiver settlement: failed for task=%s: %s",
+                    row.task_id, e,
+                )
+                continue
+            if settlement is not None and settlement.recipient_unresponsive:
+                unresponsive.add(recipient_key)
+
+    async def _settle_expired_row_with_receiver(
+        self, store, row, *, now: Optional[datetime] = None,
+    ) -> Optional[ReceiverSettlement]:
+        """Settle one unsettled expired question under its lease.
+
+        The asker already holds an ``expired`` wake for this question. A
+        withdrawal only confirms the row. A terminal state the recipient
+        reached on its own is first recorded on the row as the answer owed to
+        the asker, then relayed to it flagged ``late``; the row is confirmed
+        only once that wake is delivered. A pass that dies anywhere in between
+        leaves the row leased and unconfirmed, and the first pass after the
+        lease lapses picks it up where it stopped: it re-settles a PENDING
+        row and re-relays a held answer.
+
+        Returns the settlement attempted with the recipient, or ``None`` when
+        this pass made no attempt (the row was leased elsewhere, or only owed
+        a held answer)."""
+        from kestrel_sovereign.storage.async_pending_a2a_question_store import (
+            RECEIVER_SETTLEMENT_LATE_ANSWER,
+        )
+
+        claimed = await store.claim_receiver_settlement(row.task_id, now=now)
+        if claimed is None:
+            return None
+        settlement: Optional[ReceiverSettlement] = None
+        if claimed.receiver_settlement == RECEIVER_SETTLEMENT_LATE_ANSWER:
+            state = claimed.receiver_late_state
+            reply_text = claimed.receiver_late_reply_text or ""
+        else:
+            settlement = await self._settle_question_with_receiver(
+                task_id=claimed.task_id,
+                recipient=claimed.recipient,
+                recipient_agent_id=claimed.recipient_agent_id,
+            )
+            if settlement.outcome is ReceiverSettlementOutcome.UNCONFIRMED:
+                return settlement
+            if settlement.outcome is ReceiverSettlementOutcome.WITHDRAWN:
+                await store.confirm_receiver_withdrawn(claimed.task_id)
+                return settlement
+            if not await store.record_late_answer(
+                claimed.task_id,
+                state=settlement.state,
+                reply_text=settlement.reply_text,
+            ):
+                return settlement
+            state, reply_text = settlement.state, settlement.reply_text
+        if state not in A2A_TERMINAL_TASK_STATES:
+            logger.error(
+                "pending_a2a_question task=%s holds a late answer with "
+                "non-terminal state %r; it cannot be relayed.",
+                claimed.task_id, state,
+            )
+            return settlement
+        delivered = await self._fire_question_answered_signal(
+            task_id=claimed.task_id,
+            recipient=claimed.recipient,
+            original_question=claimed.original_question,
+            sess_id=claimed.origin_session_id or "",
+            state=state,
+            reply_text=reply_text,
+            causation_chain=None,
+            late=True,
+        )
+        if delivered:
+            await store.confirm_late_answer_delivered(claimed.task_id)
+        # Undelivered, the answer stays held on the row and the lease lapses,
+        # so a later pass relays it again.
+        return settlement
+
+    def _renewing_settlement_lease(self, handle: Any, task_id: str) -> Any:
+        """Wrap ``handle`` so its question's settlement lease is renewed while
+        the wake is awaited.
+
+        A wake waits for a whole cognition turn, which has no fixed length.
+        Without renewal the lease would lapse mid-turn, and a settlement pass
+        could relay a late answer twice, or ahead of the ``expired`` wake. A
+        handle with nothing to wait on is returned as it is, so delivery
+        still reports it as unobservable."""
+        from kestrel_sovereign.storage.async_pending_a2a_question_store import (
+            RECEIVER_SETTLEMENT_LEASE,
+        )
+
+        store = getattr(self.agent, "pending_a2a_questions", None)
+        renew = getattr(store, "renew_receiver_settlement_lease", None)
+        if not callable(renew) or not callable(getattr(handle, "wait", None)):
+            return handle
+        interval = self.QUESTION_SETTLEMENT_LEASE_RENEW_SECONDS
+        if interval is None:
+            interval = RECEIVER_SETTLEMENT_LEASE.total_seconds() / 3
+
+        async def _renew() -> bool:
+            try:
+                return bool(await renew(task_id))
+            except Exception as exc:  # noqa: BLE001 - retried next interval
+                logger.warning(
+                    "Could not renew the settlement lease of "
+                    "pending_a2a_question task=%s: %s",
+                    task_id, exc,
+                )
+                return True
+
+        return _SettlementLeaseRenewingHandle(
+            handle, interval=interval, renew=_renew,
+        )
+
     async def _fire_question_answered_signal(
         self,
         *,
@@ -2982,6 +3410,7 @@ class PeersFeature(Feature):
         causation_chain: Optional[list],
         await_delivery: bool = True,
         schedule_retry: bool = True,
+        late: bool = False,
     ) -> bool:
         """Build, enqueue, and DELIVER the local ``a2a.question_answered``
         signal, returning whether the asker was actually woken.
@@ -3010,6 +3439,11 @@ class PeersFeature(Feature):
         feature-owned supervisor which restores the ``WAITING`` row itself on
         any non-delivery, and returns ``True`` for "accepted, delivery
         supervised" so the caller does not also restore it.
+
+        ``late`` relays a recipient's answer after the asker was already woken
+        ``expired`` (#3440). Its row stays EXPIRED and keeps holding that
+        answer until the caller confirms delivery, so an undelivered late wake
+        has nothing to restore.
         """
         import asyncio
 
@@ -3071,9 +3505,14 @@ class PeersFeature(Feature):
                 target_agent=target_agent,
                 origin_session_id=sess_id,
                 causation_chain=causation_chain,
+                late=late,
             )
             enq = dispatcher.enqueue_signal(signal)
             handle = await enq if hasattr(enq, "__await__") else enq
+            if late or state == "expired":
+                # Its row is EXPIRED and may be unsettled: hold its lease
+                # for as long as this wake is in flight.
+                handle = self._renewing_settlement_lease(handle, task_id)
         except Exception as e:
             logger.error(
                 "Failed to enqueue a2a.question_answered for task=%s "
@@ -3095,6 +3534,8 @@ class PeersFeature(Feature):
                 # escapes teardown entirely and can emit an A2A wake after
                 # Peers is disabled. The restored WAITING row is what makes
                 # the next boot pick this up; that is the whole retry.
+                if late:
+                    return
                 teardown = outcome.status == STATUS_SUPERVISOR_CANCELLED
                 await self._restore_pending_question_waiting(
                     task_id,
@@ -3133,7 +3574,10 @@ class PeersFeature(Feature):
             # obligation is ours: shield the restore so the row does not stay
             # terminal for a wake nobody observed. "Better a possible duplicate
             # than a missed resumption" — the same posture this file already
-            # takes for a failed mark_resolved.
+            # takes for a failed mark_resolved. A late answer is still held on
+            # its row, so it has nothing to restore.
+            if late:
+                raise
             try:
                 await asyncio.shield(
                     self._restore_pending_question_waiting(
@@ -3157,9 +3601,12 @@ class PeersFeature(Feature):
         if not outcome.delivered:
             logger.warning(
                 "a2a.question_answered for task=%s recipient=%s was accepted "
-                "but never delivered (%s); the pending row is restored to "
-                "WAITING so the asker is still resumable",
+                "but never delivered (%s); %s",
                 task_id, recipient, outcome.describe(),
+                "the late answer stays held on its row for the next "
+                "settlement pass" if late else
+                "the pending row is restored to WAITING so the asker is "
+                "still resumable",
             )
             return False
         return True
@@ -3341,7 +3788,15 @@ class PeersFeature(Feature):
             return None
         if not isinstance(data, dict):
             return None
+        return self._parse_task_status_payload(data)
 
+    def _parse_task_status_payload(
+        self, data: Mapping[str, Any],
+    ) -> Optional[Tuple[str, str]]:
+        """Extract ``(state, reply_text)`` from one task envelope.
+
+        Shared by the SSE ``status`` frame and a direct task read, which carry
+        the same canonical and flattened shapes."""
         raw_status = data.get("status")
         if isinstance(raw_status, dict):
             current_state = raw_status.get("state")
@@ -3349,6 +3804,8 @@ class PeersFeature(Feature):
             current_state = raw_status
         if not isinstance(current_state, str):
             return None
+        # A task model dump carries its ``TaskState`` member, a ``str`` enum.
+        current_state = str(getattr(current_state, "value", current_state))
 
         reply_text = ""
         if isinstance(raw_status, dict):
@@ -3377,15 +3834,20 @@ class PeersFeature(Feature):
     # Startup-replay + hourly expiry sweep (#1444 step 6)
     #
     # On boot, walk ``pending_a2a_questions WHERE status='WAITING'``:
-    #   - past-deadline rows → mark EXPIRED + fire synthetic
-    #     ``a2a.question_answered`` with state='expired' so the asking
-    #     lineage resumes with a clean branch in the prompt template
+    #   - past-deadline rows → expire in a feature-owned task: settle with
+    #     the recipient, then fire ``a2a.question_answered`` (the
+    #     recipient's answer, or state='expired') so the asking lineage
+    #     resumes with a clean branch in the prompt template
     #   - within-deadline rows → spawn a fresh subscription supervisor
     #     so the SSE wait survives process restarts
+    # and resume receiver settlement for expired rows still unsettled: a
+    # recipient not yet confirmed terminal, or a late answer not yet
+    # delivered (#3440).
     #
     # An hourly background task runs the same expired-row scan so rows
     # whose deadline lapses without a supervisor (e.g. supervisor
-    # crashed) still get a synthetic terminal signal.
+    # crashed) still get a synthetic terminal signal, plus the same
+    # receiver-settlement retry.
     # ------------------------------------------------------------------
 
     # Hourly cron interval — overridable via constructor for test
@@ -3444,6 +3906,14 @@ class PeersFeature(Feature):
                 e, exc_info=True,
             )
 
+        # Settlement makes network calls to recipients, so it never runs
+        # inline on the boot path. FEATURE-owned for the same teardown
+        # reason as the sweep below.
+        self._track_owned_background_task(
+            self._settle_expired_questions_with_receivers(store),
+            name="a2a_question_receiver_settlement:replay",
+        )
+
         # Hourly sweep as a FEATURE-owned background task. Still agent-tracked
         # (auto-cancelled at full agent shutdown by
         # ``_shutdown_background_tasks``), but also owned by this feature so
@@ -3457,13 +3927,12 @@ class PeersFeature(Feature):
         )
 
     async def _replay_pending_a2a_questions(self, store) -> None:
-        """Walk every WAITING row at boot. Past-deadline rows get a
-        synthetic ``state='expired'`` signal; within-deadline rows get
-        a fresh subscription supervisor. The chain is NOT persisted
-        across restarts — a restart erases the asking turn's
-        context, so the resumed signal carries an empty chain and
-        the dispatcher applies its normal depth-bounded cycle check
-        from scratch."""
+        """Walk every WAITING row at boot. Past-deadline rows are expired
+        in a feature-owned task; within-deadline rows get a fresh
+        subscription supervisor. The chain is NOT persisted across
+        restarts — a restart erases the asking turn's context, so the
+        resumed signal carries an empty chain and the dispatcher applies
+        its normal depth-bounded cycle check from scratch."""
         from datetime import datetime, timezone
 
         waiting = await store.list_waiting()
@@ -3494,13 +3963,13 @@ class PeersFeature(Feature):
                     "task=%s — treating as expired.",
                     row.deadline, row.task_id,
                 )
-                await self._handle_expired_row(store, row, await_delivery=False)
+                self._expire_replayed_row(store, row)
                 expired += 1
                 continue
             if deadline.tzinfo is None:
                 deadline = deadline.replace(tzinfo=timezone.utc)
             if deadline <= now:
-                await self._handle_expired_row(store, row, await_delivery=False)
+                self._expire_replayed_row(store, row)
                 expired += 1
                 continue
             # Within deadline — spawn supervisor. Chain is not
@@ -3534,13 +4003,26 @@ class PeersFeature(Feature):
             replayed, expired, len(waiting),
         )
 
+    def _expire_replayed_row(self, store, row) -> None:
+        """Expire a past-deadline row found at boot, off the boot path.
+
+        Expiry settles with the recipient over the network and then waits for
+        the resumed turn, neither of which boot can block on (#2532, #3440).
+        FEATURE-owned so boot rollback / soft disable cancel it; the row stays
+        WAITING until its claim, so a cancelled expiry is replayed next boot.
+        """
+        self._track_owned_background_task(
+            self._handle_expired_row(store, row),
+            name=f"a2a_question_expiry:replay:{row.recipient}:{row.task_id}",
+        )
+
     async def _hourly_expiry_sweep_loop(self, store) -> None:
-        """Sweep ``list_waiting_past_deadline`` every hour. For each
-        row mark EXPIRED + fire a synthetic ``a2a.question_answered``
-        signal with ``state='expired'`` so the asking lineage
-        resumes with a clean branch in the prompt template. Logs
-        and continues on transient failures — this loop is the
-        deadline backstop and must not die silently."""
+        """Sweep ``list_waiting_past_deadline`` every hour. Each row is
+        expired via :meth:`_handle_expired_row` so the asking lineage
+        resumes with a clean branch in the prompt template, and expired
+        rows whose recipient is not yet settled are retried. Logs and
+        continues on transient failures — this loop is the deadline
+        backstop and must not die silently."""
         import asyncio
 
         while True:
@@ -3560,6 +4042,17 @@ class PeersFeature(Feature):
                     logger.info(
                         "a2a expiry sweep: expired=%d", len(expired),
                     )
+                # After this tick's expiries, so they never wait on this
+                # tick's late-answer turns or stop for a settlement failure.
+                # (Like an expiry's own wake, a relayed late answer is awaited
+                # inline, so the next tick starts after it.) A row expired
+                # just now was settled inline and is leased to its expiry.
+                try:
+                    await self._settle_expired_questions_with_receivers(store)
+                except Exception as e:
+                    logger.warning(
+                        "a2a receiver settlement pass failed: %s", e,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -3571,49 +4064,29 @@ class PeersFeature(Feature):
                 # then resume the normal cadence.
                 await asyncio.sleep(60)
 
-    async def _handle_expired_row(
-        self, store, row, *, await_delivery: bool = True,
-    ) -> None:
-        """Mark a single WAITING row EXPIRED + fire the synthetic
-        ``state='expired'`` signal. Idempotent: if the row was
-        already terminal (raced the supervisor), drop silently
-        instead of double-firing.
+    async def _handle_expired_row(self, store, row) -> None:
+        """Expire a single past-deadline WAITING row via
+        :meth:`_expire_pending_question`. Idempotent: if the row was
+        already terminal (raced the supervisor), drop silently instead of
+        double-firing.
 
-        ``await_delivery`` selects the #2532 ownership boundary and is passed
-        straight through to :meth:`_fire_question_answered_signal`: the hourly
-        sweep (a feature-owned background loop) waits for terminal delivery
-        inline, while startup replay — which runs on the boot path, where the
-        cognition turn being waited on cannot start until boot finishes —
-        hands the wait to a supervisor that restores the row itself."""
+        Both callers are feature-owned background tasks (the hourly sweep and
+        a boot-replay expiry), so terminal delivery is awaited inline (#2532).
+        A row carrying an already-observed terminal payload is re-fired as
+        captured instead."""
         if getattr(row, "retry_state", None):
-            await self._handle_retry_payload_row(
-                store, row, await_delivery=await_delivery,
-            )
+            await self._handle_retry_payload_row(store, row)
             return
 
-        was_waiting = await store.mark_expired(row.task_id)
-        if not was_waiting:
-            return
-        fired = await self._fire_question_answered_signal(
+        await self._expire_pending_question(
+            store,
             task_id=row.task_id,
             recipient=row.recipient,
+            recipient_agent_id=getattr(row, "recipient_agent_id", None),
             original_question=row.original_question,
             sess_id=row.origin_session_id or "",
-            state="expired",
-            reply_text="",
             causation_chain=None,
-            await_delivery=await_delivery,
         )
-        if not fired:
-            await self._restore_pending_question_waiting(
-                row.task_id,
-                state="expired",
-                reply_text="",
-                recipient=row.recipient,
-                original_question=row.original_question,
-                sess_id=row.origin_session_id or "",
-                causation_chain=None,
-            )
 
     async def _handle_retry_payload_row(
         self, store, row, *, await_delivery: bool = True,
