@@ -7238,6 +7238,8 @@ Expected Duration: {expected_duration}
             try:
                 wake_up_msg = await self.bootstrap_service.generate_wake_up_message()
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.error(f"[BOOTSTRAP] Failed to generate wake-up message: {e}")
                 # Fall through to normal processing rather than getting stuck
                 return None
@@ -7310,6 +7312,8 @@ Expected Duration: {expected_duration}
                         if h.get("role") and h.get("content")
                     ]
                 except Exception as fetch_exc:
+                    if is_execution_control_error(fetch_exc):
+                        raise
                     logging.debug(
                         f"[BOOTSTRAP] Could not fetch prior conversation for "
                         f"discovery context: {fetch_exc}"
@@ -7322,6 +7326,8 @@ Expected Duration: {expected_duration}
                     invocation_context=invocation_context,
                 )
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logging.warning(
                     f"[BOOTSTRAP] Discovery LLM call failed ({exc}); "
                     f"auto-completing bootstrap so the user's message "
@@ -7330,6 +7336,8 @@ Expected Duration: {expected_duration}
                 try:
                     await self.bootstrap_service.skip_discovery()
                 except Exception as skip_exc:
+                    if is_execution_control_error(skip_exc):
+                        raise
                     logging.error(f"[BOOTSTRAP] Failed to auto-complete after discovery error: {skip_exc}")
                 return None
 
@@ -7355,9 +7363,13 @@ Expected Duration: {expected_duration}
                             avatar_result = await visual_identity.generate_avatar(user_input)
                             completion_msg += f"\n\n{avatar_result}"
                         except (ConnectionError, TimeoutError, ValueError, KeyError, AttributeError) as e:
+                            if is_execution_control_error(e):
+                                raise
                             logging.warning(f"Failed to generate avatar: {e}")
                             completion_msg += "\n\n(Avatar generation had an issue - you can try again with !avatar)"
                         except Exception as e:
+                            if is_execution_control_error(e):
+                                raise
                             logging.warning(f"Failed to generate avatar: {e}", exc_info=True)
                             completion_msg += "\n\n(Avatar generation had an issue - you can try again with !avatar)"
 
@@ -7405,10 +7417,14 @@ Expected Duration: {expected_duration}
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                         return f"Avatar generated!\n\n{avatar_result}\n\nI'm ready to help. What would you like to work on?"
                     except (ConnectionError, TimeoutError, ValueError, KeyError, AttributeError) as e:
+                        if is_execution_control_error(e):
+                            raise
                         logging.warning(f"Failed to generate avatar: {e}")
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                         return "Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!"
                     except Exception as e:
+                        if is_execution_control_error(e):
+                            raise
                         logging.warning(f"Failed to generate avatar: {e}", exc_info=True)
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                         return "Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!"

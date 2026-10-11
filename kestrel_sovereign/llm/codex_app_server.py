@@ -340,20 +340,36 @@ class CodexAppServerClient:
         self._require_connection_open()
         if self._initialized:
             return
-        async with self._start_lock:
-            self._require_connection_open()
-            if self._initialized:
-                return
-            previous_token = self._auth_cancellation_token
-            self._auth_cancellation_token = cancellation_token
+        owns_startup = False
+        try:
+            async with self._start_lock:
+                self._require_connection_open()
+                if self._initialized:
+                    return
+                previous_token = self._auth_cancellation_token
+                self._auth_cancellation_token = cancellation_token
+                try:
+                    owns_startup = True
+                    await self._spawn()
+                    self._require_connection_open()
+                    await self._handshake(cancellation_token=cancellation_token)
+                    self._require_connection_open()
+                    self._initialized = True
+                finally:
+                    self._auth_cancellation_token = previous_token
+        except BaseException as startup_error:
+            if not owns_startup:
+                # A cancelled lock waiter never owned this connection birth.
+                # It may not retire another caller's still-live startup.
+                raise
+            # The retained retirement owner acquires the startup lock. Join it
+            # only AFTER releasing that lock, for every failed native birth,
+            # not just version rejection. Cancellation cannot orphan the child.
             try:
-                await self._spawn()
-                self._require_connection_open()
-                await self._handshake(cancellation_token=cancellation_token)
-                self._require_connection_open()
-                self._initialized = True
-            finally:
-                self._auth_cancellation_token = previous_token
+                await self.aclose()
+            except BaseException as retirement_error:
+                raise execution_terminal_error(startup_error, retirement_error)
+            raise
 
     async def _spawn(self) -> None:
         # Isolate ``CODEX_HOME`` to a kestrel-managed directory so codex
@@ -550,11 +566,7 @@ class CodexAppServerClient:
             cancellation_token=cancellation_token,
         )
         ua = (result or {}).get("userAgent", "")
-        try:
-            _validated_codex_version(ua)
-        except CodexAppServerError:
-            await self.aclose()
-            raise
+        _validated_codex_version(ua)
         self.notify("initialized")
         # Match kestrel-claw's auth-bridge.ts: after initialize +
         # initialized notification, explicitly drive
