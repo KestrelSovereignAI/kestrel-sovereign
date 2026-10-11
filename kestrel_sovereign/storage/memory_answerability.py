@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence
 
 from kestrel_sdk.llm.decisions import DecisionError, DecisionRequest, NoulQuestion
 
+from kestrel_sovereign.llm.output_ceiling import response_stop_reason
+
 from .async_conversation_store import _strip_search_wrappers, _tokenize_for_search
 
 if TYPE_CHECKING:
@@ -63,7 +65,68 @@ First identify the exact requested attribute, then include a candidate only if
 it supplies evidence for that same attribute. Shared words such as favorite,
 date, work, name, or place do not make different attributes equivalent."""
 
-_FENCED_JSON = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
+#: The start of the verdict object, whose only field is ``answerable_ids``.
+_VERDICT_OPENING = re.compile(r'\{\s*"answerable_ids"\s*:')
+_CODE_FENCE = "```"
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _verdict_payload(text: str) -> Any:
+    """The JSON verdict a chat judge's reply ends with.
+
+    The judge is asked for the JSON object alone, and usually returns just
+    that. A model that reasons first writes its working and then the object:
+    on ``anthropic:plan`` 14 of 128 live replies were prose ending in
+    ``{"answerable_ids": [...]}``, and parsing the whole reply as JSON failed
+    each of them (#3436). The verdict is the last thing the reply says, so it
+    is the last ``answerable_ids`` object, and it must end the reply (a code
+    fence around it aside). A reply that says anything after that object, or
+    has none, carries no verdict.
+    """
+
+    body = text.strip()
+    if body.endswith(_CODE_FENCE):
+        opening = body.rfind(_CODE_FENCE, 0, len(body) - len(_CODE_FENCE))
+        if opening < 0:
+            raise ValueError("reply ends with an unopened code fence")
+        body = body[opening + len(_CODE_FENCE):-len(_CODE_FENCE)]
+        if body.startswith("json"):
+            body = body[len("json"):]
+        body = body.strip()
+    openings = [match.start() for match in _VERDICT_OPENING.finditer(body)]
+    if not openings:
+        raise ValueError("reply has no answerable_ids object")
+    payload, end = _JSON_DECODER.raw_decode(body, openings[-1])
+    if end != len(body):
+        raise ValueError("reply continues after its answerable_ids object")
+    return payload
+
+
+def _judge_reply(response: Any) -> tuple[Any, str]:
+    """The judge reply's text, and what the route said about the reply.
+
+    The evidence names the reply's length, output tokens, stop reason and
+    route, never its text: the reply can quote private memory, and a failure
+    reason is logged. A route that returned a bare string reports what it
+    cannot know as ``unknown``.
+    """
+
+    if isinstance(response, str):
+        text: Any = response
+    else:
+        content = getattr(response, "content", None)
+        text = "" if content is None else content
+    output_tokens = getattr(response, "output_tokens", None)
+    provider = getattr(response, "provider", None)
+    model = getattr(response, "model", None)
+    route = "/".join(part for part in (provider, model) if isinstance(part, str) and part)
+    evidence = " ".join((
+        f"chars={len(text) if isinstance(text, str) else 'unknown'}",
+        f"output_tokens={output_tokens if isinstance(output_tokens, int) else 'unknown'}",
+        f"stop_reason={response_stop_reason(response) or 'unknown'}",
+        f"route={route or 'unknown'}",
+    ))
+    return text, evidence
 
 
 @dataclass(frozen=True)
@@ -243,6 +306,7 @@ class LLMAnswerabilityGate(AnswerabilityGate):
                     force_local_only=self._force_local_only(),
                     model_override=self.model_override,
                     session_id=session_id,
+                    return_response=True,
                 )
         except (TimeoutError, asyncio.TimeoutError) as exc:
             return self._failed(started, f"timeout: {exc}")
@@ -250,12 +314,15 @@ class LLMAnswerabilityGate(AnswerabilityGate):
             logger.warning("Memory answerability judge failed: %s", exc)
             return self._failed(started, f"judge_error:{type(exc).__name__}")
 
-        text = response if isinstance(response, str) else getattr(response, "content", "")
+        # A rejected reply records what the route returned, so an empty reply
+        # is told apart from text that holds no verdict (#3436).
+        text, evidence = _judge_reply(response)
+        if isinstance(text, str) and not text.strip():
+            return self._rejected_reply(started, f"empty_response: {evidence}")
         try:
-            parsed = self._parse_response(str(text), labels)
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            logger.warning("Memory answerability judge returned invalid JSON: %s", exc)
-            return self._failed(started, "invalid_response")
+            parsed = self._parse_response(text, labels)
+        except (TypeError, ValueError) as exc:
+            return self._rejected_reply(started, f"invalid_response: {exc} ({evidence})")
         latency_ms = (loop.time() - started) * 1000.0
         return AnswerabilityDecision(
             frozenset(labels[label] for label in parsed),
@@ -263,12 +330,15 @@ class LLMAnswerabilityGate(AnswerabilityGate):
             round(latency_ms, 3),
         )
 
+    def _rejected_reply(self, started: float, reason: str) -> AnswerabilityDecision:
+        logger.warning("Memory answerability judge reply rejected: %s", reason)
+        return self._failed(started, reason)
+
     @staticmethod
-    def _parse_response(text: str, labels: Mapping[str, str]) -> list[str]:
-        fenced = _FENCED_JSON.match(text)
-        if fenced:
-            text = fenced.group(1)
-        payload = json.loads(text)
+    def _parse_response(text: Any, labels: Mapping[str, str]) -> list[str]:
+        if not isinstance(text, str):
+            raise TypeError("reply is not text")
+        payload = _verdict_payload(text)
         if not isinstance(payload, dict) or set(payload) != {"answerable_ids"}:
             raise ValueError("expected only the answerable_ids field")
         answerable = payload["answerable_ids"]
@@ -280,7 +350,8 @@ class LLMAnswerabilityGate(AnswerabilityGate):
             raise ValueError("answerable_ids contains duplicates")
         unknown = set(answerable) - set(labels)
         if unknown:
-            raise ValueError(f"unknown candidate labels: {sorted(unknown)}")
+            # Counted, not echoed: the labels are the model's own text.
+            raise ValueError(f"{len(unknown)} unknown candidate label(s)")
         return answerable
 
 

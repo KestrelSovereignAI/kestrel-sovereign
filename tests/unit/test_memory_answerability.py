@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.llm.output_ceiling import attach_stop_reason
 from kestrel_sovereign.storage.memory_answerability import (
     AnswerabilityCandidate,
     AnswerabilityDecision,
@@ -62,7 +64,139 @@ async def test_gate_rejects_unknown_ids_and_fails_closed():
 
     assert decision.completed is False
     assert decision.answerable_ids == set()
-    assert decision.reason == "invalid_response"
+    # A bare-string route cannot say how the reply ended. The label is the
+    # model's own text, so the reason counts it rather than echoing it.
+    assert decision.reason == (
+        "invalid_response: 1 unknown candidate label(s) "
+        "(chars=32 output_tokens=unknown stop_reason=unknown route=unknown)"
+    )
+
+
+# --- #3436: a reasoned reply, and the cause of a rejected one ---------------
+
+#: A live ``anthropic:plan`` (claude-sonnet-5-5) judge reply to the shipped
+#: ``hometown-current`` case, captured for #3436 (125 output tokens,
+#: ``end_turn``). The model reasoned first and ended with the verdict; parsing
+#: the whole reply as JSON failed it with "Expecting value: line 1 column 1".
+_REASONED_REPLY = (
+    "The requested attribute is the user's current residence.\n\n"
+    "- c0 gives where the user grew up, which is a different attribute from "
+    "where they live now.\n"
+    "- c1 says the user moved to Austin three years ago for work. That implies "
+    "they live in Austin now, so it answers the question.\n"
+    "- c2 only comments on Austin traffic and says nothing about where the "
+    "user lives.\n\n"
+    '{"answerable_ids":["c1"]}'
+)
+_HOMETOWN_QUESTION = "Where do I live now?"
+_HOMETOWN = [
+    AnswerabilityCandidate("grew-up", "I grew up in Duluth, Minnesota, by the lake."),
+    AnswerabilityCandidate("moved", "I moved to Austin three years ago for work."),
+    AnswerabilityCandidate("traffic", "Austin traffic is terrible on Fridays."),
+]
+_PLAN_EVIDENCE = "stop_reason=end_turn route=anthropic:plan/claude-sonnet-5-5"
+
+
+def _plan_response(content, *, output_tokens):
+    """What ``generate(return_response=True)`` returns for an ``anthropic:plan``
+    reply: the adapter's stop reason, and the identity the service stamps."""
+    response = attach_stop_reason(
+        LLMResponse(content=content, output_tokens=output_tokens), "end_turn"
+    )
+    response.provider = "anthropic:plan"
+    response.model = "claude-sonnet-5-5"
+    return response
+
+
+async def _judge(reply, *, output_tokens=125):
+    service = MagicMock()
+    service.generate = AsyncMock(
+        return_value=_plan_response(reply, output_tokens=output_tokens)
+    )
+    gate = LLMAnswerabilityGate(service, force_local_only_provider=lambda: False)
+    decision = await gate.filter(_HOMETOWN_QUESTION, _HOMETOWN)
+    return decision, service.generate.await_args.kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply",
+    [
+        _REASONED_REPLY,
+        '{"answerable_ids":["c1"]}',
+        '```json\n{"answerable_ids": ["c1"]}\n```',
+        "c1 says the user moved to Austin.\n\n```json\n"
+        '{\n  "answerable_ids": ["c1"]\n}\n```',
+        # The verdict is the last one the reply gives, not a draft before it.
+        'A first read gives {"answerable_ids":["c0"]}, but c0 is where the '
+        'user grew up.\n\n{"answerable_ids":["c1"]}',
+    ],
+    ids=["captured-reasoned", "bare", "fenced", "reasoned-fenced", "redrafted"],
+)
+async def test_gate_reads_the_verdict_that_ends_the_reply(reply):
+    decision, kwargs = await _judge(reply)
+
+    assert decision.completed is True, decision.reason
+    assert decision.answerable_ids == {"moved"}
+    # The gate asks for the route's response, so a rejection can say how the
+    # reply ended.
+    assert kwargs["return_response"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply", "cause"),
+    [
+        (
+            '{"answerable_ids":["c1"]}\n\nOn reflection c0 may apply too.',
+            "reply continues after its answerable_ids object",
+        ),
+        ("c1 answers it: the user moved to Austin.", "reply has no answerable_ids object"),
+        ('c1 answers it.\n```', "reply ends with an unopened code fence"),
+        (
+            'Reasoning.\n\n{"answerable_ids":["c1"],"confidence":0.9}',
+            "expected only the answerable_ids field",
+        ),
+    ],
+    ids=["text-after-verdict", "no-verdict", "unopened-fence", "extra-field"],
+)
+async def test_reply_without_a_final_verdict_fails_closed_naming_the_cause(reply, cause):
+    decision, _ = await _judge(reply, output_tokens=40)
+
+    assert decision.completed is False
+    assert decision.answerable_ids == set()
+    assert decision.reason == (
+        f"invalid_response: {cause} (chars={len(reply)} output_tokens=40 {_PLAN_EVIDENCE})"
+    )
+    assert "Austin" not in decision.reason  # the reply's text is never logged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [None, "", " \n\n "])
+async def test_empty_reply_fails_closed_with_its_tokens_and_stop_reason(content, caplog):
+    """A reply with no text still fails closed, and says what the route
+    reported: the tokens it billed and why it stopped, not a JSON error."""
+    with caplog.at_level("WARNING", logger="kestrel_sovereign.storage.memory_answerability"):
+        decision, _ = await _judge(content, output_tokens=17)
+
+    expected = (
+        f"empty_response: chars={len(content or '')} output_tokens=17 {_PLAN_EVIDENCE}"
+    )
+    assert decision.completed is False
+    assert decision.answerable_ids == set()
+    assert decision.reason == expected
+    assert expected in caplog.text
+    assert "invalid JSON" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_non_text_reply_fails_closed():
+    decision, _ = await _judge(["c1"], output_tokens=3)
+
+    assert decision.completed is False
+    assert decision.reason == (
+        f"invalid_response: reply is not text (chars=unknown output_tokens=3 {_PLAN_EVIDENCE})"
+    )
 
 
 @pytest.mark.asyncio

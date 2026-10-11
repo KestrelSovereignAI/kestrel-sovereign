@@ -1340,15 +1340,18 @@ class AnthropicAdapter(LLMAdapter):
                     "%s: its arguments are incomplete", cut_block.name, stop_reason,
                 )
 
-            # Parse response
-            content = None
+            # Parse response. The text is every text block in order, joined as
+            # the streaming paths join their text deltas: keeping only the
+            # last block dropped whatever the model wrote before it (found
+            # while diagnosing #3436).
+            text_blocks: List[str] = []
             parsed_tool_calls = None
 
             for block in blocks:
                 if block is cut_block:
                     continue
                 if block.type == "text":
-                    content = block.text
+                    text_blocks.append(block.text)
                 elif block.type == "tool_use":
                     if parsed_tool_calls is None:
                         parsed_tool_calls = []
@@ -1357,6 +1360,7 @@ class AnthropicAdapter(LLMAdapter):
                         name=block.name,
                         arguments=block.input if isinstance(block.input, dict) else {}
                     ))
+            content = "".join(text_blocks) if text_blocks else None
 
             # Extract token usage from response
             input_tokens = None
