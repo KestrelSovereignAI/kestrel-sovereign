@@ -264,14 +264,16 @@ async def _close_aiosqlite_connection(
             retained_closes=retained_closes,
             cancel_close_task_on_timeout=cancel_close_task_on_timeout,
         )
-    except BaseException:
+    except BaseException as error:
         # Repeated cancellation can interrupt either bounded retry. Never let
         # an exit shed ownership of a still-live non-daemon worker.
         if _aiosqlite_worker_is_alive(connection):
             _retain_aiosqlite_close(
                 connection, close_task, retained_closes
             )
-        raise
+        from kestrel_sovereign._async_ownership import owned_task_error
+        close_error = owned_task_error(close_task) if close_task.done() else None
+        raise execution_terminal_error(close_error, error)
 
 
 async def _finish_aiosqlite_connection_close(
@@ -1528,8 +1530,13 @@ class SQLiteBackend(DatabaseBackend):
                     # caller unwinds, the cancellation drain closes that exact
                     # returned statement before permitting another write.
                     cursor = await asyncio.shield(execute_task)
-                except asyncio.CancelledError:
-                    raise
+                except asyncio.CancelledError as error:
+                    # shield synthesizes a cancellation when its child raises
+                    # CancelledError. Recover that child's original receipt;
+                    # neither its cause nor an uncertain commit may disappear.
+                    from kestrel_sovereign._async_ownership import owned_task_error
+                    original = owned_task_error(execute_task) if execute_task.done() else None
+                    raise execution_terminal_error(original, error)
                 except BaseException:
                     self._pending_read_executions.discard(execute_task)
                     raise

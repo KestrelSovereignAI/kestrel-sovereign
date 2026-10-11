@@ -143,6 +143,9 @@ class SovereignSqlaSessionFactory:
         self._engine_dispose_task: asyncio.Task[None] | None = None
         self._engine_dispose_error: BaseException | None = None
         self._engine_dispose_error_reported = False
+        self._driver_close_tasks: set[asyncio.Task[None]] = set()
+        self._driver_close_error: BaseException | None = None
+        self._driver_close_error_reported = False
         self._async_session = async_sessionmaker(
             engine,
             class_=_LifecycleBoundAsyncSession,
@@ -186,8 +189,26 @@ class SovereignSqlaSessionFactory:
         return (
             dispose_pending
             or session_pending
+            or any(not task.done() for task in self._driver_close_tasks)
             or self.sqlite_connection_retirement_pending
         )
+
+    def _capture_driver_close_result(self, task: asyncio.Task[None]) -> None:
+        """Retain native receipts independently of a worker's liveness record."""
+        self._capture_retirement_result("driver", task)
+        self._driver_close_tasks.discard(task)
+
+    def _capture_retirement_result(self, owner: str, task: asyncio.Task[None]) -> None:
+        """A stronger late receipt is unseen even after a weaker publication."""
+        error = owned_task_error(task)
+        if not task.cancelled():
+            task.exception()
+        field = f"_{owner}_close_error" if owner != "engine" else "_engine_dispose_error"
+        previous = getattr(self, field)
+        selected = execution_terminal_error(previous, error)
+        setattr(self, field, selected)
+        if selected is not previous:
+            setattr(self, field + "_reported", False)
 
     def _capture_engine_dispose_result(
         self, task: asyncio.Task[None]
@@ -200,19 +221,13 @@ class SovereignSqlaSessionFactory:
         database lifecycle owner surface a late failure before it permits
         replacement resources.
         """
-        error = owned_task_error(task)
-        if not task.cancelled():
-            task.exception()
-        self._engine_dispose_error = execution_terminal_error(self._engine_dispose_error, error)
+        self._capture_retirement_result("engine", task)
 
     def _capture_session_close_result(
         self, task: asyncio.Task[None]
     ) -> None:
         """Retrieve and retain a late active-session close failure."""
-        error = owned_task_error(task)
-        if not task.cancelled():
-            task.exception()
-        self._session_close_error = execution_terminal_error(self._session_close_error, error)
+        self._capture_retirement_result("session", task)
 
     def finalize_retirement(self) -> None:
         """Validate completion and surface any previously unseen failure."""
@@ -230,6 +245,10 @@ class SovereignSqlaSessionFactory:
             if session_task.done():
                 self._capture_session_close_result(session_task)
 
+        for driver_task in tuple(self._driver_close_tasks):
+            if driver_task.done():
+                self._capture_driver_close_result(driver_task)
+
         errors = (
             (
                 "session",
@@ -243,6 +262,8 @@ class SovereignSqlaSessionFactory:
                 self._engine_dispose_error_reported,
                 "SQLAlchemy engine disposal failed during lifecycle retirement",
             ),
+            ("driver", self._driver_close_error, self._driver_close_error_reported,
+             "SQLAlchemy raw driver close failed during lifecycle retirement"),
         )
         unseen = []
         for owner, error, reported, message in errors:
@@ -250,8 +271,10 @@ class SovereignSqlaSessionFactory:
                 continue
             if owner == "session":
                 self._session_close_error_reported = True
-            else:
+            elif owner == "engine":
                 self._engine_dispose_error_reported = True
+            else:
+                self._driver_close_error_reported = True
             unseen.append(error)
         terminal = execution_terminal_error(*unseen)
         if terminal is not None:
@@ -395,14 +418,15 @@ class SovereignSqlaSessionFactory:
 
         terminal = execution_terminal_error(
             lifecycle_error, cleanup_error,
-            self._session_close_error, self._engine_dispose_error,
+            self._session_close_error, self._engine_dispose_error, self._driver_close_error,
         )
-        if (terminal is not None and is_execution_control_error(terminal)
-                and terminal is not cleanup_error):
+        if terminal is not None and is_execution_control_error(terminal):
             if terminal is self._session_close_error:
                 self._session_close_error_reported = True
             elif terminal is self._engine_dispose_error:
                 self._engine_dispose_error_reported = True
+            elif terminal is self._driver_close_error:
+                self._driver_close_error_reported = True
             raise terminal
 
         if cleanup_error is not None:
@@ -463,6 +487,8 @@ class SovereignSqlaSessionFactory:
                 close_after_dispose(),
                 name=f"sqla-aiosqlite-driver-close:{id(connection)}",
             )
+            self._driver_close_tasks.add(raw_close_task)
+            raw_close_task.add_done_callback(self._capture_driver_close_result)
             _retain_aiosqlite_close(
                 connection,
                 raw_close_task,
@@ -506,15 +532,27 @@ class SovereignSqlaSessionFactory:
                 )
             )
 
-        if not close_tasks:
-            return
-
         failure = None
         for task in close_tasks:
             outcome = await await_owned_task(task)
             failure = execution_terminal_error(
                 failure, outcome.error, outcome.cancellation,
             )
+        # Engine disposal can retire a worker before its independently owned
+        # raw-close task resumes. A dead worker is not that task's terminal
+        # outcome. Join the remaining owners within the SAME close budget.
+        raw_tasks = set(self._driver_close_tasks)
+        if raw_tasks:
+            done, pending = await asyncio.wait(
+                raw_tasks, timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+            )
+            for task in done:
+                self._capture_driver_close_result(task)
+            if pending:
+                failure = execution_terminal_error(failure, ConnectionError(
+                    "SQLAlchemy raw driver close ownership is still pending"
+                ))
+        failure = execution_terminal_error(failure, self._driver_close_error)
         if failure is not None:
             raise failure
 
