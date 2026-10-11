@@ -931,9 +931,10 @@ class Feature(_SdkFeature):
     def _remember_background_control(self, error: BaseException | None) -> None:
         if error is None or not is_execution_control_error(error):
             return
-        failures = vars(self).setdefault("_owned_background_control_failures", [])
-        if all(existing is not error for existing in failures):
-            failures.append(error)
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+        self._owned_background_control = execution_terminal_error(
+            vars(self).get("_owned_background_control"), error,
+        )
 
     def _track_owned_runtime_task(self, coro, *, name: str) -> asyncio.Task:
         """Own an explicit resident service through READY and feature teardown.
@@ -969,9 +970,7 @@ class Feature(_SdkFeature):
         for task in tasks:
             self._remember_background_control(owned_task_error(task))
         self._owned_background_tasks = []
-        terminal = execution_terminal_error(
-            *vars(self).get("_owned_background_control_failures", ()),
-        )
+        terminal = execution_terminal_error(vars(self).get("_owned_background_control"))
         if terminal is not None:
             raise terminal
 

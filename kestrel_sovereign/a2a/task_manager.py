@@ -175,7 +175,7 @@ class TaskManager:
         ] = {}
         # Completed children must not disappear with an unresolved receipt.
         # Retirement joins physical owners but does not reconcile that receipt.
-        self._execution_control_failures: list[BaseException] = []
+        self._execution_control: BaseException | None = None
 
     async def initialize(self) -> None:
         """Initialize all stores."""
@@ -525,10 +525,8 @@ class TaskManager:
         return task
 
     def _remember_execution_control(self, error: BaseException) -> None:
-        if is_execution_control_error(error) and all(
-            existing is not error for existing in self._execution_control_failures
-        ):
-            self._execution_control_failures.append(error)
+        if is_execution_control_error(error):
+            self._execution_control = execution_terminal_error(self._execution_control, error)
 
     async def drain_execution_tasks(self, *, cancel: bool = False) -> None:
         """Wait for tracked background executions, optionally cancelling them."""
@@ -571,7 +569,7 @@ class TaskManager:
                 self._remember_execution_control(result)
         self._execution_tasks.difference_update(tasks)
         terminal = execution_terminal_error(
-            *self._execution_control_failures, *terminal_errors,
+            self._execution_control, *terminal_errors,
         )
         if terminal is not None:
             raise terminal

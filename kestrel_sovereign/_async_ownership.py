@@ -371,7 +371,7 @@ class OwnedAsyncIterator(Generic[_T]):
         raise_owned_outcome(outcome, operation=self._operation)
 
 
-def owned_task_error(task: asyncio.Task[_T]) -> BaseException | None:
+def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
     """Retain the first terminal error across every owner of the same task.
 
     Asyncio consumes a cancelled task's original exception on first retrieval.
@@ -392,7 +392,7 @@ def owned_task_error(task: asyncio.Task[_T]) -> BaseException | None:
 
 
 async def await_owned_task(
-    task: asyncio.Task[_T],
+    task: asyncio.Future[_T],
     pending_cancellation: asyncio.CancelledError | None = None,
 ) -> OwnedTaskOutcome[_T]:
     """Retrieve ``task`` despite repeated cancellation of its caller.
@@ -410,7 +410,7 @@ async def await_owned_task(
 
     completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
-    def mark_complete(_task: asyncio.Task[_T]) -> None:
+    def mark_complete(_task: asyncio.Future[_T]) -> None:
         if not completion.done():
             completion.set_result(None)
 

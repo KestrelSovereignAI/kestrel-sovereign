@@ -8434,14 +8434,12 @@ Expected Duration: {expected_duration}
         """Retain original terminal evidence until its lifetime is reconciled."""
         if error is None or not is_execution_control_error(error):
             return
-        failures = vars(self).setdefault("_shutdown_control_failures", [])
-        if all(existing is not error for existing in failures):
-            failures.append(error)
+        self._shutdown_control = execution_terminal_error(
+            vars(self).get("_shutdown_control"), error,
+        )
 
     def _raise_shutdown_control(self) -> None:
-        terminal = execution_terminal_error(
-            *vars(self).get("_shutdown_control_failures", ()),
-        )
+        terminal = execution_terminal_error(vars(self).get("_shutdown_control"))
         if terminal is not None:
             raise terminal
 

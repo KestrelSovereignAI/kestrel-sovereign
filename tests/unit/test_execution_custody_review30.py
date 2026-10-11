@@ -304,19 +304,21 @@ async def test_close_joins_timed_out_native_resource_before_later_owners(
     resource = Resource()
     service.providers = [{stage: resource}, {"client": SimpleNamespace(close=later)}]
     native_close_entered = asyncio.Event()
-    original_wait_for = asyncio.wait_for
+    original_wait = asyncio.wait
 
-    async def wait_after_native_setup(awaitable, timeout):
+    async def wait_after_native_setup(awaitable, *, timeout):
         # This regression concerns the resource's cancellation receipt after
         # a real write, not how quickly a SQLite worker can finish that write.
         # Keep the actual timeout owner, but arm its short test deadline only
         # after the intended resource boundary has positively been entered.
-        if timeout == 0.01:
-            await original_wait_for(native_close_entered.wait(), timeout=5)
-        return await original_wait_for(awaitable, timeout=timeout)
+        if timeout == 0.01 and any(
+            task.get_name() == f"llm-close:{stage}" for task in awaitable
+        ):
+            await asyncio.wait_for(native_close_entered.wait(), timeout=5)
+        return await original_wait(awaitable, timeout=timeout)
 
     monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 0.01)
-    monkeypatch.setattr(asyncio, "wait_for", wait_after_native_setup)
+    monkeypatch.setattr(asyncio, "wait", wait_after_native_setup)
     try:
         with pytest.raises(BaseException) as caught:
             await service.close()

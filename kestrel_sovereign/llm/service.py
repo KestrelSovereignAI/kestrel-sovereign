@@ -115,19 +115,9 @@ class AuditResult(BaseModel):
 
 
 async def _wait_for_close_result(result: Any) -> None:
-    """Own async cleanup through timeout/cancellation before classifying it."""
+    """Run cleanup in its service-owned task, without an unowned nested task."""
     if inspect.isawaitable(result):
-        task = asyncio.ensure_future(result)
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=CLIENT_CLOSE_TIMEOUT)
-        except BaseException as interruption:
-            if not task.done():
-                task.cancel()
-            outcome = await await_owned_task(
-                task,
-                interruption if isinstance(interruption, asyncio.CancelledError) else None,
-            )
-            raise execution_terminal_error(outcome.error, outcome.cancellation, interruption)
+        await result
 
 
 def _redacted_content_marker(text: Any) -> str:
@@ -5137,21 +5127,66 @@ No other text or formatting.
     # get_streaming_response is provided by StreamingMixin
 
     async def close(self):
-        """Join every writer and resource before reporting retained control."""
-        terminal = None
+        """Bound joins, retain unfinished owners, and attempt independent cleanup.
 
-        async def retire(label, operation):
-            nonlocal terminal
-            # Own the entire operation: cancellation of this closer cannot skip
-            # a sibling resource or consume the child's original CancelledError.
-            task = asyncio.create_task(operation(), name=f"llm-close:{label}")
-            outcome = await await_owned_task(task)
-            error = outcome.error
+        A late owner is joined by the next close, never replaced. Completion
+        harvests canonical control before releasing its task graph. Pending
+        cleanup is explicit debt, not a successful resource release. Caller
+        cancellation hands off remaining independent steps without spending
+        another full timeout per resource. Usage storage waits for its writers.
+        """
+        tasks = vars(self).setdefault("_llm_close_tasks", {})
+        terminal = vars(self).get("_llm_close_control")
+        interrupted = False
+
+        def completed(key, task):
+            error = owned_task_error(task)
+            if error is not None and is_execution_control_error(error):
+                self._llm_close_control = execution_terminal_error(
+                    vars(self).get("_llm_close_control"), error,
+                )
+            if tasks.get(key) is task:
+                # Preserve a settled disposition, not a completed task/traceback
+                # list. Ordinary failure may retry; unknown native effects may not.
+                if error is None or is_execution_control_error(error):
+                    tasks[key] = None
+                else:
+                    tasks.pop(key)
+
+        async def retire(label, operation, *, resource=None):
+            nonlocal terminal, interrupted
+            key = (label, id(resource)) if resource is not None else label
+            if key in tasks and tasks[key] is None:
+                return
+            task = tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(operation(), name=f"llm-close:{label}")
+                tasks[key] = task
+                task.add_done_callback(lambda done: completed(key, done))
+            try:
+                await asyncio.wait({task}, timeout=0 if interrupted else CLIENT_CLOSE_TIMEOUT)
+            except asyncio.CancelledError as cancellation:
+                terminal = execution_terminal_error(terminal, cancellation)
+                interrupted = True
+            if not task.done() and not interrupted:
+                # Send cancellation only once. A retry joins the SAME pending
+                # operation and cannot interrupt a native commit a second time.
+                if not getattr(task, "_kestrel_llm_close_cancel_sent", False):
+                    task._kestrel_llm_close_cancel_sent = True
+                    task.cancel()
+                try:
+                    await asyncio.wait({task}, timeout=0.1)
+                except asyncio.CancelledError as cancellation:
+                    terminal = execution_terminal_error(terminal, cancellation)
+                    interrupted = True
+            if not task.done():
+                return
+            completed(key, task)
+            error = owned_task_error(task)
             if error is not None and is_execution_control_error(error):
                 terminal = execution_terminal_error(terminal, error)
-            elif error is not None:
+            elif error is not None and not isinstance(error, asyncio.CancelledError):
                 logger.warning("LLM shutdown %s failed (%s)", label, type(error).__name__)
-            terminal = execution_terminal_error(terminal, outcome.cancellation)
 
         await retire("preference-writers", self.drain_preference_persistence)
         await retire("modality-writers", self.drain_modality_records)
@@ -5160,7 +5195,7 @@ No other text or formatting.
             if adapter is not None and hasattr(adapter, "aclose"):
                 async def close_adapter(adapter=adapter):
                     await _wait_for_close_result(adapter.aclose())
-                await retire("adapter", close_adapter)
+                await retire("adapter", close_adapter, resource=adapter)
 
             client = provider.get("client")
             if client is None:
@@ -5170,7 +5205,7 @@ No other text or formatting.
                     await _wait_for_close_result(client.close())
                 elif hasattr(client, "_client") and hasattr(client._client, "aclose"):
                     await _wait_for_close_result(client._client.aclose())
-            await retire("client", close_client)
+            await retire("client", close_client, resource=client)
 
         async def close_remote_route():
             # Latch closed before renewal can reactivate it. Provider capacity
@@ -5183,9 +5218,22 @@ No other text or formatting.
                 )
 
         await retire("remote-route", close_remote_route)
-        await retire("usage-database", self.close_usage_db)
+
+        async def close_usage_after_writers():
+            for key in ("preference-writers", "modality-writers"):
+                writer = tasks.get(key)
+                if writer is not None:
+                    # Its receipt is harvested separately; physical settlement
+                    # must precede closing the writer's database connection.
+                    await await_owned_task(writer)
+            await self.close_usage_db()
+
+        await retire("usage-database", close_usage_after_writers)
+        terminal = execution_terminal_error(terminal, vars(self).get("_llm_close_control"))
         if terminal is not None:
             raise terminal
+        if any(task is not None and not task.done() for task in tasks.values()):
+            raise RuntimeError("LLM shutdown incomplete: retained cleanup owners remain pending")
 
     # Remote GPU Backend Methods are provided by RemoteBackendMixin
 

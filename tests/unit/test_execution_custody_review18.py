@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, is_execution_control_error
 from kestrel_sovereign.features.isolated_runtime import ProxyFeature, _HostIngressRequest
 from tests.unit.test_execution_custody import Authority
@@ -90,9 +91,18 @@ async def test_queued_ingress_completion_cannot_ignore_predecessor_control(contr
     second = next(task for task in proxy._event_ack_tasks if task is not first)
     release.set()
     try:
-        with pytest.raises(BaseException) as caught:
-            await second
-        assert is_execution_control_error(caught.value)
+        # The completion callback is the first receipt owner. A later raw
+        # await of a cancelled Task discards its original cancellation cause;
+        # every subsequent owner must use the same canonical receipt cache.
+        outcome = await await_owned_task(second)
+        assert outcome.error is error
+        assert is_execution_control_error(outcome.error)
+        assert (await await_owned_task(first)).error is error
+        assert (await await_owned_task(second)).error is error
+        assert proxy._event_ingress_control is error
+        assert not proxy._event_ack_tasks
+        assert not proxy._event_ack_clients
         assert len(calls) == 1
     finally:
-        await asyncio.gather(first, second, return_exceptions=True)
+        await await_owned_task(first)
+        await await_owned_task(second)

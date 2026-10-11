@@ -348,12 +348,26 @@ proxy retirement and denies later ingress/completion; successful provider RPCs
 recheck the original admission before publishing their result. Terminal joins
 harvest completed owners independently of callback scheduling. Ordinary live
 provider failures retain their existing bounded retry behavior.
+Late facade operations, including health/lifecycle and ACKs beyond their
+cancellation grace, harvest the same first canonical receipt before removing
+their retained owner. Same-loop Future/Task receipts remain exact; foreign
+owner loops consume private source outcomes locally and export only a newly
+constructed fixed authority/commit category, never the private exception graph.
+Agent, Feature and A2A background owners retain one strongest control receipt
+(unknown commit before committed before authority, first identity at equal
+strength), not an append-only traceback list. Completed task graphs are released.
 Model/embedding preference callbacks do not swallow native
 control, and their completed-task drainer retains one strongest original task
 receipt. Late unbound modality accounting keeps its existing two-second caller
 deadline, but a native COMMIT/ACK failure afterward survives task removal and
-is reported by drain/close. LLM close joins every writer, adapter, client,
-remote-route and usage-database owner before propagating strongest control;
+is reported by drain/close. LLM close bounds each join and its cancellation
+grace (100ms), retains the exact unfinished operation for later close, and
+attempts independent resources before propagating strongest control. Caller
+cancellation hands remaining resources to these same service-owned tasks,
+without another full wait per resource. Pending cleanup raises explicit debt;
+usage storage waits for physical writer settlement and never closes underneath
+a retained writer. Late completions harvest one strongest receipt, and retries
+join the same operation rather than duplicate an uncertain native effect;
 closing physical resources never certifies reconciliation of an uncertain write.
 Deferred OpenRouter provisioning validates the original admission after client
 acquisition and immediately before each POST, including retries after backoff.

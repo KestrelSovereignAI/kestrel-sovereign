@@ -67,10 +67,17 @@ from kestrel_sdk.isolated_feature import (
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
 
 from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
-from kestrel_sovereign._async_ownership import owned_task_error
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    owned_task_error,
+    raise_owned_outcome,
+)
 from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    ExecutionCommitOutcomeError,
     bind_execution_custody_snapshot,
     current_execution_custody,
+    execution_commit_outcome,
     execution_terminal_error,
     is_execution_control_error,
     require_execution_work,
@@ -825,6 +832,7 @@ class _HostOwnedFacadeOperation:
         # resulting neutral classification, never the facade value, exception,
         # or traceback, so host lifecycle ownership can distinguish success.
         self._foreign_settlement_disposition: str | None = None
+        self._foreign_control_receipt: BaseException | None = None
         self._settlement_notified = False
         # ``done()`` for a foreign source means its owner loop has safely
         # consumed the private result.  It does *not* mean the host lifecycle
@@ -852,7 +860,9 @@ class _HostOwnedFacadeOperation:
         self._host_task.add_done_callback(self._notify_settled)
 
     async def _observe_source(self, source: asyncio.Future[Any]) -> Any:
-        return await asyncio.shield(source)
+        return raise_owned_outcome(
+            await await_owned_task(source), operation="isolated facade source",
+        )
 
     @property
     def foreign_loop(self) -> bool:
@@ -896,7 +906,17 @@ class _HostOwnedFacadeOperation:
         target = self._source if self._source is not None else self._host_task
         if target is None:
             raise RuntimeError("host-owned facade operation lost its completion target")
+        if not target.done():
+            return target.result()
+        error = owned_task_error(target)
+        if error is not None:
+            raise error
         return target.result()
+
+    @property
+    def foreign_control_receipt(self) -> BaseException | None:
+        """Owner-loop classified control without foreign value/traceback custody."""
+        return self._foreign_control_receipt
 
     async def wait(self) -> Any:
         return await self.shield()
@@ -1045,10 +1065,12 @@ class _HostOwnedFacadeOperation:
             return
         try:
             source.result()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             disposition = "cancelled"
-        except BaseException:  # noqa: BLE001 - foreign outcomes stay private
+            self._classify_foreign_control(error)
+        except BaseException as error:  # noqa: BLE001 - foreign outcomes stay private
             disposition = "failed"
+            self._classify_foreign_control(error)
         else:
             disposition = "succeeded"
         self._foreign_settlement_disposition = disposition
@@ -1070,6 +1092,18 @@ class _HostOwnedFacadeOperation:
             # Host shutdown cannot turn owner-loop acknowledgement into a
             # retry, but it must not undo this terminal acknowledgement.
             pass
+
+    def _classify_foreign_control(self, error: BaseException) -> None:
+        # Only fixed canonical categories cross loops. Never retain the
+        # source exception, its args/cause/context, value or traceback.
+        if not is_execution_control_error(error):
+            return
+        outcome = execution_commit_outcome(error)
+        self._foreign_control_receipt = (
+            ExecutionCommitOutcomeError(outcome)
+            if outcome is not None
+            else ExecutionAuthorityError("foreign facade execution authority denied")
+        )
 
     def _install_source_settlement_observer(self) -> None:
         source = self._source
@@ -1115,8 +1149,8 @@ class _HostOwnedFacadeOperation:
 
 def _consume_late_lifecycle_task_outcome(
     operation: asyncio.Future[Any] | _HostOwnedFacadeOperation,
-) -> None:
-    """Consume a fenced operation's eventual result without retaining failure."""
+) -> BaseException | None:
+    """Consume once; export only canonical control to the owning host."""
 
     # Cross-loop results are normally retrieved by ``observed`` in their
     # source loop.  The only exception is an already-terminal source at
@@ -1124,11 +1158,15 @@ def _consume_late_lifecycle_task_outcome(
     # stopped owner loop cannot strand it.  Do not retrieve a later foreign
     # result here: that would retain secret-bearing errors on host traceback.
     if isinstance(operation, _HostOwnedFacadeOperation) and operation.foreign_loop:
-        return
+        return operation.foreign_control_receipt
+    if isinstance(operation, asyncio.Future):
+        error = owned_task_error(operation)
+        return error if error is not None and is_execution_control_error(error) else None
     try:
         operation.result()
-    except BaseException:  # noqa: BLE001 - terminal facade outcomes stay private
-        pass
+    except BaseException as error:  # noqa: BLE001 - ordinary facade outcomes stay private
+        return error if is_execution_control_error(error) else None
+    return None
 
 
 def _facade_settlement_event(operation: _HostOwnedFacadeOperation) -> asyncio.Event:
@@ -8169,7 +8207,7 @@ class ProxyFeature(Feature):
             self._terminal_traffic_drain_task = task
 
             def release(completed_task: asyncio.Task[None]) -> None:
-                _consume_late_lifecycle_task_outcome(completed_task)
+                self._retain_event_ingress_task_control(completed_task)
                 if self._terminal_traffic_drain_task is completed_task:
                     self._terminal_traffic_drain_task = None
 
@@ -8583,7 +8621,7 @@ class ProxyFeature(Feature):
         self._terminal_lifecycle_tasks.append(ownership)
 
         def release(completed_task: _HostOwnedFacadeOperation) -> None:
-            _consume_late_lifecycle_task_outcome(completed_task)
+            self._retain_event_ingress_task_control(completed_task)
             self._terminal_lifecycle_tasks = [
                 candidate
                 for candidate in self._terminal_lifecycle_tasks
@@ -8602,7 +8640,7 @@ class ProxyFeature(Feature):
         """
 
         if task.done():
-            _consume_late_lifecycle_task_outcome(task)
+            self._retain_event_ingress_task_control(task)
             return
         if self._terminal_health_probe_task is task:
             return
@@ -8611,7 +8649,7 @@ class ProxyFeature(Feature):
         self._terminal_health_probe_task = task
 
         def release(completed_task: _HostOwnedFacadeOperation) -> None:
-            _consume_late_lifecycle_task_outcome(completed_task)
+            self._retain_event_ingress_task_control(completed_task)
             if self._terminal_health_probe_task is completed_task:
                 self._terminal_health_probe_task = None
 
@@ -8632,7 +8670,7 @@ class ProxyFeature(Feature):
             return False
         if not task.done():
             return True
-        _consume_late_lifecycle_task_outcome(task)
+        self._retain_event_ingress_task_control(task)
         if self._terminal_health_probe_task is task:
             self._terminal_health_probe_task = None
         return False
@@ -8682,13 +8720,15 @@ class ProxyFeature(Feature):
                 # facade may then publish an ordinary terminal failure instead
                 # of CancelledError.  It is not cancellation of this cleanup
                 # owner; consume it and continue with client retirement.
-                _consume_late_lifecycle_task_outcome(task)
+                self._retain_event_ingress_task_control(task)
                 break
 
         self._has_running_terminal_health_probe_task()
         return True
 
-    def _retain_event_ingress_task_control(self, task: asyncio.Task[Any]) -> None:
+    def _retain_event_ingress_task_control(
+        self, task: asyncio.Future[Any] | _HostOwnedFacadeOperation,
+    ) -> None:
         """Harvest every ingress owner before removal, retaining one receipt.
 
         Routing, deferred routing, legacy queues and ACK/NACK completion are
@@ -8699,7 +8739,10 @@ class ProxyFeature(Feature):
         """
         if not task.done():
             return
-        error = owned_task_error(task)
+        self._retain_execution_control(_consume_late_lifecycle_task_outcome(task))
+
+    def _retain_execution_control(self, error: BaseException | None) -> None:
+        """One strongest receipt across all ordinary and facade work owners."""
         if error is not None and is_execution_control_error(error):
             self._event_ingress_control = execution_terminal_error(
                 vars(self).get("_event_ingress_control"), error,
@@ -8783,7 +8826,7 @@ class ProxyFeature(Feature):
                         running = True
                     retained_tasks.append(ownership)
                     continue
-                _consume_late_lifecycle_task_outcome(task)
+                self._retain_event_ingress_task_control(task)
                 continue
             marked_client = (
                 ownership.client_ref() if ownership.client_ref is not None else None
@@ -8856,7 +8899,8 @@ class ProxyFeature(Feature):
                         self.name,
                     )
                     return False
-                except BaseException:  # noqa: BLE001 - hostile stop can raise non-Exception
+                except BaseException as error:  # noqa: BLE001 - hostile stop can raise non-Exception
+                    self._retain_execution_control(error)
                     self._terminal_cleanup_uncertain = True
                     logger.error(
                         "Isolated feature %s could not stop its terminal client; "
@@ -9117,7 +9161,8 @@ class ProxyFeature(Feature):
             await self._terminal_cleanup_attempt(
                 lifecycle_lock_held=lifecycle_lock_held,
             )
-        except BaseException:  # noqa: BLE001 - shared task must not retain facade failures
+        except BaseException as error:  # noqa: BLE001 - ordinary facade failures stay private
+            self._retain_execution_control(error)
             # If unpublication itself failed, the sealed public slot is still
             # the only exact retry handle.  Retaining by identity is harmless
             # when a prior phase already unpublished it.
@@ -15430,11 +15475,11 @@ class ProxyFeature(Feature):
                 return False, None
             except BaseException as error:  # noqa: BLE001 - failed ACK remains retryable
                 error = original_terminal_error(error)
-                _consume_late_lifecycle_task_outcome(operation)
+                self._retain_event_ingress_task_control(operation)
                 if is_execution_control_error(error):
                     raise error
                 return True, None
-            _consume_late_lifecycle_task_outcome(operation)
+            self._retain_event_ingress_task_control(operation)
             return True, None
         except asyncio.CancelledError as error:
             error = original_terminal_error(error)
@@ -15443,7 +15488,7 @@ class ProxyFeature(Feature):
                 self._retain_terminal_lifecycle_task(operation, source_client)
             raise error
         except BaseException as error:  # noqa: BLE001 - producer retries unchanged cursor
-            _consume_late_lifecycle_task_outcome(operation)
+            self._retain_event_ingress_task_control(operation)
             if is_execution_control_error(error):
                 raise
             return True, None
