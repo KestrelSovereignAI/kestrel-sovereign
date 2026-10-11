@@ -298,7 +298,7 @@ apply these material transformations:
 | Native OpenAI | Sends OpenAI message/tool forms and may supply a stable `prompt_cache_key`. Compatible OpenAI-shaped routes are not assumed to support native-only cache or message features. |
 | Gemini / Vertex | Converts messages to native role/parts structures. A system instruction may be represented as an initial user turn plus a model acknowledgement where required by the transport. |
 | Ollama | Sends Ollama chat messages and separate image fields. `num_ctx` is a route option and can cap the usable window independently of a model-family headline limit. |
-| `openai:plan` Codex | The leading system message becomes thread instructions. An existing Codex thread receives only the latest user input because Codex retains prior turns server-side; a fresh thread is seeded from Kestrel's selected transcript. Changes to thread-scoped model/instruction/tool settings invalidate the cached thread. |
+| `openai:plan` Codex | The leading system message becomes thread instructions. An existing Codex thread receives only the latest user input because Codex retains prior turns server-side; a fresh thread is seeded from Kestrel's selected transcript. Changes to thread-scoped model/instruction/tool settings invalidate the cached thread. So does a turn Kestrel abandons before Codex ends it (an idle or inactivity timeout, a Stop), because Codex may still be running that turn on the thread. |
 
 For `openai:plan`, the per-turn Kestrel projection and Codex's server-side
 thread occupancy are different measurements. Codex token-usage notifications

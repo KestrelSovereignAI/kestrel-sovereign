@@ -2853,6 +2853,10 @@ class CodexAdapter(LLMAdapter):
 
         sink = app.open_turn_sink(thread_id)
         temp_image_paths: List[Path] = []
+        # Whether the app-server ended the turn (``turn/completed``). Until it
+        # does, a caller that abandons the turn leaves it running on the
+        # thread (see below).
+        turn_ended = False
         try:
             # dynamicTools are registered at thread/start; turn/start carries
             # the user input plus per-turn overrides that mirror what
@@ -3199,6 +3203,7 @@ class CodexAdapter(LLMAdapter):
                     # rather than letting the loop fall through to the
                     # final yield with empty content. Same honesty
                     # rationale as the ``error`` branch.
+                    turn_ended = True
                     turn_info = p.get("turn") or {}
                     turn_status = turn_info.get("status")
                     if turn_status == "failed":
@@ -3253,6 +3258,17 @@ class CodexAdapter(LLMAdapter):
             # empty-string session_ids never write to ``_session_threads``,
             # so resetting them is a no-op but also signals intent.
             if session_id and poisoned_turn:
+                self.reset_thread(session_id)
+            raise
+        except (asyncio.CancelledError, GeneratorExit):
+            # The caller abandoned the turn before the app-server ended it:
+            # the orchestrator's inactivity watchdog (#3552, which fires
+            # before the transport's own idle timeout) or a Stop cancelled
+            # it, or the consumer stopped reading. The remote turn may still
+            # be running, so the thread is poisoned exactly as by an idle
+            # timeout. Invalidate it the same way, before ``finally``
+            # releases the thread lock to a queued same-session call.
+            if session_id and not turn_ended:
                 self.reset_thread(session_id)
             raise
         finally:
