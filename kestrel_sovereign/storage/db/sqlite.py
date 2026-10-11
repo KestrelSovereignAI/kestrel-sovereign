@@ -296,7 +296,7 @@ async def _close_aiosqlite_connection(
     except BaseException as error:
         # Repeated cancellation can interrupt either bounded retry. Never let
         # an exit shed ownership of a still-live non-daemon worker.
-        if _aiosqlite_worker_is_alive(connection):
+        if _aiosqlite_worker_is_alive(connection) or not close_task.done():
             _retain_aiosqlite_close(
                 connection, close_task, retained_closes
             )
@@ -340,7 +340,7 @@ async def _finish_aiosqlite_connection_close(
         try:
             await connection.interrupt()
         except ValueError as exc:
-            if "no active connection" not in str(exc):
+            if is_execution_control_error(exc) or "no active connection" not in str(exc):
                 interrupt_error = exc
         except Exception as exc:
             interrupt_error = exc

@@ -254,6 +254,14 @@ source, after POST/correlation insert under live caller admission; subscriptions
 still verify the persisted outbound route and current peer scope. Ordinary
 children receive no such handoff. Feature disable and boot
 rollback still cancel/join exactly the feature's owned tasks.
+The A2A expiry/receiver-settlement integration starts exactly one hourly
+backstop, alongside the feature-owned boot settlement and lease-delay recovery.
+Claim checks, renewals, confirmations, receiver reads and every replay/sweep
+retry boundary propagate original control receipts, not retryable non-delivery.
+Lease-renewing delivery waits and bounded receiver settlement physically join
+their original native child on cancellation/deadline; a late commit receipt
+wins over that interruption. Delivered-wake retirement and cancellation restore
+likewise join their original row-write owner before releasing the producer.
 SDK event-reader callbacks are explicit new inbound events, not continuations
 of the completed boot claim. The registered exact-client handoff joins its
 callback under the same original runtime; owned routing waits for READY. It
@@ -591,6 +599,17 @@ select the original strongest body/child receipt only after physical joins.
 Completed health writes retain control evidence before pending-owner removal,
 and repeated feature shutdown reports that same receipt. Delivery queue tools
 preserve native database control instead of converting it into a failed result.
+
+SQLite retirement retains the original unfinished close task even after its
+native worker has exited. Repeated caller cancellation cannot shed that later
+receipt, and a benign interrupt message cannot override an explicit control
+cause. Generation/tool-loop errors and anti-repeat checkpoint errors are
+selected together: a weaker checkpoint failure never replaces an original
+unknown/committed result. Operator audit and fallback-conversation writers
+propagate native control instead of requeueing an uncertain persisted notice.
+Shared embedding discovery uses one physically joined owned task, so every
+coalesced reader retrieves the same original receipt, including cancellation
+carriers whose cause would otherwise be consumed by the first reader.
 
 See the [canonical storage contract](../architecture/storage/STORAGE_ARCHITECTURE.md#hosted-execution-custody)
 for installation and limitations. Full independent review, repository/CI gates,

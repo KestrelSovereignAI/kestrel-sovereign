@@ -15,15 +15,15 @@ from kestrel_sovereign.execution_custody import (
     is_execution_control_error,
 )
 from kestrel_sovereign.features.base import Feature
-from kestrel_sovereign.features.peers.feature import PeersFeature
+from kestrel_sovereign.features.peers.feature import PeersFeature, _QuestionClaim
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.signals import (
     OrderedLockManager,
     SignalDispatcher,
     SignalLogStore,
     SourceRegistry,
+    delivery,
 )
-from kestrel_sovereign.signals import delivery
 from kestrel_sovereign.signals.sources.a2a_question_answered import (
     build_a2a_question_answered_registration,
 )
@@ -184,7 +184,9 @@ async def test_actual_peer_delivery_does_not_restore_native_effect_as_waiting(
         origin_session_id="session",
         deadline=datetime.now(timezone.utc) + timedelta(hours=1),
     )
-    assert await store.mark_resolved("question")
+    assert await store.mark_resolved(
+        "question", state="completed", reply_text="reply", claim="original-claim",
+    )
     logs = SignalLogStore(db.backend)
     await logs.initialize()
     registry = SourceRegistry()
@@ -204,6 +206,7 @@ async def test_actual_peer_delivery_does_not_restore_native_effect_as_waiting(
         state="completed",
         reply_text="reply",
         causation_chain=None,
+        claim=_QuestionClaim(store, "original-claim"),
     )
     try:
         if inline:

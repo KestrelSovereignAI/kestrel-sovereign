@@ -6,24 +6,25 @@ Enriches results with manual overrides from model_catalog.toml.
 Provides in-memory caching and disk-based cache for fast startup.
 """
 import asyncio
+import dataclasses
+import logging
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+from kestrel_sdk.llm import ModelInfo as SDKModelInfo
+
 from kestrel_sovereign.execution_custody import (
-    owned_native_http_client,
     await_execution_work,
     await_execution_work_group,
     execution_work_operation,
     is_execution_control_error,
+    owned_native_http_client,
     require_execution_work,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
-import dataclasses
-import logging
-from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 
-from kestrel_sdk.llm import ModelInfo as SDKModelInfo
-
-from .model_metadata import ModelInfo, ModelCategory
-from .model_catalog import get_catalog_service
 from .model_cache import get_shared_model_cache
+from .model_catalog import get_catalog_service
+from .model_metadata import ModelCategory, ModelInfo
 
 if TYPE_CHECKING:
     from .embedding_discovery import EmbeddingModelInfo
@@ -535,13 +536,22 @@ class ModelDiscoveryMixin:
         its own.
         """
         inflight = getattr(self, "_embedding_discovery_inflight", None)
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task,
+            create_owned_task,
+            raise_owned_outcome,
+        )
         if inflight is not None and not inflight.done():
-            return await inflight
+            return raise_owned_outcome(
+                await await_owned_task(inflight), operation="shared embedding discovery"
+            )
 
-        task = asyncio.ensure_future(self._discover_embedding_models_uncached())
+        task = create_owned_task(self._discover_embedding_models_uncached())
         self._embedding_discovery_inflight = task
         try:
-            models = await task
+            models = raise_owned_outcome(
+                await await_owned_task(task), operation="shared embedding discovery"
+            )
         finally:
             if getattr(self, "_embedding_discovery_inflight", None) is task:
                 self._embedding_discovery_inflight = None
@@ -1468,7 +1478,6 @@ class ModelDiscoveryMixin:
         on a worker thread when a loop is already running. No-op if catalogs
         were already built by the async discovery phase.
         """
-        import asyncio
 
         require_execution_work(self)
         if getattr(self, "_route_catalogs", None) is not None:

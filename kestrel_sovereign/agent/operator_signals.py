@@ -32,17 +32,21 @@ operator notice is not a signal and does not belong in ``signal_log``.
 from __future__ import annotations
 
 import asyncio
-from kestrel_sovereign.execution_custody import close_execution_stream, is_execution_control_error, owned_execution_stream
 import logging
 import uuid
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
+from kestrel_sovereign.execution_custody import (
+    close_execution_stream,
+    is_execution_control_error,
+    owned_execution_stream,
+)
 from kestrel_sovereign.storage.operator_notice_store import (
+    TERMINAL_STATES,
     OperatorNoticeAuditStore,
     OperatorNoticeState,
-    TERMINAL_STATES,
 )
 
 logger = logging.getLogger(__name__)
@@ -390,6 +394,9 @@ class OperatorNoticeLifecycle:
         try:
             await awaitable
         except Exception as exc:  # noqa: BLE001
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "Operator notice audit %s write failed for %s: %s",
                 phase,
@@ -658,6 +665,9 @@ async def inject_operator_turn(
                 rendered_content=batch.content,
             )
         except Exception as exc:  # noqa: BLE001
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "Failed to persist operator signal turn; continuing with "
                 "in-flight delivery only: %s",

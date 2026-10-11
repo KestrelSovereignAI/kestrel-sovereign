@@ -32,16 +32,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import httpx
-
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    create_owned_task,
+    owned_task_error,
+    raise_owned_outcome,
+)
 from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
-from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
     execution_work_operation,
     is_execution_control_error,
     owned_execution_stream,
 )
+from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.peers.directory import (
     LocalHostPeerDirectory,
     PeerAccessDeniedError,
@@ -182,7 +189,8 @@ class _ClaimLeaseRenewingHandle:
     async def wait(self) -> Any:
         import asyncio
 
-        waiter = asyncio.ensure_future(self._handle.wait())
+        waiter = create_owned_task(self._handle.wait())
+        primary = None
         try:
             renewing = await self._renew()
             while renewing:
@@ -190,13 +198,31 @@ class _ClaimLeaseRenewingHandle:
                 if done:
                     break
                 renewing = await self._renew()
-            return await waiter
-        finally:
-            # Undone only when this wait is abandoned (its waiter cancelled):
-            # cancelling the inner wait then cancels the dispatch it awaits,
-            # as abandoning a direct await of it would.
+        except BaseException as error:
+            primary = error
+        if primary is not None:
+            # An abandoned wait interrupts its original dispatch, but owns
+            # physical retirement and any stronger native receipt it returns.
             if not waiter.done():
                 waiter.cancel()
+        outcome = await await_owned_task(
+            waiter, cancel_on_caller_cancellation=primary is None,
+        )
+        # The SDK facade may await an already-cancelled dispatch whose first
+        # original carrier was consumed by its owning completion callback.
+        # Lease renewal must not hide that exact dispatch behind a new facade.
+        from kestrel_sdk.signals import SignalHandle
+        dispatch = self._handle.task if isinstance(self._handle, SignalHandle) else None
+        dispatch_error = (
+            owned_task_error(dispatch)
+            if isinstance(dispatch, asyncio.Task) and dispatch.done() else None
+        )
+        terminal = execution_terminal_error(
+            dispatch_error, primary, outcome.error, outcome.cancellation,
+        )
+        if terminal is not None:
+            raise terminal
+        return outcome.result
 
 
 class OutboundSigningError(RuntimeError):
@@ -448,11 +474,11 @@ class PeersFeature(Feature):
         # Without this, the sender has no introspection surface for
         # "what did I dispatch and to whom?" beyond per-task_id round
         # trips.
-        from kestrel_sovereign.features.storage_access import (
-            resolve_feature_database,
-        )
         from kestrel_sovereign.a2a.outbound_store import (
             ensure_a2a_outbound_tasks_table,
+        )
+        from kestrel_sovereign.features.storage_access import (
+            resolve_feature_database,
         )
         self._db = resolve_feature_database(self.agent)
         # A hosted retained route is security-sensitive.  Keep a separate
@@ -778,8 +804,8 @@ class PeersFeature(Feature):
             )
         try:
             from kestrel_sovereign.a2a.outbound_store import (
-                OutboundTaskRouteAmbiguousError,
                 ROUTE_STATE_ROUTABLE,
+                OutboundTaskRouteAmbiguousError,
                 get_outbound_task,
             )
 
@@ -888,6 +914,7 @@ class PeersFeature(Feature):
             raise OutboundSigningError("missing_hybrid_signing_material")
         try:
             from datetime import datetime, timezone
+
             from kestrel_sovereign.a2a.envelope_signing import (
                 bound_envelope_fields,
                 canonical_message,
@@ -992,14 +1019,15 @@ class PeersFeature(Feature):
         from uuid import uuid4
 
         from kestrel_sdk.signals import Status
+
+        from kestrel_sovereign.a2a.envelope_signing import (
+            A2A_AUDIENCE_METADATA_KEY,
+        )
         from kestrel_sovereign.signals.sources.peer_stop import (
             MAX_PEER_STOP_REASON_CHARS,
             PEER_STOP_A2A_VERB,
             encode_peer_stop_intent,
             peer_stop_delivery_id,
-        )
-        from kestrel_sovereign.a2a.envelope_signing import (
-            A2A_AUDIENCE_METADATA_KEY,
         )
         from kestrel_sovereign.stop import StopDisposition, StopOutcome, StopScope
 
@@ -3292,15 +3320,40 @@ class PeersFeature(Feature):
         import asyncio
 
         try:
-            return await asyncio.wait_for(
+            waiter = create_owned_task(
                 self._settle_question_with_receiver_unbounded(
                     task_id=task_id,
                     recipient=recipient,
                     recipient_agent_id=recipient_agent_id,
                 ),
-                timeout=self.QUESTION_SETTLEMENT_TIMEOUT_SECONDS,
             )
-        except TimeoutError:
+            primary = None
+            timed_out = False
+            try:
+                done, _ = await asyncio.wait(
+                    {waiter}, timeout=self.QUESTION_SETTLEMENT_TIMEOUT_SECONDS,
+                )
+                if not done:
+                    timed_out = True
+                    primary = TimeoutError("A2A receiver settlement deadline")
+            except BaseException as error:
+                primary = error
+            if primary is not None and not waiter.done():
+                waiter.cancel()
+            outcome = await await_owned_task(waiter)
+            child_error = outcome.error
+            if (timed_out and isinstance(child_error, asyncio.CancelledError)
+                    and not is_execution_control_error(child_error)):
+                child_error = None
+            terminal = execution_terminal_error(
+                primary, child_error, outcome.cancellation,
+            )
+            if terminal is not None:
+                raise terminal
+            return outcome.result
+        except TimeoutError as error:
+            if is_execution_control_error(error):
+                raise
             logger.warning(
                 "A2A question task=%s: could not settle with recipient=%s "
                 "within %.0fs; leaving the recipient's task unconfirmed.",
@@ -3362,12 +3415,16 @@ class PeersFeature(Feature):
             )
             data = await router.get_a2a_task(requester, peer, task_id)
         except PeerDirectoryError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.debug(
                 "A2A question task=%s: recipient=%s task unreadable: %s",
                 task_id, recipient, type(exc).__name__,
             )
             return None
-        except Exception:  # noqa: BLE001 - provider extension boundary
+        except Exception as exc:  # noqa: BLE001 - provider extension boundary
+            if is_execution_control_error(exc):
+                raise
             logger.exception(
                 "Peer router raised unexpectedly reading task %s from %r",
                 task_id, recipient,
@@ -3450,6 +3507,8 @@ class PeersFeature(Feature):
                     receiver_settled=settlement.receiver_terminal,
                 )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "Failed to mark pending_a2a_question task=%s %s: %s. "
                     "Firing signal anyway — better a possible duplicate "
@@ -3557,6 +3616,8 @@ class PeersFeature(Feature):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "a2a receiver settlement: failed for task=%s: %s",
                     row.task_id, e,
@@ -3659,6 +3720,8 @@ class PeersFeature(Feature):
                 await claim.store.renew_claim_lease(task_id, claim=claim.token)
             )
         except Exception as exc:  # noqa: BLE001 - the row stays owed
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "Could not confirm the claim on pending_a2a_question "
                 "task=%s; not waking the asker from this pass: %s",
@@ -3693,6 +3756,8 @@ class PeersFeature(Feature):
             try:
                 return bool(await renew(task_id, claim=claim.token))
             except Exception as exc:  # noqa: BLE001 - retried next interval
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "Could not renew the claim lease of pending_a2a_question "
                     "task=%s: %s",
@@ -3724,6 +3789,8 @@ class PeersFeature(Feature):
                     task_id, claim=claim.token,
                 )
         except Exception as exc:  # noqa: BLE001 - the row stays owed
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "a2a.question_answered for task=%s was delivered, but its "
                 "pending row could not be retired: %s. The asker will be "
@@ -3933,7 +4000,7 @@ class PeersFeature(Feature):
             async def _retire_after_delivery() -> None:
                 # As on the inline path: once the asker was woken, a teardown
                 # must not leave the wake owed.
-                await asyncio.shield(
+                await self._await_question_checkpoint(
                     self._retire_delivered_wake(task_id, claim, late=late)
                 )
 
@@ -3973,7 +4040,7 @@ class PeersFeature(Feature):
             if late:
                 raise
             try:
-                await asyncio.shield(
+                await self._await_question_checkpoint(
                     self._restore_pending_question_waiting(
                         task_id,
                         claim=claim,
@@ -4008,10 +4075,15 @@ class PeersFeature(Feature):
             return False
         # The asker was woken: a teardown arriving now must not leave the
         # wake owed, or it would be delivered again once the claim lapses.
-        await asyncio.shield(
+        await self._await_question_checkpoint(
             self._retire_delivered_wake(task_id, claim, late=late)
         )
         return True
+
+    async def _await_question_checkpoint(self, operation) -> None:
+        """Join the original native row write even through caller cancellation."""
+        outcome = await await_owned_task(create_owned_task(operation))
+        raise_owned_outcome(outcome, operation="A2A question checkpoint")
 
     async def _restore_pending_question_waiting(
         self,
@@ -4382,17 +4454,8 @@ class PeersFeature(Feature):
             name="a2a_question_wake_recovery:replay",
         )
 
-        # Hourly sweep as a FEATURE-owned background task. Still agent-tracked
-        # (auto-cancelled at full agent shutdown by
-        # ``_shutdown_background_tasks``), but also owned by this feature so
-        # runtime disable / boot rollback / soft disable cancel it via
-        # ``Feature.shutdown()`` — the agent's global reap only fires at full
-        # shutdown, so an agent-only task would keep sweeping after this feature
-        # is torn down (kestrel-sovereign#2522 P1).
-        self._track_owned_background_task(
-            self._hourly_expiry_sweep_loop(store),
-            name="a2a_question_expiry_sweep",
-        )
+        # The caller owns exactly one sweep: the resident service continues
+        # into it; the legacy host explicitly tracks it after replay.
 
     @execution_work_operation
     async def _replay_pending_a2a_questions(self, store) -> None:
@@ -4412,6 +4475,8 @@ class PeersFeature(Feature):
         try:
             await store.reclaim_abandoned_wakes()
         except Exception as e:  # noqa: BLE001 - the hourly sweep retries it
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "a2a question startup-replay: could not reclaim abandoned "
                 "wakes: %s. The hourly sweep retries.", e,
@@ -4515,6 +4580,8 @@ class PeersFeature(Feature):
                 try:
                     await self._redeliver_abandoned_wakes(store)
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(
                         "a2a question wake recovery failed: %s", e,
                     )
@@ -4523,6 +4590,8 @@ class PeersFeature(Feature):
                 try:
                     expired = await store.list_waiting_past_deadline()
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(
                         "a2a expiry sweep: could not list past-deadline "
                         "questions: %s", e,
@@ -4551,6 +4620,8 @@ class PeersFeature(Feature):
                 try:
                     await self._settle_expired_questions_with_receivers(store)
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(
                         "a2a receiver settlement pass failed: %s", e,
                     )
@@ -4587,6 +4658,8 @@ class PeersFeature(Feature):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "a2a question wake recovery: failed for task=%s: %s",
                     row.task_id, e,
@@ -4609,6 +4682,8 @@ class PeersFeature(Feature):
         try:
             await self._redeliver_abandoned_wakes(store)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "a2a question wake recovery after boot failed: %s. The "
                 "hourly sweep retries.", e,

@@ -21,32 +21,38 @@ import time
 from contextlib import aclosing, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import (
-    Any, AsyncIterator, Awaitable, Dict, Iterator, List, Optional, TypeVar, Union,
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    TypeVar,
+    Union,
 )
+
+from kestrel_sdk.hooks.base import HookEvent, HookInput
+from kestrel_sdk.llm import ToolCallStarted
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
     raise_owned_outcome,
 )
-from kestrel_sdk.hooks.base import HookEvent, HookInput
-from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
     ToolDispatchEntry,
     infer_tool_result_status,
     tool_result_size_bytes,
 )
-from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
-from kestrel_sovereign.llm.call_progress import call_progress_listener
-from kestrel_sovereign.llm.generation_gate import failure_summary, judge_generation
-from kestrel_sovereign.llm.output_ceiling import IncompleteGenerationError
-from kestrel_sovereign.turn_completion import (
-    confirm_unfinished,
-    confirms_complete,
-    repair_addition,
-    settle_repaired_content,
-    turn_completion_repair_prompt,
+from kestrel_sovereign.agent.direct_tool_arguments import (
+    normalize_direct_tool_arguments,
 )
-from kestrel_sdk.llm import ToolCallStarted
+from kestrel_sovereign.agent.invocation import (
+    current_invocation_effect_checkpoint,
+    current_invocation_id,
+    mark_current_invocation_effect_completed,
+)
+
 # Re-use streaming.py's in-band sentinel builders for follow-up
 # ToolCallStarted events so the chat UI's revise-on-tool semantic
 # applies uniformly to first-level AND multi-iteration tool calls
@@ -58,33 +64,34 @@ from kestrel_sovereign.agent.parts import (
     drain_parts,
     sanitize_part,
 )
-from kestrel_sovereign.agent.invocation import (
-    current_invocation_effect_checkpoint,
-    current_invocation_id,
-    mark_current_invocation_effect_completed,
-)
-from kestrel_sovereign.storage.privacy_wrapper import (
-    held_transition_reentry_token,
-)
-from kestrel_sovereign.turn_scope import capture_turn_scope
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_terminal_error, is_execution_control_error, require_execution_work
 from kestrel_sovereign.agent.streaming import (
-    _DeferredToolBatchCancellation,
     _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
-    _build_revise_sentinel,
-    _build_tool_sentinel,
-    _stopped_generation,
     INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT,
     STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+    _build_revise_sentinel,
+    _build_tool_sentinel,
+    _DeferredToolBatchCancellation,
+    _stopped_generation,
 )
-from kestrel_sovereign.agent.direct_tool_arguments import (
-    normalize_direct_tool_arguments,
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    execution_terminal_error,
+    is_execution_control_error,
+    require_execution_work,
 )
+from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
+from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
+from kestrel_sovereign.llm.call_progress import call_progress_listener
+from kestrel_sovereign.llm.generation_gate import failure_summary, judge_generation
+from kestrel_sovereign.llm.output_ceiling import IncompleteGenerationError
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.security.tool_audit import (
     ACTION_TOOL_RESOLUTION,
     ACTION_TOOL_VALIDATION,
     record_tool_rejection,
+)
+from kestrel_sovereign.storage.privacy_wrapper import (
+    held_transition_reentry_token,
 )
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
@@ -96,6 +103,14 @@ from kestrel_sovereign.telemetry import (
     # signal-dispatch spans that stamp the same value (#2940).
     real_session_id,
 )
+from kestrel_sovereign.turn_completion import (
+    confirm_unfinished,
+    confirms_complete,
+    repair_addition,
+    settle_repaired_content,
+    turn_completion_repair_prompt,
+)
+from kestrel_sovereign.turn_scope import capture_turn_scope
 
 # These constants are also defined in kestrel_agent.py — import from there at
 # runtime so that env-var overrides are respected.  The mixin accesses them via
@@ -953,15 +968,18 @@ class OrchestratorEngineMixin:
         if state is not None and state.completed and not state.checkpointed:
             request_id = current_invocation_id()
             stopped = _stopped_generation(self, request_id) is not None
-            await OrchestratorEngineMixin._persist_completed_tool_stop_checkpoint(
-                self,
-                session_id=session_id or state.session_id,
-                request_id=request_id,
-                checkpoint=(
-                    STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT if stopped
-                    else INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT
-                ),
-            )
+            try:
+                await OrchestratorEngineMixin._persist_completed_tool_stop_checkpoint(
+                    self,
+                    session_id=session_id or state.session_id,
+                    request_id=request_id,
+                    checkpoint=(
+                        STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT if stopped
+                        else INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT
+                    ),
+                )
+            except BaseException as checkpoint_error:
+                raise execution_terminal_error(error, checkpoint_error)
         return failure
 
     def _make_inline_tool_executor(
@@ -2378,7 +2396,10 @@ class OrchestratorEngineMixin:
             if not store or not callable(getattr(store, "get_permission", None)):
                 return set()
 
-            from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
+            from kestrel_sovereign.features.security.permissions import (
+                PermissionLevel,
+                PermissionStore,
+            )
             if not isinstance(store, PermissionStore):
                 return set()
 
@@ -2935,10 +2956,13 @@ class OrchestratorEngineMixin:
                 or (state is not None and state.checkpointed)
             )
             if (had_inline_effect or captured_results) and not already_checkpointed:
-                await self._persist_completed_tool_stop_checkpoint(
-                    session_id=session_id,
-                    request_id=current_invocation_id(),
-                )
+                try:
+                    await self._persist_completed_tool_stop_checkpoint(
+                        session_id=session_id,
+                        request_id=current_invocation_id(),
+                    )
+                except BaseException as checkpoint_error:
+                    raise execution_terminal_error(error, checkpoint_error)
                 if state is not None:
                     state.checkpointed = True
                 setattr(error, "_kestrel_completed_effect_checkpointed", True)

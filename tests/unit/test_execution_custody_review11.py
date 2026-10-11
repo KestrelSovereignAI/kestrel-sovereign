@@ -8,7 +8,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from kestrel_sovereign.execution_custody import (
-    ExecutionAuthorityError, ExecutionCommitOutcomeError, ExecutionCustody, bind_execution_custody,
+    ExecutionAuthorityError,
+    ExecutionCommitOutcomeError,
+    ExecutionCustody,
+    bind_execution_custody,
     require_execution_work,
 )
 from tests.unit.test_execution_custody import Authority
@@ -130,6 +133,8 @@ async def test_boot_peer_replay_and_sweep_survive_only_original_runtime():
     )
     store = SimpleNamespace(
         list_waiting=AsyncMock(return_value=[row]),
+        reclaim_abandoned_wakes=AsyncMock(return_value=[]),
+        list_expired_awaiting_receiver=AsyncMock(return_value=[]),
         list_waiting_past_deadline=AsyncMock(
             side_effect=lambda: require_execution_work(owner) or [],
         ),
@@ -159,11 +164,18 @@ async def test_boot_peer_replay_and_sweep_survive_only_original_runtime():
         assert observed.is_set(), "restored peer inherited retired cold-boot claim"
         assert store.list_waiting_past_deadline.await_count, "sweep inherited boot claim"
         tasks = tuple(owner._background_tasks)
-        assert len(tasks) == 2
+        assert len(tasks) == 3
+        assert sum(task.get_name() == "a2a_question_expiry_sweep" for task in tasks) == 1
+        assert sum(task.get_name() == "a2a_question_wake_recovery:replay" for task in tasks) == 1
         owner._execution_custody.revoke("original runtime replaced")
+        # Interrupt the lease-delay sleeper too: it must retire, rather than
+        # retaining the replaced resident authority for a full claim lease.
+        for task in tasks:
+            if task.get_name() == "a2a_question_wake_recovery:replay":
+                task.cancel()
         release.set()
         outcomes = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 1)
-        assert all(isinstance(error, ExecutionAuthorityError) for error in outcomes)
+        assert all(isinstance(error, (ExecutionAuthorityError, asyncio.CancelledError)) for error in outcomes)
         assert not feature._owned_background_tasks
     finally:
         release.set()
@@ -222,6 +234,8 @@ async def test_actual_live_question_subscription_retains_only_original_runtime(r
     owner._runtime_publication_ready.set()
     owner.pending_a2a_questions = SimpleNamespace(
         insert=AsyncMock(), mark_resolved=AsyncMock(return_value=True),
+        renew_claim_lease=AsyncMock(return_value=True),
+        confirm_wake_delivered=AsyncMock(return_value=True),
     )
     owner.dispatcher = SimpleNamespace(enqueue_signal=AsyncMock(return_value=_DeliveredSignalHandle()))
     feature = PeersFeature(owner)
@@ -257,7 +271,15 @@ async def test_actual_live_question_subscription_retains_only_original_runtime(r
         assert closed.is_set()
         if retirement == "none":
             assert outcomes == [None]
-            owner.pending_a2a_questions.mark_resolved.assert_awaited_once_with("task")
+            owner.pending_a2a_questions.mark_resolved.assert_awaited_once()
+            claimed = owner.pending_a2a_questions.mark_resolved.await_args
+            assert claimed.args == ("task",)
+            assert claimed.kwargs["state"] == "completed"
+            assert claimed.kwargs["reply_text"] == "reply"
+            assert claimed.kwargs["claim"]
+            owner.pending_a2a_questions.confirm_wake_delivered.assert_awaited_once_with(
+                "task", claim=claimed.kwargs["claim"],
+            )
             owner.dispatcher.enqueue_signal.assert_awaited_once()
             signal = owner.dispatcher.enqueue_signal.await_args.args[0]
             assert signal.target_agent == owner.did
