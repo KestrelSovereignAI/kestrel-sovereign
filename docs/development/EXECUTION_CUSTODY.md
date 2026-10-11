@@ -99,7 +99,10 @@ irreversibly after the owned database closes; retained handles and copied
 children cannot reacquire it. Exact archive reads require the native cold-read
 backend. This does not authorize tenant SQLite, arbitrary paths, or general
 PostgreSQL bypass: runtime birth replication still validates the destination's
-original generation on its actual PostgreSQL transaction. Inception embedding
+original generation on its actual PostgreSQL transaction. Native file safety
+is checked before granting anchor access: symlinks, hard links, directories and
+other non-regular leaves retain the public file-validation refusal without
+opening, moving or modifying their targets. Inception embedding
 and accounting consumers borrow the owned birth database, not a separately
 created usage database, and their native provider closure joins before that
 database retires. Physical closure never reconciles an uncertain native effect.

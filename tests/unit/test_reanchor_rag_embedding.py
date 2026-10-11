@@ -390,11 +390,13 @@ async def test_a_service_that_fails_to_close_does_not_fail_a_committed_reanchor(
     async def _close_raises(self) -> None:
         raise RuntimeError("adapter would not close")
 
-    monkeypatch.setattr(_ProcessLocalService, "close", _close_raises)
     _Host(monkeypatch, _fleet_routes)
     agent_dir, agent_did = await _incept(tmp_path, constitution_path)
     db_path = agent_dir / "kestrel_prime.db"
     _persist_fleet_embedding_config(db_path, agent_did)
+    # Exercise the reanchor's post-commit close, not inception's independently
+    # owned provider retirement (which must report a failed physical join).
+    monkeypatch.setattr(_ProcessLocalService, "close", _close_raises)
 
     result = await _force_reanchor(tmp_path, agent_dir, constitution_path)
 

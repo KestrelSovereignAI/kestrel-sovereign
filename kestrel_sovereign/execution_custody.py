@@ -15,6 +15,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
+import stat
 from typing import Any, Protocol, TYPE_CHECKING, TypeVar
 
 from kestrel_sovereign.turn_scope import capture_turn_scope, turn_scoped
@@ -264,7 +265,18 @@ def _host_identity_anchor_access(path: Path, *, read_only: bool = False) -> Iter
     """
     require_execution_work()
     path = Path(path)
-    if path.is_symlink() or not (
+    try:
+        retained = path.lstat()
+    except FileNotFoundError:
+        retained = None
+    # Preserve the public native file-safety refusal before granting access.
+    # A linked/non-regular file is not a lost execution generation, and must
+    # never acquire a capability even when its basename looks canonical.
+    if retained is not None and (
+        not stat.S_ISREG(retained.st_mode) or retained.st_nlink != 1
+    ):
+        raise ValueError("Host identity-anchor access requires an exclusively retained regular database")
+    if not (
         path.name == "kestrel_prime.db"
         or (read_only and path.name.startswith("kestrel_prime.db.backup-"))
     ):

@@ -340,3 +340,38 @@ async def test_host_anchor_capability_never_widens_or_reacquires_authority(tmp_p
     finally:
         if db is not None:
             await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "directory", "fifo"])
+async def test_host_anchor_file_refusal_precedes_capability_without_widening(tmp_path, kind):
+    import os
+    from kestrel_sovereign.execution_custody import (
+        _host_identity_anchor_access, ExecutionCustody, ProcessRuntimeExecutionFence,
+        bind_execution_custody_snapshot, ExecutionAuthorityError,
+    )
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    target = tmp_path / "original.db"
+    original = await AsyncDatabase.sqlite(str(target))
+    await original.close()
+    before = (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes())
+    path = tmp_path / "kestrel_prime.db"
+    if kind == "symlink":
+        path.symlink_to(target)
+    elif kind == "hardlink":
+        os.link(target, path)
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        os.mkfifo(path)
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("original-parent"))
+    with bind_execution_custody_snapshot((scope,)):
+        with pytest.raises(ValueError, match="exclusively retained regular database"):
+            with _host_identity_anchor_access(path):
+                pytest.fail("unsafe anchor acquired host capability")
+        scope.require_work()
+        with pytest.raises(ExecutionAuthorityError):
+            await AsyncDatabase.sqlite(str(tmp_path / "ordinary.db"))
+    assert not (tmp_path / "ordinary.db").exists()
+    assert before == (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes())
