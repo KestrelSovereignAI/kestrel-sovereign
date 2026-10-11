@@ -1291,7 +1291,10 @@ class CodexAdapter(LLMAdapter):
 
     # ----------------------------------------------------------- app-server glue
     def _app_server(self) -> CodexAppServerClient:
-        if self._client is None:
+        if self._client is None or (
+            isinstance(self._client, CodexAppServerClient)
+            and self._client.replaceable_after_failed_startup
+        ):
             self._client = CodexAppServerClient()
             if hasattr(self._client, "attach_audit_agent"):
                 self._client.attach_audit_agent(self._agent_for_audit)

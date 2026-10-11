@@ -40,6 +40,11 @@ from kestrel_sovereign.agent.sleep import (
     SleepHookPhase,
     SleepHookStatus,
 )
+from kestrel_sovereign.execution_custody import (
+    await_execution_work_group,
+    execution_terminal_error,
+    is_execution_control_error,
+)
 from kestrel_sovereign.storage.conversation_created_at import parse_stored_timestamp
 from kestrel_sovereign.storage.encryption import DecryptionError
 from kestrel_sovereign.storage.memory_attestation_state import (
@@ -234,11 +239,13 @@ class RetrievalMarks:
                 except Exception as exc:
                     failure = exc
                     raise
-        except TransactionError:
+        except TransactionError as transaction_error:
             if failure is None:
                 raise
             # Rolled back. Raise what failed, not the transaction's wrapper.
-            raise failure from None
+            terminal = execution_terminal_error(failure, transaction_error)
+            assert terminal is not None
+            raise terminal
         return True
 
 
@@ -547,7 +554,9 @@ class ReflectionSleepHook:
                     candidate=candidate,
                     session_context=candidate.session_context,
                 )
-            except Exception:  # noqa: BLE001 - hook must not block sleep
+            except Exception as error:  # noqa: BLE001 - ordinary hook failure is isolated
+                if is_execution_control_error(error):
+                    raise
                 # Provider exceptions can include prompt or response content.
                 # Keep sleep-hook diagnostics content-free.
                 logger.warning("Memory reflection attestation failed")
@@ -608,8 +617,10 @@ class ReflectionSleepHook:
         if llm_service is None or not hasattr(llm_service, "decide"):
             outcomes: List[Any] = [DecisionError("decide is unavailable on this agent")]
         else:
-            outcomes = await asyncio.gather(
-                *(attest(candidate) for candidate in candidates), return_exceptions=True
+            outcomes = await await_execution_work_group(
+                agent,
+                (lambda candidate=candidate: attest(candidate) for candidate in candidates),
+                return_exceptions=True,
             )
         for outcome in outcomes:
             if isinstance(outcome, BaseException) and not isinstance(outcome, DecisionError):
@@ -880,7 +891,9 @@ class ReflectionSleepHook:
                 metadata,
             )
             return decoded
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
+            if is_execution_control_error(error):
+                raise
             logger.debug("Could not decrypt retrieved memory candidate")
             return content or ""
 
@@ -1071,6 +1084,8 @@ async def attestation_chat_baseline(
                 session_context=str(raw.get("session", "")),
                 local_only=local_only,
             )
-    except Exception:  # noqa: BLE001 - production fails the hook; count it
+    except Exception as error:  # noqa: BLE001 - ordinary provider failure
+        if is_execution_control_error(error):
+            raise
         return None
     return {ATTESTATION_QUESTION: bool(attestation.get("applied"))}

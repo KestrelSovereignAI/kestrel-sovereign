@@ -5826,6 +5826,7 @@ def test_kinds_only_description_withholds_every_per_instance_tail():
         "wait_fallback_reconcile",
         # Durable dispatcher owner-liveness tick, a fresh task every ~40s.
         "durable_signal_owner_heartbeat:did:pkh:eip155:1:0xabc",
+        "workflows:lease-recovery",
     ],
 )
 def test_permanent_bookkeeping_daemons_are_infrastructure(name):
@@ -5844,6 +5845,7 @@ def test_permanent_bookkeeping_daemons_are_infrastructure(name):
         "post_response_memory_enrichment",
         # A lookalike must not ride on the heartbeat's exclusion.
         "durable_signal_owner:did:x",
+        "workflows:stage:real-user-effect",
     ],
 )
 def test_real_work_is_not_infrastructure(name):

@@ -22,6 +22,8 @@ from enum import Enum
 import heapq
 from typing import Optional, Dict, Any, Callable, List, Tuple
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 logger = logging.getLogger(__name__)
 
 
@@ -965,7 +967,9 @@ class SleepMixin:
         if callable(artifact_sweep):
             try:
                 await artifact_sweep()
-            except Exception:
+            except Exception as control_error:
+                if is_execution_control_error(control_error):
+                    raise
                 logger.warning("Governed semantic artifact expiry sweep failed")
                 report.error = "semantic_artifact_expiry_sweep_failed"
                 _record_failure_code(report, "semantic_artifact_expiry_sweep_failed")
@@ -1040,7 +1044,9 @@ class SleepMixin:
                 # that cleanup, so continuing into hooks or export would put
                 # the dispatcher-owned MEMORY lock back on an unbounded wait.
                 return report
-            except Exception:
+            except Exception as control_error:
+                if is_execution_control_error(control_error):
+                    raise
                 logger.error("Consolidation failed", exc_info=True)
                 if report.error:
                     report.error += "; consolidation_failed"
@@ -1099,6 +1105,8 @@ class SleepMixin:
                 export_succeeded = report.cid is not None
                 logger.info(f"Export complete: CID={report.cid}")
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Export failed: {e}")
                 if report.error:
                     report.error += f"; Export failed: {e}"
@@ -1120,6 +1128,8 @@ class SleepMixin:
             try:
                 await self.on_sleep_complete(report.cid, report)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"on_sleep_complete callback failed: {e}")
                 # Don't fail the sleep for callback errors
 
@@ -1188,7 +1198,9 @@ class SleepMixin:
                 return False
             try:
                 result = await revoke()
-            except Exception:
+            except Exception as control_error:
+                if is_execution_control_error(control_error):
+                    raise
                 report.semantic_inference = {
                     "status": "failed",
                     "reason": "semantic_inference_revocation_failed",
@@ -1234,7 +1246,9 @@ class SleepMixin:
                     profile,
                     **maintenance_kwargs,
                 )
-            except Exception:
+            except Exception as control_error:
+                if is_execution_control_error(control_error):
+                    raise
                 report.semantic_maintenance = {
                     "status": "failed",
                     "reason": "semantic_maintenance_failed",
@@ -1429,7 +1443,9 @@ class SleepMixin:
                         "Pre-sleep hook completed: insights=%d",
                         insights_generated,
                     )
-            except Exception:  # Hook errors are isolated from the sleep cycle.
+            except Exception as control_error:  # Hook errors are isolated from the sleep cycle.
+                if is_execution_control_error(control_error):
+                    raise
                 duration_ms = int((time.perf_counter() - start) * 1000)
                 self._record_hook_execution(
                     report,
@@ -1845,7 +1861,9 @@ class SleepMixin:
                         "Post-consolidation hook completed: insights=%d",
                         insights_generated,
                     )
-            except Exception:  # Individual hooks must not abort the sleep cycle.
+            except Exception as control_error:  # Individual hooks must not abort the sleep cycle.
+                if is_execution_control_error(control_error):
+                    raise
                 duration_ms = int((time.perf_counter() - start) * 1000)
                 status_by_id[hook_id] = SleepHookStatus.FAILED
                 self._record_hook_execution(
@@ -2030,6 +2048,8 @@ class SleepMixin:
                             result.get("error"),
                         )
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning("Pre-cryostasis incorporation error: %s", e)
                     report.incorporation_attempted = True
                     report.incorporation_success = False

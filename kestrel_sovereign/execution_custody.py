@@ -612,9 +612,19 @@ async def await_execution_work_group(
     async def run(operation):
         try:
             return await await_execution_work(owner, operation)
-        except Exception as error:
-            if return_exceptions and not is_execution_control_error(error):
+        except BaseException as error:
+            if (
+                isinstance(error, Exception)
+                and return_exceptions
+                and not is_execution_control_error(error)
+            ):
                 return error
+            # asyncio.gather reads a cancelled child's exception before its
+            # later physical owner can join it. Retain the original receipt
+            # inside the child, before asyncio consumes its cancellation.
+            task = asyncio.current_task()
+            if task is not None:
+                task._kestrel_owned_terminal_error = retained_execution_error(error)
             raise
 
     try:

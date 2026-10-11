@@ -327,6 +327,9 @@ _INFRA_TASK_NAMES = frozenset({
     "resume-monitor", "heartbeat-runtime", "scheduler-supervisor",
     "scheduler-runtime-telemetry",
     "delivery-queue-worker",
+    # Feature-owned bookkeeping: any workflow effect it admits is separately
+    # tracked. The resident daemon is joined on disable/shutdown, not user work.
+    "workflows:lease-recovery",
 })
 
 

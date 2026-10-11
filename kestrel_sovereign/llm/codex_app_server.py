@@ -327,6 +327,8 @@ class CodexAppServerClient:
         self._closing = False
         self._retiring = False
         self._close_task: asyncio.Task | None = None
+        self._explicitly_closed = False
+        self._startup_retryable = False
 
     # ---------------------------------------------------------------- lifecycle
     def _auth_cancelled(self) -> CodexAppServerCancelled:
@@ -366,9 +368,14 @@ class CodexAppServerClient:
             # only AFTER releasing that lock, for every failed native birth,
             # not just version rejection. Cancellation cannot orphan the child.
             try:
-                await self.aclose()
+                await self._retire_connection()
             except BaseException as retirement_error:
                 raise execution_terminal_error(startup_error, retirement_error)
+            self._startup_retryable = (
+                isinstance(startup_error, asyncio.CancelledError)
+                and not is_execution_control_error(startup_error)
+                and not self._explicitly_closed
+            )
             raise
 
     async def _spawn(self) -> None:
@@ -867,6 +874,25 @@ class CodexAppServerClient:
             raise failure
 
     async def aclose(self) -> None:
+        self._explicitly_closed = True
+        self._startup_retryable = False
+        await self._retire_connection()
+
+    @property
+    def replaceable_after_failed_startup(self) -> bool:
+        """Only cleanly retired, ordinarily cancelled startup may be replaced."""
+        task = self._close_task
+        return (
+            self._startup_retryable
+            and not self._explicitly_closed
+            and self._proc is None
+            and task is not None
+            and task.done()
+            and not task.cancelled()
+            and task.exception() is None
+        )
+
+    async def _retire_connection(self) -> None:
         # Fence admissions before scheduling the one retained retirement owner.
         self._closing = True
         if getattr(self, "_close_task", None) is None:
