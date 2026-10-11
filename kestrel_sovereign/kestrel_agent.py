@@ -8384,17 +8384,28 @@ Expected Duration: {expected_duration}
 
         async def release_llm() -> ReleaseOutcome:
             await self._join_llm_storage_dependents()
+            service = getattr(self, "llm_service", None)
+            if service is not None and callable(getattr(service, "close", None)):
+                for attempt in range(2):
+                    try:
+                        outcome = reported_outcome(await service.close())
+                        if outcome is not ReleaseOutcome.RELEASED:
+                            raise RuntimeError("LLM release incomplete; borrowed storage retained")
+                    except BaseException as failure:
+                        self._remember_shutdown_control(failure)
+                        if not is_execution_control_error(failure):
+                            if attempt == 0 and self._has_pending_llm_storage_dependents():
+                                # A bounded close retained exact native tasks.
+                                # Join them, then ask the idempotent close for
+                                # its settled disposition; never replace them.
+                                await self._join_llm_storage_dependents()
+                                continue
+                            raise
+                    break
+            # close() itself is bounded and may have started a retained native
+            # client close. The explicit continuation must join that owner too.
+            await self._join_llm_storage_dependents()
             return ReleaseOutcome.RELEASED
-
-        # Preference callbacks borrow raw agent storage; usage writers can
-        # borrow host storage. This retained physical join is upstream of
-        # EVERY storage release, not only the service's own usage DB close.
-        await custody.release("llm_service", release_llm)
-        if vars(self).get("_resolved_local_host_db") is not None:
-            async def release_host_db() -> ReleaseOutcome:
-                await self._close_local_host_db()
-                return ReleaseOutcome.RELEASED
-            await custody.release("host_key_database", release_host_db)
 
         async def release_dispatcher() -> ReleaseOutcome:
             delivered = await dispatcher.shutdown_durable_delivery()
@@ -8402,14 +8413,17 @@ Expected Duration: {expected_duration}
                 dispatcher, "wait_for_durable_shutdown_release", None
             )
             if not callable(wait_for_owner_release):
-                return _dispatcher_release_outcome(delivered)
-            # A fenced first call is expected here: the wait is what ends it.
-            waited = reported_outcome(await wait_for_owner_release())
-            if isinstance(delivered, ReleaseOutcome) and (
-                delivered is not ReleaseOutcome.RELEASED
-            ):
-                return delivered
-            return waited
+                outcome = _dispatcher_release_outcome(delivered)
+            else:
+                # A fenced first call is expected here: the wait ends it.
+                outcome = reported_outcome(await wait_for_owner_release())
+                if isinstance(delivered, ReleaseOutcome) and (
+                    delivered is not ReleaseOutcome.RELEASED
+                ):
+                    outcome = delivered
+            if outcome is not ReleaseOutcome.RELEASED:
+                raise RuntimeError("durable dispatcher release incomplete; borrowed storage retained")
+            return outcome
 
         async def close_storage() -> ReleaseOutcome:
             precloses = ReleaseOutcome.RELEASED
@@ -8422,6 +8436,16 @@ Expected Duration: {expected_duration}
 
         if dispatcher is not None and hasattr(dispatcher, "shutdown_durable_delivery"):
             await custody.release("signal_dispatcher", release_dispatcher)
+        # A rollback may have retained an LLM which has not been closed yet.
+        # Dispatcher/cognition retirement precedes that actual close; joining
+        # an empty writer set is not proof of provider retirement. Both native
+        # LLM settlement and close precede every borrowed storage release.
+        await custody.release("llm_service", release_llm)
+        if vars(self).get("_resolved_local_host_db") is not None:
+            async def release_host_db() -> ReleaseOutcome:
+                await self._close_local_host_db()
+                return ReleaseOutcome.RELEASED
+            await custody.release("host_key_database", release_host_db)
         await custody.release("storage", close_storage)
         self._raise_shutdown_control()
         self._release_serving_record()

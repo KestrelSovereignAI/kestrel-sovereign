@@ -227,3 +227,86 @@ async def test_actual_spawn_tool_preserves_distinct_child_denial_with_live_paren
     finally:
         parent._execution_custody.revoke("test retirement")
         await retire(parent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained", [False, True])
+@pytest.mark.parametrize("delayed_close", [False, True])
+@pytest.mark.parametrize("unknown_close", [False, True])
+async def test_actual_continuation_closes_unstarted_provider_only_after_dispatcher(
+    tmp_path, monkeypatch, retained, delayed_close, unknown_close,
+):
+    import httpx
+    from kestrel_sovereign.agent.custody import ReleaseOutcome, ResourceCustody
+    from kestrel_sovereign.llm import service as service_module
+
+    agent, db = await native_owner(tmp_path)
+    service = service_owner()
+    client = httpx.AsyncClient()
+    close_error = ExecutionCommitOutcomeError("unknown")
+    client_entered, release_client = asyncio.Event(), asyncio.Event()
+
+    async def close_client():
+        client_entered.set()
+        if delayed_close:
+            while not release_client.is_set():
+                try:
+                    await release_client.wait()
+                except asyncio.CancelledError:
+                    pass
+        await client.aclose()
+        if unknown_close:
+            raise close_error
+
+    monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 0.01)
+    service.providers = [{"adapter": SimpleNamespace(aclose=close_client)}]
+    agent.llm_service = service
+    entered, release = asyncio.Event(), asyncio.Event()
+    custody = ResourceCustody(truthful_owners={"signal_dispatcher", "llm_service", "storage"})
+    agent._custody = custody
+    for resource in ("signal_dispatcher", "llm_service", "storage"):
+        custody.acquire(resource)
+
+    async def wait():
+        entered.set()
+        await release.wait()
+        return ReleaseOutcome.RELEASED
+
+    dispatcher = SimpleNamespace(
+        shutdown_durable_delivery=AsyncMock(return_value=ReleaseOutcome.RETAINED if retained else False),
+        wait_for_durable_shutdown_release=wait,
+    )
+    task = asyncio.create_task(agent._complete_durable_shutdown_continuation(
+        dispatcher, agent.storage, None,
+    ))
+    try:
+        await entered.wait()
+        assert not client.is_closed
+        assert "llm_service" in custody.held and "storage" in custody.held
+        release.set()
+        if retained:
+            outcome = await await_owned_task(task)
+            assert isinstance(outcome.error, RuntimeError)
+            assert not client.is_closed
+            assert set(custody.held) == {"signal_dispatcher", "llm_service", "storage"}
+            dispatcher.shutdown_durable_delivery.return_value = ReleaseOutcome.RELEASED
+            task = asyncio.create_task(agent._complete_durable_shutdown_continuation(
+                dispatcher, agent.storage, None,
+            ))
+        await asyncio.wait_for(client_entered.wait(), 5)
+        if delayed_close:
+            await asyncio.sleep(0.15)
+            assert not task.done()
+            assert not client.is_closed
+            assert "llm_service" in custody.held and "storage" in custody.held
+        release_client.set()
+        outcome = await await_owned_task(task)
+        assert outcome.error is (close_error if unknown_close else None)
+        assert client.is_closed
+        assert "llm_service" not in custody.held and "storage" not in custody.held
+    finally:
+        release.set()
+        release_client.set()
+        await await_owned_task(task)
+        await client.aclose()
+        await retire(agent)
