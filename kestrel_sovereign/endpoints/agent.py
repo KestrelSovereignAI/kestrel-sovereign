@@ -1581,95 +1581,40 @@ async def set_privacy_mode(request: Request):
         if getattr(transition, "retryable_conflict", False):
             raise _privacy_transition_conflict()
 
-        # An EPHEMERAL exit was REFUSED because a required no-trace purge sweep
-        # failed (#2673). Nothing flipped — the agent stayed in EPHEMERAL — so we
-        # must report the ACTUAL (unchanged) mode and failure, never success.
-        # Reporting success here would let the agent claim a transition that did
-        # not happen.
+        # The transition was REFUSED: an EPHEMERAL exit whose required no-trace
+        # purge sweep failed (#2673), or a mode that could not be recorded
+        # durably (#3554). Nothing flipped, so we must report the ACTUAL
+        # (unchanged) mode and failure, never success. Reporting success here
+        # would let the agent claim a transition that did not happen.
         if transition is not None and not getattr(transition, "applied", True):
             return {
                 "success": False,
                 "purge_failed": getattr(transition, "purge_failed", False),
+                "persistence_failed": getattr(transition, "persistence_failed", False),
                 "mode": agent.privacy_mode.value,
                 "message": transition.message,
             }
 
-        # If switching to a local-only mode, auto-switch model to a local provider
-        # If switching back to cloud-allowed mode, restore the previous model
+        # Model and voice side effects are the agent's: it forces a local
+        # route on entering a local-only mode, restores the displaced mandate
+        # on leaving one, and records both durably (#3554).
         config = privacy_mode_to_config(new_mode)
         model_switched = getattr(transition, "model_switched", None)
-        if transition is None and hasattr(agent, 'llm_service') and agent.llm_service:
-            llm = agent.llm_service
-            if not config.allows_cloud_llm():
-                # Save the resolved active cloud selection before overriding to local,
-                # so we can restore it when privacy allows cloud again.
-                current_pref = llm.get_model_preference() or {}
-                current_vendor = current_pref.get("vendor")
-                current_model = current_pref.get("model")
-                current_route = current_pref.get("route")
-                if not current_model and getattr(llm, "providers", None):
-                    first = llm.providers[0]
-                    current_vendor = first.get("vendor")
-                    current_model = first.get("model")
-                    current_route = first.get("route")
-                if current_model and not (
-                    next((p for p in llm.providers if p.get("vendor") == current_vendor and p.get("is_local")), None)
-                ):
-                    llm._pre_ephemeral_preference = {
-                        "vendor": current_vendor,
-                        "model": current_model,
-                        "route": current_route,
-                    }
-
-                local_routes = [p for p in llm.providers if p.get("is_local")]
-                # Prefer ollama over llama_cpp — ollama is more universally available
-                local_route = next(
-                    (p for p in local_routes if p.get("vendor") == "ollama"),
-                    local_routes[0] if local_routes else None,
-                )
-                if local_route:
-                    llm.set_model_preference(
-                        local_route["model"], local_route.get("vendor"), local_route.get("route")
-                    )
-                    model_switched = {
-                        "vendor": local_route.get("vendor"),
-                        "route": local_route.get("route"),
-                        "model": local_route["model"],
-                    }
-            elif config.allows_cloud_llm():
-                # Restore previous cloud preference if we saved one
-                saved = getattr(llm, '_pre_ephemeral_preference', None)
-                if saved:
-                    llm.set_model_preference(
-                        saved.get("model", ""),
-                        saved.get("vendor"),
-                        saved.get("route"),
-                    )
-                    model_switched = saved
-                    llm._pre_ephemeral_preference = None
-
-        # Auto-switch voice providers if VoiceFeature is active
         voice_switched = getattr(transition, "voice_switched", None)
         biometric_warning = getattr(transition, "biometric_warning", None)
-        features = getattr(agent, "features", {})
-        vf = features.get("VoiceFeature") if features else None
-        if transition is None and vf and hasattr(vf, "on_privacy_mode_changed"):
-            try:
-                voice_switched = await vf.on_privacy_mode_changed()
-            except Exception as ve:
-                logger.warning("Voice auto-switch failed: %s", ve)
-
-            # Biometric warning when switching TO a mode that allows cloud voice
-            if config.allows_cloud_llm() and hasattr(vf, "biometric_warning"):
-                # Only warn if there are cloud voice providers configured
-                vc = getattr(vf, "_voice_config", None)
-                if vc and (vc.tts_provider or vc.stt_provider):
-                    biometric_warning = vf.biometric_warning()
+        # Applied, but not recorded as applied: a restart resumes in the more
+        # restrictive mode. The agent's message says which.
+        recorded = getattr(transition, "recorded", True)
 
         return {
             "success": True,
             "mode": new_mode.value,
-            "message": f"Privacy mode set to {new_mode.value}",
+            "message": (
+                f"Privacy mode set to {new_mode.value}"
+                if recorded
+                else transition.message
+            ),
+            "recorded": recorded,
             "allows_cloud_llm": config.allows_cloud_llm(),
             "model_switched": model_switched,
             "voice_switched": voice_switched,

@@ -445,6 +445,32 @@ Note: Transitions support app layers—e.g., switch to Isolated for reviewing hu
 - **Backward Compatibility**: Existing stored data remains accessible in all modes
 - **Isolation Integrity**: Isolated sessions cannot accidentally leak into permanent storage
 
+### Durability Across Restarts
+
+The privacy mode is recorded per agent and restored at boot, before the first
+turn runs (#3554). A Sovereign who chose a local-only mode is never returned to
+cloud routes by a restart.
+
+- **Entering a local-only mode** (EPHEMERAL, ISOLATED, ANONYMOUS, DEIDENTIFIED)
+  saves the model mandate in force just before it, alongside the mode, and
+  forces a local route. Moving between local-only modes keeps the mandate saved
+  on entry; the forced local model is never saved in its place.
+- **Leaving a local-only mode** restores the saved mandate and clears the saved
+  copy. An agent that had no mandate returns to default routing. If nothing was
+  saved, the current preference stays and a warning is logged.
+- **After a restart** the mode and the mandate agree: a local-only mode comes
+  back on its local route, and NORMAL comes back on the pre-mode mandate.
+- **Failing closed**: a transition is recorded before it applies and again
+  once it has, and only after the model mandate it implies has been written.
+  A process that stops in between, or a write that fails, leaves the first
+  record: a restart resumes in the more restrictive of the two modes, still
+  holding the saved mandate. A record that cannot be read restarts the agent
+  in EPHEMERAL, never NORMAL; boot then records EPHEMERAL, keeping any saved
+  mandate the old record still yields. A transition that cannot be recorded
+  before it applies is refused.
+
+The record and its resolution live in `kestrel_sovereign.agent.privacy_state`.
+
 ## 7. Implementation Details
 
 ### Storage Layer Integration

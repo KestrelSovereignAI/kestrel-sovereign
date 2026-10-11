@@ -44,8 +44,20 @@ from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping, Callable
 import re
 from pathlib import Path, PurePath
-from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
+from kestrel_sovereign.privacy import (
+    PrivacyMode,
+    most_restrictive_privacy_mode,
+    privacy_mode_to_config,
+)
 from kestrel_sovereign.features.privacy import PrivacyAgent
+from kestrel_sovereign.agent.model_preference import replay_model_preference
+from kestrel_sovereign.agent.privacy_state import (
+    PRIVACY_STATE_UNRECORDED_MESSAGE,
+    PrivacyState,
+    SavedModelPreference,
+    restore_privacy_state,
+    write_privacy_state,
+)
 from kestrel_sovereign.features import (
     MandatoryFeatureReadinessError,
     discover_features,
@@ -195,6 +207,16 @@ class PrivacyTransitionResult:
     # privacy linearization race. No privacy state changed; callers should
     # surface a retryable conflict rather than success or an internal error.
     retryable_conflict: bool = False
+    # True when the transition was REFUSED because it could not be recorded
+    # durably (#3554): a mode that would not survive a restart is not applied.
+    # ``applied`` is False and the agent stays in its current mode.
+    persistence_failed: bool = False
+    # False when an APPLIED transition could not be recorded as applied
+    # (#3554): the model mandate it implies, or the record itself, failed to
+    # write. The record still names the transition as pending, with the saved
+    # mandate, so a restart resumes in the more restrictive of the two modes
+    # and can still restore that mandate. ``message`` carries the warning.
+    recorded: bool = True
 
 
 async def _add_sovereign_ipfs_target_if_active(
@@ -1693,6 +1715,10 @@ class KestrelAgent(
         # awaiting explicit confirmation via confirm_privacy_transition. None when
         # no transition is pending. Guarded by _privacy_transition_lock.
         self._pending_privacy_transition: Optional[PrivacyMode] = None
+        # The model mandate a local-only privacy mode displaced, restored when
+        # the agent leaves it. Recorded with the mode (#3554); see
+        # ``kestrel_sovereign.agent.privacy_state``.
+        self._privacy_saved_preference: Optional[SavedModelPreference] = None
 
         # Shared lock manager for the dispatcher (Phase 1) AND the turn
         # lifecycle (Phase 2). CONVERSATION is acquired by `_turn_lifecycle`
@@ -2575,6 +2601,10 @@ class KestrelAgent(
         # stopped just before storage closes (#3522).
         ctx.on_rollback("background_tasks", self._boot_teardown_background_tasks)
         await self._raw_storage.initialize()
+
+        # The privacy mode is durable (#3554): every state holder below is
+        # built in the mode this agent last recorded.
+        await self._restore_recorded_privacy_mode()
 
         # Wrap storage with privacy-enforcing layer
         self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
@@ -3928,6 +3958,7 @@ class KestrelAgent(
         # Load persisted model preference from database and register persistence callback
         await self._load_model_preference()
         self.llm_service.set_preference_persistence_callback(self._persist_model_preference)
+        await self._reconcile_privacy_model_mandate()
 
         # Wire the corpus dominant-embedding-profile provider (#2366) so auto
         # embedding-model resolution prefers continuity with the DB's
@@ -4721,6 +4752,14 @@ class KestrelAgent(
         Caller holds the transition lock and has already cleared the
         confirmation gate. Flips agent mode, storage wrapper, and privacy agent
         together, then applies model/voice side effects.
+
+        The mode is durable (#3554). The transition is recorded before any
+        state holder flips, naming the mode it starts from, and recorded as
+        applied once the model mandate it implies has been persisted. A process
+        that stops in between, or a write in between that fails, leaves the
+        first record, and a restart comes back in the more restrictive of the
+        two modes. A transition that cannot be recorded before it flips is not
+        applied.
         """
         # Record agent consent before applying the change
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
@@ -4773,6 +4812,31 @@ class KestrelAgent(
                     purge_failed=True,
                 )
 
+        previous_mode = self._privacy_mode
+        previous_config = privacy_mode_to_config(previous_mode)
+        config = privacy_mode_to_config(mode)
+        previous_saved = getattr(self, "_privacy_saved_preference", None)
+        saved = self._privacy_saved_preference_for_transition(
+            config, previous_config, previous_saved
+        )
+        # Until the transition is recorded as applied, the record names both
+        # modes and keeps whichever saved mandate the more restrictive one
+        # needs: the one just captured on entering a local-only mode, the one
+        # already held on leaving it.
+        if not await self._record_privacy_state(
+            PrivacyState(
+                mode=mode,
+                saved_preference=saved if saved is not None else previous_saved,
+                transition_from=previous_mode,
+            )
+        ):
+            return PrivacyTransitionResult(
+                message=PRIVACY_STATE_UNRECORDED_MESSAGE,
+                allows_cloud_llm=previous_config.allows_cloud_llm(),
+                applied=False,
+                persistence_failed=True,
+            )
+
         # The storage wrapper owns the linearization guard against durable
         # explicit-fact operations.  Ask it first: if a fact operation is in
         # flight, the transition is refused without leaving the agent and its
@@ -4780,15 +4844,20 @@ class KestrelAgent(
         try:
             self.storage.set_privacy_mode(mode)
         except PrivacyViolationError:
+            # Nothing flipped. Record the mode still in force; if even that
+            # write fails, the interrupted record restores the more
+            # restrictive mode, which is the safe direction.
+            await self._record_privacy_state(
+                PrivacyState(mode=previous_mode, saved_preference=previous_saved)
+            )
             return PrivacyTransitionResult(
                 message=PRIVACY_TRANSITION_RETRY_MESSAGE,
-                allows_cloud_llm=privacy_mode_to_config(
-                    self._privacy_mode
-                ).allows_cloud_llm(),
+                allows_cloud_llm=previous_config.allows_cloud_llm(),
                 applied=False,
                 retryable_conflict=True,
             )
         self._privacy_mode = mode
+        self._privacy_saved_preference = saved
         # Under the persistence gate held exclusive: a later durable signal
         # receipt names this installation, not the one it replaced (#3484).
         self._privacy_policy_epoch = getattr(self, "_privacy_policy_epoch", 0) + 1
@@ -4833,8 +4902,21 @@ class KestrelAgent(
                 "feature context could not be suppressed during privacy transition"
             ) from None
 
-        config = privacy_mode_to_config(mode)
-        model_switched = self._apply_privacy_model_transition(config)
+        model_switched = self._apply_privacy_model_transition(
+            config, previous_config, previous_saved
+        )
+        # The record is the commit point: the mandate it implies must already
+        # be persisted when it stops naming the mode this transition left. If
+        # either write fails, the pending record stays, saved mandate and all.
+        recorded = await self._commit_model_mandate() and await self._record_privacy_state(
+            PrivacyState(mode=mode, saved_preference=saved)
+        )
+        if not recorded:
+            restart_mode = most_restrictive_privacy_mode(mode, previous_mode)
+            status_message = (
+                f"{status_message} Warning: the change could not be recorded; "
+                f"after a restart the agent resumes in {restart_mode.value} mode."
+            )
         voice_switched, biometric_warning = await self._apply_privacy_voice_transition(config)
 
         logging.info(f"Privacy mode changed to: {mode.value}")
@@ -4845,59 +4927,254 @@ class KestrelAgent(
             voice_switched=voice_switched,
             biometric_warning=biometric_warning,
             applied=True,
+            recorded=recorded,
         )
 
-    def _apply_privacy_model_transition(self, config) -> Optional[dict]:
-        """Apply route-routing side effects for a privacy-mode transition."""
+    def _privacy_saved_preference_for_transition(
+        self,
+        config,
+        previous_config,
+        previous_saved: Optional[SavedModelPreference],
+    ) -> Optional[SavedModelPreference]:
+        """The displaced mandate the target mode holds, for restoring on exit.
+
+        Entering a local-only mode saves the mandate in force just before it.
+        Moving between local-only modes keeps the one saved on entry: what is
+        in force then is the local route the first mode forced. A mode that
+        allows cloud routes holds none.
+        """
+        if config.allows_cloud_llm():
+            return None
+        if not previous_config.allows_cloud_llm():
+            return previous_saved
         llm = getattr(self, "llm_service", None)
         if not llm:
             return None
+        return SavedModelPreference.from_preference(llm.get_model_preference() or {})
 
-        if not config.allows_cloud_llm():
-            # Save the current {vendor, model, route} before overriding to local.
-            current_pref = llm.get_model_preference() or {}
-            current_vendor = current_pref.get("vendor")
-            current_model = current_pref.get("model")
-            current_route = current_pref.get("route")
-            if not current_model and getattr(llm, "providers", None):
-                first = llm.providers[0]
-                current_vendor = first.get("vendor")
-                current_model = first.get("model")
-                current_route = first.get("route")
-            if current_model and not any(
-                p.get("vendor") == current_vendor and p.get("is_local")
-                for p in (llm.providers or [])
-            ):
-                llm._pre_ephemeral_preference = {
-                    "vendor": current_vendor,
-                    "model": current_model,
-                    "route": current_route,
-                }
+    def _apply_privacy_model_transition(
+        self,
+        config,
+        previous_config,
+        saved: Optional[SavedModelPreference],
+    ) -> Optional[dict]:
+        """Apply route-routing side effects for a privacy-mode transition.
 
-            local_routes = [p for p in (llm.providers or []) if p.get("is_local")]
-            local_route = next(
-                (p for p in local_routes if p.get("vendor") == "ollama"),
-                local_routes[0] if local_routes else None,
-            )
-            if local_route:
-                llm.set_model_preference(
-                    local_route["model"], local_route.get("vendor"), local_route.get("route")
-                )
-                return {
-                    "vendor": local_route.get("vendor"),
-                    "route": local_route.get("route"),
-                    "model": local_route["model"],
-                }
+        A local-only mode forces a local route. Leaving one restores ``saved``,
+        the mandate it displaced.
+        """
+        llm = getattr(self, "llm_service", None)
+        if not llm:
             return None
+        if not config.allows_cloud_llm():
+            return self._force_privacy_local_route(llm)
+        if previous_config.allows_cloud_llm():
+            return None
+        return self._restore_privacy_displaced_mandate(llm, saved)
 
-        saved = getattr(llm, "_pre_ephemeral_preference", None)
-        if saved:
-            llm.set_model_preference(
-                saved.get("model", ""), saved.get("vendor"), saved.get("route")
+    @staticmethod
+    def _force_privacy_local_route(llm) -> Optional[dict]:
+        """Set the model preference to the local route a local-only mode uses."""
+        local_routes = [p for p in (llm.providers or []) if p.get("is_local")]
+        local_route = next(
+            (p for p in local_routes if p.get("vendor") == "ollama"),
+            local_routes[0] if local_routes else None,
+        )
+        if not local_route:
+            return None
+        llm.set_model_preference(
+            local_route["model"], local_route.get("vendor"), local_route.get("route")
+        )
+        return {
+            "vendor": local_route.get("vendor"),
+            "route": local_route.get("route"),
+            "model": local_route["model"],
+        }
+
+    @staticmethod
+    def _restore_privacy_displaced_mandate(
+        llm, saved: Optional[SavedModelPreference]
+    ) -> Optional[dict]:
+        """Restore the mandate a local-only mode displaced, on leaving it.
+
+        Nothing saved leaves the current preference as it is: the local route
+        the mode forced is never invented as the mandate to return to.
+        """
+        if saved is None:
+            logging.warning(
+                "Left a local-only privacy mode with no saved model mandate to "
+                "restore; keeping the current preference %s",
+                llm.get_model_preference(),
             )
-            llm._pre_ephemeral_preference = None
-            return saved
-        return None
+            return None
+        if not saved.pinned:
+            llm.clear_model_preference()
+            logging.info(
+                "Left a local-only privacy mode: restored default routing, the "
+                "state in force before it"
+            )
+            return None
+        try:
+            replay_model_preference(llm, saved.model, saved.vendor, saved.route)
+        except ValueError as exc:
+            logging.error(
+                "Could not restore the model mandate %s on leaving a local-only "
+                "privacy mode (%s); keeping the current preference %s",
+                saved.describe(),
+                exc,
+                llm.get_model_preference(),
+            )
+            return None
+        logging.info(
+            "Left a local-only privacy mode: restored model mandate %s",
+            saved.describe(),
+        )
+        return saved.as_dict()
+
+    async def _drain_model_preference_persistence(self) -> None:
+        """Wait until every scheduled model-preference write has finished."""
+        drain = getattr(getattr(self, "llm_service", None), "drain_preference_persistence", None)
+        if inspect.iscoroutinefunction(drain):
+            await drain()
+
+    async def _commit_model_mandate(self) -> bool:
+        """Persist the model mandate in force; False if it could not be written.
+
+        Waiting for the writes ``LLMService`` scheduled proves nothing: its
+        persistence callback logs a failed write and returns. So once they
+        have finished, the mandate is written again here, where a failure is
+        seen (#3554). A privacy record that implies this mandate is written
+        only after this returns True.
+        """
+        llm = getattr(self, "llm_service", None)
+        if not llm:
+            return True
+        await self._drain_model_preference_persistence()
+        if getattr(getattr(self, "_raw_storage", None), "db", None) is None:
+            return True
+        preference = llm.get_model_preference() or {}
+        try:
+            await self._write_model_preference(
+                preference.get("model"), preference.get("vendor"), preference.get("route")
+            )
+        except Exception as exc:  # noqa: BLE001 - the caller keeps the pending record
+            logging.error(
+                "Could not persist the model mandate %s (%s: %s)",
+                preference,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        return True
+
+    async def _record_privacy_state(self, state: PrivacyState) -> bool:
+        """Record ``state`` as this agent's privacy state; False if the write failed.
+
+        An agent with no database bound (a harness that skipped the storage
+        boot phase) has nothing to record into.
+        """
+        db = getattr(getattr(self, "_raw_storage", None), "db", None)
+        if db is None:
+            return True
+        try:
+            await write_privacy_state(db, self.agent_id, state)
+        except Exception as exc:  # noqa: BLE001 - the caller refuses or flags the transition
+            logging.error(
+                "Could not record privacy mode %s (%s: %s)",
+                state.mode.value,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        return True
+
+    async def _restore_recorded_privacy_mode(self) -> None:
+        """Boot in the recorded privacy mode (#3554).
+
+        Runs before storage is wrapped and the privacy agent is built, so every
+        state holder starts in the restored mode and no turn can run under
+        another one. See ``kestrel_sovereign.agent.privacy_state``.
+        """
+        db = getattr(self._raw_storage, "db", None)
+        if db is None:
+            return
+        restored = await restore_privacy_state(
+            db, self.agent_id, initial_mode=self._privacy_mode
+        )
+        self._privacy_mode = restored.mode
+        self._privacy_saved_preference = restored.saved_preference
+        if restored.recorded:
+            logging.info("Restored privacy mode: %s", restored.mode.value)
+        if restored.rewrite:
+            # The record does not name the mode this process runs in: it could
+            # not be read, or it was left mid-transition. Record what boot
+            # resolved, whatever the model mandate turns out to be, so a later
+            # boot that can read the record does not come back less
+            # restrictive than this one.
+            if not await self._record_privacy_state(
+                PrivacyState(
+                    mode=restored.mode, saved_preference=restored.saved_preference
+                )
+            ):
+                logging.error(
+                    "Booting in privacy mode %s, which could not be recorded: a "
+                    "later boot that reads the old record may restore a less "
+                    "restrictive mode",
+                    restored.mode.value,
+                )
+
+    async def _reconcile_privacy_model_mandate(self) -> None:
+        """Make the loaded model mandate agree with the restored privacy mode.
+
+        Runs at boot once the persisted model preference is loaded and its
+        persistence is wired (#3554). A local-only mode comes back on a local
+        route. The persisted preference normally is one already; one that is
+        not (a process that stopped before the forced route was persisted, or a
+        mode restored by failing closed) is the mandate the mode displaced, so
+        it is saved first, unless one is saved already. A mode that allows
+        cloud routes but holds a saved mandate restores it.
+        """
+        llm = getattr(self, "llm_service", None)
+        if not llm:
+            return
+        config = privacy_mode_to_config(self._privacy_mode)
+        saved = self._privacy_saved_preference
+        if config.allows_cloud_llm():
+            if saved is None:
+                return
+            self._restore_privacy_displaced_mandate(llm, saved)
+            self._privacy_saved_preference = None
+            # Clear the saved copy only once the restored mandate is persisted;
+            # otherwise the record keeps it and the next boot restores it again.
+            if await self._commit_model_mandate():
+                await self._record_privacy_state(PrivacyState(mode=self._privacy_mode))
+            return
+        current = llm.get_model_preference() or {}
+        if current.get("model") and any(
+            p.get("is_local")
+            and p.get("vendor") == current.get("vendor")
+            and (not current.get("route") or p.get("route") == current.get("route"))
+            for p in (llm.providers or [])
+        ):
+            return
+        if saved is None:
+            saved = SavedModelPreference.from_preference(current)
+            self._privacy_saved_preference = saved
+            await self._record_privacy_state(
+                PrivacyState(mode=self._privacy_mode, saved_preference=saved)
+            )
+        if self._force_privacy_local_route(llm) is None:
+            logging.warning(
+                "Privacy mode %s allows only local LLM routes and none is "
+                "configured; the model preference stays %s and cloud routes "
+                "remain blocked",
+                self._privacy_mode.value,
+                current,
+            )
+            return
+        # The record already holds the displaced mandate, so a forced route
+        # that fails to persist is forced again on the next boot.
+        await self._commit_model_mandate()
 
     async def _apply_privacy_voice_transition(self, config) -> tuple[Optional[dict], Optional[str]]:
         """Apply voice-provider side effects for a privacy-mode transition."""
