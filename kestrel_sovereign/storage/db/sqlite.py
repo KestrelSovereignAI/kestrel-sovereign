@@ -1447,6 +1447,14 @@ class SQLiteBackend(DatabaseBackend):
         self, conn: aiosqlite.Connection, *, error: BaseException | None = None,
     ) -> None:
         """Rollback inline, handing off if cancellation reaches cleanup."""
+        if (error is not None and execution_commit_outcome(error) is not None
+                and isinstance(error.__cause__, asyncio.CancelledError)):
+            # COMMIT uncertainty now has an explicit receipt instead of a raw
+            # cancellation. Its native queue may still be blocked. Preserve
+            # the existing deadline-safe rollback owner rather than awaiting
+            # another operation behind COMMIT before returning that receipt.
+            self._handoff_cancelled_write(conn)
+            return
         try:
             await conn.rollback()
         except asyncio.CancelledError as cleanup_error:

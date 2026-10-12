@@ -244,8 +244,12 @@ async def test_actual_first_admission_control_preserves_durable_unresolved_gener
             "SELECT generation_id FROM stop_active_invocations WHERE generation_id = ?", (recorded[0],),
         )
     finally:
-        await registry.close()
-        await database.close()
+        try:
+            with pytest.raises(BaseException) as closed:
+                await registry.close()
+            assert closed.value is error
+        finally:
+            await database.close()
 
 
 @pytest.mark.asyncio

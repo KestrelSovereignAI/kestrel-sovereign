@@ -106,7 +106,15 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
         assert calls == [True]
         owners = getattr(state, owners_name, {})
         if kind == "ordinary":
-            assert not owners
+            # An adapter's failed close receipt is not positive retirement
+            # proof, even if this test knows its underlying SQLite is closed.
+            # The production owner cannot assume that about arbitrary adapters.
+            assert len(owners) == 1
+            with pytest.raises(OSError) as closed:
+                await drain_unpublished_llm_owners(owners)
+            assert closed.value is failure
+            assert service.has_pending_close_owners()
+            assert calls == [True]
         else:
             assert len(owners) == 1
             (owner,) = owners.values()

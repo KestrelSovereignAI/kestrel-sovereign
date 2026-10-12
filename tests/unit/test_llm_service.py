@@ -252,7 +252,14 @@ async def llm_service(mock_config, mock_mandate_config, mock_provider_registry):
         # Cleanup — also clear so this module doesn't leak cache state to the
         # next test on the worker.
         get_shared_model_cache().clear()
-        await service.close()
+        expected_close_error = getattr(service, "_test_expected_close_error", None)
+        if expected_close_error is None:
+            await service.close()
+        else:
+            with pytest.raises(type(expected_close_error)) as closed:
+                await service.close()
+            assert closed.value is expected_close_error
+            assert service.has_pending_close_owners()
 
 
 # =============================================================================
@@ -3082,10 +3089,12 @@ class TestBackendLifecycle:
 
     @pytest.mark.asyncio
     async def test_close_handles_exceptions_gracefully(self, llm_service):
-        """Test that close() handles exceptions during cleanup."""
+        """A failed native close stays owned and cannot become silent success."""
         # Add a provider with a broken close method
         broken_client = AsyncMock()
-        broken_client.close = AsyncMock(side_effect=Exception("Close failed"))
+        failure = Exception("Close failed")
+        broken_client.close = AsyncMock(side_effect=failure)
+        llm_service._test_expected_close_error = failure
 
         llm_service.providers.append({
             "name": "broken",
@@ -3094,18 +3103,29 @@ class TestBackendLifecycle:
             "model": "test",
         })
 
-        # Should not raise
-        await llm_service.close()
+        with pytest.raises(Exception) as closed:
+            await llm_service.close()
+        assert closed.value is failure
+        assert llm_service.has_pending_close_owners()
+        with pytest.raises(Exception) as closed:
+            await llm_service.wait_for_close_completion()
+        assert closed.value is failure
+        broken_client.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_close_usage_db_runs_when_remote_drain_times_out(self, llm_service):
         llm_service._remote_lease = SimpleNamespace(lease_id="lease-1")
+        failure = LLMServiceError("timed out draining private route")
+        llm_service._test_expected_close_error = failure
         llm_service.deactivate_inference_lease = AsyncMock(
-            side_effect=LLMServiceError("timed out draining private route")
+            side_effect=failure
         )
         llm_service.close_usage_db = AsyncMock()
 
-        await llm_service.close()
+        with pytest.raises(LLMServiceError) as closed:
+            await llm_service.close()
+        assert closed.value is failure
+        assert llm_service.has_pending_close_owners()
 
         llm_service.deactivate_inference_lease.assert_awaited_once_with(
             "lease-1",

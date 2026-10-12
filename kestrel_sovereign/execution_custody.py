@@ -235,7 +235,7 @@ _CURRENT_CUSTODY: ContextVar[tuple[ExecutionCustody, ...]] = ContextVar(
     "kestrel_execution_custody", default=(),
 )
 _CLEANUP_ONLY: ContextVar[bool] = ContextVar("kestrel_execution_cleanup_only", default=False)
-_NATIVE_RESPONSE_SINK: ContextVar[Callable[[Any], None] | None] = ContextVar(
+_NATIVE_RESPONSE_SINK: ContextVar["NativeExecutionStreamOwner | None"] = ContextVar(
     "kestrel_native_response_sink", default=None,
 )
 
@@ -523,16 +523,25 @@ def retain_native_execution_http_client_close(client: Any) -> None:
         retain_native_execution_stream_close(response)
         sink = _NATIVE_RESPONSE_SINK.get()
         if sink is not None:
-            sink(response)
+            sink.retain(response)
         # Retain first so denial during SDK entry/error-body reading still
         # has an owner that physically closes the acquired native response.
-        require_execution_work()
+        require_original_native_work()
 
     async def require_request_authority(request):
         # A native SDK must not spend an already-revoked admission, even if
         # a caller enabled internal retry or automatic function-call dispatch.
         # Check THAT request's active scope, never the client's first caller.
-        require_execution_work()
+        require_original_native_work()
+
+    def require_original_native_work():
+        try:
+            require_execution_work()
+        except BaseException as original:
+            sink = _NATIVE_RESPONSE_SINK.get()
+            if sink is not None:
+                sink.control = execution_terminal_error(sink.control, original)
+            raise
 
     # A caller's existing observer may itself read/close the response, or
     # cancellation may land while it awaits. Own the body before ANY observer.
@@ -570,6 +579,7 @@ class NativeExecutionStreamOwner:
 
     def __init__(self):
         self.handles = []
+        self.control = None
 
     def retain(self, handle):
         if not any(handle is existing for existing in self.handles):
@@ -577,7 +587,9 @@ class NativeExecutionStreamOwner:
         return handle
 
     async def close(self, original=None):
-        terminal = original
+        # SDKs can wrap a hook's original denial as APIConnectionError. The
+        # physical response owner retains the exact pre-normalization receipt.
+        terminal = execution_terminal_error(self.control, original)
         for handle in reversed(self.handles):
             try:
                 await close_native_execution_stream(handle)
@@ -593,7 +605,7 @@ async def native_execution_response_owner(client: Any):
     """Own hidden native responses through acquisition, reading and failure."""
     retain_native_execution_http_client_close(client)
     owner = NativeExecutionStreamOwner()
-    token = _NATIVE_RESPONSE_SINK.set(owner.retain)
+    token = _NATIVE_RESPONSE_SINK.set(owner)
     try:
         yield owner
     finally:

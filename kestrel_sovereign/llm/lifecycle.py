@@ -32,6 +32,12 @@ def start_llm_close_task(owner, key, operation):
         if tasks.get(key) is done:
             if error is None or is_execution_control_error(error):
                 tasks[key] = None
+            elif key in ("preference-writers", "modality-writers"):
+                # This task joins writers; it is not a native resource close.
+                # A bounded join may have been cancelled while its original
+                # writers remained live. A later wrapper can join those SAME
+                # writers, without repeating a write or native close.
+                tasks.pop(key)
             # An ordinary native failure is not proof that every transport
             # resource retired. Keep the exact failed owner; never replace it
             # with a speculative second close or advertise release.

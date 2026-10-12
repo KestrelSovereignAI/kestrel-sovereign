@@ -1948,6 +1948,7 @@ async def test_boot_rollback_stops_owner_registered_at_sqlite_commit_cancellatio
     the real boot rollback seam (rather than only dispatcher shutdown) to
     prove an ambiguous registration cannot leave a live runtime owner behind.
     """
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
     from kestrel_sovereign.signals import (
         OrderedLockManager,
         SignalDispatcher,
@@ -1994,8 +1995,10 @@ async def test_boot_rollback_stops_owner_registered_at_sqlite_commit_cancellatio
     try:
         connection.commit = cancel_after_committed_owner_registration
         dispatcher._durable_store.register_runtime_owner = register_with_armed_commit
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(ExecutionCommitOutcomeError) as receipt:
             await dispatcher.initialize_durable_delivery()
+        assert receipt.value.commit_outcome == "unknown"
+        assert isinstance(receipt.value.__cause__, asyncio.CancelledError)
 
         assert dispatcher._durable_initialized is False
         assert dispatcher._durable_runtime_owner_registered is False

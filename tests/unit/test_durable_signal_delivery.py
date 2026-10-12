@@ -5479,6 +5479,7 @@ async def test_real_sqlite_commit_boundary_repairs_ambiguous_persistence_outcome
     owner/token capability instead of trusting that callback as proof of a
     rollback.
     """
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
     from kestrel_sovereign.privacy import get_privacy_preset
 
     backend, agent, dispatcher = await _dispatcher(
@@ -5522,7 +5523,7 @@ async def test_real_sqlite_commit_boundary_repairs_ambiguous_persistence_outcome
             if failure_kind == "cancelled"
             else _PostCommitAbort
         )
-        with pytest.raises(expected):
+        with pytest.raises(ExecutionCommitOutcomeError) as receipt:
             await dispatcher.dispatch_signal(
                 _signal(
                     agent_id=agent.did,
@@ -5530,6 +5531,8 @@ async def test_real_sqlite_commit_boundary_repairs_ambiguous_persistence_outcome
                 ),
                 source_event_id=f"sqlite-commit-boundary-{failure_kind}",
             )
+        assert receipt.value.commit_outcome == "unknown"
+        assert isinstance(receipt.value.__cause__, expected)
 
         # The repair is awaited before the original error/cancellation escapes:
         # no raw sidecar and no initial reservation can outlive this boundary.

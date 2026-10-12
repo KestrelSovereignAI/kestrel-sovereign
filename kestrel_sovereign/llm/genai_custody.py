@@ -106,7 +106,7 @@ async def genai_stream_owner(client):
     prepare_genai_client(client)
     owner = _StreamOwner()
     token = _OWNER.set(owner)
-    sink_token = _NATIVE_RESPONSE_SINK.set(owner.retain)
+    sink_token = _NATIVE_RESPONSE_SINK.set(owner)
     try:
         yield owner
     finally:

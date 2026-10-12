@@ -1493,9 +1493,18 @@ async def test_relay_compares_only_inventory_captured_before_poll(tmp_path):
     original_poll = store.poll_owner
     snapshot_taken = asyncio.Event()
     release_snapshot = asyncio.Event()
+    park_relay = False
+    parked = asyncio.Event()
+    park = asyncio.Event()
 
     async def pause_after_snapshot(*args, **kwargs):
         result = await original_poll(*args, **kwargs)
+        if park_relay:
+            # This inventory test does not inject COMMIT uncertainty during
+            # shutdown. Retire the relay at a proven post-native-poll barrier;
+            # native cancellation/unknown receipts have separate coverage.
+            parked.set()
+            await park.wait()
         snapshot_taken.set()
         await release_snapshot.wait()
         return result
@@ -1515,6 +1524,8 @@ async def test_relay_compares_only_inventory_captured_before_poll(tmp_path):
         await asyncio.sleep(0.05)
 
         assert registry._lease_lost is False
+        park_relay = True
+        await asyncio.wait_for(parked.wait(), timeout=30)
     finally:
         release_snapshot.set()
         store.poll_owner = original_poll

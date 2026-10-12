@@ -985,6 +985,7 @@ class TestSQLiteBackend:
         self, tmp_path
     ):
         """A stale diagnostic snapshot cannot drive a later application write."""
+        from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
         backend = SQLiteBackend(str(tmp_path / "cancelled-commit-read.db"))
         await backend.connect()
         await backend.execute(
@@ -1017,8 +1018,10 @@ class TestSQLiteBackend:
                         await asyncio.sleep(0.005)
 
                 timed_out_write.cancel()
-                with pytest.raises(asyncio.CancelledError):
+                with pytest.raises(ExecutionCommitOutcomeError) as receipt:
                     await timed_out_write
+                assert receipt.value.commit_outcome == "unknown"
+                assert isinstance(receipt.value.__cause__, asyncio.CancelledError)
                 drain = backend._cancelled_write_drain
                 assert drain is not None and not drain.done()
 

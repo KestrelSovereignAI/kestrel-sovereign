@@ -5307,13 +5307,17 @@ No other text or formatting.
 
     def has_pending_close_owners(self) -> bool:
         """Physical cleanup dependency, including writers on borrowed storage."""
-        owners = [
+        writers = [
             *vars(self).get("_preference_persistence_tasks", ()),
             *vars(self).get("_modality_record_tasks", ()),
-            *(task for task in vars(self).get("_llm_close_tasks", {}).values()
-              if task is not None),
         ]
-        return any(not task.done() or owned_task_error(task) is not None for task in owners)
+        closers = [task for key, task in vars(self).get("_llm_close_tasks", {}).items()
+                   if task is not None and key not in ("preference-writers", "modality-writers")]
+        # A finished writer has physically released its borrowed storage even
+        # when its ordinary write failed. A failed transport close has NOT
+        # proved resource retirement. Canonical controls are retained separately.
+        return (any(not task.done() for task in writers)
+                or any(not task.done() or owned_task_error(task) is not None for task in closers))
 
     async def wait_for_close_completion(self) -> None:
         """Join exact native owners before a host retires their borrowed storage.
@@ -5325,13 +5329,21 @@ No other text or formatting.
         while True:
             owners = set(vars(self).get("_preference_persistence_tasks", ()))
             owners.update(vars(self).get("_modality_record_tasks", ()))
-            owners.update(task for task in vars(self).get("_llm_close_tasks", {}).values()
-                          if task is not None)
+            closing = vars(self).get("_llm_close_tasks", {})
+            resource_closers = {task for key, task in closing.items()
+                                if task is not None and key not in ("preference-writers", "modality-writers")}
+            owners.update(task for task in closing.values() if task is not None)
             if not owners:
                 break
             for task in owners:
                 outcome = await await_owned_task(task)
-                failure = execution_terminal_error(outcome.error, outcome.cancellation)
+                # Joining the original caller remains cancellation-sensitive.
+                # An already-finished ordinary writer failure is not live
+                # cleanup debt; native resource failures remain unreleased.
+                error = outcome.error
+                if task not in resource_closers and error is not None and not is_execution_control_error(error):
+                    error = None
+                failure = execution_terminal_error(error, outcome.cancellation)
                 if failure is not None:
                     terminal = execution_terminal_error(terminal, failure)
             # Completion callbacks drop settled task graphs. Allow every
