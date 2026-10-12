@@ -36,23 +36,28 @@ def _feature(receipts):
 @pytest.mark.asyncio
 async def test_import_without_a_receipt_never_reads_the_host_cache():
     """A restore with no receipt (a fresh host, #2873) may read only IPFS,
-    and only an encrypted envelope is accepted from it."""
+    and only an encrypted export is accepted from it."""
     feature = _feature(receipts=[])
     with patch("kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter") as adapter_cls:
         adapter_cls.return_value.retrieve_content = MagicMock(side_effect=ValueError(f"Content not found: {HASH}"))
         result = await feature.import_sovereignty(HASH)
     assert result.status.value == "error"
     adapter_cls.return_value.retrieve_content.assert_called_once_with(
-        HASH, ipfs_cid=HASH, allow_local_cache=False, envelope=EnvelopePolicy.REQUIRE
+        HASH, ipfs_cid=HASH, allow_local_cache=False, envelope=EnvelopePolicy.ENCRYPTED_ONLY
     )
     feature.agent.storage.restore_from_backup_blob.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_import_without_a_receipt_cannot_restore_a_cached_export(tmp_path, monkeypatch):
-    """Another agent's never-published export sits in the host cache, sealed
-    under the host key every co-hosted agent shares. Naming its content hash
-    with no receipt must not restore it: the cache does not answer."""
+@pytest.mark.parametrize("seal_envelope", [True, False], ids=["envelope", "legacy"])
+async def test_import_without_a_receipt_cannot_restore_a_cached_export(
+    tmp_path, monkeypatch, seal_envelope
+):
+    """Another agent's never-published export sits in the host cache,
+    encrypted under the host key every co-hosted agent shares. Naming its
+    content hash with no receipt must not restore it: the cache does not
+    answer. A legacy export is the sharper case, because the configured key
+    does decrypt it under that name (#2873)."""
     from cryptography.fernet import Fernet
 
     monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
@@ -65,7 +70,7 @@ async def test_import_without_a_receipt_cannot_restore_a_cached_export(tmp_path,
             b"another agent's history",
             storage_tier=StorageTier.LOCAL_ONLY,
             encrypt=True,
-            seal_envelope=True,
+            seal_envelope=seal_envelope,
         )
         feature = _feature(receipts=[])
         result = await feature.import_sovereignty(stored.content_hash)

@@ -1,0 +1,385 @@
+"""An encrypted sovereignty export restores on a fresh host (#2873).
+
+The disaster a backup exists for is the loss of the host or its database, and
+with it the ``backup_artifact`` record that used to hold the only copy of an
+encrypted export's key hash. Every test here exports through
+``SovereigntyFeature.export_sovereignty`` and restores through
+``SovereigntyFeature.import_sovereignty`` alone: nothing calls
+``retrieve_content(key_hash=...)``, which is how an earlier attempt passed
+without ever exercising the gap.
+
+The "fresh host" is a second database, created empty, and a second working
+directory, so the export host's ``storage_cache`` is out of reach. IPFS is an
+in-memory Kubo daemon answering the three RPCs ``FilecoinAdapter`` makes.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import zlib
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from cryptography.fernet import Fernet
+
+from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.features.sovereignty.feature import (
+    REFUSAL_DECRYPTION_FAILED,
+    REFUSAL_ENCRYPTION_KEY_MISMATCH,
+    REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE,
+    REFUSAL_UNENCRYPTED_WITHOUT_RECEIPT,
+    SovereigntyFeature,
+)
+from kestrel_sovereign.filecoin_adapter import (
+    ENVELOPE_MAGIC,
+    FilecoinAdapter,
+    StorageTier,
+)
+from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.storage import Storage
+from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+AGENT_DID = "did:pkh:eip155:1:0x2873fresh"
+MESSAGES = [
+    ("user", "my sister's name is Ingrid"),
+    ("assistant", "I'll remember that your sister is Ingrid."),
+    ("user", "and the spare key is under the blue pot"),
+]
+
+
+class _Response:
+    def __init__(self, status_code: int, *, body: bytes = b"", json_body=None):
+        self.status_code = status_code
+        self.content = body
+        self.headers = {"Content-Length": str(len(body))}
+        self._json = json_body
+
+    def json(self):
+        return self._json
+
+    def iter_content(self, chunk_size=65536):
+        for start in range(0, len(self.content), chunk_size):
+            yield self.content[start:start + chunk_size]
+
+    def close(self):
+        pass
+
+
+class _FakeKubo:
+    """An in-memory IPFS daemon: ``version``, ``add`` and ``cat``."""
+
+    def __init__(self):
+        self.blocks: dict[str, bytes] = {}
+
+    def post(self, url, *, files=None, params=None, timeout=None, stream=False):
+        rpc = url.split("/api/v0/", 1)[1]
+        if rpc == "version":
+            return _Response(200, json_body={"Version": "0.0.0-test"})
+        if rpc == "add":
+            payload = files["file"][1]
+            data = payload.read() if hasattr(payload, "read") else payload
+            cid = "bafy" + hashlib.sha256(data).hexdigest()
+            self.blocks[cid] = data
+            return _Response(200, json_body={"Hash": cid})
+        if rpc == "cat":
+            data = self.blocks.get(params["arg"])
+            if data is None:
+                return _Response(500, body=b"block not found")
+            return _Response(200, body=data)
+        raise AssertionError(f"unexpected Kubo RPC {rpc}")
+
+    def payload(self, cid: str) -> bytes:
+        """The decompressed payload an export put on IPFS."""
+        return zlib.decompress(self.blocks[cid])
+
+    def replace_payload(self, cid: str, payload: bytes) -> None:
+        self.blocks[cid] = zlib.compress(payload)
+
+
+@pytest.fixture
+def kubo():
+    daemon = _FakeKubo()
+    with patch("kestrel_sovereign.filecoin_adapter.requests.post", side_effect=daemon.post):
+        yield daemon
+
+
+@pytest.fixture
+def data_key(monkeypatch):
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("KESTREL_DATA_KEY", key)
+    return key
+
+
+@asynccontextmanager
+async def _host(directory, monkeypatch):
+    """One host: its own working directory (so its own ``storage_cache``)
+    and its own database, wrapped the way ``KestrelAgent`` wraps it."""
+    directory.mkdir()
+    monkeypatch.chdir(directory)
+    raw = Storage(str(directory / "kestrel_prime.db"), agent_id=AGENT_DID)
+    await raw.initialize()
+    wallet = MagicMock()
+    wallet.can_afford.return_value = True
+    wallet.transfer = AsyncMock()
+    agent = SimpleNamespace(
+        agent_id=AGENT_DID,
+        storage=PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL),
+        features={},
+        wallet=wallet,
+    )
+    try:
+        yield agent, raw
+    finally:
+        await raw.close()
+
+
+async def _export(tmp_path, monkeypatch, *, encrypt=True):
+    """Export a known history from the origin host; return the CID."""
+    async with _host(tmp_path / "origin", monkeypatch) as (agent, raw):
+        for role, content in MESSAGES:
+            await raw.add_conversation(role, content, metadata={})
+        result = await SovereigntyFeature(agent).export_sovereignty(
+            storage_tier="ipfs", encrypt=encrypt
+        )
+    assert result.status is ToolResultStatus.OK, result
+    assert result.data["tier"] == "ipfs"
+    assert result.data["encrypted"] is encrypt
+    return result.data["cid"]
+
+
+async def _history(raw):
+    return [(m["role"], m["content"]) for m in await raw.get_conversation_history()]
+
+
+@pytest.mark.asyncio
+async def test_encrypted_export_restores_into_a_fresh_database(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    cid = await _export(tmp_path, monkeypatch)
+
+    # What travels is ciphertext in the envelope, never the history.
+    payload = kubo.payload(cid)
+    assert payload.startswith(ENVELOPE_MAGIC)
+    assert b"blue pot" not in payload
+
+    async with _host(tmp_path / "fresh", monkeypatch) as (agent, raw):
+        # The disaster case: this database has never heard of the export.
+        assert await agent.storage.get_nodes_by_type("backup_artifact") == []
+        assert await _history(raw) == []
+
+        result = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert result.status is ToolResultStatus.OK, result
+        assert result.data["messages_restored"] == len(MESSAGES)
+        assert await _history(raw) == MESSAGES
+
+
+@pytest.mark.asyncio
+async def test_restore_under_another_key_names_the_mismatch_and_restores_nothing(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    cid = await _export(tmp_path, monkeypatch)
+    monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
+
+    async with _host(tmp_path / "fresh", monkeypatch) as (agent, raw):
+        result = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["refusal"] == REFUSAL_ENCRYPTION_KEY_MISMATCH
+        export_key_id = result.data["export_key_id"]
+        configured_key_id = result.data["configured_key_id"]
+        assert export_key_id != configured_key_id
+        assert export_key_id in result.error and configured_key_id in result.error
+        assert "Nothing was restored" in result.error
+        assert await _history(raw) == []
+
+
+def _tamper_key_hash(payload: bytes) -> bytes:
+    """Flip one hex digit of the header's key hash, keeping it canonical."""
+    start = payload.index(b'"key_hash":"') + len(b'"key_hash":"')
+    digit = payload[start:start + 1]
+    replacement = b"0" if digit != b"0" else b"1"
+    return payload[:start] + replacement + payload[start + 1:]
+
+
+def _tamper_version(payload: bytes) -> bytes:
+    return payload.replace(b'"version":1', b'"version":2', 1)
+
+
+def _tamper_token(payload: bytes) -> bytes:
+    flipped = b"A" if payload[-10:-9] != b"A" else b"B"
+    return payload[:-10] + flipped + payload[-9:]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper",
+    [_tamper_key_hash, _tamper_version, _tamper_token],
+    ids=["header-key-hash", "header-version", "ciphertext"],
+)
+async def test_tampered_envelope_is_refused_and_restores_nothing(
+    tmp_path, monkeypatch, kubo, data_key, tamper
+):
+    cid = await _export(tmp_path, monkeypatch)
+    original = kubo.payload(cid)
+    tampered = tamper(original)
+    assert tampered != original
+    kubo.replace_payload(cid, tampered)
+
+    async with _host(tmp_path / "fresh", monkeypatch) as (agent, raw):
+        result = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["refusal"] == REFUSAL_DECRYPTION_FAILED
+        assert "Nothing was restored" in result.error
+        assert await _history(raw) == []
+
+
+async def _legacy_export(agent, raw):
+    """An encrypted export as written before the envelope (#2873): the same
+    adapter call without ``seal_envelope``, receipted the same way."""
+    for role, content in MESSAGES:
+        await raw.add_conversation(role, content, metadata={})
+    blob = await agent.storage.create_backup_blob(include_db=True)
+    result = FilecoinAdapter().store_content(
+        blob, storage_tier=StorageTier.IPFS, encrypt=True, metadata={"agent": AGENT_DID}
+    )
+    assert result.encrypted and result.ipfs_cid
+    await agent.storage.record_backup_artifact(AGENT_DID, result)
+    return result.ipfs_cid
+
+
+@pytest.mark.asyncio
+async def test_legacy_export_still_restores_with_its_backup_receipt(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    async with _host(tmp_path / "origin", monkeypatch) as (agent, raw):
+        cid = await _legacy_export(agent, raw)
+        assert not kubo.payload(cid).startswith(ENVELOPE_MAGIC)
+        # Data loss that keeps the graph: the receipt still holds the key hash.
+        await raw.db.execute_commit("DELETE FROM conversation_history")
+
+        result = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert result.status is ToolResultStatus.OK, result
+        assert result.data["messages_restored"] == len(MESSAGES)
+        assert await _history(raw) == MESSAGES
+
+
+@pytest.mark.asyncio
+async def test_legacy_export_without_its_receipt_is_refused_not_restored_as_ciphertext(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    """Requested by its IPFS CID, a legacy export has no key to try: the key
+    derives from its content hash, which neither the payload nor the CID
+    carries."""
+    async with _host(tmp_path / "origin", monkeypatch) as (agent, raw):
+        cid = await _legacy_export(agent, raw)
+
+    async with _host(tmp_path / "fresh", monkeypatch) as (agent, raw):
+        result = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["refusal"] == REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE
+        assert result.data["decryption_attempted"] is False
+        assert "legacy encrypted export" in result.error
+        assert await _history(raw) == []
+
+
+async def _legacy_export_named_by_content_hash(tmp_path, monkeypatch, kubo):
+    """A legacy export the IPFS node also answers for under its content hash:
+    the name ``export_sovereignty`` reports as the CID of an export no IPFS
+    node returned a CID for, and the only record-free source of the key hash
+    a legacy payload's key derives from."""
+    async with _host(tmp_path / "origin", monkeypatch) as (agent, raw):
+        cid = await _legacy_export(agent, raw)
+        [receipt] = await agent.storage.get_nodes_by_type("backup_artifact")
+    # A backup_artifact node is keyed by its content hash.
+    content_hash = receipt.node_id
+    assert content_hash != cid and len(content_hash) == 64
+    assert not kubo.payload(cid).startswith(ENVELOPE_MAGIC)
+    kubo.blocks[content_hash] = kubo.blocks[cid]
+    return content_hash
+
+
+@pytest.mark.asyncio
+async def test_legacy_export_without_its_receipt_decrypts_with_the_configured_key(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    content_hash = await _legacy_export_named_by_content_hash(tmp_path, monkeypatch, kubo)
+
+    async with _host(tmp_path / "fresh", monkeypatch) as (agent, raw):
+        assert await agent.storage.get_nodes_by_type("backup_artifact") == []
+
+        result = await SovereigntyFeature(agent).import_sovereignty(content_hash)
+
+        assert result.status is ToolResultStatus.OK, result
+        assert result.data["messages_restored"] == len(MESSAGES)
+        assert await _history(raw) == MESSAGES
+
+
+@pytest.mark.asyncio
+async def test_legacy_export_the_configured_key_cannot_decrypt_is_refused(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    content_hash = await _legacy_export_named_by_content_hash(tmp_path, monkeypatch, kubo)
+    monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
+
+    async with _host(tmp_path / "fresh", monkeypatch) as (agent, raw):
+        result = await SovereigntyFeature(agent).import_sovereignty(content_hash)
+
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["refusal"] == REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE
+        assert result.data["decryption_attempted"] is True
+        assert "legacy encrypted export" in result.error
+        assert "Nothing was restored" in result.error
+        assert await _history(raw) == []
+
+
+@pytest.mark.asyncio
+async def test_unencrypted_export_without_its_receipt_is_still_refused(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    """Plaintext exports are unchanged: without a receipt nothing vouches
+    for them, so a fresh database does not take one."""
+    cid = await _export(tmp_path, monkeypatch, encrypt=False)
+
+    async with _host(tmp_path / "fresh", monkeypatch) as (agent, raw):
+        result = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["refusal"] == REFUSAL_UNENCRYPTED_WITHOUT_RECEIPT
+        assert await _history(raw) == []
+
+
+@pytest.mark.asyncio
+async def test_envelope_substituted_under_a_receipt_is_refused(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    """A receipt names the export it vouches for. Another export sealed under
+    the same host key decrypts just as readily, so the receipt's key hash
+    must bind the envelope it is handed."""
+    async with _host(tmp_path / "origin", monkeypatch) as (agent, raw):
+        for role, content in MESSAGES:
+            await raw.add_conversation(role, content, metadata={})
+        feature = SovereigntyFeature(agent)
+        first = await feature.export_sovereignty(storage_tier="ipfs", encrypt=True)
+        await raw.add_conversation("user", "a later message", metadata={})
+        second = await feature.export_sovereignty(storage_tier="ipfs", encrypt=True)
+        first_cid, second_cid = first.data["cid"], second.data["cid"]
+        assert first_cid != second_cid
+        kubo.replace_payload(first_cid, kubo.payload(second_cid))
+        await raw.db.execute_commit("DELETE FROM conversation_history")
+        # The receipt read must not be satisfied by a cached copy.
+        for cached in (tmp_path / "origin" / "storage_cache").glob("*.cache"):
+            cached.unlink()
+
+        result = await feature.import_sovereignty(first_cid)
+
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["refusal"] == REFUSAL_DECRYPTION_FAILED
+        assert second.data["content_hash"] in result.error
+        assert first.data["content_hash"] in result.error
+        assert await _history(raw) == []

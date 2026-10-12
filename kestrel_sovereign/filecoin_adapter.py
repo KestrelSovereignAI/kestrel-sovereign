@@ -128,28 +128,35 @@ _FERNET_TOKEN_PREFIX = b"gAAAAA"
 
 
 class EnvelopePolicy(Enum):
-    """How ``FilecoinAdapter.retrieve_content`` treats an encrypted envelope.
+    """How ``FilecoinAdapter.retrieve_content`` treats what it retrieved.
 
     ``IGNORE`` never reads the payload as an envelope. ``OPEN`` opens an
-    envelope from its own header, and takes any other payload down the
-    ``key_hash`` path. ``REQUIRE`` accepts an envelope and nothing else.
+    envelope from its own header and decrypts other ciphertext with
+    ``key_hash``; legacy ciphertext that arrives without one is tried with the
+    configured key under the name it was retrieved by, and plaintext is
+    returned. ``ENCRYPTED_ONLY`` treats ciphertext as ``OPEN`` does and
+    refuses plaintext.
     """
 
     IGNORE = "ignore"
     OPEN = "open"
-    REQUIRE = "require"
+    ENCRYPTED_ONLY = "encrypted_only"
 
 
-class EncryptedEnvelopeError(ValueError):
+class EncryptedContentError(ValueError):
+    """Retrieved ciphertext could not be decrypted; none of it was returned."""
+
+
+class DecryptionKeyUnavailableError(EncryptedContentError):
+    """No master key is configured to decrypt the retrieved ciphertext with."""
+
+
+class EncryptedEnvelopeError(EncryptedContentError):
     """An encrypted envelope could not be opened; nothing was decrypted."""
 
 
 class EnvelopeFormatError(EncryptedEnvelopeError):
     """The envelope header is malformed or names a format this build cannot read."""
-
-
-class EnvelopeKeyUnavailableError(EncryptedEnvelopeError):
-    """No master key is configured to open an encrypted envelope with."""
 
 
 class EnvelopeKeyMismatchError(EncryptedEnvelopeError):
@@ -168,21 +175,33 @@ class EnvelopeDecryptionError(EncryptedEnvelopeError):
     """The envelope failed authentication or its plaintext failed its digest."""
 
 
-class UnsealedContentError(ValueError):
-    """The payload is not an encrypted envelope and cannot be accepted as one.
+class LegacyDecryptionUnavailableError(EncryptedContentError):
+    """Legacy ciphertext with no key hash on record that the configured key
+    did not decrypt.
 
-    ``legacy_encrypted`` is True when the payload is legacy ciphertext, whose
-    key derives from a content hash it does not carry; False when it is not
-    ciphertext at all.
+    A legacy payload predates the envelope, so it does not carry the content
+    hash its key derives from. ``attempted`` is True when the name it was
+    retrieved by has the shape of that hash and the configured key failed
+    authentication under it; False when the name is not a content hash, so
+    no key could be derived to try.
     """
 
-    def __init__(self, *, legacy_encrypted: bool):
-        self.legacy_encrypted = legacy_encrypted
+    def __init__(self, *, attempted: bool):
+        self.attempted = attempted
         super().__init__(
-            "payload is legacy ciphertext without a self-describing envelope"
-            if legacy_encrypted
-            else "payload is not encrypted"
+            "the configured KESTREL_DATA_KEY does not decrypt it under the "
+            "content hash it was requested by"
+            if attempted
+            else "its key derives from the export's content hash, which "
+            "neither the payload nor the name it was requested by carries"
         )
+
+
+class UnencryptedContentError(ValueError):
+    """The payload is not encrypted, and the policy accepts only ciphertext."""
+
+    def __init__(self) -> None:
+        super().__init__("payload is not encrypted")
 
 
 def is_encrypted_envelope(payload: bytes) -> bool:
@@ -246,7 +265,9 @@ def _parse_envelope(payload: bytes) -> Tuple[Dict[str, Any], bytes, bytes]:
     raw_header = payload[header_start:header_end]
     try:
         header = json.loads(raw_header.decode("ascii"))
-    except (UnicodeDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        # Python 3.11's scanner raises RecursionError, not ValueError, for a
+        # header of nested brackets well inside the length limit.
         raise EnvelopeFormatError("encrypted envelope header is not JSON") from exc
     if not isinstance(header, dict) or header.get("format") != ENVELOPE_FORMAT:
         raise EnvelopeFormatError("encrypted envelope header names no known format")
@@ -518,13 +539,16 @@ class FilecoinAdapter:
         its error whether the name exists (#3225). A caller with no ownership
         record for the name passes False.
 
-        Under ``EnvelopePolicy.OPEN`` or ``REQUIRE`` an encrypted envelope is
-        decrypted from its own header with the configured master key, and
-        ``key_hash`` is not consulted for it. Under ``OPEN`` a payload without
-        an envelope is decrypted with ``key_hash`` as before; legacy
-        ciphertext with no ``key_hash`` raises ``UnsealedContentError``
-        instead of being returned undecrypted. Under ``REQUIRE`` any payload
-        without an envelope raises ``UnsealedContentError``.
+        Under ``EnvelopePolicy.OPEN`` or ``ENCRYPTED_ONLY`` an encrypted
+        envelope is decrypted from its own header with the configured master
+        key; a ``key_hash``, when given, must equal the one the header names.
+        A payload without an envelope is decrypted with ``key_hash`` as
+        before. Legacy ciphertext with no ``key_hash`` is tried with the
+        configured key under ``content_hash`` (see
+        ``_decrypt_legacy_under_name``), and raises
+        ``LegacyDecryptionUnavailableError`` rather than being returned
+        undecrypted. Plaintext is returned under ``OPEN`` and raises
+        ``UnencryptedContentError`` under ``ENCRYPTED_ONLY``.
 
         Args:
             content_hash: SHA256 hash of original content
@@ -589,17 +613,19 @@ class FilecoinAdapter:
                 else:
                     result = decompressed_content
             elif is_encrypted_envelope(decompressed_content):
-                result = self.open_envelope(decompressed_content)
-            elif envelope is EnvelopePolicy.OPEN and key_hash:
-                result = self._decrypt_content(decompressed_content, key_hash)
-            elif envelope is EnvelopePolicy.OPEN and not _is_legacy_ciphertext(
-                decompressed_content
-            ):
-                result = decompressed_content
-            else:
-                raise UnsealedContentError(
-                    legacy_encrypted=_is_legacy_ciphertext(decompressed_content)
+                result = self.open_envelope(
+                    decompressed_content, expected_key_hash=key_hash
                 )
+            elif key_hash:
+                result = self._decrypt_content(decompressed_content, key_hash)
+            elif _is_legacy_ciphertext(decompressed_content):
+                result = self._decrypt_legacy_under_name(
+                    decompressed_content, content_hash
+                )
+            elif envelope is EnvelopePolicy.ENCRYPTED_ONLY:
+                raise UnencryptedContentError()
+            else:
+                result = decompressed_content
 
             if max_output_bytes is not None and len(result) > max_output_bytes:
                 raise ContentRetrievalLimitError(
@@ -743,24 +769,32 @@ class FilecoinAdapter:
         token = AEADCipher(content_key).encrypt(content, aad=prefix)
         return prefix + token, content_hash
 
-    def open_envelope(self, payload: bytes) -> bytes:
+    def open_envelope(self, payload: bytes, *,
+                      expected_key_hash: Optional[str] = None) -> bytes:
         """Decrypt a self-describing envelope with the configured master key.
 
+        ``expected_key_hash`` is the key hash a caller's own record holds for
+        this payload, if it has one. An envelope naming another one is a
+        different export, which the master key every co-hosted agent shares
+        would decrypt just as readily, so it is refused before decryption.
+
         Raises an ``EncryptedEnvelopeError`` subclass, and returns nothing,
-        when the header is malformed, no master key is configured, the
-        envelope names another master key, or the token fails authentication
-        or its plaintext does not hash to the header's ``key_hash``.
+        when the header is malformed or names another key hash than
+        ``expected_key_hash``, the envelope names another master key, or the
+        token fails authentication or its plaintext does not hash to the
+        header's ``key_hash``. Raises ``DecryptionKeyUnavailableError`` when
+        no master key is configured.
         """
         from kestrel_sdk.security.aead import AEADCipher
         from kestrel_sdk.security.exceptions import DecryptionError
 
         header, prefix, token = _parse_envelope(payload)
-        try:
-            master_key = self._get_master_key()
-        except ValueError as exc:
-            raise EnvelopeKeyUnavailableError(
-                "the export is encrypted and no KESTREL_DATA_KEY is configured"
-            ) from exc
+        if expected_key_hash is not None and header["key_hash"] != expected_key_hash:
+            raise EnvelopeDecryptionError(
+                f"the export's envelope names content hash {header['key_hash']}, "
+                f"but the record of this export holds {expected_key_hash}"
+            )
+        master_key = self._require_master_key()
         configured_key_id = envelope_key_id(master_key)
         if header["key_id"] != configured_key_id:
             raise EnvelopeKeyMismatchError(header["key_id"], configured_key_id)
@@ -778,6 +812,48 @@ class FilecoinAdapter:
                 "envelope names"
             )
         return content
+
+    def _decrypt_legacy_under_name(self, payload: bytes, name: str) -> bytes:
+        """Decrypt legacy ciphertext that no record names a key hash for.
+
+        A legacy payload predates the envelope (#2873). Its F187 key is
+        HKDF(master key, salt=content hash), and the payload does not carry
+        that hash. With no record of it, the one candidate is the name the
+        payload was retrieved by, which is that hash when the export is named
+        by it: ``export_sovereignty`` reports the content hash as the CID of
+        an export no IPFS node returned a CID for. An IPFS CID is never a
+        content hash, so a payload retrieved by one has no key to try.
+
+        No key sidecar is read. A pre-F187 export's random key lives only in
+        a ``key_<hash>.key`` sidecar in the host cache, which co-hosted agents
+        share, and a caller without a record of the export may not read that
+        cache (#3225).
+
+        Raises ``LegacyDecryptionUnavailableError`` when the name is not a
+        content hash or the configured key fails authentication under it,
+        and ``DecryptionKeyUnavailableError`` when no master key is
+        configured. The caller still checks the plaintext against the name.
+        """
+        from kestrel_sdk.security.aead import AEADCipher
+        from kestrel_sdk.security.exceptions import DecryptionError
+
+        if not _is_lower_hex(name, 64):
+            raise LegacyDecryptionUnavailableError(attempted=False)
+        master_key = self._require_master_key()
+        content_key = self._derive_content_key(master_key, name)
+        try:
+            return AEADCipher(content_key).decrypt(payload)
+        except DecryptionError as exc:
+            raise LegacyDecryptionUnavailableError(attempted=True) from exc
+
+    def _require_master_key(self) -> bytes:
+        """The master key, or ``DecryptionKeyUnavailableError`` naming its absence."""
+        try:
+            return self._get_master_key()
+        except ValueError as exc:
+            raise DecryptionKeyUnavailableError(
+                "the export is encrypted and no KESTREL_DATA_KEY is configured"
+            ) from exc
 
     def _encrypt_content(self, content: bytes,
                          content_hash: Optional[str] = None) -> Tuple[bytes, str]:

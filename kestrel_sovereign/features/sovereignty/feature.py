@@ -6,13 +6,14 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.filecoin_adapter import (
+    DecryptionKeyUnavailableError,
     EncryptedEnvelopeError,
     EnvelopeKeyMismatchError,
-    EnvelopeKeyUnavailableError,
     EnvelopePolicy,
     FilecoinAdapter,
+    LegacyDecryptionUnavailableError,
     StorageTier,
-    UnsealedContentError,
+    UnencryptedContentError,
 )
 from decimal import Decimal
 from datetime import datetime
@@ -386,10 +387,14 @@ class SovereigntyFeature(Feature):
         An encrypted export carries its decryption metadata in a
         self-describing envelope and decrypts with the configured
         KESTREL_DATA_KEY alone, so it restores on a fresh host whose storage
-        holds no record of it (#2873). A legacy encrypted export, made before
-        the envelope, decrypts only with the key hash in this agent's backup
-        receipt. An export that cannot be decrypted is refused, and none of
-        its bytes reach the restore.
+        holds no record of it (#2873). Without a backup receipt only IPFS is
+        read, never the host cache co-hosted agents share (#3225), and only an
+        encrypted export is restored. A legacy encrypted export, made before
+        the envelope, decrypts with the key hash in this agent's backup
+        receipt; without one the configured key is tried under the name it
+        was requested by, which opens it only when that name is its content
+        hash. An export that cannot be decrypted is refused, and none of its
+        bytes reach the restore.
 
         Scope (#F265): restores ``conversation_history`` faithfully —
         ``created_at`` (ordering) and ``deleted_at`` (trash) are preserved, so
@@ -419,9 +424,10 @@ class SovereigntyFeature(Feature):
                 # A fresh host, or a database lost with its records (#2873).
                 # The host cache still may not answer for a name this agent
                 # holds no receipt for, so only IPFS can, and only an export
-                # sealed in an envelope under the configured key is restored:
-                # holding that key is the authority a restore without a
-                # receipt has. A plaintext or legacy payload proves nothing.
+                # the configured key decrypts is restored: holding that key is
+                # the authority a restore without a receipt has. An envelope
+                # names its own key hash; a legacy export is tried under the
+                # name it was requested by. A plaintext payload proves nothing.
                 logger.info(
                     f"No backup receipt for CID {cid} in this agent's storage; "
                     "restoring an encrypted export from IPFS only"
@@ -431,11 +437,12 @@ class SovereigntyFeature(Feature):
                     cid,
                     ipfs_cid=cid,
                     allow_local_cache=False,
-                    envelope=EnvelopePolicy.REQUIRE,
+                    envelope=EnvelopePolicy.ENCRYPTED_ONLY,
                 )
             else:
-                # The envelope names its own key hash; the receipt's is used
-                # only for a legacy export that has no envelope.
+                # The envelope names its own key hash, and the receipt's must
+                # equal it; a legacy export without an envelope decrypts with
+                # the receipt's, or under its name if the receipt has none.
                 key_hash = receipt.properties.get("encryption_key_hash")
                 logger.info(f"Found backup artifact node for CID {cid}, encrypted: {receipt.properties.get('encrypted')}")
                 content = await asyncio.to_thread(
@@ -467,7 +474,7 @@ class SovereigntyFeature(Feature):
                     "stats": dict(stats) if stats else {},
                 },
             )
-        except EnvelopeKeyUnavailableError:
+        except DecryptionKeyUnavailableError:
             return self._import_refused(
                 cid,
                 REFUSAL_ENCRYPTION_KEY_UNAVAILABLE,
@@ -488,16 +495,16 @@ class SovereigntyFeature(Feature):
                 REFUSAL_DECRYPTION_FAILED,
                 f"it could not be decrypted: {e}",
             )
-        except UnsealedContentError as e:
-            if e.legacy_encrypted:
-                return self._import_refused(
-                    cid,
-                    REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE,
-                    "it is a legacy encrypted export and its decryption "
-                    "metadata is unavailable: it predates the self-describing "
-                    "envelope, and this agent's storage records no key hash "
-                    "for it",
-                )
+        except LegacyDecryptionUnavailableError as e:
+            return self._import_refused(
+                cid,
+                REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE,
+                "it is a legacy encrypted export and its decryption metadata "
+                "is unavailable: it predates the self-describing envelope, "
+                f"this agent's storage records no key hash for it, and {e}",
+                decryption_attempted=e.attempted,
+            )
+        except UnencryptedContentError:
             return self._import_refused(
                 cid,
                 REFUSAL_UNENCRYPTED_WITHOUT_RECEIPT,
