@@ -34,7 +34,10 @@ from kestrel_sovereign.llm.error_handling import (
     LLMAllProvidersFailedError,
     LLMProviderError,
 )
-from kestrel_sovereign.llm.model_cache import SharedModelCache
+from kestrel_sovereign.llm.model_cache import (
+    SharedModelCache,
+    VendorDiscoveryOutcome,
+)
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 from kestrel_sovereign.llm.output_ceiling import attach_stop_reason
 from kestrel_sovereign.llm.service import LLMService, ModelNotAvailableForRoute
@@ -137,18 +140,22 @@ async def outage():
         service = LLMService()
     service._usage_db = None
     service._db_initialized = False
-    # Discovery state is set by each test's outage, never inherited from a
-    # disk cache restored at construction.
-    service._discovery_failures = {}
-    service._note_discovery_outcome("anthropic", _DISCOVERY_ERROR)
 
+    # The reduced catalog, published with the anthropic discovery failure
+    # that produced it: the two are one snapshot (#3197).
     catalog = SharedModelCache()
-    catalog.set(_REDUCED_CATALOG)
+    catalog.set(_REDUCED_CATALOG, outcomes={
+        "anthropic": VendorDiscoveryOutcome.failed(
+            f"{type(_DISCOVERY_ERROR).__name__}: {_DISCOVERY_ERROR}"
+        ),
+    })
     with patch(
         "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
         return_value=catalog,
     ):
-        yield SimpleNamespace(service=service, attempts=attempts, adapters=adapters)
+        yield SimpleNamespace(
+            service=service, attempts=attempts, adapters=adapters, catalog=catalog,
+        )
     await service.close()
 
 
@@ -268,7 +275,9 @@ class TestNonPersistedSelectionsKeepTheGuard:
         self, outage
     ):
         """The stale wording is earned by a recorded failure, not assumed."""
-        outage.service._note_discovery_outcome("anthropic", None)
+        outage.catalog.set(
+            _REDUCED_CATALOG, outcomes={"anthropic": VendorDiscoveryOutcome.ok()}
+        )
 
         with pytest.raises(LLMAllProvidersFailedError) as caught:
             await outage.service.get_response(
@@ -337,7 +346,9 @@ class TestTheAuditStillFailsClosedButNamesTheStaleCatalog:
 
     @pytest.mark.asyncio
     async def test_without_a_discovery_failure_the_reason_is_unchanged(self, outage):
-        outage.service._note_discovery_outcome("anthropic", None)
+        outage.catalog.set(
+            _REDUCED_CATALOG, outcomes={"anthropic": VendorDiscoveryOutcome.ok()}
+        )
         await _replay_persisted(outage.service, VENDOR_WIDE_PIN)
 
         verdict = await outage.service.get_audit_response(

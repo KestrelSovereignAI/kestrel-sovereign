@@ -950,7 +950,17 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
     actually at risk. Neither is critical in
     :func:`derive_overall_status`, so this reports ``degraded`` rather than
     taking the host to ``unhealthy`` for a catalog problem.
+
+    The outcome is read from the process-wide catalog snapshot, not from the
+    service that happened to run discovery (#3197): every agent on a host reads
+    the same catalog, so every agent reports the same failures for it, and the
+    next refresh by any of them replaces the reading for all.
     """
+    from kestrel_sovereign.llm.model_cache import (
+        DiscoveryStatus,
+        get_shared_model_cache,
+    )
+
     start = time.monotonic()
 
     llm_service = getattr(agent, "llm_service", None)
@@ -962,12 +972,29 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
             "duration_ms": _elapsed(start),
         }
 
-    failures = getattr(llm_service, "_discovery_failures", None)
-    if not isinstance(failures, dict) or not failures:
+    snapshot = get_shared_model_cache().snapshot()
+    failures = snapshot.discovery_failures if snapshot is not None else {}
+    if not failures:
+        # A standing failure is never missing here: only a refresh retires
+        # it, by requesting the vendor's catalog or by not covering the vendor.
+        # Healthy is claimed only when some vendor's catalog request actually
+        # completed — not for a catalog restored from disk, or a refresh that
+        # issued no request.
+        discovered = snapshot is not None and any(
+            outcome.status is DiscoveryStatus.OK
+            for outcome in snapshot.outcomes.values()
+        )
         return {
             "name": "model_discovery",
             "status": "pass",
-            "message": "Model discovery healthy for all configured vendors",
+            "message": (
+                "Model discovery healthy for every discovered vendor"
+                if discovered
+                else "No vendor's model catalog has been fetched"
+            ),
+            "details": {
+                "catalog_version": snapshot.version if snapshot is not None else None,
+            },
             "duration_ms": _elapsed(start),
         }
 
@@ -1008,7 +1035,14 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
         "status": "fail" if pinned_at_risk else "warn",
         "message": message,
         "details": {
+            "catalog_version": snapshot.version,
             "failed_vendors": {v: failures[v] for v in vendors},
+            # The publication of this snapshot issued no request for these
+            # vendors; the failure is the last one observed for each.
+            "not_reattempted_vendors": [
+                v for v in vendors
+                if snapshot.outcomes[v].status is DiscoveryStatus.NOT_ATTEMPTED
+            ],
             "pinned_vendor": pinned_vendor,
             "pinned_vendor_at_risk": pinned_at_risk,
         },
