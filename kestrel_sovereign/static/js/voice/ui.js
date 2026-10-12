@@ -34,7 +34,7 @@ import { getOrCreateChatPane } from '../ui.js';
 import UI from '../ui-ext/registry.js';
 import bus from '../ui-ext/bus.js';
 import { Events } from './events.js';
-import { createRealtimeClient, normalizeToolBatchResults } from './realtime.js';
+import { createRealtimeClient, normalizeToolBatchResults, readToolBatchResponse } from './realtime.js';
 import { createPipelineClient } from './pipeline.js';
 import {
   applyVoiceCatalogAttribution,
@@ -1337,16 +1337,20 @@ async function handleToolBatch(session, ev) {
       headers: { 'Content-Type': 'application/json', ...await voiceAuthHeaders() },
       body: JSON.stringify({ calls }),
     });
-    const body = await resp.json().catch(() => ({}));
-    if (!resp.ok) {
-      throw new Error(body.detail || `tool dispatch HTTP ${resp.status}`);
-    }
-    results = Array.isArray(body.results) ? body.results : [];
+    results = await readToolBatchResponse(resp, calls);
   } catch (err) {
-    results = calls.map((call) => ({
-      call_id: call.call_id,
-      result: { error: `tool dispatch threw: ${err.message}` },
-    }));
+    // Transport/control failure may follow a committed effect. Never invent
+    // a function error or request a model continuation for that operation.
+    for (const { card, cardDiv } of cards) {
+      card.status = 'error';
+      card.events.push({ phase: 'error', name: card.name, detail: 'Acknowledgement uncertain; reconcile before continuing.' });
+      updateVoiceToolCard(cardDiv, card);
+    }
+    if (session.client === sessionClient) {
+      await sessionClient.close();
+      surfaceFatalError(err, session);
+    }
+    return;
   }
 
   const commitResults = normalizeToolBatchResults(calls, results);

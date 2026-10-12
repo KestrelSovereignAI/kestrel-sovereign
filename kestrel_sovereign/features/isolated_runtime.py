@@ -6051,6 +6051,37 @@ class _ValidatedHostedPrebuiltOverrides:
     venv_bin_path: Optional[Path]
     venv_setting: Optional[str]
     bin_path: Optional[Path]
+    venv_custody_paths: tuple[Path, ...] = ()
+    bin_custody_paths: tuple[Path, ...] = ()
+
+
+def _immutable_prebuilt_custody_paths(value: str, canonical: Path, *, setting: str) -> tuple[Path, ...]:
+    """Retain the configured entry and every required native symlink hop.
+
+    Cleanup does not follow symlinks: preserving only their final targets
+    permits deletion of a launch-critical operator entry inside a workspace.
+    A bounded walk records intermediate links, including links reached from
+    an originally external setting. No path here grants provisioning rights.
+    """
+    current = Path(os.path.abspath(Path(value).expanduser()))
+    required = {current, canonical}
+    for _ in range(64):
+        prefix = Path(current.anchor)
+        for index, component in enumerate(current.parts[1:], 1):
+            prefix /= component
+            if prefix.is_symlink():
+                required.add(prefix)
+                target = prefix.readlink()
+                if not target.is_absolute():
+                    target = prefix.parent / target
+                current = Path(os.path.abspath(target.joinpath(*current.parts[index + 1:])))
+                required.add(current)
+                break
+        else:
+            if current != canonical:
+                raise _hosted_prebuilt_override_error(setting)
+            return tuple(sorted(required))
+    raise _hosted_prebuilt_override_error(setting)
 
 
 def _validate_hosted_process_prebuilt_overrides(
@@ -6101,18 +6132,28 @@ def _validate_hosted_process_prebuilt_overrides(
 
     bin_key = _env_key(feature_name, "BIN")
     bin_value = os.environ.get(bin_key)
+    venv_custody_paths = (
+        _immutable_prebuilt_custody_paths(
+            venv_value if validated_process_venv is not None else runtime_venv,
+            selected_venv_path, setting=selected_venv_setting,
+        ) if selected_venv_path is not None else ()
+    )
     if bin_value:
+        bin_path = _validate_hosted_prebuilt_bin(bin_value, setting=bin_key)
         return _ValidatedHostedPrebuiltOverrides(
             venv_path=selected_venv_path,
             venv_bin_path=selected_venv_bin_path,
             venv_setting=selected_venv_setting,
-            bin_path=_validate_hosted_prebuilt_bin(bin_value, setting=bin_key),
+            bin_path=bin_path,
+            venv_custody_paths=venv_custody_paths,
+            bin_custody_paths=_immutable_prebuilt_custody_paths(bin_value, bin_path, setting=bin_key),
         )
     return _ValidatedHostedPrebuiltOverrides(
         venv_path=selected_venv_path,
         venv_bin_path=selected_venv_bin_path,
         venv_setting=selected_venv_setting,
         bin_path=None,
+        venv_custody_paths=venv_custody_paths,
     )
 
 
@@ -6808,6 +6849,8 @@ class ProxyFeature(Feature):
         self._validated_hosted_immutable_venv_setting: Optional[str] = None
         self._hosted_immutable_venv_custody_unproven = False
         self._validated_hosted_immutable_bin_path: Optional[Path] = None
+        self._validated_hosted_immutable_venv_custody_paths: tuple[Path, ...] = ()
+        self._validated_hosted_immutable_bin_custody_paths: tuple[Path, ...] = ()
         self._hosted_immutable_bin_custody_unproven = False
         # Hosted immutable console wrappers may themselves be operator-facing
         # symlinks. Preparation resolves and validates one exact regular target;
@@ -12438,6 +12481,8 @@ class ProxyFeature(Feature):
             self._validated_hosted_immutable_venv_setting,
             self._hosted_immutable_venv_custody_unproven,
             self._validated_hosted_immutable_bin_path,
+            self._validated_hosted_immutable_venv_custody_paths,
+            self._validated_hosted_immutable_bin_custody_paths,
             self._hosted_immutable_bin_custody_unproven,
             self._validated_hosted_console_path,
         ) = (
@@ -12448,6 +12493,8 @@ class ProxyFeature(Feature):
             validated_venv_setting,
             False,
             resolved_bin if hosted else None,
+            validated_hosted_overrides.venv_custody_paths if validated_hosted_overrides else (),
+            validated_hosted_overrides.bin_custody_paths if validated_hosted_overrides else (),
             False,
             None,
         )
@@ -12522,8 +12569,10 @@ class ProxyFeature(Feature):
         if selected_override is None:
             return False
         runtime_dir = Path(os.path.abspath(self._feature_runtime_dir()))
-        selected_venv = Path(os.path.abspath(selected_override))
-        return selected_venv == runtime_dir or runtime_dir in selected_venv.parents
+        return any(
+            selected == runtime_dir or runtime_dir in selected.parents
+            for selected in (selected_override, *self._validated_hosted_immutable_venv_custody_paths)
+        )
 
     def _immutable_venv_custody_is_unproven(self) -> bool:
         """Whether failed hosted resolution makes workspace custody unknown."""
@@ -12536,8 +12585,10 @@ class ProxyFeature(Feature):
         if selected is None:
             return False
         runtime_dir = Path(os.path.abspath(self._feature_runtime_dir()))
-        selected = Path(os.path.abspath(selected))
-        return selected == runtime_dir or runtime_dir in selected.parents
+        return any(
+            path == runtime_dir or runtime_dir in path.parents
+            for path in (selected, *self._validated_hosted_immutable_bin_custody_paths)
+        )
 
     def _process_venv_is_overridden(self) -> bool:
         """Whether this host selected a process-wide immutable venv artifact."""

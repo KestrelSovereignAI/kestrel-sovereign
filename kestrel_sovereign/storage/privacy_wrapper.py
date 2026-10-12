@@ -26,32 +26,32 @@ import sys
 import threading
 import warnings
 from contextlib import asynccontextmanager, contextmanager
-
-from kestrel_sovereign.storage.session_grouping import (
-    page_grouped_sessions,
-    parse_message_metadata,
-    summarize_sessions,
-)
-from typing import Dict, List, Optional, Any, Sequence, Tuple, Union
+from dataclasses import dataclass, field as dataclass_field
 from enum import Enum
-from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
-from kestrel_sovereign.turn_scope import turn_scoped
 from kestrel_sovereign.deidentification import (
     DEIDENTIFICATION_ASSURANCES,
     DeidentificationResult,
     EvidenceValidationError,
 )
-from kestrel_sovereign.privacy import (
-    PrivacyMode,
-    PrivacyConfig,
-    get_privacy_preset,
-    privacy_mode_to_config,
-    privacy_config_to_mode,
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
 )
-from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
+from kestrel_sovereign.knowledge import IRI, Visibility
+from kestrel_sovereign.privacy import (
+    PrivacyConfig,
+    PrivacyMode,
+    get_privacy_preset,
+    privacy_config_to_mode,
+    privacy_mode_to_config,
+)
+from kestrel_sovereign.storage.agent_resource_store import (
+    SOUL_MARKDOWN_RESOURCE_TYPE,
+)
 from kestrel_sovereign.storage.async_conversation_store import (
     _escape_like_session_value,
     search_session_summaries,
@@ -60,11 +60,14 @@ from kestrel_sovereign.storage.async_graph_store import (
     NodeDeleteResult,
     NodeSwapResult,
 )
-from kestrel_sovereign.storage.agent_resource_store import (
-    SOUL_MARKDOWN_RESOURCE_TYPE,
-)
+from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
 from kestrel_sovereign.storage.semantic_binding import SemanticAssertionBinding
-from kestrel_sovereign.knowledge import IRI, Visibility
+from kestrel_sovereign.storage.session_grouping import (
+    page_grouped_sessions,
+    parse_message_metadata,
+    summarize_sessions,
+)
+from kestrel_sovereign.turn_scope import turn_scoped
 
 # Lazy import to avoid circular dependency with features.privacy
 # Note: This global cache is shared across all instances and async contexts.
@@ -1668,6 +1671,7 @@ class StorePurgeResult:
     outcome: PurgeOutcome
     rows: int = 0
     error: Optional[str] = None
+    control_error: Optional[BaseException] = dataclass_field(default=None, repr=False, compare=False)
 
     @property
     def failed(self) -> bool:
@@ -2715,11 +2719,14 @@ class PrivacyEnforcingStorage:
         """
         try:
             rows = await coro_factory()
-        except Exception as e:  # noqa: BLE001 - every backend failure is retained, not swallowed
+        except BaseException as e:  # every independent original sweep is settled
+            if not is_execution_control_error(e) and not isinstance(e, Exception):
+                raise
             logger.warning(
                 "purge_ephemeral_session: %s purge failed: %s", store, e
             )
-            return StorePurgeResult(store, PurgeOutcome.FAILED, error=repr(e))
+            return StorePurgeResult(store, PurgeOutcome.FAILED, error=repr(e),
+                control_error=e if is_execution_control_error(e) else None)
         n = int(rows or 0)
         return StorePurgeResult(
             store, PurgeOutcome.PURGED if n > 0 else PurgeOutcome.CLEAN, rows=n,
@@ -2853,11 +2860,16 @@ class PrivacyEnforcingStorage:
         # the contract is "leave no trace" of user content, and tool-call args
         # are user content. This sink is NOT a required content store, so a
         # failure here is retained (visible) but does not block mode exit.
+        observability_control = None
         if self._observability_purge is not None:
             obs_counts: Dict[str, int] = {}
             try:
                 obs_counts = await self._observability_purge(since) or {}
-            except Exception as e:  # noqa: BLE001 - retained as non-required outcomes, never clean
+            except BaseException as e:  # retain controls through all independent sweeps
+                if not is_execution_control_error(e) and not isinstance(e, Exception):
+                    raise
+                if is_execution_control_error(e):
+                    observability_control = e
                 # The observability sink is NOT a required content store, so a
                 # failure here does not block mode exit — but it must be RETAINED
                 # (never silently read as a clean 0). A structured
@@ -2929,6 +2941,15 @@ class PrivacyEnforcingStorage:
                 "since %s",
                 agent_id, since,
             )
+
+        terminal = execution_terminal_error(
+            *(result.control_error for result in report.store_results.values()),
+            observability_control,
+        )
+        if terminal is not None:
+            # No string report or retry advice can replace the original native
+            # outcome; all independent sweeps above have still been attempted.
+            raise terminal
 
         # Clear the watermark only when the sweep ran to completion. If a
         # required sweep FAILED, PRESERVE it so a retry (the agent stays in
@@ -4153,6 +4174,8 @@ class PrivacyEnforcingStorage:
                         )
                     )
                 except Exception as error:  # noqa: BLE001
+                    if is_execution_control_error(error):
+                        raise
                     logger.warning(
                         "strategy ledger assertion read failed: %s", error
                     )
@@ -4260,6 +4283,8 @@ class PrivacyEnforcingStorage:
                     operation_id=operation_id,
                 )
         except Exception as error:  # noqa: BLE001 - the YAML write already landed
+            if is_execution_control_error(error):
+                raise
             logger.warning(
                 "strategy ledger assertion %s failed: %s", action, error
             )
@@ -4296,6 +4321,8 @@ class PrivacyEnforcingStorage:
                 ),
             )
         except Exception as error:  # noqa: BLE001
+            if is_execution_control_error(error):
+                raise
             logger.warning("strategy ledger assertion retraction failed: %s", error)
             report.failed += 1
             return
@@ -4316,7 +4343,9 @@ class PrivacyEnforcingStorage:
         if ontology_ref is None:
             try:
                 ontology_ref = ledger_assertions.ontology()
-            except Exception:  # noqa: BLE001
+            except Exception as control_error:  # noqa: BLE001
+                if is_execution_control_error(control_error):
+                    raise
                 return False
         if not ledger_assertions.declares_adapter_markers(held, ontology_ref):
             return False
@@ -4330,6 +4359,8 @@ class PrivacyEnforcingStorage:
         try:
             sources = await self.list_assertion_revision_sources(held.revision_id)
         except Exception as error:  # noqa: BLE001
+            if is_execution_control_error(error):
+                raise
             logger.warning(
                 "strategy ledger assertion provenance read failed: %s", error
             )
@@ -4447,13 +4478,15 @@ class PrivacyEnforcingStorage:
         self._assert_semantic_assertion_write_allowed("Kite invalid import quarantine")
         import hashlib
 
-        from kestrel_sovereign.features.memory_agency.semantic_facts import map_legacy_fact
+        from kestrel_sovereign.features.memory_agency.semantic_facts import (
+            map_legacy_fact,
+        )
         from kestrel_sovereign.knowledge import (
+            XSD_STRING,
             Assertion,
             DirectLineage,
             EpistemicState,
             SourceOccurrence,
-            XSD_STRING,
         )
         from kestrel_sovereign.knowledge.assertion import Literal
         from kestrel_sovereign.knowledge.shacl_validation import (
@@ -4538,7 +4571,10 @@ class PrivacyEnforcingStorage:
 
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
         from kestrel_sovereign.knowledge import (
+            IRI,
+            XSD_STRING,
             Assertion,
             DerivedLineage,
             EpistemicState,
@@ -4546,16 +4582,16 @@ class PrivacyEnforcingStorage:
             GovernedArtifactDeletionOwner,
             GovernedArtifactDeletionProof,
             GovernedCorpusPolicy,
-            IRI,
             Literal,
-            XSD_STRING,
         )
         from kestrel_sovereign.knowledge.kite_erasure_authority import (
             ERASURE_CORE_SNAPSHOT_OPERATION,
             KiteErasureDrillAuthorityError,
             _consume_kite_erasure_drill_capability,
         )
-        from kestrel_sovereign.storage.semantic_vector_projection import SemanticVectorProjectionError
+        from kestrel_sovereign.storage.semantic_vector_projection import (
+            SemanticVectorProjectionError,
+        )
 
         if os.environ.get("KESTREL_KITE_RELEASE_EVIDENCE", "").strip().lower() not in {"1", "true", "yes", "on"}:
             raise PrivacyViolationError("Kite semantic release drill is unavailable")
@@ -5769,6 +5805,8 @@ class PrivacyEnforcingStorage:
                 (row_id, agent_id)
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.debug(
                 "Pin cleanup skipped (memory_pins likely absent): %s", e
             )
@@ -6023,6 +6061,8 @@ class PrivacyEnforcingStorage:
                 (agent_id, agent_id),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.debug(
                 "Pin cleanup skipped (memory_pins likely absent): %s", e
             )

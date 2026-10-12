@@ -557,6 +557,50 @@ async def close_native_execution_stream(stream: Any, owner: Any = None) -> None:
         raise execution_terminal_error(original, outcome.error, outcome.cancellation)
 
 
+class NativeExecutionStreamOwner:
+    """Retain every acquired SDK/native handle until physical retirement.
+
+    A response can be acquired before an SDK context manager enters: its
+    error-body read may fail first. The native response hook registers it
+    here before any observer or read, so failed acquisition still has an owner.
+    """
+
+    def __init__(self):
+        self.handles = []
+
+    def retain(self, handle):
+        if not any(handle is existing for existing in self.handles):
+            self.handles.append(handle)
+        return handle
+
+    async def close(self, original=None):
+        terminal = original
+        for handle in reversed(self.handles):
+            try:
+                await close_native_execution_stream(handle)
+            except BaseException as error:
+                terminal = execution_terminal_error(terminal, error)
+        self.handles.clear()
+        if terminal is not None and (terminal is not original or original is None):
+            raise terminal
+
+
+@asynccontextmanager
+async def native_execution_response_owner(client: Any):
+    """Own hidden native responses through acquisition, reading and failure."""
+    retain_native_execution_http_client_close(client)
+    owner = NativeExecutionStreamOwner()
+    token = _NATIVE_RESPONSE_SINK.set(owner.retain)
+    try:
+        yield owner
+    finally:
+        original = sys.exc_info()[1]
+        try:
+            await owner.close(original)
+        finally:
+            _NATIVE_RESPONSE_SINK.reset(token)
+
+
 @asynccontextmanager
 async def owned_native_http_client(client: Any):
     """Own a temporary client through physical pool/transport retirement.
@@ -706,8 +750,6 @@ class _ExecutionForwarder:
     """
 
     def __init__(self, owner: Any, stream: AsyncIterator[Any]):
-        from kestrel_sovereign._async_ownership import OwnedAsyncIterator
-
         self._runtime_owner = owner
         self._source = aiter(stream)
         self._scopes = current_execution_custody(owner)
@@ -721,9 +763,10 @@ class _ExecutionForwarder:
         # The turn/session and privacy-reentry carriers above suffice for
         # source work. Do not delegate CONVERSATION: ordinary child wakes
         # must queue for their own turn, not inherit the parent's live hold.
-        self._iterator = OwnedAsyncIterator(
-            self._produce, operation="execution-stream-forward", owner_context=context,
-        )
+        # Capture now, dispatch only on the first admitted consumer pull.
+        # A deferred HTTP response may never be consumed at all.
+        self._owner_context = context
+        self._iterator = None
 
     def __aiter__(self):
         return self
@@ -733,6 +776,12 @@ class _ExecutionForwarder:
         self._scopes += tuple(scope for scope in additional if scope not in self._scopes)
         self._cleanup_state.scopes = self._scopes
         with _bind_captured_custody(self._scopes):
+            if self._iterator is None:
+                from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+                self._iterator = OwnedAsyncIterator(
+                    self._produce, operation="execution-stream-forward",
+                    owner_context=self._owner_context,
+                )
             try:
                 item = await anext(self._iterator)
             except BaseException as error:
@@ -743,9 +792,9 @@ class _ExecutionForwarder:
             return item
 
     async def _produce(self):
-        with self._turn_scope.bind(), _bind_stream_cleanup((self._cleanup_state,)):
-            error = None
-            try:
+        error = None
+        try:
+            with self._turn_scope.bind(), _bind_stream_cleanup((self._cleanup_state,)):
                 while True:
                     with _bind_captured_custody(self._scopes), bind_execution_runtime(self._runtime_owner):
                         try:
@@ -756,20 +805,22 @@ class _ExecutionForwarder:
                             return
                         require_execution_work(self._runtime_owner)
                     yield item
-            except BaseException as caught:
-                error = caught
-                self._cleanup_state.requested = True
-                raise
-            finally:
-                close = getattr(self._source, "aclose", None)
-                if callable(close):
-                    with bind_execution_cleanup(self._runtime_owner, self._scopes):
-                        try:
-                            await close()
-                        except BaseException as cleanup_error:
-                            self._source_exhausted = False
-                            self._cleanup_state.requested = True
-                            raise execution_terminal_error(error, cleanup_error)
+        except BaseException as caught:
+            error = caught
+            self._cleanup_state.requested = True
+            raise
+        finally:
+            # Carrier admission itself can fail before source advancement.
+            # Already-acquired handles still need physical cleanup in that case.
+            close = getattr(self._source, "aclose", None)
+            if callable(close):
+                with bind_execution_cleanup(self._runtime_owner, self._scopes):
+                    try:
+                        await close()
+                    except BaseException as cleanup_error:
+                        self._source_exhausted = False
+                        self._cleanup_state.requested = True
+                        raise execution_terminal_error(error, cleanup_error)
 
     async def aclose(self):
         # Normal EOF completes this source, not a queued child's independent
@@ -777,7 +828,11 @@ class _ExecutionForwarder:
         # synchronously before the source owner is cancelled.
         if not self._source_exhausted:
             self._cleanup_state.requested = True
-        await close_execution_stream(self._runtime_owner, self._iterator, self._scopes)
+        await close_execution_stream(
+            self._runtime_owner,
+            self._source if self._iterator is None else self._iterator,
+            self._scopes,
+        )
 
 
 async def close_execution_stream(
@@ -812,6 +867,15 @@ async def owned_execution_stream(owner: Any, stream: AsyncIterator[Any]):
             await iterator.aclose()
         except BaseException as cleanup_error:
             raise execution_terminal_error(error, cleanup_error)
+
+
+def execution_stream(owner: Any, stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
+    """Pin custody now for a deferred body and own its physical source.
+
+    The caller must explicitly close this iterator (for example with Core's
+    ClosingStreamingResponse). Construction does not dispatch source work.
+    """
+    return _ExecutionForwarder(owner, stream)
 
 
 turn_scoped(

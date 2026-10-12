@@ -35,6 +35,30 @@ import { Events, makeEvent } from './events.js';
 import { createVoiceCapture } from './capture.js';
 import { createVoicePlayback } from './playback.js';
 
+export async function readToolBatchResponse(response, calls) {
+  // Only acknowledged results may become function outputs. A failed request,
+  // unreadable body or missing call is not evidence that the effect failed.
+  const body = await response.json();
+  if (!response.ok) {
+    const error = new Error(body?.error?.message || `tool dispatch HTTP ${response.status}`);
+    error.code = body?.error?.code || 'execution_outcome_unknown';
+    throw error;
+  }
+  const requested = new Set(calls.map((call) => call.call_id));
+  const results = body?.results;
+  if (requested.size !== calls.length || !Array.isArray(results) || results.length !== calls.length) {
+    throw new Error('Tool acknowledgement is incomplete; reconcile before continuing.');
+  }
+  const acknowledged = new Set();
+  for (const result of results) {
+    if (!requested.has(result.call_id) || acknowledged.has(result.call_id) || !Object.hasOwn(result, 'result')) {
+      throw new Error('Tool acknowledgement is invalid; reconcile before continuing.');
+    }
+    acknowledged.add(result.call_id);
+  }
+  return results;
+}
+
 // GA WebRTC endpoint.  The Beta path was ``/v1/realtime`` (with the
 // model as a query string), but OpenAI's GA Realtime moved WebRTC SDP
 // exchange under ``/v1/realtime/calls`` (the SDK exposes it as
@@ -279,11 +303,12 @@ export async function createRealtimeClient({
         // like success and the turn would be silently dropped from history.
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       })
-      .catch((err) => {
+      .catch(async (err) => {
         if (!closed) {
+          await close();
           onEvent(makeEvent(Events.ERROR, {
             message: `transcript persist failed: ${err.message}`,
-            fatal: false,
+            fatal: true,
           }));
         }
       });

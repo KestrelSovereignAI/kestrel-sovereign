@@ -10,10 +10,15 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any
 
-from kestrel_sovereign.agent.invocation import validate_invocation_id
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
+    owned_task_error,
     raise_owned_outcome,
+)
+from kestrel_sovereign.agent.invocation import validate_invocation_id
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
 )
 
 from .receipt import StopOperationClaim, StopReceipt, StopReceiptConflict
@@ -135,6 +140,7 @@ class StopCleanupRegistry:
 
     def __init__(self) -> None:
         self._tasks: set[asyncio.Task[StopOutcome]] = set()
+        self._terminal_error: BaseException | None = None
 
     def retain(self, task: asyncio.Task[StopOutcome]) -> None:
         """Own and consume one detached target task until it truly terminates."""
@@ -145,6 +151,9 @@ class StopCleanupRegistry:
 
         def consume(completed: asyncio.Task[StopOutcome]) -> None:
             self._tasks.discard(completed)
+            error = owned_task_error(completed)
+            if error is not None and is_execution_control_error(error):
+                self._terminal_error = execution_terminal_error(self._terminal_error, error)
             try:
                 completed.result()
             except BaseException:  # noqa: BLE001, S110 - exception consumption
@@ -199,13 +208,16 @@ class StopCleanupRegistry:
                 )
                 break
             outcome = await await_owned_task(task, pending_cancellation)
+            if outcome.error is not None and is_execution_control_error(outcome.error):
+                self._terminal_error = execution_terminal_error(self._terminal_error, outcome.error)
             if pending_cancellation is None:
                 pending_cancellation = outcome.cancellation
             # The callback normally removes completed work. Discard explicitly
             # as well so drain does not depend on callback scheduling order.
             self._tasks.discard(task)
-        if pending_cancellation is not None:
-            raise pending_cancellation
+        terminal = execution_terminal_error(self._terminal_error, pending_cancellation)
+        if terminal is not None:
+            raise terminal
 
 
 class CancellationAuthority:
@@ -261,13 +273,17 @@ class CancellationAuthority:
         request = self._validated_request(request)
         try:
             replay = await self._receipt_store.load(request)
-        except StopReceiptConflict:
+        except StopReceiptConflict as error:
+            if is_execution_control_error(error):
+                raise
             return self._receipt_preflight_refusal(
                 request,
                 await self._resolve(request),
                 detail="Stop operation identity conflicts with durable evidence",
             )
-        except Exception:  # noqa: BLE001 - durable evidence boundary
+        except Exception as error:  # noqa: BLE001 - durable evidence boundary
+            if is_execution_control_error(error):
+                raise
             return self._receipt_preflight_refusal(
                 request,
                 await self._resolve(request),
@@ -308,13 +324,17 @@ class CancellationAuthority:
         if callable(claim_operation):
             try:
                 claim = await claim_operation(request)
-            except StopReceiptConflict:
+            except StopReceiptConflict as error:
+                if is_execution_control_error(error):
+                    raise
                 return self._receipt_preflight_refusal(
                     request,
                     targets,
                     detail="Stop operation identity conflicts with durable evidence",
                 )
-            except Exception:  # noqa: BLE001 - durable claim boundary
+            except Exception as error:  # noqa: BLE001 - durable claim boundary
+                if is_execution_control_error(error):
+                    raise
                 return self._receipt_preflight_refusal(
                     request,
                     targets,
@@ -417,7 +437,9 @@ class CancellationAuthority:
             if not isinstance(receipt, StopReceipt):
                 raise TypeError("Stop receipt storage returned invalid evidence")
             return receipt.outcomes
-        except Exception:  # noqa: BLE001 - report only typed indeterminacy
+        except Exception as error:  # noqa: BLE001 - report only typed indeterminacy
+            if is_execution_control_error(error):
+                raise
             return tuple(
                 replace(
                     outcome,
@@ -445,10 +467,14 @@ class CancellationAuthority:
                 disposition = await target.cancel(target_request)
                 if not isinstance(disposition, StopDisposition):
                     raise TypeError("Stop target returned an untyped disposition")
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
+                if is_execution_control_error(error):
+                    raise
                 disposition = StopDisposition.UNREACHABLE
                 detail = "Cooperative Stop target was canceled"
             except BaseExceptionGroup as error:
+                if is_execution_control_error(error):
+                    raise
                 # A cancellation-safe target may preserve cancellation beside
                 # its own cleanup failure.  That group belongs to this target,
                 # not to the fan-out owner task, so isolate it just like any
@@ -456,6 +482,8 @@ class CancellationAuthority:
                 disposition = StopDisposition.UNREACHABLE
                 detail = f"Cooperative Stop target failed ({type(error).__name__})"
             except Exception as error:  # noqa: BLE001 - target boundary
+                if is_execution_control_error(error):
+                    raise
                 disposition = StopDisposition.UNREACHABLE
                 detail = f"Cooperative Stop target failed ({type(error).__name__})"
             return StopOutcome(
@@ -514,10 +542,13 @@ class CancellationAuthority:
             for resolved in targets
             if resolved.target is None
         }
-        completed.update({
-            tasks[task][0].target_id: task.result()
-            for task in done
-        })
+        terminal_error = None
+        for task in done:
+            outcome = await await_owned_task(task)
+            if outcome.error is not None:
+                terminal_error = execution_terminal_error(terminal_error, outcome.error)
+            else:
+                completed[tasks[task][0].target_id] = outcome.result
         for task in pending:
             task.cancel()
             self._detach_cleanup(task)
@@ -532,6 +563,8 @@ class CancellationAuthority:
                 correlation_id=request.correlation_id,
                 detail="Cooperative Stop target timed out",
             )
+        if terminal_error is not None:
+            raise terminal_error
         return tuple(completed[target.target_id] for target in targets)
 
     @staticmethod

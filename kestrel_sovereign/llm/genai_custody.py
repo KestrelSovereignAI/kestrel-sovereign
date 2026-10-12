@@ -14,6 +14,7 @@ from functools import wraps
 
 from kestrel_sovereign._async_ownership import OwnedAsyncIterator
 from kestrel_sovereign.execution_custody import (
+    NativeExecutionStreamOwner as _StreamOwner,
     _NATIVE_RESPONSE_SINK,
     close_native_execution_stream,
     execution_terminal_error,
@@ -21,32 +22,6 @@ from kestrel_sovereign.execution_custody import (
 )
 
 _OWNER = ContextVar("kestrel_genai_stream_owner", default=None)
-
-
-class _StreamOwner:
-    def __init__(self):
-        self.handles = []
-
-    def retain(self, handle):
-        if not any(handle is existing for existing in self.handles):
-            self.handles.append(handle)
-        return handle
-
-    async def close(self, original=None):
-        terminal = original
-        # Take deepest generators first. Each one is still strongly retained,
-        # so its native finally cannot escape into a GC finalizer task.
-        for handle in reversed(self.handles):
-            try:
-                await close_native_execution_stream(handle)
-            except BaseException as error:
-                terminal = execution_terminal_error(terminal, error)
-        self.handles.clear()
-        if terminal is not None and terminal is not original:
-            raise terminal
-        # Even the SAME receipt must propagate if caught from native close.
-        if terminal is not None and original is None:
-            raise terminal
 
 
 def _track_iterator_factory(instance, name):

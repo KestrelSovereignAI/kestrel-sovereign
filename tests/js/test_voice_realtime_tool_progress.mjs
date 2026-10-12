@@ -10,10 +10,25 @@ import {
   bytesToBase64,
   createUserTranscriptTracker,
   normalizeToolBatchResults,
+  readToolBatchResponse,
   responseAllowsToolDispatch,
   resolveRealtimeSDPEndpoint,
   waitForPlaybackIdle,
 } from '../../kestrel_sovereign/static/js/voice/realtime.js';
+
+test('native HTTP acknowledgement controls cannot become function-error outputs', async () => {
+  const calls = [{ call_id: 'one' }, { call_id: 'two' }];
+  for (const response of [
+    new Response(JSON.stringify({ error: { code: 'execution_control', message: 'Reconcile' } }), { status: 500 }),
+    new Response('unreadable', { status: 200 }),
+    new Response(JSON.stringify({ results: [{ call_id: 'one', result: {} }] })),
+    new Response(JSON.stringify({ results: [{ call_id: 'one', result: {} }, { call_id: 'one', result: {} }] })),
+  ]) {
+    await assert.rejects(readToolBatchResponse(response, calls));
+  }
+  const results = [{ call_id: 'one', result: { error: 'acknowledged application failure' } }, { call_id: 'two', result: {} }];
+  assert.deepEqual(await readToolBatchResponse(new Response(JSON.stringify({ results })), calls), results);
+});
 
 test('realtime tool disclosure update uses session.update tools payload', () => {
   const tools = [{ type: 'function', name: 'memory_feature', parameters: { type: 'object' } }];

@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 GENESIS_AUDIT_PENDING = "pending"
 GENESIS_AUDIT_PASSED = "passed"
 GENESIS_AUDIT_FAILED = "failed"
@@ -387,9 +389,13 @@ async def evaluate_genesis_constitution(
     prompt = genesis_audit_prompt(constitution_text)
     try:
         result = await auditor(prompt)
-    except GenesisAuditError:
+    except GenesisAuditError as exc:
+        if is_execution_control_error(exc):
+            raise
         raise
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         raise GenesisAuditPendingError("auditor_error") from exc
 
     if not isinstance(result, Mapping):

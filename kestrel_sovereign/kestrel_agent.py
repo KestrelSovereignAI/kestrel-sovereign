@@ -1,51 +1,20 @@
-import logging
-import json
-import os
 import asyncio
 import contextlib
 import hashlib
 import inspect
+import json
+import logging
 import math
+import os
+import re
 import sys
 import time
-from dataclasses import dataclass, replace as _replace_dataclass
-from uuid import uuid4
-from kestrel_sovereign.audit_time import utc_now_iso
-from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
-from kestrel_sovereign.storage.privacy_wrapper import (
-    DurablePersistenceGate,
-    DurablePersistenceGateSharedLock,
-    ReentrantTransitionLock,
-    EphemeralPurgeReport,
-    StorePurgeResult,
-    PurgeOutcome,
-    PRIVACY_TRANSITION_RETRY_MESSAGE,
-    PrivacyViolationError,
-)
-from kestrel_sovereign.security.encryption import DecryptionError
-from kestrel_sovereign.security.assertion_tenant_resolver import (
-    _resolve_authenticated_agent_assertion_capability,
-)
-from kestrel_sovereign.llm.service import LLMService
-from kestrel_sovereign.llm.adapter import LLMResponse
-from kestrel_sovereign.llm.invocation_context import (
-    LLMInvocationContext,
-    turn_invocation_scope,
-)
-from kestrel_sovereign.config import (
-    SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
-    SEMANTIC_CAPABILITIES_CONFIG_ENV,
-    SEMANTIC_INFERENCE_CONFIG_ENV,
-    SEMANTIC_MAINTENANCE_CONFIG_ENV,
-    SEMANTIC_MAINTENANCE_CONFIGURED_ENV,
-    TRUSTED_AGENTS_DIR,
-)
-from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
-from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping, Callable
-import re
+from dataclasses import dataclass
+from dataclasses import replace as _replace_dataclass
 from pathlib import Path, PurePath
-from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
-from kestrel_sovereign.features.privacy import PrivacyAgent
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional
+from uuid import uuid4
+
 from kestrel_sovereign.agent.model_preference import resolve_replayed_model_preference
 from kestrel_sovereign.agent.privacy_state import (
     PRIVACY_STATE_UNRECORDED_MESSAGE,
@@ -57,6 +26,15 @@ from kestrel_sovereign.agent.privacy_state import (
     transition_origin,
     write_privacy_state,
 )
+from kestrel_sovereign.audit_time import utc_now_iso
+from kestrel_sovereign.config import (
+    SEMANTIC_CAPABILITIES_CONFIG_ENV,
+    SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
+    SEMANTIC_INFERENCE_CONFIG_ENV,
+    SEMANTIC_MAINTENANCE_CONFIG_ENV,
+    SEMANTIC_MAINTENANCE_CONFIGURED_ENV,
+    TRUSTED_AGENTS_DIR,
+)
 from kestrel_sovereign.features import (
     MandatoryFeatureReadinessError,
     discover_features,
@@ -64,23 +42,48 @@ from kestrel_sovereign.features import (
 )
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.config_validation import validate_feature_config
+from kestrel_sovereign.features.privacy import PrivacyAgent
+from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
+from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.llm.invocation_context import (
+    LLMInvocationContext,
+    turn_invocation_scope,
+)
+from kestrel_sovereign.llm.service import LLMService
+from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
+from kestrel_sovereign.security.assertion_tenant_resolver import (
+    _resolve_authenticated_agent_assertion_capability,
+)
+from kestrel_sovereign.security.encryption import DecryptionError
+from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    DurablePersistenceGate,
+    DurablePersistenceGateSharedLock,
+    EphemeralPurgeReport,
+    PrivacyViolationError,
+    PurgeOutcome,
+    ReentrantTransitionLock,
+    StorePurgeResult,
+)
 
 
 class HostFeatureConfigError(RuntimeError):
     """The host could not read the feature configuration it was asked to apply."""
-from kestrel_sovereign.command_handler import CommandHandler
-from kestrel_sovereign.command_policy import (
-    BOOTSTRAP_ALLOWED_COMMANDS,
-    prefixed_command_token,
+from kestrel_sdk.hooks.base import HookEvent, HookInput
+
+from kestrel_sovereign.a2a.stores import (
+    SQLiteFeedbackStore,
+    SQLiteMemoryService,
+    SQLiteObservabilityStore,
+    SQLiteSessionService,
+    SQLiteTaskStore,
 )
 from kestrel_sovereign.a2a.task_manager import TaskManager
-from kestrel_sovereign.a2a.stores import (
-    SQLiteTaskStore, SQLiteSessionService, SQLiteObservabilityStore,
-    SQLiteFeedbackStore, SQLiteMemoryService
-)
+
 # PostgreSQL stores imported conditionally when pg_pool is available
 from kestrel_sovereign.agent import ContextBuilder, ContextManager
-from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
+from kestrel_sovereign.agent.backup import BackupMixin
 from kestrel_sovereign.agent.boot import (
     AgentBootError,
     BootContext,
@@ -88,6 +91,12 @@ from kestrel_sovereign.agent.boot import (
     BootPhaseState,
     run_boot_sequence,
 )
+from kestrel_sovereign.agent.constitution import (
+    ConstitutionMixin,
+    SafeModeCause,
+    safe_mode_cognition_block,
+)
+from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.custody import (
     FEATURE_OWNER,
     STANDALONE_HOLD_CONTEXT,
@@ -96,52 +105,55 @@ from kestrel_sovereign.agent.custody import (
     feature_resource_name,
     reported_outcome,
 )
+from kestrel_sovereign.agent.event_manager import EventManagerMixin
+from kestrel_sovereign.agent.invocation import (
+    bind_async_invocation,
+    mark_current_invocation_effect_checkpointed,
+)
+from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
+from kestrel_sovereign.agent.operator_signals import inject_operator_turn
+from kestrel_sovereign.agent.orchestrator_engine import (
+    ContextStats,
+    OrchestratorEngineMixin,
+)
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+    RequestLifecycleMixin,
+)
+from kestrel_sovereign.agent.sleep import SleepMixin
+from kestrel_sovereign.agent.streaming import (
+    StreamingMixin,
+    _snapshot_post_response_hooks,
+    resolve_turn_invocation_context,
+)
+from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
+from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
+from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
+from kestrel_sovereign.command_handler import CommandHandler
+from kestrel_sovereign.command_policy import (
+    BOOTSTRAP_ALLOWED_COMMANDS,
+    prefixed_command_token,
+)
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    execution_work_operation,
+    is_execution_control_error,
+)
+from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
+from kestrel_sovereign.security.input_guardrails import (
+    append_security_addendum,
+    check_prompt_injection,
+    extract_raw_user_content,
+    wrap_user_input,
+)
+from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.spawn.mandate import (
     PersistedSpawnMandateExpiredError,
     SpawnMandate,
     remaining_spawn_ttl_seconds,
 )
-from kestrel_sovereign.agent.operator_signals import inject_operator_turn
-from kestrel_sovereign.agent.constitution import (
-    ConstitutionMixin,
-    SafeModeCause,
-    safe_mode_cognition_block,
-)
-from kestrel_sovereign.agent.streaming import (
-    StreamingMixin,
-    resolve_turn_invocation_context,
-    _snapshot_post_response_hooks,
-)
-from kestrel_sovereign.agent.backup import BackupMixin
-from kestrel_sovereign.agent.sleep import SleepMixin
-from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin, ContextStats
-from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
-from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
-from kestrel_sovereign.agent.event_manager import EventManagerMixin
-from kestrel_sovereign.agent.request_lifecycle import (
-    RequestCompletionDisposition,
-    RequestLifecycleMixin,
-)
-from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
-from kestrel_sovereign.agent.invocation import (
-    bind_async_invocation,
-    mark_current_invocation_effect_checkpointed,
-)
-from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
-from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
-from kestrel_sdk.hooks.base import HookEvent, HookInput
-from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
-from kestrel_sovereign.security.input_guardrails import (
-    wrap_user_input,
-    extract_raw_user_content,
-    check_prompt_injection,
-    append_security_addendum,
-)
-from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
-from kestrel_sovereign.execution_custody import (
-    execution_work_operation, execution_terminal_error, is_execution_control_error,
-)
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
@@ -152,14 +164,14 @@ from kestrel_sovereign.telemetry import (
 )
 
 if TYPE_CHECKING:
-    from kestrel_sovereign.execution_custody import ExecutionCustody
     from kestrel_sovereign.a2a.agent_card import AgentCard
+    from kestrel_sovereign.execution_custody import ExecutionCustody
     from kestrel_sovereign.features.peers.directory import (
         PeerDirectoryRouter,
         PeerRequester,
     )
-    from kestrel_sovereign.knowledge.inference import InferenceLimits, InferenceProfile
     from kestrel_sovereign.knowledge.capabilities import SemanticRuntimeCapabilities
+    from kestrel_sovereign.knowledge.inference import InferenceLimits, InferenceProfile
     from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceLimits
     from kestrel_sovereign.storage import GraphNode
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
@@ -907,7 +919,10 @@ class KestrelAgent(
                 complete maintenance snapshot for the active capability.
         """
         self.did = did
-        from kestrel_sovereign.execution_custody import ExecutionCustody, require_execution_work
+        from kestrel_sovereign.execution_custody import (
+            ExecutionCustody,
+            require_execution_work,
+        )
 
         if execution_custody is not None and not isinstance(execution_custody, ExecutionCustody):
             raise TypeError("execution_custody must be Core ExecutionCustody")
@@ -972,8 +987,8 @@ class KestrelAgent(
             # feature, rather than deriving mutable placement from database
             # storage (which PostgreSQL-backed hosted agents deliberately lack).
             from kestrel_sovereign.features.isolated_runtime import (
-                resolve_legacy_isolated_runtime_root,
                 resolve_isolated_runtime_namespace,
+                resolve_legacy_isolated_runtime_root,
             )
 
             runtime_scope = resolve_isolated_runtime_namespace(
@@ -1113,6 +1128,11 @@ class KestrelAgent(
         # incremental maintenance pass and never selects a profile itself.
         # Managed agents receive this from their LocalAgentConfig; direct
         # agents retain the existing per-agent TOML control surface below.
+        from kestrel_sovereign.knowledge.capabilities import (
+            SemanticCapabilityConfigurationError,
+            SemanticRuntimeCapabilities,
+            semantic_capabilities_from_config,
+        )
         from kestrel_sovereign.knowledge.inference import (
             InferenceError,
             InferenceLimits,
@@ -1122,11 +1142,6 @@ class KestrelAgent(
             SemanticMaintenanceLimits,
             maintenance_allows_prior_verified_snapshot,
             maintenance_limits_from_config,
-        )
-        from kestrel_sovereign.knowledge.capabilities import (
-            SemanticCapabilityConfigurationError,
-            SemanticRuntimeCapabilities,
-            semantic_capabilities_from_config,
         )
 
         if semantic_inference_limits is not None and not isinstance(
@@ -2111,7 +2126,9 @@ class KestrelAgent(
         if existing is not None:
             return existing
         from kestrel_sovereign.services.payer_resolver import open_host_db
-        from kestrel_sovereign.storage.async_database import DatabaseInitializationCleanupError
+        from kestrel_sovereign.storage.async_database import (
+            DatabaseInitializationCleanupError,
+        )
         try:
             db = await open_host_db(storage_path=self.storage_path)
         except DatabaseInitializationCleanupError as error:
@@ -2425,11 +2442,11 @@ class KestrelAgent(
             # this standalone-manager lookup because their injected preflight
             # owns the manager's exact base directory and performs the full
             # check.
+            from kestrel_sovereign.multi_agent.config import LocalAgentConfig
             from kestrel_sovereign.spawn.authority_registry import (
                 SpawnAuthorityRegistry,
                 spawn_authority_host_base_dir,
             )
-            from kestrel_sovereign.multi_agent.config import LocalAgentConfig
 
             registry = SpawnAuthorityRegistry(
                 spawn_authority_host_base_dir(self.storage_path)
@@ -2897,9 +2914,11 @@ class KestrelAgent(
             # DSN-only modes; wrappers must not drop its retained generation.
             pg_backend = self._raw_storage._backend
             from kestrel_sovereign.a2a.stores.postgres import (
-                PostgresTaskStore, PostgresSessionService,
-                PostgresMemoryService, PostgresObservabilityStore,
-                PostgresFeedbackStore
+                PostgresFeedbackStore,
+                PostgresMemoryService,
+                PostgresObservabilityStore,
+                PostgresSessionService,
+                PostgresTaskStore,
             )
             task_store = PostgresTaskStore(backend=pg_backend)
             session_service = PostgresSessionService(backend=pg_backend)
@@ -3081,23 +3100,23 @@ class KestrelAgent(
         from kestrel_sovereign.signals.sources.a2a import (
             build_a2a_task_complete_registration,
         )
+        from kestrel_sovereign.signals.sources.a2a_question_answered import (
+            build_a2a_question_answered_registration,
+        )
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             build_a2a_task_submitted_registration,
         )
         from kestrel_sovereign.signals.sources.peer_stop import (
             build_peer_stop_registration,
         )
-        from kestrel_sovereign.signals.sources.wallet import (
-            build_stripe_deposit_registration,
-        )
-        from kestrel_sovereign.signals.sources.a2a_question_answered import (
-            build_a2a_question_answered_registration,
-        )
         from kestrel_sovereign.signals.sources.wait import (
             build_wait_complete_registration,
         )
         from kestrel_sovereign.signals.sources.wait_replay import (
             build_wait_replay_registration,
+        )
+        from kestrel_sovereign.signals.sources.wallet import (
+            build_stripe_deposit_registration,
         )
         from kestrel_sovereign.signals.sources.workflow_rescue import (
             build_workflow_rescue_registrations,
@@ -3240,6 +3259,7 @@ class KestrelAgent(
         else:
             try:
                 from kestrel_sdk.payer_policy import ResourceClass
+
                 from kestrel_sovereign.services.payer_resolver import (
                     FoundationPayerResolver,
                 )
@@ -3531,7 +3551,9 @@ class KestrelAgent(
         if not shortfall:
             return
         if shortfall.identity:
-            from kestrel_sovereign.identity.birth_record import assert_birth_replay_custody
+            from kestrel_sovereign.identity.birth_record import (
+                assert_birth_replay_custody,
+            )
 
             try:
                 await assert_birth_replay_custody(runtime_db, self.agent_id)
@@ -3648,7 +3670,10 @@ class KestrelAgent(
             finally:
                 if anchor_db is not None:
                     import sys
-                    from kestrel_sovereign.storage.async_database import _close_owned_database
+
+                    from kestrel_sovereign.storage.async_database import (
+                        _close_owned_database,
+                    )
 
                     await _close_owned_database(anchor_db, sys.exception())
 
@@ -3864,7 +3889,7 @@ class KestrelAgent(
 
         # Fire SESSION_START hook
         if self.hooks_manager:
-            from kestrel_sdk.hooks.base import HookInput, HookEvent
+            from kestrel_sdk.hooks.base import HookEvent, HookInput
             hook_input = HookInput(
                 session_id="agent_init",
                 hook_event_name=HookEvent.SESSION_START.value,
@@ -3928,6 +3953,7 @@ class KestrelAgent(
         #                 a today-shippable contract).
         try:
             from kestrel_sdk.payer_policy import ResourceClass
+
             from kestrel_sovereign.services.payer_resolver import (
                 FoundationPayerResolver,
             )
@@ -4181,11 +4207,10 @@ class KestrelAgent(
         # Registers the heartbeat source with the dispatcher so its
         # ticks route through the signal pipeline (Phase 3 of #889).
         from kestrel_sovereign.heartbeat import HeartbeatConfig, HeartbeatRunner
+        from kestrel_sovereign.signals import RegistrationPolicy
         from kestrel_sovereign.signals.sources.heartbeat import (
             build_heartbeat_registration,
         )
-
-        from kestrel_sovereign.signals import RegistrationPolicy
 
         self._heartbeat_config = HeartbeatConfig.from_config()
         _heartbeat_reg = build_heartbeat_registration(
@@ -4220,6 +4245,8 @@ class KestrelAgent(
         )
         from kestrel_sovereign.signals.sources.system_resumed import (
             SOURCE_NAME as RESUME_SOURCE_NAME,
+        )
+        from kestrel_sovereign.signals.sources.system_resumed import (
             build_system_resumed_registration,
         )
 
@@ -4362,7 +4389,9 @@ class KestrelAgent(
             try:
                 await ready_hook(self)
             except (Exception, asyncio.CancelledError) as e:
-                from kestrel_sovereign.execution_custody import is_execution_control_error
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
                 if is_execution_control_error(e):
                     raise
                 # Ready hooks are explicitly best-effort.  A hook can await a
@@ -4484,7 +4513,10 @@ class KestrelAgent(
             return ReleaseOutcome.RELEASED
         # Non-native injected services still own one joined close and must
         # report RETAINED/UNKNOWN truthfully rather than losing their result.
-        from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task,
+            raise_owned_outcome,
+        )
         task = vars(self).get("_boot_llm_close_task")
         if task is None:
             task = asyncio.create_task(service.close(), name="boot:llm-close")
@@ -5590,6 +5622,8 @@ class KestrelAgent(
         try:
             voice_switched = await vf.on_privacy_mode_changed()
         except Exception as ve:
+            if is_execution_control_error(ve):
+                raise
             logging.warning("Voice auto-switch failed: %s", ve)
 
         if config.allows_cloud_llm() and hasattr(vf, "biometric_warning"):
@@ -5616,11 +5650,15 @@ class KestrelAgent(
         * A real leak (rows destroyed from a content store) writes the existing
           ``leak_purged`` audit.
 
-        Never raises — losing an audit breadcrumb is preferable to crashing the
-        transition/shutdown, but a failure is always surfaced (report + audit).
+        Ordinary availability failures remain reports. Native control outcomes
+        survive independent audit settlement as their original carriers.
         """
+        primary_error = None
         try:
-            from kestrel_sovereign.execution_custody import ExecutionCustody, ProcessRuntimeExecutionFence
+            from kestrel_sovereign.execution_custody import (
+                ExecutionCustody,
+                ProcessRuntimeExecutionFence,
+            )
             scope = getattr(self, "_execution_custody", None)
             native = getattr(getattr(self.storage, "_storage", None), "_backend", None)
             if (reason == "ephemeral-agent-shutdown" and isinstance(scope, ExecutionCustody)
@@ -5629,7 +5667,11 @@ class KestrelAgent(
                 report = await native.purge_retired_ephemeral_session(self.storage, reason=reason)
             else:
                 report = await self.storage.purge_ephemeral_session(reason=reason)
-        except Exception as e:
+        except BaseException as e:
+            if is_execution_control_error(e):
+                primary_error = e
+            elif not isinstance(e, Exception):
+                raise
             logging.error(
                 "ephemeral hard-purge raised; treating as an UNCERTIFIED purge "
                 "(required sweeps unknown, session must be treated as leaked): "
@@ -5640,18 +5682,17 @@ class KestrelAgent(
                 for store in ("conversation_history", "graph_nodes", "channel_messages")
             )
 
-        if report.required_sweep_failed:
-            await self._record_ephemeral_purge_failure_audit(
-                reason=reason, report=report,
-            )
-        elif report.leaked_rows > 0:
-            # A genuine privacy leak means data reached tables EPHEMERAL must
-            # never write. The observability sink is allowed to hold content-free
-            # metric rows during an ephemeral stint (F076), so its swept counts
-            # are reported in the breakdown but do NOT trip the leak audit.
-            await self._record_ephemeral_leak_audit(
-                reason=reason, breakdown=dict(report),
-            )
+        audit_error = None
+        try:
+            if report.required_sweep_failed:
+                await self._record_ephemeral_purge_failure_audit(reason=reason, report=report)
+            elif report.leaked_rows > 0:
+                await self._record_ephemeral_leak_audit(reason=reason, breakdown=dict(report))
+        except BaseException as error:
+            audit_error = error
+        terminal = execution_terminal_error(primary_error, audit_error)
+        if terminal is not None:
+            raise terminal
         return report
 
     async def _purge_ephemeral_on_shutdown(self, *, timeout: float) -> None:
@@ -5686,7 +5727,9 @@ class KestrelAgent(
             )
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             logging.error(
                 "ephemeral hard-purge during shutdown TIMED OUT after %.2fs — "
                 "the EPHEMERAL no-trace contract could not be certified before "
@@ -5700,6 +5743,8 @@ class KestrelAgent(
             )
             return
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.error(
                 "ephemeral hard-purge during shutdown FAILED: %s — the EPHEMERAL "
                 "no-trace contract could not be certified before exit", e,
@@ -5748,7 +5793,9 @@ class KestrelAgent(
             )
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             logging.error(
                 "[ephemeral-purge] SECURITY: shutdown purge-failure audit could "
                 "NOT be written within the remaining %.2fs of the shutdown budget "
@@ -5777,7 +5824,9 @@ class KestrelAgent(
             permission_store = (
                 getattr(feature, "permission_store", None) if feature else None
             )
-        except Exception:
+        except Exception as control_error:
+            if is_execution_control_error(control_error):
+                raise
             permission_store = None
 
         if permission_store is None:
@@ -5801,6 +5850,8 @@ class KestrelAgent(
                 }),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.warning(
                 "[ephemeral-purge] audit write failed: %s "
                 "(breakdown=%s, reason=%s)",
@@ -5833,7 +5884,9 @@ class KestrelAgent(
             permission_store = (
                 getattr(feature, "permission_store", None) if feature else None
             )
-        except Exception:
+        except Exception as control_error:
+            if is_execution_control_error(control_error):
+                raise
             permission_store = None
 
         failed_stores: list = []
@@ -5842,7 +5895,9 @@ class KestrelAgent(
             try:
                 failed_stores = [r.store for r in report.failed_stores]
                 breakdown = dict(report)
-            except Exception:  # noqa: BLE001 - never let report introspection block the audit
+            except Exception as control_error:  # noqa: BLE001 - never let report introspection block the audit
+                if is_execution_control_error(control_error):
+                    raise
                 pass
 
         if permission_store is None:
@@ -5869,6 +5924,8 @@ class KestrelAgent(
                 }),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.error(
                 "[ephemeral-purge] SECURITY: purge-failure audit write failed: "
                 "%s (reason=%s failed_stores=%s failure=%s)",
@@ -5894,6 +5951,8 @@ class KestrelAgent(
         try:
             deltas = await self.get_enablement_deltas("feature")
         except Exception as e:  # noqa: BLE001 - never block init on this
+            if is_execution_control_error(e):
+                raise
             logging.warning("Could not read feature enablement deltas: %s", e)
             return set(bootstrap)
         # The same rule the writer enforces (kestrel-sovereign#3234): a
@@ -7261,7 +7320,7 @@ Expected Duration: {expected_duration}
                 wake_up_msg, session_id=session_id,
             )
 
-            logging.info(f"[BOOTSTRAP] Agent waking up - entering discovery mode")
+            logging.info("[BOOTSTRAP] Agent waking up - entering discovery mode")
             return wake_up_msg
 
         elif state == BootstrapState.DISCOVERY:
@@ -7382,7 +7441,7 @@ Expected Duration: {expected_duration}
                         loaded = await self.context_builder.load_canonical_soul_resource()
                         if not loaded:
                             self.context_builder._load_soul_md()
-                    logging.info(f"[BOOTSTRAP] Discovery complete with avatar")
+                    logging.info("[BOOTSTRAP] Discovery complete with avatar")
                     return completion_msg
                 else:
                     # Discovery complete without avatar
@@ -7396,10 +7455,10 @@ Expected Duration: {expected_duration}
                         loaded = await self.context_builder.load_canonical_soul_resource()
                         if not loaded:
                             self.context_builder._load_soul_md()
-                    logging.info(f"[BOOTSTRAP] Discovery complete")
+                    logging.info("[BOOTSTRAP] Discovery complete")
                     return completion_msg
 
-            logging.info(f"[BOOTSTRAP] Discovery continuing...")
+            logging.info("[BOOTSTRAP] Discovery continuing...")
             return response
 
         elif state == BootstrapState.AVATAR:
@@ -8880,9 +8939,13 @@ Expected Duration: {expected_duration}
         work. Resident effect loops use `_track_runtime_task`'s READY barrier.
         """
         from contextvars import Context
+
         from kestrel_sovereign.execution_custody import (
-            ExecutionAuthorityError, ExecutionCustody, _CURRENT_CUSTODY,
-            current_execution_custody, require_execution_work,
+            _CURRENT_CUSTODY,
+            ExecutionAuthorityError,
+            ExecutionCustody,
+            current_execution_custody,
+            require_execution_work,
         )
         require_execution_work(self)
         scope = self._execution_custody
@@ -9225,7 +9288,10 @@ Expected Duration: {expected_duration}
         Creates a new Kestrel agent identity and stores it in the trusted agents directory.
         This is a simplified, local version of the "Genesis Factory" concept.
         """
-        from kestrel_sovereign.inception_service import generate_kestrel_identity, save_kestrel_identity
+        from kestrel_sovereign.inception_service import (
+            generate_kestrel_identity,
+            save_kestrel_identity,
+        )
         from kestrel_sovereign.storage import GraphNode
 
         # Generate a new identity
@@ -9312,7 +9378,11 @@ Expected Duration: {expected_duration}
         Generate an AgentCard for this agent (for A2A discovery).
         Returns agent identity, capabilities, and available skills.
         """
-        from kestrel_sovereign.a2a.agent_card import AgentCard, AgentCapabilities, AgentProvider
+        from kestrel_sovereign.a2a.agent_card import (
+            AgentCapabilities,
+            AgentCard,
+            AgentProvider,
+        )
 
         # Get agent name from storage node if available
         agent_name = "Kestrel Agent"
