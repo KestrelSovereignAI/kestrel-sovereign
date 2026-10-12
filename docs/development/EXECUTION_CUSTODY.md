@@ -744,6 +744,17 @@ immediately before sending. Realtime cognition binds a fixed constitutional
 revision/generation/hash, including through awaited model discovery. Durable
 healthy rows never override locally unpersisted Safe Mode or pending restrictions.
 
+Deferred native resources also retain their original read-only gate inventory
+through `capture_native_execution_admission` and
+`bind_native_execution_admission_snapshot`. Original gates join current caller
+gates at a handoff; a later caller cannot replace the original resource's policy.
+`require_native_execution_admission` revalidates that inventory before an owned
+child's actual lazy dispatch and before final disclosure. Execution stream
+forwarders retain the constructing inventory, checking both physical source work
+and final consumer delivery, including buffered bytes. Trusted turn-relative lock
+reentry is bound only while validating, never across delivery to a foreign caller.
+This does not mint a replacement scope or recall an already-submitted effect.
+
 Immutable launch artifacts selected inside a mutable namespace retain a durable
 restrictive marker on the owned namespace, not on the VENV/BIN itself. Canonical
 no-follow cleanup refuses that marker before deleting any contents, including

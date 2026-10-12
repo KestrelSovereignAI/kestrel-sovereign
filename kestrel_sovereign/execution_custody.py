@@ -536,6 +536,25 @@ def bind_native_execution_admission(validator: Callable[[], Awaitable[None]]) ->
         _NATIVE_ADMISSION_VALIDATORS.reset(token)
 
 
+def capture_native_execution_admission() -> tuple[Callable[[], Awaitable[None]], ...]:
+    """Retain the original trusted gate inventory for a deferred resource."""
+    return _NATIVE_ADMISSION_VALIDATORS.get()
+
+
+@contextmanager
+def bind_native_execution_admission_snapshot(captured: tuple[Callable[[], Awaitable[None]], ...]) -> Iterator[None]:
+    """Join original native gates with caller gates; never replace either."""
+    if not isinstance(captured, tuple) or not all(callable(validator) for validator in captured):
+        raise TypeError("native admission snapshot must be an immutable callable tuple")
+    existing = _NATIVE_ADMISSION_VALIDATORS.get()
+    token = _NATIVE_ADMISSION_VALIDATORS.set(existing + tuple(
+        validator for validator in captured if validator not in existing))
+    try:
+        yield
+    finally:
+        _NATIVE_ADMISSION_VALIDATORS.reset(token)
+
+
 async def require_native_execution_admission(owner: Any = None) -> None:
     """Revalidate the current original dispatch gates at a final handoff.
 
@@ -1027,6 +1046,7 @@ class _ExecutionForwarder:
     def __init__(self, owner: Any, stream: AsyncIterator[Any], captured_custody: tuple[ExecutionCustody, ...] = (), *, lifecycle: ExecutionStreamLifecycle | None = None):
         self._runtime_owner = owner
         self._source = aiter(stream)
+        self._native_admission = capture_native_execution_admission()
         self._scopes = current_execution_custody(owner)
         if not isinstance(captured_custody, tuple) or not all(isinstance(scope, ExecutionCustody) for scope in captured_custody):
             raise TypeError("captured stream custody must be an immutable ExecutionCustody tuple")
@@ -1058,9 +1078,13 @@ class _ExecutionForwarder:
         self._scopes += tuple(scope for scope in additional if scope not in self._scopes)
         self._cleanup_state.scopes = self._scopes
         try:
-            with _bind_captured_custody(self._scopes):
+            with _bind_captured_custody(self._scopes), bind_native_execution_admission_snapshot(self._native_admission):
                 if self._lifecycle is not None:
                     self._lifecycle.require_work()
+                # Trusted read-only checks retain original turn-relative lock
+                # reentry only for validation, never across consumer delivery.
+                with self._turn_scope.bind():
+                    await require_native_execution_admission(self._runtime_owner)
                 if self._iterator is None:
                     from kestrel_sovereign._async_ownership import OwnedAsyncIterator
                     with self._turn_scope.bind():
@@ -1074,6 +1098,8 @@ class _ExecutionForwarder:
                 require_execution_work(self._runtime_owner)
                 if self._lifecycle is not None:
                     self._lifecycle.require_work()
+                with self._turn_scope.bind():
+                    await require_native_execution_admission(self._runtime_owner)
         except BaseException as error:
             # Admission can fail while ENTERING the original binding, before
             # the next native pull. The suspended producer still has to retire.
@@ -1095,9 +1121,10 @@ class _ExecutionForwarder:
         try:
             with self._turn_scope.bind(), _bind_stream_cleanup((self._cleanup_state,)):
                 while True:
-                    with _bind_captured_custody(self._scopes), bind_execution_runtime(self._runtime_owner):
+                    with _bind_captured_custody(self._scopes), bind_execution_runtime(self._runtime_owner), bind_native_execution_admission_snapshot(self._native_admission):
                         if self._lifecycle is not None:
                             self._lifecycle.require_work()
+                        await require_native_execution_admission(self._runtime_owner)
                         try:
                             item = await anext(self._source)
                         except StopAsyncIteration:
@@ -1107,6 +1134,7 @@ class _ExecutionForwarder:
                         require_execution_work(self._runtime_owner)
                         if self._lifecycle is not None:
                             self._lifecycle.require_work()
+                        await require_native_execution_admission(self._runtime_owner)
                     yield item
         except BaseException as caught:
             error = caught
