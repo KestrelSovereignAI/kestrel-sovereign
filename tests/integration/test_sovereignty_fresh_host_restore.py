@@ -28,6 +28,7 @@ from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.sovereignty.feature import (
     REFUSAL_DECRYPTION_FAILED,
     REFUSAL_ENCRYPTION_KEY_MISMATCH,
+    REFUSAL_EXPORT_OF_ANOTHER_AGENT,
     REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE,
     REFUSAL_UNENCRYPTED_WITHOUT_RECEIPT,
     SovereigntyFeature,
@@ -35,6 +36,7 @@ from kestrel_sovereign.features.sovereignty.feature import (
 from kestrel_sovereign.filecoin_adapter import (
     ENVELOPE_MAGIC,
     FilecoinAdapter,
+    StorageResult,
     StorageTier,
 )
 from kestrel_sovereign.privacy import PrivacyMode
@@ -42,6 +44,7 @@ from kestrel_sovereign.storage import Storage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 
 AGENT_DID = "did:pkh:eip155:1:0x2873fresh"
+NEIGHBOUR_DID = "did:pkh:eip155:1:0x2873neighbour"
 MESSAGES = [
     ("user", "my sister's name is Ingrid"),
     ("assistant", "I'll remember that your sister is Ingrid."),
@@ -113,18 +116,18 @@ def data_key(monkeypatch):
 
 
 @asynccontextmanager
-async def _host(directory, monkeypatch):
+async def _host(directory, monkeypatch, *, did=AGENT_DID):
     """One host: its own working directory (so its own ``storage_cache``)
     and its own database, wrapped the way ``KestrelAgent`` wraps it."""
     directory.mkdir()
     monkeypatch.chdir(directory)
-    raw = Storage(str(directory / "kestrel_prime.db"), agent_id=AGENT_DID)
+    raw = Storage(str(directory / "kestrel_prime.db"), agent_id=did)
     await raw.initialize()
     wallet = MagicMock()
     wallet.can_afford.return_value = True
     wallet.transfer = AsyncMock()
     agent = SimpleNamespace(
-        agent_id=AGENT_DID,
+        agent_id=did,
         storage=PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL),
         features={},
         wallet=wallet,
@@ -196,6 +199,30 @@ async def test_restore_under_another_key_names_the_mismatch_and_restores_nothing
         assert await _history(raw) == []
 
 
+@pytest.mark.asyncio
+async def test_export_of_another_agent_is_refused_and_restores_nothing(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    """Every agent on a host shares the data key, so it decrypts any of
+    their exports. Without a receipt, an export restores only into the agent
+    it was sealed for: another agent's conversation rows are encrypted at
+    rest under that agent's DID, so restoring them would report success and
+    leave history this agent can never read."""
+    cid = await _export(tmp_path, monkeypatch)
+
+    async with _host(tmp_path / "neighbour", monkeypatch, did=NEIGHBOUR_DID) as (agent, raw):
+        assert await agent.storage.get_nodes_by_type("backup_artifact") == []
+
+        result = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["refusal"] == REFUSAL_EXPORT_OF_ANOTHER_AGENT
+        assert result.data["export_owner_id"] != result.data["agent_owner_id"]
+        assert result.data["export_owner_id"] in result.error
+        assert "Nothing was restored" in result.error
+        assert await _history(raw) == []
+
+
 def _tamper_key_hash(payload: bytes) -> bytes:
     """Flip one hex digit of the header's key hash, keeping it canonical."""
     start = payload.index(b'"key_hash":"') + len(b'"key_hash":"')
@@ -237,9 +264,58 @@ async def test_tampered_envelope_is_refused_and_restores_nothing(
         assert await _history(raw) == []
 
 
+@pytest.mark.asyncio
+async def test_damaged_envelope_under_an_encrypted_receipt_without_a_key_hash_is_refused(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    """The receipt, not the payload, says the export is encrypted. An
+    envelope whose magic bytes are damaged no longer looks like ciphertext,
+    and a CID lookup skips the content-hash check, so a receipt holding no
+    key hash must still refuse the payload rather than hand it to the
+    restore as plaintext (where a non-tar blob "restores" 0 messages OK)."""
+    async with _host(tmp_path / "origin", monkeypatch) as (agent, raw):
+        for role, content in MESSAGES:
+            await raw.add_conversation(role, content, metadata={})
+        exported = await SovereigntyFeature(agent).export_sovereignty(
+            storage_tier="ipfs", encrypt=True
+        )
+    assert exported.status is ToolResultStatus.OK, exported
+    cid = exported.data["cid"]
+    payload = kubo.payload(cid)
+    assert payload.startswith(ENVELOPE_MAGIC)
+    kubo.replace_payload(cid, b"X" + payload[1:])
+
+    async with _host(tmp_path / "fresh", monkeypatch) as (agent, raw):
+        # A receipt that records an encrypted export but lost its key hash.
+        await agent.storage.record_backup_artifact(
+            AGENT_DID,
+            StorageResult(
+                content_hash=exported.data["content_hash"],
+                tier=StorageTier.IPFS,
+                cid=cid,
+                encrypted=True,
+                encryption_key_hash=None,
+            ),
+        )
+        [receipt] = await agent.storage.get_nodes_by_type("backup_artifact")
+        assert receipt.properties["encrypted"] is True
+        assert receipt.properties["encryption_key_hash"] is None
+        restore = AsyncMock(wraps=agent.storage.restore_from_backup_blob)
+        monkeypatch.setattr(agent.storage, "restore_from_backup_blob", restore)
+
+        result = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert result.status is ToolResultStatus.ERROR, result
+        assert result.data["refusal"] == REFUSAL_DECRYPTION_FAILED
+        assert "receipt records an encrypted export" in result.error
+        assert "Nothing was restored" in result.error
+        restore.assert_not_awaited()
+        assert await _history(raw) == []
+
+
 async def _legacy_export(agent, raw):
     """An encrypted export as written before the envelope (#2873): the same
-    adapter call without ``seal_envelope``, receipted the same way."""
+    adapter call without ``envelope_owner``, receipted the same way."""
     for role, content in MESSAGES:
         await raw.add_conversation(role, content, metadata={})
     blob = await agent.storage.create_backup_blob(include_db=True)

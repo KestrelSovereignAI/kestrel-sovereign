@@ -178,7 +178,7 @@ async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotate
     storage.get_nodes_by_type = AsyncMock(return_value=[backup_node])
     storage.restore_from_backup_blob = AsyncMock()
 
-    agent = SimpleNamespace(storage=storage)
+    agent = SimpleNamespace(storage=storage, agent_id="did:kestrel:test")
     adapter = MagicMock()
     adapter.retrieve_content.side_effect = error
 
@@ -196,6 +196,7 @@ async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotate
         "bafybackup",
         ipfs_cid="bafybackup",
         key_hash="keyhash123",
-        envelope=EnvelopePolicy.OPEN,
+        envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+        envelope_owner="did:kestrel:test",
     )
     storage.restore_from_backup_blob.assert_not_awaited()

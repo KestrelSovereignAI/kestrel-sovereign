@@ -9,6 +9,7 @@ from kestrel_sovereign.filecoin_adapter import (
     DecryptionKeyUnavailableError,
     EncryptedEnvelopeError,
     EnvelopeKeyMismatchError,
+    EnvelopeOwnerMismatchError,
     EnvelopePolicy,
     FilecoinAdapter,
     LegacyDecryptionUnavailableError,
@@ -32,6 +33,7 @@ REFUSAL_INSUFFICIENT_FUNDS = "insufficient_funds"
 # Import refusals (#2873): an export that cannot be decrypted, or cannot be
 # trusted, is refused before any of it reaches the restore.
 REFUSAL_ENCRYPTION_KEY_MISMATCH = "encryption_key_mismatch"
+REFUSAL_EXPORT_OF_ANOTHER_AGENT = "export_of_another_agent"
 REFUSAL_DECRYPTION_FAILED = "decryption_failed"
 REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE = "legacy_decryption_metadata_unavailable"
 REFUSAL_UNENCRYPTED_WITHOUT_RECEIPT = "unencrypted_export_without_receipt"
@@ -197,7 +199,7 @@ class SovereigntyFeature(Feature):
             encrypt=encrypt,
             metadata={"agent": self.agent.agent_id},
             on_progress=progress,
-            seal_envelope=encrypt,
+            envelope_owner=self.agent.agent_id if encrypt else None,
         )
         progress(len(backup_blob), len(backup_blob))
 
@@ -387,14 +389,19 @@ class SovereigntyFeature(Feature):
         An encrypted export carries its decryption metadata in a
         self-describing envelope and decrypts with the configured
         KESTREL_DATA_KEY alone, so it restores on a fresh host whose storage
-        holds no record of it (#2873). Without a backup receipt only IPFS is
-        read, never the host cache co-hosted agents share (#3225), and only an
-        encrypted export is restored. A legacy encrypted export, made before
+        holds no record of it (#2873). The envelope is sealed for the agent
+        that exported it, and an export of another agent is refused: its
+        conversation rows are encrypted at rest under that agent's identity.
+        Without a backup receipt only IPFS is read, never the host cache
+        co-hosted agents share (#3225), and only an encrypted export is
+        restored. A legacy encrypted export, made before
         the envelope, decrypts with the key hash in this agent's backup
         receipt; without one the configured key is tried under the name it
         was requested by, which opens it only when that name is its content
-        hash. An export that cannot be decrypted is refused, and none of its
-        bytes reach the restore.
+        hash. With a receipt, the receipt decides whether the export is
+        encrypted: only one recording a plaintext export accepts a payload
+        that is not ciphertext. An export that cannot be decrypted is
+        refused, and none of its bytes reach the restore.
 
         Scope (#F265): restores ``conversation_history`` faithfully —
         ``created_at`` (ordering) and ``deleted_at`` (trash) are preserved, so
@@ -402,6 +409,7 @@ class SovereigntyFeature(Feature):
         Other agent state (memories, graph_nodes, saved_items, files, settings)
         is NOT restored yet; full multi-table restore is a tracked follow-up.
         """
+        receipt = None
         try:
             adapter = FilecoinAdapter()
 
@@ -424,10 +432,12 @@ class SovereigntyFeature(Feature):
                 # A fresh host, or a database lost with its records (#2873).
                 # The host cache still may not answer for a name this agent
                 # holds no receipt for, so only IPFS can, and only an export
-                # the configured key decrypts is restored: holding that key is
-                # the authority a restore without a receipt has. An envelope
-                # names its own key hash; a legacy export is tried under the
-                # name it was requested by. A plaintext payload proves nothing.
+                # the configured key decrypts is restored. That key is shared
+                # by every agent on the host, so an envelope must also have
+                # been sealed for this agent's DID, which stands in for the
+                # ownership a receipt would otherwise show. An envelope names
+                # its own key hash; a legacy export is tried under the name
+                # it was requested by. A plaintext payload proves nothing.
                 logger.info(
                     f"No backup receipt for CID {cid} in this agent's storage; "
                     "restoring an encrypted export from IPFS only"
@@ -438,19 +448,35 @@ class SovereigntyFeature(Feature):
                     ipfs_cid=cid,
                     allow_local_cache=False,
                     envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+                    envelope_owner=self.agent.agent_id,
                 )
             else:
                 # The envelope names its own key hash, and the receipt's must
                 # equal it; a legacy export without an envelope decrypts with
                 # the receipt's, or under its name if the receipt has none.
                 key_hash = receipt.properties.get("encryption_key_hash")
+                # The receipt, not the payload, says whether the export is
+                # encrypted. An envelope whose magic bytes were damaged no
+                # longer looks like ciphertext, and a CID lookup skips the
+                # content-hash check, so trusting the payload would hand the
+                # damaged bytes to the restore as plaintext. Only a receipt
+                # that records a plaintext export, and no key hash, accepts
+                # one.
+                receipt_encrypted = (
+                    receipt.properties.get("encrypted") is not False or bool(key_hash)
+                )
                 logger.info(f"Found backup artifact node for CID {cid}, encrypted: {receipt.properties.get('encrypted')}")
                 content = await asyncio.to_thread(
                     adapter.retrieve_content,
                     cid,
                     ipfs_cid=cid,
                     key_hash=key_hash,
-                    envelope=EnvelopePolicy.OPEN,
+                    envelope=(
+                        EnvelopePolicy.ENCRYPTED_ONLY
+                        if receipt_encrypted
+                        else EnvelopePolicy.OPEN
+                    ),
+                    envelope_owner=self.agent.agent_id,
                 )
 
             if not content:
@@ -489,6 +515,16 @@ class SovereigntyFeature(Feature):
                 export_key_id=e.envelope_key_id,
                 configured_key_id=e.configured_key_id,
             )
+        except EnvelopeOwnerMismatchError as e:
+            return self._import_refused(
+                cid,
+                REFUSAL_EXPORT_OF_ANOTHER_AGENT,
+                f"{e}. An export restores only into the agent that made it: "
+                "its conversation history is encrypted at rest under that "
+                "agent's identity",
+                export_owner_id=e.envelope_owner_id,
+                agent_owner_id=e.owner_id,
+            )
         except EncryptedEnvelopeError as e:
             return self._import_refused(
                 cid,
@@ -505,6 +541,14 @@ class SovereigntyFeature(Feature):
                 decryption_attempted=e.attempted,
             )
         except UnencryptedContentError:
+            if receipt is not None:
+                return self._import_refused(
+                    cid,
+                    REFUSAL_DECRYPTION_FAILED,
+                    "this agent's backup receipt records an encrypted export, "
+                    "but the retrieved payload is not ciphertext this host "
+                    "can decrypt; it may be damaged or substituted",
+                )
             return self._import_refused(
                 cid,
                 REFUSAL_UNENCRYPTED_WITHOUT_RECEIPT,

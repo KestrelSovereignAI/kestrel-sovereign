@@ -105,11 +105,19 @@ _CONTENT_KEY_INFO = b"kestrel-filecoin-content-key-v1"
 #
 # The header is canonical JSON naming the format and version, the cipher, the
 # key derivation, ``key_hash`` (the content hash the key derives from, which
-# is also the plaintext's SHA-256) and ``key_id`` (a one-way identifier of the
+# is also the plaintext's SHA-256), ``key_id`` (a one-way identifier of the
 # master key, so a payload sealed under another key is named as such instead
-# of being reported as corrupt). It holds no key material. Everything before
-# the token is the token's associated data, so changing any header byte fails
-# decryption.
+# of being reported as corrupt) and ``owner_id`` (a one-way identifier of the
+# exporting agent's DID under the master key). It holds no key material, and
+# the owner's DID is not readable from it without the master key. Everything
+# before the token is the token's associated data, so changing any header byte
+# fails decryption.
+#
+# ``owner_id`` exists because the master key is shared by every agent on a
+# host, so it decrypts any of their envelopes. A restore that holds no
+# receipt for the export has no other proof it is this agent's (#3225), and an
+# export of another agent could not be restored usefully anyway: its
+# conversation rows are encrypted at rest under that agent's DID.
 ENVELOPE_MAGIC = b"KSENV\x00"
 ENVELOPE_FORMAT = "kestrel.encrypted-envelope"
 ENVELOPE_VERSION = 1
@@ -118,10 +126,12 @@ ENVELOPE_KDF = "hkdf-sha256:" + _CONTENT_KEY_INFO.decode("ascii")
 _ENVELOPE_LENGTH_BYTES = 4
 _ENVELOPE_HEADER_LIMIT = 4096
 _ENVELOPE_HEADER_FIELDS = frozenset(
-    {"format", "version", "cipher", "kdf", "key_hash", "key_id"}
+    {"format", "version", "cipher", "kdf", "key_hash", "key_id", "owner_id"}
 )
 _ENVELOPE_KEY_ID_INFO = b"kestrel-encrypted-envelope-key-id-v1"
 _ENVELOPE_KEY_ID_BYTES = 16
+_ENVELOPE_OWNER_ID_INFO = b"kestrel-encrypted-envelope-owner-id-v1"
+_ENVELOPE_OWNER_ID_BYTES = 16
 # A legacy Fernet token is URL-safe base64 of version byte 0x80 followed by a
 # big-endian timestamp; KSAv2 tokens carry their own prefix.
 _FERNET_TOKEN_PREFIX = b"gAAAAA"
@@ -168,6 +178,18 @@ class EnvelopeKeyMismatchError(EncryptedEnvelopeError):
         super().__init__(
             f"the export was encrypted under key id {envelope_key_id}, but the "
             f"configured KESTREL_DATA_KEY has key id {configured_key_id}"
+        )
+
+
+class EnvelopeOwnerMismatchError(EncryptedEnvelopeError):
+    """The envelope was sealed for another agent than the one opening it."""
+
+    def __init__(self, envelope_owner_id: str, owner_id: str):
+        self.envelope_owner_id = envelope_owner_id
+        self.owner_id = owner_id
+        super().__init__(
+            f"the export was sealed for another agent (owner id "
+            f"{envelope_owner_id}); this agent's owner id is {owner_id}"
         )
 
 
@@ -228,7 +250,27 @@ def envelope_key_id(master_key: bytes) -> str:
     return hkdf.derive(master_key).hex()
 
 
-def _envelope_header(*, key_hash: str, key_id: str) -> bytes:
+def envelope_owner_id(master_key: bytes, owner: str) -> str:
+    """The one-way identifier of an envelope's owning agent DID.
+
+    Keyed by the master key, so the header does not publish which agent an
+    export belongs to.
+    """
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    if not isinstance(owner, str) or not owner:
+        raise ValueError("an encrypted envelope's owner must be an agent DID")
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=_ENVELOPE_OWNER_ID_BYTES,
+        salt=owner.encode("utf-8"),
+        info=_ENVELOPE_OWNER_ID_INFO,
+    )
+    return hkdf.derive(master_key).hex()
+
+
+def _envelope_header(*, key_hash: str, key_id: str, owner_id: str) -> bytes:
     header = {
         "format": ENVELOPE_FORMAT,
         "version": ENVELOPE_VERSION,
@@ -236,6 +278,7 @@ def _envelope_header(*, key_hash: str, key_id: str) -> bytes:
         "kdf": ENVELOPE_KDF,
         "key_hash": key_hash,
         "key_id": key_id,
+        "owner_id": owner_id,
     }
     return json.dumps(header, sort_keys=True, separators=(",", ":")).encode("ascii")
 
@@ -284,11 +327,18 @@ def _parse_envelope(payload: bytes) -> Tuple[Dict[str, Any], bytes, bytes]:
             f"encrypted envelope cipher {header['cipher']!r} / key derivation "
             f"{header['kdf']!r} is not supported"
         )
-    if not _is_lower_hex(header["key_hash"], 64) or not _is_lower_hex(
-        header["key_id"], _ENVELOPE_KEY_ID_BYTES * 2
+    if not (
+        _is_lower_hex(header["key_hash"], 64)
+        and _is_lower_hex(header["key_id"], _ENVELOPE_KEY_ID_BYTES * 2)
+        and _is_lower_hex(header["owner_id"], _ENVELOPE_OWNER_ID_BYTES * 2)
     ):
         raise EnvelopeFormatError("encrypted envelope key fields are invalid")
-    if _envelope_header(key_hash=header["key_hash"], key_id=header["key_id"]) != raw_header:
+    canonical = _envelope_header(
+        key_hash=header["key_hash"],
+        key_id=header["key_id"],
+        owner_id=header["owner_id"],
+    )
+    if canonical != raw_header:
         raise EnvelopeFormatError("encrypted envelope header is not canonical")
     return header, payload[:header_end], payload[header_end:]
 
@@ -414,7 +464,7 @@ class FilecoinAdapter:
                      metadata: Optional[Dict] = None,
                      on_progress: Optional[Callable[[int, int], None]] = None,
                      *,
-                     seal_envelope: bool = False) -> StorageResult:
+                     envelope_owner: Optional[str] = None) -> StorageResult:
         """
         Store content in decentralized storage based on tier.
 
@@ -424,15 +474,16 @@ class FilecoinAdapter:
             encrypt: Whether to encrypt before storage
             metadata: Additional metadata
             on_progress: Optional callback(bytes_sent, total_bytes)
-            seal_envelope: Write the encrypted content as a self-describing
-                envelope that decrypts from the payload alone plus
-                KESTREL_DATA_KEY (#2873). Requires ``encrypt``.
+            envelope_owner: The exporting agent's DID. When given, the
+                encrypted content is written as a self-describing envelope
+                sealed for that agent, which decrypts from the payload alone
+                plus KESTREL_DATA_KEY (#2873). Requires ``encrypt``.
 
         Returns:
             StorageResult with storage details
         """
-        if seal_envelope and not encrypt:
-            raise ValueError("seal_envelope=True requires encrypt=True")
+        if envelope_owner is not None and not encrypt:
+            raise ValueError("envelope_owner requires encrypt=True")
 
         # Calculate content hash
         content_hash = hashlib.sha256(content).hexdigest()
@@ -440,9 +491,9 @@ class FilecoinAdapter:
         # Handle encryption if requested
         final_content = content
         encryption_key_hash = None
-        if seal_envelope:
+        if envelope_owner is not None:
             final_content, encryption_key_hash = self._seal_envelope(
-                content, content_hash=content_hash
+                content, content_hash=content_hash, owner=envelope_owner
             )
         elif encrypt:
             final_content, encryption_key_hash = self._encrypt_content(
@@ -527,7 +578,8 @@ class FilecoinAdapter:
                          *,
                          max_output_bytes: Optional[int] = None,
                          allow_local_cache: bool = True,
-                         envelope: EnvelopePolicy = EnvelopePolicy.IGNORE) -> bytes:
+                         envelope: EnvelopePolicy = EnvelopePolicy.IGNORE,
+                         envelope_owner: Optional[str] = None) -> bytes:
         """
         Retrieve content from storage (cache first, then IPFS).
 
@@ -541,7 +593,9 @@ class FilecoinAdapter:
 
         Under ``EnvelopePolicy.OPEN`` or ``ENCRYPTED_ONLY`` an encrypted
         envelope is decrypted from its own header with the configured master
-        key; a ``key_hash``, when given, must equal the one the header names.
+        key, and only for ``envelope_owner``, the DID of the agent it was
+        sealed for, which those policies require; a ``key_hash``, when given,
+        must equal the one the header names.
         A payload without an envelope is decrypted with ``key_hash`` as
         before. Legacy ciphertext with no ``key_hash`` is tried with the
         configured key under ``content_hash`` (see
@@ -558,10 +612,17 @@ class FilecoinAdapter:
                 result. Cache/network reads and decompression intermediates are
                 bounded as well when supplied.
             envelope: How a self-describing encrypted envelope is treated.
+            envelope_owner: The DID of the agent retrieving the content; an
+                envelope sealed for another agent is refused.
 
         Returns:
             Original content bytes
         """
+        if envelope is not EnvelopePolicy.IGNORE and not envelope_owner:
+            raise ValueError(
+                f"envelope={envelope.value} requires the retrieving agent's "
+                "DID as envelope_owner"
+            )
         # Normalize a SHA-256 lookup key to lowercase so cache lookup AND the
         # integrity check are case-consistent on case-SENSITIVE filesystems too
         # (Linux CI/prod). Cache files are written with the lowercase hexdigest,
@@ -614,7 +675,9 @@ class FilecoinAdapter:
                     result = decompressed_content
             elif is_encrypted_envelope(decompressed_content):
                 result = self.open_envelope(
-                    decompressed_content, expected_key_hash=key_hash
+                    decompressed_content,
+                    owner=envelope_owner,
+                    expected_key_hash=key_hash,
                 )
             elif key_hash:
                 result = self._decrypt_content(decompressed_content, key_hash)
@@ -751,39 +814,49 @@ class FilecoinAdapter:
         )
         return hkdf.derive(master_key)
 
-    def _seal_envelope(self, content: bytes, content_hash: str) -> Tuple[bytes, str]:
+    def _seal_envelope(self, content: bytes, content_hash: str,
+                       owner: str) -> Tuple[bytes, str]:
         """Encrypt content into a self-describing envelope (#2873).
 
         The key is the same F187 per-content key ``_encrypt_content`` uses;
-        the envelope differs only in carrying ``key_hash`` and the master-key
-        identifier in its authenticated header, so it decrypts from the
-        payload and KESTREL_DATA_KEY alone.
+        the envelope differs only in carrying ``key_hash``, the master-key
+        identifier and the owning agent's identifier in its authenticated
+        header, so it decrypts from the payload and KESTREL_DATA_KEY alone,
+        for the agent ``owner`` names.
         """
         from kestrel_sdk.security.aead import AEADCipher
 
         master_key = self._get_master_key()
         prefix = _envelope_prefix(
-            _envelope_header(key_hash=content_hash, key_id=envelope_key_id(master_key))
+            _envelope_header(
+                key_hash=content_hash,
+                key_id=envelope_key_id(master_key),
+                owner_id=envelope_owner_id(master_key, owner),
+            )
         )
         content_key = self._derive_content_key(master_key, content_hash)
         token = AEADCipher(content_key).encrypt(content, aad=prefix)
         return prefix + token, content_hash
 
-    def open_envelope(self, payload: bytes, *,
+    def open_envelope(self, payload: bytes, *, owner: str,
                       expected_key_hash: Optional[str] = None) -> bytes:
         """Decrypt a self-describing envelope with the configured master key.
 
+        ``owner`` is the DID of the agent opening the envelope. Every
+        co-hosted agent shares the master key, so it would decrypt another
+        agent's envelope just as readily; one sealed for another agent is
+        refused before decryption.
+
         ``expected_key_hash`` is the key hash a caller's own record holds for
         this payload, if it has one. An envelope naming another one is a
-        different export, which the master key every co-hosted agent shares
-        would decrypt just as readily, so it is refused before decryption.
+        different export, so it is refused before decryption too.
 
         Raises an ``EncryptedEnvelopeError`` subclass, and returns nothing,
         when the header is malformed or names another key hash than
-        ``expected_key_hash``, the envelope names another master key, or the
-        token fails authentication or its plaintext does not hash to the
-        header's ``key_hash``. Raises ``DecryptionKeyUnavailableError`` when
-        no master key is configured.
+        ``expected_key_hash``, the envelope names another master key or was
+        sealed for another agent, or the token fails authentication or its
+        plaintext does not hash to the header's ``key_hash``. Raises
+        ``DecryptionKeyUnavailableError`` when no master key is configured.
         """
         from kestrel_sdk.security.aead import AEADCipher
         from kestrel_sdk.security.exceptions import DecryptionError
@@ -798,6 +871,9 @@ class FilecoinAdapter:
         configured_key_id = envelope_key_id(master_key)
         if header["key_id"] != configured_key_id:
             raise EnvelopeKeyMismatchError(header["key_id"], configured_key_id)
+        owner_id = envelope_owner_id(master_key, owner)
+        if header["owner_id"] != owner_id:
+            raise EnvelopeOwnerMismatchError(header["owner_id"], owner_id)
         content_key = self._derive_content_key(master_key, header["key_hash"])
         try:
             content = AEADCipher(content_key).decrypt(token, aad=prefix)
