@@ -359,12 +359,13 @@ async def test_reanchor_commit_outcome_never_claims_rollback_or_invites_retry(tm
     agent, _ = _make_agent()
     artifact_path = _write_artifact(tmp_path)
     original_transaction = agent._raw_storage.transaction
+    original_control = ExecutionCommitOutcomeError(outcome)
 
     @asynccontextmanager
     async def lost_at_commit():
         async with original_transaction():
             yield
-        raise ExecutionCommitOutcomeError(outcome)
+        raise original_control
 
     agent._raw_storage.transaction = lost_at_commit
     consumed = object()
@@ -372,13 +373,17 @@ async def test_reanchor_commit_outcome_never_claims_rollback_or_invites_retry(tm
          patch.object(ConstitutionMixin, "_publish_consumed_anchor_custody") as publish, \
          patch("builtins.open", create=True) as mock_open:
         mock_open.side_effect = _open_handles(FAKE_CONSTITUTION, artifact_path.read_bytes())
-        result = await agent.reanchor_constitution(
-            expected_hash=FAKE_HASH[:8], authorization="admin_command",
-            amendment_artifact_path=str(artifact_path),
-        )
-    assert f"outcome is {outcome}" in result
-    assert "do not retry" in result
-    assert "rolled back" not in result and "successfully" not in result
+        with pytest.raises(ExecutionCommitOutcomeError) as raised:
+            await agent.reanchor_constitution(
+                expected_hash=FAKE_HASH[:8], authorization="admin_command",
+                amendment_artifact_path=str(artifact_path),
+            )
+    # Reconciliation is control flow, not a successful command/text response.
+    # Preserve the exact native receipt so every caller can classify it.
+    assert raised.value is original_control
+    assert f"outcome is {outcome}" in str(raised.value)
+    assert "reconcile durable state before any retry" in str(raised.value)
+    assert "rolled back" not in str(raised.value) and "successfully" not in str(raised.value)
     assert agent._safe_mode is True
     assert "reconciliation" in agent._safe_mode_reason
     if outcome == "committed":
