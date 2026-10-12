@@ -5667,6 +5667,27 @@ def remove_agent_runtime_namespace(agent: Any) -> RuntimeNamespaceCleanupOutcome
         if runtime_scope is not None
         else None
     )
+    if runtime_scope is not None:
+        # Retain constructed proxies even when discovery quarantines them or
+        # removes them from the public feature map. Offboarding is not a grant
+        # to delete a host-selected immutable artifact.
+        owners = list(getattr(agent, "__dict__", {}).get("_isolated_runtime_cleanup_owners", ()))
+        features = getattr(agent, "features", None)
+        if isinstance(features, dict):
+            owners.extend(feature for feature in features.values() if isinstance(feature, ProxyFeature))
+        roots = (runtime_scope.path,) + ((legacy_root,) if legacy_root is not None else ())
+        for feature in owners:
+            if any(getattr(feature, attr, True) for attr in (
+                "_hosted_immutable_venv_custody_unproven",
+                "_hosted_immutable_bin_custody_unproven",
+            )):
+                raise IsolatedRuntimePreparationError("Agent runtime cleanup has unproven immutable artifact custody.")
+            paths = (
+                *feature._validated_hosted_immutable_venv_custody_paths,
+                *feature._validated_hosted_immutable_bin_custody_paths,
+            )
+            if any(path == root or root in path.parents for root in roots for path in paths):
+                raise IsolatedRuntimePreparationError("Agent runtime cleanup would remove an immutable host launch artifact.")
     return remove_runtime_namespace(runtime_scope, owner, legacy_root)
 
 
@@ -5925,6 +5946,7 @@ class _ValidatedHostedPrebuiltVenv:
 
     root_path: Path
     bin_path: Path
+    custody_paths: tuple[Path, ...]
 
 
 def _validate_hosted_prebuilt_venv(
@@ -5982,6 +6004,12 @@ def _validate_hosted_prebuilt_venv(
     return _ValidatedHostedPrebuiltVenv(
         root_path=venv_path,
         bin_path=bin_path,
+        custody_paths=tuple(sorted(set(
+            _immutable_prebuilt_custody_paths(value, venv_path, setting=setting)
+            + _immutable_prebuilt_custody_paths(str(venv_path / "pyvenv.cfg"), config_path, setting=setting)
+            + _immutable_prebuilt_custody_paths(str(_venv_bin_dir(venv_path)), bin_path, setting=setting)
+            + _immutable_prebuilt_custody_paths(str(_venv_python(venv_path)), python_path, setting=setting)
+        ))),
     )
 
 
@@ -6132,12 +6160,7 @@ def _validate_hosted_process_prebuilt_overrides(
 
     bin_key = _env_key(feature_name, "BIN")
     bin_value = os.environ.get(bin_key)
-    venv_custody_paths = (
-        _immutable_prebuilt_custody_paths(
-            venv_value if validated_process_venv is not None else runtime_venv,
-            selected_venv_path, setting=selected_venv_setting,
-        ) if selected_venv_path is not None else ()
-    )
+    venv_custody_paths = selected_venv.custody_paths if selected_venv is not None else ()
     if bin_value:
         bin_path = _validate_hosted_prebuilt_bin(bin_value, setting=bin_key)
         return _ValidatedHostedPrebuiltOverrides(
@@ -6574,6 +6597,7 @@ class ProxyFeature(Feature):
         agent_attributes = getattr(agent, "__dict__", None)
         if isinstance(agent_attributes, dict):
             agent_attributes["_isolated_runtime_features_constructed"] = True
+            agent_attributes.setdefault("_isolated_runtime_cleanup_owners", []).append(self)
         self.runtime = runtime
         self.name = runtime.class_name
         # Resolve hosted containment before classifying optional feature
@@ -13448,6 +13472,14 @@ class ProxyFeature(Feature):
                         target.console_executable,
                         setting=hosted_immutable_setting,
                     )
+                    self._validated_hosted_immutable_venv_custody_paths = tuple(sorted(set(
+                        self._validated_hosted_immutable_venv_custody_paths
+                        + validated_overrides.venv_custody_paths
+                        + _immutable_prebuilt_custody_paths(
+                            str(_console_script_path(self._venv_path, target.console_executable)),
+                            validated_console_path, setting=hosted_immutable_setting,
+                        )
+                    )))
                     self._verify_launch_artifact(
                         validated_console_path=validated_console_path,
                     )

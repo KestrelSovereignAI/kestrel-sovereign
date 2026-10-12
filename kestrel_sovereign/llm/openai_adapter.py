@@ -74,6 +74,7 @@ from .output_ceiling import (
 from .retry import with_retry
 from kestrel_sovereign.execution_custody import (
     owned_native_http_client,
+    native_execution_response_owner,
     close_native_execution_stream, retain_native_execution_http_client_close, is_execution_control_error,
 )
 
@@ -722,8 +723,16 @@ class OpenAIAdapter(LLMAdapter):
             )
 
             logger.info(f"Starting OpenAI stream for model: {model}")
+            async def acquire_stream(**request):
+                async with native_execution_response_owner(getattr(client, "_client", None)) as responses:
+                    acquired = await client.chat.completions.create(**request)
+                    # The returned SDK stream now owns the same response;
+                    # failed SDK entry instead retires every hidden handle.
+                    responses.handles.clear()
+                    return acquired
+
             stream = await with_retry(
-                client.chat.completions.create,
+                acquire_stream,
                 model=model,
                 messages=normalized_messages,
                 stream=True,
@@ -867,8 +876,14 @@ class OpenAIAdapter(LLMAdapter):
             extra_kwargs["stream_options"] = {"include_usage": True}
 
             logger.info(f"Starting OpenAI stream with tools for model: {model}")
+            async def acquire_stream(**request):
+                async with native_execution_response_owner(getattr(client, "_client", None)) as responses:
+                    acquired = await client.chat.completions.create(**request)
+                    responses.handles.clear()
+                    return acquired
+
             stream = await with_retry(
-                client.chat.completions.create,
+                acquire_stream,
                 model=model,
                 messages=normalized_messages,
                 stream=True,

@@ -16,11 +16,13 @@ import hashlib
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any
 from uuid import uuid4
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
+    owned_task_error,
     raise_owned_outcome,
 )
 from kestrel_sovereign.agent.invocation import (
@@ -28,7 +30,7 @@ from kestrel_sovereign.agent.invocation import (
     validate_invocation_id,
 )
 from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
-from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 from kestrel_sdk.storage.database.interface import TransactionError
 from kestrel_sovereign.storage.database_clock import (
     database_lease_cutoff_sql,
@@ -913,6 +915,20 @@ class DistributedInvocationStore:
             await self.abandon(str(row[0]), owner_id)
 
 
+def _registry_control_boundary(function):
+    @wraps(function)
+    async def guarded(self, *args, **kwargs):
+        self._require_terminal_control()
+        try:
+            result = await function(self, *args, **kwargs)
+        except BaseException as error:
+            self._retain_terminal_control(error)
+            raise
+        self._require_terminal_control()
+        return result
+    return guarded
+
+
 class DistributedInvocationRegistry:
     """One process's live map and relay for shared Stop requests.
 
@@ -958,14 +974,26 @@ class DistributedInvocationRegistry:
         self._reacquisition_failure: str | None = None
         self._next_relay_reacquisition_at: float | None = None
         self._last_heartbeat_monotonic: float | None = None
+        self._terminal_control: BaseException | None = None
+
+    def _retain_terminal_control(self, error: BaseException) -> None:
+        if is_execution_control_error(error):
+            self._terminal_control = execution_terminal_error(self._terminal_control, error)
+            self._fail_closed_owner("original execution control retained by Stop settlement")
+
+    def _require_terminal_control(self) -> None:
+        if self._terminal_control is not None:
+            raise self._terminal_control
 
     def start(self) -> None:
+        self._require_terminal_control()
         if self._relay_task is None:
             self._relay_task = asyncio.create_task(
                 self._relay(), name="distributed-stop-relay"
             )
 
     def attach(self, agent: object) -> None:
+        self._require_terminal_control()
         if self._closing:
             raise RuntimeError("distributed Stop registry is closing")
         if self._lease_lost:
@@ -1022,6 +1050,7 @@ class DistributedInvocationRegistry:
             else "local-agent"
         )
 
+    @_registry_control_boundary
     async def _renew_owner_lease(
         self,
         generation_id: str,
@@ -1038,6 +1067,8 @@ class DistributedInvocationRegistry:
                 lease_seconds=self._owner_lease_seconds,
             )
         except Exception as error:
+            if is_execution_control_error(error):
+                raise
             self._fail_closed_owner(
                 f"owner lease could not be renewed {operation} "
                 f"({type(error).__name__})"
@@ -1062,6 +1093,7 @@ class DistributedInvocationRegistry:
         self._last_heartbeat_monotonic = poll_started
         return polled
 
+    @_registry_control_boundary
     async def register(
         self,
         agent: object,
@@ -1200,6 +1232,7 @@ class DistributedInvocationRegistry:
             outcome, operation="distributed Stop invocation registration"
         )
 
+    @_registry_control_boundary
     async def bind_public_turn(
         self,
         agent: object,
@@ -1305,9 +1338,12 @@ class DistributedInvocationRegistry:
                             owner_id,
                             disposition,
                         )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as error:
+                    except BaseException as error:
+                        if is_execution_control_error(error):
+                            self._retain_terminal_control(error)
+                            raise
+                        if not isinstance(error, Exception):
+                            raise
                         logger.error(
                             "Distributed Stop completion failed; retrying (%s)",
                             type(error).__name__,
@@ -1345,15 +1381,16 @@ class DistributedInvocationRegistry:
 
     def _consume_cleanup(self, task: asyncio.Task[None]) -> None:
         self._cleanup_tasks.discard(task)
-        try:
-            task.result()
-        except BaseException as error:
+        error = owned_task_error(task)
+        if error is not None:
+            self._retain_terminal_control(error)
             logger.error(
                 "Distributed Stop completion failed (%s)",
                 type(error).__name__,
                 exc_info=(type(error), error, error.__traceback__),
             )
 
+    @_registry_control_boundary
     async def request_turn(
         self,
         agent_id: str,
@@ -1361,6 +1398,7 @@ class DistributedInvocationRegistry:
     ) -> DistributedStopTicket:
         return await self._store.mark_turn(agent_id, turn_id)
 
+    @_registry_control_boundary
     async def request_public_turn(
         self,
         agent_id: str,
@@ -1368,9 +1406,11 @@ class DistributedInvocationRegistry:
     ) -> DistributedStopTicket:
         return await self._store.mark_public_turn(agent_id, turn_id)
 
+    @_registry_control_boundary
     async def request_agent(self, agent_id: str) -> DistributedStopTicket:
         return await self._store.mark_agent(agent_id)
 
+    @_registry_control_boundary
     async def agent_has_unsettled_work(self, agent_id: str) -> bool:
         """Expose the durable fleet inventory without marking it for Stop."""
 
@@ -1404,6 +1444,7 @@ class DistributedInvocationRegistry:
                 cancelled.append((target.turn_id, target.generation))
         return tuple(cancelled)
 
+    @_registry_control_boundary
     async def wait_for_stop(
         self,
         ticket: DistributedStopTicket,
@@ -1483,7 +1524,9 @@ class DistributedInvocationRegistry:
                             request_id=target.turn_id,
                             generation=target.generation,
                         )
-                except Exception:
+                except Exception as error:
+                    if is_execution_control_error(error):
+                        raise
                     logger.exception(
                         "Distributed Stop owner self-fence cancellation failed"
                     )
@@ -1503,6 +1546,7 @@ class DistributedInvocationRegistry:
             )
         self._reacquisition_failure = failure
 
+    @_registry_control_boundary
     async def _reacquire_owner_lease(self) -> None:
         """Re-establish ownership for new work under a fresh owner identity.
 
@@ -1526,6 +1570,8 @@ class DistributedInvocationRegistry:
                 lease_seconds=self._owner_lease_seconds,
             )
         except Exception as error:
+            if is_execution_control_error(error):
+                raise
             self._record_reacquisition_failure(
                 f"owner lease store unavailable ({type(error).__name__})"
             )
@@ -1577,6 +1623,7 @@ class DistributedInvocationRegistry:
                 loop.time() + self._owner_lease_seconds
             )
 
+    @_registry_control_boundary
     async def _relay(self) -> None:
         while not self._closing:
             if self._lease_lost:
@@ -1585,6 +1632,8 @@ class DistributedInvocationRegistry:
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
+                    if is_execution_control_error(error):
+                        raise
                     logger.error(
                         "Distributed Stop owner re-establishment failed (%s)",
                         type(error).__name__,
@@ -1659,6 +1708,8 @@ class DistributedInvocationRegistry:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.error(
                     "Distributed Stop relay failed (%s)",
                     type(error).__name__,
@@ -1686,7 +1737,12 @@ class DistributedInvocationRegistry:
                 self._store.abandon_owner(owner_id),
                 timeout=remaining,
             )
-        except (asyncio.TimeoutError, Exception) as error:  # noqa: BLE001
+        except BaseException as error:
+            if is_execution_control_error(error):
+                self._retain_terminal_control(error)
+                return
+            if not isinstance(error, Exception):
+                raise
             # Owner abandonment is recoverable: the lease expires and
             # reap_expired() retires the rows into the unresolved ledger.
             # Never hold teardown open for it.
@@ -1702,10 +1758,11 @@ class DistributedInvocationRegistry:
         relay = self._relay_task
         if relay is not None:
             relay.cancel()
-            try:
-                await relay
-            except asyncio.CancelledError:
-                pass
+            outcome = await await_owned_task(relay)
+            if outcome.error is not None:
+                self._retain_terminal_control(outcome.error)
+                if not isinstance(outcome.error, asyncio.CancelledError) and not is_execution_control_error(outcome.error):
+                    raise outcome.error
             self._relay_task = None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _DEFAULT_CLOSE_DRAIN_SECONDS
@@ -1753,6 +1810,7 @@ class DistributedInvocationRegistry:
         self._by_local_generation.clear()
         self._cleanup_keys.clear()
         self._completing_generation_ids.clear()
+        self._require_terminal_control()
 
 
 __all__ = [

@@ -2716,7 +2716,7 @@ class ConstitutionMixin:
                 await self._raw_storage.add_node(agent_node, capability=acquire_control_plane_capability())
                 consumed = await ConstitutionMixin._consume_initial_anchor_custody(self)
             ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
-        except Exception as e:
+        except BaseException as e:
             from kestrel_sovereign.execution_custody import execution_commit_outcome
 
             outcome = execution_commit_outcome(e)
@@ -2730,6 +2730,8 @@ class ConstitutionMixin:
                 raise
             from kestrel_sovereign.execution_custody import is_execution_control_error
             if is_execution_control_error(e):
+                raise
+            if not isinstance(e, Exception):
                 raise
             return (
                 f"Error: Reanchor failed mid-write and was rolled back; "

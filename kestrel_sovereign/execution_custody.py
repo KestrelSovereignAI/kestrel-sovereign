@@ -524,6 +524,9 @@ def retain_native_execution_http_client_close(client: Any) -> None:
         sink = _NATIVE_RESPONSE_SINK.get()
         if sink is not None:
             sink(response)
+        # Retain first so denial during SDK entry/error-body reading still
+        # has an owner that physically closes the acquired native response.
+        require_execution_work()
 
     async def require_request_authority(request):
         # A native SDK must not spend an already-revoked admission, even if
@@ -705,11 +708,27 @@ def execution_work_stream(function: Callable) -> Callable:
     the consumer. Every later consumer's admissions join the pinned union.
     """
     @wraps(function)
-    async def guarded(self, *args, **kwargs) -> AsyncIterator[Any]:
-        async with owned_execution_stream(self, function(self, *args, **kwargs)) as iterator:
-            async for item in iterator:
-                yield item
+    def guarded(self, *args, **kwargs) -> AsyncIterator[Any]:
+        # Async-generator bodies run on first pull, too late to capture the
+        # creator's authority. Construct only the lazy forwarder here.
+        return execution_stream(self, function(self, *args, **kwargs))
     return guarded
+
+
+async def run_execution_blocking_operation(owner: Any, operation: Callable, *args):
+    """Admit at the actual foreign-worker entry, then physically join it.
+
+    Cleanup uses the separate unrestricted physical-join primitive. This
+    work-only boundary is opt-in for native inference and model/file work.
+    """
+    from kestrel_sovereign._async_ownership import run_blocking_operation
+    require_execution_work(owner)
+    def run_original_work():
+        require_execution_work(owner)
+        return operation(*args)
+    result = await run_blocking_operation(run_original_work)
+    require_execution_work(owner)
+    return result
 
 
 @contextmanager
@@ -784,11 +803,18 @@ class _ExecutionForwarder:
                 )
             try:
                 item = await anext(self._iterator)
+                require_execution_work(self._runtime_owner)
             except BaseException as error:
+                # A deferred iterator is a public ownership boundary too.
+                # Cancellation of its pull must join the physical producer,
+                # even when the consumer never gets a chance to call aclose.
+                try:
+                    await self.aclose()
+                except BaseException as cleanup_error:
+                    raise execution_terminal_error(error, cleanup_error)
                 if not is_execution_control_error(error):
                     require_execution_work(self._runtime_owner)
                 raise
-            require_execution_work(self._runtime_owner)
             return item
 
     async def _produce(self):

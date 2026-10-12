@@ -1474,9 +1474,6 @@ class SQLiteBackend(DatabaseBackend):
     async def _commit_write(self, conn: aiosqlite.Connection) -> None:
         """One native COMMIT handoff, including host/local-anchor receipts."""
         scopes = self._execution_commit_scopes()
-        if not scopes:
-            await conn.commit()
-            return
         self._require_execution_backend()
         try:
             await conn.commit()

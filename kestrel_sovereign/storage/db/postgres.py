@@ -779,6 +779,11 @@ class PostgresBackend(DatabaseBackend):
 
     @asynccontextmanager
     async def _authority_pool_checkout(self, pool: Any) -> AsyncIterator[tuple[Any, _ExecutionCommitState]]:
+        async with self._tracked_pool_checkout(pool, admit_work=True) as owned:
+            yield owned
+
+    @asynccontextmanager
+    async def _tracked_pool_checkout(self, pool: Any, *, admit_work: bool) -> AsyncIterator[tuple[Any, _ExecutionCommitState]]:
         # asyncpg release/reset is awaited after COMMIT. Carry the exact commit
         # state through that await so a release failure cannot imply rollback.
         state = _ExecutionCommitState()
@@ -803,6 +808,8 @@ class PostgresBackend(DatabaseBackend):
         # Release/reset is an awaited part of the operation, not an
         # authority-free epilogue. Never publish a stale read/RETURNING value
         # or imply rollback when revocation raced a successful COMMIT/reset.
+        if not admit_work:
+            return
         if state.outcome is not None:
             self._require_after_authority_commit(state.scopes)
         else:
@@ -813,6 +820,23 @@ class PostgresBackend(DatabaseBackend):
         self, connection: Any, scopes: tuple[ExecutionCustody, ...],
         commit_state: _ExecutionCommitState | None = None,
     ) -> AsyncIterator[None]:
+        async with self._tracked_native_transaction(connection, scopes, commit_state):
+            await lock_execution_authority(connection, "postgres", scopes)
+            yield
+            require_execution_backend("postgres", scopes)
+            self._require_transaction_custody()
+        self._require_after_authority_commit(scopes)
+
+    @asynccontextmanager
+    async def _tracked_native_transaction(
+        self, connection: Any, scopes: tuple[ExecutionCustody, ...],
+        commit_state: _ExecutionCommitState | None = None,
+    ) -> AsyncIterator[None]:
+        """Classify native commit acknowledgement without granting work.
+
+        Ordinary work adds its lock/admission in _authority_transaction; fixed
+        cleanup uses only this private physical-outcome boundary.
+        """
         # A failure in the body rolls back. Once the body/precommit checks
         # finish, a failed commit acknowledgement must instead be reconciled.
         if commit_state is not None:
@@ -822,10 +846,7 @@ class PostgresBackend(DatabaseBackend):
         try:
             async with connection.transaction():
                 try:
-                    await lock_execution_authority(connection, "postgres", scopes)
                     yield
-                    require_execution_backend("postgres", scopes)
-                    self._require_transaction_custody()
                 except BaseException as error:
                     # Native __aexit__ may replace this error during rollback.
                     # Keep the explicit original receipt, not cleanup context.
@@ -836,13 +857,15 @@ class PostgresBackend(DatabaseBackend):
                     commit_state.outcome = "unknown"
         except BaseException as exc:
             if committing:
+                outcome = execution_commit_outcome(exc) or "unknown"
                 for scope in scopes:
-                    scope.preserve_commit_uncertainty("unknown")
-                raise ExecutionCommitOutcomeError("unknown") from exc
+                    scope.preserve_commit_uncertainty(outcome)
+                if execution_commit_outcome(exc) is not None:
+                    raise
+                raise ExecutionCommitOutcomeError(outcome) from exc
             raise execution_terminal_error(body_failure, exc)
         if commit_state is not None:
             commit_state.outcome = "committed"
-        self._require_after_authority_commit(scopes)
 
     @staticmethod
     def _require_after_authority_commit(scopes: tuple[ExecutionCustody, ...]) -> None:
@@ -1379,10 +1402,11 @@ class PostgresBackend(DatabaseBackend):
             raise ConnectionError("Stop terminal custody requires the original connected backend")
         # A terminalizer must not wedge shutdown waiting for a saturated pool.
         async with asyncio.timeout(5):
-            async with pool.acquire() as connection:
-                await _settle_stop_on_connection(
-                    connection, generation_id, owner_id, disposition,
-                )
+            async with self._tracked_pool_checkout(pool, admit_work=False) as (connection, state):
+                async with self._tracked_native_transaction(connection, state.scopes, state):
+                    await _settle_stop_on_connection(
+                        connection, generation_id, owner_id, disposition,
+                    )
 
     async def release_initial_reservations(
         self, *, agent_id: str, owner_id: str, now: datetime,
@@ -1404,8 +1428,8 @@ class PostgresBackend(DatabaseBackend):
         if pool is None:
             raise ConnectionError("runtime cleanup requires the original backend")
         async with asyncio.timeout(5):
-            async with pool.acquire() as connection:
-                async with connection.transaction():
+            async with self._tracked_pool_checkout(pool, admit_work=False) as (connection, state):
+                async with self._tracked_native_transaction(connection, state.scopes, state):
                     await connection.fetchval(
                         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                         DurableSignalStore.runtime_owner_lock_key(agent_id),
@@ -1454,17 +1478,18 @@ class PostgresBackend(DatabaseBackend):
         if pool is None:
             raise ConnectionError("initial reservation cleanup requires the original backend")
         async with asyncio.timeout(5):
-            async with pool.acquire() as connection:
-                result = await connection.execute(
-                    f"UPDATE {DurableSignalStore.DELIVERIES} "
-                    "SET status='retry', lease_owner=NULL, lease_token=NULL, "
-                    "lease_expires_at=NULL, next_attempt_at=$6, last_error=$7, "
-                    "updated_at=$6 WHERE agent_id=$1 AND consumer_id=$2 "
-                    "AND delivery_id=$3 AND lease_owner=$4 AND lease_token=$5 "
-                    "AND status IN ('initial_reserved','leased')",
-                    agent_id, consumer_id, delivery_id, owner_id, reservation_token, now, reason,
-                )
-                return result == "UPDATE 1"
+            async with self._tracked_pool_checkout(pool, admit_work=False) as (connection, state):
+                async with self._tracked_native_transaction(connection, state.scopes, state):
+                    result = await connection.execute(
+                        f"UPDATE {DurableSignalStore.DELIVERIES} "
+                        "SET status='retry', lease_owner=NULL, lease_token=NULL, "
+                        "lease_expires_at=NULL, next_attempt_at=$6, last_error=$7, "
+                        "updated_at=$6 WHERE agent_id=$1 AND consumer_id=$2 "
+                        "AND delivery_id=$3 AND lease_owner=$4 AND lease_token=$5 "
+                        "AND status IN ('initial_reserved','leased')",
+                        agent_id, consumer_id, delivery_id, owner_id, reservation_token, now, reason,
+                    )
+                    return result == "UPDATE 1"
 
     async def purge_retired_ephemeral_session(self, wrapper, *, reason: str):
         """Run only the original standalone runtime's mandatory privacy purge.
@@ -1494,10 +1519,17 @@ class PostgresBackend(DatabaseBackend):
         if pool is None:
             raise ConnectionError("privacy cleanup requires the original connected backend")
         async with asyncio.timeout(5):
-            async with pool.acquire() as connection:
-                return await _purge_original_ephemeral_session(
-                    self, connection, wrapper, reason=reason, agent_id=agent_id, since=since,
-                )
+            async with self._tracked_pool_checkout(pool, admit_work=False) as (connection, state):
+                async with self._tracked_native_transaction(connection, state.scopes, state):
+                    report, watermark = await _purge_original_ephemeral_session(
+                        self, connection, wrapper, reason=reason, agent_id=agent_id, since=since,
+                    )
+        # Publish only after native COMMIT and pool release/reset acknowledge.
+        if not report.required_sweep_failed:
+            wrapper._entered_ephemeral_at = watermark
+            wrapper._session_conversations = []
+            wrapper._session_files = {}
+        return report
 
     async def retain_cognition_cleanup_owner(self, *, agent_id: str, owner_id: str) -> bool:
         """Retain an existing live owner with leased or receipt-pending cognition.
@@ -1517,8 +1549,8 @@ class PostgresBackend(DatabaseBackend):
         if pool is None:
             raise ConnectionError("cognition cleanup requires the original backend")
         async with asyncio.timeout(5):
-            async with pool.acquire() as connection:
-                async with connection.transaction():
+            async with self._tracked_pool_checkout(pool, admit_work=False) as (connection, state):
+                async with self._tracked_native_transaction(connection, state.scopes, state):
                     await connection.fetchval(
                         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                         DurableSignalStore.runtime_owner_lock_key(agent_id),
@@ -1562,15 +1594,16 @@ class PostgresBackend(DatabaseBackend):
         if pool is None:
             raise ConnectionError("cognition terminal custody requires the original backend")
         async with asyncio.timeout(5):
-            async with pool.acquire() as connection:
-                result = await connection.execute(
-                    f"UPDATE {DurableSignalStore.DELIVERIES} "
-                    "SET status = 'failed', next_attempt_at = NULL, "
-                    "lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, "
-                    "last_error = $1, terminal_at = NOW(), updated_at = NOW() "
-                    "WHERE agent_id = $2 AND consumer_id = $3 AND delivery_id = $4 "
-                    "AND status IN ('leased', 'retry') "
-                    "AND lease_owner = $5 AND lease_token = $6",
-                    error, agent_id, consumer_id, delivery_id, owner_id, lease_token,
-                )
-                return result == "UPDATE 1"
+            async with self._tracked_pool_checkout(pool, admit_work=False) as (connection, state):
+                async with self._tracked_native_transaction(connection, state.scopes, state):
+                    result = await connection.execute(
+                        f"UPDATE {DurableSignalStore.DELIVERIES} "
+                        "SET status = 'failed', next_attempt_at = NULL, "
+                        "lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, "
+                        "last_error = $1, terminal_at = NOW(), updated_at = NOW() "
+                        "WHERE agent_id = $2 AND consumer_id = $3 AND delivery_id = $4 "
+                        "AND status IN ('leased', 'retry') "
+                        "AND lease_owner = $5 AND lease_token = $6",
+                        error, agent_id, consumer_id, delivery_id, owner_id, lease_token,
+                    )
+                    return result == "UPDATE 1"

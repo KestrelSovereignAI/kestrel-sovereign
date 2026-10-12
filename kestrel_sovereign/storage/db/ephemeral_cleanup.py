@@ -73,8 +73,7 @@ async def _purge_original_ephemeral_session(backend, connection, wrapper, *, rea
     # Optional observability callback keeps its ordinary, denying backend; it
     # is never handed this private executor or upgraded to cleanup authority.
     report = await cleanup.purge_ephemeral_session(reason=reason)
-    if not report.required_sweep_failed:
-        wrapper._entered_ephemeral_at = cleanup._entered_ephemeral_at
-    wrapper._session_conversations = []
-    wrapper._session_files = {}
-    return report
+    # The outer original-pool owner publishes these only after physical commit
+    # and checkout release. A failed acknowledgement must retain the original
+    # cutoff and session inventory for reconciliation.
+    return report, cleanup._entered_ephemeral_at

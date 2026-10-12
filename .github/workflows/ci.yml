@@ -906,6 +906,10 @@ jobs:
         run: npx playwright install --with-deps chromium
         timeout-minutes: 5
 
+      - name: Verify offline native voice transport custody
+        run: node --test tests/js/test_voice_native_custody.cjs
+        timeout-minutes: 3
+
       - name: Run the Console smoke against a fresh isolated instance
         run: uv run kestrel demo smoke --home "$RUNNER_TEMP/kestrel-console-smoke" --port "$SMOKE_PORT"
         timeout-minutes: 10

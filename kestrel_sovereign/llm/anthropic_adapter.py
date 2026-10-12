@@ -56,6 +56,7 @@ import sys
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 from kestrel_sovereign.execution_custody import (
     owned_native_http_client,
+    native_execution_response_owner,
     retain_native_execution_http_client_close,
     is_execution_control_error,
 )
@@ -105,10 +106,12 @@ async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
         from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
 
         retain_native_execution_http_client_close(getattr(client, "_client", None))
-        cm = client.messages.stream(**api_params)
-        stream = await cm.__aenter__()
-        retain_native_execution_stream_close(stream)
-        return cm, stream
+        async with native_execution_response_owner(getattr(client, "_client", None)) as responses:
+            cm = client.messages.stream(**api_params)
+            stream = await cm.__aenter__()
+            retain_native_execution_stream_close(stream)
+            responses.handles.clear()
+            return cm, stream
 
     async def close_acquired(pair):
         from kestrel_sovereign._async_ownership import await_owned_task

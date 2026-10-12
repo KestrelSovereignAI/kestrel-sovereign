@@ -230,15 +230,19 @@ export async function createRealtimeClient({
    * Swallows send errors when the channel is closing — barge-in races are
    * common and we don't want to promote them to UI errors.
    */
-  function sendJSON(msg) {
+  function sendJSON(msg, { required = false } = {}) {
     const channelOpen = dc && dc.readyState === 'open';
     const socketOpen = ws && ws.readyState === WebSocket.OPEN;
-    if (!channelOpen && !socketOpen) return;
+    if (!channelOpen && !socketOpen) {
+      if (required) throw new Error('Original voice transport is not open.');
+      return;
+    }
     try {
       const payload = JSON.stringify(msg);
       if (channelOpen) dc.send(payload);
       else ws.send(payload);
     } catch (err) {
+      if (required) throw err;
       if (!closed) {
         onEvent(makeEvent(Events.ERROR, {
           message: `data channel send failed: ${err.message}`,
@@ -297,11 +301,15 @@ export async function createRealtimeClient({
           }),
         }),
       )
-      .then((resp) => {
+      .then(async (resp) => {
         // fetch() only rejects on network failure — an HTTP 401/404/500
         // still resolves. Without this check a failed persist would look
         // like success and the turn would be silently dropped from history.
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const acknowledgement = await resp.json();
+        if (!acknowledgement || typeof acknowledgement.persisted !== 'boolean') {
+          throw new Error('Transcript acknowledgement uncertain; reconcile before continuing.');
+        }
       })
       .catch(async (err) => {
         if (!closed) {
@@ -711,21 +719,26 @@ export async function createRealtimeClient({
    */
   async function commitToolResults(results = []) {
     if (!results.length) return;
-    for (const { call_id: callId, result } of results) {
-      sendJSON({
-        type: 'conversation.item.create',
-        item: {
-          type: 'function_call_output',
-          call_id: callId,
-          output: JSON.stringify(result),
-        },
-      });
+    try {
+      for (const { call_id: callId, result } of results) {
+        sendJSON({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: callId,
+            output: JSON.stringify(result),
+          },
+        }, { required: true });
+      }
+      // xAI can finish delivering response audio before the browser has played
+      // it. Waiting here prevents the post-tool response from overlapping the
+      // prior response; WebRTC providers resolve immediately.
+      await waitForPlaybackIdle(playback);
+      sendJSON({ type: 'response.create' }, { required: true });
+    } catch (error) {
+      await close();
+      throw error;
     }
-    // xAI can finish delivering response audio before the browser has played
-    // it. Waiting here prevents the post-tool response from overlapping the
-    // prior response; WebRTC providers resolve immediately.
-    await waitForPlaybackIdle(playback);
-    sendJSON({ type: 'response.create' });
   }
 
   async function commitToolResult(callId, result) {

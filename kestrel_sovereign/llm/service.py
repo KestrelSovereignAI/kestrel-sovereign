@@ -5262,7 +5262,7 @@ No other text or formatting.
             *(task for task in vars(self).get("_llm_close_tasks", {}).values()
               if task is not None),
         ]
-        return any(not task.done() for task in owners)
+        return any(not task.done() or owned_task_error(task) is not None for task in owners)
 
     async def wait_for_close_completion(self) -> None:
         """Join exact native owners before a host retires their borrowed storage.
@@ -5281,11 +5281,13 @@ No other text or formatting.
             for task in owners:
                 outcome = await await_owned_task(task)
                 failure = execution_terminal_error(outcome.error, outcome.cancellation)
-                if failure is not None and is_execution_control_error(failure):
+                if failure is not None:
                     terminal = execution_terminal_error(terminal, failure)
             # Completion callbacks drop settled task graphs. Allow every
             # already-queued canonical harvester to finish before resnapshot.
             await asyncio.sleep(0)
+            if terminal is not None and all(task.done() for task in owners):
+                break
         terminal = execution_terminal_error(terminal, vars(self).get("_llm_close_control"),
                                             vars(self).get("_preference_persistence_control"),
                                             vars(self).get("_modality_record_control"))
@@ -5337,6 +5339,7 @@ No other text or formatting.
                 terminal = execution_terminal_error(terminal, error)
             elif error is not None and not isinstance(error, asyncio.CancelledError):
                 logger.warning("LLM shutdown %s failed (%s)", label, type(error).__name__)
+                terminal = execution_terminal_error(terminal, error)
 
         await retire("preference-writers", self.drain_preference_persistence)
         await retire("modality-writers", self.drain_modality_records)

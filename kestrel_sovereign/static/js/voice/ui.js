@@ -1346,8 +1346,8 @@ async function handleToolBatch(session, ev) {
       card.events.push({ phase: 'error', name: card.name, detail: 'Acknowledgement uncertain; reconcile before continuing.' });
       updateVoiceToolCard(cardDiv, card);
     }
+    await sessionClient.close();
     if (session.client === sessionClient) {
-      await sessionClient.close();
       surfaceFatalError(err, session);
     }
     return;

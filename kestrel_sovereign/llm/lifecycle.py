@@ -32,8 +32,9 @@ def start_llm_close_task(owner, key, operation):
         if tasks.get(key) is done:
             if error is None or is_execution_control_error(error):
                 tasks[key] = None
-            else:
-                tasks.pop(key)
+            # An ordinary native failure is not proof that every transport
+            # resource retired. Keep the exact failed owner; never replace it
+            # with a speculative second close or advertise release.
 
     task.add_done_callback(completed)
     return task
@@ -56,7 +57,7 @@ class UnpublishedLLMOwner:
                 )
         task, joins_native = self.task, self.task_joins_native
         outcome = await await_owned_task(task)
-        if self.task is task:
+        if self.task is task and outcome.error is None:
             self.task = None
         terminal = execution_terminal_error(outcome.error, outcome.cancellation)
         if terminal is not None and is_execution_control_error(terminal):
@@ -65,6 +66,10 @@ class UnpublishedLLMOwner:
             # A drain may encounter an in-flight bounded startup attempt. Its
             # completion is not the terminal host join; upgrade the SAME owner
             # after that attempt settles, retaining original control evidence.
+            # The bounded attempt is physically done even if it failed. A host
+            # join needs a new wrapper task around the SAME retained resource
+            # owners, not recursive rejoining of this completed attempt.
+            self.task = None
             await self.retire(join_native=True)
             if outcome.cancellation is not None:
                 raise outcome.cancellation
