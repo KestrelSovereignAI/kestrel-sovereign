@@ -5400,9 +5400,10 @@ No other text or formatting.
             error = owned_task_error(task)
             if error is not None and is_execution_control_error(error):
                 terminal = execution_terminal_error(terminal, error)
-            elif error is not None and not isinstance(error, asyncio.CancelledError):
+            elif error is not None:
                 logger.warning("LLM shutdown %s failed (%s)", label, type(error).__name__)
-                terminal = execution_terminal_error(terminal, error)
+                if label not in ("preference-writers", "modality-writers"):
+                    terminal = execution_terminal_error(terminal, error)
 
         await retire("preference-writers", self.drain_preference_persistence)
         await retire("modality-writers", self.drain_modality_records)

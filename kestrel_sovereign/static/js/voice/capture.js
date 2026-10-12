@@ -29,7 +29,11 @@ export async function createVoiceCapture({ targetSampleRate = 24000 } = {}) {
     },
   });
 
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  let ctx;
+  let source;
+  let node;
+  try {
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
   // Safari may start the context in "suspended" state on a gesture-less page.
   if (ctx.state === 'suspended') {
     try { await ctx.resume(); } catch (_) { /* non-fatal */ }
@@ -37,8 +41,8 @@ export async function createVoiceCapture({ targetSampleRate = 24000 } = {}) {
 
   await ctx.audioWorklet.addModule(WORKLET_URL);
 
-  const source = ctx.createMediaStreamSource(stream);
-  const node = new AudioWorkletNode(ctx, 'kestrel-capture', {
+  source = ctx.createMediaStreamSource(stream);
+  node = new AudioWorkletNode(ctx, 'kestrel-capture', {
     numberOfInputs: 1,
     numberOfOutputs: 0,  // processor consumes; nothing routes to speakers
     channelCount: 1,
@@ -81,4 +85,12 @@ export async function createVoiceCapture({ targetSampleRate = 24000 } = {}) {
       try { await ctx.close(); } catch (_) {}
     },
   };
+  } catch (error) {
+    // The factory still owns partial acquisitions until it returns destroy().
+    try { source?.disconnect(); } catch (_) {}
+    try { node?.disconnect(); } catch (_) {}
+    for (const track of stream.getTracks()) track.stop();
+    try { await ctx?.close(); } catch (_) {}
+    throw error;
+  }
 }

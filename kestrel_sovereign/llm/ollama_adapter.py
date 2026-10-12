@@ -10,10 +10,15 @@ Adapter for local Ollama instance with support for:
 """
 import json
 import logging
+import asyncio
+from contextlib import asynccontextmanager
+from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     owned_native_http_client,
     owned_execution_stream, close_native_execution_stream, retain_native_execution_http_client_close,
     is_execution_control_error,
+    current_execution_custody, bind_execution_cleanup, require_execution_work,
+    execution_terminal_error,
 )
 from collections.abc import Mapping
 from typing import (
@@ -217,6 +222,58 @@ class OllamaAdapter(LLMAdapter):
         self._embedding_configured = (
             embedding_model is not None or embedding_dim is not None
         )
+        self._discovery_clients = {}
+        self._discovery_closed = False
+
+    async def _retire_discovery_client(self, client, scopes):
+        task = self._discovery_clients[client]
+        if task is None:
+            with bind_execution_cleanup(self, scopes):
+                task = asyncio.create_task(close_native_execution_stream(client, self))
+            self._discovery_clients[client] = task
+        outcome = await await_owned_task(task)
+        if outcome.error is None:
+            self._discovery_clients.pop(client, None)
+        terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+        if terminal is not None:
+            raise terminal
+
+    @asynccontextmanager
+    async def _discovery_client(self, client=None):
+        require_execution_work(self)
+        if self._discovery_closed:
+            raise RuntimeError("Ollama discovery owner is retired")
+        if client is not None:
+            yield client
+            return  # Borrowed route clients belong to the service, not this call.
+        scopes = current_execution_custody(self)
+        client = ollama.AsyncClient()
+        native = client._client
+        self._discovery_clients[native] = None
+        original = None
+        try:
+            retain_native_execution_http_client_close(native)
+            yield client
+        except BaseException as error:
+            original = error
+        try:
+            await self._retire_discovery_client(native, scopes)
+        except BaseException as error:
+            original = execution_terminal_error(original, error)
+        if original is not None:
+            raise original
+
+    async def aclose(self):
+        """Join exact discovery pool owners; a failed close is never repeated."""
+        self._discovery_closed = True
+        terminal = None
+        for client in tuple(self._discovery_clients):
+            try:
+                await self._retire_discovery_client(client, current_execution_custody(self))
+            except BaseException as error:
+                terminal = execution_terminal_error(terminal, error)
+        if terminal is not None:
+            raise terminal
 
     def provider_capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
@@ -1096,6 +1153,13 @@ class OllamaAdapter(LLMAdapter):
         return supports
 
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
+        """Discover local models with an owned temporary native connection pool."""
+        if not OLLAMA_AVAILABLE:
+            return []
+        async with self._discovery_client() as local:
+            return await self._list_models(local)
+
+    async def _list_models(self, client: Any) -> List[ModelInfo]:
         """List available models from the local Ollama instance.
 
         ``client`` is accepted for contract symmetry with
@@ -1116,7 +1180,6 @@ class OllamaAdapter(LLMAdapter):
 
         try:
             # Use async client to list models
-            client = ollama.AsyncClient()
             retain_native_execution_http_client_close(getattr(client, "_client", None))
             response = await client.list()
 
@@ -1206,6 +1269,8 @@ class OllamaAdapter(LLMAdapter):
 
         except ollama.ResponseError as e:
             logger.error(f"Ollama API error while listing models: {e}")
+            if is_execution_control_error(e):
+                raise
             return []
         except Exception as e:
             if is_execution_control_error(e):
@@ -1303,6 +1368,15 @@ class OllamaAdapter(LLMAdapter):
     async def list_embedding_models(
         self, client: Any = None, chat_models: Any = None
     ) -> List["EmbeddingModelInfo"]:
+        """Borrow a route client or own the whole temporary discovery pool."""
+        if not OLLAMA_AVAILABLE:
+            return []
+        async with self._discovery_client(client) as local:
+            return await self._list_embedding_models(local, chat_models)
+
+    async def _list_embedding_models(
+        self, client: Any, chat_models: Any = None
+    ) -> List["EmbeddingModelInfo"]:
         """Discover locally-available embedding models (#2338).
 
         ``/api/tags`` lists installed models, ``/api/show`` reports each model's
@@ -1327,9 +1401,6 @@ class OllamaAdapter(LLMAdapter):
             return []
 
         try:
-            if client is None:
-                client = ollama.AsyncClient()
-                retain_native_execution_http_client_close(getattr(client, "_client", None))
             response = await client.list()
 
             if hasattr(response, "models"):

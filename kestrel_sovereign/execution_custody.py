@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from httpx import AsyncClient as _NativeHTTPXAsyncClient
+from httpx import AsyncByteStream as _NativeHTTPXAsyncByteStream
 from httpx import Response as _NativeHTTPXResponse
 from kestrel_sdk.storage.database import TransactionError
 
@@ -340,10 +341,16 @@ def current_execution_custody(owner: Any = None) -> tuple[ExecutionCustody, ...]
 
 
 def require_execution_work(owner: Any = None) -> None:
+    terminal = None
     if _execution_cleanup_requested():
-        raise ExecutionAuthorityError("execution is cleanup-only; ordinary work is denied")
+        terminal = ExecutionAuthorityError("execution is cleanup-only; ordinary work is denied")
     for scope in current_execution_custody(owner):
-        scope.require_work()
+        try:
+            scope.require_work()
+        except BaseException as denial:
+            terminal = execution_terminal_error(terminal, denial)
+    if terminal is not None:
+        raise terminal
 
 
 def refuse_unfenced_executor(owner: Any = None) -> None:
@@ -358,12 +365,23 @@ def require_execution_backend(
     backend_type: str, scopes: tuple[ExecutionCustody, ...] | None = None,
     *, _identity_anchor_access: _HostIdentityAnchorAccess | None = None,
 ) -> None:
+    terminal = None
     if _execution_cleanup_requested():
-        raise ExecutionAuthorityError("execution is cleanup-only; ordinary work is denied")
+        terminal = ExecutionAuthorityError("execution is cleanup-only; ordinary work is denied")
     if _identity_anchor_access is not None:
-        _identity_anchor_access.require_live()
-    for scope in current_execution_custody() if scopes is None else scopes:
-        scope.require_work()
+        try:
+            _identity_anchor_access.require_live()
+        except BaseException as denial:
+            terminal = execution_terminal_error(terminal, denial)
+    captured = current_execution_custody() if scopes is None else scopes
+    for scope in captured:
+        try:
+            scope.require_work()
+        except BaseException as denial:
+            terminal = execution_terminal_error(terminal, denial)
+    if terminal is not None:
+        raise terminal
+    for scope in captured:
         if scope.fence.backend_type != backend_type:
             if (
                 backend_type == "sqlite"
@@ -506,6 +524,35 @@ def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None
     response.aclose = joined_close
 
 
+class _CustodyHTTPBody(_NativeHTTPXAsyncByteStream):
+    """Guard native body advances after arbitrary response observers await."""
+
+    def __init__(self, response, scopes):
+        self.response, self.stream, self.scopes = response, response.stream, scopes
+
+    async def __aiter__(self):
+        iterator = self.stream.__aiter__()
+        try:
+            while True:
+                with bind_execution_custody_snapshot(self.scopes):
+                    require_execution_work()
+                    try:
+                        chunk = await anext(iterator)
+                    except StopAsyncIteration:
+                        return
+                    require_execution_work()
+                yield chunk
+        except BaseException as original:
+            try:
+                await close_native_execution_stream(self.response)
+            except BaseException as cleanup:
+                raise execution_terminal_error(original, cleanup)
+            raise
+
+    async def aclose(self):
+        await self.stream.aclose()
+
+
 def retain_native_execution_http_client_close(client: Any) -> None:
     """Acquire response custody for SDKs that hide it inside generators.
 
@@ -520,6 +567,9 @@ def retain_native_execution_http_client_close(client: Any) -> None:
         return
 
     async def retain_response(response):
+        captured = response.request.extensions.get("kestrel.execution_custody", current_execution_custody())
+        if not isinstance(response.stream, _CustodyHTTPBody):
+            response.stream = _CustodyHTTPBody(response, captured)
         retain_native_execution_stream_close(response)
         sink = _NATIVE_RESPONSE_SINK.get()
         if sink is not None:
@@ -532,7 +582,17 @@ def retain_native_execution_http_client_close(client: Any) -> None:
         # A native SDK must not spend an already-revoked admission, even if
         # a caller enabled internal retry or automatic function-call dispatch.
         # Check THAT request's active scope, never the client's first caller.
+        request.extensions["kestrel.execution_custody"] = current_execution_custody()
         require_original_native_work()
+
+    native_dispatch = client._send_single_request
+
+    async def dispatch_after_observers(request):
+        # HTTPX runs every request observer before this native boundary. A
+        # check at the beginning of that list cannot admit the final dispatch.
+        with bind_execution_custody_snapshot(request.extensions.get("kestrel.execution_custody", ())):
+            require_original_native_work()
+            return await native_dispatch(request)
 
     def require_original_native_work():
         try:
@@ -547,6 +607,7 @@ def retain_native_execution_http_client_close(client: Any) -> None:
     # cancellation may land while it awaits. Own the body before ANY observer.
     client.event_hooks["response"].insert(0, retain_response)
     client.event_hooks["request"].insert(0, require_request_authority)
+    client._send_single_request = dispatch_after_observers
     client._kestrel_native_close_hook = retain_response
 
 
@@ -780,10 +841,13 @@ class _ExecutionForwarder:
     bindings, and later foreign consumers may add but never discard custody.
     """
 
-    def __init__(self, owner: Any, stream: AsyncIterator[Any]):
+    def __init__(self, owner: Any, stream: AsyncIterator[Any], captured_custody: tuple[ExecutionCustody, ...] = ()):
         self._runtime_owner = owner
         self._source = aiter(stream)
         self._scopes = current_execution_custody(owner)
+        if not isinstance(captured_custody, tuple) or not all(isinstance(scope, ExecutionCustody) for scope in captured_custody):
+            raise TypeError("captured stream custody must be an immutable ExecutionCustody tuple")
+        self._scopes += tuple(scope for scope in captured_custody if scope not in self._scopes)
         self._cleanup_state = _StreamCleanupState(self._scopes)
         self._source_exhausted = False
         # Task-relative capabilities (notably privacy-lock reentry) are not
@@ -806,28 +870,28 @@ class _ExecutionForwarder:
         additional = current_execution_custody(self._runtime_owner)
         self._scopes += tuple(scope for scope in additional if scope not in self._scopes)
         self._cleanup_state.scopes = self._scopes
-        with _bind_captured_custody(self._scopes):
-            if self._iterator is None:
-                from kestrel_sovereign._async_ownership import OwnedAsyncIterator
-                self._iterator = OwnedAsyncIterator(
-                    self._produce, operation="execution-stream-forward",
-                    owner_context=self._owner_context,
-                )
-            try:
+        try:
+            with _bind_captured_custody(self._scopes):
+                if self._iterator is None:
+                    from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+                    self._iterator = OwnedAsyncIterator(
+                        self._produce, operation="execution-stream-forward",
+                        owner_context=self._owner_context,
+                    )
                 item = await anext(self._iterator)
                 require_execution_work(self._runtime_owner)
-            except BaseException as error:
-                # A deferred iterator is a public ownership boundary too.
-                # Cancellation of its pull must join the physical producer,
-                # even when the consumer never gets a chance to call aclose.
-                try:
-                    await self.aclose()
-                except BaseException as cleanup_error:
-                    raise execution_terminal_error(error, cleanup_error)
-                if not is_execution_control_error(error):
+        except BaseException as error:
+            # Admission can fail while ENTERING the original binding, before
+            # the next native pull. The suspended producer still has to retire.
+            try:
+                await self.aclose()
+            except BaseException as cleanup_error:
+                raise execution_terminal_error(error, cleanup_error)
+            if not is_execution_control_error(error):
+                with _bind_captured_custody(self._scopes):
                     require_execution_work(self._runtime_owner)
-                raise
-            return item
+            raise
+        return item
 
     async def _produce(self):
         error = None
@@ -907,13 +971,13 @@ async def owned_execution_stream(owner: Any, stream: AsyncIterator[Any]):
             raise execution_terminal_error(error, cleanup_error)
 
 
-def execution_stream(owner: Any, stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
+def execution_stream(owner: Any, stream: AsyncIterator[Any], *, captured_custody: tuple[ExecutionCustody, ...] = ()) -> AsyncIterator[Any]:
     """Pin custody now for a deferred body and own its physical source.
 
     The caller must explicitly close this iterator (for example with Core's
     ClosingStreamingResponse). Construction does not dispatch source work.
     """
-    return _ExecutionForwarder(owner, stream)
+    return _ExecutionForwarder(owner, stream, captured_custody)
 
 
 turn_scoped(

@@ -628,3 +628,24 @@ receipts. An authorized Safe Mode exit may have committed before its connection
 release acknowledgement fails; that is a reconciliation requirement, not proof
 that the state was never persisted. The in-memory Safe Mode remains closed until
 the original outcome has been reconciled.
+
+## Bounded observation is not native settlement
+
+`wait_owned_or_pending` observes an already lifecycle-retained task. The first
+caller cancellation starts one finite positive grace deadline and forwards at
+most one stop request; subsequent cancellation cannot extend that deadline or
+reinterrupt cleanup. `PendingOwnedTask` means the observer abandoned unfinished
+work. It is neither a terminal task outcome nor an unknown commit receipt.
+Callers must retain the exact owner, harvest its late native evidence and join it
+with `await_owned_task` at the owning lifecycle boundary.
+
+`ReentrantTransitionLock.start_owned_native_work` retains a fixed body before
+dispatch, including under eager task creation. An actual admitted foreign-mutex
+owner registers that exact continuation as its frame dependency; a copied token
+alone grants no mutex bypass. Other workers enter the ordinary serialized path
+and recheck live policy there. Foreign-frame exit drains its dependencies before
+unlocking, and the original base turn retains its existing physical drain.
+`privacy_transition` joins entered native dependencies before changing policy;
+queued, not-yet-admitted workers revalidate after acquiring the lock instead.
+These enclosing joins can outlast the observer grace. Native unknown/committed
+receipts and repeated lifecycle observations always retain the original carrier.

@@ -1013,6 +1013,12 @@ async function stopSession(session = activeSession()) {
 
 
 function surfaceFatalError(err, session = activeSession()) {
+  const retiringClient = session.client;
+  session.closingClient = retiringClient;
+  session.client = null;
+  if (retiringClient) void retiringClient.close().catch(closeError => {
+    console.error('[voice/ui] voice retirement failed:', closeError);
+  });
   console.error('[voice/ui] fatal voice error:', err);
   setState(State.ERROR, session);
   // Surface as an agent message so the user sees it inline with the chat.
@@ -1168,7 +1174,11 @@ function handleClientEvent(agent, ev, startSeq) {
           } catch (_) { /* non-DOM context — ignore */ }
         });
       }
+      const retiringClient = session.client;
       session.client = null;
+      if (retiringClient) void retiringClient.close().catch(closeError => {
+        console.error('[voice/ui] voice retirement failed:', closeError);
+      });
       session.closingClient = null;
       session.pathLabel = '';
       session.pathTooltip = '';
@@ -1381,6 +1391,10 @@ async function handleToolBatch(session, ev) {
   // closed.
   if (sessionClient !== session.client) {
     console.info('[voice/ui] session ended before tool result; dropping commit');
+    // Losing the UI pointer is not physical retirement. A fatal RTC error
+    // may clear it while the request is still pending; retire the captured
+    // original client, never a subsequently-created replacement session.
+    try { await sessionClient.close(); } catch (_) {}
     return;
   }
 

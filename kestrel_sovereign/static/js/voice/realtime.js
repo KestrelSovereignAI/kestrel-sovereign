@@ -216,6 +216,16 @@ export async function createRealtimeClient({
   let inputMuted = false;
   let outputMuted = false;
   let closed = false;
+  let closeOwner = null;
+  const startupAbort = new AbortController();
+
+  async function requireOpen() {
+    if (!closed) return;
+    // Permission prompts cannot be aborted. Retire a late native acquisition
+    // even if the original close owner has already finished.
+    await retireAcquired();
+    throw new Error('Realtime client retired during startup');
+  }
   const persistedTurnIds = new Set();  // item_ids already sent to /transcript
   const pendingPersists = new Set();   // in-flight /transcript POST promises
   let pendingToolEvents = [];          // tool cards to attach to next assistant turn
@@ -501,10 +511,12 @@ export async function createRealtimeClient({
   }
 
   async function startWebRTC() {
+    await requireOpen();
     pc = new RTCPeerConnection();
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    await requireOpen();
     for (const track of micStream.getTracks()) pc.addTrack(track, micStream);
 
     audioSink = document.createElement('audio');
@@ -524,11 +536,12 @@ export async function createRealtimeClient({
       }
     };
     dc.onclose = () => {
-      if (!closed) onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'data_channel_closed' }));
+      if (!closed) void close();
     };
     pc.onconnectionstatechange = () => {
       if (closed || !pc) return;
       if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        void close();
         onEvent(makeEvent(Events.ERROR, {
           message: `RTC connection ${pc.connectionState}`,
           code: `rtc_${pc.connectionState}`,
@@ -538,22 +551,31 @@ export async function createRealtimeClient({
     };
 
     const offer = await pc.createOffer();
+    await requireOpen();
     await pc.setLocalDescription(offer);
+    await requireOpen();
     const sdpResp = await fetch(resolveRealtimeSDPEndpoint(session), {
       method: 'POST',
       body: offer.sdp,
+      signal: startupAbort.signal,
       headers: {
         'Authorization': `Bearer ${session.client_secret.value}`,
         'Content-Type': 'application/sdp',
       },
     });
+    await requireOpen();
     if (!sdpResp.ok) throw new Error(`SDP exchange failed: HTTP ${sdpResp.status}`);
-    await pc.setRemoteDescription({ type: 'answer', sdp: await sdpResp.text() });
+    const answer = await sdpResp.text();
+    await requireOpen();
+    await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+    await requireOpen();
   }
 
   async function startWebSocket() {
     capture = await createVoiceCapture({ targetSampleRate: 24000 });
+    await requireOpen();
     playback = await createVoicePlayback({ sampleRate: 24000 });
+    await requireOpen();
     playback.setMuted?.(outputMuted);
     capture.onchunk((pcm) => {
       if (inputMuted || closed) return;
@@ -583,6 +605,7 @@ export async function createRealtimeClient({
     };
     await new Promise((resolve, reject) => {
       ws.onopen = () => {
+        if (closed) { reject(new Error('Realtime client retired during startup')); return; }
         if (session.session_config && Object.keys(session.session_config).length) {
           sendJSON({ type: 'session.update', session: session.session_config });
         }
@@ -594,12 +617,15 @@ export async function createRealtimeClient({
         resolve();
       };
       ws.onerror = () => reject(new Error(`${session.provider || 'Realtime'} WebSocket failed`));
+      ws.onclose = () => reject(new Error('Realtime WebSocket closed during startup'));
     });
+    await requireOpen();
     ws.onclose = () => {
-      if (!closed) onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'websocket_closed' }));
+      if (!closed) void close();
     };
     ws.onerror = () => {
       if (!closed) {
+        void close();
         onEvent(makeEvent(Events.ERROR, {
           message: `${session.provider || 'Realtime'} WebSocket error`,
           code: 'websocket_error',
@@ -610,7 +636,9 @@ export async function createRealtimeClient({
   }
 
   async function start() {
+    await requireOpen();
     if (session) throw new Error('Realtime client already started');
+    try {
 
     // 1. Mint session from backend. Auth headers come from `getAuthHeaders`
     // so the voice UI shell can wire in `API.applyAuth({})` (which honors
@@ -618,6 +646,7 @@ export async function createRealtimeClient({
     // other Kestrel endpoint authenticates. Without this the request gets a
     // 401 against any server with auth enabled.
     const authHeaders = (await getAuthHeaders()) || {};
+    await requireOpen();
     const resp = await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -626,7 +655,9 @@ export async function createRealtimeClient({
       },
       body: JSON.stringify(sessionRequestBody),
       ...sessionRequestInit,
+      signal: startupAbort.signal,
     });
+    await requireOpen();
     if (resp.status === 409) {
       // Resolver rejected realtime — caller should fall back to pipeline.
       const body = await resp.json();
@@ -639,15 +670,19 @@ export async function createRealtimeClient({
       throw new Error(`Session mint failed: HTTP ${resp.status}`);
     }
     session = await resp.json();
+    await requireOpen();
 
     if (session.transport === 'websocket') await startWebSocket();
     else if (session.transport === 'webrtc' || !session.transport) await startWebRTC();
     else throw new Error(`Unsupported realtime transport: ${session.transport}`);
+    } catch (error) {
+      await close();
+      await retireAcquired();
+      throw error;
+    }
   }
 
-  async function close() {
-    if (closed) return;
-    closed = true;
+  async function retireAcquired() {
     try { dc?.close(); } catch (_) {}
     try { ws?.close(); } catch (_) {}
     try {
@@ -664,7 +699,16 @@ export async function createRealtimeClient({
         audioSink.srcObject = null;
       }
     } catch (_) {}
-    onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'client_close' }));
+  }
+
+  function close() {
+    if (closeOwner) return closeOwner;
+    closed = true;
+    startupAbort.abort();
+    closeOwner = retireAcquired().then(() => {
+      onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'client_close' }));
+    });
+    return closeOwner;
   }
 
   /** Queue a text message into the conversation (without speaking it aloud). */

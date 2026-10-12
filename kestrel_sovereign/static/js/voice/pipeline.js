@@ -74,6 +74,13 @@ export async function createPipelineClient({
   let capture = null;
   let playback = null;
   let closed = false;
+  let closeOwner = null;
+
+  async function requireOpen() {
+    if (!closed) return;
+    await retireAcquired();
+    throw new Error('Pipeline client retired during startup');
+  }
   let sessionReady = false;
   // When true, captured mic frames are dropped instead of sent — used to
   // disarm a backgrounded agent's input so the user's speech isn't routed to
@@ -152,15 +159,19 @@ export async function createPipelineClient({
   }
 
   async function start() {
+    await requireOpen();
     if (ws) throw new Error('Pipeline client already started');
+    try {
 
     // 1. Set up audio pipes first so the first mic frame after open() has
     // somewhere to go. Playback starts muted until audio arrives.
     capture = await createVoiceCapture({ targetSampleRate: sampleRate });
+    await requireOpen();
     playback = await createVoicePlayback({ sampleRate });
+    await requireOpen();
 
     capture.onchunk((pcm) => {
-      if (inputMuted) return;
+      if (inputMuted || closed) return;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       try {
         ws.send(encodeAudioFrame(pcm));
@@ -186,6 +197,7 @@ export async function createPipelineClient({
     ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
+      if (closed) { ws.close(); return; }
       sessionReady = true;
       onEvent(makeEvent(Events.SESSION_READY, {
         session_id: '',  // Pipeline has no discrete session ID today.
@@ -193,6 +205,7 @@ export async function createPipelineClient({
       }));
     };
     ws.onmessage = (ev) => {
+      if (closed) return;
       // Server can send either binary (audio/JSON-framed) or text (rare).
       if (typeof ev.data === 'string') {
         try {
@@ -232,18 +245,28 @@ export async function createPipelineClient({
       }));
     };
     ws.onclose = () => {
-      if (closed) return;
-      onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'ws_closed' }));
+      if (!closed) void close();
     };
+    } catch (error) {
+      await close();
+      await retireAcquired();
+      throw error;
+    }
   }
 
-  async function close() {
-    if (closed) return;
-    closed = true;
+  async function retireAcquired() {
     try { ws?.close(); } catch (_) {}
     try { await capture?.destroy(); } catch (_) {}
     try { await playback?.destroy(); } catch (_) {}
-    onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'client_close' }));
+  }
+
+  function close() {
+    if (closeOwner) return closeOwner;
+    closed = true;
+    closeOwner = retireAcquired().then(() => {
+      onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'client_close' }));
+    });
+    return closeOwner;
   }
 
   /**

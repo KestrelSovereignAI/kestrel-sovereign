@@ -30,7 +30,7 @@ from dataclasses import dataclass, field as dataclass_field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, owned_task_error, raise_owned_outcome
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.deidentification import (
     DEIDENTIFICATION_ASSURANCES,
@@ -424,6 +424,62 @@ class ReentrantTransitionLock:
         # NORMAL-mode write. Starts set (no reentrant writer at construction).
         self._reentry_idle = asyncio.Event()
         self._reentry_idle.set()
+        self._native_work = set()
+        self._foreign_native_dependencies = {}
+
+    def start_owned_native_work(self, operation):
+        """Retain a fixed native body without lending arbitrary reentry rights.
+
+        Only the actual foreign-mutex owner may reserve continuation of that
+        frame. Its outer exit drains the exact tasks before releasing exclusion.
+        Other workers acquire the ordinary lock path and revalidate live policy.
+        """
+        parent = asyncio.current_task()
+        foreign = parent is not None and self._reentry_owner is parent
+        token = self.current_reentry_token()
+        if token is None and self._token_matches_current_span():
+            token = _transition_lock_reentry_token.get()
+        state = {"entered": foreign}
+        retained = asyncio.Event()
+        async def run():
+            # Even an eager task factory cannot dispatch the body before its
+            # exact dependency and terminal-harvesting records are installed.
+            await retained.wait()
+            if foreign:
+                return await operation()
+            with bind_transition_lock_reentry(token):
+                async with self:
+                    state["entered"] = True
+                    return await operation()
+        task = create_owned_task(run(), name="privacy-owned-native-work")
+        self._native_work.add(task)
+        task._kestrel_native_privacy_state = state
+        if foreign:
+            self._foreign_native_dependencies.setdefault(parent, set()).add(task)
+        def completed(finished):
+            owned_task_error(finished)
+            self._native_work.discard(finished)
+        task.add_done_callback(completed)
+        retained.set()
+        return task
+
+    async def join_owned_native_work(self):
+        """Drain entered native bodies before an in-turn policy change.
+
+        Queued workers have not admitted native work: they recheck policy on
+        acquisition and must not be awaited behind the mutex held by this caller.
+        """
+        current = asyncio.current_task()
+        terminal = None
+        for task in tuple(self._native_work):
+            if task is current or not task._kestrel_native_privacy_state["entered"]:
+                continue
+            outcome = await await_owned_task(task)
+            if outcome.error is not None and is_execution_control_error(outcome.error):
+                terminal = execution_terminal_error(terminal, outcome.error)
+            terminal = execution_terminal_error(terminal, outcome.cancellation)
+        if terminal is not None:
+            raise terminal
 
     def locked(self) -> bool:
         return self._lock.locked()
@@ -506,6 +562,14 @@ class ReentrantTransitionLock:
         if self._reentry_owner is not None and self._reentry_owner is task:
             self._reentry_depth -= 1
             if self._reentry_depth <= 0:
+                terminal = exc
+                # A nested waiter may abandon, but this admitted foreign frame
+                # still owns its exact native continuations through settlement.
+                for child in self._foreign_native_dependencies.pop(task, ()):
+                    outcome = await await_owned_task(child)
+                    if outcome.error is not None and is_execution_control_error(outcome.error):
+                        terminal = execution_terminal_error(terminal, outcome.error)
+                    terminal = execution_terminal_error(terminal, outcome.cancellation)
                 self._reentry_depth = 0
                 self._reentry_owner = None
                 self._reentry_lock.release()
@@ -513,6 +577,8 @@ class ReentrantTransitionLock:
                 # section; signal any owner blocked in the drain that it may now
                 # release the base lock (#2672 review P1 cancellation).
                 self._reentry_idle.set()
+                if terminal is not None and terminal is not exc:
+                    raise terminal
             return False
         self._depth -= 1
         if self._depth <= 0:
@@ -538,7 +604,7 @@ class ReentrantTransitionLock:
             # lock is safely released, so the owning turn's cancellation still
             # propagates but never at the cost of skipping the drain.
             if pending_cancel is not None:
-                raise pending_cancel
+                raise execution_terminal_error(exc, pending_cancel)
         return False
 
     async def _drain_active_reentrant(self) -> Optional[BaseException]:

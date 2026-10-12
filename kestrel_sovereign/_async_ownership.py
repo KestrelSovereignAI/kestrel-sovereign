@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import math
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Generic, TypeVar, cast
@@ -158,6 +159,23 @@ class OwnedTaskOutcome(Generic[_T]):
     result: _T | None
     error: BaseException | None
     cancellation: asyncio.CancelledError | None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingOwnedTask(Generic[_T]):
+    """Abandoned observation, never a terminal native result or commit receipt."""
+
+    task: asyncio.Future[_T]
+    cancellation: asyncio.CancelledError
+
+    def raise_abandonment(self):
+        from kestrel_sovereign.execution_custody import (
+            ExecutionAuthorityError, execution_terminal_error,
+        )
+        pending = ExecutionAuthorityError("native operation remains pending in its retained lifecycle owner")
+        pending.native_owner = self.task
+        pending.__cause__ = self.cancellation
+        raise execution_terminal_error(self.cancellation, pending)
 
 
 class OwnedAsyncIterator(Generic[_T]):
@@ -531,6 +549,45 @@ async def await_owned_task(
     return OwnedTaskOutcome(task.result(), None, pending_cancellation)
 
 
+async def wait_owned_or_pending(
+    task: asyncio.Future[_T], *, cancellation_grace: float,
+    cancel_on_caller_cancellation: bool = True,
+) -> OwnedTaskOutcome[_T] | PendingOwnedTask[_T]:
+    """Observe a lifecycle-retained task; bound waiting only after cancellation.
+
+    The caller MUST retain and physically join the task elsewhere. One timer
+    starts on first cancellation; repeated interruption cannot reset it or
+    re-cancel the native unwind. A pending result does not assert settlement.
+    """
+    if not math.isfinite(cancellation_grace) or cancellation_grace <= 0:
+        raise ValueError("cancellation_grace must be finite and positive")
+    loop = asyncio.get_running_loop()
+    completion = loop.create_future()
+    def wake(_task=None):
+        if not completion.done():
+            completion.set_result(None)
+    task.add_done_callback(wake)
+    cancellation = None
+    timer = None
+    try:
+        while not task.done() and not completion.done():
+            try:
+                await asyncio.shield(completion)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+                    timer = loop.call_later(cancellation_grace, wake)
+                    if cancel_on_caller_cancellation:
+                        task.cancel()
+        if not task.done():
+            return PendingOwnedTask(task, cancellation)
+        return await await_owned_task(task, cancellation)
+    finally:
+        task.remove_done_callback(wake)
+        if timer is not None:
+            timer.cancel()
+
+
 def raise_owned_outcome(
     outcome: OwnedTaskOutcome[_T],
     *,
@@ -572,10 +629,12 @@ async def run_blocking_operation(
 __all__ = [
     "OwnedAsyncIterator",
     "OwnedTaskOutcome",
+    "PendingOwnedTask",
     "await_owned_task",
     "create_owned_task",
     "gather_owned",
     "owned_task_error",
     "raise_owned_outcome",
     "run_blocking_operation",
+    "wait_owned_or_pending",
 ]

@@ -27,12 +27,15 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
     throw new Error('AudioWorklet is not supported in this browser.');
   }
   const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
+  let node;
+  let gain;
+  try {
   if (ctx.state === 'suspended') {
     try { await ctx.resume(); } catch (_) { /* non-fatal; user gesture may be required */ }
   }
   await ctx.audioWorklet.addModule(WORKLET_URL);
 
-  const node = new AudioWorkletNode(ctx, 'kestrel-playback', {
+  node = new AudioWorkletNode(ctx, 'kestrel-playback', {
     numberOfInputs: 0,
     numberOfOutputs: 1,
     outputChannelCount: [1],
@@ -41,7 +44,7 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
       underflowSamples: Math.floor(sampleRate / 5),
     },
   });
-  const gain = ctx.createGain();
+  gain = ctx.createGain();
   node.connect(gain);
   gain.connect(ctx.destination);
 
@@ -107,4 +110,10 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
       try { await ctx.close(); } catch (_) {}
     },
   };
+  } catch (error) {
+    try { node?.disconnect(); } catch (_) {}
+    try { gain?.disconnect(); } catch (_) {}
+    try { await ctx.close(); } catch (_) {}
+    throw error;
+  }
 }

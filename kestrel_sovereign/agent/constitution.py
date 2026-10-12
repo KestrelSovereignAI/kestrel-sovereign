@@ -2618,6 +2618,7 @@ class ConstitutionMixin:
         # update would durably commit the property/edge disagreement this
         # very command exists to repair, and a concurrent integrity audit
         # could observe it.
+        consumed = None
         try:
             async with ConstitutionMixin._constitution_state_guard(self), self._raw_storage.transaction():
                 from kestrel_sovereign.constitution.anchored_bytes import (
@@ -2721,7 +2722,7 @@ class ConstitutionMixin:
 
             outcome = execution_commit_outcome(e)
             if outcome is not None:
-                if outcome == "committed":
+                if outcome == "committed" and consumed is not None:
                     ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
                 # Never continue cognition using an unreconciled in-memory
                 # anchor. No provider notice or fresh work admission is minted.

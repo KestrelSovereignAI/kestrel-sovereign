@@ -22,7 +22,7 @@ import logging
 import json
 from pathlib import Path
 from dataclasses import dataclass
-from contextlib import asynccontextmanager, AsyncExitStack
+from contextlib import asynccontextmanager, AsyncExitStack, ExitStack
 from cryptography.hazmat.primitives.asymmetric import ec
 from kestrel_sovereign.storage import GraphNode
 from kestrel_sovereign.storage.async_database import AsyncDatabase, DatabaseInitializationCleanupError, _close_owned_database
@@ -65,6 +65,43 @@ class AgentCredentials:
         async def _return_self():
             return self
         return _return_self().__await__()
+
+
+@dataclass
+class InceptionProviderRetirementOwner:
+    """Transfer the exact unpublished provider, borrowed storage and birth lock."""
+    provider_owner: object
+    database: Optional[AsyncDatabase]
+    directory_custody: Optional[ExitStack] = None
+
+    def provider_retirement_pending(self) -> bool:
+        provider = self.provider_owner.provider
+        pending = getattr(type(provider), "has_pending_close_owners", None)
+        return not callable(pending) or pending(provider)
+
+    async def retire(self) -> None:
+        failure = None
+        try:
+            await self.provider_owner.retire(join_native=True)
+        except BaseException as error:
+            failure = error
+            if self.provider_retirement_pending():
+                error.inception_retirement_owner = self
+                raise
+        # A native transport still borrowing this database must retire first.
+        # Caller-supplied databases are never registered here.
+        if self.database is not None:
+            try:
+                await _close_owned_database(self.database, failure)
+            except BaseException as error:
+                error.inception_retirement_owner = self
+                raise
+            self.database = None
+        if self.directory_custody is not None:
+            self.directory_custody.close()
+            self.directory_custody = None
+        if failure is not None:
+            raise failure
 
 
 def generate_secp256k1_keypair() -> tuple[ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey]:
@@ -922,9 +959,11 @@ async def create_kestrel_identity_async(
 
     owned_database = None
     owned_embeddings = None
+    owned_embedding_owner = None
+    birth_custody = ExitStack()
 
     async def retire_owned_database(operation_error=None):
-        nonlocal owned_database, owned_embeddings
+        nonlocal owned_database, owned_embeddings, owned_embedding_owner
         # The inception embedding borrower uses this exact birth database for
         # accounting. Physically retire it BEFORE that database; never lazily
         # open a process-global usage SQLite under a parent's PG authority.
@@ -932,13 +971,26 @@ async def create_kestrel_identity_async(
         if owned_embeddings is not None:
             from kestrel_sovereign.llm.lifecycle import UnpublishedLLMOwner
 
-            owner = UnpublishedLLMOwner(owned_embeddings, current_execution_custody())
+            if owned_embedding_owner is None:
+                owned_embedding_owner = InceptionProviderRetirementOwner(
+                    UnpublishedLLMOwner(owned_embeddings, current_execution_custody()),
+                    owned_database,
+                )
+            owner = owned_embedding_owner
             try:
-                await owner.retire(join_native=True)
+                await owner.provider_owner.retire(join_native=True)
             except BaseException as error:
                 provider_error = error
-            finally:
-                owned_embeddings = None
+                if owner.provider_retirement_pending():
+                    # Transfer before unwinding: retain the SAME native owner
+                    # and keep replacement birth fenced by the original lock.
+                    if owner.directory_custody is None:
+                        owner.directory_custody = birth_custody.pop_all()
+                    terminal = execution_terminal_error(operation_error, error)
+                    terminal.inception_retirement_owner = owner
+                    raise terminal
+            owned_embeddings = None
+            owned_embedding_owner = None
         if owned_database is not None:
             from kestrel_sovereign.storage.async_database import _close_owned_database
 
@@ -1527,7 +1579,10 @@ async def create_kestrel_identity_async(
         )
 
 
-    with exclusive_private_file_lock(Path(output_dir) / ".inception.lock", label="inception", blocking=False), _host_identity_anchor_access(Path(output_dir) / "kestrel_prime.db"):
+    with birth_custody, _host_identity_anchor_access(Path(output_dir) / "kestrel_prime.db"):
+        birth_custody.enter_context(exclusive_private_file_lock(
+            Path(output_dir) / ".inception.lock", label="inception", blocking=False,
+        ))
         operation_error = None
         try:
             return await publish_owned_attempt()
@@ -1548,7 +1603,11 @@ async def create_kestrel_identity_async(
                 and isinstance(operation_error, (DatabaseRetirementError, DatabaseInitializationCleanupError))
                 and getattr(operation_error, "retirement_owner", None) is owned_database
             )
-            if not own_retirement_uncertain:
+            provider_retirement_transferred = (
+                owned_embedding_owner is not None
+                and getattr(operation_error, "inception_retirement_owner", None) is owned_embedding_owner
+            )
+            if not own_retirement_uncertain and not provider_retirement_transferred:
                 await retire_owned_database(operation_error)
 
 

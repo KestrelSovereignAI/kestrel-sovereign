@@ -6736,12 +6736,13 @@ class ProxyFeature(Feature):
         # Resolve at construction, before feature startup/discovery can turn a
         # missing hosted scope into an optional-feature warning and continue.
         self._agent_runtime_dir = agent_runtime_dir(agent)
+        constructor_overrides = None
         if (
             self._isolated_runtime_scope is not None
             or getattr(agent, "isolated_runtime_hosted", False) is True
         ):
             _assert_hosted_feature_env_is_scoped(self.name, self.runtime.distribution)
-            _validate_hosted_process_prebuilt_overrides(
+            constructor_overrides = _validate_hosted_process_prebuilt_overrides(
                 self.name,
                 runtime_venv=self.runtime.venv,
             )
@@ -6869,12 +6870,22 @@ class ProxyFeature(Feature):
         self._bin_path: Optional[Path] = None
         # BIN deliberately makes _venv_path name the unused Core default.
         # Retain the separately validated immutable VENV for custody checks.
-        self._validated_hosted_immutable_venv_path: Optional[Path] = None
-        self._validated_hosted_immutable_venv_setting: Optional[str] = None
+        self._validated_hosted_immutable_venv_path: Optional[Path] = (
+            constructor_overrides.venv_path if constructor_overrides else None
+        )
+        self._validated_hosted_immutable_venv_setting: Optional[str] = (
+            constructor_overrides.venv_setting if constructor_overrides else None
+        )
         self._hosted_immutable_venv_custody_unproven = False
-        self._validated_hosted_immutable_bin_path: Optional[Path] = None
-        self._validated_hosted_immutable_venv_custody_paths: tuple[Path, ...] = ()
-        self._validated_hosted_immutable_bin_custody_paths: tuple[Path, ...] = ()
+        self._validated_hosted_immutable_bin_path: Optional[Path] = (
+            constructor_overrides.bin_path if constructor_overrides else None
+        )
+        self._validated_hosted_immutable_venv_custody_paths: tuple[Path, ...] = (
+            constructor_overrides.venv_custody_paths if constructor_overrides else ()
+        )
+        self._validated_hosted_immutable_bin_custody_paths: tuple[Path, ...] = (
+            constructor_overrides.bin_custody_paths if constructor_overrides else ()
+        )
         self._hosted_immutable_bin_custody_unproven = False
         # Hosted immutable console wrappers may themselves be operator-facing
         # symlinks. Preparation resolves and validates one exact regular target;
@@ -12513,13 +12524,15 @@ class ProxyFeature(Feature):
             service_target,
             resolved_venv,
             resolved_bin,
-            validated_venv_path,
-            validated_venv_setting,
-            False,
-            resolved_bin if hosted else None,
-            validated_hosted_overrides.venv_custody_paths if validated_hosted_overrides else (),
-            validated_hosted_overrides.bin_custody_paths if validated_hosted_overrides else (),
-            False,
+            validated_venv_path or self._validated_hosted_immutable_venv_path,
+            validated_venv_setting or self._validated_hosted_immutable_venv_setting,
+            self._hosted_immutable_venv_custody_unproven,
+            (resolved_bin or self._validated_hosted_immutable_bin_path) if hosted else None,
+            tuple(dict.fromkeys((*self._validated_hosted_immutable_venv_custody_paths,
+                *(validated_hosted_overrides.venv_custody_paths if validated_hosted_overrides else ())))),
+            tuple(dict.fromkeys((*self._validated_hosted_immutable_bin_custody_paths,
+                *(validated_hosted_overrides.bin_custody_paths if validated_hosted_overrides else ())))),
+            self._hosted_immutable_bin_custody_unproven,
             None,
         )
         return resolved_venv, resolved_bin

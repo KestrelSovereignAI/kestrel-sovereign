@@ -179,7 +179,8 @@ async def test_standalone_sqlite_commit_keeps_uncertainty(tmp_path, monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_failed_native_tcp_close_retains_exact_owner(monkeypatch):
+@pytest.mark.parametrize("carrier", ["error", "cancel"])
+async def test_failed_native_tcp_close_retains_exact_owner(monkeypatch, carrier):
     peer_done = asyncio.Event()
     async def peer(reader, writer):
         try:
@@ -197,7 +198,9 @@ async def test_failed_native_tcp_close_retains_exact_owner(monkeypatch):
     await client.get(f"http://127.0.0.1:{port}/")
     pool = client._transport._pool
     connections, close_native = list(pool.connections), pool._close_connections
-    original, calls = OSError("native transport could not retire socket"), []
+    original = (OSError("native transport could not retire socket") if carrier == "error"
+                else asyncio.CancelledError("native transport close was cancelled"))
+    calls = []
     async def failed_close(connections):
         calls.append(True)
         raise original
@@ -206,12 +209,12 @@ async def test_failed_native_tcp_close_retains_exact_owner(monkeypatch):
     service.providers = [{"adapter": client}]
     owner = UnpublishedLLMOwner(service, ())
     try:
-        with pytest.raises(OSError) as caught:
+        with pytest.raises(BaseException) as caught:
             await owner.retire()
         assert caught.value is original
         first = service._llm_close_tasks[("adapter", id(client))]
         assert service.has_pending_close_owners() and not peer_done.is_set()
-        with pytest.raises(OSError) as caught:
+        with pytest.raises(BaseException) as caught:
             await asyncio.wait_for(owner.retire(join_native=True), 2)
         assert caught.value is original
         assert service._llm_close_tasks[("adapter", id(client))] is first

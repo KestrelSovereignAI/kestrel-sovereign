@@ -1245,7 +1245,9 @@ async def test_failed_idle_wake_revalidation_keeps_immutable_venv_custody(
     assert immutable_venv.is_dir()
     assert immutable_python.is_file()
     feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
-    assert feature._hosted_immutable_venv_custody_unproven is False
+    # A new successful selection proves its current metadata, not custody of
+    # every historical selection at the failed wake. It cannot erase that debt.
+    assert feature._hosted_immutable_venv_custody_unproven is True
     assert feature.runtime_telemetry_snapshot().cleanup_eligible is False
 
 

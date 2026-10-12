@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import httpx
+from httpx import AsyncClient as NativeHTTPClient
 import pytest
 
 from kestrel_sdk.llm.decisions import (
@@ -231,12 +232,22 @@ async def test_ollama_discovery_uses_capabilities_and_served_context(monkeypatch
 
 @pytest.mark.asyncio
 async def test_ollama_chat_listing_drops_decision_only_models(monkeypatch) -> None:
+    # The module's decision-HTTP fixture replaces the shared httpx export;
+    # this catalog case exercises the actual SDK's owned native pool instead.
+    monkeypatch.setattr(httpx, "AsyncClient", NativeHTTPClient)
     monkeypatch.setattr(ollama_mod, "OLLAMA_AVAILABLE", True)
-    client = _ollama_client({
+    catalog = {
         "tev1:0.8b": {"capabilities": ["decision"]},
         "both:latest": {"capabilities": ["decision", "completion"]},
         "qwen3.8:latest": {"capabilities": ["completion", "tools"]},
-    })
+    }
+    def transport(request):
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"model": name} for name in catalog]})
+        assert request.url.path == "/api/show"
+        return httpx.Response(200, json={"model_info": {}, **catalog[json.loads(request.content)["model"]]})
+    client = ollama_mod.ollama.AsyncClient(transport=httpx.MockTransport(transport))
     monkeypatch.setattr(ollama_mod.ollama, "AsyncClient", lambda *a, **k: client)
     listed = [m.id for m in await OllamaAdapter().list_models()]
     assert listed == ["both:latest", "qwen3.8:latest"]
+    assert client._client.is_closed
