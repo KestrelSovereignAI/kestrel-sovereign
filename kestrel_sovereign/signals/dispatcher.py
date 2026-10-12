@@ -88,6 +88,7 @@ import os
 import re
 import secrets
 import time
+import weakref
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
@@ -867,6 +868,7 @@ class SignalDispatcher:
         self._retained_durable_cognition_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._retained_cognition_control_debt: dict[str, tuple[DurableDelivery, BaseException]] = {}
         self._cognition_control_terminal_owners: dict[tuple[str, ...], asyncio.Task[None]] = {}
+        self._cognition_control_terminal_receipts: dict[tuple[str, ...], weakref.ReferenceType] = {}
         # Channel ingress ACKs after its selected delivery is durable, not
         # after cognition completes.  These owners make that promise useful
         # after the provider has advanced its cursor: every restarted
@@ -5252,6 +5254,11 @@ class SignalDispatcher:
         key = (self._agent.did, delivery.consumer_id, delivery.delivery_id,
             self._durable_delivery_owner, delivery.lease_token or "")
         owners = vars(self).setdefault("_cognition_control_terminal_owners", {})
+        receipts = vars(self).setdefault("_cognition_control_terminal_receipts", {})
+        receipt = receipts.get(key)
+        if receipt is not None and receipt() is not None:
+            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+            return
         task = owners.get(key)
         if task is None or (task.done() and owned_task_error(task) is not None):
             # Concurrent retention callbacks and shutdown join the SAME native
@@ -5269,6 +5276,16 @@ class SignalDispatcher:
         # been joined, so clear confirmed settlement before propagating it;
         # otherwise every retry loses the now-cleared original-token CAS.
         if outcome.error is None:
+            # Keep only the successful original-token receipt while an
+            # original delivery callback still owns its immutable snapshot.
+            # Neither completed tasks nor their signal/ContextVar graph may
+            # become a dispatcher-lifetime cache.
+            def forget_receipt(reference):
+                if receipts.get(key) is reference:
+                    receipts.pop(key, None)
+            receipts[key] = weakref.ref(delivery, forget_receipt)
+            if owners.get(key) is task:
+                owners.pop(key, None)
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
         if outcome.error is not None or outcome.cancellation is not None:
             terminal = execution_terminal_error(error, outcome.error, outcome.cancellation)

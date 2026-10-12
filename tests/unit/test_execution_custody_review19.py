@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from tests.utils.receipt_delivery import ReceiptDelivery
 
 from kestrel_sovereign.signals.dispatcher import SignalDispatcher
 from tests.unit.test_execution_custody_review15 import control_error
@@ -31,7 +32,7 @@ async def test_cancelled_renewal_closer_joins_late_original_control(control, car
 
     dispatcher = SignalDispatcher.__new__(SignalDispatcher)
     dispatcher.renew_durable_delivery_lease = renew
-    delivery = SimpleNamespace(delivery_id="original-delivery", consumer_id="original-consumer",
+    delivery = ReceiptDelivery(delivery_id="original-delivery", consumer_id="original-consumer",
                                lease_token="original-token",
                                lease_expires_at=datetime.now(timezone.utc)+timedelta(seconds=0.03))
 

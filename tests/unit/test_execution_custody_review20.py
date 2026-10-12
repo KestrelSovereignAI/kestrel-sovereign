@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from tests.utils.receipt_delivery import ReceiptDelivery
 
 from kestrel_sovereign.signals.dispatcher import SignalDispatcher
 from tests.unit.test_execution_custody_review15 import control_error
@@ -18,7 +19,7 @@ async def test_joined_terminalizer_debt_tracks_child_receipt_not_caller_cancel(c
     dispatcher._agent = SimpleNamespace(did="did:test:original")
     dispatcher._durable_delivery_owner = "original-owner"
     dispatcher._retained_cognition_control_debt = {}
-    delivery = SimpleNamespace(delivery_id="original", consumer_id="original-consumer", lease_token="original-token")
+    delivery = ReceiptDelivery(delivery_id="original", consumer_id="original-consumer", lease_token="original-token")
     original = control_error("unknown", carrier)
     entered, finish = asyncio.Event(), asyncio.Event()
     children = []

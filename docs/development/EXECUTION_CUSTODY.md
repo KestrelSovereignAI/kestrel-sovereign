@@ -549,6 +549,21 @@ generations. Loss of the registry's own original custody, unscoped denial,
 uncertain commit, or native retirement debt still fences the shared owner;
 caller-local classification never grants a replacement admission or receipt.
 
+Explicit native retirement debt is execution control even when the original
+closer raised an ordinary exception. The canonical control classifier preserves
+that actual resource/closer evidence through availability and tool-error paths.
+An outer tap HTTP body retains its original failure and close task: failed
+body/physical retirement releases the original generation as `ABANDONED`, and
+repeated close returns the same receipt rather than successful completion.
+
+Scheduler finalization stops future renewal intervals only after acquiring its
+original live-token row lock. Its own committed token clearance is not external
+lease loss; original in-flight renewal/finalizer acknowledgements still join,
+and the original confirmed deadline is never extended by this stop signal.
+Cognition terminalizers share pending native tasks, but successful completion
+retains only a weak original-delivery receipt. Completed tasks and their signal
+contexts are released; the receipt expires with its original delivery owners.
+
 Scheduler dispatch classifies every explicit execution-control carrier before
 ordinary task-failure and typed feature/owner/unavailable normalization. Even
 when only a child admission is denied and the outer claim remains live, the

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from tests.utils.receipt_delivery import ReceiptDelivery
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCommitOutcomeError, ExecutionCustody,
@@ -293,7 +294,7 @@ async def test_control_terminalizer_failure_or_cancel_retains_exact_cleanup_debt
     dispatcher._durable_delivery_owner = "dispatcher:original"
     dispatcher._agent = SimpleNamespace(did="original")
     dispatcher._discard_transient_durable_handoff = Mock()
-    delivery = SimpleNamespace(
+    delivery = ReceiptDelivery(
         delivery_id="delivery", consumer_id="consumer", lease_token="token",
     )
     entered, release = asyncio.Event(), asyncio.Event()
@@ -332,7 +333,7 @@ async def test_shutdown_cleanup_failure_keeps_owner_fenced_until_exact_retry(tmp
     from tests.unit.test_durable_signal_delivery import _dispatcher, _close
 
     backend, agent, dispatcher = await _dispatcher(tmp_path / "control-debt.db", "did:test:debt")
-    delivery = SimpleNamespace(delivery_id="original", consumer_id="original-consumer", lease_token="original-token")
+    delivery = ReceiptDelivery(delivery_id="original", consumer_id="original-consumer", lease_token="original-token")
     error = control("unknown", True)
     dispatcher._retained_cognition_control_debt[delivery.delivery_id] = (delivery, error)
     original_apply = dispatcher._apply_cognition_control_terminal
@@ -580,7 +581,7 @@ async def test_retained_cognition_control_never_requeues_even_during_shutdown(sh
     dispatcher._terminalize_failed_cognition = AsyncMock()
     dispatcher.release_durable_delivery_after_task = AsyncMock()
     error = control("unknown", True)
-    delivery = SimpleNamespace(delivery_id="delivery")
+    delivery = ReceiptDelivery(delivery_id="delivery")
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def route():

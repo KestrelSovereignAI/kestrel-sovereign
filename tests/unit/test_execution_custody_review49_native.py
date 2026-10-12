@@ -6,6 +6,7 @@ from contextvars import Context
 from types import SimpleNamespace
 
 import pytest
+from tests.utils.receipt_delivery import ReceiptDelivery
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput
 from kestrel_sdk.llm import InferenceLeaseState
 from sqlalchemy import text
@@ -542,7 +543,7 @@ async def test_completed_cognition_selects_original_native_receipt_before_failed
     # An already-settled original child races a weak renewal failure. A stale
     # lease intentionally cannot CAS a terminal row; its strongest original
     # receipt must still survive that actual native failure path.
-    delivery = SimpleNamespace(delivery_id="stale-original", consumer_id="original-consumer", lease_token="original-token")
+    delivery = ReceiptDelivery(delivery_id="stale-original", consumer_id="original-consumer", lease_token="original-token")
     try:
         await join(child)
         result = await join(create_owned_task(dispatcher._settle_cognition_control(delivery, ExecutionAuthorityError("renewal lost authority"), child)))

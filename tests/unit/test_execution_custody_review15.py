@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
+from tests.utils.receipt_delivery import ReceiptDelivery
 
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError, InvocationSelfFencedError,
@@ -57,7 +58,7 @@ def dispatcher_fixture(error):
         backend_type="postgres", fail_cognition_delivery=AsyncMock(return_value=False),
         retain_cognition_cleanup_owner=AsyncMock(return_value=False),
     ))
-    delivery = SimpleNamespace(delivery_id="delivery", consumer_id="consumer", lease_token="original-token")
+    delivery = ReceiptDelivery(delivery_id="delivery", consumer_id="consumer", lease_token="original-token")
     return dispatcher, delivery
 
 

@@ -28,6 +28,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
 
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, raise_owned_outcome
+from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
+
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCustody,
     bind_execution_custody_snapshot, current_execution_custody,
@@ -47,6 +50,8 @@ class _TapResponseOwner:
         fence.owner.retain_active_request_generation(fence.request_id, fence.generation)
         self.stream, self.fence, self.producer = stream, fence, producer
         self.retired = False
+        self._close_task = None
+        self._terminal_error = None
 
     def __aiter__(self):
         return self
@@ -55,6 +60,8 @@ class _TapResponseOwner:
         try:
             return await anext(self.stream)
         except BaseException as original:
+            if not isinstance(original, StopAsyncIteration):
+                self._terminal_error = execution_terminal_error(self._terminal_error, original)
             try:
                 await self.aclose()
             except BaseException as cleanup:
@@ -62,14 +69,28 @@ class _TapResponseOwner:
             raise
 
     async def aclose(self):
-        if self.retired:
-            return
-        try:
-            await close_execution_stream(self.fence.owner, self.stream, self.producer)
-        finally:
-            if not self.retired:
-                self.retired = True
-                self.fence.owner._cleanup_cancelled_request(self.fence.request_id, generation=self.fence.generation)
+        if self._close_task is None:
+            async def retire():
+                disposition = (RequestCompletionDisposition.ABANDONED
+                    if self._terminal_error is not None else RequestCompletionDisposition.COMPLETED)
+                try:
+                    try:
+                        await close_execution_stream(self.fence.owner, self.stream, self.producer)
+                    except BaseException as cleanup:
+                        self._terminal_error = execution_terminal_error(self._terminal_error, cleanup)
+                    if self._terminal_error is not None:
+                        raise self._terminal_error
+                except BaseException:
+                    disposition = RequestCompletionDisposition.ABANDONED
+                    raise
+                finally:
+                    if not self.retired:
+                        self.retired = True
+                        self.fence.owner._cleanup_cancelled_request(self.fence.request_id,
+                            generation=self.fence.generation, disposition=disposition)
+            self._close_task = create_owned_task(retire())
+        return raise_owned_outcome(await await_owned_task(self._close_task),
+            operation="original tap response retirement")
 
 
 @dataclass

@@ -79,8 +79,14 @@ def execution_commit_outcome(error: BaseException | None) -> str | None:
 
 
 def is_execution_control_error(error: BaseException | None) -> bool:
-    """Authority/commit control evidence must not become a tool error string."""
+    """Original authority, commit, or physical-retirement evidence is control.
+
+    An ordinary native close exception still controls retirement when it
+    carries the actual retained resource/closer. Availability/tool-error
+    normalization must never erase that original ownership evidence.
+    """
     return any(isinstance(current, ExecutionAuthorityError)
+               or bool(vars(current).get("_kestrel_native_retirement_debts"))
                for current in _explicit_control_chain(error))
 
 

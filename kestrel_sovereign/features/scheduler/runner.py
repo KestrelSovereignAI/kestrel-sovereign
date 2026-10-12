@@ -4238,6 +4238,15 @@ class SchedulerRunner:
                 if not await self._lock_live_claim_for_finalization(task, execution):
                     await self._mark_cancelled_if_no_longer_runnable(execution)
                     return
+                renewal_state = _rollout_renewal_state.get()
+                if renewal_state is not None:
+                    # This exact finalizer now owns the original live-token
+                    # row lock. Stop future intervals before it clears that
+                    # token: a renewal observing our own committed clearance
+                    # is not external lease loss. Already-entered native
+                    # renewal acknowledgements still join at scope retirement;
+                    # the original confirmed deadline is never extended here.
+                    renewal_state.stop_requested.set()
                 schedule_now = await self._database_clock()
             else:
                 schedule_now = datetime.now(timezone.utc)

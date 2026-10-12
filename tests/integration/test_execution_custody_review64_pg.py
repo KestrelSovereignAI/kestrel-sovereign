@@ -153,6 +153,16 @@ async def test_concurrent_native_cognition_terminalizers_share_original_success_
         # receipt, not another UPDATE against an already-cleared token.
         await dispatcher._terminalize_failed_cognition(delivery, error)
         assert len(commits) == 1 and not dispatcher._retained_cognition_control_debt
+        assert not dispatcher._cognition_control_terminal_owners, "completed native tasks retained their dispatch context"
+        assert len(dispatcher._cognition_control_terminal_receipts) == 1
+        import gc
+        import weakref
+        original_snapshot = weakref.ref(delivery)
+        del delivery
+        await asyncio.sleep(0)
+        gc.collect()
+        assert original_snapshot() is None
+        assert not dispatcher._cognition_control_terminal_receipts, "receipt outlived all original delivery owners"
         row = await observer.fetchrow("SELECT status,lease_owner,lease_token FROM durable_signal_deliveries WHERE delivery_id='delivery1'")
         assert tuple(row) == ("failed", None, None)
         with pytest.raises(ExecutionAuthorityError):
@@ -165,3 +175,56 @@ async def test_concurrent_native_cognition_terminalizers_share_original_success_
         backend._execution_custody = None
         await dispatcher._stop_runtime_owner_heartbeat()
         await dispatcher.shutdown_durable_delivery()
+async def test_native_scheduler_finalizer_ack_does_not_manufacture_claim_loss(native_pg, monkeypatch):
+    from contextvars import ContextVar
+    backend, observer, schema = native_pg
+    await observer.execute(f'SET search_path TO "{schema}"')
+    runtime = ExecutionCustody(ProcessRuntimeExecutionFence("original"))
+    async def effect(*args):
+        await backend.execute("INSERT INTO effects VALUES (65, 'original finalized effect')")
+    scheduler = SchedulerRunner(AsyncDatabase(backend), "original", effect, lease_seconds=2)
+    await scheduler._ensure_tables()
+    due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    await backend.execute("""INSERT INTO scheduled_tasks
+        (id,agent_id,task_name,cron_expression,enabled,next_run_at,created_at,idempotency_key,scheduler_protocol_version)
+        VALUES ('original-final-ack','original','offline','* * * * *',1,?,?,'original-final-ack',?)""",
+        (due, due, SCHEDULER_PROTOCOL_VERSION))
+    entered, release = asyncio.Event(), asyncio.Event()
+    finalizing = ContextVar("original_native_finalization", default=False)
+    native_exit = asyncpg.transaction.Transaction.__aexit__
+    finalize = scheduler._finalize
+    commits = []
+    async def marked_finalizer(*args, **kwargs):
+        token = finalizing.set(True)
+        try:
+            return await finalize(*args, **kwargs)
+        finally:
+            finalizing.reset(token)
+    async def held_exit(transaction, error_type, error, traceback):
+        result = await native_exit(transaction, error_type, error, traceback)
+        if error_type is None and finalizing.get() and not transaction._nested and not commits:
+            commits.append(transaction)
+            entered.set()
+            await release.wait()
+        return result
+    monkeypatch.setattr(scheduler, "_finalize", marked_finalizer)
+    monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", held_exit)
+    backend._execution_custody = runtime
+    owner = create_owned_task(tick_and_settle(scheduler))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        assert await observer.fetchval("SELECT claim_token FROM scheduled_tasks WHERE id='original-final-ack'") is None
+        done, _ = await asyncio.wait({owner}, timeout=.9)
+        release.set()
+        outcome = await await_owned_task(owner)
+        assert not done, "original finalizer COMMIT acknowledgement was cancelled after its own token clearance"
+        assert outcome.error is None and scheduler._execution_control_error is None
+        runtime.require_work()
+        assert len(commits) == 1
+        assert await observer.fetchval("SELECT count(*) FROM effects WHERE id=65") == 1
+    finally:
+        release.set()
+        await await_owned_task(owner)
+        monkeypatch.undo()
+        backend._execution_custody = None
+        await await_owned_task(create_owned_task(scheduler.stop()))

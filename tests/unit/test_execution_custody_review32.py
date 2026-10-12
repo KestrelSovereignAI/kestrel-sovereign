@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from tests.utils.receipt_delivery import ReceiptDelivery
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
@@ -162,7 +163,7 @@ async def test_late_native_cognition_carrier_is_harvested_before_owner_removal(t
     await backend.execute("CREATE TABLE effects(id INTEGER PRIMARY KEY)")
     release = asyncio.Event()
     error = receipt(kind)
-    delivery = SimpleNamespace(delivery_id="original", consumer_id="consumer", lease_token="original-token")
+    delivery = ReceiptDelivery(delivery_id="original", consumer_id="consumer", lease_token="original-token")
     dispatcher._terminalize_failed_cognition = AsyncMock()
     dispatcher.release_durable_delivery_after_task = AsyncMock()
 
