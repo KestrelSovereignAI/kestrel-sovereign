@@ -536,6 +536,18 @@ def bind_native_execution_admission(validator: Callable[[], Awaitable[None]]) ->
         _NATIVE_ADMISSION_VALIDATORS.reset(token)
 
 
+async def require_native_execution_admission(owner: Any = None) -> None:
+    """Revalidate the current original dispatch gates at a final handoff.
+
+    This checks retained custody and trusted validators; it never issues a
+    replacement scope or turns a routing identifier into execution authority.
+    """
+    require_execution_work(owner)
+    for validator in _NATIVE_ADMISSION_VALIDATORS.get():
+        await validator()
+    require_execution_work(owner)
+
+
 async def await_execution_work(
     owner: Any, operation: Callable[[], Awaitable[_Result]], *,
     acquired_result_cleanup: Callable[[_Result], Awaitable[None]] | None = None,
@@ -554,6 +566,12 @@ async def await_execution_work(
             hook(owner, error)
     with bind_execution_runtime(owner):
         try:
+            # Owned provider children may start after their caller's entry
+            # check. WebSocket dispatch has no HTTP transport hook, so the
+            # same original validators must run BEFORE the lazy native effect.
+            for validator in validators:
+                await validator()
+            require_execution_work(owner)
             result = await operation()
         except (ExecutionAuthorityError, asyncio.CancelledError) as error:
             retain_retirement(error)

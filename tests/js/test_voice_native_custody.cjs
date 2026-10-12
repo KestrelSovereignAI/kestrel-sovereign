@@ -9,7 +9,7 @@ const { chromium } = require('playwright');
 const { wsServer: WebSocketServer } = require(path.join(
   path.dirname(require.resolve('playwright-core/package.json')), 'lib/utilsBundle.js'));
 
-async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint = false, failWorklet = '', holdWorklet = '', transport = 'webrtc', declineMint = false } = {}) {
+async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint = false, failWorklet = '', holdWorklet = '', transport = 'webrtc', declineMint = false, responseStartTimeoutMs = 30000 } = {}) {
   const staticRoot = process.env.KESTREL_TEST_STATIC_ROOT
     ? path.resolve(process.env.KESTREL_TEST_STATIC_ROOT)
     : path.resolve(__dirname, '../../kestrel_sovereign/static');
@@ -139,12 +139,12 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
     await page.route('**/*', route => new URL(route.request().url()).origin === origin
       ? route.continue() : route.abort());
     await page.goto(origin);
-    await page.evaluate(async autoStart => {
+    await page.evaluate(async ({ autoStart, responseStartTimeoutMs }) => {
       const { createRealtimeClient } = await import('/js/voice/realtime.js');
       window.nativeEvents = [];
-      window.client = await createRealtimeClient({ onEvent: event => window.nativeEvents.push(event) });
+      window.client = await createRealtimeClient({ onEvent: event => window.nativeEvents.push(event), responseStartTimeoutMs });
       if (autoStart) await window.client.start();
-    }, autoStart);
+    }, { autoStart, responseStartTimeoutMs });
     if (autoStart && transport === 'webrtc') await page.waitForFunction(() => window.nativeChannel?.readyState === 'open');
     await body({ page, entered, enteredMint, enteredWorklet,
       releaseWorklet: () => {
@@ -205,6 +205,76 @@ test('native WebRTC buffered old input commit cannot reopen pre-ID cancellation'
     await page.waitForFunction(() => window.nativeEvents.some(event => event.kind === 'tool_call_batch_requested'));
     assert.deepEqual(await page.evaluate(() => window.nativeEvents.filter(event => event.kind === 'tool_call_batch_requested').map(event => event.batch_id)), ['fresh-response']);
   }, '{"persisted":true,"status":"ok"}');
+});
+
+test('native server VAD does not clear the fresh utterance that triggered speech', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page }) => {
+    await page.evaluate(() => {
+      for (const payload of [
+        { type: 'input_audio_buffer.speech_started', item_id: 'original-fresh-input' },
+        { type: 'input_audio_buffer.speech_stopped', item_id: 'original-fresh-input' },
+        { type: 'input_audio_buffer.committed', item_id: 'original-fresh-input' },
+        { type: 'response.created', response: { id: 'original-fresh-response' } },
+        { type: 'conversation.item.input_audio_transcription.completed', item_id: 'original-fresh-input', transcript: 'fresh input barrier' },
+      ]) window.nativeChannel.send(JSON.stringify(payload));
+    });
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.item_id === 'original-fresh-input'));
+    const state = await page.evaluate(() => ({
+      clears: window.nativeMessages.filter(message => message.type === 'input_audio_buffer.clear').length,
+      speaking: window.nativeEvents.filter(event => event.kind === 'speaking_started').length,
+    }));
+    assert.equal(state.clears, 0, 'ordinary VAD speech destructively cleared newly detected input');
+    assert.equal(state.speaking, 1);
+  }, '{"persisted":true,"status":"ok"}');
+});
+
+test('native typed input requires matching original response correlation after pre-ID Stop', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page }) => {
+    await page.evaluate(() => {
+      window.client.cancelResponse();
+      window.client.sendText('new original typed input');
+      for (const payload of [
+        { type: 'response.created', response: { id: 'old-before-clear' } },
+        { type: 'response.function_call_arguments.done', response_id: 'old-before-clear', call_id: 'old-call', name: 'offline', arguments: '{}' },
+        { type: 'response.done', response: { id: 'old-before-clear', status: 'completed' } },
+        { type: 'input_audio_buffer.cleared' },
+        { type: 'response.created', response: { id: 'old-after-clear' } },
+        { type: 'response.function_call_arguments.done', response_id: 'old-after-clear', call_id: 'later-old-call', name: 'offline', arguments: '{}' },
+        { type: 'response.done', response: { id: 'old-after-clear', status: 'completed' } },
+        { type: 'conversation.item.input_audio_transcription.completed', item_id: 'typed-old-barrier', transcript: 'old output barrier' },
+      ]) window.nativeChannel.send(JSON.stringify(payload));
+    });
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.item_id === 'typed-old-barrier'));
+    assert.equal(await page.evaluate(() => window.nativeEvents.filter(event => event.kind === 'tool_call_batch_requested').length), 0,
+      'new text admitted buffered output from the cancelled original response');
+    await page.waitForFunction(() => window.nativeMessages.some(message => message.type === 'response.create'));
+    const metadata = await page.evaluate(() => window.nativeMessages.find(message => message.type === 'response.create').response?.metadata);
+    assert.ok(metadata?.kestrel_input_generation, 'typed native request lacks original response correlation');
+    await page.evaluate(metadata => {
+      for (const payload of [
+        { type: 'response.created', response: { id: 'fresh-typed-response', metadata } },
+        { type: 'response.function_call_arguments.done', response_id: 'fresh-typed-response', call_id: 'fresh-typed-call', name: 'offline', arguments: '{}' },
+        { type: 'response.done', response: { id: 'fresh-typed-response', status: 'completed' } },
+      ]) window.nativeChannel.send(JSON.stringify(payload));
+    }, metadata);
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.kind === 'tool_call_batch_requested'));
+    assert.deepEqual(await page.evaluate(() => window.nativeEvents.filter(event => event.kind === 'tool_call_batch_requested').map(event => event.batch_id)),
+      ['fresh-typed-response']);
+  }, '{"persisted":true,"status":"ok"}');
+});
+
+test('native typed response without correlation closes the original transport within its bound', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page }) => {
+    await page.evaluate(() => {
+      window.client.sendText('bounded original input');
+      window.nativeChannel.send(JSON.stringify({ type: 'response.created', response: { id: 'uncorrelated' } }));
+    });
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.kind === 'session_closed'));
+    assert.equal(await page.evaluate(() => window.nativeEvents.some(event =>
+      event.code === 'RESPONSE_CORRELATION_UNCONFIRMED' && event.fatal)), true);
+    assert.equal(await page.evaluate(() => window.nativeEvents.filter(event => event.kind === 'speaking_started').length), 0);
+    assert.equal(await page.evaluate(() => window.nativeChannel.readyState), 'closed');
+  }, '{"persisted":true,"status":"ok"}', { responseStartTimeoutMs: 1000 });
 });
 
 test('native websocket barge-in fences playback continuation and late publication', { timeout: 30000 }, async () => {

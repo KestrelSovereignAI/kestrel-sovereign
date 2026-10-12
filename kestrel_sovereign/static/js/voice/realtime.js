@@ -200,9 +200,13 @@ export async function createRealtimeClient({
   getAuthHeaders = () => ({}),
   sessionRequestInit = {},
   sessionRequestBody = {},
+  responseStartTimeoutMs = 30000,
 } = {}) {
   if (typeof onEvent !== 'function') {
     throw new Error('createRealtimeClient requires an onEvent callback');
+  }
+  if (!Number.isFinite(responseStartTimeoutMs) || responseStartTimeoutMs <= 0) {
+    throw new Error('responseStartTimeoutMs must be finite and positive');
   }
 
   let session = null;    // { session_id, model, voice, client_secret }
@@ -236,6 +240,9 @@ export async function createRealtimeClient({
   let responseAdmissionOpen = true;
   const pendingInputClears = [];
   let freshInputGeneration = null;
+  let speechInputItemId = '';
+  let typedInputGeneration = null;
+  let responseStartTimer = null;
   const userTranscriptTracker = createUserTranscriptTracker();
   let earlyAudioChunks = [];
   let earlyAudioBytes = 0;
@@ -379,6 +386,21 @@ export async function createRealtimeClient({
     switch (raw.type) {
       case 'response.created':
         if (!responseId) break;
+        {
+          const supplied = raw.response?.metadata?.kestrel_input_generation;
+          if (typedInputGeneration !== null ? supplied !== typedInputGeneration : supplied !== undefined) {
+            // A new local turn or audio-clear ACK does not identify a delayed
+            // response. Client-requested output must echo its original input
+            // correlation; this is routing evidence, never tool authority.
+            cancelledResponses.add(responseId);
+            break;
+          }
+          if (typedInputGeneration !== null) {
+            clearTimeout(responseStartTimer);
+            responseStartTimer = null;
+            responseAdmissionOpen = true;
+          }
+        }
         if (!responseAdmissionOpen) {
           cancelledResponses.add(responseId);
           break;
@@ -398,7 +420,10 @@ export async function createRealtimeClient({
       case 'input_audio_buffer.speech_started':
         // A barge-in abandons the prior response. Completed arguments from
         // that interrupted response must not execute or bleed into the next.
-        abandonResponse();
+        // Server VAD already detected this fresh audio. Retire old output,
+        // not the microphone buffer containing the new utterance.
+        abandonResponse({ clearInput: false });
+        speechInputItemId = raw.item_id ?? '';
         userTranscriptTracker.speechStarted();
         playback?.flush?.();
         onEvent(makeEvent(Events.LISTENING_STARTED, {}));
@@ -410,7 +435,8 @@ export async function createRealtimeClient({
       case 'input_audio_buffer.committed':
         // An old buffered commit can arrive after cancellation but before
         // the ordered clear acknowledgement. It cannot authorize output.
-        if (freshInputGeneration === responseGeneration) responseAdmissionOpen = true;
+        if (typedInputGeneration === null && freshInputGeneration === responseGeneration
+            && (!speechInputItemId || speechInputItemId === raw.item_id)) responseAdmissionOpen = true;
         userTranscriptTracker.committed(raw.item_id ?? '');
         break;
       case 'input_audio_buffer.cleared':
@@ -741,6 +767,8 @@ export async function createRealtimeClient({
   function close() {
     if (closeOwner) return closeOwner;
     closed = true;
+    clearTimeout(responseStartTimer);
+    responseStartTimer = null;
     startupAbort.abort();
     closeOwner = retireAcquired().then(() => {
       onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'client_close' }));
@@ -750,6 +778,9 @@ export async function createRealtimeClient({
 
   /** Queue a text message into the conversation (without speaking it aloud). */
   function sendText(text) {
+    if (closed) throw new Error('Original voice transport is closed.');
+    abandonResponse({ clearInput: false });
+    typedInputGeneration = crypto.randomUUID();
     sendJSON({
       type: 'conversation.item.create',
       item: {
@@ -757,9 +788,8 @@ export async function createRealtimeClient({
         role: 'user',
         content: [{ type: 'input_text', text }],
       },
-    });
-    responseAdmissionOpen = true;
-    sendJSON({ type: 'response.create' });
+    }, { required: true });
+    requestResponse();
     // Typed turns don't produce an input_audio_transcription.completed event,
     // so persist the user side here or backend history would be one-sided
     // (assistant reply only). The assistant turn still persists via
@@ -768,12 +798,18 @@ export async function createRealtimeClient({
   }
 
   /** Barge-in: abort the in-flight agent response. */
-  function abandonResponse() {
+  function abandonResponse({ clearInput = true } = {}) {
+    clearTimeout(responseStartTimer);
+    responseStartTimer = null;
+    typedInputGeneration = null;
+    speechInputItemId = '';
     responseAdmissionOpen = false;
     responseGeneration += 1;
-    freshInputGeneration = null;
-    pendingInputClears.push(responseGeneration);
-    sendJSON({ type: 'input_audio_buffer.clear' });
+    freshInputGeneration = clearInput ? null : responseGeneration;
+    if (clearInput) {
+      pendingInputClears.push(responseGeneration);
+      sendJSON({ type: 'input_audio_buffer.clear' });
+    }
     if (activeResponseId) cancelledResponses.add(activeResponseId);
     for (const id of pendingToolCalls.keys()) cancelledResponses.add(id);
     pendingToolCalls.clear();
@@ -783,6 +819,25 @@ export async function createRealtimeClient({
     abandonResponse();
     sendJSON({ type: 'response.cancel' });
     playback?.flush?.();
+  }
+
+  function requestResponse() {
+    const original = typedInputGeneration;
+    sendJSON(original === null ? { type: 'response.create' } : {
+      type: 'response.create',
+      response: { metadata: { kestrel_input_generation: original } },
+    }, { required: true });
+    if (original !== null) {
+      clearTimeout(responseStartTimer);
+      responseStartTimer = setTimeout(() => {
+        if (closed || typedInputGeneration !== original) return;
+        onEvent(makeEvent(Events.ERROR, {
+          message: 'Realtime provider did not acknowledge the original typed response correlation.',
+          code: 'RESPONSE_CORRELATION_UNCONFIRMED', fatal: true,
+        }));
+        close();
+      }, responseStartTimeoutMs);
+    }
   }
 
   /**
@@ -830,7 +885,7 @@ export async function createRealtimeClient({
       await waitForPlaybackIdle(playback);
       if (closed || originalGeneration !== responseGeneration) return;
       responseAdmissionOpen = true;
-      sendJSON({ type: 'response.create' }, { required: true });
+      requestResponse();
     } catch (error) {
       await close();
       throw error;

@@ -35,6 +35,7 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCustody,
     bind_execution_custody_snapshot, current_execution_custody,
     close_execution_stream, execution_terminal_error,
+    execution_cleanup_debts, execution_denial_scopes,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,21 +72,27 @@ class _TapResponseOwner:
     async def aclose(self):
         if self._close_task is None:
             async def retire():
-                disposition = (RequestCompletionDisposition.ABANDONED
-                    if self._terminal_error is not None else RequestCompletionDisposition.COMPLETED)
+                cleanup_failed = False
                 try:
                     try:
                         await close_execution_stream(self.fence.owner, self.stream, self.producer)
                     except BaseException as cleanup:
+                        cleanup_failed = True
                         self._terminal_error = execution_terminal_error(self._terminal_error, cleanup)
                     if self._terminal_error is not None:
                         raise self._terminal_error
-                except BaseException:
-                    disposition = RequestCompletionDisposition.ABANDONED
-                    raise
                 finally:
                     if not self.retired:
                         self.retired = True
+                        # Work refusal remains visible to the original reader.
+                        # Successfully closed ordinary scoped Stop is not
+                        # physical abandonment; actual close failures, native
+                        # debt and irreversible/unscoped receipts still are.
+                        ordinary_stop = (execution_denial_scopes(self._terminal_error) is not None
+                            and not execution_cleanup_debts(self._terminal_error))
+                        disposition = (RequestCompletionDisposition.COMPLETED
+                            if not cleanup_failed and (self._terminal_error is None or ordinary_stop)
+                            else RequestCompletionDisposition.ABANDONED)
                         self.fence.owner._cleanup_cancelled_request(self.fence.request_id,
                             generation=self.fence.generation, disposition=disposition)
             self._close_task = create_owned_task(retire())

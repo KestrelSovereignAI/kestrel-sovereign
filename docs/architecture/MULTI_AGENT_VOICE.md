@@ -150,6 +150,28 @@ The draft fix is therefore **not a separate task** — it's the cheapest first s
 3. **Privacy across the room.** Each session already routes through the per-agent privacy resolver (#723). In a shared room, whose privacy mode governs a turn that one agent voices and another hears? Likely: each agent's own mode gates its own I/O, but this needs to be stated, not assumed. See [security/PRIVACY_AGENT.md](security/PRIVACY_AGENT.md).
 4. **Solo semantics with an armed mic.** If I solo A's *output* but my mic is armed to B, is that a coherent state or should solo also re-arm? Lean toward keeping the buses independent (they're orthogonal by design), but the UI should make the split legible.
 
+## Realtime interruption and typed-response correlation
+
+Server VAD `speech_started` retires prior output without clearing the fresh
+microphone input that triggered it. An explicit local Stop may still clear
+buffered input; its acknowledgement does not identify a subsequent response.
+
+For browser typed turns, `response.create.response.metadata.kestrel_input_generation`
+contains a fresh correlation ID. Only a matching `response.created` admits that
+typed turn's output, including tool continuations. This is routing evidence,
+not execution authority: hosted tool dispatch still validates original custody.
+Missing or mismatched correlation fails closed; if no matching response starts
+within `responseStartTimeoutMs` (30 seconds by default), the original client
+emits `RESPONSE_CORRELATION_UNCONFIRMED` and physically closes its transport.
+Providers must echo this metadata for typed-turn support; compatibility with
+other vendors is not inferred from OpenAI compatibility claims.
+
+The protocol uses the documented OpenAI
+[response metadata](https://developers.openai.com/api/reference/resources/realtime/client-events)
+and [Realtime VAD interruption](https://developers.openai.com/api/docs/guides/realtime-conversations)
+contracts. Native loopback WebRTC/WebSocket tests cover cancellation, correlation,
+fresh speech preservation and bounded refusal without paid provider calls.
+
 ## Appendix — source map
 
 **Frontend (kestrel-sovereign):**
