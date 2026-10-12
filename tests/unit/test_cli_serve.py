@@ -16,15 +16,14 @@ Real serving is exercised manually / in the integration tier.
 from __future__ import annotations
 
 import argparse
-import json
-import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from kestrel_sovereign import cli_serve
+from kestrel_sovereign.paths import SERVE_STATE_DIR_ENV
 
 
 # --------------------------------------------------------------------------- #
@@ -33,10 +32,7 @@ from kestrel_sovereign import cli_serve
 @pytest.fixture(autouse=True)
 def _isolate_state(tmp_path, monkeypatch):
     """Redirect state/log dirs to a temp location for every test."""
-    state_dir = tmp_path / "state"
-    monkeypatch.setattr(cli_serve, "STATE_DIR", state_dir)
-    monkeypatch.setattr(cli_serve, "STATE_FILE", state_dir / "serve_state.json")
-    monkeypatch.setattr(cli_serve, "LOG_DIR", state_dir / "logs")
+    monkeypatch.setenv(SERVE_STATE_DIR_ENV, str(tmp_path / "state"))
     # Default: no registry env leakage
     monkeypatch.delenv("KESTREL_SERVE_REGISTRY", raising=False)
     yield

@@ -231,6 +231,10 @@ TRASH_DIR_ENV = "KESTREL_TRASH_DIR"
 #: ``kestrel serve`` model-server state and logs.
 SERVE_STATE_DIR_ENV = "KESTREL_SERVE_STATE_DIR"
 
+#: Model context limits found by discovery, persisted for cold starts (see
+#: ``agent.token_counter``). A file, not a root.
+CONTEXT_LIMITS_CACHE_FILE_ENV = "KESTREL_CONTEXT_LIMITS_CACHE_FILE"
+
 #: Operator override for the source project root holding anchored doctrine.
 PROJECT_ROOT_ENV = "KESTREL_PROJECT_ROOT"
 
@@ -263,6 +267,7 @@ RUNTIME_PATH_ENV_NAMES: tuple[str, ...] = (
     CACHE_DIR_ENV,
     TRASH_DIR_ENV,
     SERVE_STATE_DIR_ENV,
+    CONTEXT_LIMITS_CACHE_FILE_ENV,
     PROJECT_ROOT_ENV,
     MULTI_AGENT_CONFIG_ENV,
     TRAINING_WORKING_DIR_ENV,
