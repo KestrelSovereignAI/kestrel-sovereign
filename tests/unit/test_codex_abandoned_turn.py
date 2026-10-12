@@ -33,6 +33,7 @@ from kestrel_sovereign.agent.orchestrator_engine import (
 from kestrel_sovereign.llm.cancellation import raise_if_cancelled
 from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 from kestrel_sovereign.llm.codex_app_server import CodexAppServerError
+from tests.shared.booted_agent import booted_agent
 
 #: A watchdog bound short enough to trip in a unit test.
 BOUND = 0.2
@@ -359,11 +360,12 @@ async def test_a_stalled_plan_turn_times_out_and_the_next_starts_a_new_thread(
     carries a one-time briefing, so the second starts its own thread; the
     third has the second's settings and would reuse its thread, where the
     abandoned turn is still running."""
-    from tests.unit.test_llm_call_watchdog import _booted_agent
-
     monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", BOUND)
     app = FakeCodexAppServer("answer", "stall", "answer")
-    async with _booted_agent(tmp_path) as agent:
+    async with booted_agent(
+        tmp_path, name="Codex", provenance="test:codex_abandoned_turn",
+        features=frozenset(),
+    ) as agent:
         _plan_route(agent, app, monkeypatch, tmp_path)
 
         assert await turns(agent) == ["Noted.", "Noted."]
