@@ -4499,6 +4499,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         cancel_token: Optional[CancelToken] = None,
         explicit_selection: bool = False,
         invocation_context: Optional[LLMInvocationContext] = None,
+        return_response: bool = False,
     ) -> Union[str, LLMResponse]:
         """Try to get a response from a single provider.
 
@@ -4575,7 +4576,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         )
 
         # Return full LLMResponse if tools or structured output requested
-        if tools is not None or response_format is not None:
+        if tools is not None or response_format is not None or return_response:
             return response
         else:
             if isinstance(response, LLMResponse):
@@ -4996,6 +4997,7 @@ No other text or formatting.
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         cancel_token: Optional[CancelToken] = None,
         invocation_context: LLMInvocationContext,
+        return_response: bool = False,
     ) -> Union[str, LLMResponse]:
         """Get a response from providers in priority order.
 
@@ -5006,9 +5008,12 @@ No other text or formatting.
             model_override: Override the model selection
             tools: Optional tools for function calling
             response_format: Optional Pydantic model for structured output
+            return_response: Return the route's LLMResponse even without
+                tools or structured output (see ``generate``)
 
         Returns:
-            String content or LLMResponse (if tools provided or structured output)
+            String content or LLMResponse (if tools provided, structured
+            output, or ``return_response``)
         """
         if not self.providers:
             raise RuntimeError("No LLM providers initialized.")
@@ -5078,6 +5083,7 @@ No other text or formatting.
                     cancel_token=cancel_token,
                     explicit_selection=explicit_selection,
                     invocation_context=invocation_context,
+                    return_response=return_response,
                 )
                 logger.info(f"Success from {provider_name}")
                 return result
@@ -5397,6 +5403,7 @@ No other text or formatting.
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         cancel_token: Optional[CancelToken] = None,
         invocation_context: Optional[LLMInvocationContext] = None,
+        return_response: bool = False,
     ) -> Union[str, LLMResponse]:
         """Generate text using the active backend with automatic fallback.
 
@@ -5420,9 +5427,16 @@ No other text or formatting.
                 Callers with genuinely no session (the sleep-cycle memory
                 attestation, the salvage janitor) pass nothing and stay
                 unstamped rather than stamping an empty value.
+            return_response: Return the route's ``LLMResponse`` for a plain
+                text call too, so the caller keeps its ``output_tokens`` and
+                stop reason (``output_ceiling.response_stop_reason``). A caller
+                that rejects the text can then say what the route returned
+                (#3436). A route whose adapter returns a bare string still
+                returns that string.
 
         Returns:
-            String content or LLMResponse (if tools/structured output)
+            String content or LLMResponse (if tools/structured output, or
+            ``return_response``)
         """
         self._check_policy()
         force_local_only = self._effective_force_local_only(force_local_only)
@@ -5492,7 +5506,7 @@ No other text or formatting.
                         self._raise_managed_remote_failure(exc)
 
             if remote_route is not None:
-                if tools is not None or response_format is not None:
+                if tools is not None or response_format is not None or return_response:
                     return self._annotate_and_return(
                         span,
                         remote_response,
@@ -5521,6 +5535,7 @@ No other text or formatting.
                 tool_executor=tool_executor,
                 cancel_token=cancel_token,
                 invocation_context=invocation_context,
+                return_response=return_response,
             )
             return self._annotate_and_return(span, result, redact=_redact)
 
