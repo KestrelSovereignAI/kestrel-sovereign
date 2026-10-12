@@ -30,7 +30,10 @@ from kestrel_sovereign.agent.invocation import (
     validate_invocation_id,
 )
 from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
-from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+from kestrel_sovereign.execution_custody import (
+    current_execution_custody, execution_cleanup_debts, execution_denial_scopes,
+    execution_terminal_error, is_execution_control_error,
+)
 from kestrel_sdk.storage.database.interface import TransactionError
 from kestrel_sovereign.storage.database_clock import (
     database_lease_cutoff_sql,
@@ -956,6 +959,9 @@ class DistributedInvocationRegistry:
                 "distributed Stop owner lease must exceed its poll interval"
             )
         self._store = store
+        # This shared service owns its original host/storage lifetime, not
+        # every tenant/turn scope a caller subsequently brings to an API.
+        self._runtime_custody = current_execution_custody(store._db.backend)
         self._owner_id = uuid4().hex
         self._owner_epoch = 1
         self._poll_seconds = float(poll_seconds)
@@ -978,6 +984,15 @@ class DistributedInvocationRegistry:
 
     def _retain_terminal_control(self, error: BaseException) -> None:
         if is_execution_control_error(error):
+            denied = execution_denial_scopes(error)
+            if (denied and not execution_cleanup_debts(error)
+                    and all(scope not in self._runtime_custody for scope in denied)):
+                # Pure external-scope refusal remains on the original caller
+                # receipt. It grants no work and cannot retire a healthy
+                # process-wide Stop owner or another tenant's generations.
+                # Unscoped denial, native retirement debt, commit uncertainty
+                # and loss of this service's original custody still fail closed.
+                return
             self._terminal_control = execution_terminal_error(self._terminal_control, error)
             self._fail_closed_owner("original execution control retained by Stop settlement")
 

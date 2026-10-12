@@ -1346,6 +1346,7 @@ async def test_postgres_renewal_does_not_resurrect_expired_token_after_row_lock_
     blocked_renewal_finished = asyncio.Event()
     blocked_renewal_cancelled = asyncio.Event()
     blocked_renewal_results: list[bool] = []
+    blocked_renewal_denials: list[BaseException] = []
 
     async def executor(_task_name, _args):
         executor_started.set()
@@ -1365,6 +1366,11 @@ async def test_postgres_renewal_does_not_resurrect_expired_token_after_row_lock_
                 return renewed
             except asyncio.CancelledError:
                 blocked_renewal_cancelled.set()
+                raise
+            except Exception as error:
+                from kestrel_sovereign.execution_custody import execution_denial_scopes
+                assert execution_denial_scopes(error), "renewal failed without original authority-denial provenance"
+                blocked_renewal_denials.append(error)
                 raise
             finally:
                 blocked_renewal_finished.set()
@@ -1436,10 +1442,13 @@ async def test_postgres_renewal_does_not_resurrect_expired_token_after_row_lock_
 
         row_lock_held.clear()
         await asyncio.wait_for(blocked_renewal_finished.wait(), timeout=2)
-        # The independently confirmed deadline may cancel/join renewal before
-        # the row lock is released. Neither path may extend the durable lease.
+        # The independently confirmed deadline denies the original renewal
+        # when its row lock resumes, or revokes it before native admission.
+        # Every original receipt must be joined; none may extend the lease.
         assert blocked_renewal_results == [False] or (
             blocked_renewal_results == [] and blocked_renewal_cancelled.is_set()
+        ) or (
+            blocked_renewal_results == [] and len(blocked_renewal_denials) == 1
         )
         assert locked_expiry is not None
         row = await db.fetchone(

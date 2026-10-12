@@ -542,6 +542,13 @@ closure and transport cleanup select original terminal evidence before later
 cleanup noise; an abandoned stream never becomes a retry recommendation or
 an acknowledged Stop.
 
+The process-wide distributed Stop registry retains its original host/storage
+custody separately from caller scopes. A pure, originally scoped tenant/turn
+denial remains on that caller's receipt and does not fence unrelated active
+generations. Loss of the registry's own original custody, unscoped denial,
+uncertain commit, or native retirement debt still fences the shared owner;
+caller-local classification never grants a replacement admission or receipt.
+
 Scheduler dispatch classifies every explicit execution-control carrier before
 ordinary task-failure and typed feature/owner/unavailable normalization. Even
 when only a child admission is denied and the outer claim remains live, the
