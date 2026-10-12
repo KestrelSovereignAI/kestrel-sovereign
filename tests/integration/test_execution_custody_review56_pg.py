@@ -103,6 +103,8 @@ async def test_retired_privacy_cutoff_published_only_after_physical_ack(native_p
     watermark = (datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat()
     wrapper._entered_ephemeral_at = watermark
     wrapper._session_conversations = [{"role": "user", "content": "retained private stint"}]
+    wrapper._session_files = {"private-content-hash": b"original private file"}
+    wrapper._session_file_metadata = {"private-content-hash": {"private": "original metadata"}}
     await storage.conversation.add_conversation("user", "native privacy leak")
     scope = ExecutionCustody(ProcessRuntimeExecutionFence(storage.agent_id))
     backend._execution_custody = scope
@@ -116,11 +118,13 @@ async def test_retired_privacy_cutoff_published_only_after_physical_ack(native_p
         assert execution_commit_outcome(caught.value) == ("unknown" if boundary == "commit" else "committed")
         assert wrapper._entered_ephemeral_at == watermark
         assert wrapper._session_conversations
+        assert wrapper._session_files and wrapper._session_file_metadata
         assert await observer.fetchval(f'SELECT COUNT(*) FROM "{schema}".conversation_history') == 0
         monkeypatch.undo()
         report = await backend.purge_retired_ephemeral_session(wrapper, reason="reconcile original cutoff")
         assert not report.required_sweep_failed
         assert wrapper._entered_ephemeral_at is None and wrapper._session_conversations == []
+        assert wrapper._session_files == {} and wrapper._session_file_metadata == {}
     finally:
         monkeypatch.undo()
         backend._execution_custody = None

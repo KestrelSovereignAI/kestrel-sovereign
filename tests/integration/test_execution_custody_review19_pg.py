@@ -27,12 +27,11 @@ def delayed_native_commit_ack(monkeypatch, original):
         if error_type is None:
             # Actual PostgreSQL COMMIT happened; the child still owns its ACK.
             committed.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                draining.set()
-                await release.wait()
-                raise original
+            # Model the physical ACK itself, not an artificial operation that
+            # starts unwinding only when teardown cancels native COMMIT.
+            draining.set()
+            await release.wait()
+            raise original
         return result
 
     monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", delayed_ack)

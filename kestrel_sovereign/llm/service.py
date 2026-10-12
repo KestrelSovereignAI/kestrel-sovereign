@@ -5397,6 +5397,19 @@ No other text or formatting.
         return (any(not task.done() for task in writers)
                 or any(not task.done() or owned_task_error(task) is not None for task in closers))
 
+    def _retain_native_execution_retirement(self, error: BaseException) -> None:
+        """Keep failed temporary discovery transports in the original reaper."""
+        from kestrel_sovereign.execution_custody import execution_cleanup_debts
+        tasks = vars(self).setdefault("_llm_close_tasks", {})
+        resources = vars(self).setdefault("_llm_native_retirement_resources", {})
+        for resource, task in execution_cleanup_debts(error):
+            key = ("native-retirement", id(resource))
+            resources[key] = resource
+            tasks[key] = task
+        if resources:
+            self._llm_close_control = execution_terminal_error(
+                vars(self).get("_llm_close_control"), error)
+
     async def wait_for_close_completion(self) -> None:
         """Join exact native owners before a host retires their borrowed storage.
 

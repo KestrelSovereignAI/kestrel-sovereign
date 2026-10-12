@@ -31,12 +31,45 @@ from typing import AsyncIterator, Optional
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCustody,
     bind_execution_custody_snapshot, current_execution_custody,
+    close_execution_stream, execution_terminal_error,
 )
 
 logger = logging.getLogger(__name__)
 
 # Sentinel object that signals the stream is complete.
 _STREAM_DONE = object()
+
+
+class _TapResponseOwner:
+    """Hold original drain authority through the outer HTTP EOF/close."""
+    def __init__(self, stream, fence, producer):
+        fence.require_work()
+        fence.owner.retain_active_request_generation(fence.request_id, fence.generation)
+        self.stream, self.fence, self.producer = stream, fence, producer
+        self.retired = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return await anext(self.stream)
+        except BaseException as original:
+            try:
+                await self.aclose()
+            except BaseException as cleanup:
+                raise execution_terminal_error(original, cleanup)
+            raise
+
+    async def aclose(self):
+        if self.retired:
+            return
+        try:
+            await close_execution_stream(self.fence.owner, self.stream, self.producer)
+        finally:
+            if not self.retired:
+                self.retired = True
+                self.fence.owner._cleanup_cancelled_request(self.fence.request_id, generation=self.fence.generation)
 
 
 @dataclass
@@ -120,6 +153,12 @@ class AgentStreamTap:
         with bind_execution_custody_snapshot(producer[1]):
             pass
         return producer[1]
+
+    def own_response(self, delivery_id: str, owner, stream):
+        """Retain the SAME live generation; never create a replacement turn."""
+        producer = self.producer_custody(delivery_id, owner)
+        fence = self._requests.get(delivery_id)
+        return stream if fence is None else _TapResponseOwner(stream, fence, producer)
 
     def capture_request_privacy(self, owner, request_id: str, generation: int | None) -> None:
         """The ACTUAL text lock owner transfers only its matching delivery span."""

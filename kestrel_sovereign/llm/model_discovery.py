@@ -19,6 +19,7 @@ from kestrel_sovereign.execution_custody import (
     await_execution_work_group,
     execution_work_operation,
     is_execution_control_error,
+    execution_cleanup_debts,
     owned_native_http_client,
     require_execution_work,
 )
@@ -134,7 +135,7 @@ def _resolve_deployment_embedding_dim() -> Optional[int]:
         dim = resolve_embedding_dim()
         return int(dim) if dim else None
     except Exception as execution_error:  # pragma: no cover - defensive
-        if is_execution_control_error(execution_error):
+        if is_execution_control_error(execution_error) or execution_cleanup_debts(execution_error):
             raise
         return None
 
@@ -759,11 +760,11 @@ class ModelDiscoveryMixin:
                 logger.info("%s: no embedding models discovered", route_name)
             return models or []
         except NotImplementedError as execution_error:
-            if is_execution_control_error(execution_error):
+            if is_execution_control_error(execution_error) or execution_cleanup_debts(execution_error):
                 raise
             return []
         except Exception as e:
-            if is_execution_control_error(e):
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
                 raise
             if self._route_claims_embedding_support(route):
                 logger.error(
@@ -1076,7 +1077,7 @@ class ModelDiscoveryMixin:
         try:
             discovered = await self.discover_embedding_models(use_cache=use_cache)
         except Exception as e:  # pragma: no cover - never break init on discovery
-            if is_execution_control_error(e):
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
                 raise
             logger.debug("embedding capability reconcile skipped: %s", e)
             return
@@ -1116,7 +1117,7 @@ class ModelDiscoveryMixin:
                     deployment_dim=deployment_dim,
                 )
             except Exception as exc:  # pragma: no cover - never break init
-                if is_execution_control_error(exc):
+                if is_execution_control_error(exc) or execution_cleanup_debts(exc):
                     raise
                 logger.debug(
                     "embedding capability resolve skipped for %s: %s",
@@ -1210,7 +1211,7 @@ class ModelDiscoveryMixin:
                 result = await result
             return result or None
         except Exception as exc:  # pragma: no cover - never break reconcile
-            if is_execution_control_error(exc):
+            if is_execution_control_error(exc) or execution_cleanup_debts(exc):
                 raise
             logger.debug("corpus embedding profile lookup failed: %s", exc)
             return None
@@ -1381,7 +1382,7 @@ class ModelDiscoveryMixin:
             try:
                 models.extend(await self._discover_for_vendor_route(vendor, route))
             except Exception as exc:  # pragma: no cover - defensive
-                if is_execution_control_error(exc):
+                if is_execution_control_error(exc) or execution_cleanup_debts(exc):
                     raise
                 logger.warning(
                     "Local-only discovery failed for %s: %s", route.get("name"), exc
@@ -1462,7 +1463,7 @@ class ModelDiscoveryMixin:
         try:
             from .codex_adapter import CodexAdapter
         except Exception as execution_error:  # pragma: no cover - import-safety
-            if is_execution_control_error(execution_error):
+            if is_execution_control_error(execution_error) or execution_cleanup_debts(execution_error):
                 raise
             return
         for provider in self.providers:
@@ -1498,11 +1499,11 @@ class ModelDiscoveryMixin:
             try:
                 models = await await_execution_work(self, lambda: adapter.list_models())
             except NotImplementedError as execution_error:
-                if is_execution_control_error(execution_error):
+                if is_execution_control_error(execution_error) or execution_cleanup_debts(execution_error):
                     raise
                 continue
             except Exception as e:  # pragma: no cover - defensive
-                if is_execution_control_error(e):
+                if is_execution_control_error(e) or execution_cleanup_debts(e):
                     raise
                 logger.warning("route %s: catalog build failed: %s", route_key, e)
                 models = []
@@ -1535,7 +1536,7 @@ class ModelDiscoveryMixin:
             try:
                 asyncio.run(self._build_route_catalogs())
             except Exception as e:  # pragma: no cover - defensive
-                if is_execution_control_error(e):
+                if is_execution_control_error(e) or execution_cleanup_debts(e):
                     raise
                 logger.debug("sync route-catalog build skipped: %s", e)
                 self._route_catalogs = {}
@@ -1565,7 +1566,7 @@ class ModelDiscoveryMixin:
                     require_execution_work(self)
                     self._route_catalogs = catalogs
             except Exception as e:  # pragma: no cover - defensive
-                if is_execution_control_error(e):
+                if is_execution_control_error(e) or execution_cleanup_debts(e):
                     raise
                 logger.debug("threaded route-catalog build skipped: %s", e)
                 self._route_catalogs = {
@@ -1754,7 +1755,7 @@ class ModelDiscoveryMixin:
         try:
             models = await coro
         except Exception as e:  # noqa: BLE001 - discovery must never break init
-            if is_execution_control_error(e):
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
                 raise
             logger.warning("%s: model discovery failed: %s", vendor, e)
             self._note_discovery_outcome(vendor, e)
@@ -1804,7 +1805,7 @@ class ModelDiscoveryMixin:
                 self._note_discovery_outcome(vendor, None)
                 return models
         except NotImplementedError as execution_error:
-            if is_execution_control_error(execution_error):
+            if is_execution_control_error(execution_error) or execution_cleanup_debts(execution_error):
                 raise
             # Not a failure: the adapter simply publishes no catalog, so no
             # request was issued and the pass records the vendor as not
@@ -1812,7 +1813,7 @@ class ModelDiscoveryMixin:
             # discovery as broken.
             logger.debug("%s: adapter.list_models not implemented", vendor)
         except Exception as e:
-            if is_execution_control_error(e):
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
                 raise
             logger.warning("%s: model discovery failed: %s", vendor, e)
             self._note_discovery_outcome(vendor, e)
@@ -1868,7 +1869,7 @@ class ModelDiscoveryMixin:
             )
             return results
         except Exception as e:
-            if is_execution_control_error(e):
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
                 raise
             # Raise rather than return [] (#3190): an empty list is also what a
             # server with no models returns, and the caller cannot tell those
@@ -1931,7 +1932,7 @@ class ModelDiscoveryMixin:
             logger.info(f"{provider_name}: discovered {len(results)} models from {models_url}")
             return results
         except Exception as e:
-            if is_execution_control_error(e):
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
                 raise
             # See _discover_local_openai_compatible: failure must be
             # distinguishable from "serves nothing" (#3190).
@@ -1973,7 +1974,7 @@ class ModelDiscoveryMixin:
                             logger.info(f"Detected context window {ctx} from {endpoint}")
                             return int(ctx)
             except Exception as execution_error:
-                if is_execution_control_error(execution_error):
+                if is_execution_control_error(execution_error) or execution_cleanup_debts(execution_error):
                     raise
                 continue
         return None

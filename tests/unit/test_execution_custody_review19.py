@@ -23,12 +23,11 @@ async def test_cancelled_renewal_closer_joins_late_original_control(control, car
     async def renew(**kwargs):
         owned.append(asyncio.current_task())
         entered.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            draining.set()
-            await release.wait()
-            raise original
+        # The original native ACK is pending already. Cooperative teardown
+        # joins it without cancelling native work to initiate this fixture.
+        draining.set()
+        await release.wait()
+        raise original
 
     dispatcher = SignalDispatcher.__new__(SignalDispatcher)
     dispatcher.renew_durable_delivery_lease = renew

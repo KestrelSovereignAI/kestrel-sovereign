@@ -4195,7 +4195,7 @@ async def test_scheduler_revokes_context_for_detached_core_child_before_late_iso
             return True
 
         async def _renew_lease(self, task):
-            await asyncio.Future()
+            await asyncio.current_task()._kestrel_renewal_state.stop_requested.wait()
 
         async def _finalize(self, *args, **kwargs):
             return None

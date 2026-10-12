@@ -110,18 +110,49 @@ def execution_cleanup_debts(error: BaseException | None) -> tuple:
     return tuple(debts)
 
 
+def execution_denial_scopes(error: BaseException | None) -> tuple | None:
+    """Exact denial provenance, or None for unscoped/irreversible control.
+
+    Consumers may distinguish a retired occurrence from their runtime only
+    when EVERY explicit authority carrier has original typed scope evidence.
+    """
+    scopes = []
+    for carrier in _explicit_control_chain(error):
+        if isinstance(carrier, ExecutionCommitOutcomeError):
+            return None
+        if isinstance(carrier, ExecutionAuthorityError):
+            if vars(carrier).get("_kestrel_unscoped_execution_denial"):
+                return None
+            denied = vars(carrier).get("_kestrel_denied_execution_scopes")
+            if not denied:
+                return None
+            scopes.extend(scope for scope in denied if scope not in scopes)
+    return tuple(scopes) if scopes else None
+
+
 def execution_terminal_error(*errors: BaseException | None) -> BaseException | None:
     """Keep irreversible control evidence ahead of cancellation/cleanup noise."""
     import asyncio
     present = tuple(error for error in errors if error is not None)
     def retain(selected):
         debts = []
+        denied_scopes = []
+        unscoped_denial = False
         for error in present:
             for debt in execution_cleanup_debts(error):
                 if not any(debt[0] is prior[0] and debt[1] is prior[1] for prior in debts):
                     debts.append(debt)
+            for carrier in _explicit_control_chain(error):
+                if isinstance(carrier, ExecutionAuthorityError):
+                    denied = vars(carrier).get("_kestrel_denied_execution_scopes", ())
+                    unscoped_denial |= not denied or bool(vars(carrier).get("_kestrel_unscoped_execution_denial"))
+                    denied_scopes.extend(scope for scope in denied if scope not in denied_scopes)
         if debts:
             selected._kestrel_native_retirement_debts = tuple(debts)
+        if denied_scopes:
+            selected._kestrel_denied_execution_scopes = tuple(denied_scopes)
+        if unscoped_denial:
+            selected._kestrel_unscoped_execution_denial = True
         return selected
     for outcome in ("unknown", "committed"):
         for error in present:
@@ -233,14 +264,17 @@ class ExecutionCustody:
             self._denial = reason or "execution authority revoked"
 
     def require_work(self) -> None:
-        if self._uncertain_commit is not None:
-            raise ExecutionCommitOutcomeError(self._uncertain_commit)
-        if self._denial is not None:
-            raise ExecutionAuthorityError(self._denial)
         try:
+            if self._uncertain_commit is not None:
+                raise ExecutionCommitOutcomeError(self._uncertain_commit)
+            if self._denial is not None:
+                raise ExecutionAuthorityError(self._denial)
             self.fence.require_work()
         except ExecutionAuthorityError as error:
             self.revoke(str(error))
+            scopes = vars(error).get("_kestrel_denied_execution_scopes", ())
+            if self not in scopes:
+                error._kestrel_denied_execution_scopes = (*scopes, self)
             raise
 
 
@@ -503,17 +537,34 @@ async def await_execution_work(
     a recoverable route failure; a successful provider cannot disclose a result
     after loss. This does not recall an already submitted remote operation.
     """
+    validators = _NATIVE_ADMISSION_VALIDATORS.get()
+    def retain_retirement(error):
+        hook = getattr(type(owner), "_retain_native_execution_retirement", None)
+        if execution_cleanup_debts(error) and callable(hook):
+            hook(owner, error)
     with bind_execution_runtime(owner):
         try:
             result = await operation()
-        except ExecutionAuthorityError:
+        except (ExecutionAuthorityError, asyncio.CancelledError) as error:
+            retain_retirement(error)
             raise
         except Exception as error:
+            retain_retirement(error)
             if is_execution_control_error(error):
                 raise
-            require_execution_work(owner)
+            try:
+                require_execution_work(owner)
+            except BaseException as denial:
+                # Failed physical retirement is not superseded by later
+                # revocation. Retain its native owner/debt on the denial too.
+                raise execution_terminal_error(error, denial)
             raise
         try:
+            require_execution_work(owner)
+            # Dispatch admission is not permission to publish credentials or
+            # other results after the original constitutional gate changes.
+            for validator in validators:
+                await validator()
             require_execution_work(owner)
         except BaseException as denial:
             # A successful OPEN may already own an HTTP response. Admission
@@ -525,7 +576,9 @@ async def await_execution_work(
                 with bind_execution_cleanup(owner):
                     close = asyncio.create_task(acquired_result_cleanup(result))
                     outcome = await await_owned_task(close)
-                raise execution_terminal_error(denial, outcome.error, outcome.cancellation)
+                terminal = execution_terminal_error(denial, outcome.error, outcome.cancellation)
+                retain_retirement(terminal)
+                raise terminal
             raise
         return result
 
@@ -818,6 +871,7 @@ async def await_execution_work_group(
                 isinstance(error, Exception)
                 and return_exceptions
                 and not is_execution_control_error(error)
+                and not execution_cleanup_debts(error)
             ):
                 return error
             # asyncio.gather reads a cancelled child's exception before its

@@ -22,6 +22,7 @@ import logging
 from kestrel_sovereign.execution_custody import (
     owned_native_http_client,
     owned_execution_stream, retain_native_execution_http_client_close, is_execution_control_error,
+    execution_cleanup_debts,
 )
 from dataclasses import replace
 import httpx
@@ -413,12 +414,12 @@ class OpenRouterAdapter(OpenAIAdapter):
             return models
 
         except httpx.HTTPError as e:
-            if is_execution_control_error(e):
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
                 raise
             logger.warning(f"OpenRouter HTTP error during model discovery: {e}")
             return []
         except Exception as e:
-            if is_execution_control_error(e):
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
                 raise
             logger.warning(f"OpenRouter model discovery failed: {e}")
             return []

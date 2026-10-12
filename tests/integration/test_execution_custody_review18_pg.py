@@ -139,10 +139,10 @@ async def test_native_renewal_control_survives_cooperative_or_retained_cognition
         await entered.wait()
         if late_commit:
             renewing.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                pass
+            # Teardown now cooperatively stops renewal; this injected control
+            # is delivered at that original stop boundary, not by cancelling
+            # a fake never-ending database operation.
+            await asyncio.current_task()._kestrel_renewal_stop.wait()
         scope.revoke("renewal original authority lost")
         raise error
 

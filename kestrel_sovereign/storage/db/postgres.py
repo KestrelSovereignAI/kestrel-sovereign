@@ -1529,6 +1529,7 @@ class PostgresBackend(DatabaseBackend):
             wrapper._entered_ephemeral_at = watermark
             wrapper._session_conversations = []
             wrapper._session_files = {}
+            wrapper._session_file_metadata = {}
         return report
 
     async def retain_cognition_cleanup_owner(self, *, agent_id: str, owner_id: str) -> bool:

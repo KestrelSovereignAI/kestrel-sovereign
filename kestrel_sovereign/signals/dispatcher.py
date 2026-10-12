@@ -866,6 +866,7 @@ class SignalDispatcher:
         self._retained_durable_cognition_tasks: set[asyncio.Task[SignalResult]] = set()
         self._retained_durable_cognition_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._retained_cognition_control_debt: dict[str, tuple[DurableDelivery, BaseException]] = {}
+        self._cognition_control_terminal_owners: dict[tuple[str, ...], asyncio.Task[None]] = {}
         # Channel ingress ACKs after its selected delivery is durable, not
         # after cognition completes.  These owners make that promise useful
         # after the provider has advanced its cursor: every restarted
@@ -3676,6 +3677,7 @@ class SignalDispatcher:
             return
 
         async def renew() -> None:
+            asyncio.current_task()._kestrel_renewal_stop = stop
             try:
                 expires_at = delivery.lease_expires_at
                 while not stop.is_set():
@@ -3747,9 +3749,8 @@ class SignalDispatcher:
             from kestrel_sovereign._async_ownership import await_owned_task
 
             stop.set()
-            if not task.done():
-                task.cancel()
-            # Cancelling the closer cannot abandon a renewal's native commit.
+            # Wake the interval only. Never inject cancellation into an
+            # in-flight renewal COMMIT or its native pool-release ACK.
             # Harvest its original control evidence only after it is terminal.
             outcome = await await_owned_task(task)
             child_error = outcome.error
@@ -5243,15 +5244,26 @@ class SignalDispatcher:
         self, delivery: DurableDelivery, error: BaseException,
     ) -> None:
         """Keep irreversible control evidence non-retryable and non-ACKable."""
-        from kestrel_sovereign._async_ownership import await_owned_task
+        from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
         from kestrel_sovereign.execution_custody import execution_terminal_error
 
         self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, error)
         self._rearm_cleanup_runtime_owner_heartbeat()
-        task = asyncio.create_task(
-            self._apply_cognition_control_terminal(delivery, error),
-            name=f"durable_cognition_control_terminal:{delivery.delivery_id}",
-        )
+        key = (self._agent.did, delivery.consumer_id, delivery.delivery_id,
+            self._durable_delivery_owner, delivery.lease_token or "")
+        owners = vars(self).setdefault("_cognition_control_terminal_owners", {})
+        task = owners.get(key)
+        if task is None or (task.done() and owned_task_error(task) is not None):
+            # Concurrent retention callbacks and shutdown join the SAME native
+            # terminalizer. Its successful original-token receipt survives a
+            # later callback; the cleared CAS cannot manufacture new debt.
+            # A failed metadata attempt keeps the existing bounded exact-token
+            # reconciliation policy, never a replacement owner or work grant.
+            task = asyncio.create_task(
+                self._apply_cognition_control_terminal(delivery, error),
+                name=f"durable_cognition_control_terminal:{delivery.delivery_id}",
+            )
+            owners[key] = task
         outcome = await await_owned_task(task)
         # Caller cancellation is not a failed receipt. The owned child has
         # been joined, so clear confirmed settlement before propagating it;

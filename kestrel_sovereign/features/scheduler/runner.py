@@ -40,7 +40,9 @@ from typing import (
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
+    create_owned_task,
     owned_task_error,
+    raise_owned_outcome,
     run_blocking_operation,
 )
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
@@ -497,6 +499,10 @@ class _SchedulerExecutionScope:
         self.occurrence_task = None
 
 
+class _SchedulerEffectFence(AdvisoryExecutionFence):
+    """Typed occurrence lease, distinct from a resident runtime advisory lease."""
+
+
 @dataclass
 class _LeaseRenewalState:
     """Shared fail-closed state for an owned claim-renewal task.
@@ -508,6 +514,8 @@ class _LeaseRenewalState:
     """
 
     lost: asyncio.Event = field(default_factory=asyncio.Event)
+    stop_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    stop_owner: Optional[Callable[[], Awaitable[None]]] = None
     error: Optional[BaseException] = None
     custody: tuple = ()
     confirmed_deadline: float | None = None
@@ -2501,7 +2509,7 @@ class SchedulerRunner:
 
         async with advisory_locks(keys, shared=shared, on_loss=on_loss if keys else None) as lease:
             if shared and lease is not None:
-                with bind_execution_custody(AdvisoryExecutionFence(
+                with bind_execution_custody(_SchedulerEffectFence(
                     lease, owner_live=(
                         renewal_state.is_live
                         if renewal_state is not None else None
@@ -2509,7 +2517,10 @@ class SchedulerRunner:
                 )):
                     if renewal_state is not None:
                         renewal_state.custody = current_execution_custody()
-                    yield
+                    try:
+                        yield
+                    finally:
+                        await self._join_renewal_before_exclusion_retirement()
             else:
                 yield
 
@@ -2651,14 +2662,27 @@ class SchedulerRunner:
             # executor. The advisory gate has the same protocol linearization
             # role while allowing lease renewal and ordinary tool writes.
             async with self._sqlite_rollout_gate(task.agent_id, shared=True):
-                async with self._transaction():
-                    admitted = await self._lock_active_rollout_control(task.agent_id)
+                admitted = await self._settled_dispatch_admission(task.agent_id)
                 yield admitted
             return
         async with self._postgres_rollout_effect_gate(task.agent_id):
-            async with self._transaction():
-                admitted = await self._lock_active_rollout_control(task.agent_id)
+            admitted = await self._settled_dispatch_admission(task.agent_id)
             yield admitted
+
+    async def _settled_dispatch_admission(self, agent_id: str) -> bool:
+        """Join the original admission mutation before Stop can leave its gate.
+
+        The caller still owns the effect advisory lease. Its cancellation must
+        not interrupt the short transaction's native COMMIT acknowledgement,
+        nor allow an effect after that acknowledgement. Genuine native commit
+        failures retain their original outcome through the owned-task helper.
+        """
+        async def record_admission():
+            async with self._transaction():
+                return await self._lock_active_rollout_control(agent_id)
+
+        outcome = await await_owned_task(create_owned_task(record_admission()))
+        return raise_owned_outcome(outcome, operation="scheduler dispatch admission")
 
     async def _lock_claim_execution_log(
         self, execution_id: str, task: ScheduledTask
@@ -3386,6 +3410,7 @@ class SchedulerRunner:
                 self._monitor_lease_renewal(task, renewal_state),
                 name=f"scheduler-lease:{execution.id}",
             )
+            renewal_state.stop_owner = lambda: self._stop_renewal(renewal, task, execution)
         except BaseException:
             if deadline_watch is not None:
                 deadline_watch.cancel()
@@ -3721,7 +3746,10 @@ class SchedulerRunner:
             async def dispatch() -> Any:
                 return await self._run_executor(execution)
 
-            yield dispatch
+            try:
+                yield dispatch
+            finally:
+                await self._join_renewal_before_exclusion_retirement()
             return
 
         context = prepare(execution)
@@ -3739,13 +3767,31 @@ class SchedulerRunner:
                 raise TypeError(
                     "prepare_scheduled must yield an async dispatch callable"
                 )
-            yield dispatch
+            try:
+                yield dispatch
+            finally:
+                await self._join_renewal_before_exclusion_retirement()
+
+    async def _join_renewal_before_exclusion_retirement(self) -> None:
+        """Original native renewal must settle before any enclosing lease exits."""
+        state = _rollout_renewal_state.get()
+        if state is not None and state.stop_owner is not None:
+            primary = sys.exception()
+            try:
+                await state.stop_owner()
+            except BaseException as cleanup:
+                raise execution_terminal_error(primary, cleanup)
+            finally:
+                # The original task is physically settled before this helper
+                # returns/raises. Detached denied children need its receipt,
+                # not a closure retaining the whole scheduler/parent graph.
+                state.stop_owner = None
 
     async def _monitor_lease_renewal(
         self, task: ScheduledTask, state: _LeaseRenewalState
     ) -> None:
         """Run a renewal worker and make any terminal outcome fail closed."""
-
+        asyncio.current_task()._kestrel_renewal_state = state
         try:
             await self._renew_lease(task)
         except asyncio.CancelledError:
@@ -3756,7 +3802,8 @@ class SchedulerRunner:
         else:
             # The renewal loop has no successful terminal state. A normal
             # return means the exact claim or live authority was lost.
-            state.mark_lost()
+            if not state.stop_requested.is_set():
+                state.mark_lost()
         finally:
             self._forget_live_claim(task)
 
@@ -3987,9 +4034,17 @@ class SchedulerRunner:
         task: ScheduledTask,
         execution: SchedulerExecution,
     ) -> None:
-        """Cancel and join the owned renewal task despite caller cancellation."""
+        """Stop its interval; join the original native renewal acknowledgement."""
 
-        renewal.cancel()
+        state = getattr(renewal, "_kestrel_renewal_state", None)
+        if state is None:
+            # A not-yet-started monitor still owns the state copied at birth.
+            state = _rollout_renewal_state.get()
+        if state is not None:
+            state.stop_requested.set()
+        else:
+            # Legacy external/test renewers have no native owned monitor.
+            renewal.cancel()
         outcome = await await_owned_task(renewal)
         terminal = execution_terminal_error(outcome.error, outcome.cancellation)
         if terminal is not None and is_execution_control_error(terminal):
@@ -4020,8 +4075,16 @@ class SchedulerRunner:
         # fractional configuration in a future release.
         interval = min(self._lease_seconds / 3, self._lease_seconds - 0.001)
         interval = max(0.001, interval)
+        state = getattr(asyncio.current_task(), "_kestrel_renewal_state", None)
         while True:
-            await asyncio.sleep(interval)
+            if state is None:
+                await asyncio.sleep(interval)
+            else:
+                try:
+                    await asyncio.wait_for(state.stop_requested.wait(), timeout=interval)
+                    return
+                except asyncio.TimeoutError:
+                    pass
             if not await self._renew_live_claim_once(task):
                 logger.warning("Lost scheduler lease for task %s execution %s", task.id, task.claim_execution_id)
                 return

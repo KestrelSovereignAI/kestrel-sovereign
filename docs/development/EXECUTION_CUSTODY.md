@@ -33,6 +33,24 @@ same opaque ID. Waiting for tapped text holds no privacy mutex; each native
 synthesis validates original producer custody and fresh privacy policy. Direct
 realtime cognition admission reads durable constitutional restrictions and the
 completed hash-bound governance receipt before minting a session.
+Captured constitutional validators are repeated before result/credential
+publication as well as native dispatch. A tapped HTTP response retains the
+same request generation through every outer forwarding layer's EOF and close.
+Later revocation cannot replace an original failed native closer's debt with
+an unowned denial.
+
+Scheduler admission owns its original short database mutation through the
+native COMMIT acknowledgement. Stop is reported after that owner settles and
+before any scheduled effect begins; genuine commit uncertainty is preserved.
+`execution_denial_scopes(error)` reports exact original scope provenance only
+when all explicit authority carriers are scoped and none carries commit
+uncertainty. Combining runtime and occurrence denials retains both scopes;
+an unscoped authority error is never reclassified as occurrence-only retirement.
+Renewal teardown cooperatively stops the interval and physically joins its
+in-flight native transaction before releasing the original advisory exclusion.
+Concurrent cognition terminalization callbacks share one exact original-token
+owner; its successful receipt prevents a late callback from manufacturing debt
+by repeating a CAS against a token already cleared by that same owner.
 
 `PostgresBackend.advisory_locks(..., on_loss=callback)` yields an exact-session
 `AdvisoryLease` (or `None` for an empty, unobserved exclusion set). Registering

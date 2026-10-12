@@ -13554,6 +13554,16 @@ class ProxyFeature(Feature):
                             validated_console_path, setting=hosted_immutable_setting,
                         )
                     )))
+                    # Acceptance can discover an intermediate console symlink
+                    # in an owned mutable namespace after constructor custody.
+                    # Persist its restrictive marker before publishing launch.
+                    retain_host_launch_artifact_custody(
+                        self._isolated_runtime_scope,
+                        _agent_runtime_owner(self.agent) if self._isolated_runtime_scope is not None else None,
+                        self._released_legacy_runtime_root,
+                        (*self._validated_hosted_immutable_venv_custody_paths,
+                         *self._validated_hosted_immutable_bin_custody_paths),
+                    )
                     self._verify_launch_artifact(
                         validated_console_path=validated_console_path,
                     )
