@@ -178,6 +178,35 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
   }
 }
 
+test('native WebRTC buffered old input commit cannot reopen pre-ID cancellation', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page }) => {
+    await page.evaluate(() => {
+      window.client.cancelResponse();
+      for (const payload of [
+        { type: 'input_audio_buffer.committed', item_id: 'old-buffer' },
+        { type: 'response.created', response: { id: 'late-old' } },
+        { type: 'response.function_call_arguments.done', response_id: 'late-old', call_id: 'old-call', name: 'offline', arguments: '{}' },
+        { type: 'response.done', response: { id: 'late-old', status: 'completed' } },
+        { type: 'conversation.item.input_audio_transcription.completed', item_id: 'barrier-old', transcript: 'input barrier' },
+      ]) window.nativeChannel.send(JSON.stringify(payload));
+    });
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.item_id === 'barrier-old'));
+    assert.equal(await page.evaluate(() => window.nativeEvents.filter(event => event.kind === 'tool_call_batch_requested').length), 0);
+    assert.equal(await page.evaluate(() => window.nativeEvents.filter(event => event.kind === 'speaking_started').length), 0);
+    await page.evaluate(() => {
+      for (const payload of [
+        { type: 'input_audio_buffer.cleared' },
+        { type: 'input_audio_buffer.committed', item_id: 'fresh-buffer' },
+        { type: 'response.created', response: { id: 'fresh-response' } },
+        { type: 'response.function_call_arguments.done', response_id: 'fresh-response', call_id: 'fresh-call', name: 'offline', arguments: '{}' },
+        { type: 'response.done', response: { id: 'fresh-response', status: 'completed' } },
+      ]) window.nativeChannel.send(JSON.stringify(payload));
+    });
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.kind === 'tool_call_batch_requested'));
+    assert.deepEqual(await page.evaluate(() => window.nativeEvents.filter(event => event.kind === 'tool_call_batch_requested').map(event => event.batch_id)), ['fresh-response']);
+  }, '{"persisted":true,"status":"ok"}');
+});
+
 test('native websocket barge-in fences playback continuation and late publication', { timeout: 30000 }, async () => {
   await nativeVoice(async ({ page, sendRealtime, realtimeMessages }) => {
     await page.evaluate(async () => {

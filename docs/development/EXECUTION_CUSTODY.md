@@ -756,3 +756,15 @@ Runtime-owner heartbeat teardown joins its original native SQL operation rather
 than cancelling a possibly submitted COMMIT. An ordinary failed native closer is
 retained background retirement debt even without a commit/authority exception;
 successful physical close plus caller cancellation remains cancellation alone.
+
+Browser realtime cancellation closes response admission even before a response
+ID is known. A buffered pre-cancellation input commit cannot reopen it: new audio
+requires the original ordered input-buffer-clear acknowledgement followed by a
+fresh commit. Late response IDs and tool arguments remain cancelled; user input
+transcripts remain independently deliverable.
+
+Scheduler telemetry observation remains bounded, but retiring its observer joins
+each already-accepted native SQL write through its original COMMIT acknowledgement.
+Cancellation stops publication between statements; it does not manufacture an
+unknown transaction outcome by interrupting a healthy COMMIT. Genuine native
+unknown/committed receipts still fence readiness and remain available at shutdown.

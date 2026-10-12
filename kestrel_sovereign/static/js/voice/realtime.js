@@ -234,6 +234,8 @@ export async function createRealtimeClient({
   let activeResponseId = '';
   let responseGeneration = 0;
   let responseAdmissionOpen = true;
+  const pendingInputClears = [];
+  let freshInputGeneration = null;
   const userTranscriptTracker = createUserTranscriptTracker();
   let earlyAudioChunks = [];
   let earlyAudioBytes = 0;
@@ -406,8 +408,15 @@ export async function createRealtimeClient({
         onEvent(makeEvent(Events.LISTENING_STOPPED, {}));
         break;
       case 'input_audio_buffer.committed':
-        responseAdmissionOpen = true;
+        // An old buffered commit can arrive after cancellation but before
+        // the ordered clear acknowledgement. It cannot authorize output.
+        if (freshInputGeneration === responseGeneration) responseAdmissionOpen = true;
         userTranscriptTracker.committed(raw.item_id ?? '');
+        break;
+      case 'input_audio_buffer.cleared':
+        if (pendingInputClears.length && pendingInputClears.shift() === responseGeneration) {
+          freshInputGeneration = responseGeneration;
+        }
         break;
 
       case 'conversation.item.input_audio_transcription.delta': {
@@ -486,7 +495,7 @@ export async function createRealtimeClient({
         { const responseId = raw.response?.id ?? raw.response_id;
         const calls = pendingToolCalls.get(responseId) || [];
         pendingToolCalls.delete(responseId);
-        if (calls.length && responseAllowsToolDispatch(raw) && !cancelledResponses.has(responseId)) {
+        if (responseAdmissionOpen && calls.length && responseAllowsToolDispatch(raw) && !cancelledResponses.has(responseId)) {
           onEvent(makeEvent(Events.TOOL_CALL_BATCH_REQUESTED, {
             batch_id: responseId,
             response_generation: responseGeneration,
@@ -499,7 +508,7 @@ export async function createRealtimeClient({
 
       case 'response.function_call_arguments.done': {
         const responseId = raw.response_id;
-        if (!responseId || cancelledResponses.has(responseId)) break;
+        if (!responseAdmissionOpen || !responseId || cancelledResponses.has(responseId)) break;
         if (!activeResponseId) activeResponseId = responseId;
         let args = {};
         try {
@@ -762,6 +771,9 @@ export async function createRealtimeClient({
   function abandonResponse() {
     responseAdmissionOpen = false;
     responseGeneration += 1;
+    freshInputGeneration = null;
+    pendingInputClears.push(responseGeneration);
+    sendJSON({ type: 'input_audio_buffer.clear' });
     if (activeResponseId) cancelledResponses.add(activeResponseId);
     for (const id of pendingToolCalls.keys()) cancelledResponses.add(id);
     pendingToolCalls.clear();

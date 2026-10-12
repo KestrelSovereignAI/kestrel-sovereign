@@ -12,6 +12,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Collection, Dict, Optional
 
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, raise_owned_outcome
+
 from kestrel_sovereign.features.scheduler.constants import (
     ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
     SCHEDULER_SAFETY_DISABLEMENT_REASONS,
@@ -567,6 +569,17 @@ def scheduler_status_parameters(feature: Any) -> Dict[str, Any]:
     }
 
 
+async def _write_runtime_status(operation):
+    """Join one accepted native SQL write before propagating observer Stop.
+
+    Observer deadlines can retire work between SQL statements. They cannot
+    cancel a submitted COMMIT and turn a healthy acknowledgement into unknown.
+    The original publisher remains the physical owner of this finite write.
+    """
+    outcome = await await_owned_task(create_owned_task(operation()))
+    return raise_owned_outcome(outcome, operation="native scheduler status write")
+
+
 async def emit_runtime_status(
     db: Any,
     *,
@@ -597,11 +610,11 @@ async def emit_runtime_status(
     # stopped runner can no longer reap its own rows, and a revoked tenant no
     # longer appears in another runner's live authority scope. Expiry is safe
     # to enforce from any publisher because fresh peer reports are untouched.
-    await db.execute(
+    await _write_runtime_status(lambda: db.execute(
         f"DELETE FROM {RUNTIME_STATUS_TABLE} "
         "WHERE reported_at < ?",
         (retention_cutoff,),
-    )
+    ))
     # A live runner owns only the rows bearing its opaque lifetime UUID. Drop
     # rows for DIDs that disappeared from its current authority snapshot while
     # preserving every other runner's view of the same tenants. This also runs
@@ -609,16 +622,16 @@ async def emit_runtime_status(
     # bounded instead of waiting for the retention horizon.
     if complete_authority_snapshot and normalized_ids:
         placeholders = ", ".join("?" for _ in normalized_ids)
-        await db.execute(
+        await _write_runtime_status(lambda: db.execute(
             f"DELETE FROM {RUNTIME_STATUS_TABLE} "
             f"WHERE owner_id = ? AND agent_id NOT IN ({placeholders})",
             (owner_id, *normalized_ids),
-        )
+        ))
     elif complete_authority_snapshot:
-        await db.execute(
+        await _write_runtime_status(lambda: db.execute(
             f"DELETE FROM {RUNTIME_STATUS_TABLE} WHERE owner_id = ?",
             (owner_id,),
-        )
+        ))
         return
     elif not normalized_ids:
         return
@@ -668,7 +681,7 @@ async def emit_runtime_status(
             inventory["fenced_count"],
             inventory["system_disabled_count"],
         ))
-    await db.execute_many(upsert_sql, params_list)
+    await _write_runtime_status(lambda: db.execute_many(upsert_sql, params_list))
 
 
 async def mark_runtime_owner_stopped(
@@ -688,7 +701,7 @@ async def mark_runtime_owner_stopped(
     memory and parameter scope; rows never visited by this owner do not exist.
     """
 
-    await db.execute(
+    await _write_runtime_status(lambda: db.execute(
         f"""
         UPDATE {RUNTIME_STATUS_TABLE}
         SET worker_state = 'stopped',
@@ -705,7 +718,7 @@ async def mark_runtime_owner_stopped(
             last_error_type,
             owner_id,
         ),
-    )
+    ))
 
 
 async def scheduler_status(
