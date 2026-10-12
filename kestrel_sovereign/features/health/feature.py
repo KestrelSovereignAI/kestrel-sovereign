@@ -132,15 +132,14 @@ class HealthFeature(Feature):
         )
         errors.extend((loop_outcome.error, loop_outcome.cancellation))
 
-        # A timed-out health persistence wait remains live so it cannot install
-        # a global SQLite cancellation fence. Teardown still owns that work:
-        # cancel and reap it before the feature/database lifecycle continues.
+        # Stop future ticks first, then join finite writes without forwarding
+        # cancellation into native COMMIT. Feature disable leaves the agent
+        # live; interrupting an accepted acknowledgement would manufacture
+        # unknown commit authority on that shared runtime. Caller cancellation
+        # is propagated only after the original write physically settles.
         pending_persists = [
             task for task in getattr(self, "_health_persist_tasks", set())
         ]
-        for task in pending_persists:
-            if not task.done():
-                task.cancel()
         for task in pending_persists:
             outcome = await await_owned_task(task)
             self._harvest_health_persistence(task)

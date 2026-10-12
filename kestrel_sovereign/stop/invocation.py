@@ -22,6 +22,7 @@ from uuid import uuid4
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
+    create_owned_task,
     owned_task_error,
     raise_owned_outcome,
 )
@@ -789,6 +790,17 @@ class DistributedInvocationStore:
         owner_id = _required_identity(owner_id, "owner identity")
         if lease_seconds <= 0:
             raise ValueError("distributed Stop owner lease must be positive")
+        # The relay is cancellable between polls, not inside an accepted
+        # renewal's native COMMIT acknowledgement. Retain this finite original
+        # transaction until physical settlement, then propagate caller Stop.
+        task = create_owned_task(
+            self._poll_owner_transaction(owner_id, lease_seconds=lease_seconds),
+            name=f"distributed-stop-owner-poll:{owner_id}",
+        )
+        return raise_owned_outcome(await await_owned_task(task),
+            operation="distributed Stop owner renewal")
+
+    async def _poll_owner_transaction(self, owner_id: str, *, lease_seconds: float) -> _OwnerPoll:
         async with self._db.transaction(immediate=True):
             now_sql = database_now_sql(self._db)
             cutoff_sql, cutoff_args = database_lease_cutoff_sql(

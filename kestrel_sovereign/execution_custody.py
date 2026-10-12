@@ -269,6 +269,13 @@ class ExecutionCustody:
         if self._denial is None:
             self._denial = reason or "execution authority revoked"
 
+    def _retain_denial(self, error: ExecutionAuthorityError) -> None:
+        """Keep original scope provenance at both pure and native gates."""
+        self.revoke(str(error))
+        scopes = vars(error).get("_kestrel_denied_execution_scopes", ())
+        if self not in scopes:
+            error._kestrel_denied_execution_scopes = (*scopes, self)
+
     def require_work(self) -> None:
         try:
             if self._uncertain_commit is not None:
@@ -277,10 +284,7 @@ class ExecutionCustody:
                 raise ExecutionAuthorityError(self._denial)
             self.fence.require_work()
         except ExecutionAuthorityError as error:
-            self.revoke(str(error))
-            scopes = vars(error).get("_kestrel_denied_execution_scopes", ())
-            if self not in scopes:
-                error._kestrel_denied_execution_scopes = (*scopes, self)
+            self._retain_denial(error)
             raise
 
 
@@ -465,7 +469,7 @@ async def lock_execution_authority(
         try:
             await scope.fence.lock_and_validate(connection)
         except ExecutionAuthorityError as error:
-            scope.revoke(str(error))
+            scope._retain_denial(error)
             raise
         # Cancellation-resistant validators must not republish a lost scope.
         require_execution_backend(backend_type, captured)

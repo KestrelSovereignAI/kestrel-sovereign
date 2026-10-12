@@ -49,6 +49,8 @@ from kestrel_sovereign._async_ownership import (
     raise_owned_outcome,
 )
 from kestrel_sovereign.execution_custody import (
+    execution_cleanup_debts,
+    execution_denial_scopes,
     execution_terminal_error,
     is_execution_control_error,
     owned_native_http_client,
@@ -847,8 +849,16 @@ class CodexAppServerClient:
         if getattr(self, "_closing", False) or getattr(self, "_retiring", False):
             raise CodexAppServerConnectionClosed("codex app-server is retiring")
 
-    def _retain_request_failure(self, error: BaseException) -> None:
+    def _retain_request_failure(self, error: BaseException, *, caller_local: bool = False) -> None:
         if is_execution_control_error(error):
+            if (caller_local and execution_denial_scopes(error)
+                    and not execution_cleanup_debts(error)):
+                # Original typed callback refusal stays on its owning turn's
+                # bridge receipt. It does not authorize that turn to continue
+                # or imply failure of the shared native connection. Reader,
+                # lifecycle, unscoped, commit and native-close failures remain
+                # connection-wide control, never inferred from a thread ID.
+                return
             self._server_request_failure = execution_terminal_error(
                 getattr(self, "_server_request_failure", None), error,
             )
@@ -857,7 +867,8 @@ class CodexAppServerClient:
     def _server_request_done(self, task: asyncio.Task) -> None:
         error = owned_task_error(task)
         if error is not None:
-            self._retain_request_failure(error)
+            self._retain_request_failure(error,
+                caller_local=getattr(task, "_kestrel_codex_caller_handler", False))
         self._server_request_tasks.discard(task)
 
     async def _join_server_requests(self) -> None:
@@ -868,7 +879,8 @@ class CodexAppServerClient:
         for task in tasks:
             outcome = await await_owned_task(task)
             if outcome.error is not None:
-                self._retain_request_failure(outcome.error)
+                self._retain_request_failure(outcome.error,
+                    caller_local=getattr(task, "_kestrel_codex_caller_handler", False))
         failure = getattr(self, "_server_request_failure", None)
         if failure is not None:
             raise failure
@@ -1194,6 +1206,7 @@ class CodexAppServerClient:
                     handler_selected=True,
                 )
             )
+            task._kestrel_codex_caller_handler = handler is not None
             if not hasattr(self, "_server_request_tasks"):
                 self._server_request_tasks = set()
             self._server_request_tasks.add(task)
@@ -1332,7 +1345,7 @@ class CodexAppServerClient:
                 sink = self._turn_sinks.get(tid)
                 if sink is not None:
                     sink.put_nowait({"__bridge_error__": e})
-                self._retain_request_failure(e)
+                self._retain_request_failure(e, caller_local=handler is not None)
                 self._send({"id": mid, "error": {"message": "execution requires authority/commit reconciliation"}})
                 return
             logger.warning("codex server-request %s failed: %s", method, e)

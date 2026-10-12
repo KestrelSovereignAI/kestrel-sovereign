@@ -4937,6 +4937,18 @@ def _open_cleanup_parent_at(
         raise
 
 
+def _assert_no_immutable_launch_custody_at(directory_fd: int) -> None:
+    """Restrictive disk evidence survives cold cleanup and is never followed."""
+    try:
+        os.stat(_IMMUTABLE_LAUNCH_CUSTODY_MARKER, dir_fd=directory_fd,
+                follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise IsolatedRuntimePreparationError(
+        "Runtime cleanup would remove a retained immutable host launch artifact."
+    )
+
+
 def _cleanup_child_directories_at(
     directory_fd: int,
     *,
@@ -4944,14 +4956,11 @@ def _cleanup_child_directories_at(
 ) -> list[tuple[str, tuple[int, int]]]:
     """Snapshot child-directory identities after checking namespace custody."""
 
+    _assert_no_immutable_launch_custody_at(directory_fd)
     children: list[tuple[str, tuple[int, int]]] = []
     with os.scandir(directory_fd) as entries:
         for entry in entries:
             name = entry.name
-            if name == _IMMUTABLE_LAUNCH_CUSTODY_MARKER:
-                raise IsolatedRuntimePreparationError(
-                    "Runtime cleanup would remove a retained immutable host launch artifact."
-                )
             if not allow_owner_marker and name == _RUNTIME_OWNER_MARKER:
                 raise IsolatedRuntimeNamespaceError(
                     "Hosted isolated feature runtime cleanup found a nested "
@@ -5235,6 +5244,9 @@ def _remove_isolated_feature_runtime(
                 return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
             descriptors.append(current_fd)
         _read_existing_runtime_owner(current_fd, owner)
+        # Feature-level reclamation also crosses the namespace's durable
+        # launch-custody boundary. A cold proxy has no historical path list.
+        _assert_no_immutable_launch_custody_at(current_fd)
         try:
             feature_parent_fd = os.open(
                 "feature_venvs", _directory_open_flags(), dir_fd=current_fd
