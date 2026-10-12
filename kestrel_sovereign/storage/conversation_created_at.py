@@ -184,11 +184,13 @@ def comparable_created_at(value: Any) -> Optional[str]:
     produces one and the migration truncates them — but a *boundary* may, and
     truncating one moves it.
 
-    That is not cosmetic in a destructive path. ``purge_all_since`` compares
-    ``>=`` against a caller's watermark: truncate ``12:00:00.500`` to
-    ``12:00:00`` and a row stamped ``12:00:00`` — which predates the boundary —
-    is selected and permanently deleted. PostgreSQL keeps the fraction, so the
-    two backends would also disagree about which rows a purge destroys.
+    That is not cosmetic for a ``>=`` boundary: truncate ``12:00:00.500`` to
+    ``12:00:00`` and a row stamped ``12:00:00`` — which may predate the
+    boundary — is selected. PostgreSQL keeps the fraction, so the two backends
+    would also disagree about which rows match. (The EPHEMERAL leak sweep,
+    ``purge_all_since``, deliberately does select that row: it compares
+    against :func:`created_at_bind` instead, because a leak written in the
+    boundary's second is stored exactly like it, #3227.)
 
     Still sorts correctly against canonical values, which is what lets the
     comparison be a text one: ``'12:00:00' < '12:00:00.5' < '12:00:01'``.

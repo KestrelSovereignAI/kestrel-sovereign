@@ -1162,8 +1162,9 @@ class AsyncStorage:
         never wipes preexisting NORMAL channel history.
 
         Timestamp-shape safety (regression fix): the ``since_iso`` watermark is
-        SQLite ``datetime('now')`` shape (``YYYY-MM-DD HH:MM:SS``, space
-        separator), but ``channel_messages.created_at`` is written by the
+        SQLite ``datetime('now')`` shape plus microseconds
+        (``YYYY-MM-DD HH:MM:SS.ffffff``, space separator; whole seconds from
+        older callers), but ``channel_messages.created_at`` is written by the
         channels feature as ``message.timestamp.isoformat()`` (``T`` separator,
         microseconds, offset). A raw SQL ``created_at >= since_iso`` compares
         lexically, and ``'T'`` (0x54) > ``' '`` (0x20), so a same-UTC-day row

@@ -23,7 +23,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
-from .conversation_created_at import UNDATED_TABLE
+from .conversation_created_at import UNDATED_TABLE, created_at_bind
 from .session_grouping import (
     UNDATABLE_ROW_FALLBACK,
     canonical_session_id,
@@ -3781,6 +3781,18 @@ class AsyncConversationStore:
         DELETE — the absence of a timestamp means we can't safely scope,
         and the original wipe-on-shutdown bug is precisely what this
         method exists to prevent.
+
+        The boundary is the stamp a row written at ``since_iso`` would
+        carry (:func:`created_at_bind`), so the comparison is made at the
+        column's own precision (#3227). On PostgreSQL that is the instant
+        itself — the column is ``NOW()``-stamped to the microsecond, so a
+        NORMAL row written earlier in the transition second survives. On
+        SQLite the column is whole-second by CHECK (#3009) and the boundary
+        is the watermark's second: a leak written in that second is stored
+        exactly like a row written just before the watermark, and a privacy
+        sweep must not leave leaks behind, so the whole second is purged.
+        That is deliberately not :func:`comparable_created_at`, which keeps
+        a boundary's fraction for readers that must not over-select.
         """
         if not since_iso:
             logger.warning(
@@ -3790,6 +3802,11 @@ class AsyncConversationStore:
                 reason,
             )
             return 0
+        boundary = created_at_bind(self.db.backend_type, since_iso)
+        if boundary is None:
+            raise ValueError(
+                f"purge_all_since needs a datable watermark; got {since_iso!r}"
+            )
         created_at_predicate = self._timestamp_predicate("created_at", ">=")
         purged = await self._purge_conversation_rows(
             [
@@ -3797,7 +3814,7 @@ class AsyncConversationStore:
                     f"SELECT {_PURGE_SELECT_PLACEHOLDER} FROM conversation_history "
                     f"WHERE agent_id = ? AND {created_at_predicate} "
                     "ORDER BY id ASC",
-                    (self.agent_id, self._timestamp_query_param(since_iso)),
+                    (self.agent_id, boundary),
                 )
             ],
             operation_type="purge_all_since",
