@@ -37,6 +37,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kestrel_sovereign.llm.model_cache import (
+    DiscoveryStatus,
+    SharedModelCache,
+    VendorDiscoveryOutcome,
+)
+from kestrel_sovereign.llm.model_discovery import collect_discovery_outcomes
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 from kestrel_sovereign.llm.service import LLMService
 
@@ -57,7 +63,7 @@ def _cached(models):
     return cache
 
 
-def _make_service(*, providers=None, discovery_failures=None):
+def _make_service(*, providers=None):
     svc = LLMService.__new__(LLMService)
     svc.providers = providers if providers is not None else [
         {"name": "anthropic:plan", "vendor": "anthropic", "route": "plan", "model": "auto"},
@@ -67,9 +73,68 @@ def _make_service(*, providers=None, discovery_failures=None):
     svc._preference_persistence_tasks = set()
     svc._route_catalogs = {}
     svc._ensure_route_catalogs_sync = lambda: None
-    svc._discovery_failures = dict(discovery_failures or {})
     svc._mandate_load_error = None
     return svc
+
+
+async def _run_discovery_pass(svc, discover, *, cache):
+    """Run the real ``discover_all_models`` once, publishing into ``cache``.
+
+    ``discover`` maps each vendor to a coroutine function standing in for its
+    route discovery. It runs where the real ``_discover_for_vendor_route``
+    would, so whatever it records is what the pass publishes with its catalog
+    (#3197). Returns the snapshot the pass published.
+    """
+    svc._select_discovery_routes = lambda: [
+        (vendor, {"name": f"{vendor}:api"}) for vendor in discover
+    ]
+
+    async def _discover_for_vendor_route(vendor, route):
+        return await discover[vendor]()
+
+    svc._discover_for_vendor_route = _discover_for_vendor_route
+    svc._resolve_auto_providers = lambda models: None
+    svc._snapshot_chat_models_by_route = lambda models: None
+    svc._filter_models = lambda models, **k: models
+
+    async def _noop(*a, **k):
+        return None
+
+    svc.reconcile_embedding_capabilities = _noop
+    catalog = MagicMock()
+    catalog.enrich_models = MagicMock(side_effect=lambda models, **k: models)
+
+    with patch(
+        "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
+        return_value=cache,
+    ), patch(
+        "kestrel_sovereign.llm.model_discovery.get_catalog_service",
+        return_value=catalog,
+    ):
+        await svc.discover_all_models(use_cache=False)
+    return cache.snapshot()
+
+
+def _raises(error):
+    async def _discover():
+        raise error
+
+    return _discover
+
+
+def _lists_via(svc, vendor, models):
+    """A vendor whose adapter's ``list_models`` returns ``models``."""
+    adapter = MagicMock()
+
+    async def _list(client):
+        return models
+
+    adapter.list_models = _list
+
+    async def _discover():
+        return await svc._safe_list_models(vendor, adapter, MagicMock())
+
+    return _discover
 
 
 def _loader_harness(pref):
@@ -219,22 +284,45 @@ class TestDiscoveryFailuresAreRecorded:
 
     def test_an_exception_is_recorded(self):
         svc = _make_service()
-        svc._note_discovery_outcome("anthropic", RuntimeError("401 Unauthorized"))
-        assert "401 Unauthorized" in svc._discovery_failures["anthropic"]
+        with collect_discovery_outcomes() as outcomes:
+            svc._note_discovery_outcome("anthropic", RuntimeError("401 Unauthorized"))
+        assert outcomes["anthropic"].status is DiscoveryStatus.FAILED
+        assert "401 Unauthorized" in outcomes["anthropic"].error
 
-    def test_success_clears_a_prior_failure(self):
-        svc = _make_service(discovery_failures={"anthropic": "401"})
-        svc._note_discovery_outcome("anthropic", None)
-        assert "anthropic" not in svc._discovery_failures
+    @pytest.mark.asyncio
+    async def test_success_clears_a_prior_failure(self):
+        svc = _make_service(providers=[])
+        cache = SharedModelCache()
+        await _run_discovery_pass(
+            svc, {"anthropic": _raises(RuntimeError("401"))}, cache=cache
+        )
+        assert "anthropic" in cache.snapshot().discovery_failures
+
+        published = await _run_discovery_pass(
+            svc,
+            {"anthropic": _lists_via(svc, "anthropic", [_mk_model("m", "anthropic")])},
+            cache=cache,
+        )
+
+        assert published.discovery_failures == {}
 
     def test_the_reason_is_bounded(self):
         svc = _make_service()
-        svc._note_discovery_outcome("anthropic", RuntimeError("x" * 5000))
-        assert len(svc._discovery_failures["anthropic"]) <= 300
+        with collect_discovery_outcomes() as outcomes:
+            svc._note_discovery_outcome("anthropic", RuntimeError("x" * 5000))
+        assert len(outcomes["anthropic"].error) <= 300
 
     def test_a_partially_constructed_instance_does_not_raise(self):
         svc = LLMService.__new__(LLMService)
         svc._note_discovery_outcome("anthropic", RuntimeError("boom"))
+
+    def test_outside_a_discovery_pass_nothing_is_recorded(self):
+        """An observation with no catalog to publish beside it is dropped."""
+        svc = _make_service()
+        svc._note_discovery_outcome("anthropic", RuntimeError("boom"))
+        with collect_discovery_outcomes() as outcomes:
+            pass
+        assert outcomes == {}
 
     @pytest.mark.asyncio
     async def test_safe_list_models_records_an_adapter_exception(self):
@@ -245,8 +333,9 @@ class TestDiscoveryFailuresAreRecorded:
             raise RuntimeError("401 Unauthorized")
 
         adapter.list_models = _list
-        assert await svc._safe_list_models("anthropic", adapter, MagicMock()) == []
-        assert "401 Unauthorized" in svc._discovery_failures["anthropic"]
+        with collect_discovery_outcomes() as outcomes:
+            assert await svc._safe_list_models("anthropic", adapter, MagicMock()) == []
+        assert "401 Unauthorized" in outcomes["anthropic"].error
 
     @pytest.mark.asyncio
     async def test_not_implemented_is_not_a_failure(self):
@@ -258,8 +347,9 @@ class TestDiscoveryFailuresAreRecorded:
             raise NotImplementedError
 
         adapter.list_models = _list
-        assert await svc._safe_list_models("anthropic", adapter, MagicMock()) == []
-        assert svc._discovery_failures == {}
+        with collect_discovery_outcomes() as outcomes:
+            assert await svc._safe_list_models("anthropic", adapter, MagicMock()) == []
+        assert outcomes == {}
 
     @pytest.mark.asyncio
     async def test_a_swallowing_adapter_is_invisible_and_that_is_stated(self):
@@ -277,8 +367,9 @@ class TestDiscoveryFailuresAreRecorded:
             return []  # what AnthropicAdapter does with a 401
 
         adapter.list_models = _list
-        await svc._safe_list_models("anthropic", adapter, MagicMock())
-        assert svc._discovery_failures == {}
+        with collect_discovery_outcomes() as outcomes:
+            await svc._safe_list_models("anthropic", adapter, MagicMock())
+        assert outcomes == {"anthropic": VendorDiscoveryOutcome.ok()}
 
 
 class TestRecordDiscoverySeam:
@@ -291,18 +382,20 @@ class TestRecordDiscoverySeam:
         async def _boom():
             raise RuntimeError("remote model discovery failed (…/models): 404")
 
-        assert await svc._record_discovery("runpod", _boom()) == []
-        assert "404" in svc._discovery_failures["runpod"]
+        with collect_discovery_outcomes() as outcomes:
+            assert await svc._record_discovery("runpod", _boom()) == []
+        assert "404" in outcomes["runpod"].error
 
     @pytest.mark.asyncio
-    async def test_success_clears(self):
-        svc = _make_service(discovery_failures={"ollama": "stale"})
+    async def test_success_is_recorded(self):
+        svc = _make_service()
 
         async def _ok():
             return [_mk_model("llama3.2:1b", "ollama")]
 
-        assert len(await svc._record_discovery("ollama", _ok())) == 1
-        assert "ollama" not in svc._discovery_failures
+        with collect_discovery_outcomes() as outcomes:
+            assert len(await svc._record_discovery("ollama", _ok())) == 1
+        assert outcomes == {"ollama": VendorDiscoveryOutcome.ok()}
 
 
 class TestHelpersRaiseRatherThanSwallow:
@@ -358,23 +451,25 @@ class TestHelpersRaiseRatherThanSwallow:
         # Both not-attempted paths in the remote helper: no base_url, and a
         # base_url whose credential env var is unset. Only the first was
         # covered at first, and the mutant for the second survived.
-        assert await svc._discover_openai_compatible_remote("runpod", {}) is None
-        assert await svc._discover_local_openai_compatible("ollama", {}) is None
-        assert svc._discovery_failures == {}
+        with collect_discovery_outcomes() as outcomes:
+            assert await svc._discover_openai_compatible_remote("runpod", {}) is None
+            assert await svc._discover_local_openai_compatible("ollama", {}) is None
+        assert outcomes == {}
 
     @pytest.mark.asyncio
     async def test_a_missing_credential_also_signals_not_attempted(self, monkeypatch):
         """The second not-attempted path — a base_url with no key set."""
         svc = _make_service()
         monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-        out = await svc._discover_openai_compatible_remote(
-            "runpod", {"base_url": "https://api.runpod.ai/v2/x/openai/v1"}
-        )
+        with collect_discovery_outcomes() as outcomes:
+            out = await svc._discover_openai_compatible_remote(
+                "runpod", {"base_url": "https://api.runpod.ai/v2/x/openai/v1"}
+            )
         assert out is None, (
             "an unset credential means the request was never issued, which "
             "must not be reported as a successful empty fetch"
         )
-        assert svc._discovery_failures == {}
+        assert outcomes == {}
 
 
 class TestVendorAttributionInGather:
@@ -387,50 +482,18 @@ class TestVendorAttributionInGather:
     @pytest.mark.asyncio
     async def test_an_outer_exception_is_recorded_against_its_own_vendor(self):
         svc = _make_service(providers=[])
-        svc._select_discovery_routes = lambda: [
-            ("anthropic", {"name": "anthropic:plan"}),
-            ("openai", {"name": "openai:api"}),
-        ]
 
-        async def _fake_discover(vendor, route):
-            if vendor == "anthropic":
-                raise RuntimeError("401 Unauthorized")
+        async def _empty():
             return []
 
-        svc._discover_for_vendor_route = _fake_discover
-        svc._resolve_auto_providers = lambda models: None
-        svc._snapshot_chat_models_by_route = lambda models: None
-        svc._apply_recency_visibility = lambda *a, **k: None
-        svc._filter_models = lambda models, **k: models
+        published = await _run_discovery_pass(
+            svc,
+            {"anthropic": _raises(RuntimeError("401 Unauthorized")), "openai": _empty},
+            cache=SharedModelCache(),
+        )
 
-        async def _noop(*a, **k):
-            return None
-
-        svc.reconcile_embedding_capabilities = _noop
-
-        shared = MagicMock()
-        shared.get = MagicMock(return_value=None)
-        shared.get_any = MagicMock(return_value=None)
-        shared.set = MagicMock()
-
-        async def _wait():
-            return False
-
-        shared.wait_for_refresh = _wait
-        catalog = MagicMock()
-        catalog.enrich_models = MagicMock(side_effect=lambda models, **k: models)
-
-        with patch(
-            "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
-            return_value=shared,
-        ), patch(
-            "kestrel_sovereign.llm.model_discovery.get_catalog_service",
-            return_value=catalog,
-        ):
-            await svc.discover_all_models(use_cache=False)
-
-        assert "401 Unauthorized" in svc._discovery_failures["anthropic"]
-        assert "openai" not in svc._discovery_failures
+        assert "401 Unauthorized" in published.discovery_failures["anthropic"]
+        assert "openai" not in published.discovery_failures
 
 
 class TestMandateLoadErrorLifecycle:
@@ -472,39 +535,109 @@ class TestSkippedDiscoveryDoesNotClearAFailure:
     work, because every adapter answers differently.
     """
 
+    @staticmethod
+    def _through_record_discovery(svc, vendor, helper):
+        """``vendor`` discovered through ``_record_discovery``, as the
+        OpenAI-compatible routes are."""
+
+        async def _discover():
+            return await svc._record_discovery(vendor, helper())
+
+        return _discover
+
     @pytest.mark.asyncio
     async def test_a_skipped_request_leaves_a_prior_failure_standing(self):
-        svc = _make_service(discovery_failures={"runpod": "404 Not Found"})
+        svc = _make_service(providers=[])
+        cache = SharedModelCache()
+        failed = await _run_discovery_pass(
+            svc,
+            {"runpod": _raises(RuntimeError("404 Not Found"))},
+            cache=cache,
+        )
 
         async def _skipped():
             return None  # NOT ATTEMPTED — the helper never issued a request
 
-        assert await svc._record_discovery("runpod", _skipped()) == []
-        assert svc._discovery_failures.get("runpod") == "404 Not Found", (
-            "a non-attempt must not clear a real failure"
+        published = await _run_discovery_pass(
+            svc,
+            {"runpod": self._through_record_discovery(svc, "runpod", _skipped)},
+            cache=cache,
+        )
+
+        assert published.version > failed.version
+        assert published.discovery_failures == {
+            "runpod": "RuntimeError: 404 Not Found"
+        }, "a non-attempt must not clear a real failure"
+        # Labelled for what it is: the failure an earlier refresh observed.
+        assert published.outcomes["runpod"] == VendorDiscoveryOutcome(
+            DiscoveryStatus.NOT_ATTEMPTED,
+            error="RuntimeError: 404 Not Found",
+            observed_version=failed.version,
         )
 
     @pytest.mark.asyncio
-    async def test_a_skipped_request_does_not_invent_a_failure_either(self):
-        """The other half: not-attempted is not evidence of failure."""
-        svc = _make_service()
+    async def test_a_cache_clear_between_passes_does_not_clear_it(self):
+        """``clear()`` runs on unrelated events, such as an Ollama pull."""
+        svc = _make_service(providers=[])
+        cache = SharedModelCache()
+        await _run_discovery_pass(
+            svc,
+            {"runpod": _raises(RuntimeError("404 Not Found"))},
+            cache=cache,
+        )
+        cache.clear()
 
         async def _skipped():
             return None
 
-        await svc._record_discovery("runpod", _skipped())
-        assert svc._discovery_failures == {}
+        published = await _run_discovery_pass(
+            svc,
+            {"runpod": self._through_record_discovery(svc, "runpod", _skipped)},
+            cache=cache,
+        )
+
+        assert published.discovery_failures == {
+            "runpod": "RuntimeError: 404 Not Found"
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_request_does_not_invent_a_failure_either(self):
+        """The other half: not-attempted is not evidence of failure."""
+        svc = _make_service(providers=[])
+
+        async def _skipped():
+            return None
+
+        published = await _run_discovery_pass(
+            svc,
+            {"runpod": self._through_record_discovery(svc, "runpod", _skipped)},
+            cache=SharedModelCache(),
+        )
+
+        assert published.discovery_failures == {}
+        assert published.outcomes["runpod"] == VendorDiscoveryOutcome.not_attempted()
 
     @pytest.mark.asyncio
     async def test_a_real_fetch_still_clears(self):
         """The converse — proves clearing was gated, not removed."""
-        svc = _make_service(discovery_failures={"ollama": "connection refused"})
+        svc = _make_service(providers=[])
+        cache = SharedModelCache()
+        await _run_discovery_pass(
+            svc,
+            {"ollama": _raises(RuntimeError("connection refused"))},
+            cache=cache,
+        )
 
         async def _ok():
             return [_mk_model("llama3.2:1b", "ollama")]
 
-        assert len(await svc._record_discovery("ollama", _ok())) == 1
-        assert "ollama" not in svc._discovery_failures
+        published = await _run_discovery_pass(
+            svc,
+            {"ollama": self._through_record_discovery(svc, "ollama", _ok)},
+            cache=cache,
+        )
+
+        assert published.discovery_failures == {}
 
 
 class TestSuccessfulEmptyFetchClearsAFailure:
@@ -522,13 +655,25 @@ class TestSuccessfulEmptyFetchClearsAFailure:
 
     @pytest.mark.asyncio
     async def test_an_empty_but_successful_fetch_clears(self):
-        svc = _make_service(discovery_failures={"ollama": "connection refused"})
+        svc = _make_service(providers=[])
+        cache = SharedModelCache()
+        await _run_discovery_pass(
+            svc,
+            {"ollama": _raises(RuntimeError("connection refused"))},
+            cache=cache,
+        )
 
         async def _empty_but_fetched():
             return []  # the server answered; it just has nothing loaded
 
-        assert await svc._record_discovery("ollama", _empty_but_fetched()) == []
-        assert "ollama" not in svc._discovery_failures, (
+        async def _discover():
+            return await svc._record_discovery("ollama", _empty_but_fetched())
+
+        published = await _run_discovery_pass(
+            svc, {"ollama": _discover}, cache=cache
+        )
+
+        assert "ollama" not in published.discovery_failures, (
             "a completed request that found no models is still a successful "
             "fetch and must clear a stale failure"
         )

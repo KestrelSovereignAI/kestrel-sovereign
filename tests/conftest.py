@@ -478,13 +478,25 @@ def _isolate_shared_model_cache():
     vendor catalog into unrelated tests, silently flipping cache-sensitive
     assertions — model availability (``_model_available_for_route``) and vision
     capability (``_apply_eager_vision``) — based purely on xdist worker
-    assignment. The teardown clear guarantees each test ends with a cold cache,
+    assignment. The teardown reset guarantees each test ends with a cold cache,
     so the next test is order-independent regardless of what ran before it.
+
+    ``clear()`` alone is not a reset: it carries the discovery failures the
+    cache reported into the invalidated snapshot (#3197). So each side clears
+    the singleton (which also cancels a refresh a test left running) and then
+    drops it, and the next ``get_shared_model_cache()`` builds a new one. The
+    singleton is read directly: a test may still have the accessor patched.
     """
-    from kestrel_sovereign.llm.model_cache import get_shared_model_cache
-    get_shared_model_cache().clear()
+    from kestrel_sovereign.llm import model_cache
+
+    def _reset() -> None:
+        if model_cache._shared_cache is not None:
+            model_cache._shared_cache.clear()
+        model_cache._shared_cache = None
+
+    _reset()
     yield
-    get_shared_model_cache().clear()
+    _reset()
 
 
 @pytest.fixture(scope="session")

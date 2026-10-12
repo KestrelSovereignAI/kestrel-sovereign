@@ -6,20 +6,46 @@ Enriches results with manual overrides from model_catalog.toml.
 Provides in-memory caching and disk-based cache for fast startup.
 """
 import asyncio
+import contextlib
 import dataclasses
 import logging
-from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
+from contextvars import ContextVar
+from typing import List, Dict, Any, Iterator, Optional, Tuple, TYPE_CHECKING
 
 from kestrel_sdk.llm import ModelInfo as SDKModelInfo
 
 from .model_metadata import ModelInfo, ModelCategory
 from .model_catalog import get_catalog_service
-from .model_cache import get_shared_model_cache
+from .model_cache import VendorDiscoveryOutcome, get_shared_model_cache
 
 if TYPE_CHECKING:
     from .embedding_discovery import EmbeddingModelInfo
 
 logger = logging.getLogger(__name__)
+
+#: The outcomes the discovery pass running in this context has observed so far
+#: (#3197). A pass's vendors run as gathered child tasks; each copies this
+#: context, so every one writes into the same pass-owned map.
+_PASS_OUTCOMES: ContextVar[Optional[Dict[str, VendorDiscoveryOutcome]]] = ContextVar(
+    "kestrel_model_discovery_pass_outcomes", default=None
+)
+
+
+@contextlib.contextmanager
+def collect_discovery_outcomes() -> Iterator[Dict[str, VendorDiscoveryOutcome]]:
+    """Scope one discovery pass: yield the map its outcomes are recorded into.
+
+    The outcomes reach the shared cache only when the pass publishes them with
+    the catalog they produced, so no reader sees an outcome before its catalog.
+    A pass that raises before publishing publishes neither.
+    """
+    outcomes: Dict[str, VendorDiscoveryOutcome] = {}
+    token = _PASS_OUTCOMES.set(outcomes)
+    try:
+        yield outcomes
+    finally:
+        _PASS_OUTCOMES.reset(token)
+
 
 #: Every field the framework ``ModelInfo`` constructor accepts (#3270).
 _FRAMEWORK_MODEL_FIELDS = tuple(
@@ -112,11 +138,11 @@ class ModelDiscoveryMixin:
     def _note_discovery_outcome(
         self, vendor: str, error: Optional[BaseException]
     ) -> None:
-        """Record that ``vendor``'s discovery raised, for the health surface.
+        """Record that ``vendor``'s catalog request completed or raised.
 
-        Deliberately records ONLY an observed exception. Earlier revisions also
-        tried to infer failure from the RETURNED VALUE — an empty list, or a
-        catalog that looked reduced — and that cannot work: every adapter
+        Deliberately records ONLY what a request observed. Earlier revisions
+        also tried to infer failure from the RETURNED VALUE — an empty list, or
+        a catalog that looked reduced — and that cannot work: every adapter
         handles its own errors differently. ``AnthropicAdapter`` swallows a 401
         and returns ``[]``; ``VertexAIAdapter`` swallows and returns a
         non-empty STALE disk catalog; the OpenAI-compatible helpers raise. Five
@@ -128,18 +154,26 @@ class ModelDiscoveryMixin:
         than papered over: fixing THAT needs an explicit outcome contract from
         the adapters, which is a larger change than this one.
 
+        The outcome belongs to the discovery pass running in this context
+        (:func:`collect_discovery_outcomes`), which publishes it with the
+        catalog it produced (#3197). Outside a pass, as in local-only route
+        resolution, no catalog is published, so there is nothing to pair the
+        observation with and it is not recorded.
+
         Nothing gates routing on this. It drives the ``model_discovery`` health
         check, so a dead credential is visible instead of living only in a log
         line — which is the operator-facing gap #3190 was filed for.
         """
-        failures = getattr(self, "_discovery_failures", None)
-        if failures is None:
-            # Bare harness / partially-constructed instance — nothing to record.
+        outcomes = _PASS_OUTCOMES.get()
+        if outcomes is None:
+            logger.debug("%s: discovery outcome outside a discovery pass", vendor)
             return
         if error is None:
-            failures.pop(vendor, None)
+            outcomes[vendor] = VendorDiscoveryOutcome.ok()
         else:
-            failures[vendor] = f"{type(error).__name__}: {error}"[:300]
+            outcomes[vendor] = VendorDiscoveryOutcome.failed(
+                f"{type(error).__name__}: {error}"[:300]
+            )
 
     async def discover_all_models(
         self,
@@ -239,23 +273,34 @@ class ModelDiscoveryMixin:
         # we pick the first route per vendor whose adapter can list models.
         discovery_vendors: List[str] = []
         discovery_tasks = []
-        for vendor, route in self._select_discovery_routes():
-            discovery_vendors.append(vendor)
-            discovery_tasks.append(
-                self._discover_for_vendor_route(vendor, route)
+        # Opened before any vendor's discovery is scheduled, so every one runs
+        # in this pass's context however its task is created.
+        with collect_discovery_outcomes() as discovery_outcomes:
+            for vendor, route in self._select_discovery_routes():
+                discovery_vendors.append(vendor)
+                discovery_tasks.append(
+                    self._discover_for_vendor_route(vendor, route)
+                )
+
+            results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
+
+            # Zip vendors back onto results (#3190): ``gather`` returns a bare
+            # list, so the previous loop could neither name the failing vendor
+            # in its warning nor record the outcome against it.
+            for vendor, result in zip(discovery_vendors, results):
+                if isinstance(result, BaseException):
+                    logger.warning("%s: vendor discovery failed: %s", vendor, result)
+                    self._note_discovery_outcome(vendor, result)
+                elif isinstance(result, list):
+                    all_models.extend(result)
+        # Every vendor the pass covered, with the outcome its discovery recorded.
+        # A vendor that recorded nothing issued no catalog request.
+        pass_outcomes = {
+            vendor: discovery_outcomes.get(
+                vendor, VendorDiscoveryOutcome.not_attempted()
             )
-
-        results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
-
-        # Zip vendors back onto results (#3190): ``gather`` returns a bare list,
-        # so the previous loop could neither name the failing vendor in its
-        # warning nor record the outcome against it.
-        for vendor, result in zip(discovery_vendors, results):
-            if isinstance(result, BaseException):
-                logger.warning("%s: vendor discovery failed: %s", vendor, result)
-                self._note_discovery_outcome(vendor, result)
-            elif isinstance(result, list):
-                all_models.extend(result)
+            for vendor in discovery_vendors
+        }
 
         # Add configured provider models (from kestrel.toml [llm]) that weren't discovered
         # This ensures models like xai/grok show up even without API discovery
@@ -367,8 +412,9 @@ class ModelDiscoveryMixin:
         # miss refreshes every decision route and re-runs pin canaries.
         await self.reconcile_decision_capabilities(use_cache=False)
 
-        # Cache results in shared memory cache and on disk
-        shared_cache.set(all_models)
+        # Cache results in shared memory cache and on disk. The catalog and the
+        # outcomes that produced it are published as one snapshot (#3197).
+        shared_cache.set(all_models, outcomes=pass_outcomes)
         catalog.write_cache(all_models)
 
         logger.info(f"Discovered {len(all_models)} models total")
@@ -1650,9 +1696,10 @@ class ModelDiscoveryMixin:
             self._note_discovery_outcome(vendor, e)
             return []
         if models is None:
-            # NOT ATTEMPTED. Leave the record exactly as it was: do not clear a
-            # standing failure (#3190 r10 P2 — unsetting a key would otherwise
-            # turn health green having fetched nothing) and do not invent one.
+            # NOT ATTEMPTED. Record nothing: the pass publishes this vendor as
+            # not attempted, which keeps a standing failure standing (#3190
+            # r10 P2 — unsetting a key would otherwise turn health green having
+            # fetched nothing) and does not invent one.
             logger.debug("%s: discovery not attempted", vendor)
             return []
 
@@ -1692,10 +1739,10 @@ class ModelDiscoveryMixin:
                 self._note_discovery_outcome(vendor, None)
                 return models
         except NotImplementedError:
-            # Not a failure: the adapter simply publishes no catalog. Recording
-            # it as one would excuse the serveability veto for every such
-            # vendor, which is broader than this fix intends — the veto is
-            # relaxed only where discovery was ATTEMPTED and failed.
+            # Not a failure: the adapter simply publishes no catalog, so no
+            # request was issued and the pass records the vendor as not
+            # attempted. Recording a failure would report every such vendor's
+            # discovery as broken.
             logger.debug("%s: adapter.list_models not implemented", vendor)
         except Exception as e:
             logger.warning("%s: model discovery failed: %s", vendor, e)

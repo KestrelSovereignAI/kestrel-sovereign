@@ -1,4 +1,5 @@
 """Tests for SharedModelCache — process-wide model discovery cache."""
+import dataclasses
 import time
 import asyncio
 from unittest.mock import MagicMock
@@ -42,7 +43,9 @@ class TestSharedModelCache:
         cache.set(models)
 
         # Manually expire
-        cache._timestamp = time.time() - 2
+        cache._snapshot = dataclasses.replace(
+            cache._snapshot, timestamp=time.time() - 2
+        )
 
         assert cache.get() is None  # Stale
         assert cache.get_any() is not None  # Still available via get_any

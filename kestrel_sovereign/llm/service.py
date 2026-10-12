@@ -488,17 +488,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
 
         # Model discovery uses process-wide SharedModelCache (see model_cache.py).
         # Pre-populate from disk if this is the first LLMService instance.
-        # vendor -> last model-discovery error (#3190). Records the fact that a
-        # vendor's catalog could NOT be retrieved, which ``len(catalog) > 0``
-        # cannot express: a failed ``list_models`` and a vendor that genuinely
-        # serves nothing both yield an empty list.
-        #
-        # MUST be created before ``_load_from_disk_cache()`` on the next line.
-        # That call restores a persisted catalog AND its failure record, so
-        # initialising this afterwards made the restoration dead code on every
-        # real construction — the map it wrote into did not exist yet, and the
-        # later assignment then replaced it with an empty one (codex r2 P1).
-        self._discovery_failures: Dict[str, str] = {}
+        # Discovery outcomes live in the cache's snapshot beside the catalog
+        # they describe, never on this instance (#3197).
         self._load_from_disk_cache()  # Immediate availability before API discovery
 
         # Storage info cache
@@ -4505,9 +4496,14 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
 
         Carries the vendor's recorded discovery failure, when there is one, so
         a rejection by a stale catalog says so instead of calling the model
-        unavailable (#3196). Shared by the generation and audit guards.
+        unavailable (#3196). Shared by the generation and audit guards. The
+        failure is read from the shared catalog snapshot, so every service
+        reading that catalog names it (#3197).
         """
-        discovery_failures = getattr(self, "_discovery_failures", None) or {}
+        from .model_cache import get_shared_model_cache
+
+        snapshot = get_shared_model_cache().snapshot()
+        discovery_failures = snapshot.discovery_failures if snapshot else {}
         return ModelNotAvailableForRoute(
             vendor=provider.get("vendor"),
             route=provider.get("route"),
