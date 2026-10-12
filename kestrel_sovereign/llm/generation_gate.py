@@ -17,7 +17,9 @@ provider's own terminal stop reason is a natural end
 applies it to every attempt of the two calls a turn's answer and tool calls
 come from, ``stream_with_tool_detection`` and ``generate_with_messages``,
 because the provider's evidence is there: a call returns, or a stream ends,
-only with a generation the gate accepted. The turn applies it to the
+only with a generation the gate accepted. Each attempt is judged before it is
+recorded, so telemetry records a rejected attempt as a failed one, with the
+usage its provider reported (#3576). The turn applies it to the
 outcomes only the turn sees, a Stop and a call that raised. A failed attempt
 contributes nothing to the answer: the turn records none, and a tool batch it
 had already completed is recorded as a fixed checkpoint, so the next turn does
@@ -254,6 +256,19 @@ ANSWER_PATHS: Tuple[AnswerPath, ...] = (
         "kestrel_sovereign.llm.streaming:StreamingMixin._stream_adapter_with_usage",
         ("_require_finished_generation",),
     ),
+    # A route's non-streaming attempt, judged before it is finalized.
+    AnswerPath(
+        "route_attempt.finalized",
+        "kestrel_sovereign.llm.service:LLMService._run_provider_attempt",
+        ("_require_finished_generation",),
+    ),
+    AnswerPath(
+        "route_attempt.stream_fallback",
+        "kestrel_sovereign.llm.streaming:StreamingMixin._run_stream_fallback_attempt",
+        # Through the service's attempt runner, or, for a host without one,
+        # judged here.
+        ("_run_provider_attempt", "_require_finished_generation"),
+    ),
     # Fallback across routes: each route walk judges every attempt, so a later
     # route's answer stands alone and a failed route contributes nothing.
     AnswerPath(
@@ -265,7 +280,7 @@ ANSWER_PATHS: Tuple[AnswerPath, ...] = (
         "route_walk.attempts",
         "kestrel_sovereign.llm.service:LLMService._generate_with_messages_inner",
         # The managed remote GPU route, and each configured route.
-        ("_require_finished_generation*2",),
+        ("_run_provider_attempt(require_completion=True)*2",),
     ),
     AnswerPath(
         "route_walk.streamed",
@@ -274,7 +289,7 @@ ANSWER_PATHS: Tuple[AnswerPath, ...] = (
         # text-only stream. Not streamed: a route without a usage stream.
         (
             "_stream_adapter_with_usage(require_completion=True)*3",
-            "_require_finished_generation",
+            "_run_stream_fallback_attempt(require_completion=True)",
         ),
     ),
     # Aggregate route results: the error a route walk raises once every route

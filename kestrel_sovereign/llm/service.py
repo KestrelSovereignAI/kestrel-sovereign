@@ -51,7 +51,7 @@ from .adapter import (
     provider_usage_cost,
     response_usage_available,
 )
-from .output_ceiling import response_stop_reason
+from .output_ceiling import IncompleteGenerationError, response_stop_reason
 from .generation_gate import UnfinishedAfterInlineToolsError
 from .model_discovery import ModelDiscoveryMixin
 from .mandate import ModelMandateMixin
@@ -3789,6 +3789,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         publish_identity: bool = True,
         usage_available: Optional[bool] = None,
         track_model_usage: Optional[bool] = None,
+        meter_usage: Optional[bool] = None,
     ) -> None:
         """Record one provider attempt while isolating every telemetry sink.
 
@@ -3906,6 +3907,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             cost=cost,
             usage_available=usage_available,
             invocation_context=invocation_context,
+            meter_usage=meter_usage,
         )
 
     async def _finalize_successful_invocation(
@@ -3968,6 +3970,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         response: Any = None,
         usage_available: bool = False,
         track_model_usage: bool = False,
+        meter_usage: bool = False,
     ) -> None:
         """Record one failed provider attempt without publishing its identity."""
 
@@ -3990,6 +3993,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             publish_identity=False,
             usage_available=usage_available,
             track_model_usage=track_model_usage,
+            meter_usage=meter_usage,
         )
 
     async def _run_provider_attempt(
@@ -4009,8 +4013,20 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         tools_used: Optional[bool] = None,
         publish_identity: bool = True,
         error_message_override: Optional[str] = None,
+        require_completion: bool = False,
     ) -> Any:
-        """Await and finalize one provider call, successful or failed."""
+        """Await and finalize one provider call, successful or failed.
+
+        ``require_completion`` holds the attempt to the generation gate
+        (#3552) before it is finalized. A response the gate rejects is
+        recorded as a failed attempt, with the usage its provider reported,
+        and the gate's failure is raised in its place (#3576).
+        """
+
+        def recorded_error(error: Exception) -> Exception:
+            if error_message_override is not None:
+                return LLMServiceError(error_message_override)
+            return error
 
         try:
             require_execution_work(self)
@@ -4054,13 +4070,44 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 )
                 raise
 
+            duration_ms = int((time.monotonic() - started) * 1000)
+            if require_completion:
+                try:
+                    self._require_finished_generation(
+                        response, provider_name=provider_name, model=model,
+                    )
+                except IncompleteGenerationError as rejected:
+                    usage_available = response_usage_available(response)
+                    await self._finalize_failed_invocation(
+                        provider_name,
+                        model,
+                        path=path,
+                        invocation_context=invocation_context,
+                        duration_ms=duration_ms,
+                        error=recorded_error(rejected),
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        tools=tools,
+                        response_format=response_format,
+                        force_local_only=force_local_only,
+                        metadata=metadata,
+                        tools_used=tools_used,
+                        response=response,
+                        usage_available=usage_available,
+                        track_model_usage=usage_available,
+                        # The provider billed the call; only the gate refused
+                        # its answer. Original execution custody still applies.
+                        meter_usage=True,
+                    )
+                    raise
+
             await self._finalize_successful_invocation(
                 response,
                 provider_name,
                 model,
                 path=path,
                 invocation_context=invocation_context,
-                duration_ms=int((time.monotonic() - started) * 1000),
+                duration_ms=duration_ms,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 tools=tools,
@@ -4097,6 +4144,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         invocation_context: Optional[LLMInvocationContext] = None,
         modality: str = "chat",
         caller: Optional[str] = None,
+        meter_usage: Optional[bool] = None,
     ) -> None:
         """Log an LLM call to the observability store (if configured).
 
@@ -4110,6 +4158,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
 
         This is called automatically by get_response() and generate().
         Also triggers metering callback for billing (Vending Machine).
+        ``meter_usage`` says whether to bill the call's usage, ``success`` when
+        omitted: a generation the gate rejected failed, but its provider still
+        billed it (#3576).
 
         Also emits a single structured ``llm.usage:`` INFO line so callers
         that downcast the response to a plain string don't lose token /
@@ -4262,7 +4313,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         )
         if (
             metering_callback
-            and success
+            and (success if meter_usage is None else meter_usage)
             and usage_available
             and billable_breakdown_available
         ):
@@ -5668,9 +5719,7 @@ No other text or formatting.
                         error_message_override=(
                             self._managed_remote_failure_message
                         ),
-                    )
-                    self._require_finished_generation(
-                        remote_response, provider_name="remote_gpu", model=model,
+                        require_completion=True,
                     )
                 except ExecutionAuthorityError:
                     raise
@@ -5848,9 +5897,7 @@ No other text or formatting.
                     tools=tools,
                     response_format=response_format,
                     force_local_only=force_local_only,
-                )
-                self._require_finished_generation(
-                    response, provider_name=provider["name"], model=model,
+                    require_completion=True,
                 )
                 if tools is not None or response_format is not None:
                     return self._annotate_and_return(span, response, redact=_redact)
