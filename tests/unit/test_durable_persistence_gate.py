@@ -511,11 +511,17 @@ def test_privacy_transition_acquires_the_gate_after_the_privacy_lock():
         i for i, l in enumerate(lines)
         if l == "async with persistence_gate.exclusive():"
     ]
-    assert len(lock_entries) == 2 and len(gate_entries) == 2
-    for lock_line, gate_line in zip(lock_entries, gate_entries):
-        assert gate_line == lock_line + 1, (
-            "each branch must take the persistence gate directly inside the "
-            "privacy-transition lock"
+    drain_entries = [
+        i for i, l in enumerate(lines)
+        if l == "await transition_lock.join_owned_native_work()"
+    ]
+    assert len(lock_entries) == len(drain_entries) == len(gate_entries) == 2
+    for lock_line, drain_line, gate_line in zip(
+        lock_entries, drain_entries, gate_entries
+    ):
+        assert drain_line == lock_line + 1 and gate_line == drain_line + 1, (
+            "each branch must drain owned native work inside the privacy lock "
+            "before taking the durable persistence gate"
         )
     conversation = next(
         i for i, l in enumerate(lines)
