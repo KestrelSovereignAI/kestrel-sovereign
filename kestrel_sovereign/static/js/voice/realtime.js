@@ -180,7 +180,7 @@ export async function waitForPlaybackIdle(playbackController, timeoutMs = 2000) 
 
 export function responseAllowsToolDispatch(raw = {}) {
   const status = String(raw.response?.status ?? raw.status ?? '').toLowerCase();
-  return !['cancelled', 'canceled', 'failed', 'incomplete'].includes(status);
+  return status === 'completed';
 }
 
 
@@ -229,7 +229,10 @@ export async function createRealtimeClient({
   const persistedTurnIds = new Set();  // item_ids already sent to /transcript
   const pendingPersists = new Set();   // in-flight /transcript POST promises
   let pendingToolEvents = [];          // tool cards to attach to next assistant turn
-  let pendingToolCalls = [];           // collected until response.done
+  const pendingToolCalls = new Map();  // arguments keyed by ORIGINAL response
+  const cancelledResponses = new Set();
+  let activeResponseId = '';
+  let responseGeneration = 0;
   const userTranscriptTracker = createUserTranscriptTracker();
   let earlyAudioChunks = [];
   let earlyAudioBytes = 0;
@@ -366,6 +369,10 @@ export async function createRealtimeClient({
    */
   function handleProviderEvent(raw) {
     switch (raw.type) {
+      case 'response.created':
+        activeResponseId = raw.response?.id ?? raw.response_id ?? '';
+        responseGeneration += 1;
+        break;
       case 'session.created':
         onEvent(makeEvent(Events.SESSION_READY, {
           session_id: raw.session?.id ?? session?.session_id ?? '',
@@ -377,7 +384,7 @@ export async function createRealtimeClient({
       case 'input_audio_buffer.speech_started':
         // A barge-in abandons the prior response. Completed arguments from
         // that interrupted response must not execute or bleed into the next.
-        pendingToolCalls = [];
+        abandonResponse();
         userTranscriptTracker.speechStarted();
         playback?.flush?.();
         onEvent(makeEvent(Events.LISTENING_STARTED, {}));
@@ -466,32 +473,37 @@ export async function createRealtimeClient({
         break;
       case 'response.done':
         playback?.endOfStream?.();
-        if (pendingToolCalls.length && responseAllowsToolDispatch(raw)) {
-          const calls = pendingToolCalls;
-          pendingToolCalls = [];
+        { const responseId = raw.response?.id ?? raw.response_id;
+        const calls = pendingToolCalls.get(responseId) || [];
+        pendingToolCalls.delete(responseId);
+        if (calls.length && responseAllowsToolDispatch(raw) && !cancelledResponses.has(responseId)) {
           onEvent(makeEvent(Events.TOOL_CALL_BATCH_REQUESTED, {
-            batch_id: raw.response?.id ?? raw.response_id ?? '',
+            batch_id: responseId,
+            response_generation: responseGeneration,
             calls,
           }));
-        } else {
-          pendingToolCalls = [];
-        }
+        } }
         onEvent(makeEvent(Events.SPEAKING_STOPPED, {}));
         onEvent(makeEvent(Events.RESPONSE_DONE, {}));
         break;
 
       case 'response.function_call_arguments.done': {
+        const responseId = raw.response_id;
+        if (!responseId || cancelledResponses.has(responseId)) break;
+        if (!activeResponseId) activeResponseId = responseId;
         let args = {};
         try {
           args = raw.arguments ? JSON.parse(raw.arguments) : {};
         } catch (_err) {
           args = { _raw: raw.arguments ?? '' };
         }
-        pendingToolCalls.push({
+        const calls = pendingToolCalls.get(responseId) || [];
+        calls.push({
           call_id: raw.call_id ?? '',
           name: raw.name ?? '',
           arguments: args,
         });
+        pendingToolCalls.set(responseId, calls);
         break;
       }
 
@@ -736,8 +748,15 @@ export async function createRealtimeClient({
   }
 
   /** Barge-in: abort the in-flight agent response. */
+  function abandonResponse() {
+    responseGeneration += 1;
+    if (activeResponseId) cancelledResponses.add(activeResponseId);
+    for (const id of pendingToolCalls.keys()) cancelledResponses.add(id);
+    pendingToolCalls.clear();
+  }
+
   function cancelResponse() {
-    pendingToolCalls = [];
+    abandonResponse();
     sendJSON({ type: 'response.cancel' });
     playback?.flush?.();
   }
@@ -852,5 +871,6 @@ export async function createRealtimeClient({
     get session() {
       return session;
     },
+    get responseGeneration() { return responseGeneration; },
   };
 }

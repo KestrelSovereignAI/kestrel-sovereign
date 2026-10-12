@@ -138,7 +138,7 @@ test('playback idle wait has a bounded continuation timeout', async () => {
 
 test('cancelled and failed responses never dispatch collected tools', () => {
   assert.equal(responseAllowsToolDispatch({ response: { status: 'completed' } }), true);
-  assert.equal(responseAllowsToolDispatch({}), true); // xAI-compatible absent status
+  assert.equal(responseAllowsToolDispatch({}), false); // absent status is not a completed receipt
   assert.equal(responseAllowsToolDispatch({ response: { status: 'cancelled' } }), false);
   assert.equal(responseAllowsToolDispatch({ response: { status: 'failed' } }), false);
   assert.equal(responseAllowsToolDispatch({ response: { status: 'incomplete' } }), false);

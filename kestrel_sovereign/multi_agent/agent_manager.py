@@ -6370,7 +6370,7 @@ class AgentManager:
                                 [registration_failure, rollback_failure],
                             )
                         if rollback_cancelled:
-                            raise asyncio.CancelledError()
+                            raise execution_terminal_error(registration_failure, asyncio.CancelledError())
                         raise
                     committed = True
                     admission.published = True
@@ -6432,7 +6432,7 @@ class AgentManager:
                                 )
                             )
                             if cleanup_cancelled or rollback_cancelled:
-                                raise asyncio.CancelledError()
+                                raise execution_terminal_error(onboarding_failure, asyncio.CancelledError())
                     else:
                         # The nested load must not close the graph underneath a
                         # signed receipt whose write outcome is ambiguous. The
@@ -6455,13 +6455,14 @@ class AgentManager:
                 raise
         finally:
             if owns_admission:
+                original_failure = sys.exc_info()[1]
                 release_cancelled = await self._release_agent_operations([admission])
                 # Once the agent is fully published, returning cancellation
                 # would report failure while leaving a live agent and a config
                 # handoff that the caller may never persist. The admission is
                 # now terminal, so retain the successful return instead.
                 if release_cancelled and not admission.published:
-                    raise asyncio.CancelledError()
+                    raise execution_terminal_error(original_failure, asyncio.CancelledError())
 
     def _reconcile_spawn_authority_restart_roster(
         self,

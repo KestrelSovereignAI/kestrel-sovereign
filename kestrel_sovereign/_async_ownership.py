@@ -214,6 +214,7 @@ class OwnedAsyncIterator(Generic[_T]):
         # asyncio discards a cancelled task's original exception after its
         # first retrieval. Both the reader and closer need the same evidence.
         self._terminal_error: BaseException | None = None
+        self._terminal_published = False
         self._cancellation_watch_started = False
         self._consumer_close = _ConsumerCloseRecord()
         # The producer runs in a copy of the constructing context in which
@@ -233,6 +234,7 @@ class OwnedAsyncIterator(Generic[_T]):
         # Bound before the producer can run a single step: ``create_task``
         # only schedules it, so no read can observe an unowned record.
         self._consumer_close.owner = self._owner
+        self._owner.add_done_callback(self._publish_owner_completion)
         if owner_started is not None:
             owner_started(self, self._owner)
         self._cancellation_owner = asyncio.create_task(
@@ -246,6 +248,14 @@ class OwnedAsyncIterator(Generic[_T]):
 
     def __aiter__(self) -> "OwnedAsyncIterator[_T]":
         return self
+
+    def _publish_owner_completion(self, _owner: asyncio.Task[None]) -> None:
+        # A native owner can terminate while waiting for privacy admission,
+        # before _run() enters its finally. The blocked reader still needs
+        # the original owner's terminal outcome, never a replacement body.
+        if not self._terminal_published:
+            self._terminal_published = True
+            self._items.put_nowait((_ITERATOR_TERMINAL, None))
 
     @property
     def terminal_error(self) -> BaseException | None:
@@ -444,7 +454,7 @@ class OwnedAsyncIterator(Generic[_T]):
                             )
                             raise self._terminal_error
             finally:
-                self._items.put_nowait((_ITERATOR_TERMINAL, None))
+                self._publish_owner_completion(self._owner)
 
     async def aclose(self) -> None:
         """Stop producing and join the source iterator's owner task."""

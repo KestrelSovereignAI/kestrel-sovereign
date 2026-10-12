@@ -21,6 +21,8 @@ import httpx
 
 from kestrel_sovereign.a2a.transport_auth import A2A_TRANSPORT_KEY_HEADER
 from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    ExecutionCommitOutcomeError,
     ExecutionCustody,
     close_native_execution_stream,
     execution_work_operation,
@@ -313,6 +315,19 @@ class LocalHostPeerDirectory:
     @staticmethod
     def _raise_for_route_status(response: Any, *, action: str) -> None:
         status_code = response.status_code
+        if status_code >= 400:
+            try:
+                payload = response.json()
+            except (TypeError, ValueError):
+                payload = None
+            error = payload.get("error") if isinstance(payload, Mapping) else None
+            if isinstance(error, Mapping) and error.get("code") == "execution_control":
+                details = error.get("details")
+                outcome = (details[0].get("commit_outcome") if isinstance(details, list)
+                    and len(details) == 1 and isinstance(details[0], Mapping) else None)
+                if isinstance(outcome, str) and outcome in {"unknown", "committed"}:
+                    raise ExecutionCommitOutcomeError(outcome)
+                raise ExecutionAuthorityError("peer execution stopped; reconcile before continuing")
         if status_code == 404:
             raise PeerNotFoundError("Peer is not in the automatic directory")
         if status_code == 503:

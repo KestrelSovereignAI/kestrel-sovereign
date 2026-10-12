@@ -211,7 +211,8 @@ test(`Stop reaches partially acquired native ${factory} while ${mode} worklet HT
 }
 }
 
-test('Stop during native tool authentication cannot dispatch the captured session batch', { timeout: 30000 }, async () => {
+for (const interruption of ['Stop', 'Barge-in']) {
+test(`${interruption} during native tool authentication cannot dispatch the captured session batch`, { timeout: 30000 }, async () => {
   await nativeVoice(async ({ page, toolPosts, releaseBatch }) => {
     await page.evaluate(async () => {
       const { default: API } = await import('/js/api.js');
@@ -231,7 +232,10 @@ test('Stop during native tool authentication cannot dispatch the captured sessio
       ] });
     });
     await page.waitForFunction(() => window.authEntered);
-    await page.evaluate(() => window.voiceUI.surfaceFatalError(new Error('operator Stop'), window.uiSession));
+    await page.evaluate(interruption => {
+      if (interruption === 'Stop') window.voiceUI.surfaceFatalError(new Error('operator Stop'), window.uiSession);
+      else window.client.cancelResponse();
+    }, interruption);
     await page.evaluate(() => window.releaseAuth());
     await page.waitForTimeout(150);
     if (toolPosts()) releaseBatch({ results: [{ call_id: 'original', result: { text: 'offline' } }] });
@@ -239,6 +243,7 @@ test('Stop during native tool authentication cannot dispatch the captured sessio
     assert.equal(toolPosts(), 0, 'authentication completion dispatched a retired session tool batch');
   });
 });
+}
 
 test('obsolete native microphone startup cannot close the replacement UI session', { timeout: 30000 }, async () => {
   await nativeVoice(async ({ page }) => {

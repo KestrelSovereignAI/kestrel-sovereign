@@ -3530,6 +3530,33 @@ class ConstitutionMixin:
                 return safe_mode_cognition_block(self, user_input)
         return None
 
+    async def require_cognition_admission(self):
+        """Read-only canonical admission for external realtime cognition.
+
+        This does not run an auditor, mint a new turn, repair an anchor, or
+        authorize delayed future work. The caller must retain its original
+        execution/privacy span across composition and native dispatch.
+        """
+        from kestrel_sovereign.execution_custody import ExecutionAuthorityError, is_execution_control_error
+        from kestrel_sovereign.constitution.genesis_audit import GENESIS_AUDIT_PASSED, validate_completed_genesis_audit
+        try:
+            async with ConstitutionMixin._constitution_state_guard(self):
+                store = vars(self).get("_constitution_state_store")
+                if store is None:
+                    raise RuntimeError("Native constitutional runtime custody is unavailable")
+                state, digest, receipt = await ConstitutionMixin._locked_turn_governance(self, store)
+                if (state is None or not state.generation or state.safe_mode or state.bootstrap_pending
+                    or state.last_successful_audit_at is None or state.interaction_count >= self.AUDIT_INTERVAL
+                    or ConstitutionMixin._constitution_time_audit_due(self._constitution_now(), state.last_successful_audit_at)
+                    or (state.revision, state.generation) != (self._constitution_state_revision, self._constitution_state_generation)
+                    or not isinstance(receipt, Mapping)
+                    or validate_completed_genesis_audit(receipt, digest) != GENESIS_AUDIT_PASSED):
+                    raise RuntimeError("Native constitutional cognition admission is not ready")
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            raise ExecutionAuthorityError("constitutional cognition admission refused") from error
+
     async def _locked_turn_governance(self, store):
         """Capture one native runtime/graph snapshot, never mixed revisions.
 

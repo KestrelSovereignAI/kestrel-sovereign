@@ -991,7 +991,12 @@ async def reanchor_constitution(
             governance_preflight=governance_preflight,
         )
     except Exception as exc:  # noqa: BLE001 — surface the underlying error verbatim
-        from kestrel_sovereign.execution_custody import execution_commit_outcome
+        from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
+
+        if is_execution_control_error(exc):
+            # Keep the exact committed/unknown receipt AND its retained native
+            # owner. A printable error result cannot carry lifecycle custody.
+            raise
 
         outcome = execution_commit_outcome(exc)
         logger.exception(
@@ -1585,20 +1590,54 @@ async def _agent_embedding(
     from kestrel_sovereign.cli_embeddings import resolve_agent_embedding
 
     resolution = await resolve_agent_embedding(db, agent_did)
+    body_error = None
     try:
         yield resolution
+    except BaseException as error:
+        body_error = error
+        raise
     finally:
         if resolution.llm_service is not None:
-            try:
-                await resolution.llm_service.close()
-            except Exception:  # noqa: BLE001 — cleanup after the outcome is decided
-                # This runs after the caller's transaction has committed or
-                # rolled back. Raising here would report a committed reanchor
-                # as failed, or replace the error that rolled one back.
-                logger.warning(
-                    "Could not close the embedding LLM service after the "
-                    "reanchor of %s.", agent_did, exc_info=True,
+            from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+            from kestrel_sovereign.execution_custody import (
+                ExecutionCommitOutcomeError, execution_terminal_error,
+            )
+
+            service = resolution.llm_service
+            async def retire():
+                close_error = None
+                try:
+                    await service.close()
+                except BaseException as error:
+                    close_error = error
+                # A bounded close is not physical retirement. Join the SAME
+                # retained native owners before borrowed transaction storage
+                # is closed, without retrying any provider or reanchor effect.
+                pending = getattr(service, "has_pending_close_owners", None)
+                if callable(pending) and pending():
+                    try:
+                        await service.wait_for_close_completion()
+                    except BaseException as error:
+                        close_error = execution_terminal_error(close_error, error)
+                if close_error is not None:
+                    raise close_error
+
+            closer = create_owned_task(retire())
+            outcome = await await_owned_task(closer)
+            cleanup = execution_terminal_error(outcome.error, outcome.cancellation)
+            if cleanup is not None:
+                # The embedding span surrounds the caller's transaction. A
+                # successful body is a committed repair, NOT retry permission.
+                if body_error is None:
+                    terminal = ExecutionCommitOutcomeError("committed")
+                    terminal.__cause__ = cleanup
+                else:
+                    terminal = execution_terminal_error(body_error, cleanup)
+                terminal._kestrel_native_retirement_debts = (
+                    *getattr(terminal, "_kestrel_native_retirement_debts", ()),
+                    (service, closer),
                 )
+                raise terminal
 
 
 async def _reindex_constitution_rag(

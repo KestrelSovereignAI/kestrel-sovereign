@@ -1345,6 +1345,10 @@ async function handleToolBatch(session, ev) {
     return;
   }
   const sessionId = sessionClient.session.session_id;
+  const responseGeneration = ev.response_generation ?? sessionClient.responseGeneration;
+  const originalResponseIsLive = () => (
+    session.client === sessionClient && sessionClient.responseGeneration === responseGeneration
+  );
   const calls = Array.isArray(ev.calls) ? ev.calls : [];
   if (!calls.length) return;
 
@@ -1379,8 +1383,8 @@ async function handleToolBatch(session, ev) {
     const authHeaders = await voiceAuthHeaders();
     // Authentication can outlive Stop or a replacement session. Never send
     // a tool effect using that retired session's freshly completed token.
-    if (session.client !== sessionClient) {
-      await sessionClient.close();
+    if (!originalResponseIsLive()) {
+      if (session.client !== sessionClient) await sessionClient.close();
       return;
     }
     const resp = await fetch(buildAgentUrlForAgent(
@@ -1433,12 +1437,14 @@ async function handleToolBatch(session, ev) {
   // If the session ended while we were awaiting the dispatch, the model is
   // gone and there's nowhere to commit. Drop silently — the model already
   // closed.
-  if (sessionClient !== session.client) {
+  if (!originalResponseIsLive()) {
     console.info('[voice/ui] session ended before tool result; dropping commit');
     // Losing the UI pointer is not physical retirement. A fatal RTC error
     // may clear it while the request is still pending; retire the captured
     // original client, never a subsequently-created replacement session.
-    try { await sessionClient.close(); } catch (_) {}
+    if (sessionClient !== session.client) {
+      try { await sessionClient.close(); } catch (_) {}
+    }
     return;
   }
 

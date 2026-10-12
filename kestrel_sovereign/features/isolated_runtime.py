@@ -32,6 +32,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 import time
 import weakref
@@ -1817,8 +1818,12 @@ class _TrafficGate:
         try:
             yield
         finally:
+            original = sys.exc_info()[1]
             release = asyncio.create_task(self._release_admission())
-            await _await_task_until_complete(release, preserve_cancellation=False)
+            try:
+                await _await_task_until_complete(release, preserve_cancellation=False)
+            except BaseException as cleanup:
+                raise execution_terminal_error(original, cleanup)
 
 
 _HOST_INGRESS_SUCCESS = "success"
@@ -1827,6 +1832,7 @@ _HOST_INGRESS_UNSUPPORTED = "unsupported"
 _HOST_INGRESS_UNKNOWN_NAME = "unknown-name"
 _HOST_INGRESS_TERMINAL = "terminal"
 _HOST_INGRESS_CANCELLED = "cancelled"
+_HOST_INGRESS_CONTROL = "execution-control"
 
 # A valid JSON tree whose encoded form fits the SDK's 64 KiB wire limit can
 # contain at most this many nodes: a flat list of one-character JSON scalars
@@ -1858,6 +1864,17 @@ class _HostIngressOutcome:
 
     status: str
     payload: HostIngressPayload = field(default=None, repr=False)
+    commit_outcome: str | None = None
+
+
+def _redacted_host_ingress_error(error: BaseException) -> _HostIngressOutcome:
+    # Only canonical non-sensitive classifications cross the private boundary;
+    # no native exception, traceback, request payload or provider prose escapes.
+    if is_execution_control_error(error):
+        return _HostIngressOutcome(_HOST_INGRESS_CONTROL,
+            commit_outcome=execution_commit_outcome(error))
+    return _HostIngressOutcome(_HOST_INGRESS_CANCELLED if isinstance(error, asyncio.CancelledError)
+        else _HOST_INGRESS_GENERIC_FAILURE)
 
 
 @dataclass
@@ -2208,7 +2225,7 @@ async def _wait_for_host_ingress_operation(
         # slot held by its public caller.
         outcome_slot.take()
         outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
-    if caller_cancel_args is not None:
+    if caller_cancel_args is not None and outcome.status != _HOST_INGRESS_CONTROL:
         # A completed worker can carry a successful response even though a
         # caller cancellation won while its shield was being drained.  Never
         # return that response through the public cancellation path: exception
@@ -2224,6 +2241,10 @@ def _deliver_host_ingress_outcome(
 ) -> HostIngressPayload:
     """Raise public errors from a frame that has no request/client locals."""
 
+    if outcome.status == _HOST_INGRESS_CONTROL:
+        if outcome.commit_outcome is not None:
+            raise ExecutionCommitOutcomeError(outcome.commit_outcome)
+        raise ExecutionAuthorityError("host ingress execution authority retired")
     if caller_cancel_args is not None:
         raise asyncio.CancelledError(*caller_cancel_args)
     if outcome.status == _HOST_INGRESS_SUCCESS:
@@ -11931,16 +11952,13 @@ class ProxyFeature(Feature):
 
         try:
             try:
+                require_execution_work(self.agent)
                 result = await _maybe_await(call(request.name, request.payload))
-            except asyncio.CancelledError:
-                outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
-                return
-            except BaseException:  # noqa: BLE001 - external RPC boundary redaction
+                require_execution_work(self.agent)
+            except BaseException as error:  # noqa: BLE001 - external RPC boundary redaction
                 # The SDK/custom-client boundary is untrusted. Do not retain its
                 # exception object or its potentially secret-bearing message.
-                outcome_slot.outcome = _HostIngressOutcome(
-                    _HOST_INGRESS_GENERIC_FAILURE
-                )
+                outcome_slot.outcome = _redacted_host_ingress_error(error)
                 return
             try:
                 # A custom facade must not be able to return a mutable or subclass
@@ -11950,12 +11968,8 @@ class ProxyFeature(Feature):
                     _HOST_INGRESS_SUCCESS,
                     _snapshot_host_ingress_payload(result),
                 )
-            except asyncio.CancelledError:
-                outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
-            except BaseException:  # noqa: BLE001 - external response boundary redaction
-                outcome_slot.outcome = _HostIngressOutcome(
-                    _HOST_INGRESS_GENERIC_FAILURE
-                )
+            except BaseException as error:  # noqa: BLE001 - external response boundary redaction
+                outcome_slot.outcome = _redacted_host_ingress_error(error)
         finally:
             # This worker may survive a caller cancellation. Drop every
             # request/client-adjacent reference as soon as the RPC settles;
@@ -11974,9 +11988,11 @@ class ProxyFeature(Feature):
 
         try:
             while True:
+                require_execution_work(self.agent)
                 wake_idle = False
                 completed_call = False
                 async with self._traffic_gate.admit():
+                    require_execution_work(self.agent)
                     client = self._client
                     if client is None and self._idle_retired:
                         wake_idle = True
@@ -11988,15 +12004,8 @@ class ProxyFeature(Feature):
                     else:
                         try:
                             capabilities = self._host_ingress_capabilities()
-                        except asyncio.CancelledError:
-                            outcome_slot.outcome = _HostIngressOutcome(
-                                _HOST_INGRESS_CANCELLED
-                            )
-                            return
-                        except BaseException:  # noqa: BLE001 - untrusted capability facade
-                            outcome_slot.outcome = _HostIngressOutcome(
-                                _HOST_INGRESS_GENERIC_FAILURE
-                            )
+                        except BaseException as error:  # noqa: BLE001 - untrusted capability facade
+                            outcome_slot.outcome = _redacted_host_ingress_error(error)
                             return
                         if capabilities is None:
                             outcome_slot.outcome = _HostIngressOutcome(
@@ -12011,15 +12020,8 @@ class ProxyFeature(Feature):
 
                         try:
                             call = getattr(client, "call_host_ingress", None)
-                        except asyncio.CancelledError:
-                            outcome_slot.outcome = _HostIngressOutcome(
-                                _HOST_INGRESS_CANCELLED
-                            )
-                            return
-                        except BaseException:  # noqa: BLE001 - untrusted descriptor boundary
-                            outcome_slot.outcome = _HostIngressOutcome(
-                                _HOST_INGRESS_GENERIC_FAILURE
-                            )
+                        except BaseException as error:  # noqa: BLE001 - untrusted descriptor boundary
+                            outcome_slot.outcome = _redacted_host_ingress_error(error)
                             return
                         if not callable(call):
                             outcome_slot.outcome = _HostIngressOutcome(
@@ -12035,19 +12037,20 @@ class ProxyFeature(Feature):
                             self._record_runtime_activity()
                         completed_call = True
                 if completed_call:
+                    require_execution_work(self.agent)
                     self._schedule_runtime_telemetry()
                     return
                 if wake_idle:
                     await self._wake_idle_runtime()
         except (_TrafficGateTerminalError, _TerminalLifecyclePermitRevoked):
             outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_TERMINAL)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             # The public caller shields this worker, so a cancellation here is
             # child/runtime-originated and must remain distinguishable from the
             # caller cancellation handled by ``_wait_for_host_ingress_operation``.
-            outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
-        except BaseException:  # noqa: BLE001 - no internal traceback may escape
-            outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
+            outcome_slot.outcome = _redacted_host_ingress_error(error)
+        except BaseException as error:  # noqa: BLE001 - no internal traceback may escape
+            outcome_slot.outcome = _redacted_host_ingress_error(error)
         finally:
             call = None
             capabilities = None

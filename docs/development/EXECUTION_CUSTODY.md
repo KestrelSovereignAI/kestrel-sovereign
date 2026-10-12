@@ -15,6 +15,25 @@ tags:
 Core issue #3569 extends existing PostgreSQL advisory and native transaction
 custody. This is a host authority contract, not a causation-derived permission.
 
+Native response retirement retains each failed resource and its original close
+task even when the SDK has already set an optimistic closed flag. Repeated
+shutdown joins that task; it does not retry the close or erase unresolved debt.
+Ordinary caller cancellation after a successful close is not cleanup failure.
+Cold initialization, ingress release and reanchor cleanup preserve original
+unknown/committed receipts ahead of cancellation. HTTP peer envelopes and
+private ingress redaction carry only safe control/outcome classifications, not
+private provider prose. Scheduler telemetry harvests cause-bearing cancelled
+receipts before releasing the publisher task and latches them for readiness.
+
+Stream lifecycle inheritance requires the actual constructing producer task;
+a copied ContextVar in a sibling cannot confer privacy-frame reentry. Text
+taps retain the original producer agent, admission scopes and request generation.
+A TTS consumer cannot substitute its own agent or a replacement request with the
+same opaque ID. Waiting for tapped text holds no privacy mutex; each native
+synthesis validates original producer custody and fresh privacy policy. Direct
+realtime cognition admission reads durable constitutional restrictions and the
+completed hash-bound governance receipt before minting a session.
+
 `PostgresBackend.advisory_locks(..., on_loss=callback)` yields an exact-session
 `AdvisoryLease` (or `None` for an empty, unobserved exclusion set). Registering
 the callback is part of acquisition. `require_live()` rejects physical session

@@ -99,33 +99,53 @@ def retained_execution_error(error: BaseException) -> BaseException:
     return error
 
 
+def execution_cleanup_debts(error: BaseException | None) -> tuple:
+    """Actual failed native closers, distinct from ordinary provider errors."""
+    debts = []
+    if error is not None:
+        for carrier in _explicit_control_chain(error):
+            for debt in vars(carrier).get("_kestrel_native_retirement_debts", ()):
+                if not any(debt[0] is prior[0] and debt[1] is prior[1] for prior in debts):
+                    debts.append(debt)
+    return tuple(debts)
+
+
 def execution_terminal_error(*errors: BaseException | None) -> BaseException | None:
     """Keep irreversible control evidence ahead of cancellation/cleanup noise."""
     import asyncio
     present = tuple(error for error in errors if error is not None)
+    def retain(selected):
+        debts = []
+        for error in present:
+            for debt in execution_cleanup_debts(error):
+                if not any(debt[0] is prior[0] and debt[1] is prior[1] for prior in debts):
+                    debts.append(debt)
+        if debts:
+            selected._kestrel_native_retirement_debts = tuple(debts)
+        return selected
     for outcome in ("unknown", "committed"):
         for error in present:
             if execution_commit_outcome(error) == outcome:
-                return retained_execution_error(error)
+                return retain(retained_execution_error(error))
     for error in present:
         if is_execution_control_error(error):
-            return retained_execution_error(error)
+            return retain(retained_execution_error(error))
     for error in present:
         # OwnedAsyncIterator carries source cleanup debt as the explicit cause
         # of cancellation. A failed checkpoint is not a successful Stop.
         if isinstance(error, asyncio.CancelledError) and error.__cause__ is not None:
-            return error.__cause__
+            return retain(error.__cause__)
     if present and isinstance(present[0], GeneratorExit):
         # GeneratorExit is the source's ordinary close request, not caller
         # cancellation. A later cancellation while joining that close must
         # still reach the closer after cleanup settles. Control evidence was
         # already selected above, so it cannot be demoted by this rule.
-        return next((error for error in present[1:] if not isinstance(error, GeneratorExit)), present[0])
+        return retain(next((error for error in present[1:] if not isinstance(error, GeneratorExit)), present[0]))
     if present and isinstance(present[0], (asyncio.CancelledError, GeneratorExit)):
         for error in present[1:]:
             if not isinstance(error, (asyncio.CancelledError, GeneratorExit)):
-                return error
-    return present[0] if present else None
+                return retain(error)
+    return retain(present[0]) if present else None
 
 
 class ExecutionFence(Protocol):
@@ -517,7 +537,15 @@ def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None
             with bind_execution_cleanup(owner, captured):
                 task = asyncio.create_task(native_close())
         outcome = await await_owned_task(task)
+        if outcome.error is not None:
+            outcome.error._kestrel_native_retirement_debts = (
+                *getattr(outcome.error, "_kestrel_native_retirement_debts", ()),
+                (response, task),
+            )
         if outcome.error is not None or outcome.cancellation is not None:
+            if (outcome.error is None and outcome.cancellation is not None
+                and (original is None or not is_execution_control_error(original))):
+                raise outcome.cancellation
             raise execution_terminal_error(original, outcome.error, outcome.cancellation)
 
     response.extensions["kestrel.native_close_owner"] = joined_close
@@ -625,8 +653,18 @@ async def close_native_execution_stream(stream: Any, owner: Any = None) -> None:
             result = close()
             if inspect.isawaitable(result):
                 await result
-    outcome = await await_owned_task(asyncio.create_task(owned_close()))
+    close_task = asyncio.create_task(owned_close())
+    outcome = await await_owned_task(close_task)
+    if outcome.error is not None:
+        # Keep the exact failed attempt reachable even if the native SDK has
+        # already set an optimistic "closed" flag. Never retry that closer.
+        outcome.error._kestrel_native_retirement_debts = (
+            *getattr(outcome.error, "_kestrel_native_retirement_debts", ()),
+            (stream, close_task),
+        )
     if outcome.error is not None or outcome.cancellation is not None:
+        if outcome.error is None and outcome.cancellation is not None and not is_execution_control_error(original):
+            raise outcome.cancellation
         raise execution_terminal_error(original, outcome.error, outcome.cancellation)
 
 
@@ -641,6 +679,7 @@ class NativeExecutionStreamOwner:
     def __init__(self):
         self.handles = []
         self.control = None
+        self.retirement_error = None
 
     def retain(self, handle):
         if not any(handle is existing for existing in self.handles):
@@ -650,13 +689,33 @@ class NativeExecutionStreamOwner:
     async def close(self, original=None):
         # SDKs can wrap a hook's original denial as APIConnectionError. The
         # physical response owner retains the exact pre-normalization receipt.
-        terminal = execution_terminal_error(self.control, original)
-        for handle in reversed(self.handles):
+        terminal = execution_terminal_error(self.control, original, self.retirement_error)
+        if self.retirement_error is not None:
+            terminal._kestrel_native_retirement_owner = self
+            raise terminal
+        for handle in reversed(tuple(self.handles)):
             try:
                 await close_native_execution_stream(handle)
             except BaseException as error:
-                terminal = execution_terminal_error(terminal, error)
-        self.handles.clear()
+                if execution_cleanup_debts(error):
+                    self.retirement_error = execution_terminal_error(self.retirement_error, error)
+                    terminal = execution_terminal_error(terminal, error)
+                else:
+                    # Caller cancellation AFTER a successful physical close is
+                    # a request receipt, not failed transport retirement. Keep
+                    # canonical original control; an ordinary SDK status error
+                    # must not mask this later observer cancellation.
+                    self.handles[:] = [retained for retained in self.handles if retained is not handle]
+                    if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(terminal):
+                        terminal = error
+                    else:
+                        terminal = execution_terminal_error(terminal, error)
+            else:
+                self.handles[:] = [retained for retained in self.handles if retained is not handle]
+        if self.retirement_error is not None:
+            # The exception's original native close task owns failed handles;
+            # this request owner also keeps its inventory for later shutdown.
+            terminal._kestrel_native_retirement_owner = self
         if terminal is not None and (terminal is not original or original is None):
             raise terminal
 
@@ -850,7 +909,7 @@ class ExecutionStreamLifecycle:
     require_work: Callable
 
 
-_STREAM_LIFECYCLE: ContextVar[ExecutionStreamLifecycle | None] = ContextVar("execution_stream_lifecycle", default=None)
+_STREAM_LIFECYCLE: ContextVar[tuple[asyncio.Task, ExecutionStreamLifecycle] | None] = ContextVar("execution_stream_lifecycle", default=None)
 
 
 class _ExecutionForwarder:
@@ -882,7 +941,10 @@ class _ExecutionForwarder:
         # A deferred HTTP response may never be consumed at all.
         self._owner_context = context
         self._iterator = None
-        self._lifecycle = lifecycle if lifecycle is not None else _STREAM_LIFECYCLE.get()
+        inherited = _STREAM_LIFECYCLE.get()
+        self._lifecycle = lifecycle if lifecycle is not None else (
+            inherited[1] if inherited is not None and inherited[0] is asyncio.current_task() else None
+        )
 
     def __aiter__(self):
         return self
@@ -923,7 +985,9 @@ class _ExecutionForwarder:
 
     async def _produce(self):
         error = None
-        lifetime_token = _STREAM_LIFECYCLE.set(self._lifecycle)
+        lifetime_token = _STREAM_LIFECYCLE.set(
+            None if self._lifecycle is None else (asyncio.current_task(), self._lifecycle)
+        )
         try:
             with self._turn_scope.bind(), _bind_stream_cleanup((self._cleanup_state,)):
                 while True:

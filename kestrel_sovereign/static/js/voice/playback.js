@@ -41,6 +41,11 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400,
   function requireActive() {
     if (retired) throw new Error('Audio playback retired during initialization');
   }
+  function pushToWorklet(uint8) {
+    // uint8 is a PCM16 view (even byte count).
+    const copy = new Uint8Array(uint8);
+    node.port.postMessage({ type: 'push', pcm: copy.buffer }, [copy.buffer]);
+  }
   const owner = {
     enqueue(uint8) {
       if (retired || !uint8 || uint8.byteLength === 0) return;
@@ -109,12 +114,6 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400,
       resolveIdleWaiters();
     }
   };
-
-  function pushToWorklet(uint8) {
-    // uint8 is a PCM16 view (even byte count).
-    const copy = new Uint8Array(uint8);
-    node.port.postMessage({ type: 'push', pcm: copy.buffer }, [copy.buffer]);
-  }
 
   return owner;
   } catch (error) {

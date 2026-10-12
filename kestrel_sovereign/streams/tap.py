@@ -24,12 +24,34 @@ Usage::
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import AsyncIterator, Optional
+
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError, ExecutionCustody,
+    bind_execution_custody_snapshot, current_execution_custody,
+)
 
 logger = logging.getLogger(__name__)
 
 # Sentinel object that signals the stream is complete.
 _STREAM_DONE = object()
+
+
+@dataclass(frozen=True)
+class _TapRequestFence:
+    owner: object
+    request_id: str
+    generation: int
+    backend_type = None
+
+    def require_work(self):
+        if (self.generation not in self.owner._active_generations_for_request(self.request_id)
+            or (self.request_id, self.generation) in self.owner._cancelled_request_generations):
+            raise ExecutionAuthorityError("original stream tap request generation retired")
+
+    async def lock_and_validate(self, connection):
+        self.require_work()
 
 
 class AgentStreamTap:
@@ -42,6 +64,7 @@ class AgentStreamTap:
 
     def __init__(self) -> None:
         self._queues: dict[str, asyncio.Queue] = {}
+        self._producers: dict[str, tuple[object, tuple[ExecutionCustody, ...]]] = {}
 
     @classmethod
     def get_instance(cls) -> "AgentStreamTap":
@@ -56,10 +79,28 @@ class AgentStreamTap:
 
     # ---- Producer API ----
 
-    def register(self, delivery_id: str) -> None:
+    def register(self, delivery_id: str, *, owner=None, request_id: str | None = None) -> None:
         """Create a queue for one server-owned stream delivery."""
         if delivery_id not in self._queues:
             self._queues[delivery_id] = asyncio.Queue()
+            if owner is not None:
+                scopes = current_execution_custody(owner)
+                if request_id is not None:
+                    generation = owner._request_generation_for_current_task(request_id)
+                    if generation is None:
+                        self._queues.pop(delivery_id)
+                        raise ExecutionAuthorityError("stream tap producer has no original request generation")
+                    scopes += (ExecutionCustody(_TapRequestFence(owner, request_id, generation)),)
+                self._producers[delivery_id] = (owner, scopes)
+
+    def producer_custody(self, delivery_id: str, owner) -> tuple[ExecutionCustody, ...]:
+        """Only the same agent may consume this original producer admission."""
+        producer = self._producers.get(delivery_id)
+        if producer is None or producer[0] is not owner:
+            raise ExecutionAuthorityError("stream tap is not owned by this agent")
+        with bind_execution_custody_snapshot(producer[1]):
+            pass
+        return producer[1]
 
     async def publish(self, delivery_id: str, text_chunk: str) -> None:
         """Push a text chunk to subscribers of one stream delivery."""
@@ -76,6 +117,7 @@ class AgentStreamTap:
     def unregister(self, delivery_id: str) -> None:
         """Remove the queue for one completed stream delivery."""
         self._queues.pop(delivery_id, None)
+        self._producers.pop(delivery_id, None)
 
     def has_stream(self, delivery_id: str) -> bool:
         """Check whether a stream delivery has an active tap."""
@@ -84,7 +126,7 @@ class AgentStreamTap:
     # ---- Consumer API ----
 
     async def subscribe(
-        self, delivery_id: str, timeout: float = 30.0
+        self, delivery_id: str, timeout: float = 30.0, *, owner=None,
     ) -> AsyncIterator[str]:
         """Yield text chunks as they arrive for *request_id*.
 
@@ -99,9 +141,12 @@ class AgentStreamTap:
         if queue is None:
             logger.warning("No active stream for delivery_id=%s", delivery_id)
             return
+        producer = self.producer_custody(delivery_id, owner) if owner is not None else ()
 
         try:
             while True:
+                with bind_execution_custody_snapshot(producer):
+                    pass
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=timeout)
                 except asyncio.TimeoutError:
@@ -111,6 +156,8 @@ class AgentStreamTap:
                     break
                 if item is _STREAM_DONE:
                     break
+                with bind_execution_custody_snapshot(producer):
+                    pass
                 yield item
         finally:
             # Consumer done — clean up only if no other subscribers

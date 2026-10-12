@@ -1238,7 +1238,10 @@ class RestartCoordinatorFeature(Feature):
                     "authority": "required",
                 },
             )
-        except TransactionError:
+        except TransactionError as error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(error):
+                raise
             return ToolResult.failed(
                 "Restart authority acknowledgement did not commit atomically",
                 data={

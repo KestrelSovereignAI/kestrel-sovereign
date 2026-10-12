@@ -948,7 +948,7 @@ async def stream_agent_response(request: Request):
         # server-owned id prevents concurrent response streams from publishing
         # into or closing each other's tap queue.
         stream_delivery_id = new_stream_delivery_id()
-        stream_tap.register(stream_delivery_id)
+        stream_tap.register(stream_delivery_id, owner=agent, request_id=request_id)
         stream_tap_registered = True
 
         # Pre-resolve the effective session_id and surface it via a

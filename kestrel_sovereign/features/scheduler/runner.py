@@ -1650,6 +1650,15 @@ class SchedulerRunner:
                 last_error_type=self._last_worker_error_type,
             )
 
+    def _harvest_runtime_status_publication(self, task):
+        """Keep a cancelled native receipt before releasing its task graph."""
+        error = owned_task_error(task)
+        if not getattr(task, "_kestrel_status_control_harvested", False):
+            task._kestrel_status_control_harvested = True
+            if error is not None and is_execution_control_error(error):
+                self._latch_protocol_failure(error)
+        return error
+
     async def _publish_runtime_status_best_effort(
         self,
         worker_state: Optional[str] = None,
@@ -1681,6 +1690,7 @@ class SchedulerRunner:
                                 wait_seconds,
                             )
                             return
+                    self._harvest_runtime_status_publication(pending)
                     self._runtime_status_publish_task = None
 
                 remaining = deadline - loop.time()
@@ -1694,9 +1704,7 @@ class SchedulerRunner:
                 self._runtime_status_publish_task = publish_task
 
                 def _publish_done(task: asyncio.Task) -> None:
-                    if task.cancelled():
-                        return
-                    error = task.exception()
+                    error = self._harvest_runtime_status_publication(task)
                     if error is not None:
                         logger.warning(
                             "SchedulerRunner %s could not publish %s state",
@@ -1712,6 +1720,7 @@ class SchedulerRunner:
                     timeout=wait_seconds,
                 )
                 if done:
+                    self._harvest_runtime_status_publication(publish_task)
                     self._runtime_status_publish_task = None
                 else:
                     logger.warning(
@@ -1750,14 +1759,15 @@ class SchedulerRunner:
                     deadline=deadline,
                 )
                 await self._join_runtime_status_publish_task(deadline=deadline)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             publish_task = self._runtime_status_publish_task
             if publish_task is not None and not publish_task.done():
                 publish_task.cancel()
                 await await_owned_task(publish_task)
+            error = self._harvest_runtime_status_publication(publish_task) if publish_task is not None else None
             if self._runtime_status_publish_task is publish_task:
                 self._runtime_status_publish_task = None
-            raise
+            raise execution_terminal_error(error, cancellation)
 
     async def _join_runtime_status_publish_task(self, *, deadline: float) -> bool:
         """Join one publish for a bounded interval, then cancel as a last resort."""
@@ -1783,6 +1793,7 @@ class SchedulerRunner:
                 )
                 publish_task.cancel()
                 outcome = await await_owned_task(publish_task)
+                self._harvest_runtime_status_publication(publish_task)
                 if self._runtime_status_publish_task is publish_task:
                     self._runtime_status_publish_task = None
                 if outcome.cancellation is not None:
@@ -1790,6 +1801,7 @@ class SchedulerRunner:
                 return False
 
         outcome = await await_owned_task(publish_task)
+        self._harvest_runtime_status_publication(publish_task)
         if self._runtime_status_publish_task is publish_task:
             self._runtime_status_publish_task = None
         if outcome.cancellation is not None:
