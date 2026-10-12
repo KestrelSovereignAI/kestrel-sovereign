@@ -51,7 +51,11 @@ from .adapter import (
     provider_usage_cost,
     response_usage_available,
 )
-from .output_ceiling import IncompleteGenerationError, response_stop_reason
+from .output_ceiling import (
+    IncompleteGenerationError,
+    reported_usage,
+    response_stop_reason,
+)
 from .generation_gate import UnfinishedAfterInlineToolsError
 from .model_discovery import ModelDiscoveryMixin
 from .mandate import ModelMandateMixin
@@ -3968,7 +3972,10 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         ``require_completion`` holds the attempt to the generation gate
         (#3552) before it is finalized. A response the gate rejects is
         recorded as a failed attempt, with the usage its provider reported,
-        and the gate's failure is raised in its place (#3576).
+        and the gate's failure is raised in its place (#3576). A call whose
+        adapter refused an unfinished generation itself raises with the usage
+        its provider reported on the error, and is recorded with that usage
+        (#3577).
         """
 
         def recorded_error(error: Exception) -> Exception:
@@ -3984,6 +3991,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             # the historical cancellation contract and do not fabricate a row.
             raise
         except Exception as exc:
+            reported = reported_usage(exc)
+            usage_available = response_usage_available(reported)
             await self._finalize_failed_invocation(
                 provider_name,
                 model,
@@ -3998,6 +4007,12 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 force_local_only=force_local_only,
                 metadata=metadata,
                 tools_used=tools_used,
+                response=reported,
+                usage_available=usage_available,
+                track_model_usage=usage_available,
+                # The provider served and billed the tokens it reported; only
+                # the adapter refused the unfinished answer.
+                meter_usage=usage_available,
             )
             raise
 
