@@ -206,11 +206,11 @@ def test_a_fractional_boundary_is_not_rounded_into_a_row_it_excludes():
 
     Stored values are whole seconds — no writer produces a fraction and #3009's
     migration truncates them — but a caller's BOUNDARY may carry one, and the
-    canonical spelling would round it down. ``purge_all_since`` compares
-    ``>=``, so a boundary of ``12:00:00.500`` truncated to ``12:00:00`` starts
-    selecting the row stamped ``12:00:00``, which predates it, and PERMANENTLY
-    deletes it. PostgreSQL keeps the fraction, so the two backends would also
-    disagree about what a purge destroys.
+    canonical spelling would round it down. A ``>=`` boundary of
+    ``12:00:00.500`` truncated to ``12:00:00`` starts selecting the row stamped
+    ``12:00:00``, which may predate it. PostgreSQL keeps the fraction, so the
+    two backends would also disagree about what matches. (The EPHEMERAL leak
+    sweep floors on purpose instead, through ``canonical_created_at``: #3227.)
 
     Asked of the real predicate rather than of the formatting, because it is
     the comparison that decides which rows die.

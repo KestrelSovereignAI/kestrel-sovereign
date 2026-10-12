@@ -236,19 +236,28 @@ class RoutingResolution:
     authorization computed by the SAME resolution pass. The streaming/dispatch
     loops read ``resolution.meta`` instead of re-deriving authorization in a
     parallel ``resolve_routing_meta`` that could drift.
+
+    :attr:`mandate_pin` is True when the routes and target model came from the
+    agent's persisted mandate (a ``{vendor, model, route?}`` preference with a
+    vendor, matched to available routes) rather than from an override or the
+    mandate fallbacks. It is set by the branch that made that choice, not
+    re-derived (#3196).
     """
 
-    __slots__ = ("providers", "target_model", "meta")
+    __slots__ = ("providers", "target_model", "meta", "mandate_pin")
 
     def __init__(
         self,
         providers: List[Dict[str, Any]],
         target_model: Optional[str],
         meta: RoutingMeta,
+        *,
+        mandate_pin: bool = False,
     ) -> None:
         self.providers = providers
         self.target_model = target_model
         self.meta = meta
+        self.mandate_pin = mandate_pin
 
     def __iter__(self) -> Iterator[Any]:
         # Back-compat: ``providers, target_model = resolve_provider_routing(...)``

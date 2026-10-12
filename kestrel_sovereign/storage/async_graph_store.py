@@ -20,7 +20,7 @@ import hashlib
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from dataclasses import dataclass
@@ -863,6 +863,78 @@ class Edge:
     target_id: str
     label: str
     properties: Optional[Dict[str, Any]] = None
+
+
+# ---------------------------------------------------------------------------
+# How the scoped EPHEMERAL purge dates ``properties.created_at`` (#3227)
+# ---------------------------------------------------------------------------
+#
+# One grammar, defined here and nowhere else. The purge reads each owned row's
+# ``created_at`` text from the database and classifies it with
+# :func:`_purge_created_at_instant`, on SQLite and PostgreSQL alike, so the two
+# backends cannot disagree about a shape: no SQL normalises, casts or compares
+# the value. The watermark is read by the same function.
+
+#: The UTC markers a ``created_at`` may end with. ``+00:00`` is what the module
+#: contract's ``isoformat()`` writes, ``Z`` is RFC 3339's spelling of the same
+#: offset, and the empty marker is an offset-free value, which this module has
+#: always read as UTC. Any other offset, or UTC spelled any other way, is
+#: outside the grammar.
+_CREATED_AT_UTC_MARKERS = ("+00:00", "Z", "")
+
+#: Between the date and the time: ISO-8601's ``T``, or the space that SQLite's
+#: ``datetime('now')`` and the purge watermark use.
+_CREATED_AT_SEPARATORS = ("T", " ")
+
+#: The longest fraction accepted: Python writes six digits, JavaScript three, a
+#: nanosecond clock nine. Digits past the sixth are truncated, never rounded,
+#: because ``datetime`` holds microseconds.
+_CREATED_AT_MAX_FRACTION_DIGITS = 9
+
+#: Owned rows the scoped purge reads per query. It dates every node an agent
+#: owns on every EPHEMERAL exit, so the scan is paged rather than one read of
+#: the whole tenant graph.
+_PURGE_SCAN_PAGE = 500
+
+_CREATED_AT_GRAMMAR = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})"
+    + "[" + "".join(re.escape(sep) for sep in _CREATED_AT_SEPARATORS) + "]"
+    + r"([0-9]{2}):([0-9]{2}):([0-9]{2})"
+    + r"(?:\.([0-9]{1,%d}))?" % _CREATED_AT_MAX_FRACTION_DIGITS
+    + "(?:" + "|".join(re.escape(marker) for marker in _CREATED_AT_UTC_MARKERS) + ")"
+)
+
+
+def _purge_created_at_instant(value: Any) -> Optional[datetime]:
+    """The UTC instant ``value`` names, or ``None`` when it names none.
+
+    Accepted, exactly and in full: ``YYYY-MM-DD``, ``T`` or a space,
+    ``HH:MM:SS``, an optional fraction of one to nine digits, then ``+00:00``,
+    ``Z`` or nothing. Everything else is ``None`` — the purge's *untimed*: a
+    missing or non-string value, a bare date, an offset other than UTC,
+    surrounding whitespace, trailing text, a lowercase marker, an impossible
+    date. An untimed row is preserved and counted, never purged, and never an
+    error that could abort the sweep.
+
+    Precision is the row's own: a fraction is kept to the microsecond, so a
+    NORMAL node stamped earlier in the transition second is placed before the
+    transition instead of being read as the second's start and purged (#3227).
+    A whole-second value reads as ``.000000``.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _CREATED_AT_GRAMMAR.fullmatch(value)
+    if match is None:
+        return None
+    year, month, day, hour, minute, second, fraction = match.groups()
+    microsecond = int((fraction or "").ljust(6, "0")[:6])
+    try:
+        return datetime(
+            int(year), int(month), int(day), int(hour), int(minute), int(second),
+            microsecond, tzinfo=timezone.utc,
+        )
+    except ValueError:
+        return None
 
 
 class AsyncGraphStore:
@@ -1920,14 +1992,19 @@ class AsyncGraphStore:
 
         Args:
             agent_id: agent's DID.
-            since_iso: Optional ISO-8601 timestamp.  When provided, only
-                nodes whose ``properties.created_at >= since_iso`` are
-                destroyed — this scopes the EPHEMERAL leak-purge to the
+            since_iso: Optional watermark.  When provided, only nodes whose
+                ``properties.created_at`` names an instant at or after it
+                are destroyed — this scopes the EPHEMERAL leak-purge to the
                 rows authored *during* the EPHEMERAL stint and leaves
-                preexisting NORMAL data alone (#867).  When omitted,
-                every node owned by this agent is destroyed (legacy
-                behaviour preserved for restore-from-CAR and explicit
-                administrative wipes).
+                preexisting NORMAL data alone (#867).  Both the watermark
+                and every row are read by :func:`_purge_created_at_instant`
+                and compared as instants at microsecond precision: a
+                whole-second comparison destroyed NORMAL nodes written
+                earlier in the same second as the transition (#3227).  A
+                watermark that grammar cannot date raises ``ValueError``.
+                When omitted, every node owned by this agent is destroyed
+                (legacy behaviour preserved for restore-from-CAR and
+                explicit administrative wipes).
 
         Returns:
             Number of node rows destroyed. Zero is the happy path; any
@@ -1939,87 +2016,86 @@ class AsyncGraphStore:
         if self.agent_id and self.agent_id != agent_id:
             raise ValueError("A bound graph store cannot purge another agent")
 
-        if self.db.backend_type == "postgres":
-            # graph_nodes.properties.created_at is documented as
-            # ``YYYY-MM-DDTHH:MM:SS+00:00`` (ISO with T separator, fixed
-            # offset).  Normalise it to ``YYYY-MM-DD HH:MM:SS`` so it can
-            # be lex-compared against the SQLite-format watermark the
-            # privacy wrapper records.  Without this normalisation the
-            # ``T`` (0x54) sorts AFTER space (0x20) and every same-day
-            # graph row appears strictly greater than the watermark — so
-            # pre-stint nodes get purged.
-            created_normalized = (
-                "to_char(("
-                "  CASE WHEN (properties::jsonb->>'created_at') IS NULL THEN NULL "
-                "       ELSE ((properties::jsonb->>'created_at')::timestamptz) "
-                "  END "
-                ") AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"
-            )
-        else:
-            # SQLite normalisation: ``T`` → space, then truncate to
-            # ``YYYY-MM-DD HH:MM:SS`` (length 19).  Handles both ISO
-            # (``2026-04-26T16:31:06+00:00``) and SQLite-format (``2026-04-26
-            # 16:31:06``) inputs uniformly.
-            created_normalized = (
-                "substr("
-                "  replace(json_extract(properties, '$.created_at'), 'T', ' '), "
-                "  1, 19"
-                ")"
-            )
-
         ownership_clause = (
             "EXISTS (SELECT 1 FROM graph_node_owners AS purge_owner "
             "WHERE purge_owner.node_id = graph_nodes.node_id "
             "AND purge_owner.agent_id = ?)"
         )
-        if since_iso:
-            # Nodes without a ``created_at`` are excluded from the scoped
-            # purge — we can't prove they're in-window leaks, so we
-            # preserve them rather than risk destroying real preexisting
-            # data.  Operators get a WARNING below if any such nodes
-            # exist for this agent (visible-but-skipped surface).
-            agent_clause = (
-                f"({ownership_clause} AND {created_normalized} IS NOT NULL "
-                f"AND {created_normalized} >= ?)"
-            )
-            agent_args: tuple = (agent_id, since_iso)
-        else:
-            agent_clause = ownership_clause
-            agent_args = (agent_id,)
-
-        # When scoping by since_iso, count nodes for this agent that have
-        # NO created_at — they're skipped by the predicate and we want
-        # operators to see them so they can investigate the missing
-        # provenance.  Cheap row count, scoped to the agent.
-        if since_iso:
-            try:
-                untimed_row = await self.db.fetchone(
-                    f"SELECT COUNT(*) FROM graph_nodes "
-                    f"WHERE {ownership_clause} "
-                    f"  AND {created_normalized} IS NULL",
+        if not since_iso:
+            async with self.db.transaction():
+                selected = await self.db.fetchall(
+                    f"SELECT node_id FROM graph_nodes WHERE {ownership_clause}",
                     (agent_id,),
                 )
-                untimed = int(untimed_row[0]) if untimed_row else 0
-                if untimed > 0:
-                    logger.warning(
-                        "purge_agent_nodes (scoped): %d node(s) for agent=%s "
-                        "have no properties.created_at and were skipped — "
-                        "leak coverage is incomplete for them.  Investigate "
-                        "the writer and stamp created_at going forward.",
-                        untimed, agent_id,
-                    )
-            except Exception:
-                # Pre-flight count is informational only.
-                pass
+                node_ids = [row[0] for row in selected]
+                return await release_graph_node_owners(self.db, node_ids, agent_id)
 
-        async with self.db.transaction():
-            selected = await self.db.fetchall(
-                f"SELECT node_id FROM graph_nodes WHERE {agent_clause}",
-                agent_args,
+        watermark = _purge_created_at_instant(since_iso)
+        if watermark is None:
+            raise ValueError(
+                "purge watermark must be a UTC timestamp "
+                f"(YYYY-MM-DD[T| ]HH:MM:SS[.fraction][+00:00|Z]); got {since_iso!r}"
             )
-            node_ids = [row[0] for row in selected]
-            return await release_graph_node_owners(self.db, node_ids, agent_id)
-    
+
+        # The database only hands back each owned row's text; the grammar
+        # decides, identically for both backends. A row it cannot date is
+        # UNTIMED: we can't prove it is an in-window leak, so it is preserved
+        # rather than risk destroying real preexisting data, and counted so
+        # operators see it (visible-but-skipped surface).
+        #
+        # Every owned node is dated on every EPHEMERAL exit, so they are read
+        # in pages of ``_PURGE_SCAN_PAGE`` and only the leaks are kept. The
+        # release still runs once, after the scan: it reserves its lock
+        # shards before any row lock, which a release per page would break.
+        untimed = 0
+        node_ids: List[str] = []
+        async with self.db.transaction():
+            after: Optional[str] = None
+            while True:
+                page = await self._owned_created_at_page(agent_id, after)
+                for node_id, value in page:
+                    instant = _purge_created_at_instant(value)
+                    if instant is None:
+                        untimed += 1
+                    elif instant >= watermark:
+                        node_ids.append(node_id)
+                if len(page) < _PURGE_SCAN_PAGE:
+                    break
+                after = page[-1][0]
+            purged = await release_graph_node_owners(self.db, node_ids, agent_id)
+
+        if untimed > 0:
+            logger.warning(
+                "purge_agent_nodes (scoped): %d node(s) for agent=%s "
+                "have no properties.created_at the purge can date (absent, "
+                "or not a UTC timestamp in an accepted shape) and were "
+                "skipped — leak coverage is incomplete for them.  "
+                "Investigate the writer and stamp created_at going forward.",
+                untimed, agent_id,
+            )
+        return purged
+
+    async def _owned_created_at_page(
+        self, agent_id: str, after: Optional[str]
+    ) -> List[tuple]:
+        """One page of ``(node_id, created_at text)`` for ``agent_id``'s nodes.
+
+        Keyed on ``node_id`` through the ownership ledger's
+        ``(agent_id, node_id)`` index: the page after ``after`` in node-id
+        order, at most :data:`_PURGE_SCAN_PAGE` rows.
+        """
+        created_at = self._json_extract("graph_nodes.properties", "created_at")
+        after_clause = "" if after is None else "AND purge_owner.node_id > ? "
+        params: tuple = (agent_id,) if after is None else (agent_id, after)
+        return await self.db.fetchall(
+            f"SELECT purge_owner.node_id, {created_at} "
+            "FROM graph_node_owners AS purge_owner "
+            "JOIN graph_nodes ON graph_nodes.node_id = purge_owner.node_id "
+            f"WHERE purge_owner.agent_id = ? {after_clause}"
+            "ORDER BY purge_owner.node_id LIMIT ?",
+            params + (_PURGE_SCAN_PAGE,),
+        )
+
     async def add_edge(
         self,
         source_id: str,

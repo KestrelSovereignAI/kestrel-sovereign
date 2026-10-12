@@ -1162,8 +1162,9 @@ class AsyncStorage:
         never wipes preexisting NORMAL channel history.
 
         Timestamp-shape safety (regression fix): the ``since_iso`` watermark is
-        SQLite ``datetime('now')`` shape (``YYYY-MM-DD HH:MM:SS``, space
-        separator), but ``channel_messages.created_at`` is written by the
+        SQLite ``datetime('now')`` shape plus microseconds
+        (``YYYY-MM-DD HH:MM:SS.ffffff``, space separator; whole seconds from
+        older callers), but ``channel_messages.created_at`` is written by the
         channels feature as ``message.timestamp.isoformat()`` (``T`` separator,
         microseconds, offset). A raw SQL ``created_at >= since_iso`` compares
         lexically, and ``'T'`` (0x54) > ``' '`` (0x20), so a same-UTC-day row
@@ -1177,6 +1178,13 @@ class AsyncStorage:
         The doomed ids are deleted in bounded batches so a high-volume session
         never trips the backend's bind-parameter ceiling and raises (which the
         caller would swallow, leaving the whole leak behind).
+
+        The boundary is the start of the watermark's second, as it was while
+        the watermark carried whole seconds (#3227). ``created_at`` is
+        ``ChannelMessage.timestamp``, which defaults to when the adapter built
+        the message, not when this row was written, so a message built earlier
+        in the transition second and logged during the stint carries a stamp
+        before the watermark. A privacy sweep must not leave that leak behind.
         """
         if not since_iso:
             return 0
@@ -1197,6 +1205,7 @@ class AsyncStorage:
                 since_iso, self.agent_id, reason,
             )
             return 0
+        since_dt = since_dt.replace(microsecond=0)
 
         rows = await self.db.fetchall(
             "SELECT id, created_at FROM channel_messages WHERE agent_id = ?",

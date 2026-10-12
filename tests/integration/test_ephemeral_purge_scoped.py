@@ -306,3 +306,105 @@ async def test_other_agents_data_untouched(tmp_path):
             "Other agent's row must not be touched by this agent's "
             "EPHEMERAL leak-purge"
         )
+
+
+# ---------------------------------------------------------------------------
+# #3227: the transition instant and a row can share one second
+# ---------------------------------------------------------------------------
+
+
+def _pin_transition(monkeypatch, instant):
+    """Pin the clock the wrapper reads its watermark from."""
+    monkeypatch.setattr(PrivacyEnforcingStorage, "_now_utc", staticmethod(lambda: instant))
+
+
+def test_the_transition_clock_carries_sub_second_precision(tmp_path):
+    """Unpinned: the watermark keeps the clock's microseconds. A watermark
+    truncated to seconds would reintroduce #3227 while every pinned test
+    stayed green."""
+    storage = AsyncStorage(str(tmp_path / "clock.db"), agent_id=AGENT_ID)
+    fractions = set()
+    for _ in range(25):
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        mark = wrapper._entered_ephemeral_at
+        assert len(mark) == 26 and mark[10] == " " and mark[19] == ".", mark
+        fractions.add(mark[20:])
+    assert fractions != {"000000"}, fractions
+
+
+@pytest.mark.asyncio
+async def test_a_channel_message_stamped_in_the_transition_second_is_purged(tmp_path, monkeypatch):
+    """channel_messages.created_at is ``ChannelMessage.timestamp``: when the
+    adapter built the message, not when the row was written. A message built
+    300 ms before the transition and logged during the stint is a leak with a
+    stamp before the watermark, so the sweep purges the whole transition
+    second, as it did while the watermark carried whole seconds. The last
+    microsecond of the previous second survives."""
+    from datetime import datetime, timedelta, timezone
+
+    transition = datetime(2026, 9, 7, 12, 0, 5, 500000, tzinfo=timezone.utc)
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        await storage.db.execute_commit(
+            """CREATE TABLE IF NOT EXISTS channel_messages (
+                   id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, channel_type TEXT NOT NULL,
+                   direction TEXT NOT NULL, sender TEXT, recipient TEXT, content TEXT NOT NULL,
+                   status TEXT NOT NULL DEFAULT 'success', metadata TEXT,
+                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+
+        async def _insert(mid, stamp):
+            await storage.db.execute_commit(
+                "INSERT INTO channel_messages (id, agent_id, channel_type, direction, sender, "
+                "recipient, content, status, metadata, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mid, AGENT_ID, "telegram", "inbound", "alice", "bot", "text", "received",
+                 None, stamp.isoformat()),
+            )
+
+        await _insert("previous-second", transition.replace(microsecond=0) - timedelta(microseconds=1))
+        _pin_transition(monkeypatch, transition)
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        await _insert("built-before-watermark", transition - timedelta(milliseconds=300))
+        await _insert("leak-post-transition", transition + timedelta(milliseconds=300))
+        result = await wrapper.purge_ephemeral_session(reason="test-channel-same-second")
+        assert result["channel_messages"] == 2, result
+        rows = await storage.db.fetchall("SELECT id FROM channel_messages ORDER BY id")
+        assert [r[0] for r in rows] == ["previous-second"]
+
+
+@pytest.mark.asyncio
+async def test_every_sweep_is_handed_the_exact_instant(tmp_path, monkeypatch):
+    """One watermark for every sweep: the conversation, graph, channel and
+    observability sweeps all receive the microsecond instant, and each store
+    decides what its own column can honour."""
+    from datetime import datetime, timezone
+
+    transition = datetime(2026, 9, 7, 12, 0, 5, 500000, tzinfo=timezone.utc)
+    seen = {}
+
+    def _record(name):
+        async def _sweep(*args, **kwargs):
+            seen[name] = args[0] if args else kwargs.get("since_iso")
+            return {} if name == "observability" else 0
+        return _sweep
+
+    async with AsyncStorage(str(tmp_path / "w.db"), agent_id=AGENT_ID) as storage:
+        _pin_transition(monkeypatch, transition)
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        monkeypatch.setattr(storage, "purge_conversations_since", _record("conversation"))
+        monkeypatch.setattr(storage, "purge_agent_graph_nodes", _record("graph"))
+        monkeypatch.setattr(storage, "purge_channel_messages_since", _record("channel"))
+        wrapper.set_observability_purge(_record("observability"))
+        report = await wrapper.purge_ephemeral_session(reason="wiring")
+    assert not report.required_sweep_failed
+    assert seen == {
+        "conversation": "2026-09-07 12:00:05.500000",
+        "graph": "2026-09-07 12:00:05.500000",
+        "channel": "2026-09-07 12:00:05.500000",
+        "observability": "2026-09-07 12:00:05.500000",
+    }, seen

@@ -24,7 +24,11 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 from .async_database import AsyncDatabase
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from .conversation_ids import coerce_persistent_message_id
-from .conversation_created_at import UNDATED_TABLE
+from .conversation_created_at import (
+    UNDATED_TABLE,
+    canonical_created_at,
+    created_at_bind,
+)
 from .session_grouping import (
     UNDATABLE_ROW_FALLBACK,
     canonical_session_id,
@@ -3836,6 +3840,29 @@ class AsyncConversationStore:
         DELETE — the absence of a timestamp means we can't safely scope,
         and the original wipe-on-shutdown bug is precisely what this
         method exists to prevent.
+
+        The boundary is the start of the second ``since_iso`` falls in, on
+        both backends: the whole transition second is purged, as it always
+        was. The wrapper's watermark is exact to the microsecond (#3227),
+        but a row's stamp is not evidence of when it was written to that
+        precision:
+
+        * SQLite's column is whole-second by CHECK (#3009), so a leak
+          written in the transition second is stored exactly like a row
+          written just before the watermark;
+        * PostgreSQL stamps the column with ``NOW()`` (``_now_sql``), which
+          is the time the writing *transaction* started. A row inserted
+          during the EPHEMERAL stint by a transaction that began earlier in
+          the transition second carries a stamp before the watermark, and an
+          exact cutoff would keep that leak.
+
+        A privacy sweep must not leave leaks behind, so a NORMAL row written
+        earlier in the transition second is purged with them. The floor
+        covers a straddling transaction only within that second; one that
+        began in an earlier second is stamped outside the window either way.
+
+        That is deliberately not :func:`comparable_created_at`, which keeps
+        a boundary's fraction for readers that must not over-select.
         """
         if not since_iso:
             logger.warning(
@@ -3845,6 +3872,14 @@ class AsyncConversationStore:
                 reason,
             )
             return 0
+        # The canonical spelling is whole-second, so the bind is that
+        # second's start on PostgreSQL too, not the watermark's instant.
+        transition_second = canonical_created_at(since_iso)
+        if transition_second is None:
+            raise ValueError(
+                f"purge_all_since needs a datable watermark; got {since_iso!r}"
+            )
+        boundary = created_at_bind(self.db.backend_type, transition_second)
         created_at_predicate = self._timestamp_predicate("created_at", ">=")
         purged = await self._purge_conversation_rows(
             [
@@ -3852,7 +3887,7 @@ class AsyncConversationStore:
                     f"SELECT {_PURGE_SELECT_PLACEHOLDER} FROM conversation_history "
                     f"WHERE agent_id = ? AND {created_at_predicate} "
                     "ORDER BY id ASC",
-                    (self.agent_id, self._timestamp_query_param(since_iso)),
+                    (self.agent_id, boundary),
                 )
             ],
             operation_type="purge_all_since",

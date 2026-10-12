@@ -608,9 +608,15 @@ class ObservabilityStore(UnifiedStoreBase):
     def _normalize_since_param(self, since_iso: str) -> Any:
         """Coerce a watermark string into the store's timestamp parameter form.
 
-        Accepts both the ``YYYY-MM-DD HH:MM:SS`` watermark shape and a full
-        ISO-8601 string; returns a value comparable against the rows this store
-        writes (``datetime`` for PostgreSQL, ISO string for SQLite).
+        Accepts both the ``YYYY-MM-DD HH:MM:SS[.ffffff]`` watermark shape and a
+        full ISO-8601 string; returns a value comparable against the rows this
+        store writes (``datetime`` for PostgreSQL, ISO string for SQLite).
+
+        Floored to the start of the watermark's second, as it was while the
+        watermark carried whole seconds (#3227). A row's ``timestamp`` may be
+        an event time a producer supplied after the fact (``log_tool_call``),
+        so a row written during the stint can carry a stamp earlier in the
+        transition second, and the sweep must not leave it behind.
         """
         raw = str(since_iso).strip()
         try:
@@ -619,7 +625,7 @@ class ObservabilityStore(UnifiedStoreBase):
             return since_iso
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return self.to_timestamp_param(dt)
+        return self.to_timestamp_param(dt.replace(microsecond=0))
 
     async def log_tool_call(
         self,

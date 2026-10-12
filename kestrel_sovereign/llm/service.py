@@ -330,17 +330,40 @@ class ModelNotAvailableForRoute(LLMError):
     instead of firing a request that will either 404/400 (cloud provider
     rejects the model) or silently serve the wrong weights (llama.cpp
     ignores the model name).
+
+    ``discovery_failure`` is the vendor's recorded model-discovery error, when
+    there is one (#3196). The catalog that rejected the model is then known to
+    be stale, so the message points at discovery rather than claiming the
+    model is unavailable: the route may well still serve it.
     """
 
-    def __init__(self, vendor: Optional[str], route: Optional[str], model: str):
+    def __init__(
+        self,
+        vendor: Optional[str],
+        route: Optional[str],
+        model: str,
+        *,
+        discovery_failure: Optional[str] = None,
+    ):
         self.vendor = vendor
         self.route = route
         self.model = model
+        self.discovery_failure = discovery_failure
         route_key = f"{vendor}:{route}" if vendor and route else (vendor or "unknown")
-        super().__init__(
-            f"Model '{model}' is not available for route '{route_key}'. "
-            "Skipping — callers should target a vendor that serves this model."
-        )
+        if discovery_failure:
+            message = (
+                f"Model '{model}' is not in the model catalog for route "
+                f"'{route_key}', and that catalog is stale: model discovery "
+                f"for '{vendor}' failed ({discovery_failure}). The route may "
+                "still serve the model — restore model discovery (check the "
+                "vendor's credentials) rather than changing the model selection."
+            )
+        else:
+            message = (
+                f"Model '{model}' is not available for route '{route_key}'. "
+                "Skipping — callers should target a vendor that serves this model."
+            )
+        super().__init__(message)
 
 
 def _warn_no_llm_config_found() -> None:
@@ -2402,7 +2425,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         ``authorized_vendors``) computed in this SAME pass by
         :meth:`StreamingMixin._compute_route_authorization`. The dispatch loops
         consume ``.meta`` instead of re-deriving it, so the two can no longer
-        drift (the root cause of the prior edge-bug rounds).
+        drift (the root cause of the prior edge-bug rounds). ``.mandate_pin``
+        records that step 2 below chose the routes: the persisted mandate, not
+        an override or its fallbacks (#3196).
 
         Resolution order:
             1. ``model_override`` — caller-supplied ``vendor/model`` or
@@ -2427,6 +2452,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         force_local_only = self._effective_force_local_only(force_local_only)
         providers_to_use = self._available_providers()
         target_model: Optional[str] = None
+        mandate_pin = False
 
         # Normalize the sentinel "auto" to no-override. "auto" expresses
         # routing intent ("pick the default for whichever route runs"), not
@@ -2487,6 +2513,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 matching = self._filter_providers_by_selector(providers_to_use, selector)
                 if matching:
                     providers_to_use = matching
+                    mandate_pin = True
                     logger.info(
                         "Provider routing: using mandated %s with model '%s'",
                         selector,
@@ -2574,7 +2601,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             model_override=model_override,
             force_local_only=force_local_only,
         )
-        return RoutingResolution(providers_to_use, target_model, meta)
+        return RoutingResolution(
+            providers_to_use, target_model, meta, mandate_pin=mandate_pin
+        )
 
     @staticmethod
     def _provider_supports_embeddings(provider: Dict[str, Any]) -> bool:
@@ -4547,6 +4576,23 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 model="auto",
             ) from exc
 
+    def _catalog_rejection(
+        self, provider: Dict[str, Any], model: str
+    ) -> ModelNotAvailableForRoute:
+        """The catalog guard's rejection of ``model`` on ``provider``.
+
+        Carries the vendor's recorded discovery failure, when there is one, so
+        a rejection by a stale catalog says so instead of calling the model
+        unavailable (#3196). Shared by the generation and audit guards.
+        """
+        discovery_failures = getattr(self, "_discovery_failures", None) or {}
+        return ModelNotAvailableForRoute(
+            vendor=provider.get("vendor"),
+            route=provider.get("route"),
+            model=model,
+            discovery_failure=discovery_failures.get(provider.get("vendor")),
+        )
+
     @handle_llm_errors()
     async def _try_single_provider(
         self,
@@ -4562,6 +4608,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         explicit_selection: bool = False,
         invocation_context: Optional[LLMInvocationContext] = None,
         return_response: bool = False,
+        mandate_pin: bool = False,
     ) -> Union[str, LLMResponse]:
         """Try to get a response from a single provider.
 
@@ -4591,23 +4638,37 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         cross-vendor cascade risk when the route is explicitly pinned, so honour
         it exactly as streaming does.
 
+        The agent's persisted mandate (``mandate_pin=True``, set by
+        ``resolve_provider_routing``) is trusted the same way, whether or not it
+        narrows to one route (#3196). It is a decision this agent already
+        accepted, and #3190 settled that a catalog fetched seconds ago must not
+        overrule it: a vendor-wide pin (``route`` omitted) on a vendor with
+        several routes is not explicit, but during a discovery outage the
+        guard rejected every one of its routes before any call, while the
+        routes still served the model. Each route of that vendor is tried in
+        its normal order; if the model is really gone, the provider's own error
+        is what surfaces.
+
         EXCEPTION: local vendors whose server ignores the requested model ID and
         serves whatever weights are loaded (e.g. ``llama_cpp``, ``ollama:local``
         with a preloaded model) — trusting an explicit selection there would
         silently mislabel the response (codex round-2 P2). Keep catalog
         validation on those so a mismatched pin fails loud instead of being
         metered as the wrong model.
+
+        When the guard does reject and discovery for the route's vendor is
+        recorded as failed, the error says the catalog is stale and names
+        discovery, rather than that the model is unavailable.
         """
         messages = messages_for(provider["adapter"], user_prompt=user_prompt, system_prompt=system_prompt)
 
-        skip_catalog = explicit_selection and provider.get("vendor") not in _MODEL_IGNORING_VENDORS
+        trusted_selection = explicit_selection or mandate_pin
+        skip_catalog = (
+            trusted_selection and provider.get("vendor") not in _MODEL_IGNORING_VENDORS
+        )
         if target_model and target_model != "auto" and not skip_catalog:
             if not self._model_available_for_route(provider, target_model):
-                raise ModelNotAvailableForRoute(
-                    vendor=provider.get("vendor"),
-                    route=provider.get("route"),
-                    model=target_model,
-                )
+                raise self._catalog_rejection(provider, target_model)
         model_to_use = self._resolve_concrete_model(target_model, provider)
 
         frozen_context = (
@@ -4849,9 +4910,14 @@ No other text or formatting.
                 if target_model and not self._model_available_for_route(provider, target_model):
                     # Record the skip so that if EVERY route rejects the
                     # mandated model, the loop fails closed (risk=3) instead of
-                    # falling through to the benign "no providers" risk=1.
+                    # falling through to the benign "no providers" risk=1. A
+                    # stale catalog is named as such (#3196): the audit still
+                    # fails closed, but must not blame the model.
+                    rejection = self._catalog_rejection(provider, target_model)
                     errors[provider["name"]] = (
-                        f"target model {target_model} not available for route"
+                        str(rejection)
+                        if rejection.discovery_failure
+                        else f"target model {target_model} not available for route"
                     )
                     logger.debug(
                         "Audit: skipping %s (target model %s not in vendor catalog)",
@@ -5146,6 +5212,7 @@ No other text or formatting.
                     explicit_selection=explicit_selection,
                     invocation_context=invocation_context,
                     return_response=return_response,
+                    mandate_pin=resolution.mandate_pin,
                 )
                 logger.info(f"Success from {provider_name}")
                 return result
@@ -5154,11 +5221,15 @@ No other text or formatting.
                 if is_execution_control_error(e):
                     raise
                 # Route can't serve the target model. Skip silently — no HTTP
-                # call was made — and try the next provider.
-                logger.debug(
-                    "Skipping %s: %s not in vendor catalog",
-                    provider["name"], e.model,
-                )
+                # call was made — and try the next provider. A stale catalog
+                # (#3196) is an operator problem with discovery, so say so.
+                if e.discovery_failure:
+                    logger.warning("Skipping %s: %s", provider["name"], e)
+                else:
+                    logger.debug(
+                        "Skipping %s: %s not in vendor catalog",
+                        provider["name"], e.model,
+                    )
                 errors[provider["name"]] = e
                 continue
 

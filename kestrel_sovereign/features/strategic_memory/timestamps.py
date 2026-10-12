@@ -2,14 +2,15 @@
 
 ``storage/async_graph_store.py`` requires every persisted
 ``properties.created_at`` to be a UTC ISO-8601 string (the shape
-``datetime.now(timezone.utc).isoformat()`` produces) because range filters,
-ordering and the scoped EPHEMERAL purge compare it lexicographically. The
+``datetime.now(timezone.utc).isoformat()`` produces) because range filters
+and ordering compare it lexicographically, and the scoped EPHEMERAL purge
+dates only the UTC timestamp shapes it accepts. The
 strategic-memory ledger and decision file carry day-granular dates
 (``YYYY-MM-DD``) written by ``date.today()``, and some rows carry no date at
 all. Three projections used to copy those values straight into
 ``created_at`` — a bare date sorts before every timestamp of its day, and an
-empty string either aborts the Postgres purge cast or, after #3227, drops the
-row out of leak coverage for good.
+empty string aborted the Postgres purge's cast; since #3227 both are untimed
+to the purge, out of leak coverage for good.
 
 One rule, in one place: a date becomes midnight UTC of that date; a full
 timestamp is normalised to the contract; nothing usable leaves the key
