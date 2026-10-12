@@ -649,3 +649,19 @@ unlocking, and the original base turn retains its existing physical drain.
 queued, not-yet-admitted workers revalidate after acquiring the lock instead.
 These enclosing joins can outlast the observer grace. Native unknown/committed
 receipts and repeated lifecycle observations always retain the original carrier.
+
+`ExecutionStreamLifecycle` is an opt-in physical lifetime for lazy stream
+producers. Its factory receives the lazy body and original context; its start
+callback registers the actual producer task before any source step, including
+under eager task creation. It is inherited only within opted-in source work,
+not by unrelated Core cognition streams. The lifetime admission runs before
+native advancement and before returning each item to a consumer. Shutdown must
+close paused iterators as well as join their exact tasks; a task join alone
+cannot release a producer waiting for another consumer pull.
+
+`capture_native_work_factory` retains the constructing owner's held privacy
+frame for a deferred source without starting it. A live foreign frame permits
+only its exact registered native tasks to reenter and to register transitive
+native continuations. An ended frame cannot be revived, and an arbitrary child
+with copied ContextVars still queues on the ordinary reentry mutex. Foreign
+exit drains newly registered dependencies until the original graph is empty.

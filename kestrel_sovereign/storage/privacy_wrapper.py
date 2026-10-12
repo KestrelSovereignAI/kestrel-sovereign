@@ -426,8 +426,26 @@ class ReentrantTransitionLock:
         self._reentry_idle.set()
         self._native_work = set()
         self._foreign_native_dependencies = {}
+        self._native_foreign_frames = {}
+        self._native_foreign_depths = {}
 
-    def start_owned_native_work(self, operation):
+    def capture_native_work_factory(self):
+        """Capture the constructing owner's held frame for one lazy source.
+
+        Registration is still deferred until dispatch, and an ended foreign
+        frame cannot be revived. Copied-context children gain no frame rights.
+        """
+        parent = asyncio.current_task()
+        frame = parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent)
+        token = self.current_reentry_token()
+        if token is None and self._token_matches_current_span():
+            token = _transition_lock_reentry_token.get()
+        def start(operation, context=None):
+            return self.start_owned_native_work(operation, context=context,
+                _captured_frame=frame, _captured_token=token)
+        return start
+
+    def start_owned_native_work(self, operation, *, context=None, _captured_frame=None, _captured_token=None):
         """Retain a fixed native body without lending arbitrary reentry rights.
 
         Only the actual foreign-mutex owner may reserve continuation of that
@@ -435,10 +453,15 @@ class ReentrantTransitionLock:
         Other workers acquire the ordinary lock path and revalidate live policy.
         """
         parent = asyncio.current_task()
-        foreign = parent is not None and self._reentry_owner is parent
+        frame = parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent)
+        if frame is None and _captured_frame is self._reentry_owner:
+            frame = _captured_frame
+        foreign = frame is not None and self._reentry_owner is frame
         token = self.current_reentry_token()
         if token is None and self._token_matches_current_span():
             token = _transition_lock_reentry_token.get()
+        if token is None:
+            token = _captured_token
         state = {"entered": foreign}
         retained = asyncio.Event()
         async def run():
@@ -451,14 +474,17 @@ class ReentrantTransitionLock:
                 async with self:
                     state["entered"] = True
                     return await operation()
-        task = create_owned_task(run(), name="privacy-owned-native-work")
+        task = create_owned_task(run(), name="privacy-owned-native-work", context=context)
         self._native_work.add(task)
         task._kestrel_native_privacy_state = state
         if foreign:
-            self._foreign_native_dependencies.setdefault(parent, set()).add(task)
+            self._native_foreign_frames[task] = frame
+            self._foreign_native_dependencies.setdefault(frame, set()).add(task)
         def completed(finished):
             owned_task_error(finished)
             self._native_work.discard(finished)
+            self._native_foreign_frames.pop(finished, None)
+            self._native_foreign_depths.pop(finished, None)
         task.add_done_callback(completed)
         retained.set()
         return task
@@ -523,6 +549,12 @@ class ReentrantTransitionLock:
         if task is not None and self._reentry_owner is task:
             self._reentry_depth += 1
             return self
+        # Only an exact task registered by the current foreign frame may use
+        # that frame's native continuation. A copied ContextVar is insufficient.
+        frame = self._native_foreign_frames.get(task)
+        if frame is not None and self._reentry_owner is frame:
+            self._native_foreign_depths[task] = self._native_foreign_depths.get(task, 0) + 1
+            return self
         # (3) First cross-task reentry via a captured span token (the codex
         #     app-server's per-tool reader task). Multiple inline tools in ONE turn
         #     all carry the SAME span token; serialize concurrent token-bearers on
@@ -556,6 +588,9 @@ class ReentrantTransitionLock:
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
         task = asyncio.current_task()
+        if self._native_foreign_depths.get(task, 0):
+            self._native_foreign_depths[task] -= 1
+            return False
         # Unwind a cross-task reentry frame (reader task holding the reentry mutex)
         # before the base-lock frame — the two are always distinct tasks, so task
         # identity disambiguates which frame this ``__aexit__`` pairs with.
@@ -565,11 +600,18 @@ class ReentrantTransitionLock:
                 terminal = exc
                 # A nested waiter may abandon, but this admitted foreign frame
                 # still owns its exact native continuations through settlement.
-                for child in self._foreign_native_dependencies.pop(task, ()):
-                    outcome = await await_owned_task(child)
-                    if outcome.error is not None and is_execution_control_error(outcome.error):
-                        terminal = execution_terminal_error(terminal, outcome.error)
-                    terminal = execution_terminal_error(terminal, outcome.cancellation)
+                # Nested native owners may be registered while an earlier
+                # child settles. Keep the same frame open until the entire
+                # exact dependency graph is physically joined.
+                dependencies = self._foreign_native_dependencies.setdefault(task, set())
+                while dependencies:
+                    for child in tuple(dependencies):
+                        outcome = await await_owned_task(child)
+                        dependencies.discard(child)
+                        if outcome.error is not None and is_execution_control_error(outcome.error):
+                            terminal = execution_terminal_error(terminal, outcome.error)
+                        terminal = execution_terminal_error(terminal, outcome.cancellation)
+                self._foreign_native_dependencies.pop(task, None)
                 self._reentry_depth = 0
                 self._reentry_owner = None
                 self._reentry_lock.release()

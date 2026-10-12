@@ -774,17 +774,20 @@ async def await_execution_work_group(
         raise terminal
 
 
-def execution_work_stream(function: Callable) -> Callable:
+def execution_work_stream(function: Callable | None = None, *, lifecycle: Callable | None = None) -> Callable:
     """Monotonic custody across foreign consumers, errors, and fallback.
 
     Context is installed only during an advance/close, never across yield to
     the consumer. Every later consumer's admissions join the pinned union.
     """
+    if function is None:
+        return lambda source: execution_work_stream(source, lifecycle=lifecycle)
     @wraps(function)
     def guarded(self, *args, **kwargs) -> AsyncIterator[Any]:
         # Async-generator bodies run on first pull, too late to capture the
         # creator's authority. Construct only the lazy forwarder here.
-        return execution_stream(self, function(self, *args, **kwargs))
+        return execution_stream(self, function(self, *args, **kwargs),
+                                lifecycle=None if lifecycle is None else lifecycle(self))
     return guarded
 
 
@@ -833,6 +836,23 @@ def bind_execution_cleanup(
         _CURRENT_CUSTODY.reset(custody_token)
 
 
+@dataclass(frozen=True)
+class ExecutionStreamLifecycle:
+    """Opt-in physical producer custody supplied by its actual feature lifetime.
+
+    The factory receives the lazy body and its original context. Registration
+    finishes before any body step, including under an eager task factory.
+    Nested forwarders inherit this same lifetime only inside source work.
+    """
+
+    owner_factory: Callable
+    owner_started: Callable
+    require_work: Callable
+
+
+_STREAM_LIFECYCLE: ContextVar[ExecutionStreamLifecycle | None] = ContextVar("execution_stream_lifecycle", default=None)
+
+
 class _ExecutionForwarder:
     """One source task, monotonic consumer custody, and joined closure.
 
@@ -841,7 +861,7 @@ class _ExecutionForwarder:
     bindings, and later foreign consumers may add but never discard custody.
     """
 
-    def __init__(self, owner: Any, stream: AsyncIterator[Any], captured_custody: tuple[ExecutionCustody, ...] = ()):
+    def __init__(self, owner: Any, stream: AsyncIterator[Any], captured_custody: tuple[ExecutionCustody, ...] = (), *, lifecycle: ExecutionStreamLifecycle | None = None):
         self._runtime_owner = owner
         self._source = aiter(stream)
         self._scopes = current_execution_custody(owner)
@@ -862,6 +882,7 @@ class _ExecutionForwarder:
         # A deferred HTTP response may never be consumed at all.
         self._owner_context = context
         self._iterator = None
+        self._lifecycle = lifecycle if lifecycle is not None else _STREAM_LIFECYCLE.get()
 
     def __aiter__(self):
         return self
@@ -872,14 +893,21 @@ class _ExecutionForwarder:
         self._cleanup_state.scopes = self._scopes
         try:
             with _bind_captured_custody(self._scopes):
+                if self._lifecycle is not None:
+                    self._lifecycle.require_work()
                 if self._iterator is None:
                     from kestrel_sovereign._async_ownership import OwnedAsyncIterator
-                    self._iterator = OwnedAsyncIterator(
-                        self._produce, operation="execution-stream-forward",
-                        owner_context=self._owner_context,
-                    )
+                    with self._turn_scope.bind():
+                        self._iterator = OwnedAsyncIterator(
+                            self._produce, operation="execution-stream-forward",
+                            owner_context=self._owner_context,
+                            owner_factory=None if self._lifecycle is None else self._lifecycle.owner_factory,
+                            owner_started=None if self._lifecycle is None else self._lifecycle.owner_started,
+                        )
                 item = await anext(self._iterator)
                 require_execution_work(self._runtime_owner)
+                if self._lifecycle is not None:
+                    self._lifecycle.require_work()
         except BaseException as error:
             # Admission can fail while ENTERING the original binding, before
             # the next native pull. The suspended producer still has to retire.
@@ -895,10 +923,13 @@ class _ExecutionForwarder:
 
     async def _produce(self):
         error = None
+        lifetime_token = _STREAM_LIFECYCLE.set(self._lifecycle)
         try:
             with self._turn_scope.bind(), _bind_stream_cleanup((self._cleanup_state,)):
                 while True:
                     with _bind_captured_custody(self._scopes), bind_execution_runtime(self._runtime_owner):
+                        if self._lifecycle is not None:
+                            self._lifecycle.require_work()
                         try:
                             item = await anext(self._source)
                         except StopAsyncIteration:
@@ -906,12 +937,15 @@ class _ExecutionForwarder:
                             self._source_exhausted = True
                             return
                         require_execution_work(self._runtime_owner)
+                        if self._lifecycle is not None:
+                            self._lifecycle.require_work()
                     yield item
         except BaseException as caught:
             error = caught
             self._cleanup_state.requested = True
             raise
         finally:
+            _STREAM_LIFECYCLE.reset(lifetime_token)
             # Carrier admission itself can fail before source advancement.
             # Already-acquired handles still need physical cleanup in that case.
             close = getattr(self._source, "aclose", None)
@@ -971,13 +1005,13 @@ async def owned_execution_stream(owner: Any, stream: AsyncIterator[Any]):
             raise execution_terminal_error(error, cleanup_error)
 
 
-def execution_stream(owner: Any, stream: AsyncIterator[Any], *, captured_custody: tuple[ExecutionCustody, ...] = ()) -> AsyncIterator[Any]:
+def execution_stream(owner: Any, stream: AsyncIterator[Any], *, captured_custody: tuple[ExecutionCustody, ...] = (), lifecycle: ExecutionStreamLifecycle | None = None) -> AsyncIterator[Any]:
     """Pin custody now for a deferred body and own its physical source.
 
     The caller must explicitly close this iterator (for example with Core's
     ClosingStreamingResponse). Construction does not dispatch source work.
     """
-    return _ExecutionForwarder(owner, stream, captured_custody)
+    return _ExecutionForwarder(owner, stream, captured_custody, lifecycle=lifecycle)
 
 
 turn_scoped(

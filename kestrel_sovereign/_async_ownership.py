@@ -196,6 +196,8 @@ class OwnedAsyncIterator(Generic[_T]):
         operation: str,
         cleanup_requested: Callable[[], bool] | None = None,
         owner_context: contextvars.Context | None = None,
+        owner_factory: Callable | None = None,
+        owner_started: Callable | None = None,
     ) -> None:
         self._iterator_factory = iterator_factory
         self._operation = operation
@@ -220,14 +222,19 @@ class OwnedAsyncIterator(Generic[_T]):
         # what keeps tasks the producer spawns from claiming it.
         owner_context = contextvars.copy_context() if owner_context is None else owner_context
         owner_context.run(_CONSUMER_CLOSE.set, self._consumer_close)
-        self._owner = asyncio.create_task(
-            self._run(),
-            name=f"owned_async_iterator:{operation}",
-            context=owner_context,
+        dispatch = asyncio.Event()
+        async def run_owned():
+            await dispatch.wait()
+            await self._run()
+        self._owner = (
+            asyncio.create_task(run_owned(), name=f"owned_async_iterator:{operation}", context=owner_context)
+            if owner_factory is None else owner_factory(run_owned, owner_context)
         )
         # Bound before the producer can run a single step: ``create_task``
         # only schedules it, so no read can observe an unowned record.
         self._consumer_close.owner = self._owner
+        if owner_started is not None:
+            owner_started(self, self._owner)
         self._cancellation_owner = asyncio.create_task(
             self._watch_owner_cancellation(),
             name=f"owned_async_iterator_cancel:{operation}",
@@ -235,6 +242,7 @@ class OwnedAsyncIterator(Generic[_T]):
         self._cancellation_owner.add_done_callback(
             self._interrupt_if_watch_never_started
         )
+        dispatch.set()
 
     def __aiter__(self) -> "OwnedAsyncIterator[_T]":
         return self
