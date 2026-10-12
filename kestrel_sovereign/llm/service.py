@@ -51,7 +51,11 @@ from .adapter import (
     provider_usage_cost,
     response_usage_available,
 )
-from .output_ceiling import IncompleteGenerationError, response_stop_reason
+from .output_ceiling import (
+    IncompleteGenerationError,
+    reported_usage,
+    response_stop_reason,
+)
 from .generation_gate import UnfinishedAfterInlineToolsError
 from .model_discovery import ModelDiscoveryMixin
 from .mandate import ModelMandateMixin
@@ -4020,7 +4024,10 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         ``require_completion`` holds the attempt to the generation gate
         (#3552) before it is finalized. A response the gate rejects is
         recorded as a failed attempt, with the usage its provider reported,
-        and the gate's failure is raised in its place (#3576).
+        and the gate's failure is raised in its place (#3576). A call whose
+        adapter refused an unfinished generation itself raises with the usage
+        its provider reported on the error, and is recorded with that usage
+        (#3577).
         """
 
         def recorded_error(error: Exception) -> Exception:
@@ -4049,17 +4056,15 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 if is_execution_control_error(exc):
                     raise
                 require_execution_work(self)
+                reported = reported_usage(exc)
+                usage_available = response_usage_available(reported)
                 await self._finalize_failed_invocation(
                     provider_name,
                     model,
                     path=path,
                     invocation_context=invocation_context,
                     duration_ms=int((time.monotonic() - started) * 1000),
-                    error=(
-                        LLMServiceError(error_message_override)
-                        if error_message_override is not None
-                        else exc
-                    ),
+                    error=recorded_error(exc),
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     tools=tools,
@@ -4067,6 +4072,12 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                     force_local_only=force_local_only,
                     metadata=metadata,
                     tools_used=tools_used,
+                    response=reported,
+                    usage_available=usage_available,
+                    track_model_usage=usage_available,
+                    # Preserve main's capped-attempt usage without granting
+                    # accounting authority after native custody loss.
+                    meter_usage=usage_available,
                 )
                 raise
 

@@ -30,6 +30,7 @@ from kestrel_sovereign.llm.output_ceiling import (  # noqa: E402
     IncompleteGenerationError,
     OutputCapReachedError,
     incomplete_generation,
+    reported_usage,
     response_stop_reason,
 )
 
@@ -199,6 +200,21 @@ async def test_a_response_stopped_by_the_route_cap_is_a_failure_not_an_answer():
     # The error names the route's knob and carries none of the response text.
     assert "max_output_tokens" in str(raised.value)
     assert "loop" not in str(raised.value)
+    _assert_reported_usage(raised.value)
+
+
+def _assert_reported_usage(error: OutputCapReachedError) -> None:
+    """The error carries the counts Ollama reported for the attempt, and its
+    stop reason, so the failed attempt is recorded with them (#3577); never
+    the response's text."""
+    usage = reported_usage(error)
+    assert usage is error.usage
+    assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (
+        11, 3, 14,
+    )
+    assert response_stop_reason(usage) == "length"
+    assert usage.content is None and usage.tool_calls is None
+    assert usage.raw is None
 
 
 @pytest.mark.asyncio
@@ -208,21 +224,24 @@ async def test_the_tool_stream_path_fails_on_the_cap_before_yielding_anything():
     daemon = _replying("loop loop loop", done_reason="length")
     seen: List[Any] = []
 
-    with pytest.raises(OutputCapReachedError):
+    with pytest.raises(OutputCapReachedError) as raised:
         async for item in OllamaAdapter().get_streaming_response_with_tools(
             client=daemon.client(), model=MODEL, messages=MESSAGES, tools=TOOLS,
         ):
             seen.append(item)
 
     assert seen == []
+    _assert_reported_usage(raised.value)
 
 
 @pytest.mark.asyncio
 async def test_a_stream_stopped_by_the_route_cap_is_a_failure_not_an_answer():
     daemon = _replying("loop loop loop", done_reason="length")
 
-    with pytest.raises(OutputCapReachedError):
+    with pytest.raises(OutputCapReachedError) as raised:
         await _stream(OllamaAdapter(), daemon)
+
+    _assert_reported_usage(raised.value)
 
 
 @pytest.mark.asyncio
@@ -238,6 +257,7 @@ async def test_a_stop_on_a_callers_lower_budget_is_a_failure_too():
     assert daemon.num_predict == 32
     assert raised.value.cap == 32 and raised.value.route_cap == 128
     assert "partial" not in str(raised.value)
+    _assert_reported_usage(raised.value)
 
 
 @pytest.mark.asyncio
@@ -428,6 +448,8 @@ async def test_a_server_that_streams_forever_is_cut_at_the_cap_and_disconnected(
 
     assert daemon.num_predict == 32
     assert raised.value.cap == 32
+    # Ollama reported no counts before the cut: none are invented.
+    assert raised.value.usage is None
     assert endless.closed, "the HTTP response to Ollama was left open"
     # It stopped one chunk past the cap rather than reading on.
     assert endless.sent <= 34

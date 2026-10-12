@@ -302,6 +302,11 @@ async def test_inception_transfers_failed_native_provider_and_birth_database(mon
                 did_web_slug="review57-retirement",
             )
         assert caught.value is original
+        # Prove the physical birth DB and socket stay owned before inspecting
+        # the new retention record. Old-source failure must be native custody,
+        # not the absence of a newly added helper attribute.
+        assert born_databases[0].backend._connection is not None
+        assert not peer_done.is_set()
         owner = caught.value.inception_retirement_owner
         assert owner.provider_owner.provider is provider
         assert owner.database is born_databases[0]

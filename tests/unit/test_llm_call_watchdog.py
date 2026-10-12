@@ -51,6 +51,7 @@ from kestrel_sovereign.llm.streaming_errors import (
     agent_stream_error_block,
     safe_streaming_error_message,
 )
+from tests.shared.booted_agent import booted_agent
 
 BOUND = 180
 
@@ -351,34 +352,14 @@ def test_every_codex_turn_event_is_progress():
 TURN_BOUND = 0.3
 
 
-@asynccontextmanager
-async def _booted_agent(tmp_path):
-    """A real agent on real storage; only the provider calls are scripted."""
-    from kestrel_sovereign.bootstrap import BootstrapState
-    from kestrel_sovereign.inception_service import create_kestrel_identity_async
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
-    from kestrel_sovereign.llm.service import LLMService
-    from tests.shared.genesis_audit import complete_deterministic_genesis_audit
-
-    credentials = await create_kestrel_identity_async(
-        output_dir=str(tmp_path), is_test_instance=True, agent_name="Watchdog"
+def _booted_agent(tmp_path):
+    """A real agent on real storage; only the provider calls are scripted.
+    Beyond the mandatory features it loads only the one whose tool the turns
+    call, so an installed optional package adds no model call of its own."""
+    return booted_agent(
+        tmp_path, name="Watchdog", provenance="test:llm_call_watchdog",
+        features={"StateOfMindFeature"},
     )
-    llm_service = LLMService()
-    agent = KestrelAgent(
-        did=credentials.agent_did,
-        storage_path=os.path.join(str(tmp_path), "kestrel_prime.db"),
-        llm_service=llm_service,
-    )
-    try:
-        await agent.initialize()
-        await complete_deterministic_genesis_audit(
-            agent, provenance="test:llm_call_watchdog"
-        )
-        await agent.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
-        yield agent
-    finally:
-        await agent.shutdown()
-        await llm_service.close()
 
 
 class _ScriptedProvider:

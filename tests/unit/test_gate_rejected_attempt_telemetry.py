@@ -176,10 +176,11 @@ def service(monkeypatch, store):
 
     llm.set_metering_callback(meter)
 
-    def install(adapter: _Route) -> None:
+    def install(adapter: Any, client: Any = None) -> None:
         monkeypatch.setattr(llm, "providers", [{
             "name": ROUTE, "vendor": "ollama", "route": "local",
-            "client": AsyncMock(), "adapter": adapter, "model": MODEL,
+            "client": AsyncMock() if client is None else client,
+            "adapter": adapter, "model": MODEL,
             "is_cloud": False, "is_local": True, "base_url": None,
             "selection_hints": [],
         }])

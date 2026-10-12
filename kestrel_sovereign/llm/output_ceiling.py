@@ -34,7 +34,10 @@ Two halves of one fact (#3300):
   answer at all: the adapter raises :class:`OutputCapReachedError`, an
   :class:`IncompleteGenerationError`, and the attempt fails.
   :func:`incomplete_generation` finds one inside the service's wrappers so a
-  transport can say what happened without reflecting any error text.
+  transport can say what happened without reflecting any error text. The
+  error carries the token usage the provider reported for the attempt, and
+  none of its text, so the failed attempt is recorded with the tokens it
+  consumed (:func:`reported_usage`, #3577).
 
 Whether a generation may become a turn's answer at all is decided in one
 place, :func:`kestrel_sovereign.llm.generation_gate.judge_generation`, from
@@ -45,6 +48,8 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, Iterable, Optional
+
+from kestrel_sdk.llm import LLMResponse
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +88,11 @@ class IncompleteGenerationError(RuntimeError):
     #: call's card in the chat.
     summary = "did not finish"
 
+    #: The token usage the provider reported for the unfinished attempt, as a
+    #: response carrying only its counts and stop reason, never its text;
+    #: ``None`` when the error carries none. Read with :func:`reported_usage`.
+    usage: Optional[LLMResponse] = None
+
 
 class OutputCapReachedError(IncompleteGenerationError):
     """A response stopped at its output cap, not because it finished.
@@ -91,6 +101,11 @@ class OutputCapReachedError(IncompleteGenerationError):
     one the call asked for. ``route_cap`` is the route's own cap (``cap`` when
     not given). ``cap`` is ``None`` when only the provider's stop reason
     (``stop_reason``) says the response hit an output limit, not how large.
+
+    ``input_tokens`` and ``output_tokens`` are the counts the provider
+    reported for the attempt, when an adapter refuses the response itself:
+    the provider still consumed and billed them (#3577). They become
+    :attr:`usage`; the response's text never does.
     """
 
     def __init__(
@@ -101,12 +116,19 @@ class OutputCapReachedError(IncompleteGenerationError):
         cap: Optional[int],
         route_cap: Optional[int] = None,
         stop_reason: Optional[str] = None,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
     ) -> None:
         self.provider = provider
         self.model = model
         self.cap = cap
         self.route_cap = cap if route_cap is None else route_cap
         self.stop_reason = stop_reason
+        self.usage = _usage_report(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            stop_reason=stop_reason,
+        )
         if cap is None:
             self.summary = "stopped at its output limit"
             super().__init__(
@@ -130,6 +152,53 @@ class OutputCapReachedError(IncompleteGenerationError):
             f"{provider} stopped model {model!r} at its output cap of {cap:,} "
             f"tokens before it finished; the attempt failed. {remedy}"
         )
+
+
+def _token_count(value: Any) -> Optional[int]:
+    """``value`` when it is a plausible token count, else ``None``."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _usage_report(
+    *,
+    input_tokens: Any,
+    output_tokens: Any,
+    stop_reason: Optional[str],
+) -> Optional[LLMResponse]:
+    """A response holding only reported token counts and the stop reason,
+    or ``None`` when no count was reported."""
+    inputs = _token_count(input_tokens)
+    outputs = _token_count(output_tokens)
+    if inputs is None and outputs is None:
+        return None
+    return attach_stop_reason(
+        LLMResponse(
+            input_tokens=inputs,
+            output_tokens=outputs,
+            total_tokens=(
+                inputs + outputs
+                if inputs is not None and outputs is not None
+                else None
+            ),
+        ),
+        stop_reason,
+    )
+
+
+def reported_usage(error: BaseException) -> Optional[LLMResponse]:
+    """The usage reported for the unfinished attempt ``error`` is or wraps.
+
+    An adapter that refuses an unfinished generation itself raises before it
+    returns a response, so the attempt's usage arrives on the error
+    (:attr:`IncompleteGenerationError.usage`) rather than on a response. The
+    LLM service records a failed attempt with it (#3577). ``None`` when
+    ``error`` is not an incomplete generation, or carries no usage.
+    """
+    found = incomplete_generation(error)
+    usage = getattr(found, "usage", None)
+    return usage if isinstance(usage, LLMResponse) else None
 
 
 #: Runtime attribute on an aggregate of several routes' errors: its
@@ -334,5 +403,6 @@ __all__ = [
     "output_ceiling_notice_chunk",
     "output_limit_cut_notice",
     "reported_token_limit",
+    "reported_usage",
     "response_stop_reason",
 ]

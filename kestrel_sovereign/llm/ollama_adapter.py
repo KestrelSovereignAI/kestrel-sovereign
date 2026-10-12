@@ -135,6 +135,18 @@ def _num_ctx(parameters: Any) -> Optional[int]:
     return None
 
 
+def _reported_counts(payload: Any) -> tuple[Any, Any]:
+    """Return ``(prompt_eval_count, eval_count)`` from an Ollama chat payload:
+    the input and output tokens Ollama reports, on a reply or on the final
+    (``done``) chunk of a stream. Either is ``None`` when not reported."""
+    if isinstance(payload, dict):
+        return payload.get("prompt_eval_count"), payload.get("eval_count")
+    return (
+        getattr(payload, "prompt_eval_count", None),
+        getattr(payload, "eval_count", None),
+    )
+
+
 def _extract_message_fields(payload: Any) -> tuple[Optional[str], Optional[str]]:
     """Return ``(thinking, content)`` from an Ollama chat payload.
 
@@ -384,15 +396,29 @@ class OllamaAdapter(LLMAdapter):
         extra_kwargs["options"] = merged
         return extra_kwargs, budget
 
-    def _output_cap_reached(self, model: str, budget: int) -> OutputCapReachedError:
+    def _output_cap_reached(
+        self,
+        model: str,
+        budget: int,
+        *,
+        done_reason: Optional[str] = None,
+        input_tokens: Any = None,
+        output_tokens: Any = None,
+    ) -> OutputCapReachedError:
         """The failure for a generation that stopped at its output budget.
 
         Raised for a stop at any budget, the route's or a smaller one the call
-        asked for: an unfinished response is never an answer.
+        asked for: an unfinished response is never an answer. The error
+        carries the token counts Ollama reported for the attempt, and none of
+        its text, so the failed attempt is recorded with the tokens it
+        consumed (#3577).
         """
         return OutputCapReachedError(
             provider="ollama", model=model, cap=budget,
             route_cap=self._max_output_tokens,
+            stop_reason=done_reason,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
     async def raw_request(
@@ -655,8 +681,12 @@ class OllamaAdapter(LLMAdapter):
                 done_reason = response.get("done_reason")
             else:
                 done_reason = getattr(response, "done_reason", None)
+            input_tokens, output_tokens = _reported_counts(response)
             if done_reason == _LENGTH_DONE_REASON:
-                raise self._output_cap_reached(model, budget)
+                raise self._output_cap_reached(
+                    model, budget, done_reason=done_reason,
+                    input_tokens=input_tokens, output_tokens=output_tokens,
+                )
 
             # Extract content - handle both dict and Pydantic model responses
             if isinstance(response, dict):
@@ -730,17 +760,7 @@ class OllamaAdapter(LLMAdapter):
                         arguments=args
                     ))
 
-            # Extract token usage from response
-            # Ollama uses prompt_eval_count and eval_count
-            input_tokens = None
-            output_tokens = None
             total_tokens = None
-            if isinstance(response, dict):
-                input_tokens = response.get('prompt_eval_count')
-                output_tokens = response.get('eval_count')
-            else:
-                input_tokens = getattr(response, 'prompt_eval_count', None)
-                output_tokens = getattr(response, 'eval_count', None)
             if input_tokens is not None and output_tokens is not None:
                 total_tokens = input_tokens + output_tokens
 
@@ -836,13 +856,10 @@ class OllamaAdapter(LLMAdapter):
                         break
                     # Usage and the stop reason arrive on the final (done)
                     # chunk; keep the latest.
+                    it, ot = _reported_counts(chunk)
                     if isinstance(chunk, dict):
-                        it = chunk.get('prompt_eval_count')
-                        ot = chunk.get('eval_count')
                         reason = chunk.get('done_reason')
                     else:
-                        it = getattr(chunk, 'prompt_eval_count', None)
-                        ot = getattr(chunk, 'eval_count', None)
                         reason = getattr(chunk, 'done_reason', None)
                     if it is not None:
                         input_tokens = it
@@ -859,7 +876,11 @@ class OllamaAdapter(LLMAdapter):
                         # not honoring the cap.
                         generated_chunks += 1
                         if generated_chunks > budget:
-                            raise self._output_cap_reached(model, budget)
+                            raise self._output_cap_reached(
+                                model, budget,
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                            )
 
                     if thinking and response_format is None:
                         yield ThinkingDelta(thinking, provider="ollama")
@@ -880,7 +901,10 @@ class OllamaAdapter(LLMAdapter):
                 await close_native_execution_stream(stream, self)
 
             if done_reason == _LENGTH_DONE_REASON:
-                raise self._output_cap_reached(model, budget)
+                raise self._output_cap_reached(
+                    model, budget, done_reason=done_reason,
+                    input_tokens=input_tokens, output_tokens=output_tokens,
+                )
 
             if response_format is None:
                 for event in splitter.flush():

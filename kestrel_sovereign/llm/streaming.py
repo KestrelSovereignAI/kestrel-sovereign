@@ -96,7 +96,7 @@ from .generation_gate import (
     judge_generation,
     ran_inline_tools,
 )
-from .output_ceiling import IncompleteGenerationError
+from .output_ceiling import IncompleteGenerationError, reported_usage
 from .provider_registry import provider_cache_body
 
 if TYPE_CHECKING:
@@ -1097,7 +1097,9 @@ class StreamingMixin:
         stream that ends without one has given no evidence it finished. A
         rejected attempt raises the gate's failure instead of ending, and is
         recorded as a failed attempt with the usage and stop reason its
-        provider reported (#3576).
+        provider reported (#3576). So is a stream whose adapter refused its
+        own unfinished generation, from the usage carried on the error it
+        raised (#3577).
         """
 
         common_kwargs: Dict[str, Any] = {}
@@ -1236,6 +1238,7 @@ class StreamingMixin:
                 with (bind_execution_cleanup(self, admitted_custody) if aborted else bind_execution_custody_snapshot(admitted_custody)):
                     duration_ms = int((time.monotonic() - started) * 1000)
                     rejection_message = None if rejected is None else recorded_message(rejected)
+                    refused_usage = None if failure is None else reported_usage(failure)
                     if final_response is not None:
                         await self._record_streamed_usage(
                             final_response,
@@ -1246,6 +1249,17 @@ class StreamingMixin:
                             success=rejected is None,
                             error_message=rejection_message,
                             # The terminal response was stamped before it was exposed.
+                            publish_identity=False,
+                            invocation_context=invocation_context,
+                            meter_usage=True,
+                        )
+                    elif refused_usage is not None:
+                        # Main's adapter-side refusal retains token counts,
+                        # never text. Original native custody still governs.
+                        await self._record_streamed_usage(
+                            refused_usage, model, provider_name,
+                            duration_ms=duration_ms, path=path, success=False,
+                            error_message=recorded_message(failure),
                             publish_identity=False,
                             invocation_context=invocation_context,
                             meter_usage=True,
