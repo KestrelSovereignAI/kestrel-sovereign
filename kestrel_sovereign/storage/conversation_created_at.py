@@ -188,9 +188,10 @@ def comparable_created_at(value: Any) -> Optional[str]:
     ``12:00:00`` and a row stamped ``12:00:00`` — which may predate the
     boundary — is selected. PostgreSQL keeps the fraction, so the two backends
     would also disagree about which rows match. (The EPHEMERAL leak sweep,
-    ``purge_all_since``, deliberately does select that row: it compares
-    against :func:`created_at_bind` instead, because a leak written in the
-    boundary's second is stored exactly like it, #3227.)
+    ``purge_all_since``, deliberately does select that row: it floors its
+    watermark to the second with :func:`canonical_created_at` on both
+    backends, because a leak written in that second can carry the same
+    stamp, #3227.)
 
     Still sorts correctly against canonical values, which is what lets the
     comparison be a text one: ``'12:00:00' < '12:00:00.5' < '12:00:01'``.

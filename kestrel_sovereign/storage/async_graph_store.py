@@ -891,6 +891,11 @@ _CREATED_AT_SEPARATORS = ("T", " ")
 #: because ``datetime`` holds microseconds.
 _CREATED_AT_MAX_FRACTION_DIGITS = 9
 
+#: Owned rows the scoped purge reads per query. It dates every node an agent
+#: owns on every EPHEMERAL exit, so the scan is paged rather than one read of
+#: the whole tenant graph.
+_PURGE_SCAN_PAGE = 500
+
 _CREATED_AT_GRAMMAR = re.compile(
     r"([0-9]{4})-([0-9]{2})-([0-9]{2})"
     + "[" + "".join(re.escape(sep) for sep in _CREATED_AT_SEPARATORS) + "]"
@@ -2029,7 +2034,7 @@ class AsyncGraphStore:
         if watermark is None:
             raise ValueError(
                 "purge watermark must be a UTC timestamp "
-                f"(YYYY-MM-DD HH:MM:SS[.fraction][+00:00|Z]); got {since_iso!r}"
+                f"(YYYY-MM-DD[T| ]HH:MM:SS[.fraction][+00:00|Z]); got {since_iso!r}"
             )
 
         # The database only hands back each owned row's text; the grammar
@@ -2037,21 +2042,26 @@ class AsyncGraphStore:
         # UNTIMED: we can't prove it is an in-window leak, so it is preserved
         # rather than risk destroying real preexisting data, and counted so
         # operators see it (visible-but-skipped surface).
-        created_at = self._json_extract("properties", "created_at")
+        #
+        # Every owned node is dated on every EPHEMERAL exit, so they are read
+        # in pages of ``_PURGE_SCAN_PAGE`` and only the leaks are kept. The
+        # release still runs once, after the scan: it reserves its lock
+        # shards before any row lock, which a release per page would break.
         untimed = 0
+        node_ids: List[str] = []
         async with self.db.transaction():
-            rows = await self.db.fetchall(
-                f"SELECT node_id, {created_at} FROM graph_nodes "
-                f"WHERE {ownership_clause}",
-                (agent_id,),
-            )
-            node_ids = []
-            for node_id, value in rows:
-                instant = _purge_created_at_instant(value)
-                if instant is None:
-                    untimed += 1
-                elif instant >= watermark:
-                    node_ids.append(node_id)
+            after: Optional[str] = None
+            while True:
+                page = await self._owned_created_at_page(agent_id, after)
+                for node_id, value in page:
+                    instant = _purge_created_at_instant(value)
+                    if instant is None:
+                        untimed += 1
+                    elif instant >= watermark:
+                        node_ids.append(node_id)
+                if len(page) < _PURGE_SCAN_PAGE:
+                    break
+                after = page[-1][0]
             purged = await release_graph_node_owners(self.db, node_ids, agent_id)
 
         if untimed > 0:
@@ -2064,7 +2074,28 @@ class AsyncGraphStore:
                 untimed, agent_id,
             )
         return purged
-    
+
+    async def _owned_created_at_page(
+        self, agent_id: str, after: Optional[str]
+    ) -> List[tuple]:
+        """One page of ``(node_id, created_at text)`` for ``agent_id``'s nodes.
+
+        Keyed on ``node_id`` through the ownership ledger's
+        ``(agent_id, node_id)`` index: the page after ``after`` in node-id
+        order, at most :data:`_PURGE_SCAN_PAGE` rows.
+        """
+        created_at = self._json_extract("graph_nodes.properties", "created_at")
+        after_clause = "" if after is None else "AND purge_owner.node_id > ? "
+        params: tuple = (agent_id,) if after is None else (agent_id, after)
+        return await self.db.fetchall(
+            f"SELECT purge_owner.node_id, {created_at} "
+            "FROM graph_node_owners AS purge_owner "
+            "JOIN graph_nodes ON graph_nodes.node_id = purge_owner.node_id "
+            f"WHERE purge_owner.agent_id = ? {after_clause}"
+            "ORDER BY purge_owner.node_id LIMIT ?",
+            params + (_PURGE_SCAN_PAGE,),
+        )
+
     async def add_edge(
         self,
         source_id: str,

@@ -1178,6 +1178,13 @@ class AsyncStorage:
         The doomed ids are deleted in bounded batches so a high-volume session
         never trips the backend's bind-parameter ceiling and raises (which the
         caller would swallow, leaving the whole leak behind).
+
+        The boundary is the start of the watermark's second, as it was while
+        the watermark carried whole seconds (#3227). ``created_at`` is
+        ``ChannelMessage.timestamp``, which defaults to when the adapter built
+        the message, not when this row was written, so a message built earlier
+        in the transition second and logged during the stint carries a stamp
+        before the watermark. A privacy sweep must not leave that leak behind.
         """
         if not since_iso:
             return 0
@@ -1198,6 +1205,7 @@ class AsyncStorage:
                 since_iso, self.agent_id, reason,
             )
             return 0
+        since_dt = since_dt.replace(microsecond=0)
 
         rows = await self.db.fetchall(
             "SELECT id, created_at FROM channel_messages WHERE agent_id = ?",

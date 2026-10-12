@@ -23,7 +23,11 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
-from .conversation_created_at import UNDATED_TABLE, created_at_bind
+from .conversation_created_at import (
+    UNDATED_TABLE,
+    canonical_created_at,
+    created_at_bind,
+)
 from .session_grouping import (
     UNDATABLE_ROW_FALLBACK,
     canonical_session_id,
@@ -3782,15 +3786,26 @@ class AsyncConversationStore:
         and the original wipe-on-shutdown bug is precisely what this
         method exists to prevent.
 
-        The boundary is the stamp a row written at ``since_iso`` would
-        carry (:func:`created_at_bind`), so the comparison is made at the
-        column's own precision (#3227). On PostgreSQL that is the instant
-        itself — the column is ``NOW()``-stamped to the microsecond, so a
-        NORMAL row written earlier in the transition second survives. On
-        SQLite the column is whole-second by CHECK (#3009) and the boundary
-        is the watermark's second: a leak written in that second is stored
-        exactly like a row written just before the watermark, and a privacy
-        sweep must not leave leaks behind, so the whole second is purged.
+        The boundary is the start of the second ``since_iso`` falls in, on
+        both backends: the whole transition second is purged, as it always
+        was. The wrapper's watermark is exact to the microsecond (#3227),
+        but a row's stamp is not evidence of when it was written to that
+        precision:
+
+        * SQLite's column is whole-second by CHECK (#3009), so a leak
+          written in the transition second is stored exactly like a row
+          written just before the watermark;
+        * PostgreSQL stamps the column with ``NOW()`` (``_now_sql``), which
+          is the time the writing *transaction* started. A row inserted
+          during the EPHEMERAL stint by a transaction that began earlier in
+          the transition second carries a stamp before the watermark, and an
+          exact cutoff would keep that leak.
+
+        A privacy sweep must not leave leaks behind, so a NORMAL row written
+        earlier in the transition second is purged with them. The floor
+        covers a straddling transaction only within that second; one that
+        began in an earlier second is stamped outside the window either way.
+
         That is deliberately not :func:`comparable_created_at`, which keeps
         a boundary's fraction for readers that must not over-select.
         """
@@ -3802,11 +3817,14 @@ class AsyncConversationStore:
                 reason,
             )
             return 0
-        boundary = created_at_bind(self.db.backend_type, since_iso)
-        if boundary is None:
+        # The canonical spelling is whole-second, so the bind is that
+        # second's start on PostgreSQL too, not the watermark's instant.
+        transition_second = canonical_created_at(since_iso)
+        if transition_second is None:
             raise ValueError(
                 f"purge_all_since needs a datable watermark; got {since_iso!r}"
             )
+        boundary = created_at_bind(self.db.backend_type, transition_second)
         created_at_predicate = self._timestamp_predicate("created_at", ">=")
         purged = await self._purge_conversation_rows(
             [

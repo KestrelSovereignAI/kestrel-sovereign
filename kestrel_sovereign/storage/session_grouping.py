@@ -40,7 +40,6 @@ the shape #2948 was filed about.
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -153,9 +152,10 @@ def timestamp_query_param(backend_type: str, value: Any) -> Any:
 
     Sub-second precision is KEPT, which is why this is ``comparable_`` and not
     the storage spelling. Nothing stores a fraction, but a boundary may carry
-    one, and rounding it down moves the boundary — ``purge_all_since`` compares
-    ``>=`` and would permanently delete a row that predates the watermark it
-    was given.
+    one, and rounding it down moves the boundary — a ``>=`` comparison would
+    then select a row that predates the boundary it was given. (The EPHEMERAL
+    leak sweep, ``purge_all_since``, floors its watermark on purpose and does
+    not bind through here, #3227.)
 
     A value nothing can date is passed through unchanged rather than becoming
     NULL: a predicate against it found nothing before and must go on finding

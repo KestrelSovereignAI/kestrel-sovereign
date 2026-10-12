@@ -1915,9 +1915,10 @@ class PrivacyEnforcingStorage:
         # (#867) uses this to scope its DELETE so that flipping a long-lived
         # agent into EPHEMERAL for 30 seconds doesn't destroy the months of
         # NORMAL history that preceded it — only rows authored on/after this
-        # timestamp can be leaks.  None when the agent was never in
-        # EPHEMERAL during this process; refreshed each time we re-enter
-        # EPHEMERAL.
+        # timestamp can be leaks.  Sweeps whose stamps can precede the write
+        # purge from the start of its second (see ``_now_iso``).  None when
+        # the agent was never in EPHEMERAL during this process; refreshed
+        # each time we re-enter EPHEMERAL.
         self._entered_ephemeral_at: Optional[str] = None
         if self._privacy_config.is_ephemeral():
             self._entered_ephemeral_at = self._now_iso()
@@ -2509,20 +2510,20 @@ class PrivacyEnforcingStorage:
 
         ``YYYY-MM-DD HH:MM:SS.ffffff`` in UTC: SQLite's ``datetime('now')``
         shape (space separator, no offset) plus microseconds. One watermark
-        is handed to every sweep, and each store compares it at the
-        precision its own rows are stamped with:
+        is handed to every sweep, and each store decides what its own
+        stamps can honour:
 
-        * graph nodes, channel messages, observability rows and PostgreSQL
-          conversation rows carry sub-second stamps and compare exactly;
-        * SQLite's ``conversation_history.created_at`` is whole-second, so
-          its sweep compares against the stamp a row written at this
-          instant would carry — the whole transition second is purged, as
-          it always was, because a leak in that second cannot be told from
-          a row written just before it.
-
-        It used to be truncated to whole seconds for every store. A
-        microsecond store then read a NORMAL row written earlier in the
-        transition second as equal to the watermark, and purged it (#3227).
+        * the graph sweep compares exactly. It used to be handed whole
+          seconds, read a NORMAL node written earlier in the transition
+          second as equal to the watermark, and purged it (#3227);
+        * the conversation, channel and observability sweeps purge the whole
+          transition second, as they did while the watermark carried whole
+          seconds. Their stamps can precede the write: SQLite's conversation
+          column is whole-second, PostgreSQL's is ``NOW()`` (the writing
+          transaction's start), a channel message is stamped when its
+          adapter built it, and an observability event may carry its
+          producer's time. A leak in that second cannot be told from a row
+          written just before the watermark.
         """
         from datetime import timezone
         return cls._now_utc().astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -2821,8 +2822,8 @@ class PrivacyEnforcingStorage:
 
         # Attempt ALL independent sweeps, retaining each outcome. A failure in
         # one never turns into a clean count and never skips the others (#2673).
-        # Every sweep gets the same exact instant; each compares it at its own
-        # column's precision (see ``_now_iso``, #3227).
+        # Every sweep gets the same exact instant; each decides what its own
+        # stamps can honour (see ``_now_iso``, #3227).
         report.record(await self._sweep_store(
             "conversation_history",
             lambda: self._storage.purge_conversations_since(since, reason=reason),
@@ -2833,10 +2834,10 @@ class PrivacyEnforcingStorage:
         ))
         # Defense-in-depth for the channels feature (#2096 / F112): a leaked
         # channel_messages row must be swept on EPHEMERAL exit, scoped to the
-        # same watermark, which it parses to an aware instant and so compares
-        # to the microsecond (#3227). The primitive itself tolerates the table
-        # being absent (channels feature never loaded) and returns 0 — only a
-        # genuine backend error becomes FAILED here.
+        # same watermark, from the start of its second (#3227). The primitive
+        # itself tolerates the table being absent (channels feature never
+        # loaded) and returns 0 — only a genuine backend error becomes FAILED
+        # here.
         report.record(await self._sweep_store(
             "channel_messages",
             lambda: self._storage.purge_channel_messages_since(since, reason=reason),

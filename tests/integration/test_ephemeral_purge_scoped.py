@@ -334,10 +334,13 @@ def test_the_transition_clock_carries_sub_second_precision(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_same_second_pre_transition_channel_message_survives(tmp_path, monkeypatch):
-    """channel_messages rows are stamped with isoformat() and the purge parses
-    both sides, so handed the exact instant it keeps a NORMAL message written
-    300 ms before the transition; handed whole seconds, it destroyed it."""
+async def test_a_channel_message_stamped_in_the_transition_second_is_purged(tmp_path, monkeypatch):
+    """channel_messages.created_at is ``ChannelMessage.timestamp``: when the
+    adapter built the message, not when the row was written. A message built
+    300 ms before the transition and logged during the stint is a leak with a
+    stamp before the watermark, so the sweep purges the whole transition
+    second, as it did while the watermark carried whole seconds. The last
+    microsecond of the previous second survives."""
     from datetime import datetime, timedelta, timezone
 
     transition = datetime(2026, 9, 7, 12, 0, 5, 500000, tzinfo=timezone.utc)
@@ -361,15 +364,16 @@ async def test_same_second_pre_transition_channel_message_survives(tmp_path, mon
                  None, stamp.isoformat()),
             )
 
-        await _insert("normal-pre-transition", transition - timedelta(milliseconds=300))
+        await _insert("previous-second", transition.replace(microsecond=0) - timedelta(microseconds=1))
         _pin_transition(monkeypatch, transition)
         wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
         wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        await _insert("built-before-watermark", transition - timedelta(milliseconds=300))
         await _insert("leak-post-transition", transition + timedelta(milliseconds=300))
         result = await wrapper.purge_ephemeral_session(reason="test-channel-same-second")
-        assert result["channel_messages"] == 1, result
+        assert result["channel_messages"] == 2, result
         rows = await storage.db.fetchall("SELECT id FROM channel_messages ORDER BY id")
-        assert [r[0] for r in rows] == ["normal-pre-transition"]
+        assert [r[0] for r in rows] == ["previous-second"]
 
 
 @pytest.mark.asyncio

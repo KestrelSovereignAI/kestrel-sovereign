@@ -14,6 +14,7 @@ Runs on SQLite and, in the integration job, on PostgreSQL through
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import uuid
@@ -23,6 +24,7 @@ import pytest
 import pytest_asyncio
 
 from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.storage import async_graph_store
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_graph_store import (
     AsyncGraphStore,
@@ -310,6 +312,71 @@ async def test_an_offset_free_value_is_utc_on_the_purges_own_connection_on_backe
     assert purged == 1
     assert await store.get_node(f"{agent}:before") is not None
     assert await store.get_node(f"{agent}:after") is None
+
+
+# ---------------------------------------------------------------------------
+# The scan is paged
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize(
+    "owned, pages",
+    [(7, [2, 2, 2, 1]), (6, [2, 2, 2, 0])],
+    ids=["partial-last-page", "full-last-page"],
+)
+async def test_the_scan_reads_owned_nodes_in_bounded_pages_on_backend(
+    graph_db, monkeypatch, owned, pages
+):
+    """The scoped purge dates every node an agent owns on every EPHEMERAL exit,
+    so it reads them a page at a time rather than in one read of the whole
+    graph. With a page of two, no read returns more than two rows, the leaks
+    on every page are found (rows 1, 2, 5 and 6: pages are [0, 1], [2, 3],
+    [4, 5], [6], so a leak sits at the end of one page and at the start of
+    the next), and another agent's nodes are neither read nor touched."""
+    monkeypatch.setattr(async_graph_store, "_PURGE_SCAN_PAGE", 2)
+    agent = f"did:test:paged-{uuid.uuid4().hex}"
+    other = f"did:test:paged-other-{uuid.uuid4().hex}"
+    leak = (TRANSITION + timedelta(seconds=1)).isoformat()
+    normal = (TRANSITION - timedelta(seconds=1)).isoformat()
+    leaks = [i for i in range(owned) if i % 4 in (1, 2)]
+    store = AsyncGraphStore(graph_db, agent_id=agent)
+    for i in range(owned):
+        await store.add_node(GraphNode(
+            node_id=f"{agent}:{i:02d}", node_type="memory", label=str(i),
+            properties={"agent_id": agent, "created_at": leak if i in leaks else normal},
+        ))
+    other_store = AsyncGraphStore(graph_db, agent_id=other)
+    for i in range(3):
+        await other_store.add_node(GraphNode(
+            node_id=f"{other}:{i:02d}", node_type="memory", label=str(i),
+            properties={"agent_id": other, "created_at": leak},
+        ))
+
+    scan_reads = []
+    fetchall = graph_db.fetchall
+
+    async def recording_fetchall(sql, *args, **kwargs):
+        rows = await fetchall(sql, *args, **kwargs)
+        if "created_at" in sql and "graph_node_owners" in sql:
+            scan_reads.append(len(rows))
+        return rows
+
+    monkeypatch.setattr(graph_db, "fetchall", recording_fetchall)
+    purged = await asyncio.wait_for(
+        store.purge_agent_nodes(agent, since_iso=WATERMARK), timeout=60
+    )
+    monkeypatch.setattr(graph_db, "fetchall", fetchall)
+
+    assert scan_reads == pages
+    assert purged == len(leaks)
+    survivors = [
+        i for i in range(owned) if await store.get_node(f"{agent}:{i:02d}") is not None
+    ]
+    assert survivors == [i for i in range(owned) if i not in leaks]
+    for i in range(3):
+        assert await other_store.get_node(f"{other}:{i:02d}") is not None
 
 
 # ---------------------------------------------------------------------------
