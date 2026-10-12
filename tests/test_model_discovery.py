@@ -12,6 +12,7 @@ import pytest
 
 from kestrel_sovereign.agent import token_counter
 from kestrel_sovereign.llm import model_catalog
+from kestrel_sovereign.llm.model_cache import get_shared_model_cache
 from kestrel_sovereign.llm.model_catalog import ModelCatalogService
 from kestrel_sovereign.llm.model_metadata import ModelInfo
 from kestrel_sovereign.llm.service import LLMService
@@ -29,8 +30,8 @@ pytestmark = [
 async def test_live_discovery_returns_only_model_info(tmp_path, monkeypatch):
     """Whatever the vendors answer, only framework ``ModelInfo`` reaches the catalog.
 
-    A vendor that fails is excluded and named in ``_discovery_failures``
-    instead of failing this test.
+    A vendor that fails is excluded and named in the published snapshot's
+    ``discovery_failures`` instead of failing this test.
     """
     # The default catalog writes its disk cache beside the package source.
     monkeypatch.setattr(
@@ -43,7 +44,7 @@ async def test_live_discovery_returns_only_model_info(tmp_path, monkeypatch):
     service = LLMService()
     try:
         models = await service.discover_all_models(use_cache=False)
-        failures = dict(service._discovery_failures)
+        failures = get_shared_model_cache().snapshot().discovery_failures
     finally:
         await service.close()
 

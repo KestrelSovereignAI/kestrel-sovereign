@@ -21,17 +21,23 @@ from kestrel_sovereign.features.health.checks import (
     derive_overall_status,
     worst_status,
 )
+from kestrel_sovereign.llm.model_cache import (
+    VendorDiscoveryOutcome,
+    get_shared_model_cache,
+)
 
 
 def _agent(*, failures=None, pinned_vendor=None, providers=None, load_error=None):
+    # Discovery outcomes are published with the catalog in the process-wide
+    # snapshot (#3197), which is what the check reads. tests/conftest.py clears
+    # that cache around every test.
+    outcomes = {"anthropic": VendorDiscoveryOutcome.ok()}
+    outcomes.update({
+        vendor: VendorDiscoveryOutcome.failed(error)
+        for vendor, error in (failures or {}).items()
+    })
+    get_shared_model_cache().set([], outcomes=outcomes)
     llm = MagicMock()
-    llm._discovery_failures = failures if failures is not None else {}
-    # Match the real envelope: the check reads the RECONCILED view via a real
-    # method returning a real dict. Left as a bare MagicMock attribute this is
-    # callable and returns a mock, the isinstance guard rejects it, and every
-    # one of these tests silently reports "pass" — testing the double, not the
-    # code.
-
     llm._mandate_load_error = load_error
     llm.providers = providers if providers is not None else [
         {"name": "anthropic:plan", "vendor": "anthropic"},
@@ -51,6 +57,31 @@ class TestModelDiscoveryCheck:
     async def test_passes_when_every_vendor_discovered(self):
         result = await check_model_discovery(_agent())
         assert result["status"] == "pass"
+        assert result["message"] == "Model discovery healthy for every discovered vendor"
+
+    @pytest.mark.asyncio
+    async def test_passes_when_no_outcome_is_recorded(self):
+        agent = _agent()
+        get_shared_model_cache().clear()
+
+        result = await check_model_discovery(agent)
+
+        assert result["status"] == "pass"
+        assert result["message"] == "No vendor's model catalog has been fetched"
+
+    @pytest.mark.asyncio
+    async def test_a_refresh_that_requested_nothing_is_not_called_healthy(self):
+        """No credential anywhere: every vendor not attempted, nothing failed."""
+        agent = _agent()
+        get_shared_model_cache().clear()
+        get_shared_model_cache().set([], outcomes={
+            "anthropic": VendorDiscoveryOutcome.not_attempted(),
+        })
+
+        result = await check_model_discovery(agent)
+
+        assert result["status"] == "pass"
+        assert result["message"] == "No vendor's model catalog has been fetched"
 
     @pytest.mark.asyncio
     async def test_warns_and_names_the_failing_vendor(self):

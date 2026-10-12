@@ -33,9 +33,16 @@ import pytest_asyncio
 from kestrel_sdk.llm import ModelInfo as SDKModelInfo
 from kestrel_sovereign.agent import token_counter
 from kestrel_sovereign.llm import model_catalog
-from kestrel_sovereign.llm.model_cache import get_shared_model_cache
+from kestrel_sovereign.llm.model_cache import (
+    DiscoveryStatus,
+    VendorDiscoveryOutcome,
+    get_shared_model_cache,
+)
 from kestrel_sovereign.llm.model_catalog import ModelCatalogService
-from kestrel_sovereign.llm.model_discovery import _as_framework_models
+from kestrel_sovereign.llm.model_discovery import (
+    _as_framework_models,
+    collect_discovery_outcomes,
+)
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from tests.utils.process_local_llm_service import process_local_service
@@ -222,7 +229,6 @@ async def discovery(fixture_http, fixture_catalog, monkeypatch):
         # A plugin without a catalog, pinned to a model in config.
         _route("kimi", _CataloglessAdapter(), model=PINNED_KIMI_MODEL),
     ])
-    service._discovery_failures = {}
     try:
         yield service
     finally:
@@ -245,6 +251,11 @@ def _route(vendor, adapter, *, route="api", client=None, model="auto", **config)
 
 def _by_id(models) -> dict[str, ModelInfo]:
     return {model.id: model for model in models}
+
+
+def _published_failures() -> dict[str, str]:
+    """The discovery failures published with the catalog (#3197)."""
+    return get_shared_model_cache().snapshot().discovery_failures
 
 
 def _discovery_warnings(caplog) -> list[str]:
@@ -318,7 +329,7 @@ class TestVendorFailureOutcomes:
         models = await discovery.discover_all_models(use_cache=False)
 
         assert [m.id for m in models if m.provider == "runpod"] == []
-        recorded = discovery._discovery_failures["runpod"]
+        recorded = _published_failures()["runpod"]
         assert recorded.startswith("RuntimeError: remote model discovery failed")
         assert "404 Not Found" in recorded
         assert any(
@@ -335,7 +346,7 @@ class TestVendorFailureOutcomes:
         models = await discovery.discover_all_models(use_cache=False)
 
         assert [m.id for m in models if m.provider == "bedrock"] == []
-        assert discovery._discovery_failures["bedrock"] == (
+        assert _published_failures()["bedrock"] == (
             "NoCredentialsError: Unable to locate credentials"
         )
         assert (
@@ -347,7 +358,11 @@ class TestVendorFailureOutcomes:
     async def test_only_the_failing_vendors_are_recorded(self, discovery):
         await discovery.discover_all_models(use_cache=False)
 
-        assert set(discovery._discovery_failures) == {"runpod", "bedrock"}
+        assert set(_published_failures()) == {"runpod", "bedrock"}
+        outcomes = get_shared_model_cache().snapshot().outcomes
+        assert outcomes["openai"].status is DiscoveryStatus.OK
+        # A catalog-less adapter issued no request: not attempted, not failed.
+        assert outcomes["kimi"] == VendorDiscoveryOutcome.not_attempted()
 
 
 class TestDiscoveryFilters:
@@ -484,14 +499,15 @@ class TestAdapterBoundary:
     @pytest.mark.asyncio
     async def test_a_non_list_result_is_recorded_as_that_vendors_failure(self):
         service = process_local_service([])
-        service._discovery_failures = {}
 
-        models = await service._safe_list_models(
-            "xai", _PluginAdapter(models={"grok": "not a list"}), object()
-        )
+        with collect_discovery_outcomes() as outcomes:
+            models = await service._safe_list_models(
+                "xai", _PluginAdapter(models={"grok": "not a list"}), object()
+            )
 
         assert models == []
-        assert service._discovery_failures["xai"].startswith(
+        assert outcomes["xai"].status is DiscoveryStatus.FAILED
+        assert outcomes["xai"].error.startswith(
             "TypeError: list_models returned dict"
         )
 
@@ -499,11 +515,11 @@ class TestAdapterBoundary:
     async def test_a_partly_malformed_catalog_is_not_a_vendor_failure(self):
         """The well-formed records still came back, so discovery succeeded."""
         service = process_local_service([])
-        service._discovery_failures = {"xai": "RuntimeError: earlier outage"}
 
-        models = await service._safe_list_models(
-            "xai", _PluginAdapter(models=[*XAI_SDK_MODELS, None]), object()
-        )
+        with collect_discovery_outcomes() as outcomes:
+            models = await service._safe_list_models(
+                "xai", _PluginAdapter(models=[*XAI_SDK_MODELS, None]), object()
+            )
 
         assert [m.id for m in models] == [m.id for m in XAI_SDK_MODELS]
-        assert service._discovery_failures == {}
+        assert outcomes == {"xai": VendorDiscoveryOutcome.ok()}
