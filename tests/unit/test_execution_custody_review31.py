@@ -223,7 +223,16 @@ async def test_llm_bounded_handoff_retains_late_native_control_and_later_cleanup
         with pytest.raises(BaseException) as caught:
             await service.close()
         assert caught.value is failure
-        assert not any(task is not None for task in service._llm_close_tasks.values())
+        if stage == "preference":
+            # A writer receipt is independent of physical writer settlement.
+            assert not any(task is not None for task in service._llm_close_tasks.values())
+        else:
+            # A failed native close is not a retirement receipt. Its original
+            # owner remains sticky; another close may not repeat the effect.
+            retained = tuple(task for task in service._llm_close_tasks.values() if task is not None)
+            assert retained == pending
+            assert all(task.done() for task in retained)
+            assert service.has_pending_close_owners()
         assert calls.count(stage) == 1
         assert calls.count("later") == 1
         assert calls.count("usage") == 1

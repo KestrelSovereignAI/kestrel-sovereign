@@ -323,6 +323,7 @@ async def test_close_retains_timed_out_native_resource_and_joins_original_receip
             await service.close()
         assert native_close_entered.is_set()
         assert service.has_pending_close_owners()
+        failed_owner = service._llm_close_tasks[(stage, id(resource))]
         assert retired == ["later"]
         assert service._remote_route_closed is True
         assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1
@@ -330,11 +331,17 @@ async def test_close_retains_timed_out_native_resource_and_joins_original_receip
         with pytest.raises(BaseException) as caught:
             await service.wait_for_close_completion()
         assert caught.value is failure
-        assert not service.has_pending_close_owners()
+        # A native close raising a control receipt has not proved transport
+        # retirement. Preserve its exact owner even after its task settles.
+        assert service.has_pending_close_owners()
+        assert service._llm_close_tasks[(stage, id(resource))] is failed_owner
+        assert failed_owner.done()
         with pytest.raises(BaseException) as caught:
             await service.close()
         assert caught.value is failure
         assert retired == ["later"]
+        assert service._llm_close_tasks[(stage, id(resource))] is failed_owner
+        assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1
     finally:
         release_native_close.set()
         for task in tuple(vars(service).get("_llm_close_tasks", {}).values()):
