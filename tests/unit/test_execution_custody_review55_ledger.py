@@ -5,7 +5,8 @@ import pytest
 from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
 from tests.unit.test_execution_custody_review43_native import carries
 from tests.unit.test_strategic_memory_ledger_assertions import (
-    governed, ledger, project, seed, tenant_identity,
+    governed as governed, ledger as ledger, project, seed,
+    tenant_identity as tenant_identity,
 )
 
 

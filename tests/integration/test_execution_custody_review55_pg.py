@@ -9,7 +9,7 @@ from kestrel_sovereign.agent.constitution import ConstitutionMixin
 from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_custody_snapshot, execution_commit_outcome
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.stop import StopReceiptStore, StopDoor
-from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg
+from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as native_pg
 from tests.integration.test_constitution_turn_admission import _ready_turn
 from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
 from tests.unit.test_stop_receipts import _request, _outcomes
