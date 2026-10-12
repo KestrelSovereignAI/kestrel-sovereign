@@ -29,7 +29,7 @@ from kestrel_sovereign.agent.invocation import (
 from kestrel_sovereign.features.sovereignty.artifacts import (
     owned_artifacts,
     owned_cache_names,
-    owned_content_hashes,
+    owned_legacy_content_hashes,
 )
 from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.paths import CACHE_DIR_ENV, runtime_path_env
@@ -101,20 +101,22 @@ def _read_metadata_file(meta_path: Path):
 
 
 async def _owned_names(agent) -> "tuple[set, set]":
-    """The content hashes the routed agent durably owns, and the cache
-    names it owns them under (#3225).
+    """The cache names the routed agent durably owns its artifacts under,
+    and the content hashes of those its receipts record no name for (#3225).
 
     From the receipts in the agent's *own* storage, never from the cache:
     the directory is one per host, shared by every agent and every producer
     that ever ran here, so a filename, a CID, or a sidecar's ``agent`` field
-    is a claim anyone with the filesystem can plant. A hash with no receipt
-    here is unavailable to this agent, indistinguishably from a hash that
-    does not exist. An encrypted envelope is cached under a name its receipt
-    records, which no other agent's receipt holds, though two agents'
-    envelopes of one plaintext share its content hash (#2873).
+    is a claim anyone with the filesystem can plant. A name with no receipt
+    here is unavailable to this agent, indistinguishably from a name that
+    does not exist. A receipt that records a cache name owns that name
+    only: two agents' exports of one plaintext share its content hash, so
+    the bare hash is not an encrypted envelope's receipt's to confer
+    (#2873). A receipt written before the name was recorded owns its
+    content hash, under which every export was cached then.
     """
     artifacts = await owned_artifacts(getattr(agent, "storage", None))
-    return owned_content_hashes(artifacts), owned_cache_names(artifacts)
+    return owned_cache_names(artifacts), owned_legacy_content_hashes(artifacts)
 
 
 async def _artifact_is_owned(agent, filename: str) -> bool:
@@ -122,44 +124,45 @@ async def _artifact_is_owned(agent, filename: str) -> bool:
 
     The producers write these shapes into the cache: ``{name}.cache`` (the
     bytes) and ``{name}.meta`` (the durability sidecar), where ``name`` is
-    the content hash or, for an encrypted envelope, the name its receipt
-    records; and, for content encrypted before F187, ``key_{hash}.key``.
-    Any other name belongs to no artifact and so to no agent.
+    the name the receipt records (the content hash, for one that records
+    none); and, for content encrypted before F187, ``key_{hash}.key``,
+    which only a receipt recording no name can own. Any other name belongs
+    to no artifact and so to no agent.
     """
     if filename.endswith(".cache") or filename.endswith(".meta"):
         stem = filename.rsplit(".", 1)[0]
-        return bool(stem) and stem in (await _owned_names(agent))[1]
+        return bool(stem) and stem in (await _owned_names(agent))[0]
     if filename.startswith("key_") and filename.endswith(".key"):
         stem = filename[len("key_"):-len(".key")]
-        return bool(stem) and stem in (await _owned_names(agent))[0]
+        return bool(stem) and stem in (await _owned_names(agent))[1]
     return False
 
 
-def _list_owned_cache_files(cache_dir: Path, owned: set, cache_names: set):
-    """List the cache entries for the given hashes and names, and only those.
+def _list_owned_cache_files(cache_dir: Path, cache_names: set, legacy_hashes: set):
+    """List the cache entries under the given names, and only those.
 
     Walks the owned sets rather than the directory: the host cache holds
     thousands of other agents' and long-gone producers' files, and reading
     their sidecars (or even their names) would be the disclosure this
-    browser exists to avoid. ``owned`` holds content hashes and
-    ``cache_names`` the names they are cached under, so another agent's
-    envelope of the same content is not listed. Symlinks are followed here
+    browser exists to avoid. ``cache_names`` holds the names the agent's
+    receipts record, so another agent's export of the same content, under
+    its own envelope name or the bare content hash, is not listed;
+    ``legacy_hashes`` the content hashes of receipts recording no name,
+    whose pre-F187 key sidecars are listed too. Symlinks are followed here
     as before; the download and preview handlers still resolve and contain
     the real path.
     """
     files = []
     total_size = 0
 
-    # An envelope is cached under the name its receipt records, which begins
-    # with its content hash.
-    stems = [(content_hash, content_hash) for content_hash in sorted(owned)]
-    stems += [(name, name.partition(".")[0]) for name in sorted(cache_names - owned)]
-    for stem, content_hash in stems:
+    for stem in sorted(cache_names):
+        # An envelope is cached under ``{content_hash}.{owner_id}``.
+        content_hash = stem.partition(".")[0]
         candidates = [
             (f"{stem}.cache", "cache"),
             (f"{stem}.meta", "meta"),
         ]
-        if stem == content_hash:
+        if stem in legacy_hashes:
             # Pre-F187 key sidecar, classified as it always was.
             candidates.append((f"key_{content_hash}.key", "other"))
         for name, file_type in candidates:
@@ -412,13 +415,13 @@ async def list_sovereignty_files(request: Request):
     carries.
     """
     agent = get_agent(request)
-    owned, cache_names = await _owned_names(agent)
-    if not owned or not STORAGE_CACHE_DIR.exists():
+    cache_names, legacy_hashes = await _owned_names(agent)
+    if not cache_names or not STORAGE_CACHE_DIR.exists():
         return {"files": [], "total_size": 0, "file_count": 0}
 
     try:
         files, total_size = await asyncio.to_thread(
-            _list_owned_cache_files, STORAGE_CACHE_DIR, owned, cache_names
+            _list_owned_cache_files, STORAGE_CACHE_DIR, cache_names, legacy_hashes
         )
 
         return {

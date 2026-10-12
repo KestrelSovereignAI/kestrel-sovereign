@@ -245,6 +245,11 @@ class SovereigntyFeature(Feature):
             "provider": getattr(result, "provider", None),
             "encrypted": result.encrypted,
             "encryption_key_hash": result.encryption_key_hash,
+            # The host-cache name, as the ``backup_artifact`` records it. A
+            # receipt that records it owns that cache entry only, never the
+            # bare content hash, which another agent's export of the same
+            # plaintext may be cached under (#2873).
+            "cache_name": getattr(result, "cache_name", None),
             "size_bytes": getattr(result, "size_bytes", 0) or len(backup_blob),
             # Graph created_at is a UTC ISO-8601 contract (#3256).
             "created_at": utc_now_iso(),

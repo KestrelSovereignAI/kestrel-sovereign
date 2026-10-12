@@ -5,6 +5,7 @@ storage cache (one ``storage_cache/`` directory, shared by every agent on
 the host and by every producer that ever ran here) and a receipt into the
 agent's *own* storage — a ``backup_artifact`` node whose id is the content
 hash, and a ``sovereignty_receipt`` node naming the same hash and CID.
+Both record the name the cache holds the bytes under.
 
 Only the second is an ownership record. The cache directory carries a
 filename and a ``.meta`` sidecar, and the sidecar names an agent, but a
@@ -37,12 +38,14 @@ class OwnedArtifact:
     """One export/backup artifact the bound agent recorded as its own.
 
     ``cache_name`` is the host-cache name the receipt records the artifact
-    under, when it records one (#2873).
+    under (#2873), as recorded, or None for a receipt written before the
+    name was recorded. A receipt that records one, valid or not, is not a
+    legacy receipt.
     """
 
     content_hash: Optional[str]
     cid: Optional[str]
-    cache_name: Optional[str] = None
+    cache_name: Any = None
 
 
 async def owned_artifacts(storage: Any) -> List[OwnedArtifact]:
@@ -72,7 +75,7 @@ async def owned_artifacts(storage: Any) -> List[OwnedArtifact]:
             OwnedArtifact(
                 content_hash=_text(getattr(node, "node_id", None)),
                 cid=_text(properties.get("ipfs_cid")),
-                cache_name=_text(properties.get("cache_name")),
+                cache_name=properties.get("cache_name"),
             )
         )
     for node in await storage.get_nodes_by_type(SOVEREIGNTY_RECEIPT_NODE_TYPE):
@@ -81,43 +84,55 @@ async def owned_artifacts(storage: Any) -> List[OwnedArtifact]:
             OwnedArtifact(
                 content_hash=_text(properties.get("content_hash")),
                 cid=_text(properties.get("ipfs_cid") or properties.get("cid")),
+                cache_name=properties.get("cache_name"),
             )
         )
     return artifacts
 
 
-def owned_content_hashes(artifacts: List[OwnedArtifact]) -> set:
-    """The content hashes the artifacts record.
-
-    Only a lowercase SHA-256, the name ``store_content`` gives content: a
-    receipt naming anything else names no cache entry. Otherwise a receipt
-    could name an envelope's cache name, ``{hash}.{owner_id}``, as its
-    content hash and confer another agent's envelope (#2873).
-    """
-    return {
-        a.content_hash
-        for a in artifacts
-        if a.content_hash and is_cache_name_of(a.content_hash, a.content_hash)
-    }
-
-
 def owned_cache_names(artifacts: List[OwnedArtifact]) -> set:
     """The host-cache names the artifacts are cached under.
 
-    Each content hash, and the name a receipt records for an encrypted
-    envelope, which the cache keys by the agent it was sealed for (#2873).
-    Envelopes of one plaintext sealed for two agents share its content hash,
-    so only the recorded name says which is this agent's. A recorded name
-    that is not a cache name of its own artifact's content hash confers
-    nothing.
+    A receipt that records a cache name confers that name and nothing else
+    (#2873). An encrypted envelope is cached under ``{hash}.{owner_id}``,
+    keyed by the agent it was sealed for, while another agent's export of
+    the same plaintext may sit under the bare content hash: a plaintext
+    export, or an encrypted one from before the envelope, with its sidecar
+    and perhaps its key. The content hash alone is shared, so it is not
+    this receipt's to confer. A recorded name that is not a cache name of
+    the receipt's own content hash confers nothing.
+
+    A receipt that records no cache name was written before the name was
+    recorded, when ``store_content`` cached every export under its content
+    hash, so it confers its content hash. That hash must be a lowercase
+    SHA-256, the name ``store_content`` gives content: a receipt naming
+    anything else names no cache entry, in particular not another agent's
+    envelope, whose name a receipt could otherwise hold as its content hash.
     """
-    names = owned_content_hashes(artifacts)
-    names.update(
-        a.cache_name
-        for a in artifacts
-        if a.content_hash and is_cache_name_of(a.cache_name, a.content_hash)
-    )
+    names = set()
+    for artifact in artifacts:
+        name = artifact.content_hash if artifact.cache_name is None else artifact.cache_name
+        if artifact.content_hash and is_cache_name_of(name, artifact.content_hash):
+            names.add(name)
     return names
+
+
+def owned_legacy_content_hashes(artifacts: List[OwnedArtifact]) -> set:
+    """The content hashes of the artifacts whose receipts record no cache name.
+
+    Only such an export, cached under its bare content hash, can have the
+    sidecar ``key_{hash}.key`` that content encrypted before F187 was
+    written with. A receipt that records a cache name confers no such
+    sidecar: one beside the bare hash belongs to another export of the same
+    plaintext, perhaps another agent's (#2873).
+    """
+    return {
+        artifact.content_hash
+        for artifact in artifacts
+        if artifact.cache_name is None
+        and artifact.content_hash
+        and is_cache_name_of(artifact.content_hash, artifact.content_hash)
+    }
 
 
 def owned_cids(artifacts: List[OwnedArtifact]) -> set:

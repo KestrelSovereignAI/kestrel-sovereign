@@ -57,6 +57,7 @@ async def test_export_persists_receipt_with_import_and_audit_provenance():
         encrypted=True,
         encryption_key_hash="keyhash123",
         size_bytes=len(backup_blob),
+        cache_name="hash123.owner123",
     )
     adapter = MagicMock()
     adapter.store_content.return_value = storage_result
@@ -91,6 +92,8 @@ async def test_export_persists_receipt_with_import_and_audit_provenance():
         "provider": "ipfs",
         "encrypted": True,
         "encryption_key_hash": "keyhash123",
+        # The cache entry it owns, as the backup_artifact records it (#2873).
+        "cache_name": "hash123.owner123",
         "size_bytes": len(backup_blob),
         "created_at": receipt.properties["created_at"],
         "node_id": "hash123",
