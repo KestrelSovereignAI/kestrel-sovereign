@@ -937,6 +937,7 @@ async def test_stalled_native_renewal_cancels_and_joins_expired_effect(native_pg
     db = AsyncDatabase(backend)
     started, stalled, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
     release = asyncio.Event()
+    renewal_acknowledgement = asyncio.Event()
     effects = []
 
     async def effect(*args):
@@ -980,18 +981,24 @@ async def test_stalled_native_renewal_cancels_and_joins_expired_effect(native_pg
         if len(attempts) == 1:
             return await renew_once(task)
         stalled.set()
-        await asyncio.Event().wait()  # Bounded test owner always joins this worker.
+        # Expiry revokes the effect immediately but does not abandon the
+        # already-pending original renewal acknowledgement.
+        await renewal_acknowledgement.wait()
+        return False
     runner._renew_lease_once = stalled_renewal
     pending = asyncio.create_task(runner._execute_claim(claimed))
     try:
         await asyncio.wait_for(started.wait(), timeout=1)
         await asyncio.wait_for(stalled.wait(), timeout=1)
         await asyncio.wait_for(cancelled.wait(), timeout=1.5)
+        assert not pending.done()
+        renewal_acknowledgement.set()
         await asyncio.wait_for(pending, timeout=1)
         assert not effects
         assert await db.fetchval("SELECT status FROM task_execution_log WHERE id=?", (claimed.claim_execution_id,)) == "executing"
     finally:
         release.set()
+        renewal_acknowledgement.set()
         if not pending.done():
             pending.cancel()
         await asyncio.gather(pending, return_exceptions=True)

@@ -332,7 +332,7 @@ async def test_shutdown_cleanup_failure_keeps_owner_fenced_until_exact_retry(tmp
     from tests.unit.test_durable_signal_delivery import _dispatcher, _close
 
     backend, agent, dispatcher = await _dispatcher(tmp_path / "control-debt.db", "did:test:debt")
-    delivery = SimpleNamespace(delivery_id="original")
+    delivery = SimpleNamespace(delivery_id="original", consumer_id="original-consumer", lease_token="original-token")
     error = control("unknown", True)
     dispatcher._retained_cognition_control_debt[delivery.delivery_id] = (delivery, error)
     original_apply = dispatcher._apply_cognition_control_terminal

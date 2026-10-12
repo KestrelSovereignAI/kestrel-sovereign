@@ -15,8 +15,10 @@ from tests.unit.test_execution_custody_review15 import control_error
 @pytest.mark.parametrize("fails", [False, True])
 async def test_joined_terminalizer_debt_tracks_child_receipt_not_caller_cancel(carrier, repeat, fails):
     dispatcher = SignalDispatcher.__new__(SignalDispatcher)
+    dispatcher._agent = SimpleNamespace(did="did:test:original")
+    dispatcher._durable_delivery_owner = "original-owner"
     dispatcher._retained_cognition_control_debt = {}
-    delivery = SimpleNamespace(delivery_id="original")
+    delivery = SimpleNamespace(delivery_id="original", consumer_id="original-consumer", lease_token="original-token")
     original = control_error("unknown", carrier)
     entered, finish = asyncio.Event(), asyncio.Event()
     children = []
