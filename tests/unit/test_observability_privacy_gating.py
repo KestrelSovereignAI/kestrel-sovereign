@@ -329,6 +329,43 @@ async def test_purge_observability_since_sweeps_rows(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_purge_observability_since_purges_the_whole_transition_second(tmp_path):
+    """#3227: the wrapper's watermark is exact to the microsecond, but a row's
+    ``timestamp`` can be an event time supplied after the fact, earlier than
+    the write. A row stamped 300 ms before the watermark, in its second, is
+    purged as it was while the watermark carried whole seconds; the last
+    microsecond of the previous second survives."""
+    from datetime import datetime, timedelta, timezone
+
+    transition = datetime(2026, 9, 7, 12, 0, 5, 500000, tzinfo=timezone.utc)
+    backend, store = await _store(tmp_path, "purge-second.db")
+    try:
+        for name, stamp in (
+            ("previous-second", transition.replace(microsecond=0) - timedelta(microseconds=1)),
+            ("before-watermark", transition - timedelta(milliseconds=300)),
+            ("after-watermark", transition + timedelta(milliseconds=300)),
+        ):
+            await store.log_tool_call(
+                agent_name="did:test:emma", tool_name=name, timestamp=stamp
+            )
+
+        counts = await store.purge_observability_since(
+            "2026-09-07 12:00:05.500000",
+            agent_did="did:test:emma",
+            agent_name="did:test:emma",
+        )
+
+        assert counts["a2a_observability"] == 2
+        rows = await backend.fetch_all(
+            "SELECT tool_name FROM a2a_observability WHERE agent_name=?",
+            ("did:test:emma",),
+        )
+        assert [row[0] for row in rows] == ["previous-second"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_purge_ephemeral_session_drives_observability_sweep(tmp_path):
     """The storage wrapper's ephemeral purge invokes the bound sweep (F076)."""
     backend, store = await _store(tmp_path, "wrapper-purge.db")
