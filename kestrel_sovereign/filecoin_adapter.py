@@ -270,6 +270,31 @@ def envelope_owner_id(master_key: bytes, owner: str) -> str:
     return hkdf.derive(master_key).hex()
 
 
+def configured_envelope_owner_id(owner: str) -> Optional[str]:
+    """``owner``'s envelope owner id under the configured master key.
+
+    None when no master key is configured, in which case no envelope can be
+    sealed or opened on this host.
+    """
+    from kestrel_sovereign.security.encryption import get_master_key_bytes
+
+    master_key = get_master_key_bytes()
+    return envelope_owner_id(master_key, owner) if master_key else None
+
+
+def envelope_cache_name(content_hash: str, owner_id: str) -> str:
+    """The host-cache name of an envelope sealed for ``owner_id``.
+
+    Envelopes of one plaintext sealed for two agents share its content hash,
+    and the host cache is one directory shared by every agent on the host.
+    Keyed by the content hash alone, the second agent's envelope would
+    overwrite the first's, whose restore would then be refused as another
+    agent's export (#2873). ``owner_id`` is the ``owner_id`` the envelope's
+    own header names.
+    """
+    return f"{content_hash}.{owner_id}"
+
+
 def _envelope_header(*, key_hash: str, key_id: str, owner_id: str) -> bytes:
     header = {
         "format": ENVELOPE_FORMAT,
@@ -477,7 +502,8 @@ class FilecoinAdapter:
             envelope_owner: The exporting agent's DID. When given, the
                 encrypted content is written as a self-describing envelope
                 sealed for that agent, which decrypts from the payload alone
-                plus KESTREL_DATA_KEY (#2873). Requires ``encrypt``.
+                plus KESTREL_DATA_KEY (#2873), and is cached under
+                ``envelope_cache_name``. Requires ``encrypt``.
 
         Returns:
             StorageResult with storage details
@@ -491,9 +517,13 @@ class FilecoinAdapter:
         # Handle encryption if requested
         final_content = content
         encryption_key_hash = None
+        cache_name = content_hash
         if envelope_owner is not None:
             final_content, encryption_key_hash = self._seal_envelope(
                 content, content_hash=content_hash, owner=envelope_owner
+            )
+            cache_name = envelope_cache_name(
+                content_hash, envelope_owner_id(self._get_master_key(), envelope_owner)
             )
         elif encrypt:
             final_content, encryption_key_hash = self._encrypt_content(
@@ -515,7 +545,7 @@ class FilecoinAdapter:
         # tier/cid (result.tier/result.cid) so cleanup_cache knows whether a
         # remote replica exists (#1725).
         if storage_tier == StorageTier.LOCAL_ONLY:
-            self._store_local_cache(content_hash, compressed_content, metadata,
+            self._store_local_cache(cache_name, compressed_content, metadata,
                                     tier=result.tier, cid=result.cid)
             self._report_progress(on_progress, len(compressed_content), len(compressed_content))
 
@@ -523,7 +553,7 @@ class FilecoinAdapter:
             if not self.ipfs_is_available():
                 logging.warning("IPFS not available. Storing locally instead.")
                 result.tier = StorageTier.LOCAL_ONLY
-                self._store_local_cache(content_hash, compressed_content, metadata,
+                self._store_local_cache(cache_name, compressed_content, metadata,
                                         tier=result.tier, cid=result.cid)
                 self._report_progress(on_progress, len(compressed_content), len(compressed_content))
                 return result
@@ -531,14 +561,14 @@ class FilecoinAdapter:
             ipfs_cid = self._store_ipfs(compressed_content, metadata, on_progress=on_progress)
             result.cid = ipfs_cid
             # Also cache locally for performance
-            self._store_local_cache(content_hash, compressed_content, metadata,
+            self._store_local_cache(cache_name, compressed_content, metadata,
                                     tier=result.tier, cid=result.cid)
 
         elif storage_tier in [StorageTier.FILECOIN, StorageTier.ENCRYPTED_FILECOIN]:
             if not self.ipfs_is_available() or not self.lotus_is_available():
                 logging.warning("IPFS or Lotus not available. Storing locally instead.")
                 result.tier = StorageTier.LOCAL_ONLY
-                self._store_local_cache(content_hash, compressed_content, metadata,
+                self._store_local_cache(cache_name, compressed_content, metadata,
                                         tier=result.tier, cid=result.cid)
                 self._report_progress(on_progress, len(compressed_content), len(compressed_content))
                 return result
@@ -552,7 +582,7 @@ class FilecoinAdapter:
             result.deal_id = deal_id
 
             # Cache locally
-            self._store_local_cache(content_hash, compressed_content, metadata,
+            self._store_local_cache(cache_name, compressed_content, metadata,
                                     tier=result.tier, cid=result.cid)
         
         logging.info(f"📁 Stored content: {content_hash[:16]}... -> {storage_tier.value}")
@@ -579,7 +609,8 @@ class FilecoinAdapter:
                          max_output_bytes: Optional[int] = None,
                          allow_local_cache: bool = True,
                          envelope: EnvelopePolicy = EnvelopePolicy.IGNORE,
-                         envelope_owner: Optional[str] = None) -> bytes:
+                         envelope_owner: Optional[str] = None,
+                         envelope_key_hash: Optional[str] = None) -> bytes:
         """
         Retrieve content from storage (cache first, then IPFS).
 
@@ -594,8 +625,11 @@ class FilecoinAdapter:
         Under ``EnvelopePolicy.OPEN`` or ``ENCRYPTED_ONLY`` an encrypted
         envelope is decrypted from its own header with the configured master
         key, and only for ``envelope_owner``, the DID of the agent it was
-        sealed for, which those policies require; a ``key_hash``, when given,
-        must equal the one the header names.
+        sealed for, which those policies require; the key hash the header
+        names must equal ``envelope_key_hash`` (by default ``key_hash``) when
+        one is given. When a master key is configured, the cache is read
+        first under the name ``envelope_cache_name`` gives
+        ``envelope_owner``'s envelope, then under ``content_hash``.
         A payload without an envelope is decrypted with ``key_hash`` as
         before. Legacy ciphertext with no ``key_hash`` is tried with the
         configured key under ``content_hash`` (see
@@ -614,6 +648,11 @@ class FilecoinAdapter:
             envelope: How a self-describing encrypted envelope is treated.
             envelope_owner: The DID of the agent retrieving the content; an
                 envelope sealed for another agent is refused.
+            envelope_key_hash: The content hash the caller's record of the
+                export names, which an envelope's header must name too.
+                Defaults to ``key_hash``. A record that holds no key hash
+                still names its export by content hash, so an envelope of
+                another export is refused rather than restored under it.
 
         Returns:
             Original content bytes
@@ -623,6 +662,8 @@ class FilecoinAdapter:
                 f"envelope={envelope.value} requires the retrieving agent's "
                 "DID as envelope_owner"
             )
+        if envelope_key_hash is None:
+            envelope_key_hash = key_hash
         # Normalize a SHA-256 lookup key to lowercase so cache lookup AND the
         # integrity check are case-consistent on case-SENSITIVE filesystems too
         # (Linux CI/prod). Cache files are written with the lowercase hexdigest,
@@ -631,16 +672,31 @@ class FilecoinAdapter:
         if _looks_like_sha256(content_hash):
             content_hash = content_hash.lower()
         encoded_limit = _encoded_retrieval_limit(max_output_bytes)
+        # The owner id ``envelope_owner``'s envelopes are cached under. With
+        # no master key configured no envelope can be opened, so only the
+        # plain name is read.
+        cache_owner_id = (
+            None
+            if envelope is EnvelopePolicy.IGNORE
+            else configured_envelope_owner_id(envelope_owner)
+        )
 
         # Try local cache first (unless the caller may not use it)
         try:
             from_ipfs = False
+            opened_envelope = False
             retrieved_content = None
             if allow_local_cache:
-                retrieved_content = self._retrieve_local_cache(
-                    content_hash,
-                    max_bytes=encoded_limit,
-                )
+                cache_names = [content_hash]
+                if cache_owner_id is not None:
+                    cache_names.insert(0, envelope_cache_name(content_hash, cache_owner_id))
+                for cache_name in cache_names:
+                    retrieved_content = self._retrieve_local_cache(
+                        cache_name,
+                        max_bytes=encoded_limit,
+                    )
+                    if retrieved_content:
+                        break
             if retrieved_content:
                 logging.info(f"📂 Retrieved from cache: {content_hash[:16]}...")
             else:
@@ -677,8 +733,9 @@ class FilecoinAdapter:
                 result = self.open_envelope(
                     decompressed_content,
                     owner=envelope_owner,
-                    expected_key_hash=key_hash,
+                    expected_key_hash=envelope_key_hash,
                 )
+                opened_envelope = True
             elif key_hash:
                 result = self._decrypt_content(decompressed_content, key_hash)
             elif _is_legacy_ciphertext(decompressed_content):
@@ -715,9 +772,14 @@ class FilecoinAdapter:
 
             if from_ipfs:
                 # This content is durably on IPFS (we just fetched it by CID), so
-                # the cache copy is safe to evict later.
+                # the cache copy is safe to evict later. An envelope that
+                # opened for ``envelope_owner`` was sealed for it, and is
+                # cached under its owner's name as ``store_content`` does.
+                cache_name = content_hash
+                if opened_envelope and cache_owner_id is not None:
+                    cache_name = envelope_cache_name(content_hash, cache_owner_id)
                 self._store_local_cache(
-                    content_hash, retrieved_content,
+                    cache_name, retrieved_content,
                     tier=StorageTier.IPFS, cid=ipfs_cid,
                 )
 

@@ -6,6 +6,7 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.filecoin_adapter import (
+    ContentRetrievalLimitError,
     DecryptionKeyUnavailableError,
     EncryptedEnvelopeError,
     EnvelopeKeyMismatchError,
@@ -37,6 +38,15 @@ REFUSAL_EXPORT_OF_ANOTHER_AGENT = "export_of_another_agent"
 REFUSAL_DECRYPTION_FAILED = "decryption_failed"
 REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE = "legacy_decryption_metadata_unavailable"
 REFUSAL_UNENCRYPTED_WITHOUT_RECEIPT = "unencrypted_export_without_receipt"
+REFUSAL_EXPORT_EXCEEDS_IMPORT_LIMIT = "export_exceeds_import_limit"
+
+# The largest backup blob an import restores. A fresh host restores whatever
+# a caller-supplied CID returns, before anything has authenticated it (#2873),
+# so the IPFS read and the decompression stop at a ceiling derived from this
+# one (twice it, plus an allowance for ciphertext overhead), and a decrypted
+# blob larger than it is refused. The largest export observed, a long-lived
+# agent's whole database, was 105 MB; 1 GiB leaves ten times that.
+MAX_SOVEREIGNTY_IMPORT_BYTES = 1024 * 1024 * 1024
 
 
 class SovereigntyFeature(Feature):
@@ -398,10 +408,15 @@ class SovereigntyFeature(Feature):
         the envelope, decrypts with the key hash in this agent's backup
         receipt; without one the configured key is tried under the name it
         was requested by, which opens it only when that name is its content
-        hash. With a receipt, the receipt decides whether the export is
+        hash. Without a receipt that name must also be one IPFS answers for:
+        an export known only by its content hash (a local-tier export) is in
+        a host cache, which that path does not read. With a receipt, the
+        receipt decides whether the export is
         encrypted: only one recording a plaintext export accepts a payload
-        that is not ciphertext. An export that cannot be decrypted is
-        refused, and none of its bytes reach the restore.
+        that is not ciphertext. The IPFS read and the decompression stop at a
+        ceiling derived from ``MAX_SOVEREIGNTY_IMPORT_BYTES`` rather than
+        after it, and a larger export is refused. An export that cannot be
+        decrypted is refused, and none of its bytes reach the restore.
 
         Scope (#F265): restores ``conversation_history`` faithfully —
         ``created_at`` (ordering) and ``deleted_at`` (trash) are preserved, so
@@ -446,6 +461,7 @@ class SovereigntyFeature(Feature):
                     adapter.retrieve_content,
                     cid,
                     ipfs_cid=cid,
+                    max_output_bytes=MAX_SOVEREIGNTY_IMPORT_BYTES,
                     allow_local_cache=False,
                     envelope=EnvelopePolicy.ENCRYPTED_ONLY,
                     envelope_owner=self.agent.agent_id,
@@ -454,6 +470,9 @@ class SovereigntyFeature(Feature):
                 # The envelope names its own key hash, and the receipt's must
                 # equal it; a legacy export without an envelope decrypts with
                 # the receipt's, or under its name if the receipt has none.
+                # A receipt that lost its key hash still names its export:
+                # a ``backup_artifact`` node's id is the content hash, so an
+                # envelope of another export is refused under it too.
                 key_hash = receipt.properties.get("encryption_key_hash")
                 # The receipt, not the payload, says whether the export is
                 # encrypted. An envelope whose magic bytes were damaged no
@@ -471,12 +490,14 @@ class SovereigntyFeature(Feature):
                     cid,
                     ipfs_cid=cid,
                     key_hash=key_hash,
+                    max_output_bytes=MAX_SOVEREIGNTY_IMPORT_BYTES,
                     envelope=(
                         EnvelopePolicy.ENCRYPTED_ONLY
                         if receipt_encrypted
                         else EnvelopePolicy.OPEN
                     ),
                     envelope_owner=self.agent.agent_id,
+                    envelope_key_hash=key_hash or receipt.node_id,
                 )
 
             if not content:
@@ -499,6 +520,14 @@ class SovereigntyFeature(Feature):
                     "messages_restored": messages_restored,
                     "stats": dict(stats) if stats else {},
                 },
+            )
+        except ContentRetrievalLimitError:
+            return self._import_refused(
+                cid,
+                REFUSAL_EXPORT_EXCEEDS_IMPORT_LIMIT,
+                f"it exceeds the {MAX_SOVEREIGNTY_IMPORT_BYTES}-byte limit on "
+                "what an import retrieves and decodes",
+                limit_bytes=MAX_SOVEREIGNTY_IMPORT_BYTES,
             )
         except DecryptionKeyUnavailableError:
             return self._import_refused(

@@ -15,14 +15,16 @@ from __future__ import annotations
 import hashlib
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import httpx
 import pytest
+from cryptography.fernet import Fernet
 from fastapi import FastAPI
 
 from kestrel_sovereign.endpoints import sovereignty as sovereignty_endpoints
+from kestrel_sovereign.filecoin_adapter import FilecoinAdapter, StorageTier
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 
 
@@ -238,4 +240,85 @@ async def test_receipt_content_hash_also_confers_ownership(cache_dir, identities
     assert {f["name"] for f in listing["files"]} == {
         f"{identities.mine_hash}.cache",
         f"{identities.mine_hash}.meta",
+    }
+
+
+@pytest.mark.asyncio
+async def test_each_agent_sees_only_its_own_envelope_of_a_shared_plaintext(
+    tmp_path, identities, monkeypatch
+):
+    """Two agents' encrypted exports of one plaintext share its content
+    hash, and each agent's receipt names it. The host cache keys each
+    envelope by the agent it was sealed for (#2873); the browser lists and
+    serves each agent its own, and the other's is the same 404 as a name
+    that does not exist."""
+    monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
+    cache = tmp_path / "storage_cache"
+    monkeypatch.setattr(sovereignty_endpoints, "STORAGE_CACHE_DIR", cache)
+    plaintext = f"one plaintext, two owners {identities.mine_hash}".encode()
+    with patch(
+        "kestrel_sovereign.filecoin_adapter.requests.post",
+        side_effect=ConnectionError("no IPFS daemon"),
+    ):
+        adapter = FilecoinAdapter(cache_dir=str(cache))
+        stored = {
+            did: adapter.store_content(
+                plaintext,
+                storage_tier=StorageTier.LOCAL_ONLY,
+                encrypt=True,
+                metadata={"agent": did},
+                envelope_owner=did,
+            )
+            for did in (identities.mine, identities.theirs)
+        }
+    shared = stored[identities.mine].content_hash
+    assert stored[identities.theirs].content_hash == shared
+    names = {path.name for path in cache.glob(f"{shared}.*.cache")}
+    assert len(names) == 2
+
+    def agent_for(did):
+        receipt = SimpleNamespace(node_id=shared, properties={})
+
+        async def by_type(node_type):
+            return [receipt] if node_type == "backup_artifact" else []
+
+        storage = SimpleNamespace(privacy_config=None, get_nodes_by_type=by_type)
+        return SimpleNamespace(did=did, agent_name="x", storage=storage)
+
+    mine, theirs = agent_for(identities.mine), agent_for(identities.theirs)
+    async with _client(mine, theirs) as client:
+        listing = (await client.get("/api/sovereignty/files")).json()
+    listed = {f["name"] for f in listing["files"]}
+    [own_cache] = [name for name in listed if name.endswith(".cache")]
+    [other_cache] = names - {own_cache}
+    own_stem = own_cache[: -len(".cache")]
+    assert listed == {own_cache, f"{own_stem}.meta"}, listing
+    entry = next(f for f in listing["files"] if f["name"] == own_cache)
+    assert entry["hash"] == shared
+    assert entry["has_meta"] is True and entry["metadata"]["agent"] == identities.mine
+
+    unknown = f"{shared}.{'0' * 32}.cache"
+    async with _client(mine, theirs) as client:
+        own = await client.get(f"/api/sovereignty/files/{own_cache}")
+        own_preview = await client.get(f"/api/sovereignty/files/{own_cache}/preview")
+        responses = {
+            name: (
+                await client.get(f"/api/sovereignty/files/{name}"),
+                await client.get(f"/api/sovereignty/files/{name}/preview"),
+            )
+            for name in (other_cache, f"{other_cache[: -len('.cache')]}.meta", unknown)
+        }
+    assert own.status_code == 200 and own.content == (cache / own_cache).read_bytes()
+    assert own_preview.status_code == 200
+    for name, (download, preview) in responses.items():
+        assert download.status_code == 404, (name, download.text)
+        assert preview.status_code == 404, (name, preview.text)
+        assert download.json() == responses[unknown][0].json(), name
+
+    # The other agent sees the other envelope, and only it.
+    async with _client(theirs, mine) as client:
+        their_listing = (await client.get("/api/sovereignty/files")).json()
+    assert {f["name"] for f in their_listing["files"]} == {
+        other_cache,
+        f"{other_cache[: -len('.cache')]}.meta",
     }

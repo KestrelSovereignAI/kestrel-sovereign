@@ -16,6 +16,8 @@ in-memory Kubo daemon answering the three RPCs ``FilecoinAdapter`` makes.
 from __future__ import annotations
 
 import hashlib
+import os
+import tracemalloc
 import zlib
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -25,9 +27,11 @@ import pytest
 from cryptography.fernet import Fernet
 
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.features.sovereignty import feature as sovereignty_feature
 from kestrel_sovereign.features.sovereignty.feature import (
     REFUSAL_DECRYPTION_FAILED,
     REFUSAL_ENCRYPTION_KEY_MISMATCH,
+    REFUSAL_EXPORT_EXCEEDS_IMPORT_LIMIT,
     REFUSAL_EXPORT_OF_ANOTHER_AGENT,
     REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE,
     REFUSAL_UNENCRYPTED_WITHOUT_RECEIPT,
@@ -53,10 +57,11 @@ MESSAGES = [
 
 
 class _Response:
-    def __init__(self, status_code: int, *, body: bytes = b"", json_body=None):
+    def __init__(self, status_code: int, *, body: bytes = b"", json_body=None,
+                 declare_length: bool = True):
         self.status_code = status_code
         self.content = body
-        self.headers = {"Content-Length": str(len(body))}
+        self.headers = {"Content-Length": str(len(body))} if declare_length else {}
         self._json = json_body
 
     def json(self):
@@ -75,6 +80,8 @@ class _FakeKubo:
 
     def __init__(self):
         self.blocks: dict[str, bytes] = {}
+        # A gateway need not say how long its answer is.
+        self.declare_length = True
 
     def post(self, url, *, files=None, params=None, timeout=None, stream=False):
         rpc = url.split("/api/v0/", 1)[1]
@@ -90,7 +97,7 @@ class _FakeKubo:
             data = self.blocks.get(params["arg"])
             if data is None:
                 return _Response(500, body=b"block not found")
-            return _Response(200, body=data)
+            return _Response(200, body=data, declare_length=self.declare_length)
         raise AssertionError(f"unexpected Kubo RPC {rpc}")
 
     def payload(self, cid: str) -> bytes:
@@ -116,12 +123,13 @@ def data_key(monkeypatch):
 
 
 @asynccontextmanager
-async def _host(directory, monkeypatch, *, did=AGENT_DID):
+async def _host(directory, monkeypatch, *, did=AGENT_DID, database="kestrel_prime.db"):
     """One host: its own working directory (so its own ``storage_cache``)
-    and its own database, wrapped the way ``KestrelAgent`` wraps it."""
-    directory.mkdir()
+    and its own database, wrapped the way ``KestrelAgent`` wraps it. Agents
+    co-hosted in one directory share its cache and keep their databases."""
+    directory.mkdir(exist_ok=True)
     monkeypatch.chdir(directory)
-    raw = Storage(str(directory / "kestrel_prime.db"), agent_id=did)
+    raw = Storage(str(directory / database), agent_id=did)
     await raw.initialize()
     wallet = MagicMock()
     wallet.can_afford.return_value = True
@@ -459,3 +467,173 @@ async def test_envelope_substituted_under_a_receipt_is_refused(
         assert second.data["content_hash"] in result.error
         assert first.data["content_hash"] in result.error
         assert await _history(raw) == []
+
+
+@pytest.mark.asyncio
+async def test_envelope_substituted_under_a_receipt_without_a_key_hash_is_refused(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    """A receipt that lost its key hash still names its export: a
+    ``backup_artifact`` node's id is the content hash. Another export of the
+    same agent, sealed under the same key, must not restore under it."""
+    async with _host(tmp_path / "origin", monkeypatch) as (agent, raw):
+        for role, content in MESSAGES:
+            await raw.add_conversation(role, content, metadata={})
+        feature = SovereigntyFeature(agent)
+        first = await feature.export_sovereignty(storage_tier="ipfs", encrypt=True)
+        await raw.add_conversation("user", "a later message", metadata={})
+        second = await feature.export_sovereignty(storage_tier="ipfs", encrypt=True)
+    first_cid, second_cid = first.data["cid"], second.data["cid"]
+    first_payload = kubo.payload(first_cid)
+    kubo.replace_payload(first_cid, kubo.payload(second_cid))
+
+    async with _host(tmp_path / "fresh", monkeypatch) as (agent, raw):
+        await agent.storage.record_backup_artifact(
+            AGENT_DID,
+            StorageResult(
+                content_hash=first.data["content_hash"],
+                tier=StorageTier.IPFS,
+                cid=first_cid,
+                encrypted=True,
+                encryption_key_hash=None,
+            ),
+        )
+        restore = AsyncMock(wraps=agent.storage.restore_from_backup_blob)
+        monkeypatch.setattr(agent.storage, "restore_from_backup_blob", restore)
+
+        refused = await SovereigntyFeature(agent).import_sovereignty(first_cid)
+
+        assert refused.status is ToolResultStatus.ERROR, refused
+        assert refused.data["refusal"] == REFUSAL_DECRYPTION_FAILED
+        assert second.data["content_hash"] in refused.error
+        assert first.data["content_hash"] in refused.error
+        assert "Nothing was restored" in refused.error
+        restore.assert_not_awaited()
+        assert await _history(raw) == []
+
+        # The receipt's own export still restores under it.
+        kubo.replace_payload(first_cid, first_payload)
+        restored = await SovereigntyFeature(agent).import_sovereignty(first_cid)
+
+        assert restored.status is ToolResultStatus.OK, restored
+        assert await _history(raw) == MESSAGES
+
+
+@pytest.mark.asyncio
+async def test_two_agents_exporting_one_plaintext_on_one_host_each_restore_their_own(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    """Both agents' encrypted exports of one plaintext land in the host
+    cache, which every co-hosted agent shares. Keyed by content hash alone,
+    the second overwrote the first, whose restore was then refused as
+    another agent's export (#2873)."""
+    host = tmp_path / "host"
+    async with _host(host, monkeypatch, did=NEIGHBOUR_DID, database="blank.db") as (blank, _):
+        blob = await blank.storage.create_backup_blob(include_db=True)
+
+    exported = {}
+    for did, database in ((AGENT_DID, "mine.db"), (NEIGHBOUR_DID, "theirs.db")):
+        async with _host(host, monkeypatch, did=did, database=database) as (agent, _):
+            agent.storage.create_backup_blob = AsyncMock(return_value=blob)
+            exported[did] = await SovereigntyFeature(agent).export_sovereignty(
+                storage_tier="local", encrypt=True
+            )
+            assert exported[did].status is ToolResultStatus.OK, exported[did]
+    content_hash = exported[AGENT_DID].data["content_hash"]
+    assert exported[NEIGHBOUR_DID].data["content_hash"] == content_hash
+    assert len(list((host / "storage_cache").glob(f"{content_hash}.*.cache"))) == 2
+
+    for did, database in ((AGENT_DID, "mine.db"), (NEIGHBOUR_DID, "theirs.db")):
+        async with _host(host, monkeypatch, did=did, database=database) as (agent, _):
+            result = await SovereigntyFeature(agent).import_sovereignty(content_hash)
+
+            assert result.status is ToolResultStatus.OK, (did, result)
+            assert result.data["messages_restored"] == 0
+
+
+IMPORT_LIMIT = 1024 * 1024
+
+
+@pytest.fixture
+def small_import_limit(monkeypatch):
+    """The real ceiling is 1 GiB; the bounds scale with it."""
+    monkeypatch.setattr(sovereignty_feature, "MAX_SOVEREIGNTY_IMPORT_BYTES", IMPORT_LIMIT)
+    return IMPORT_LIMIT
+
+
+async def _import_refused_as_too_large(agent, raw, monkeypatch, cid):
+    restore = AsyncMock(wraps=agent.storage.restore_from_backup_blob)
+    monkeypatch.setattr(agent.storage, "restore_from_backup_blob", restore)
+
+    tracemalloc.start()
+    try:
+        result = await SovereigntyFeature(agent).import_sovereignty(cid)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result.status is ToolResultStatus.ERROR, result
+    assert result.data["refusal"] == REFUSAL_EXPORT_EXCEEDS_IMPORT_LIMIT
+    assert result.data["limit_bytes"] == IMPORT_LIMIT
+    assert f"{IMPORT_LIMIT}-byte limit" in result.error
+    assert "Nothing was restored" in result.error
+    restore.assert_not_awaited()
+    assert await _history(raw) == []
+    return peak
+
+
+async def _receipt_for(agent, cid):
+    """A receipt recording an encrypted export under this CID."""
+    content_hash = hashlib.sha256(cid.encode()).hexdigest()
+    await agent.storage.record_backup_artifact(
+        AGENT_DID,
+        StorageResult(
+            content_hash=content_hash,
+            tier=StorageTier.IPFS,
+            cid=cid,
+            encrypted=True,
+            encryption_key_hash=content_hash,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declare_length", [True, False], ids=["declared", "streamed"])
+@pytest.mark.parametrize("with_receipt", [False, True], ids=["fresh-host", "receipt"])
+async def test_oversized_payload_is_refused_before_it_is_read_whole(
+    tmp_path, monkeypatch, kubo, data_key, small_import_limit, declare_length, with_receipt
+):
+    """A caller-supplied CID can name anything. The read stops at the
+    ceiling, whether or not the gateway says how long its answer is."""
+    cid = "bafyoversized"
+    kubo.blocks[cid] = os.urandom(3 * IMPORT_LIMIT)
+    kubo.declare_length = declare_length
+
+    async with _host(tmp_path / "fresh", monkeypatch) as (agent, raw):
+        if with_receipt:
+            await _receipt_for(agent, cid)
+        peak = await _import_refused_as_too_large(agent, raw, monkeypatch, cid)
+
+    assert peak < 4 * IMPORT_LIMIT + 1024 * 1024
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_receipt", [False, True], ids=["fresh-host", "receipt"])
+async def test_compression_bomb_is_refused_while_it_is_decompressed(
+    tmp_path, monkeypatch, kubo, data_key, small_import_limit, with_receipt
+):
+    """64 MiB of zeros compresses to about 64 KB, well inside the read
+    limit. Decompression stops at the ceiling instead of inflating it."""
+    inflated = b"\0" * (64 * IMPORT_LIMIT)
+    cid = "bafybomb"
+    kubo.blocks[cid] = zlib.compress(inflated, 9)
+    del inflated
+    assert len(kubo.blocks[cid]) < IMPORT_LIMIT
+
+    async with _host(tmp_path / "fresh", monkeypatch) as (agent, raw):
+        if with_receipt:
+            await _receipt_for(agent, cid)
+        peak = await _import_refused_as_too_large(agent, raw, monkeypatch, cid)
+
+    # Inflating it whole would allocate 64 MiB.
+    assert peak < 8 * IMPORT_LIMIT

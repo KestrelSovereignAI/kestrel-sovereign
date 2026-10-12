@@ -17,7 +17,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kestrel_sovereign.features.sovereignty.feature import SovereigntyFeature
+from kestrel_sovereign.features.sovereignty.feature import (
+    MAX_SOVEREIGNTY_IMPORT_BYTES,
+    SovereigntyFeature,
+)
 from kestrel_sovereign.filecoin_adapter import EnvelopePolicy, FilecoinAdapter, StorageTier
 from kestrel_sovereign.identity import package_intake
 
@@ -45,6 +48,7 @@ async def test_import_without_a_receipt_never_reads_the_host_cache():
     adapter_cls.return_value.retrieve_content.assert_called_once_with(
         HASH,
         ipfs_cid=HASH,
+        max_output_bytes=MAX_SOVEREIGNTY_IMPORT_BYTES,
         allow_local_cache=False,
         envelope=EnvelopePolicy.ENCRYPTED_ONLY,
         envelope_owner="did:test:me",
@@ -85,21 +89,24 @@ async def test_import_without_a_receipt_cannot_restore_a_cached_export(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("properties", "key_hash", "policy"),
+    ("properties", "key_hash", "policy", "envelope_key_hash"),
     [
-        ({"encryption_key_hash": "kh", "encrypted": True}, "kh", EnvelopePolicy.ENCRYPTED_ONLY),
+        ({"encryption_key_hash": "kh", "encrypted": True}, "kh", EnvelopePolicy.ENCRYPTED_ONLY, "kh"),
         # An encrypted receipt that lost its key hash still refuses a payload
-        # that does not look like ciphertext (a damaged envelope magic).
-        ({"encryption_key_hash": None, "encrypted": True}, None, EnvelopePolicy.ENCRYPTED_ONLY),
+        # that does not look like ciphertext (a damaged envelope magic), and
+        # still binds an envelope to the content hash it is keyed by.
+        ({"encryption_key_hash": None, "encrypted": True}, None, EnvelopePolicy.ENCRYPTED_ONLY, HASH),
         # A receipt that does not say it is plaintext is not taken as one.
-        ({}, None, EnvelopePolicy.ENCRYPTED_ONLY),
-        ({"encryption_key_hash": "kh", "encrypted": False}, "kh", EnvelopePolicy.ENCRYPTED_ONLY),
+        ({}, None, EnvelopePolicy.ENCRYPTED_ONLY, HASH),
+        ({"encryption_key_hash": "kh", "encrypted": False}, "kh", EnvelopePolicy.ENCRYPTED_ONLY, "kh"),
         # Only a receipt recording a plaintext export accepts plaintext.
-        ({"encryption_key_hash": None, "encrypted": False}, None, EnvelopePolicy.OPEN),
+        ({"encryption_key_hash": None, "encrypted": False}, None, EnvelopePolicy.OPEN, HASH),
     ],
     ids=["encrypted", "encrypted-no-key-hash", "unrecorded", "contradictory", "plaintext"],
 )
-async def test_import_with_a_receipt_follows_what_it_records(properties, key_hash, policy):
+async def test_import_with_a_receipt_follows_what_it_records(
+    properties, key_hash, policy, envelope_key_hash
+):
     receipt = SimpleNamespace(node_id=HASH, properties=properties)
     feature = _feature(receipts=[receipt])
     with patch("kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter") as adapter_cls:
@@ -110,8 +117,10 @@ async def test_import_with_a_receipt_follows_what_it_records(properties, key_has
         HASH,
         ipfs_cid=HASH,
         key_hash=key_hash,
+        max_output_bytes=MAX_SOVEREIGNTY_IMPORT_BYTES,
         envelope=policy,
         envelope_owner="did:test:me",
+        envelope_key_hash=envelope_key_hash,
     )
 
 

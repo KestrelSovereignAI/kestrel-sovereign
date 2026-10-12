@@ -34,6 +34,7 @@ from kestrel_sovereign.filecoin_adapter import (
     LegacyDecryptionUnavailableError,
     StorageTier,
     UnencryptedContentError,
+    envelope_cache_name,
     envelope_key_id,
     envelope_owner_id,
 )
@@ -282,14 +283,79 @@ def _cached(adapter, *, encrypt, envelope_owner=None):
     )
 
 
+def _owner_cache_name(adapter, content_hash, owner):
+    return envelope_cache_name(content_hash, envelope_owner_id(adapter._get_master_key(), owner))
+
+
 def test_sealed_store_writes_an_envelope_and_records_its_key_hash(tmp_path, data_key):
     adapter = _adapter(tmp_path)
     result = _cached(adapter, encrypt=True, envelope_owner=OWNER)
 
-    stored = zlib.decompress((adapter.cache_dir / f"{result.content_hash}.cache").read_bytes())
+    name = _owner_cache_name(adapter, result.content_hash, OWNER)
+    stored = zlib.decompress((adapter.cache_dir / f"{name}.cache").read_bytes())
     assert stored.startswith(ENVELOPE_MAGIC)
+    assert _split(stored)[0]["owner_id"] == name.split(".", 1)[1]
+    assert not (adapter.cache_dir / f"{result.content_hash}.cache").exists()
     assert result.encrypted is True
     assert result.encryption_key_hash == result.content_hash == _split(stored)[0]["key_hash"]
+
+
+def test_two_agents_sealing_one_plaintext_each_restore_their_own(tmp_path, data_key):
+    """The host cache is shared, and envelopes of one plaintext sealed for
+    two agents share its content hash. Cached under that hash alone, the
+    second would overwrite the first, whose restore would then be refused
+    as another agent's export (#2873)."""
+    adapter = _adapter(tmp_path)
+    mine = _cached(adapter, encrypt=True, envelope_owner=OWNER)
+    theirs = _cached(adapter, encrypt=True, envelope_owner=OTHER_AGENT)
+    assert mine.content_hash == theirs.content_hash
+
+    for owner in (OWNER, OTHER_AGENT):
+        assert adapter.retrieve_content(
+            mine.content_hash,
+            envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+            envelope_owner=owner,
+            envelope_key_hash=mine.content_hash,
+        ) == PLAINTEXT
+
+
+def test_an_envelope_fetched_from_ipfs_is_cached_under_its_owner(tmp_path, data_key):
+    """A restore that reads an envelope from IPFS caches it as the store
+    does, so another agent's later read of the same name is not answered by
+    this agent's envelope."""
+    origin = _adapter(tmp_path)
+    stored = origin.store_content(
+        PLAINTEXT, storage_tier=StorageTier.LOCAL_ONLY, encrypt=True, envelope_owner=OWNER
+    )
+    name = _owner_cache_name(origin, stored.content_hash, OWNER)
+    blob = (origin.cache_dir / f"{name}.cache").read_bytes()
+    fresh = _adapter(tmp_path, "fresh")
+
+    with patch.object(fresh, "_retrieve_ipfs", return_value=blob):
+        assert fresh.retrieve_content(
+            stored.content_hash,
+            ipfs_cid="bafy-owner",
+            envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+            envelope_owner=OWNER,
+        ) == PLAINTEXT
+
+    assert (fresh.cache_dir / f"{name}.cache").read_bytes() == blob
+    assert not (fresh.cache_dir / f"{stored.content_hash}.cache").exists()
+
+
+def test_retrieve_without_a_master_key_still_reads_a_plaintext_export(tmp_path, data_key):
+    """The owner-keyed cache name derives from the master key. Without one
+    no envelope can be opened, and a plaintext export is read as before."""
+    adapter = _adapter(tmp_path)
+    plain = _cached(adapter, encrypt=False)
+
+    with patch(
+        "kestrel_sovereign.security.encryption.get_master_key_bytes",
+        return_value=None,
+    ):
+        assert adapter.retrieve_content(
+            plain.content_hash, envelope=EnvelopePolicy.OPEN, envelope_owner=OWNER
+        ) == PLAINTEXT
 
 
 def test_sealing_an_envelope_requires_encryption(tmp_path, data_key):
@@ -315,10 +381,43 @@ def test_retrieve_binds_an_envelope_to_the_key_hash_it_is_given(tmp_path, data_k
         )
 
 
-@pytest.mark.parametrize("policy", [EnvelopePolicy.OPEN, EnvelopePolicy.ENCRYPTED_ONLY])
-def test_retrieve_refuses_an_envelope_sealed_for_another_agent(tmp_path, data_key, policy):
+def test_retrieve_binds_an_envelope_to_the_content_hash_its_record_names(tmp_path, data_key):
+    """A record with no key hash still names its export by content hash."""
     adapter = _adapter(tmp_path)
     result = _cached(adapter, encrypt=True, envelope_owner=OWNER)
+
+    assert adapter.retrieve_content(
+        result.content_hash,
+        envelope=EnvelopePolicy.OPEN,
+        envelope_owner=OWNER,
+        envelope_key_hash=result.content_hash,
+    ) == PLAINTEXT
+    with pytest.raises(EnvelopeDecryptionError, match="c" * 64):
+        adapter.retrieve_content(
+            result.content_hash,
+            envelope=EnvelopePolicy.OPEN,
+            envelope_owner=OWNER,
+            envelope_key_hash="c" * 64,
+        )
+
+
+@pytest.mark.parametrize("policy", [EnvelopePolicy.OPEN, EnvelopePolicy.ENCRYPTED_ONLY])
+def test_retrieve_refuses_an_envelope_sealed_for_another_agent(tmp_path, data_key, policy):
+    """The cache keys an envelope by its owner, so another agent's read of
+    its content hash does not find it there. One that arrives another way,
+    here under the plain name, is refused."""
+    adapter = _adapter(tmp_path)
+    result = _cached(adapter, encrypt=True, envelope_owner=OWNER)
+    with pytest.raises(ValueError, match="Content not found"):
+        adapter.retrieve_content(
+            result.content_hash, envelope=policy, envelope_owner=OTHER_AGENT
+        )
+    name = _owner_cache_name(adapter, result.content_hash, OWNER)
+    _cached_under(
+        adapter,
+        result.content_hash,
+        zlib.decompress((adapter.cache_dir / f"{name}.cache").read_bytes()),
+    )
 
     with pytest.raises(EnvelopeOwnerMismatchError):
         adapter.retrieve_content(
@@ -512,10 +611,12 @@ async def test_backup_command_seals_its_encrypted_backup(tmp_path, monkeypatch, 
 
     result = agent.recorded()
     assert result.encrypted is True
-    stored = zlib.decompress((tmp_path / "storage_cache" / f"{result.content_hash}.cache").read_bytes())
-    assert stored.startswith(ENVELOPE_MAGIC)
     master_key = FilecoinAdapter()._get_master_key()
-    assert _split(stored)[0]["owner_id"] == envelope_owner_id(master_key, agent.agent_id)
+    owner_id = envelope_owner_id(master_key, agent.agent_id)
+    name = envelope_cache_name(result.content_hash, owner_id)
+    stored = zlib.decompress((tmp_path / "storage_cache" / f"{name}.cache").read_bytes())
+    assert stored.startswith(ENVELOPE_MAGIC)
+    assert _split(stored)[0]["owner_id"] == owner_id
     assert FilecoinAdapter().retrieve_content(
         result.content_hash,
         envelope=EnvelopePolicy.ENCRYPTED_ONLY,

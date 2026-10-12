@@ -7,7 +7,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kestrel_sdk.tools.result import ToolResult
-from kestrel_sovereign.features.sovereignty.feature import SovereigntyFeature
+from kestrel_sovereign.features.sovereignty.feature import (
+    MAX_SOVEREIGNTY_IMPORT_BYTES,
+    SovereigntyFeature,
+)
 from kestrel_sovereign.filecoin_adapter import EnvelopePolicy
 from kestrel_sovereign.storage.providers.base import StorageResult, StorageTier
 
@@ -196,7 +199,9 @@ async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotate
         "bafybackup",
         ipfs_cid="bafybackup",
         key_hash="keyhash123",
+        max_output_bytes=MAX_SOVEREIGNTY_IMPORT_BYTES,
         envelope=EnvelopePolicy.ENCRYPTED_ONLY,
         envelope_owner="did:kestrel:test",
+        envelope_key_hash="keyhash123",
     )
     storage.restore_from_backup_blob.assert_not_awaited()
