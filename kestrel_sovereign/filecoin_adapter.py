@@ -270,18 +270,6 @@ def envelope_owner_id(master_key: bytes, owner: str) -> str:
     return hkdf.derive(master_key).hex()
 
 
-def configured_envelope_owner_id(owner: str) -> Optional[str]:
-    """``owner``'s envelope owner id under the configured master key.
-
-    None when no master key is configured, in which case no envelope can be
-    sealed or opened on this host.
-    """
-    from kestrel_sovereign.security.encryption import get_master_key_bytes
-
-    master_key = get_master_key_bytes()
-    return envelope_owner_id(master_key, owner) if master_key else None
-
-
 def envelope_cache_name(content_hash: str, owner_id: str) -> str:
     """The host-cache name of an envelope sealed for ``owner_id``.
 
@@ -291,8 +279,26 @@ def envelope_cache_name(content_hash: str, owner_id: str) -> str:
     overwrite the first's, whose restore would then be refused as another
     agent's export (#2873). ``owner_id`` is the ``owner_id`` the envelope's
     own header names.
+
+    The owner id derives from the master key, so a reader under another key,
+    or under none, cannot derive this name. ``store_content`` records it in
+    ``StorageResult.cache_name``, and a restore reads the name its receipt
+    records rather than deriving one.
     """
     return f"{content_hash}.{owner_id}"
+
+
+def is_cache_name_of(name: Any, content_hash: str) -> bool:
+    """Whether ``name`` is a host-cache name ``store_content`` writes content
+    hashing to ``content_hash`` under: the hash itself, or the
+    ``envelope_cache_name`` of an envelope of it.
+    """
+    if not isinstance(name, str) or not _is_lower_hex(content_hash, 64):
+        return False
+    stem, separator, owner_id = name.partition(".")
+    if stem != content_hash:
+        return False
+    return not separator or _is_lower_hex(owner_id, _ENVELOPE_OWNER_ID_BYTES * 2)
 
 
 def _envelope_header(*, key_hash: str, key_id: str, owner_id: str) -> bytes:
@@ -506,7 +512,8 @@ class FilecoinAdapter:
                 ``envelope_cache_name``. Requires ``encrypt``.
 
         Returns:
-            StorageResult with storage details
+            StorageResult with storage details. Its ``cache_name`` is the
+            name the content was cached under.
         """
         if envelope_owner is not None and not encrypt:
             raise ValueError("envelope_owner requires encrypt=True")
@@ -537,6 +544,7 @@ class FilecoinAdapter:
         result = StorageResult(
             content_hash=content_hash,
             tier=storage_tier,
+            cache_name=cache_name,
             encrypted=encrypt,
             encryption_key_hash=encryption_key_hash
         )
@@ -610,7 +618,8 @@ class FilecoinAdapter:
                          allow_local_cache: bool = True,
                          envelope: EnvelopePolicy = EnvelopePolicy.IGNORE,
                          envelope_owner: Optional[str] = None,
-                         envelope_key_hash: Optional[str] = None) -> bytes:
+                         envelope_key_hash: Optional[str] = None,
+                         cache_name: Optional[str] = None) -> bytes:
         """
         Retrieve content from storage (cache first, then IPFS).
 
@@ -627,12 +636,10 @@ class FilecoinAdapter:
         key, and only for ``envelope_owner``, the DID of the agent it was
         sealed for, which those policies require; the key hash the header
         names must equal ``envelope_key_hash`` (by default ``key_hash``) when
-        one is given. When a master key is configured, the cache is read
-        first under the name ``envelope_cache_name`` gives
-        ``envelope_owner``'s envelope, then under ``content_hash``.
-        A payload without an envelope is decrypted with ``key_hash`` as
-        before. Legacy ciphertext with no ``key_hash`` is tried with the
-        configured key under ``content_hash`` (see
+        one is given. The cache is read under ``cache_name`` when given, then
+        under ``content_hash``. A payload without an envelope is decrypted
+        with ``key_hash`` as before. Legacy ciphertext with no ``key_hash`` is
+        tried with the configured key under ``content_hash`` (see
         ``_decrypt_legacy_under_name``), and raises
         ``LegacyDecryptionUnavailableError`` rather than being returned
         undecrypted. Plaintext is returned under ``OPEN`` and raises
@@ -653,6 +660,20 @@ class FilecoinAdapter:
                 Defaults to ``key_hash``. A record that holds no key hash
                 still names its export by content hash, so an envelope of
                 another export is refused rather than restored under it.
+            cache_name: The host-cache name the caller's record of the
+                content holds (``StorageResult.cache_name``), read before
+                ``content_hash``. An envelope is cached under a name
+                that derives from the master key it was sealed under, so
+                only the recorded name finds it when another key, or none,
+                is configured; the envelope's header then names that key
+                (#2873). The result must hash to the content hash the name
+                begins with, from the cache or IPFS. Requires
+                ``allow_local_cache``.
+
+        Content fetched from IPFS is cached again under the name
+        ``store_content`` gives it, not the name it was requested by, when
+        the content establishes that name: an opened envelope's header, or
+        the content hash it was checked against.
 
         Returns:
             Original content bytes
@@ -664,6 +685,17 @@ class FilecoinAdapter:
             )
         if envelope_key_hash is None:
             envelope_key_hash = key_hash
+        if cache_name is not None:
+            if not allow_local_cache:
+                raise ValueError(
+                    "cache_name names a host-cache entry, which "
+                    "allow_local_cache=False forbids reading"
+                )
+            if not (
+                isinstance(cache_name, str)
+                and is_cache_name_of(cache_name, cache_name.partition(".")[0])
+            ):
+                raise ValueError("cache_name is not a name the host cache is written under")
         # Normalize a SHA-256 lookup key to lowercase so cache lookup AND the
         # integrity check are case-consistent on case-SENSITIVE filesystems too
         # (Linux CI/prod). Cache files are written with the lowercase hexdigest,
@@ -672,27 +704,29 @@ class FilecoinAdapter:
         if _looks_like_sha256(content_hash):
             content_hash = content_hash.lower()
         encoded_limit = _encoded_retrieval_limit(max_output_bytes)
-        # The owner id ``envelope_owner``'s envelopes are cached under. With
-        # no master key configured no envelope can be opened, so only the
-        # plain name is read.
-        cache_owner_id = (
-            None
-            if envelope is EnvelopePolicy.IGNORE
-            else configured_envelope_owner_id(envelope_owner)
-        )
 
         # Try local cache first (unless the caller may not use it)
         try:
             from_ipfs = False
-            opened_envelope = False
+            opened_header = None
             retrieved_content = None
+            # The content hashes the result must hash to. A cache name begins
+            # with the content hash of what is cached under it, whatever name
+            # the content was requested by (an IPFS CID is not one), and
+            # whether the cache or IPFS answers.
+            expected_digests = {content_hash} if _looks_like_sha256(content_hash) else set()
+            if cache_name is not None:
+                expected_digests.add(cache_name.partition(".")[0])
             if allow_local_cache:
-                cache_names = [content_hash]
-                if cache_owner_id is not None:
-                    cache_names.insert(0, envelope_cache_name(content_hash, cache_owner_id))
-                for cache_name in cache_names:
+                # The recorded name first; then the name the content was
+                # requested by, under which a restore by CID before #2873
+                # cached what IPFS returned.
+                lookup_names = [content_hash]
+                if cache_name is not None and cache_name != content_hash:
+                    lookup_names.insert(0, cache_name)
+                for lookup_name in lookup_names:
                     retrieved_content = self._retrieve_local_cache(
-                        cache_name,
+                        lookup_name,
                         max_bytes=encoded_limit,
                     )
                     if retrieved_content:
@@ -730,12 +764,11 @@ class FilecoinAdapter:
                 else:
                     result = decompressed_content
             elif is_encrypted_envelope(decompressed_content):
-                result = self.open_envelope(
+                opened_header, result = self._open_envelope(
                     decompressed_content,
                     owner=envelope_owner,
                     expected_key_hash=envelope_key_hash,
                 )
-                opened_envelope = True
             elif key_hash:
                 result = self._decrypt_content(decompressed_content, key_hash)
             elif _is_legacy_ciphertext(decompressed_content):
@@ -759,27 +792,45 @@ class FilecoinAdapter:
             # gateway substitution, and only cache IPFS content AFTER it verifies.
             # NOTE: some callers retrieve by CID and pass ``content_hash=cid``
             # (a base58/base32 CID, NOT a sha256); those paths skip this check —
-            # comparing a sha256 to a CID string would always (wrongly) fail.
-            if _looks_like_sha256(content_hash):
+            # comparing a sha256 to a CID string would always (wrongly) fail —
+            # unless the caller gave a recorded ``cache_name``, which names
+            # its content hash.
+            verified_digest = None
+            if expected_digests:
                 # content_hash was lowercased above, matching hexdigest().
                 actual = hashlib.sha256(result).hexdigest()
-                if actual != content_hash:
-                    raise ValueError(
-                        f"Content integrity check failed for {content_hash[:16]}…: "
-                        f"computed {actual[:16]}… (possible cache poisoning / gateway "
-                        f"substitution)"
-                    )
+                for expected in sorted(expected_digests):
+                    if actual != expected:
+                        raise ValueError(
+                            f"Content integrity check failed for {expected[:16]}…: "
+                            f"computed {actual[:16]}… (possible cache poisoning / gateway "
+                            f"substitution)"
+                        )
+                verified_digest = actual
 
             if from_ipfs:
                 # This content is durably on IPFS (we just fetched it by CID), so
-                # the cache copy is safe to evict later. An envelope that
-                # opened for ``envelope_owner`` was sealed for it, and is
-                # cached under its owner's name as ``store_content`` does.
-                cache_name = content_hash
-                if opened_envelope and cache_owner_id is not None:
-                    cache_name = envelope_cache_name(content_hash, cache_owner_id)
+                # the cache copy is safe to evict later. Content that
+                # establishes its own name is cached under the name
+                # ``store_content`` gives it, which a record of it holds, not
+                # under the name it was requested by: an import requests an
+                # export by its IPFS CID, and a copy under the CID is one its
+                # receipt's name never finds (#2873). An opened envelope's
+                # authenticated header names its content hash and the agent
+                # it was sealed for; other content is named by the content
+                # hash it was checked against. Content checked against none,
+                # a CID lookup with no record, keeps the name it was
+                # requested by, which the next lookup by that CID reads.
+                if opened_header is not None:
+                    recache_name = envelope_cache_name(
+                        opened_header["key_hash"], opened_header["owner_id"]
+                    )
+                elif verified_digest is not None:
+                    recache_name = verified_digest
+                else:
+                    recache_name = content_hash
                 self._store_local_cache(
-                    cache_name, retrieved_content,
+                    recache_name, retrieved_content,
                     tier=StorageTier.IPFS, cid=ipfs_cid,
                 )
 
@@ -920,6 +971,14 @@ class FilecoinAdapter:
         plaintext does not hash to the header's ``key_hash``. Raises
         ``DecryptionKeyUnavailableError`` when no master key is configured.
         """
+        return self._open_envelope(
+            payload, owner=owner, expected_key_hash=expected_key_hash
+        )[1]
+
+    def _open_envelope(self, payload: bytes, *, owner: str,
+                       expected_key_hash: Optional[str] = None
+                       ) -> Tuple[Dict[str, Any], bytes]:
+        """``open_envelope``, also returning the header it authenticated."""
         from kestrel_sdk.security.aead import AEADCipher
         from kestrel_sdk.security.exceptions import DecryptionError
 
@@ -949,7 +1008,7 @@ class FilecoinAdapter:
                 "the decrypted export does not match the content hash its "
                 "envelope names"
             )
-        return content
+        return header, content
 
     def _decrypt_legacy_under_name(self, payload: bytes, name: str) -> bytes:
         """Decrypt legacy ciphertext that no record names a key hash for.

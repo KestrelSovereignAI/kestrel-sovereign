@@ -244,14 +244,75 @@ async def test_receipt_content_hash_also_confers_ownership(cache_dir, identities
 
 
 @pytest.mark.asyncio
+async def test_a_recorded_cache_name_of_another_export_confers_nothing(cache_dir, identities):
+    """A receipt's cache name is its own export's (#2873): one naming another
+    content hash's entry neither lists nor serves it."""
+    receipt = SimpleNamespace(
+        node_id=identities.mine_hash, properties={"cache_name": identities.theirs_hash}
+    )
+
+    async def by_type(node_type):
+        return [receipt] if node_type == "backup_artifact" else []
+
+    storage = SimpleNamespace(privacy_config=None, get_nodes_by_type=by_type)
+    agent = SimpleNamespace(did=identities.mine, agent_name="x", storage=storage)
+    async with _client(agent, agent) as client:
+        listing = (await client.get("/api/sovereignty/files")).json()
+        download = await client.get(f"/api/sovereignty/files/{identities.theirs_hash}.cache")
+    assert {f["name"] for f in listing["files"]} == {
+        f"{identities.mine_hash}.cache",
+        f"{identities.mine_hash}.meta",
+    }
+    assert download.status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "node_id",
+    ["envelope-name", "parent-dir", "uppercase"],
+)
+async def test_a_receipt_whose_node_id_is_not_a_content_hash_confers_nothing(
+    cache_dir, identities, node_id
+):
+    """A content hash is what ``store_content`` names content by, a
+    lowercase SHA-256. A receipt naming anything else names no cache entry:
+    in particular not another agent's envelope, ``{hash}.{owner_id}``, whose
+    name a receipt could otherwise hold as its content hash (#2873)."""
+    theirs_envelope = f"{identities.theirs_hash}.{'b' * 32}"
+    (cache_dir / f"{theirs_envelope}.cache").write_bytes(b"their envelope")
+    (cache_dir / f"{theirs_envelope}.meta").write_text(json.dumps({"agent": identities.theirs}))
+    (cache_dir.parent / "outside.cache").write_bytes(b"outside the cache")
+    claimed = {
+        "envelope-name": theirs_envelope,
+        "parent-dir": "../outside",
+        "uppercase": identities.theirs_hash.upper(),
+    }[node_id]
+    receipt = SimpleNamespace(node_id=claimed, properties={})
+
+    async def by_type(node_type):
+        return [receipt] if node_type == "backup_artifact" else []
+
+    storage = SimpleNamespace(privacy_config=None, get_nodes_by_type=by_type)
+    agent = SimpleNamespace(did=identities.mine, agent_name="x", storage=storage)
+    async with _client(agent, agent) as client:
+        listing = (await client.get("/api/sovereignty/files")).json()
+        download = await client.get(f"/api/sovereignty/files/{theirs_envelope}.cache")
+    assert listing["files"] == []
+    assert download.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_each_agent_sees_only_its_own_envelope_of_a_shared_plaintext(
     tmp_path, identities, monkeypatch
 ):
     """Two agents' encrypted exports of one plaintext share its content
     hash, and each agent's receipt names it. The host cache keys each
-    envelope by the agent it was sealed for (#2873); the browser lists and
-    serves each agent its own, and the other's is the same 404 as a name
-    that does not exist."""
+    envelope by the agent it was sealed for (#2873), and each receipt
+    records the name; the browser lists and serves each agent its own, and
+    the other's is the same 404 as a name that does not exist. The name
+    derives from the key the envelope was sealed under, and the browser
+    reads the receipt's record of it, so none of this depends on the key
+    configured now."""
     monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
     cache = tmp_path / "storage_cache"
     monkeypatch.setattr(sovereignty_endpoints, "STORAGE_CACHE_DIR", cache)
@@ -276,8 +337,13 @@ async def test_each_agent_sees_only_its_own_envelope_of_a_shared_plaintext(
     names = {path.name for path in cache.glob(f"{shared}.*.cache")}
     assert len(names) == 2
 
+    # The browser asks the receipts, not the key.
+    monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
+
     def agent_for(did):
-        receipt = SimpleNamespace(node_id=shared, properties={})
+        receipt = SimpleNamespace(
+            node_id=shared, properties={"cache_name": stored[did].cache_name}
+        )
 
         async def by_type(node_type):
             return [receipt] if node_type == "backup_artifact" else []
@@ -290,6 +356,7 @@ async def test_each_agent_sees_only_its_own_envelope_of_a_shared_plaintext(
         listing = (await client.get("/api/sovereignty/files")).json()
     listed = {f["name"] for f in listing["files"]}
     [own_cache] = [name for name in listed if name.endswith(".cache")]
+    assert own_cache == f"{stored[identities.mine].cache_name}.cache"
     [other_cache] = names - {own_cache}
     own_stem = own_cache[: -len(".cache")]
     assert listed == {own_cache, f"{own_stem}.meta"}, listing

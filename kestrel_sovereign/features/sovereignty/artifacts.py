@@ -26,16 +26,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
+from kestrel_sovereign.filecoin_adapter import is_cache_name_of
+
 BACKUP_ARTIFACT_NODE_TYPE = "backup_artifact"
 SOVEREIGNTY_RECEIPT_NODE_TYPE = "sovereignty_receipt"
 
 
 @dataclass(frozen=True)
 class OwnedArtifact:
-    """One export/backup artifact the bound agent recorded as its own."""
+    """One export/backup artifact the bound agent recorded as its own.
+
+    ``cache_name`` is the host-cache name the receipt records the artifact
+    under, when it records one (#2873).
+    """
 
     content_hash: Optional[str]
     cid: Optional[str]
+    cache_name: Optional[str] = None
 
 
 async def owned_artifacts(storage: Any) -> List[OwnedArtifact]:
@@ -65,6 +72,7 @@ async def owned_artifacts(storage: Any) -> List[OwnedArtifact]:
             OwnedArtifact(
                 content_hash=_text(getattr(node, "node_id", None)),
                 cid=_text(properties.get("ipfs_cid")),
+                cache_name=_text(properties.get("cache_name")),
             )
         )
     for node in await storage.get_nodes_by_type(SOVEREIGNTY_RECEIPT_NODE_TYPE):
@@ -79,7 +87,37 @@ async def owned_artifacts(storage: Any) -> List[OwnedArtifact]:
 
 
 def owned_content_hashes(artifacts: List[OwnedArtifact]) -> set:
-    return {a.content_hash for a in artifacts if a.content_hash}
+    """The content hashes the artifacts record.
+
+    Only a lowercase SHA-256, the name ``store_content`` gives content: a
+    receipt naming anything else names no cache entry. Otherwise a receipt
+    could name an envelope's cache name, ``{hash}.{owner_id}``, as its
+    content hash and confer another agent's envelope (#2873).
+    """
+    return {
+        a.content_hash
+        for a in artifacts
+        if a.content_hash and is_cache_name_of(a.content_hash, a.content_hash)
+    }
+
+
+def owned_cache_names(artifacts: List[OwnedArtifact]) -> set:
+    """The host-cache names the artifacts are cached under.
+
+    Each content hash, and the name a receipt records for an encrypted
+    envelope, which the cache keys by the agent it was sealed for (#2873).
+    Envelopes of one plaintext sealed for two agents share its content hash,
+    so only the recorded name says which is this agent's. A recorded name
+    that is not a cache name of its own artifact's content hash confers
+    nothing.
+    """
+    names = owned_content_hashes(artifacts)
+    names.update(
+        a.cache_name
+        for a in artifacts
+        if a.content_hash and is_cache_name_of(a.cache_name, a.content_hash)
+    )
+    return names
 
 
 def owned_cids(artifacts: List[OwnedArtifact]) -> set:

@@ -19,6 +19,7 @@ import pytest
 
 from kestrel_sovereign.features.sovereignty.feature import (
     MAX_SOVEREIGNTY_IMPORT_BYTES,
+    REFUSAL_BACKUP_RECEIPT_INVALID,
     SovereigntyFeature,
 )
 from kestrel_sovereign.filecoin_adapter import EnvelopePolicy, FilecoinAdapter, StorageTier
@@ -87,25 +88,43 @@ async def test_import_without_a_receipt_cannot_restore_a_cached_export(
     feature.agent.storage.restore_from_backup_blob.assert_not_awaited()
 
 
+ENVELOPE_NAME = f"{HASH}.{'b' * 32}"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("properties", "key_hash", "policy", "envelope_key_hash"),
+    ("properties", "key_hash", "policy", "envelope_key_hash", "cache_name"),
     [
-        ({"encryption_key_hash": "kh", "encrypted": True}, "kh", EnvelopePolicy.ENCRYPTED_ONLY, "kh"),
+        # A receipt written before the cache name was recorded holds none: its
+        # export is cached under its content hash, the receipt's node id,
+        # never under the CID it is requested by (#2873).
+        ({"encryption_key_hash": "kh", "encrypted": True}, "kh", EnvelopePolicy.ENCRYPTED_ONLY, "kh", HASH),
         # An encrypted receipt that lost its key hash still refuses a payload
         # that does not look like ciphertext (a damaged envelope magic), and
         # still binds an envelope to the content hash it is keyed by.
-        ({"encryption_key_hash": None, "encrypted": True}, None, EnvelopePolicy.ENCRYPTED_ONLY, HASH),
+        ({"encryption_key_hash": None, "encrypted": True}, None, EnvelopePolicy.ENCRYPTED_ONLY, HASH, HASH),
         # A receipt that does not say it is plaintext is not taken as one.
-        ({}, None, EnvelopePolicy.ENCRYPTED_ONLY, HASH),
-        ({"encryption_key_hash": "kh", "encrypted": False}, "kh", EnvelopePolicy.ENCRYPTED_ONLY, "kh"),
+        ({}, None, EnvelopePolicy.ENCRYPTED_ONLY, HASH, HASH),
+        ({"encryption_key_hash": "kh", "encrypted": False}, "kh", EnvelopePolicy.ENCRYPTED_ONLY, "kh", HASH),
         # Only a receipt recording a plaintext export accepts plaintext.
-        ({"encryption_key_hash": None, "encrypted": False}, None, EnvelopePolicy.OPEN, HASH),
+        ({"encryption_key_hash": None, "encrypted": False}, None, EnvelopePolicy.OPEN, HASH, HASH),
+        # The cache is read under the name the receipt records (#2873).
+        (
+            {"encryption_key_hash": HASH, "encrypted": True, "cache_name": ENVELOPE_NAME},
+            HASH, EnvelopePolicy.ENCRYPTED_ONLY, HASH, ENVELOPE_NAME,
+        ),
+        (
+            {"encryption_key_hash": None, "encrypted": False, "cache_name": HASH},
+            None, EnvelopePolicy.OPEN, HASH, HASH,
+        ),
     ],
-    ids=["encrypted", "encrypted-no-key-hash", "unrecorded", "contradictory", "plaintext"],
+    ids=[
+        "encrypted", "encrypted-no-key-hash", "unrecorded", "contradictory", "plaintext",
+        "envelope-cache-name", "plaintext-cache-name",
+    ],
 )
 async def test_import_with_a_receipt_follows_what_it_records(
-    properties, key_hash, policy, envelope_key_hash
+    properties, key_hash, policy, envelope_key_hash, cache_name
 ):
     receipt = SimpleNamespace(node_id=HASH, properties=properties)
     feature = _feature(receipts=[receipt])
@@ -121,7 +140,74 @@ async def test_import_with_a_receipt_follows_what_it_records(
         envelope=policy,
         envelope_owner="did:test:me",
         envelope_key_hash=envelope_key_hash,
+        cache_name=cache_name,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("node_id", "cache_name"),
+    [(HASH, HASH), ("not-a-content-hash", None), (HASH.upper(), None)],
+    ids=["content-hash", "other-node-id", "uppercase-node-id"],
+)
+async def test_a_receipt_without_a_cache_name_reads_its_content_hash_not_its_cid(
+    node_id, cache_name
+):
+    """A receipt written before the cache name was recorded names its export
+    by its node id, the content hash every export was then cached under.
+    The CID it is requested by is never a cache name; a node id that is not
+    a content hash names no cache entry."""
+    receipt = SimpleNamespace(
+        node_id=node_id,
+        properties={"ipfs_cid": "bafy-export", "encryption_key_hash": "kh", "encrypted": True},
+    )
+    feature = _feature(receipts=[receipt])
+    with patch("kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter") as adapter_cls:
+        adapter_cls.return_value.retrieve_content = MagicMock(return_value=b"blob")
+        result = await feature.import_sovereignty("bafy-export")
+    assert result.status.value == "ok", result
+    adapter_cls.return_value.retrieve_content.assert_called_once_with(
+        "bafy-export",
+        ipfs_cid="bafy-export",
+        key_hash="kh",
+        max_output_bytes=MAX_SOVEREIGNTY_IMPORT_BYTES,
+        envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+        envelope_owner="did:test:me",
+        envelope_key_hash="kh",
+        cache_name=cache_name,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cache_name",
+    [
+        f"{'c' * 64}.{'b' * 32}",  # another export's envelope
+        "c" * 64,  # another export
+        "../../etc/passwd",
+        f"{HASH}.{'b' * 31}",
+        f"{HASH}.{'B' * 32}",
+        f"{HASH}.",
+        HASH.upper(),
+        "",
+        7,
+    ],
+)
+async def test_import_refuses_a_receipt_whose_cache_name_is_not_its_exports(cache_name):
+    """A receipt names the cache entry of the export it records, and only
+    that: a name of another export, or no cache name at all, is never read."""
+    receipt = SimpleNamespace(
+        node_id=HASH,
+        properties={"encryption_key_hash": HASH, "encrypted": True, "cache_name": cache_name},
+    )
+    feature = _feature(receipts=[receipt])
+    with patch("kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter") as adapter_cls:
+        result = await feature.import_sovereignty(HASH)
+    assert result.status.value == "error"
+    assert result.data["refusal"] == REFUSAL_BACKUP_RECEIPT_INVALID
+    assert "Nothing was restored" in result.error
+    adapter_cls.return_value.retrieve_content.assert_not_called()
+    feature.agent.storage.restore_from_backup_blob.assert_not_awaited()
 
 
 def test_identity_intake_never_answers_a_cid_from_the_local_cache():

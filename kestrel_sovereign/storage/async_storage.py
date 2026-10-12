@@ -2954,6 +2954,10 @@ class AsyncStorage:
             "filecoin_deal_id": getattr(result, 'filecoin_deal_id', None),
             "encrypted": getattr(result, 'encrypted', False),
             "encryption_key_hash": getattr(result, 'encryption_key_hash', None),
+            # Where the host cache holds it. An encrypted envelope's cache
+            # name derives from the master key, so a restore under another
+            # key, or none, finds it only by this record (#2873).
+            "cache_name": getattr(result, 'cache_name', None),
             "created_at": datetime.now(UTC).isoformat(),
         }
 

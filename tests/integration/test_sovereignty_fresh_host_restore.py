@@ -11,6 +11,10 @@ without ever exercising the gap.
 The "fresh host" is a second database, created empty, and a second working
 directory, so the export host's ``storage_cache`` is out of reach. IPFS is an
 in-memory Kubo daemon answering the three RPCs ``FilecoinAdapter`` makes.
+
+The same host restoring a local-tier export under another key, or none, keeps
+its receipt and cache: the envelope must be found and refused for the key it
+names, not reported missing.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from kestrel_sovereign.features.sovereignty import feature as sovereignty_featur
 from kestrel_sovereign.features.sovereignty.feature import (
     REFUSAL_DECRYPTION_FAILED,
     REFUSAL_ENCRYPTION_KEY_MISMATCH,
+    REFUSAL_ENCRYPTION_KEY_UNAVAILABLE,
     REFUSAL_EXPORT_EXCEEDS_IMPORT_LIMIT,
     REFUSAL_EXPORT_OF_ANOTHER_AGENT,
     REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE,
@@ -82,8 +87,12 @@ class _FakeKubo:
         self.blocks: dict[str, bytes] = {}
         # A gateway need not say how long its answer is.
         self.declare_length = True
+        self.online = True
+        self.cat_requests = 0
 
     def post(self, url, *, files=None, params=None, timeout=None, stream=False):
+        if not self.online:
+            raise ConnectionError("IPFS daemon unreachable")
         rpc = url.split("/api/v0/", 1)[1]
         if rpc == "version":
             return _Response(200, json_body={"Version": "0.0.0-test"})
@@ -94,6 +103,7 @@ class _FakeKubo:
             self.blocks[cid] = data
             return _Response(200, json_body={"Hash": cid})
         if rpc == "cat":
+            self.cat_requests += 1
             data = self.blocks.get(params["arg"])
             if data is None:
                 return _Response(500, body=b"block not found")
@@ -231,6 +241,132 @@ async def test_export_of_another_agent_is_refused_and_restores_nothing(
         assert await _history(raw) == []
 
 
+async def _local_export_then_lose_history(tmp_path, agent, raw):
+    """Export a known history to the local tier, then lose the history but
+    keep the receipt. Return the content hash the export is named by and the
+    path of its envelope in the host cache."""
+    for role, content in MESSAGES:
+        await raw.add_conversation(role, content, metadata={})
+    exported = await SovereigntyFeature(agent).export_sovereignty(
+        storage_tier="local", encrypt=True
+    )
+    assert exported.status is ToolResultStatus.OK, exported
+    assert exported.data["cid"] is None
+    content_hash = exported.data["content_hash"]
+    [receipt] = await agent.storage.get_nodes_by_type("backup_artifact")
+    cache_name = receipt.properties["cache_name"]
+    # The envelope is cached under a name that derives from the key.
+    assert cache_name.startswith(f"{content_hash}.")
+    cached = tmp_path / "origin" / "storage_cache" / f"{cache_name}.cache"
+    assert zlib.decompress(cached.read_bytes()).startswith(ENVELOPE_MAGIC)
+    await raw.db.execute_commit("DELETE FROM conversation_history")
+    restore = AsyncMock(wraps=agent.storage.restore_from_backup_blob)
+    agent.storage.restore_from_backup_blob = restore
+    return content_hash, cached, restore
+
+
+@pytest.mark.asyncio
+async def test_local_export_under_another_key_is_refused_naming_the_key(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    async with _host(tmp_path / "origin", monkeypatch) as (agent, raw):
+        content_hash, cached, restore = await _local_export_then_lose_history(
+            tmp_path, agent, raw
+        )
+        monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
+
+        refused = await SovereigntyFeature(agent).import_sovereignty(content_hash)
+
+        assert refused.status is ToolResultStatus.ERROR, refused
+        assert refused.data["refusal"] == REFUSAL_ENCRYPTION_KEY_MISMATCH, refused
+        assert refused.data["export_key_id"] != refused.data["configured_key_id"]
+        assert refused.data["export_key_id"] in refused.error
+        assert "Nothing was restored" in refused.error
+        restore.assert_not_awaited()
+        assert cached.is_file()
+
+        # The key the export was made with restores it.
+        monkeypatch.setenv("KESTREL_DATA_KEY", data_key)
+        restored = await SovereigntyFeature(agent).import_sovereignty(content_hash)
+
+        assert restored.status is ToolResultStatus.OK, restored
+        assert await _history(raw) == MESSAGES
+
+
+@pytest.mark.asyncio
+async def test_local_export_with_no_key_configured_is_refused_naming_the_absence(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    async with _host(tmp_path / "origin", monkeypatch) as (agent, raw):
+        content_hash, cached, restore = await _local_export_then_lose_history(
+            tmp_path, agent, raw
+        )
+        monkeypatch.delenv("KESTREL_DATA_KEY")
+        monkeypatch.delenv("KESTREL_DATA_KEY_FILE", raising=False)
+
+        refused = await SovereigntyFeature(agent).import_sovereignty(content_hash)
+
+        assert refused.status is ToolResultStatus.ERROR, refused
+        assert refused.data["refusal"] == REFUSAL_ENCRYPTION_KEY_UNAVAILABLE, refused
+        assert "no KESTREL_DATA_KEY is configured" in refused.error
+        assert "Nothing was restored" in refused.error
+        restore.assert_not_awaited()
+        assert cached.is_file()
+
+        monkeypatch.setenv("KESTREL_DATA_KEY", data_key)
+        restored = await SovereigntyFeature(agent).import_sovereignty(content_hash)
+
+        assert restored.status is ToolResultStatus.OK, restored
+        assert await _history(raw) == MESSAGES
+
+
+@pytest.mark.asyncio
+async def test_a_restore_by_cid_caches_the_export_under_its_receipt_s_name(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    """An import names an export by its IPFS CID. Once its cache entry is
+    evicted, a restore fetches it from IPFS and caches it again under the
+    name its receipt records, not under the CID, so the next restore is
+    answered from the host cache while IPFS is unreachable (#2873)."""
+    async with _host(tmp_path / "origin", monkeypatch) as (agent, raw):
+        for role, content in MESSAGES:
+            await raw.add_conversation(role, content, metadata={})
+        exported = await SovereigntyFeature(agent).export_sovereignty(
+            storage_tier="ipfs", encrypt=True
+        )
+        assert exported.status is ToolResultStatus.OK, exported
+        cid = exported.data["cid"]
+        [receipt] = await agent.storage.get_nodes_by_type("backup_artifact")
+        cache_name = receipt.properties["cache_name"]
+        cache = tmp_path / "origin" / "storage_cache"
+        # An IPFS-tier copy is one cleanup_cache may evict.
+        for evicted in cache.iterdir():
+            evicted.unlink()
+        await raw.db.execute_commit("DELETE FROM conversation_history")
+
+        first = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert first.status is ToolResultStatus.OK, first
+        assert await _history(raw) == MESSAGES
+        assert kubo.cat_requests == 1
+        assert sorted(path.name for path in cache.iterdir()) == [
+            f"{cache_name}.cache",
+            f"{cache_name}.meta",
+        ]
+        assert zlib.decompress((cache / f"{cache_name}.cache").read_bytes()).startswith(
+            ENVELOPE_MAGIC
+        )
+
+        kubo.online = False
+        await raw.db.execute_commit("DELETE FROM conversation_history")
+        second = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert second.status is ToolResultStatus.OK, second
+        assert second.data["messages_restored"] == len(MESSAGES)
+        assert await _history(raw) == MESSAGES
+        assert kubo.cat_requests == 1
+
+
 def _tamper_key_hash(payload: bytes) -> bytes:
     """Flip one hex digit of the header's key hash, keeping it canonical."""
     start = payload.index(b'"key_hash":"') + len(b'"key_hash":"')
@@ -349,6 +485,60 @@ async def test_legacy_export_still_restores_with_its_backup_receipt(
 
         assert result.status is ToolResultStatus.OK, result
         assert result.data["messages_restored"] == len(MESSAGES)
+        assert await _history(raw) == MESSAGES
+
+
+@pytest.mark.asyncio
+async def test_legacy_receipt_without_a_cache_name_restores_from_the_content_hash_s_entry(
+    tmp_path, monkeypatch, kubo, data_key
+):
+    """A receipt written before the cache name was recorded holds none, and
+    its export was cached under its content hash. Requested by its IPFS CID,
+    the export is cached again under that hash when IPFS answers, and found
+    there when IPFS cannot (#2873)."""
+    async with _host(tmp_path / "origin", monkeypatch) as (agent, raw):
+        for role, content in MESSAGES:
+            await raw.add_conversation(role, content, metadata={})
+        blob = await agent.storage.create_backup_blob(include_db=True)
+        stored = FilecoinAdapter().store_content(
+            blob, storage_tier=StorageTier.IPFS, encrypt=True, metadata={"agent": AGENT_DID}
+        )
+        assert stored.cache_name == stored.content_hash
+        # As the receipt was written before the name was recorded.
+        stored.cache_name = None
+        await agent.storage.record_backup_artifact(AGENT_DID, stored)
+        [receipt] = await agent.storage.get_nodes_by_type("backup_artifact")
+        assert receipt.properties["cache_name"] is None
+        cid = stored.ipfs_cid
+        cache = tmp_path / "origin" / "storage_cache"
+        for evicted in cache.iterdir():
+            evicted.unlink()
+        await raw.db.execute_commit("DELETE FROM conversation_history")
+
+        first = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert first.status is ToolResultStatus.OK, first
+        assert await _history(raw) == MESSAGES
+        assert sorted(path.name for path in cache.iterdir()) == [
+            f"{stored.content_hash}.cache",
+            f"{stored.content_hash}.meta",
+        ]
+
+        kubo.online = False
+        await raw.db.execute_commit("DELETE FROM conversation_history")
+        second = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert second.status is ToolResultStatus.OK, second
+        assert await _history(raw) == MESSAGES
+
+        # A restore by CID before #2873 cached what IPFS returned under the
+        # CID. With only that copy left, it still answers.
+        (cache / f"{stored.content_hash}.cache").rename(cache / f"{cid}.cache")
+        (cache / f"{stored.content_hash}.meta").rename(cache / f"{cid}.meta")
+        await raw.db.execute_commit("DELETE FROM conversation_history")
+        third = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert third.status is ToolResultStatus.OK, third
         assert await _history(raw) == MESSAGES
 
 

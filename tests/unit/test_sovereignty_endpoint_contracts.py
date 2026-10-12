@@ -1,6 +1,7 @@
 """Focused contract tests for sovereignty endpoints."""
 
 import asyncio
+import hashlib
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -374,6 +375,10 @@ def test_sovereignty_import_reports_owner_self_fence_as_retryable():
         _restore_app(app, original)
 
 
+# The name store_content caches content under: its lowercase SHA-256.
+SAMPLE = hashlib.sha256(b"sample").hexdigest()
+
+
 def _agent_owning(*content_hashes):
     """An agent whose own storage holds a backup receipt for each hash.
 
@@ -394,10 +399,10 @@ def test_sovereignty_files_listing_and_preview_contract(tmp_path):
 
     cache_dir = tmp_path / "storage_cache"
     cache_dir.mkdir()
-    (cache_dir / "sample.cache").write_text("hello world")
-    (cache_dir / "sample.meta").write_text('{"source":"test"}')
+    (cache_dir / f"{SAMPLE}.cache").write_text("hello world")
+    (cache_dir / f"{SAMPLE}.meta").write_text('{"source":"test"}')
 
-    agent = _agent_owning("sample")
+    agent = _agent_owning(SAMPLE)
     app, original = _prepare_app(agent)
     original_cache_dir = sovereignty_endpoints.STORAGE_CACHE_DIR
     sovereignty_endpoints.STORAGE_CACHE_DIR = cache_dir
@@ -406,7 +411,7 @@ def test_sovereignty_files_listing_and_preview_contract(tmp_path):
             with TestClient(app) as client:
                 list_response = client.get("/api/sovereignty/files", headers={"X-API-Key": "test-key"})
                 preview_response = client.get(
-                    "/api/sovereignty/files/sample.cache/preview",
+                    f"/api/sovereignty/files/{SAMPLE}.cache/preview",
                     headers={"X-API-Key": "test-key"},
                 )
                 invalid_response = client.get(
@@ -428,10 +433,10 @@ def test_sovereignty_file_browser_offloads_blocking_io(tmp_path):
 
     cache_dir = tmp_path / "storage_cache"
     cache_dir.mkdir()
-    (cache_dir / "sample.cache").write_text("hello world")
-    (cache_dir / "sample.meta").write_text('{"source":"test"}')
+    (cache_dir / f"{SAMPLE}.cache").write_text("hello world")
+    (cache_dir / f"{SAMPLE}.meta").write_text('{"source":"test"}')
 
-    agent = _agent_owning("sample")
+    agent = _agent_owning(SAMPLE)
     app, original = _prepare_app(agent)
     original_cache_dir = sovereignty_endpoints.STORAGE_CACHE_DIR
     sovereignty_endpoints.STORAGE_CACHE_DIR = cache_dir
@@ -449,7 +454,7 @@ def test_sovereignty_file_browser_offloads_blocking_io(tmp_path):
                 with TestClient(app) as client:
                     list_response = client.get("/api/sovereignty/files", headers={"X-API-Key": "test-key"})
                     preview_response = client.get(
-                        "/api/sovereignty/files/sample.cache/preview",
+                        f"/api/sovereignty/files/{SAMPLE}.cache/preview",
                         headers={"X-API-Key": "test-key"},
                     )
         assert list_response.status_code == 200

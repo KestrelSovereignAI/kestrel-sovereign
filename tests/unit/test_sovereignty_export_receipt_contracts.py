@@ -203,5 +203,6 @@ async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotate
         envelope=EnvelopePolicy.ENCRYPTED_ONLY,
         envelope_owner="did:kestrel:test",
         envelope_key_hash="keyhash123",
+        cache_name=None,
     )
     storage.restore_from_backup_blob.assert_not_awaited()

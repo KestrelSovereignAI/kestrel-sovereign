@@ -37,6 +37,7 @@ from kestrel_sovereign.filecoin_adapter import (
     envelope_cache_name,
     envelope_key_id,
     envelope_owner_id,
+    is_cache_name_of,
 )
 
 PLAINTEXT = b"a whole agent database, in a tarball"
@@ -298,6 +299,43 @@ def test_sealed_store_writes_an_envelope_and_records_its_key_hash(tmp_path, data
     assert not (adapter.cache_dir / f"{result.content_hash}.cache").exists()
     assert result.encrypted is True
     assert result.encryption_key_hash == result.content_hash == _split(stored)[0]["key_hash"]
+    # The name derives from the master key; the result records it.
+    assert result.cache_name == name
+
+
+@pytest.mark.parametrize("encrypt", [False, True], ids=["plaintext", "legacy-ciphertext"])
+def test_store_without_an_envelope_records_its_content_hash_as_its_cache_name(
+    tmp_path, data_key, encrypt
+):
+    adapter = _adapter(tmp_path)
+    result = _cached(adapter, encrypt=encrypt)
+
+    assert result.cache_name == result.content_hash
+    assert (adapter.cache_dir / f"{result.cache_name}.cache").is_file()
+
+
+def test_is_cache_name_of_accepts_only_the_names_a_store_writes(tmp_path, data_key):
+    content_hash = hashlib.sha256(PLAINTEXT).hexdigest()
+    envelope_name = f"{content_hash}.{'b' * 32}"
+
+    assert is_cache_name_of(content_hash, content_hash)
+    assert is_cache_name_of(envelope_name, content_hash)
+    for name in (
+        "c" * 64,
+        f"{'c' * 64}.{'b' * 32}",
+        f"{content_hash}.{'b' * 31}",
+        f"{content_hash}.{'B' * 32}",
+        f"{content_hash}.",
+        f"{content_hash}.{'b' * 32}.cache",
+        f"{content_hash}/../{'b' * 32}",
+        content_hash.upper(),
+        "",
+        None,
+        7,
+    ):
+        assert not is_cache_name_of(name, content_hash), name
+    # A content hash is a lowercase SHA-256, never a CID.
+    assert not is_cache_name_of("bafyabc", "bafyabc")
 
 
 def test_two_agents_sealing_one_plaintext_each_restore_their_own(tmp_path, data_key):
@@ -310,12 +348,14 @@ def test_two_agents_sealing_one_plaintext_each_restore_their_own(tmp_path, data_
     theirs = _cached(adapter, encrypt=True, envelope_owner=OTHER_AGENT)
     assert mine.content_hash == theirs.content_hash
 
-    for owner in (OWNER, OTHER_AGENT):
+    assert mine.cache_name != theirs.cache_name
+    for owner, stored in ((OWNER, mine), (OTHER_AGENT, theirs)):
         assert adapter.retrieve_content(
-            mine.content_hash,
+            stored.content_hash,
             envelope=EnvelopePolicy.ENCRYPTED_ONLY,
             envelope_owner=owner,
-            envelope_key_hash=mine.content_hash,
+            envelope_key_hash=stored.content_hash,
+            cache_name=stored.cache_name,
         ) == PLAINTEXT
 
 
@@ -343,9 +383,99 @@ def test_an_envelope_fetched_from_ipfs_is_cached_under_its_owner(tmp_path, data_
     assert not (fresh.cache_dir / f"{stored.content_hash}.cache").exists()
 
 
+@pytest.mark.parametrize("recorded", [True, False], ids=["receipt", "no-receipt"])
+def test_an_envelope_fetched_by_cid_is_cached_under_its_record_s_name(
+    tmp_path, data_key, recorded
+):
+    """An import requests an export by its IPFS CID. Fetched from IPFS, the
+    envelope is cached under the name its header authenticates, which is the
+    name ``store_content`` recorded, not under the CID: a copy under the CID
+    is one a later read by the recorded name never finds (#2873)."""
+    origin = _adapter(tmp_path)
+    stored = _cached(origin, encrypt=True, envelope_owner=OWNER)
+    blob = (origin.cache_dir / f"{stored.cache_name}.cache").read_bytes()
+    host = _adapter(tmp_path, "restoring")
+    cache_name = stored.cache_name if recorded else None
+
+    with patch.object(host, "_retrieve_ipfs", return_value=blob):
+        assert host.retrieve_content(
+            "bafy-export",
+            ipfs_cid="bafy-export",
+            envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+            envelope_owner=OWNER,
+            envelope_key_hash=stored.content_hash,
+            cache_name=cache_name,
+        ) == PLAINTEXT
+
+    assert sorted(path.name for path in host.cache_dir.iterdir()) == [
+        f"{stored.cache_name}.cache",
+        f"{stored.cache_name}.meta",
+    ]
+    assert (host.cache_dir / f"{stored.cache_name}.cache").read_bytes() == blob
+    # IPFS is gone; the record's name still finds the export.
+    with patch.object(host, "_retrieve_ipfs", side_effect=ConnectionError("IPFS down")):
+        assert host.retrieve_content(
+            "bafy-export",
+            ipfs_cid="bafy-export",
+            envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+            envelope_owner=OWNER,
+            envelope_key_hash=stored.content_hash,
+            cache_name=stored.cache_name,
+        ) == PLAINTEXT
+
+
+def test_plaintext_fetched_by_cid_is_cached_under_the_content_hash_it_was_checked_against(
+    tmp_path, data_key
+):
+    """With a recorded cache name the content is checked against the content
+    hash the name begins with, and cached under it; with none, a CID lookup
+    checks nothing and keeps the name it was requested by, as before."""
+    origin = _adapter(tmp_path)
+    plain = _cached(origin, encrypt=False)
+    blob = (origin.cache_dir / f"{plain.cache_name}.cache").read_bytes()
+    recorded = _adapter(tmp_path, "recorded")
+    unrecorded = _adapter(tmp_path, "unrecorded")
+
+    for host, cache_name in ((recorded, plain.cache_name), (unrecorded, None)):
+        with patch.object(host, "_retrieve_ipfs", return_value=blob):
+            assert host.retrieve_content(
+                "bafy-plain",
+                ipfs_cid="bafy-plain",
+                envelope=EnvelopePolicy.OPEN,
+                envelope_owner=OWNER,
+                cache_name=cache_name,
+            ) == PLAINTEXT
+
+    assert (recorded.cache_dir / f"{plain.content_hash}.cache").read_bytes() == blob
+    assert not (recorded.cache_dir / "bafy-plain.cache").exists()
+    assert (unrecorded.cache_dir / "bafy-plain.cache").read_bytes() == blob
+    assert not (unrecorded.cache_dir / f"{plain.content_hash}.cache").exists()
+
+
+def test_content_fetched_under_a_recorded_cache_name_must_hash_to_it(tmp_path, data_key):
+    """A recorded cache name names the content hash of its export, so IPFS
+    answering a CID with another export's bytes is refused and nothing is
+    cached."""
+    origin = _adapter(tmp_path)
+    plain = _cached(origin, encrypt=False)
+    host = _adapter(tmp_path, "restoring")
+
+    with patch.object(host, "_retrieve_ipfs", return_value=zlib.compress(b"another export")):
+        with pytest.raises(ValueError, match="integrity check failed"):
+            host.retrieve_content(
+                "bafy-plain",
+                ipfs_cid="bafy-plain",
+                envelope=EnvelopePolicy.OPEN,
+                envelope_owner=OWNER,
+                cache_name=plain.cache_name,
+            )
+
+    assert list(host.cache_dir.iterdir()) == []
+
+
 def test_retrieve_without_a_master_key_still_reads_a_plaintext_export(tmp_path, data_key):
-    """The owner-keyed cache name derives from the master key. Without one
-    no envelope can be opened, and a plaintext export is read as before."""
+    """Without a master key no envelope can be opened, and a plaintext
+    export is read as before."""
     adapter = _adapter(tmp_path)
     plain = _cached(adapter, encrypt=False)
 
@@ -368,7 +498,9 @@ def test_retrieve_opens_an_envelope_without_a_key_hash(tmp_path, data_key, polic
     adapter = _adapter(tmp_path)
     result = _cached(adapter, encrypt=True, envelope_owner=OWNER)
 
-    assert adapter.retrieve_content(result.content_hash, envelope=policy, envelope_owner=OWNER) == PLAINTEXT
+    assert adapter.retrieve_content(
+        result.content_hash, envelope=policy, envelope_owner=OWNER, cache_name=result.cache_name
+    ) == PLAINTEXT
 
 
 def test_retrieve_binds_an_envelope_to_the_key_hash_it_is_given(tmp_path, data_key):
@@ -377,7 +509,11 @@ def test_retrieve_binds_an_envelope_to_the_key_hash_it_is_given(tmp_path, data_k
 
     with pytest.raises(EnvelopeDecryptionError):
         adapter.retrieve_content(
-            result.content_hash, key_hash="c" * 64, envelope=EnvelopePolicy.OPEN, envelope_owner=OWNER
+            result.content_hash,
+            key_hash="c" * 64,
+            envelope=EnvelopePolicy.OPEN,
+            envelope_owner=OWNER,
+            cache_name=result.cache_name,
         )
 
 
@@ -391,6 +527,7 @@ def test_retrieve_binds_an_envelope_to_the_content_hash_its_record_names(tmp_pat
         envelope=EnvelopePolicy.OPEN,
         envelope_owner=OWNER,
         envelope_key_hash=result.content_hash,
+        cache_name=result.cache_name,
     ) == PLAINTEXT
     with pytest.raises(EnvelopeDecryptionError, match="c" * 64):
         adapter.retrieve_content(
@@ -398,6 +535,7 @@ def test_retrieve_binds_an_envelope_to_the_content_hash_its_record_names(tmp_pat
             envelope=EnvelopePolicy.OPEN,
             envelope_owner=OWNER,
             envelope_key_hash="c" * 64,
+            cache_name=result.cache_name,
         )
 
 
@@ -405,12 +543,19 @@ def test_retrieve_binds_an_envelope_to_the_content_hash_its_record_names(tmp_pat
 def test_retrieve_refuses_an_envelope_sealed_for_another_agent(tmp_path, data_key, policy):
     """The cache keys an envelope by its owner, so another agent's read of
     its content hash does not find it there. One that arrives another way,
-    here under the plain name, is refused."""
+    under its owner's name or the plain one, is refused."""
     adapter = _adapter(tmp_path)
     result = _cached(adapter, encrypt=True, envelope_owner=OWNER)
     with pytest.raises(ValueError, match="Content not found"):
         adapter.retrieve_content(
             result.content_hash, envelope=policy, envelope_owner=OTHER_AGENT
+        )
+    with pytest.raises(EnvelopeOwnerMismatchError):
+        adapter.retrieve_content(
+            result.content_hash,
+            envelope=policy,
+            envelope_owner=OTHER_AGENT,
+            cache_name=result.cache_name,
         )
     name = _owner_cache_name(adapter, result.content_hash, OWNER)
     _cached_under(
@@ -426,6 +571,138 @@ def test_retrieve_refuses_an_envelope_sealed_for_another_agent(tmp_path, data_ke
             envelope=policy,
             envelope_owner=OTHER_AGENT,
         )
+
+
+def test_recorded_cache_name_finds_an_envelope_under_another_key_which_it_names(
+    tmp_path, data_key, monkeypatch
+):
+    """The cache name derives from the key the envelope was sealed under, so
+    a reader under another key cannot derive it. Read by the name its record
+    holds, the envelope is found and names the key it needs, rather than the
+    export being reported missing (#2873)."""
+    adapter = _adapter(tmp_path)
+    result = _cached(adapter, encrypt=True, envelope_owner=OWNER)
+    sealed_key_id = envelope_key_id(adapter._get_master_key())
+    monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
+
+    with pytest.raises(ValueError, match="Content not found"):
+        adapter.retrieve_content(
+            result.content_hash, envelope=EnvelopePolicy.ENCRYPTED_ONLY, envelope_owner=OWNER
+        )
+    with pytest.raises(EnvelopeKeyMismatchError) as caught:
+        adapter.retrieve_content(
+            result.content_hash,
+            envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+            envelope_owner=OWNER,
+            cache_name=result.cache_name,
+        )
+
+    assert caught.value.envelope_key_id == sealed_key_id
+    assert caught.value.configured_key_id == envelope_key_id(adapter._get_master_key())
+    assert (adapter.cache_dir / f"{result.cache_name}.cache").is_file()
+
+
+def test_recorded_cache_name_finds_an_envelope_with_no_key_configured(tmp_path, data_key):
+    adapter = _adapter(tmp_path)
+    result = _cached(adapter, encrypt=True, envelope_owner=OWNER)
+
+    with patch(
+        "kestrel_sovereign.security.encryption.get_master_key_bytes",
+        return_value=None,
+    ):
+        with pytest.raises(DecryptionKeyUnavailableError):
+            adapter.retrieve_content(
+                result.content_hash,
+                envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+                envelope_owner=OWNER,
+                cache_name=result.cache_name,
+            )
+
+
+@pytest.mark.parametrize(
+    "cache_name",
+    ["../../etc/passwd", "bafyabc", f"{'a' * 64}.{'b' * 31}", ("a" * 64).upper(), "", 7],
+)
+def test_retrieve_reads_no_cache_entry_under_a_name_no_store_writes(
+    tmp_path, data_key, cache_name
+):
+    adapter = _adapter(tmp_path)
+
+    with patch.object(adapter, "_retrieve_local_cache") as read_cache:
+        with pytest.raises(ValueError, match="not a name the host cache is written under"):
+            adapter.retrieve_content(
+                "a" * 64,
+                envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+                envelope_owner=OWNER,
+                cache_name=cache_name,
+            )
+
+    read_cache.assert_not_called()
+
+
+def test_retrieve_refuses_a_cache_name_it_may_not_read(tmp_path, data_key):
+    adapter = _adapter(tmp_path)
+    result = _cached(adapter, encrypt=True, envelope_owner=OWNER)
+
+    with patch.object(adapter, "_retrieve_local_cache") as read_cache:
+        with pytest.raises(ValueError, match="allow_local_cache=False"):
+            adapter.retrieve_content(
+                result.content_hash,
+                envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+                envelope_owner=OWNER,
+                allow_local_cache=False,
+                cache_name=result.cache_name,
+            )
+
+    read_cache.assert_not_called()
+
+
+def test_content_read_by_its_cache_name_must_hash_to_it_whatever_it_was_requested_by(
+    tmp_path, data_key
+):
+    """A receipt's export is requested by its IPFS CID, which is no content
+    hash to check the result against. Read from the cache by its recorded
+    name, the result must still hash to the content hash the name begins
+    with."""
+    adapter = _adapter(tmp_path)
+    plain = _cached(adapter, encrypt=False)
+    _cached_under(adapter, plain.cache_name, b"another export's bytes")
+
+    with pytest.raises(ValueError, match="integrity check failed"):
+        adapter.retrieve_content(
+            "bafy-requested-by-cid",
+            ipfs_cid="bafy-requested-by-cid",
+            envelope=EnvelopePolicy.OPEN,
+            envelope_owner=OWNER,
+            cache_name=plain.cache_name,
+        )
+
+
+def test_the_requested_name_is_read_when_the_recorded_name_misses(tmp_path, data_key):
+    """Before #2873 a restore by CID cached what IPFS returned under the CID.
+    With the recorded name's entry evicted, that copy still answers, and it
+    must hash to the content hash the recorded name begins with."""
+    adapter = _adapter(tmp_path)
+    plain = _cached(adapter, encrypt=False)
+    (adapter.cache_dir / f"{plain.cache_name}.cache").unlink()
+
+    def retrieve():
+        return adapter.retrieve_content(
+            "bafy-restored-before",
+            ipfs_cid="bafy-restored-before",
+            envelope=EnvelopePolicy.OPEN,
+            envelope_owner=OWNER,
+            cache_name=plain.cache_name,
+        )
+
+    with patch.object(adapter, "_retrieve_ipfs", side_effect=ConnectionError("IPFS down")):
+        with pytest.raises(ValueError, match="Content not found"):
+            retrieve()
+        _cached_under(adapter, "bafy-restored-before", PLAINTEXT)
+        assert retrieve() == PLAINTEXT
+        _cached_under(adapter, "bafy-restored-before", b"another export's bytes")
+        with pytest.raises(ValueError, match="integrity check failed"):
+            retrieve()
 
 
 @pytest.mark.parametrize("policy", [EnvelopePolicy.OPEN, EnvelopePolicy.ENCRYPTED_ONLY])
@@ -617,10 +894,12 @@ async def test_backup_command_seals_its_encrypted_backup(tmp_path, monkeypatch, 
     stored = zlib.decompress((tmp_path / "storage_cache" / f"{name}.cache").read_bytes())
     assert stored.startswith(ENVELOPE_MAGIC)
     assert _split(stored)[0]["owner_id"] == owner_id
+    assert result.cache_name == name
     assert FilecoinAdapter().retrieve_content(
         result.content_hash,
         envelope=EnvelopePolicy.ENCRYPTED_ONLY,
         envelope_owner=agent.agent_id,
+        cache_name=result.cache_name,
     ) == PLAINTEXT
 
 

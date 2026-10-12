@@ -16,6 +16,7 @@ from kestrel_sovereign.filecoin_adapter import (
     LegacyDecryptionUnavailableError,
     StorageTier,
     UnencryptedContentError,
+    is_cache_name_of,
 )
 from decimal import Decimal
 from datetime import datetime
@@ -39,6 +40,7 @@ REFUSAL_DECRYPTION_FAILED = "decryption_failed"
 REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE = "legacy_decryption_metadata_unavailable"
 REFUSAL_UNENCRYPTED_WITHOUT_RECEIPT = "unencrypted_export_without_receipt"
 REFUSAL_EXPORT_EXCEEDS_IMPORT_LIMIT = "export_exceeds_import_limit"
+REFUSAL_BACKUP_RECEIPT_INVALID = "backup_receipt_invalid"
 
 # The largest backup blob an import restores. A fresh host restores whatever
 # a caller-supplied CID returns, before anything has authenticated it (#2873),
@@ -411,7 +413,15 @@ class SovereigntyFeature(Feature):
         hash. Without a receipt that name must also be one IPFS answers for:
         an export known only by its content hash (a local-tier export) is in
         a host cache, which that path does not read. With a receipt, the
-        receipt decides whether the export is
+        host cache is read under the name the receipt records (its content
+        hash, for a receipt that records none), then under the name it was
+        requested by. An envelope's recorded name derives from the key it
+        was sealed under, so an export made under another key, or read with
+        none configured, is still found and refused naming the key rather
+        than reported missing. A copy fetched from IPFS is cached again
+        under its content hash, with its owner for an envelope, as the
+        export was, never under the CID. The receipt
+        also decides whether the export is
         encrypted: only one recording a plaintext export accepts a payload
         that is not ciphertext. The IPFS read and the decompression stop at a
         ceiling derived from ``MAX_SOVEREIGNTY_IMPORT_BYTES`` rather than
@@ -484,6 +494,28 @@ class SovereigntyFeature(Feature):
                 receipt_encrypted = (
                     receipt.properties.get("encrypted") is not False or bool(key_hash)
                 )
+                # Where the host cache holds the export, which the export
+                # determines and the CID it is requested by does not. An
+                # envelope's name derives from the master key it was sealed
+                # under, so a reader under another key, or none, cannot
+                # derive it: the receipt's record of it is read instead, and
+                # the envelope then names the key it needs. A receipt written
+                # before the name was recorded holds none; ``store_content``
+                # cached every export then under its content hash, which is
+                # the receipt's node id. ``retrieve_content`` also reads the
+                # requested name, under which a restore by CID before #2873
+                # cached what IPFS returned.
+                cache_name = receipt.properties.get("cache_name")
+                if cache_name is None:
+                    if is_cache_name_of(receipt.node_id, receipt.node_id):
+                        cache_name = receipt.node_id
+                elif not is_cache_name_of(cache_name, receipt.node_id):
+                    return self._import_refused(
+                        cid,
+                        REFUSAL_BACKUP_RECEIPT_INVALID,
+                        "this agent's backup receipt records a cache name "
+                        "that is not one of the export it records",
+                    )
                 logger.info(f"Found backup artifact node for CID {cid}, encrypted: {receipt.properties.get('encrypted')}")
                 content = await asyncio.to_thread(
                     adapter.retrieve_content,
@@ -498,6 +530,7 @@ class SovereigntyFeature(Feature):
                     ),
                     envelope_owner=self.agent.agent_id,
                     envelope_key_hash=key_hash or receipt.node_id,
+                    cache_name=cache_name,
                 )
 
             if not content:
