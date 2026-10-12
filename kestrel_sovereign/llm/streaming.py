@@ -89,7 +89,7 @@ from .generation_gate import (
     judge_generation,
     ran_inline_tools,
 )
-from .output_ceiling import IncompleteGenerationError
+from .output_ceiling import IncompleteGenerationError, reported_usage
 from .provider_registry import provider_cache_body
 
 if TYPE_CHECKING:
@@ -1065,7 +1065,9 @@ class StreamingMixin:
         stream that ends without one has given no evidence it finished. A
         rejected attempt raises the gate's failure instead of ending, and is
         recorded as a failed attempt with the usage and stop reason its
-        provider reported (#3576).
+        provider reported (#3576). So is a stream whose adapter refused its
+        own unfinished generation, from the usage carried on the error it
+        raised (#3577).
         """
 
         common_kwargs: Dict[str, Any] = {}
@@ -1176,6 +1178,7 @@ class StreamingMixin:
             rejection_message = (
                 None if rejected is None else recorded_message(rejected)
             )
+            refused_usage = None if failure is None else reported_usage(failure)
             if final_response is not None:
                 await self._record_streamed_usage(
                     final_response,
@@ -1189,6 +1192,21 @@ class StreamingMixin:
                     publish_identity=False,
                     invocation_context=invocation_context,
                     # The provider billed the usage whatever the gate decided.
+                    meter_usage=True,
+                )
+            elif refused_usage is not None:
+                # The adapter refused its own unfinished generation and raised
+                # with the usage its provider reported, never the text.
+                await self._record_streamed_usage(
+                    refused_usage,
+                    model,
+                    provider_name,
+                    duration_ms=duration_ms,
+                    path=path,
+                    success=False,
+                    error_message=recorded_message(failure),
+                    publish_identity=False,
+                    invocation_context=invocation_context,
                     meter_usage=True,
                 )
             elif usage_sink:
