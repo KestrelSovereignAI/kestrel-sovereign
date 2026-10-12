@@ -13,7 +13,7 @@
 
 const WORKLET_URL = '/static/js/voice/capture-worklet.js';
 
-export async function createVoiceCapture({ targetSampleRate = 24000 } = {}) {
+export async function createVoiceCapture({ targetSampleRate = 24000, onAcquire } = {}) {
   if (typeof AudioWorkletNode === 'undefined') {
     throw new Error('AudioWorklet is not supported in this browser.');
   }
@@ -32,14 +32,43 @@ export async function createVoiceCapture({ targetSampleRate = 24000 } = {}) {
   let ctx;
   let source;
   let node;
+  let chunkCallback = null;
+  let currentLevel = 0;
+  let retired = false;
+  let closeOwner;
+  const owner = {
+    onchunk(fn) { chunkCallback = fn; },
+    getLevel() { return currentLevel; },
+    pause() { node?.port.postMessage({ type: 'pause' }); },
+    resume() { if (!retired) node?.port.postMessage({ type: 'resume' }); },
+    destroy() {
+      retired = true;
+      try { source?.disconnect(); } catch (_) {}
+      try { node?.disconnect(); } catch (_) {}
+      for (const track of stream.getTracks()) track.stop();
+      if (!closeOwner) closeOwner = (async () => {
+        try { await ctx?.close(); } catch (_) {}
+      })();
+      return closeOwner;
+    },
+  };
+  function requireActive() {
+    if (retired) throw new Error('Microphone capture retired during initialization');
+  }
   try {
+  // Publish custody before any subsequent suspension. Stop can retire a real
+  // microphone even when resume/worklet loading never finishes.
+  onAcquire?.(owner);
+  requireActive();
   ctx = new (window.AudioContext || window.webkitAudioContext)();
   // Safari may start the context in "suspended" state on a gesture-less page.
   if (ctx.state === 'suspended') {
     try { await ctx.resume(); } catch (_) { /* non-fatal */ }
   }
+  requireActive();
 
   await ctx.audioWorklet.addModule(WORKLET_URL);
+  requireActive();
 
   source = ctx.createMediaStreamSource(stream);
   node = new AudioWorkletNode(ctx, 'kestrel-capture', {
@@ -50,10 +79,8 @@ export async function createVoiceCapture({ targetSampleRate = 24000 } = {}) {
 
   node.port.postMessage({ type: 'configure', targetSampleRate });
 
-  let chunkCallback = null;
-  let currentLevel = 0;
-
   node.port.onmessage = (ev) => {
+    if (retired) return;
     const msg = ev.data;
     if (!msg || msg.type !== 'chunk') return;
     currentLevel = msg.level || 0;
@@ -65,32 +92,9 @@ export async function createVoiceCapture({ targetSampleRate = 24000 } = {}) {
   source.connect(node);
   // Don't connect `node` to destination — we don't want to echo the mic.
 
-  return {
-    onchunk(fn) {
-      chunkCallback = fn;
-    },
-    getLevel() {
-      return currentLevel;
-    },
-    pause() {
-      node.port.postMessage({ type: 'pause' });
-    },
-    resume() {
-      node.port.postMessage({ type: 'resume' });
-    },
-    async destroy() {
-      try { source.disconnect(); } catch (_) {}
-      try { node.disconnect(); } catch (_) {}
-      for (const t of stream.getTracks()) t.stop();
-      try { await ctx.close(); } catch (_) {}
-    },
-  };
+  return owner;
   } catch (error) {
-    // The factory still owns partial acquisitions until it returns destroy().
-    try { source?.disconnect(); } catch (_) {}
-    try { node?.disconnect(); } catch (_) {}
-    for (const track of stream.getTracks()) track.stop();
-    try { await ctx?.close(); } catch (_) {}
+    await owner.destroy();
     throw error;
   }
 }

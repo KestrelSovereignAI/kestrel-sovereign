@@ -179,7 +179,7 @@ async def test_standalone_sqlite_commit_keeps_uncertainty(tmp_path, monkeypatch,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("carrier", ["error", "cancel"])
+@pytest.mark.parametrize("carrier", ["error", "cancel", "authority", "unknown", "committed", "wrapped", "group"])
 async def test_failed_native_tcp_close_retains_exact_owner(monkeypatch, carrier):
     peer_done = asyncio.Event()
     async def peer(reader, writer):
@@ -200,6 +200,17 @@ async def test_failed_native_tcp_close_retains_exact_owner(monkeypatch, carrier)
     connections, close_native = list(pool.connections), pool._close_connections
     original = (OSError("native transport could not retire socket") if carrier == "error"
                 else asyncio.CancelledError("native transport close was cancelled"))
+    if carrier == "authority":
+        original = ExecutionAuthorityError("native close authority lost before socket retirement")
+    elif carrier in {"unknown", "committed"}:
+        original = ExecutionCommitOutcomeError(carrier)
+    elif carrier in {"wrapped", "group"}:
+        receipt = ExecutionCommitOutcomeError("unknown")
+        if carrier == "wrapped":
+            original = OSError("native transport failed before retiring socket")
+            original.__cause__ = receipt
+        else:
+            original = BaseExceptionGroup("native close receipt", [original, receipt])
     calls = []
     async def failed_close(connections):
         calls.append(True)

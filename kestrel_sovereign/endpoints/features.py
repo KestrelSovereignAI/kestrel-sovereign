@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
@@ -1381,6 +1382,12 @@ async def _settle_feature_transition(
         pending_cancellation=pending_cancellation,
     )
     task.remove_done_callback(mark_terminal_before_admission)
+    terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+    if terminal is not None and is_execution_control_error(terminal):
+        # A caller disconnect is not stronger than the admitted child's
+        # original authority/commit receipt. Ordinary package errors remain
+        # sanitized below; do not chain or stringify their config bytes.
+        raise terminal
     if outcome.cancellation is not None:
         if outcome.error is not None and not (
             isinstance(outcome.error, asyncio.CancelledError)

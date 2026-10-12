@@ -305,10 +305,20 @@ async def test_actual_continuation_closes_unstarted_provider_only_after_dispatch
         outcome = await await_owned_task(task)
         assert outcome.error is (close_error if unknown_close else None)
         assert client.is_closed
-        assert "llm_service" not in custody.held and "storage" not in custody.held
+        if unknown_close:
+            # The test can observe HTTPX closure, but the opaque adapter's
+            # failed native close did not provide positive retirement proof.
+            # Its control receipt must not release borrowed storage custody.
+            assert "llm_service" in custody.held and "storage" in custody.held
+            assert service.has_pending_close_owners()
+        else:
+            assert "llm_service" not in custody.held and "storage" not in custody.held
     finally:
         release.set()
         release_client.set()
         await await_owned_task(task)
         await client.aclose()
         await retire(agent)
+        # Test-owned storage may deliberately remain in production custody
+        # after an uncertain adapter close. Physically retire our own fixture.
+        await db.close()

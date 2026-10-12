@@ -165,9 +165,15 @@ export async function createPipelineClient({
 
     // 1. Set up audio pipes first so the first mic frame after open() has
     // somewhere to go. Playback starts muted until audio arrives.
-    capture = await createVoiceCapture({ targetSampleRate: sampleRate });
+    capture = await createVoiceCapture({ targetSampleRate: sampleRate, onAcquire: owner => {
+      capture = owner;
+      if (closed) void owner.destroy();
+    } });
     await requireOpen();
-    playback = await createVoicePlayback({ sampleRate });
+    playback = await createVoicePlayback({ sampleRate, onAcquire: owner => {
+      playback = owner;
+      if (closed) void owner.destroy();
+    } });
     await requireOpen();
 
     capture.onchunk((pcm) => {

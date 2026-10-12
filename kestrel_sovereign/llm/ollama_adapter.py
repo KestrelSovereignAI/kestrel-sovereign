@@ -235,9 +235,14 @@ class OllamaAdapter(LLMAdapter):
             embedding_model is not None or embedding_dim is not None
         )
         self._discovery_clients = {}
+        self._discovery_borrowers = {}
         self._discovery_closed = False
 
     async def _retire_discovery_client(self, client, scopes):
+        if client not in self._discovery_clients:
+            # A concurrent borrower/retirement waiter already joined the SAME
+            # successful close. Failed closes are never removed from this map.
+            return
         task = self._discovery_clients[client]
         if task is None:
             with bind_execution_cleanup(self, scopes):
@@ -262,12 +267,19 @@ class OllamaAdapter(LLMAdapter):
         client = ollama.AsyncClient()
         native = client._client
         self._discovery_clients[native] = None
+        borrower = asyncio.get_running_loop().create_future()
+        self._discovery_borrowers[native] = borrower
         original = None
         try:
             retain_native_execution_http_client_close(native)
             yield client
         except BaseException as error:
             original = error
+        finally:
+            # The borrower has exited native discovery before a concurrent
+            # shutdown may retire its transport. This is not a close receipt.
+            borrower.set_result(None)
+            self._discovery_borrowers.pop(native, None)
         try:
             await self._retire_discovery_client(native, scopes)
         except BaseException as error:
@@ -281,6 +293,10 @@ class OllamaAdapter(LLMAdapter):
         terminal = None
         for client in tuple(self._discovery_clients):
             try:
+                borrower = self._discovery_borrowers.get(client)
+                if borrower is not None:
+                    joined = await await_owned_task(borrower)
+                    terminal = execution_terminal_error(terminal, joined.error, joined.cancellation)
                 await self._retire_discovery_client(client, current_execution_custody(self))
             except BaseException as error:
                 terminal = execution_terminal_error(terminal, error)

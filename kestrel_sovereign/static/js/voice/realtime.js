@@ -572,9 +572,15 @@ export async function createRealtimeClient({
   }
 
   async function startWebSocket() {
-    capture = await createVoiceCapture({ targetSampleRate: 24000 });
+    capture = await createVoiceCapture({ targetSampleRate: 24000, onAcquire: owner => {
+      capture = owner;
+      if (closed) void owner.destroy();
+    } });
     await requireOpen();
-    playback = await createVoicePlayback({ sampleRate: 24000 });
+    playback = await createVoicePlayback({ sampleRate: 24000, onAcquire: owner => {
+      playback = owner;
+      if (closed) void owner.destroy();
+    } });
     await requireOpen();
     playback.setMuted?.(outputMuted);
     capture.onchunk((pcm) => {

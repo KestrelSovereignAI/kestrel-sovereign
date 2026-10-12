@@ -2825,7 +2825,9 @@ def _a2a_inbound_current_scope_is_valid(
         return False
     try:
         return validator(*arguments) is True
-    except Exception:  # noqa: BLE001 - injected host policy boundary
+    except Exception as error:  # noqa: BLE001 - injected host policy boundary
+        if is_execution_control_error(error):
+            raise
         return False
 
 
@@ -2878,7 +2880,9 @@ async def _authorize_verified_a2a_sender(
             )
         if inspect.isawaitable(result):
             result = await result
-    except Exception:  # noqa: BLE001 - injected host policy boundary
+    except Exception as error:  # noqa: BLE001 - injected host policy boundary
+        if is_execution_control_error(error):
+            raise
         logger.warning(
             "Inbound A2A sender authorization provider failed",
             exc_info=True,

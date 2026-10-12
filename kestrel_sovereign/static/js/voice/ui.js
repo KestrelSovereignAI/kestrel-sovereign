@@ -865,6 +865,9 @@ async function startSession(session = activeSession()) {
   // can't clobber a newer session. Bumped per start, captured in `onEvent`.
   session.startSeq = (session.startSeq || 0) + 1;
   const startSeq = session.startSeq;
+  session.startupSeq = startSeq;
+  const isCurrentStartup = () => session.startSeq === startSeq;
+  let startupPending = true;
   setState(State.CONNECTING, session);
   resetTurnState(session);
   if (session === controlSession()) setPathBadge('', '');
@@ -876,7 +879,12 @@ async function startSession(session = activeSession()) {
   session.realtimeVendor = '';
   setArmedAgent(agent);
 
-  const onEvent = (ev) => handleClientEvent(agent, ev, startSeq);
+  const onEvent = (ev) => {
+    // A startup failure retires its own client. Its close is not an operator
+    // Stop and must not disarm an expected realtime→pipeline handoff.
+    if (startupPending && ev.kind === Events.SESSION_CLOSED) return;
+    handleClientEvent(agent, ev, startSeq);
+  };
 
   // Apply user picker overrides (mode + TTS) to drive routing.
   const overrides = pickerOverridesFromUI(
@@ -891,8 +899,9 @@ async function startSession(session = activeSession()) {
   // work and the 409 looks like a bug to anyone reading the network tab.
   // Mode selection is the user's contract — honor it.
   if (overrides.prefer_realtime !== false) {
+    let realtimeClient;
     try {
-      session.client = await createRealtimeClient({
+      realtimeClient = await createRealtimeClient({
         onEvent,
         // Rewrite to /api/agents/<host>/voice/realtime/session in multi_agent
         // mode; identity in standalone mode.
@@ -906,11 +915,19 @@ async function startSession(session = activeSession()) {
           preferred_conversation: overrides.preferred_conversation || '',
         },
       });
-      await session.client.start();
+      if (!isCurrentStartup()) { await realtimeClient.close(); return; }
+      session.client = realtimeClient;
+      await realtimeClient.start();
+      if (!isCurrentStartup() || session.client !== realtimeClient) {
+        await realtimeClient.close();
+        return;
+      }
+      startupPending = false;
+      session.startupSeq = null;
       applyActiveSessionPolicy();
-      const realtimeModel = session.client.session?.model || 'realtime';
-      const realtimeProvider = session.client.session?.provider || 'realtime';
-      const realtimeVendor = session.client.session?.vendor || realtimeProvider;
+      const realtimeModel = realtimeClient.session?.model || 'realtime';
+      const realtimeProvider = realtimeClient.session?.provider || 'realtime';
+      const realtimeVendor = realtimeClient.session?.vendor || realtimeProvider;
       session.realtimeModel = realtimeModel;
       session.realtimeProvider = realtimeProvider;
       session.realtimeVendor = realtimeVendor.replace(/_realtime$/i, '');
@@ -935,6 +952,7 @@ async function startSession(session = activeSession()) {
       );
       return;
     } catch (err) {
+      if (!isCurrentStartup()) { await realtimeClient?.close(); return; }
       if (err && err.code === 'REALTIME_UNAVAILABLE') {
         const fallback = err.fallback || {};
         const canUsePipeline =
@@ -957,8 +975,9 @@ async function startSession(session = activeSession()) {
   }
 
   // Pipeline path.
+  let pipelineClient;
   try {
-    session.client = await createPipelineClient({
+    pipelineClient = await createPipelineClient({
       onEvent,
       apiKey: API.getApiKey() || '',
       wsPath: buildAgentUrlForAgent('/voice/chat', agent),
@@ -973,7 +992,15 @@ async function startSession(session = activeSession()) {
       // so Whisper doesn't hallucinate language switches mid-utterance.
       language: (navigator.language || 'en').split('-')[0],
     });
-    await session.client.start();
+    if (!isCurrentStartup()) { await pipelineClient.close(); return; }
+    session.client = pipelineClient;
+    await pipelineClient.start();
+    if (!isCurrentStartup() || session.client !== pipelineClient) {
+      await pipelineClient.close();
+      return;
+    }
+    startupPending = false;
+    session.startupSeq = null;
     applyActiveSessionPolicy();
     session.path = 'pipeline';
     session.pathLabel = 'Pipeline';
@@ -982,12 +1009,21 @@ async function startSession(session = activeSession()) {
       setPathBadge(session.pathLabel, session.pathTooltip, session.path);
     }
   } catch (err) {
+    if (!isCurrentStartup()) { await pipelineClient?.close(); return; }
     surfaceFatalError(err, session);
   }
 }
 
 
+function invalidatePendingStartup(session) {
+  if (session.startupSeq !== null && session.startupSeq === session.startSeq) {
+    session.startSeq = (session.startSeq || 0) + 1;
+    session.startupSeq = null;
+  }
+}
+
 async function stopSession(session = activeSession()) {
+  invalidatePendingStartup(session);
   const c = session.client;
   // close() emits SESSION_CLOSED synchronously, by which point session.client
   // is already null — stash the client so that handler can still await its
@@ -1013,6 +1049,7 @@ async function stopSession(session = activeSession()) {
 
 
 function surfaceFatalError(err, session = activeSession()) {
+  invalidatePendingStartup(session);
   const retiringClient = session.client;
   session.closingClient = retiringClient;
   session.client = null;
@@ -1339,12 +1376,19 @@ async function handleToolBatch(session, ev) {
   session.persistedAny = true;
   let results;
   try {
+    const authHeaders = await voiceAuthHeaders();
+    // Authentication can outlive Stop or a replacement session. Never send
+    // a tool effect using that retired session's freshly completed token.
+    if (session.client !== sessionClient) {
+      await sessionClient.close();
+      return;
+    }
     const resp = await fetch(buildAgentUrlForAgent(
       `/voice/realtime/tools/${encodeURIComponent(sessionId)}/batch`,
       session.agent,
     ), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...await voiceAuthHeaders() },
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
       body: JSON.stringify({ calls }),
     });
     results = await readToolBatchResponse(resp, calls);

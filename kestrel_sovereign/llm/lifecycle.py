@@ -30,7 +30,7 @@ def start_llm_close_task(owner, key, operation):
                 vars(owner).get("_llm_close_control"), error,
             )
         if tasks.get(key) is done:
-            if error is None or is_execution_control_error(error):
+            if error is None:
                 tasks[key] = None
             elif key in ("preference-writers", "modality-writers"):
                 # This task joins writers; it is not a native resource close.
@@ -38,9 +38,10 @@ def start_llm_close_task(owner, key, operation):
                 # writers remained live. A later wrapper can join those SAME
                 # writers, without repeating a write or native close.
                 tasks.pop(key)
-            # An ordinary native failure is not proof that every transport
+            # ANY native failure is not proof that every transport
             # resource retired. Keep the exact failed owner; never replace it
-            # with a speculative second close or advertise release.
+            # with a speculative second close or advertise release. A control
+            # receipt describes authority/effect disposition, not retirement.
 
     task.add_done_callback(completed)
     return task

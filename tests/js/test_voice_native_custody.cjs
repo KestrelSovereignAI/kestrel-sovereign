@@ -5,8 +5,11 @@ const http = require('node:http');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { chromium } = require('playwright');
+// Use the real WebSocket server already bundled with the browser test runtime.
+const { wsServer: WebSocketServer } = require(path.join(
+  path.dirname(require.resolve('playwright-core/package.json')), 'lib/utilsBundle.js'));
 
-async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint = false, failWorklet = '' } = {}) {
+async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint = false, failWorklet = '', holdWorklet = '', transport = 'webrtc', declineMint = false } = {}) {
   const staticRoot = process.env.KESTREL_TEST_STATIC_ROOT
     ? path.resolve(process.env.KESTREL_TEST_STATIC_ROOT)
     : path.resolve(__dirname, '../../kestrel_sovereign/static');
@@ -16,6 +19,11 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
   let mintResponse;
   let mintEntered;
   let sdpRequests = 0;
+  let toolPosts = 0;
+  let pipelineFrames = 0;
+  let workletResponse;
+  let workletEntered;
+  const enteredWorklet = new Promise(resolve => { workletEntered = resolve; });
   const enteredMint = new Promise(resolve => { mintEntered = resolve; });
   const entered = new Promise(resolve => { batchEntered = resolve; });
   const server = http.createServer(async (req, res) => {
@@ -24,7 +32,12 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
       for await (const chunk of req) chunks.push(chunk);
       if (req.url === '/voice/realtime/session') {
         res.setHeader('Content-Type', 'application/json');
-        const payload = JSON.stringify({ session_id: 'native-offline', transport: 'webrtc',
+        if (declineMint) {
+          res.writeHead(409).end(JSON.stringify({ path: 'pipeline', fallback_tts: 'offline',
+            fallback_stt: 'offline', reason: 'offline pipeline route selected' }));
+          return;
+        }
+        const payload = JSON.stringify({ session_id: 'native-offline', transport,
           client_secret: { value: 'offline-peer-only' }, endpoint: `${origin}/sdp` });
         mintResponse = { res, payload };
         mintEntered();
@@ -57,6 +70,7 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
         res.setHeader('Content-Type', 'application/json');
         res.end(transcript);
       } else if (req.url.includes('/voice/realtime/tools/')) {
+        toolPosts++;
         batchResponse = res;
         batchEntered();
       } else if (req.url === '/') {
@@ -75,9 +89,14 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
           return;
         }
         let source = await fs.readFile(target, 'utf8');
+        if (holdWorklet && relative.endsWith(`/${holdWorklet}-worklet.js`)) {
+          workletResponse = { res, source };
+          workletEntered();
+          return;
+        }
         // Expose existing module-private UI functions, without replacing any
         // production branch, rendering, HTTP, close or transport operation.
-        if (relative === '/js/voice/ui.js') source += '\nexport { createSession, handleToolBatch, surfaceFatalError };\n';
+        if (relative === '/js/voice/ui.js') source += '\nexport { createSession, sessionForAgent, startSession, stopSession, handleToolBatch, surfaceFatalError };\n';
         res.setHeader('Content-Type', 'text/javascript');
         res.end(source);
       }
@@ -85,6 +104,18 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
       console.error('offline fixture resource failed', req.url, String(error));
       res.writeHead(500).end(String(error));
     }
+  });
+  const wsServer = new WebSocketServer({ noServer: true });
+  server.on('upgrade', (request, socket, head) => {
+    wsServer.handleUpgrade(request, socket, head, connection => {
+      wsServer.emit('connection', connection, request);
+    });
+  });
+  wsServer.on('connection', connection => {
+    connection.send(JSON.stringify({ type: 'status', state: 'listening' }));
+    connection.on('message', (bytes, binary) => {
+      if (binary && bytes[0] === 1) pipelineFrames++;
+    });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -110,12 +141,22 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
       if (autoStart) await window.client.start();
     }, autoStart);
     if (autoStart) await page.waitForFunction(() => window.nativeChannel?.readyState === 'open');
-    await body({ page, entered, enteredMint,
+    await body({ page, entered, enteredMint, enteredWorklet,
+      releaseWorklet: () => {
+        workletResponse.res.setHeader('Content-Type', 'text/javascript');
+        workletResponse.res.end(workletResponse.source);
+      },
+      toolPosts: () => toolPosts,
+      pipelineFrames: () => pipelineFrames,
       releaseMint: () => mintResponse.res.end(mintResponse.payload),
       sdpRequests: () => sdpRequests,
       releaseBatch: (ack = {}) => batchResponse.end(JSON.stringify(ack)) });
     assert.deepEqual(pageErrors, [], 'production console raised an unhandled browser error');
   } finally {
+    if (workletResponse && !workletResponse.res.writableEnded) {
+      workletResponse.res.setHeader('Content-Type', 'text/javascript');
+      workletResponse.res.end(workletResponse.source);
+    }
     if (mintResponse && !mintResponse.res.writableEnded) mintResponse.res.end(mintResponse.payload);
     if (batchResponse && !batchResponse.writableEnded) batchResponse.end('{}');
     if (page) await page.evaluate(async () => {
@@ -124,9 +165,130 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
     }).catch(() => {});
     await context.close();
     await browser.close();
+    for (const connection of wsServer.clients) connection.terminate();
+    await new Promise(resolve => wsServer.close(resolve));
     await new Promise(resolve => server.close(resolve));
   }
 }
+
+for (const mode of ['pipeline', 'realtime']) {
+for (const factory of ['capture', 'playback']) {
+test(`Stop reaches partially acquired native ${factory} while ${mode} worklet HTTP is pending`, { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, enteredWorklet, releaseWorklet }) => {
+    await page.evaluate(async mode => {
+      window.acquiredContexts = [];
+      window.acquiredStreams = [];
+      const NativeContext = window.AudioContext;
+      window.AudioContext = class extends NativeContext {
+        constructor(...args) { super(...args); window.acquiredContexts.push(this); }
+      };
+      const nativeCapture = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+      navigator.mediaDevices.getUserMedia = async (...args) => {
+        const stream = await nativeCapture(...args);
+        window.acquiredStreams.push(stream);
+        return stream;
+      };
+      if (mode === 'pipeline') {
+        const { createPipelineClient } = await import('/js/voice/pipeline.js');
+        window.client = await createPipelineClient({ onEvent: event => window.nativeEvents.push(event) });
+      }
+      window.startup = window.client.start().then(() => null, error => error.message);
+    }, mode);
+    await enteredWorklet;
+    const state = await page.evaluate(async () => {
+      await window.client.close();
+      return { contexts: window.acquiredContexts.map(ctx => ctx.state),
+        tracks: window.acquiredStreams.flatMap(stream => stream.getTracks().map(track => track.readyState)),
+        closed: window.nativeEvents.filter(event => event.kind === 'session_closed').length };
+    });
+    releaseWorklet();
+    assert.ok(await page.evaluate(() => window.startup), 'retired startup must not create later native nodes');
+    assert.equal(state.closed, 1);
+    assert.ok(state.tracks.length && state.tracks.every(state => state === 'ended'), 'Stop returned with acquired microphone live');
+    assert.ok(state.contexts.length && state.contexts.every(state => state === 'closed'), 'Stop returned with acquired AudioContext live');
+  }, '{}', { autoStart: false, holdWorklet: factory, transport: 'websocket' });
+});
+}
+}
+
+test('Stop during native tool authentication cannot dispatch the captured session batch', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, toolPosts, releaseBatch }) => {
+    await page.evaluate(async () => {
+      const { default: API } = await import('/js/api.js');
+      const apply = API.applyAuth.bind(API);
+      const release = new Promise(resolve => { window.releaseAuth = resolve; });
+      API.applyAuth = async (...args) => {
+        const headers = await apply(...args);
+        window.authEntered = true;
+        await release;
+        return headers;
+      };
+      window.voiceUI = await import('/js/voice/ui.js');
+      window.uiSession = window.voiceUI.createSession(null);
+      window.uiSession.client = window.client;
+      window.uiTask = window.voiceUI.handleToolBatch(window.uiSession, { calls: [
+        { call_id: 'original', name: 'native-no-execution', arguments: {} },
+      ] });
+    });
+    await page.waitForFunction(() => window.authEntered);
+    await page.evaluate(() => window.voiceUI.surfaceFatalError(new Error('operator Stop'), window.uiSession));
+    await page.evaluate(() => window.releaseAuth());
+    await page.waitForTimeout(150);
+    if (toolPosts()) releaseBatch({ results: [{ call_id: 'original', result: { text: 'offline' } }] });
+    await page.evaluate(() => window.uiTask);
+    assert.equal(toolPosts(), 0, 'authentication completion dispatched a retired session tool batch');
+  });
+});
+
+test('obsolete native microphone startup cannot close the replacement UI session', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page }) => {
+    await page.evaluate(async () => {
+      const nativeCapture = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+      const release = new Promise(resolve => { window.releaseFirstPermission = resolve; });
+      window.acquiredStreams = [];
+      navigator.mediaDevices.getUserMedia = async (...args) => {
+        const stream = await nativeCapture(...args);
+        window.acquiredStreams.push(stream);
+        if (window.acquiredStreams.length === 1) await release;
+        return stream;
+      };
+      window.voiceUI = await import('/js/voice/ui.js');
+      window.uiSession = window.voiceUI.sessionForAgent(null);
+      window.firstStartup = window.voiceUI.startSession(window.uiSession);
+    });
+    await page.waitForFunction(() => window.acquiredStreams.length === 1);
+    await page.evaluate(() => window.voiceUI.stopSession(window.uiSession));
+    await page.evaluate(async () => {
+      await window.voiceUI.startSession(window.uiSession);
+      window.replacement = window.uiSession.client;
+      window.client = window.replacement;
+      window.releaseFirstPermission();
+      await window.firstStartup;
+    });
+    const state = await page.evaluate(() => ({
+      same: window.uiSession.client === window.replacement,
+      first: window.acquiredStreams[0].getTracks().map(track => track.readyState),
+      replacement: window.replacement.micStream.getTracks().map(track => track.readyState),
+    }));
+    assert.ok(state.same, 'obsolete startup error cleared the replacement UI client');
+    assert.ok(state.first.every(state => state === 'ended'));
+    assert.ok(state.replacement.length && state.replacement.every(state => state === 'live'), 'obsolete startup retired replacement microphone');
+  }, '{}', { autoStart: false });
+});
+
+test('expected realtime refusal preserves armed microphone through native pipeline fallback', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, pipelineFrames }) => {
+    await page.evaluate(async () => {
+      const voiceUI = await import('/js/voice/ui.js');
+      window.uiSession = voiceUI.sessionForAgent(null);
+      await voiceUI.startSession(window.uiSession);
+      window.client = window.uiSession.client;
+    });
+    assert.equal(await page.evaluate(() => window.uiSession.path), 'pipeline');
+    await page.waitForTimeout(600);
+    assert.ok(pipelineFrames() > 0, 'fallback policy disarmed the actual microphone input');
+  }, '{}', { autoStart: false, declineMint: true });
+});
 
 test('native RTC transport retirement closes original resources without model continuation', { timeout: 30000 }, async () => {
   await nativeVoice(async ({ page }) => {

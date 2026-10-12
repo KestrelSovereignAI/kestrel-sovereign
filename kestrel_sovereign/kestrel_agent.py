@@ -9027,7 +9027,7 @@ Expected Duration: {expected_duration}
                 await waiter(service)
             except BaseException as failure:
                 self._remember_shutdown_control(failure)
-                if not is_execution_control_error(failure):
+                if not is_execution_control_error(failure) or self._has_pending_llm_storage_dependents():
                     raise
 
     async def _complete_durable_shutdown_continuation(
@@ -9060,6 +9060,11 @@ Expected Duration: {expected_duration}
                             raise RuntimeError("LLM release incomplete; borrowed storage retained")
                     except BaseException as failure:
                         self._remember_shutdown_control(failure)
+                        if is_execution_control_error(failure) and self._has_pending_llm_storage_dependents():
+                            # A control-bearing failed native close still owns
+                            # transport/storage resources. Preserve its receipt
+                            # and custody instead of reporting physical release.
+                            raise
                         if not is_execution_control_error(failure):
                             if attempt == 0 and self._has_pending_llm_storage_dependents():
                                 # A bounded close retained exact native tasks.

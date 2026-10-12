@@ -22,18 +22,68 @@ const WORKLET_URL = '/static/js/voice/playback-worklet.js';
 // (~360ms observed). 400ms preroll absorbs that initial latency once and the
 // jitter buffer stays full thereafter; smaller preroll causes audible stutter
 // at the start of every reply.
-export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 } = {}) {
+export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400, onAcquire } = {}) {
   if (typeof AudioWorkletNode === 'undefined') {
     throw new Error('AudioWorklet is not supported in this browser.');
   }
   const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
   let node;
   let gain;
+  let retired = false;
+  let closeOwner;
+  let playing = false;
+  let underflowCount = 0;
+  const idleWaiters = new Set();
+  function resolveIdleWaiters() {
+    for (const resolve of idleWaiters) resolve();
+    idleWaiters.clear();
+  }
+  function requireActive() {
+    if (retired) throw new Error('Audio playback retired during initialization');
+  }
+  const owner = {
+    enqueue(uint8) {
+      if (retired || !uint8 || uint8.byteLength === 0) return;
+      playing = true;
+      pushToWorklet(uint8);
+    },
+    endOfStream() {
+      if (!retired) node?.port.postMessage({ type: 'end' });
+      if (!playing) resolveIdleWaiters();
+    },
+    whenIdle() {
+      if (!playing) return Promise.resolve();
+      return new Promise((resolve) => idleWaiters.add(resolve));
+    },
+    flush() {
+      playing = false;
+      node?.port.postMessage({ type: 'flush' });
+      resolveIdleWaiters();
+    },
+    isPlaying() { return playing; },
+    underflowCount() { return underflowCount; },
+    setMuted(muted) { if (gain) gain.gain.value = muted ? 0 : 1; },
+    destroy() {
+      retired = true;
+      playing = false;
+      resolveIdleWaiters();
+      try { node?.disconnect(); } catch (_) {}
+      try { gain?.disconnect(); } catch (_) {}
+      if (!closeOwner) closeOwner = (async () => {
+        try { await ctx.close(); } catch (_) {}
+      })();
+      return closeOwner;
+    },
+  };
   try {
+  onAcquire?.(owner);
+  requireActive();
   if (ctx.state === 'suspended') {
     try { await ctx.resume(); } catch (_) { /* non-fatal; user gesture may be required */ }
   }
+  requireActive();
   await ctx.audioWorklet.addModule(WORKLET_URL);
+  requireActive();
 
   node = new AudioWorkletNode(ctx, 'kestrel-playback', {
     numberOfInputs: 0,
@@ -48,16 +98,8 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
   node.connect(gain);
   gain.connect(ctx.destination);
 
-  let playing = false;
-  let underflowCount = 0;
-  const idleWaiters = new Set();
-
-  function resolveIdleWaiters() {
-    for (const resolve of idleWaiters) resolve();
-    idleWaiters.clear();
-  }
-
   node.port.onmessage = (ev) => {
+    if (retired) return;
     const msg = ev.data;
     if (!msg) return;
     if (msg.type === 'underflow') {
@@ -74,46 +116,9 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
     node.port.postMessage({ type: 'push', pcm: copy.buffer }, [copy.buffer]);
   }
 
-  return {
-    enqueue(uint8) {
-      if (!uint8 || uint8.byteLength === 0) return;
-      playing = true;
-      pushToWorklet(uint8);
-    },
-    endOfStream() {
-      node.port.postMessage({ type: 'end' });
-      if (!playing) resolveIdleWaiters();
-    },
-    whenIdle() {
-      if (!playing) return Promise.resolve();
-      return new Promise((resolve) => idleWaiters.add(resolve));
-    },
-    flush() {
-      playing = false;
-      node.port.postMessage({ type: 'flush' });
-      resolveIdleWaiters();
-    },
-    isPlaying() {
-      return playing;
-    },
-    underflowCount() {
-      return underflowCount;
-    },
-    setMuted(muted) {
-      gain.gain.value = muted ? 0 : 1;
-    },
-    async destroy() {
-      playing = false;
-      resolveIdleWaiters();
-      try { node.disconnect(); } catch (_) {}
-      try { gain.disconnect(); } catch (_) {}
-      try { await ctx.close(); } catch (_) {}
-    },
-  };
+  return owner;
   } catch (error) {
-    try { node?.disconnect(); } catch (_) {}
-    try { gain?.disconnect(); } catch (_) {}
-    try { await ctx.close(); } catch (_) {}
+    await owner.destroy();
     throw error;
   }
 }
