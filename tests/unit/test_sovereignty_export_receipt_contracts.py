@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kestrel_sdk.tools.result import ToolResult
-from kestrel_sovereign.features.sovereignty.feature import SovereigntyFeature
+from kestrel_sovereign.features.sovereignty.feature import (
+    MAX_SOVEREIGNTY_IMPORT_BYTES,
+    SovereigntyFeature,
+)
+from kestrel_sovereign.filecoin_adapter import EnvelopePolicy
 from kestrel_sovereign.storage.providers.base import StorageResult, StorageTier
 
 
@@ -53,6 +57,7 @@ async def test_export_persists_receipt_with_import_and_audit_provenance():
         encrypted=True,
         encryption_key_hash="keyhash123",
         size_bytes=len(backup_blob),
+        cache_name="hash123.owner123",
     )
     adapter = MagicMock()
     adapter.store_content.return_value = storage_result
@@ -87,6 +92,8 @@ async def test_export_persists_receipt_with_import_and_audit_provenance():
         "provider": "ipfs",
         "encrypted": True,
         "encryption_key_hash": "keyhash123",
+        # The cache entry it owns, as the backup_artifact records it (#2873).
+        "cache_name": "hash123.owner123",
         "size_bytes": len(backup_blob),
         "created_at": receipt.properties["created_at"],
         "node_id": "hash123",
@@ -177,7 +184,7 @@ async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotate
     storage.get_nodes_by_type = AsyncMock(return_value=[backup_node])
     storage.restore_from_backup_blob = AsyncMock()
 
-    agent = SimpleNamespace(storage=storage)
+    agent = SimpleNamespace(storage=storage, agent_id="did:kestrel:test")
     adapter = MagicMock()
     adapter.retrieve_content.side_effect = error
 
@@ -195,5 +202,10 @@ async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotate
         "bafybackup",
         ipfs_cid="bafybackup",
         key_hash="keyhash123",
+        max_output_bytes=MAX_SOVEREIGNTY_IMPORT_BYTES,
+        envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+        envelope_owner="did:kestrel:test",
+        envelope_key_hash="keyhash123",
+        cache_name=None,
     )
     storage.restore_from_backup_blob.assert_not_awaited()

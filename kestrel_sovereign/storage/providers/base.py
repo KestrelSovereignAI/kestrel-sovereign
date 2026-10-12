@@ -70,6 +70,12 @@ class StorageResult:
     # Storage location
     tier: StorageTier = StorageTier.LOCAL
     provider: str = "local"  # 'local', 'lighthouse'
+    # The host ``storage_cache`` name FilecoinAdapter wrote the content under:
+    # the content hash, or ``{content_hash}.{owner_id}`` for an encrypted
+    # envelope, whose owner id derives from the master key (#2873). A backup
+    # receipt records it, so a restore finds the entry under any configured
+    # key, and the envelope then names the key it was sealed under.
+    cache_name: Optional[str] = None
 
     # Filecoin deal info (for CLOUD_COLD)
     deal_id: Optional[str] = None
@@ -114,6 +120,7 @@ class StorageResult:
             "cid": self.cid,
             "tier": self.tier.value,
             "provider": self.provider,
+            "cache_name": self.cache_name,
             "deal_id": self.deal_id,
             "deal_status": self.deal_status,
             "encrypted": self.encrypted,
@@ -134,6 +141,7 @@ class StorageResult:
             cid=data.get("cid"),
             tier=StorageTier(data.get("tier", "local")),
             provider=data.get("provider", "local"),
+            cache_name=data.get("cache_name"),
             deal_id=data.get("deal_id"),
             deal_status=data.get("deal_status"),
             encrypted=data.get("encrypted", False),
