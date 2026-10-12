@@ -684,3 +684,35 @@ only its exact registered native tasks to reenter and to register transitive
 native continuations. An ended frame cannot be revived, and an arbitrary child
 with copied ContextVars still queues on the ordinary reentry mutex. Foreign
 exit drains newly registered dependencies until the original graph is empty.
+
+## Successful stream drain and native cognition dispatch
+
+Text EOF is not Stop. A successfully completed tap retains one reference to
+the exact original request generation before text endpoint cleanup. Its one
+speech owner releases that reference only after queued text and final buffered
+synthesis physically drain. Stop and abandonment continue to deny this same
+generation; same-ID redelivery cannot lend a replacement. A late Stop declines
+the handoff without retroactively failing an already-published text response.
+Unclaimed completed queues expire after 30 seconds. The actual text privacy
+owner transfers its held-span token only to a matching agent/request generation;
+speech waits for text without holding that span and validates each synthesis.
+
+`bind_native_execution_admission` carries original trusted asynchronous read-only
+admission validators to native HTTP dispatch. Each request captures its validators
+before observers, and the original transport runs them after every observer and
+immediately before sending. Realtime cognition binds a fixed constitutional
+revision/generation/hash, including through awaited model discovery. Durable
+healthy rows never override locally unpersisted Safe Mode or pending restrictions.
+
+Immutable launch artifacts selected inside a mutable namespace retain a durable
+restrictive marker on the owned namespace, not on the VENV/BIN itself. Canonical
+no-follow cleanup refuses that marker before deleting any contents, including
+cold offboarding after proxies, process settings and manager witnesses disappear.
+It is cleanup denial, never provisioning/launch authority or a cleanup override.
+Session-only ISOLATED file bytes retain their matching metadata in session memory;
+session clearing/EPHEMERAL purge clears both without persistent file writes.
+
+Runtime-owner heartbeat teardown joins its original native SQL operation rather
+than cancelling a possibly submitted COMMIT. An ordinary failed native closer is
+retained background retirement debt even without a commit/authority exception;
+successful physical close plus caller cancellation remains cancellation alone.

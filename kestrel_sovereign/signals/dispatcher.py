@@ -2981,11 +2981,21 @@ class SignalDispatcher:
             self._runtime_owner_heartbeat_timer.cancel()
             self._runtime_owner_heartbeat_timer = None
         task = self._runtime_owner_heartbeat_task
-        self._runtime_owner_heartbeat_task = None
-        if task is not None and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        try:
+            if task is not None:
+                # The heartbeat can already be committing cleanup-owner CAS.
+                # Cancelling it manufactures an UNKNOWN acknowledgement during
+                # otherwise successful teardown. Join the original bounded SQL
+                # operation; caller cancellation cannot close its store early.
+                from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+                raise_owned_outcome(await await_owned_task(task), operation="runtime-owner heartbeat retirement")
+        finally:
+            if self._runtime_owner_heartbeat_task is task:
+                self._runtime_owner_heartbeat_task = None
+            # Its completion callback may have rearmed while we were joining.
+            if self._runtime_owner_heartbeat_timer is not None:
+                self._runtime_owner_heartbeat_timer.cancel()
+                self._runtime_owner_heartbeat_timer = None
 
     def _start_runtime_owner_heartbeat(self) -> None:
         self._runtime_owner_heartbeat_timer = None

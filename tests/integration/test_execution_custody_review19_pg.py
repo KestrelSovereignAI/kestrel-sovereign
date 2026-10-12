@@ -115,7 +115,12 @@ async def test_native_renewal_commit_ack_is_joined_under_repeated_closer_cancel(
         with pytest.raises(BaseException) as caught:
             await task
         assert caught.value is observed[0].result()
-        assert execution_commit_outcome(caught.value) == "unknown"
+        # A native acknowledgement carrying its own COMMITTED receipt is
+        # evidence, not an ordinary lost acknowledgement to relabel UNKNOWN.
+        # Denial alone and an explicit UNKNOWN still require reconciliation.
+        assert execution_commit_outcome(caught.value) == (
+            "committed" if control == "committed" else "unknown"
+        )
         error = caught.value
         while error is not original and error.__cause__ is not None:
             error = error.__cause__

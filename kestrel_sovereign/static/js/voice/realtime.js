@@ -233,6 +233,7 @@ export async function createRealtimeClient({
   const cancelledResponses = new Set();
   let activeResponseId = '';
   let responseGeneration = 0;
+  let responseAdmissionOpen = true;
   const userTranscriptTracker = createUserTranscriptTracker();
   let earlyAudioChunks = [];
   let earlyAudioBytes = 0;
@@ -368,10 +369,21 @@ export async function createRealtimeClient({
    * values so the UI shell never sees undefined text.
    */
   function handleProviderEvent(raw) {
+    if (closed) return;
+    const responseId = raw.response?.id ?? raw.response_id ?? '';
+    // Input/session events are not output-response cancellation casualties.
+    // A cancelled response cannot publish late audio, text, or completion.
+    if (responseId && cancelledResponses.has(responseId)) return;
     switch (raw.type) {
       case 'response.created':
-        activeResponseId = raw.response?.id ?? raw.response_id ?? '';
+        if (!responseId) break;
+        if (!responseAdmissionOpen) {
+          cancelledResponses.add(responseId);
+          break;
+        }
+        activeResponseId = responseId;
         responseGeneration += 1;
+        onEvent(makeEvent(Events.SPEAKING_STARTED, {}));
         break;
       case 'session.created':
         onEvent(makeEvent(Events.SESSION_READY, {
@@ -394,6 +406,7 @@ export async function createRealtimeClient({
         onEvent(makeEvent(Events.LISTENING_STOPPED, {}));
         break;
       case 'input_audio_buffer.committed':
+        responseAdmissionOpen = true;
         userTranscriptTracker.committed(raw.item_id ?? '');
         break;
 
@@ -449,9 +462,6 @@ export async function createRealtimeClient({
         break;
       }
 
-      case 'response.created':
-        onEvent(makeEvent(Events.SPEAKING_STARTED, {}));
-        break;
       // GA renamed audio-transcript events to the `output_audio_transcript`
       // namespace; the text-modality stream is `output_text`. Without these
       // the agent's spoken reply never reaches the chat window because the
@@ -739,6 +749,7 @@ export async function createRealtimeClient({
         content: [{ type: 'input_text', text }],
       },
     });
+    responseAdmissionOpen = true;
     sendJSON({ type: 'response.create' });
     // Typed turns don't produce an input_audio_transcription.completed event,
     // so persist the user side here or backend history would be one-sided
@@ -749,6 +760,7 @@ export async function createRealtimeClient({
 
   /** Barge-in: abort the in-flight agent response. */
   function abandonResponse() {
+    responseAdmissionOpen = false;
     responseGeneration += 1;
     if (activeResponseId) cancelledResponses.add(activeResponseId);
     for (const id of pendingToolCalls.keys()) cancelledResponses.add(id);
@@ -788,6 +800,7 @@ export async function createRealtimeClient({
    */
   async function commitToolResults(results = []) {
     if (!results.length) return;
+    const originalGeneration = responseGeneration;
     try {
       for (const { call_id: callId, result } of results) {
         sendJSON({
@@ -803,6 +816,8 @@ export async function createRealtimeClient({
       // it. Waiting here prevents the post-tool response from overlapping the
       // prior response; WebRTC providers resolve immediately.
       await waitForPlaybackIdle(playback);
+      if (closed || originalGeneration !== responseGeneration) return;
+      responseAdmissionOpen = true;
       sendJSON({ type: 'response.create' }, { required: true });
     } catch (error) {
       await close();

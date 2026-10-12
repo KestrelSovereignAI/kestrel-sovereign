@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from kestrel_sovereign.agent.invocation import bind_async_invocation
-from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError, ExecutionCustody, is_execution_control_error
+from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError, ExecutionCustody, execution_commit_outcome, is_execution_control_error
 from kestrel_sovereign.signals import OrderedLockManager, SignalDispatcher, SignalLogStore, SourceRegistry
 from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
 from tests.integration.test_execution_authority_postgres import native_pg as _native_pg, GenerationFence
@@ -115,4 +115,9 @@ async def test_native_first_admission_poll_control_cannot_be_settled_completed(n
         assert await controller.fetchval(f'SELECT generation_id FROM "{schema}".stop_unresolved_invocations WHERE generation_id=$1', recorded[0]) == recorded[0]
         assert await controller.fetchval(f'SELECT count(*) FROM "{schema}".stop_active_invocations WHERE generation_id=$1', recorded[0]) == 0
     finally:
-        await registry.close()
+        # Terminal shutdown must not advertise clean retirement after the
+        # original admission latched an uncertain durable receipt.
+        with pytest.raises(BaseException) as shutdown:
+            await registry.close()
+        assert is_execution_control_error(shutdown.value)
+        assert execution_commit_outcome(shutdown.value) == "unknown"

@@ -2022,6 +2022,7 @@ class PrivacyEnforcingStorage:
         self._policy = PrivacyPolicy.from_config(self._privacy_config)
         self._session_conversations: List[Dict] = []
         self._session_files: Dict[str, bytes] = {}
+        self._session_file_metadata: Dict[str, Dict] = {}
         # UTC timestamp (microseconds, see ``_now_iso``) recorded at the
         # moment the wrapper transitions INTO EPHEMERAL.  The leak-purge
         # (#867) uses this to scope its DELETE so that flipping a long-lived
@@ -2908,6 +2909,7 @@ class PrivacyEnforcingStorage:
         # count needed — the buffer never persisted.
         self._session_conversations = []
         self._session_files = {}
+        self._session_file_metadata = {}
 
         # Scoped to ``_entered_ephemeral_at`` (#867) so the DELETE only
         # touches rows authored *during* the EPHEMERAL stint.  Without
@@ -3213,6 +3215,7 @@ class PrivacyEnforcingStorage:
         count = len(self._session_conversations)
         self._session_conversations.clear()
         self._session_files.clear()
+        self._session_file_metadata.clear()
         logger.info(f"Session cleared: {count} conversations")
         return count
     
@@ -3256,6 +3259,7 @@ class PrivacyEnforcingStorage:
             import hashlib
             content_hash = hashlib.sha256(content).hexdigest()
             self._session_files[content_hash] = content
+            self._session_file_metadata[content_hash] = dict(metadata or {})
             logger.debug(f"File stored in session: {original_name} ({content_hash[:8]}...)")
             return content_hash
         
@@ -5447,6 +5451,8 @@ class PrivacyEnforcingStorage:
     
     async def get_file_metadata(self, content_hash: str) -> Optional[Dict]:
         """Get file metadata."""
+        if self._policy.use_session_storage and content_hash in self._session_files:
+            return dict(self._session_file_metadata[content_hash])
         return await self._storage.get_file_metadata(content_hash)
     
     async def search_case_law(self, query: str, top_k: int = 3) -> List[Dict]:

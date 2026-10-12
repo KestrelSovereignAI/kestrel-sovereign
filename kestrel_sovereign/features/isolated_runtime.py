@@ -3034,6 +3034,7 @@ _WINDOWS_RESERVED_COMPONENTS = frozenset(
     }
 )
 _RUNTIME_OWNER_MARKER = ".kestrel-runtime-owner"
+_IMMUTABLE_LAUNCH_CUSTODY_MARKER = ".kestrel-immutable-launch-custody"
 _RUNTIME_OWNER_TEMP_PREFIX = ".kestrel-runtime-owner.tmp-"
 _VENV_RELOCATION_REPAIR_MARKER = ".kestrel-venv-relocation-pending"
 _VENV_RELOCATION_REPAIR_TEMP_PREFIX = ".kestrel-venv-relocation-pending.tmp-"
@@ -4947,6 +4948,10 @@ def _cleanup_child_directories_at(
     with os.scandir(directory_fd) as entries:
         for entry in entries:
             name = entry.name
+            if name == _IMMUTABLE_LAUNCH_CUSTODY_MARKER:
+                raise IsolatedRuntimePreparationError(
+                    "Runtime cleanup would remove a retained immutable host launch artifact."
+                )
             if not allow_owner_marker and name == _RUNTIME_OWNER_MARKER:
                 raise IsolatedRuntimeNamespaceError(
                     "Hosted isolated feature runtime cleanup found a nested "
@@ -5651,6 +5656,45 @@ def remove_released_legacy_runtime_root(
             os.close(legacy_fd)
         if parent_fd is not None:
             os.close(parent_fd)
+
+
+def retain_host_launch_artifact_custody(scope, owner, legacy_root, paths) -> None:
+    """Persist cleanup denial on OWNED mutable roots, never on launch artifacts.
+
+    Historical operator selections remain protected after the agent, proxy,
+    manager and process settings disappear. Presence is restrictive evidence,
+    never permission to launch or delete. No cleanup path may erase it.
+    """
+    if scope is None:
+        return
+    for root in (scope.path,) + ((legacy_root,) if legacy_root is not None else ()):
+        if not any(path == root or root in path.parents for path in paths):
+            continue
+        if root == scope.path:
+            prepare_isolated_runtime_namespace(scope, owner)
+        directory_fd = os.open(root, _directory_open_flags())
+        try:
+            if not _same_file_identity(os.stat(root, follow_symlinks=False), os.fstat(directory_fd)):
+                raise IsolatedRuntimeNamespaceError("Immutable launch custody root changed during validation.")
+            if root == scope.path:
+                _read_existing_runtime_owner(directory_fd, owner)
+            else:
+                _validate_released_legacy_root_custody(os.fstat(directory_fd))
+            try:
+                marker_fd = os.open(_IMMUTABLE_LAUNCH_CUSTODY_MARKER,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    _PRIVATE_FILE_MODE, dir_fd=directory_fd)
+            except FileExistsError:
+                # Even malformed/replaced restrictive evidence denies cleanup.
+                continue
+            try:
+                _write_all(marker_fd, _runtime_owner_bytes(owner))
+                os.fsync(marker_fd)
+            finally:
+                os.close(marker_fd)
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 def remove_runtime_namespace(
@@ -6908,6 +6952,13 @@ class ProxyFeature(Feature):
             constructor_overrides.bin_custody_paths if constructor_overrides else ()
         )
         self._hosted_immutable_bin_custody_unproven = False
+        retain_host_launch_artifact_custody(
+            self._isolated_runtime_scope,
+            _agent_runtime_owner(agent) if self._isolated_runtime_scope is not None else None,
+            self._released_legacy_runtime_root,
+            (*self._validated_hosted_immutable_venv_custody_paths,
+             *self._validated_hosted_immutable_bin_custody_paths),
+        )
         # Hosted immutable console wrappers may themselves be operator-facing
         # symlinks. Preparation resolves and validates one exact regular target;
         # child construction must execute that target rather than re-following
@@ -12511,6 +12562,13 @@ class ProxyFeature(Feature):
         # Publish only after every validation and computation succeeds. There
         # is no await between these stores, and production callers hold the
         # reload lock, so reclaim cannot observe a mixed launch/custody state.
+        if validated_hosted_overrides is not None:
+            retain_host_launch_artifact_custody(
+                self._isolated_runtime_scope, _agent_runtime_owner(self.agent),
+                self._released_legacy_runtime_root,
+                (*validated_hosted_overrides.venv_custody_paths,
+                 *validated_hosted_overrides.bin_custody_paths),
+            )
         (
             self._service_target,
             self._venv_path,

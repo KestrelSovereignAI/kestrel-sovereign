@@ -3541,6 +3541,15 @@ class ConstitutionMixin:
         from kestrel_sovereign.constitution.genesis_audit import GENESIS_AUDIT_PASSED, validate_completed_genesis_audit
         try:
             async with ConstitutionMixin._constitution_state_guard(self):
+                # A failed restriction write must not lend the previous healthy
+                # durable row to realtime cognition. These are the same local
+                # restrictive/pending states observed by ordinary turn admission.
+                if any(getattr(self, flag, False) for flag in (
+                    "_safe_mode", "_constitution_state_persistence_pending",
+                    "_constitution_state_migration_pending", "_constitution_bootstrap_pending",
+                    "_constitution_audit_pending",
+                )):
+                    raise RuntimeError("Local constitutional cognition admission is not ready")
                 store = vars(self).get("_constitution_state_store")
                 if store is None:
                     raise RuntimeError("Native constitutional runtime custody is unavailable")
@@ -3552,6 +3561,7 @@ class ConstitutionMixin:
                     or not isinstance(receipt, Mapping)
                     or validate_completed_genesis_audit(receipt, digest) != GENESIS_AUDIT_PASSED):
                     raise RuntimeError("Native constitutional cognition admission is not ready")
+                return state.revision, state.generation, digest
         except Exception as error:
             if is_execution_control_error(error):
                 raise

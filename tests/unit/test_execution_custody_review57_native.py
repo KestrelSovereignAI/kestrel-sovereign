@@ -11,10 +11,12 @@ from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("selection", ["constructor", "removed", "retargeted"])
-async def test_preinitialize_and_historical_immutable_artifacts_survive_offboarding(tmp_path, monkeypatch, selection):
+@pytest.mark.parametrize("cleanup", ["loaded", "cold"])
+async def test_preinitialize_and_historical_immutable_artifacts_survive_offboarding(tmp_path, monkeypatch, selection, cleanup):
     from unittest.mock import Mock
     from kestrel_sovereign.features.isolated_runtime import (
         ProxyFeature, IsolatedRuntimePreparationError, remove_agent_runtime_namespace,
+        remove_runtime_namespace,
     )
     from tests.unit.test_isolated_feature_runtime import (
         _configure_idle_lifecycle, _idle_test_runtime, _write_prebuilt_venv_shape, FakeIsolatedClient,
@@ -41,7 +43,16 @@ async def test_preinitialize_and_historical_immutable_artifacts_survive_offboard
             monkeypatch.setenv(key, str(external))
         feature.resolve_runtime_paths()
     with pytest.raises(IsolatedRuntimePreparationError, match="immutable"):
-        remove_agent_runtime_namespace(agent)
+        if cleanup == "loaded":
+            remove_agent_runtime_namespace(agent)
+        else:
+            # Cold AgentManager deletion has only the namespace/DID. Clear all
+            # proxy/settings witnesses: canonical disk preflight must retain
+            # historical selections even after a process restart.
+            scope = feature._isolated_runtime_scope
+            agent._isolated_runtime_cleanup_owners.clear()
+            monkeypatch.delenv(key, raising=False)
+            remove_runtime_namespace(scope, agent.did)
     assert (retained / "pyvenv.cfg").is_file()
     assert (retained / "bin/python").is_file()
 

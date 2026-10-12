@@ -365,6 +365,22 @@ class RequestLifecycleMixin:
         generation = generations.get(request_id)
         return generation if isinstance(generation, int) else None
 
+    def retain_active_request_generation(self, request_id: str, generation: int) -> None:
+        """Hand an original live delivery to a drain owner, never a new turn.
+
+        The receiver releases this exact reference using explicit-generation
+        cleanup. Stop continues to see and fence it until physical drain ends.
+        """
+        from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+        key = (request_id, generation)
+        counts = getattr(self, "_active_request_generation_counts", {})
+        if (counts.get(key, 0) <= 0
+            or key in getattr(self, "_cancelled_request_generations", ())
+            or generation in getattr(self, "_abandoned_request_generations", {}).get(request_id, ())):
+            raise ExecutionAuthorityError("original request cannot transfer drain custody")
+        counts[key] += 1
+        self._active_request_counts[request_id] += 1
+
     def _active_generations_for_request(self, request_id: str) -> set[int]:
         """Return every live delivery generation for one opaque request ID."""
 

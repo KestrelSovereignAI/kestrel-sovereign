@@ -83,8 +83,29 @@ async def test_inception_borrower_native_close_precedes_owned_birth_database(nat
     outcome = await await_owned_task(asyncio.create_task(incept()))
     assert len(providers) == 1, "birth consumers did not share one owned accounting borrower"
     assert outcome.error is failure, "database retirement replaced its borrower's native close receipt"
-    assert providers[0][1].backend._connection is None
-    assert providers[0][2].is_closed and providers[0][3] == [True]
+    service, database, http, calls = providers[0]
+    retirement = outcome.error.inception_retirement_owner
+    try:
+        # Even a physically closed socket does not prove that a close which
+        # returned an uncertain effect receipt retired all native borrowers.
+        assert retirement.database is database
+        assert database.backend._connection is not None
+        assert http.is_closed and calls == [True]
+        original_owners = tuple(task for task in service._llm_close_tasks.values() if task is not None)
+        assert original_owners and all(task.done() for task in original_owners)
+        assert service.has_pending_close_owners()
+        with pytest.raises(BaseException) as repeated:
+            await retirement.retire()
+        assert repeated.value is failure
+        assert retirement.database is database
+        assert calls == [True], "reconciliation repeated the failed native close"
+        assert tuple(task for task in service._llm_close_tasks.values() if task is not None) == original_owners
+    finally:
+        # Dispose only this fixture's original database/lock. This is not a
+        # production success acknowledgement and never clears close evidence.
+        await database.close()
+        if retirement.directory_custody is not None:
+            retirement.directory_custody.close()
 
 
 @pytest.mark.parametrize("generation_changed", ["none", "before", "after_anchor"])

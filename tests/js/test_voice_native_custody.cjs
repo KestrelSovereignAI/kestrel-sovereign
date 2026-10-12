@@ -21,6 +21,8 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
   let sdpRequests = 0;
   let toolPosts = 0;
   let pipelineFrames = 0;
+  const realtimeMessages = [];
+  const realtimePeers = [];
   let workletResponse;
   let workletEntered;
   const enteredWorklet = new Promise(resolve => { workletEntered = resolve; });
@@ -38,7 +40,8 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
           return;
         }
         const payload = JSON.stringify({ session_id: 'native-offline', transport,
-          client_secret: { value: 'offline-peer-only' }, endpoint: `${origin}/sdp` });
+          client_secret: { value: 'offline-peer-only' }, endpoint: transport === 'websocket'
+            ? `${origin.replace('http:', 'ws:')}/realtime` : `${origin}/sdp` });
         mintResponse = { res, payload };
         mintEntered();
         if (!holdMint) res.end(payload);
@@ -112,9 +115,11 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
     });
   });
   wsServer.on('connection', connection => {
+    realtimePeers.push(connection);
     connection.send(JSON.stringify({ type: 'status', state: 'listening' }));
     connection.on('message', (bytes, binary) => {
       if (binary && bytes[0] === 1) pipelineFrames++;
+      if (!binary) realtimeMessages.push(JSON.parse(bytes.toString()));
     });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -140,7 +145,7 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
       window.client = await createRealtimeClient({ onEvent: event => window.nativeEvents.push(event) });
       if (autoStart) await window.client.start();
     }, autoStart);
-    if (autoStart) await page.waitForFunction(() => window.nativeChannel?.readyState === 'open');
+    if (autoStart && transport === 'webrtc') await page.waitForFunction(() => window.nativeChannel?.readyState === 'open');
     await body({ page, entered, enteredMint, enteredWorklet,
       releaseWorklet: () => {
         workletResponse.res.setHeader('Content-Type', 'text/javascript');
@@ -148,6 +153,8 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
       },
       toolPosts: () => toolPosts,
       pipelineFrames: () => pipelineFrames,
+      realtimeMessages: () => realtimeMessages,
+      sendRealtime: payload => realtimePeers[0].send(JSON.stringify(payload)),
       releaseMint: () => mintResponse.res.end(mintResponse.payload),
       sdpRequests: () => sdpRequests,
       releaseBatch: (ack = {}) => batchResponse.end(JSON.stringify(ack)) });
@@ -170,6 +177,50 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
     await new Promise(resolve => server.close(resolve));
   }
 }
+
+test('native websocket barge-in fences playback continuation and late publication', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, sendRealtime, realtimeMessages }) => {
+    await page.evaluate(async () => {
+      window.playbackPushes = 0;
+      const NativeNode = window.AudioWorkletNode;
+      window.AudioWorkletNode = class extends NativeNode {
+        constructor(...args) {
+          super(...args);
+          const original = this.port.postMessage.bind(this.port);
+          this.port.postMessage = (...messages) => {
+            if (messages[0]?.type === 'push') window.playbackPushes++;
+            return original(...messages);
+          };
+        }
+      };
+      await window.client.start();
+    });
+    sendRealtime({ type: 'response.created', response: { id: 'original' } });
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.kind === 'speaking_started'));
+    const delta = Buffer.alloc(24000 * 2 * 4, 1).toString('base64');
+    sendRealtime({ type: 'response.output_audio.delta', response_id: 'original', delta });
+    await page.waitForFunction(() => window.playbackPushes === 1);
+    await page.evaluate(() => {
+      window.continuationSettled = false;
+      window.continuation = window.client.commitToolResults([
+        { call_id: 'original-call', result: { native: true } },
+      ]).then(() => { window.continuationSettled = true; });
+    });
+    assert.equal(await page.evaluate(() => window.continuationSettled), false);
+    sendRealtime({ type: 'input_audio_buffer.speech_started' });
+    await page.evaluate(() => window.continuation);
+    sendRealtime({ type: 'response.output_audio.delta', response_id: 'original', delta });
+    sendRealtime({ type: 'response.output_text.delta', response_id: 'original', delta: 'cancelled-private-text' });
+    sendRealtime({ type: 'response.created', response: { id: 'delayed-cancelled' } });
+    sendRealtime({ type: 'response.output_audio.delta', response_id: 'delayed-cancelled', delta });
+    sendRealtime({ type: 'input_audio_buffer.speech_stopped', item_id: 'input-barrier' });
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.kind === 'listening_stopped'));
+    assert.equal(await page.evaluate(() => window.playbackPushes), 1);
+    assert.equal(await page.evaluate(() => window.nativeEvents.filter(event => event.kind === 'speaking_started').length), 1);
+    assert.equal(await page.evaluate(() => window.nativeEvents.some(event => event.text === 'cancelled-private-text')), false);
+    assert.equal(realtimeMessages().filter(event => event.type === 'response.create').length, 0);
+  }, '{}', { autoStart: false, transport: 'websocket' });
+});
 
 for (const mode of ['pipeline', 'realtime']) {
 for (const factory of ['capture', 'playback']) {

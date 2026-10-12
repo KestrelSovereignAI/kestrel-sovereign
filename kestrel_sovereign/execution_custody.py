@@ -49,10 +49,10 @@ class ExecutionCommitOutcomeError(ExecutionAuthorityError, TransactionError):
         )
 
 
-def _explicit_control_chain(error: BaseException) -> Iterator[BaseException]:
+def _explicit_control_chain(error: BaseException | None) -> Iterator[BaseException]:
     """Walk explicit carriers, never implicit cleanup/handling context."""
     seen: set[int] = set()
-    pending = [error]
+    pending = [error] if error is not None else []
     while pending:
         current = pending.pop()
         if id(current) in seen:
@@ -67,7 +67,7 @@ def _explicit_control_chain(error: BaseException) -> Iterator[BaseException]:
             pending.extend(current.exceptions)
 
 
-def execution_commit_outcome(error: BaseException) -> str | None:
+def execution_commit_outcome(error: BaseException | None) -> str | None:
     """Preserve the strongest commit distinction through explicit carriers."""
     outcome = None
     for current in _explicit_control_chain(error):
@@ -78,7 +78,7 @@ def execution_commit_outcome(error: BaseException) -> str | None:
     return outcome
 
 
-def is_execution_control_error(error: BaseException) -> bool:
+def is_execution_control_error(error: BaseException | None) -> bool:
     """Authority/commit control evidence must not become a tool error string."""
     return any(isinstance(current, ExecutionAuthorityError)
                for current in _explicit_control_chain(error))
@@ -473,6 +473,24 @@ def bind_execution_runtime(owner: Any) -> Iterator[None]:
 
 _Result = TypeVar("_Result")
 
+_NATIVE_ADMISSION_VALIDATORS: ContextVar[tuple[Callable[[], Awaitable[None]], ...]] = ContextVar(
+    "native_execution_admission_validators", default=())
+
+
+@contextmanager
+def bind_native_execution_admission(validator: Callable[[], Awaitable[None]]) -> Iterator[None]:
+    """Carry a trusted original read-only gate to actual native dispatch.
+
+    Provider preparation/discovery is not the effect boundary. HTTP requests
+    retain this immutable callback inventory before observers and revalidate
+    it immediately before the original SDK transport dispatch.
+    """
+    token = _NATIVE_ADMISSION_VALIDATORS.set((*_NATIVE_ADMISSION_VALIDATORS.get(), validator))
+    try:
+        yield
+    finally:
+        _NATIVE_ADMISSION_VALIDATORS.reset(token)
+
 
 async def await_execution_work(
     owner: Any, operation: Callable[[], Awaitable[_Result]], *,
@@ -611,6 +629,7 @@ def retain_native_execution_http_client_close(client: Any) -> None:
         # a caller enabled internal retry or automatic function-call dispatch.
         # Check THAT request's active scope, never the client's first caller.
         request.extensions["kestrel.execution_custody"] = current_execution_custody()
+        request.extensions["kestrel.native_admission"] = _NATIVE_ADMISSION_VALIDATORS.get()
         require_original_native_work()
 
     native_dispatch = client._send_single_request
@@ -619,6 +638,9 @@ def retain_native_execution_http_client_close(client: Any) -> None:
         # HTTPX runs every request observer before this native boundary. A
         # check at the beginning of that list cannot admit the final dispatch.
         with bind_execution_custody_snapshot(request.extensions.get("kestrel.execution_custody", ())):
+            require_original_native_work()
+            for validator in request.extensions.get("kestrel.native_admission", ()):
+                await validator()
             require_original_native_work()
             return await native_dispatch(request)
 

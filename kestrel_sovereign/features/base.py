@@ -958,7 +958,8 @@ class Feature(_SdkFeature):
         return task
 
     def _remember_background_control(self, error: BaseException | None) -> None:
-        if error is None or not is_execution_control_error(error):
+        from kestrel_sovereign.execution_custody import execution_cleanup_debts
+        if error is None or not (is_execution_control_error(error) or execution_cleanup_debts(error)):
             return
         from kestrel_sovereign.execution_custody import execution_terminal_error
         self._owned_background_control = execution_terminal_error(

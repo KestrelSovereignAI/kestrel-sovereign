@@ -1137,7 +1137,10 @@ async def stream_agent_response(request: Request):
                 finally:
                     try:
                         # Signal stream completion for TTS consumers
-                        await stream_tap.finish(stream_delivery_id)
+                        await stream_tap.finish(stream_delivery_id, completed=(
+                            active_error is None and source_cleanup_error is None
+                            and not agent_stream_cleanup_failed and not stop_notice_emitted
+                        ))
                     except BaseException as tap_error:
                         raise execution_terminal_error(active_error, source_cleanup_error, tap_error)
                     finally:

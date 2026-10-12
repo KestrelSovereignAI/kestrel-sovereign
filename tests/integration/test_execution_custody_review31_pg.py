@@ -149,7 +149,21 @@ async def test_llm_bounded_native_commit_owner_reports_late_uncertainty(
         assert caught.value is service._llm_close_control
         assert calls.count(stage) == 1
         assert calls.count("later") == 1
-        assert not any(task is not None for task in service._llm_close_tasks.values())
+        if stage == "preference":
+            # Finished writers release borrowed storage; their receipt remains
+            # separately latched. They are not physical transport close debt.
+            assert not any(task is not None for task in service._llm_close_tasks.values())
+        else:
+            retained = tuple(task for task in service._llm_close_tasks.values() if task is not None)
+            assert retained == pending
+            assert all(task.done() for task in retained)
+            assert service.has_pending_close_owners()
+            # Rejoining MUST NOT invoke an uncertain native close a second time.
+            with pytest.raises(BaseException) as repeated:
+                await service.close()
+            assert repeated.value is caught.value
+            assert calls.count(stage) == 1 and calls.count("later") == 1
+            assert tuple(task for task in service._llm_close_tasks.values() if task is not None) == retained
     finally:
         release.set()
         for task in (closer, writer, *tuple(vars(service).get("_llm_close_tasks", {}).values())):

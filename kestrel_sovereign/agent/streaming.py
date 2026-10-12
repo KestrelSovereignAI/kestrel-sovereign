@@ -1215,6 +1215,9 @@ class StreamingMixin:
                         return
                     transition_lock = self._get_privacy_transition_lock()
                     async with transition_lock:
+                        from kestrel_sovereign.streams.tap import AgentStreamTap
+                        AgentStreamTap.get_instance().capture_request_privacy(
+                            self, request_id, self._request_generation_for_current_task(request_id))
                         # #1914: bind a per-turn part buffer so tools/features can
                         # ``emit_part`` typed component bubbles; the orchestrator
                         # drains it into PART sentinels at the point each tool ran.
