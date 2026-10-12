@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kestrel_sovereign.features.sovereignty.feature import SovereigntyFeature
-from kestrel_sovereign.filecoin_adapter import FilecoinAdapter, StorageTier
+from kestrel_sovereign.filecoin_adapter import EnvelopePolicy, FilecoinAdapter, StorageTier
 from kestrel_sovereign.identity import package_intake
 
 HASH = "a" * 64
@@ -34,14 +34,43 @@ def _feature(receipts):
 
 
 @pytest.mark.asyncio
-async def test_import_without_a_receipt_is_refused_before_any_read():
+async def test_import_without_a_receipt_never_reads_the_host_cache():
+    """A restore with no receipt (a fresh host, #2873) may read only IPFS,
+    and only an encrypted envelope is accepted from it."""
     feature = _feature(receipts=[])
     with patch("kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter") as adapter_cls:
+        adapter_cls.return_value.retrieve_content = MagicMock(side_effect=ValueError(f"Content not found: {HASH}"))
         result = await feature.import_sovereignty(HASH)
     assert result.status.value == "error"
-    # Same message as an artifact that does not exist: not an oracle.
-    assert result.error == f"Could not retrieve content for CID {HASH}"
-    adapter_cls.return_value.retrieve_content.assert_not_called()
+    adapter_cls.return_value.retrieve_content.assert_called_once_with(
+        HASH, ipfs_cid=HASH, allow_local_cache=False, envelope=EnvelopePolicy.REQUIRE
+    )
+    feature.agent.storage.restore_from_backup_blob.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_import_without_a_receipt_cannot_restore_a_cached_export(tmp_path, monkeypatch):
+    """Another agent's never-published export sits in the host cache, sealed
+    under the host key every co-hosted agent shares. Naming its content hash
+    with no receipt must not restore it: the cache does not answer."""
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
+    monkeypatch.chdir(tmp_path)
+    with patch(
+        "kestrel_sovereign.filecoin_adapter.requests.post",
+        side_effect=ConnectionError("no IPFS daemon"),
+    ):
+        stored = FilecoinAdapter().store_content(
+            b"another agent's history",
+            storage_tier=StorageTier.LOCAL_ONLY,
+            encrypt=True,
+            seal_envelope=True,
+        )
+        feature = _feature(receipts=[])
+        result = await feature.import_sovereignty(stored.content_hash)
+    assert result.status.value == "error"
+    assert "Content not found" in result.error
     feature.agent.storage.restore_from_backup_blob.assert_not_awaited()
 
 
@@ -53,7 +82,9 @@ async def test_import_with_a_receipt_reads_and_uses_its_key_hash():
         adapter_cls.return_value.retrieve_content = MagicMock(return_value=b"blob")
         result = await feature.import_sovereignty(HASH)
     assert result.status.value == "ok", result
-    adapter_cls.return_value.retrieve_content.assert_called_once_with(HASH, ipfs_cid=HASH, key_hash="kh")
+    adapter_cls.return_value.retrieve_content.assert_called_once_with(
+        HASH, ipfs_cid=HASH, key_hash="kh", envelope=EnvelopePolicy.OPEN
+    )
 
 
 def test_identity_intake_never_answers_a_cid_from_the_local_cache():

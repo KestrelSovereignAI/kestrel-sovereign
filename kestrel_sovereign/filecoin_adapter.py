@@ -5,6 +5,7 @@ Provides decentralized storage while maintaining local caching for performance.
 """
 
 import hashlib
+from enum import Enum
 from io import BytesIO
 import json
 import logging
@@ -85,6 +86,190 @@ def _looks_like_sha256(value: str) -> bool:
     if not isinstance(value, str) or len(value) != 64:
         return False
     return all(c in "0123456789abcdef" for c in value.lower())
+
+
+# HKDF ``info`` of the F187 per-content key. The envelope header names it, so
+# both read from this one constant.
+_CONTENT_KEY_INFO = b"kestrel-filecoin-content-key-v1"
+
+# Self-describing encrypted envelope (#2873).
+#
+# The F187 per-content key is HKDF(KESTREL_DATA_KEY, salt=content hash), and a
+# legacy encrypted payload carries no copy of that hash: it lived only in the
+# exporter's local ``backup_artifact`` record, so an encrypted export could
+# not be decrypted after the host or its database was lost, which is the
+# disaster a backup exists for. An enveloped payload carries what decryption
+# needs in an authenticated plaintext header:
+#
+#     ENVELOPE_MAGIC || header length (u32, big-endian) || header || KSAv2 token
+#
+# The header is canonical JSON naming the format and version, the cipher, the
+# key derivation, ``key_hash`` (the content hash the key derives from, which
+# is also the plaintext's SHA-256) and ``key_id`` (a one-way identifier of the
+# master key, so a payload sealed under another key is named as such instead
+# of being reported as corrupt). It holds no key material. Everything before
+# the token is the token's associated data, so changing any header byte fails
+# decryption.
+ENVELOPE_MAGIC = b"KSENV\x00"
+ENVELOPE_FORMAT = "kestrel.encrypted-envelope"
+ENVELOPE_VERSION = 1
+ENVELOPE_CIPHER = "aes-256-gcm"
+ENVELOPE_KDF = "hkdf-sha256:" + _CONTENT_KEY_INFO.decode("ascii")
+_ENVELOPE_LENGTH_BYTES = 4
+_ENVELOPE_HEADER_LIMIT = 4096
+_ENVELOPE_HEADER_FIELDS = frozenset(
+    {"format", "version", "cipher", "kdf", "key_hash", "key_id"}
+)
+_ENVELOPE_KEY_ID_INFO = b"kestrel-encrypted-envelope-key-id-v1"
+_ENVELOPE_KEY_ID_BYTES = 16
+# A legacy Fernet token is URL-safe base64 of version byte 0x80 followed by a
+# big-endian timestamp; KSAv2 tokens carry their own prefix.
+_FERNET_TOKEN_PREFIX = b"gAAAAA"
+
+
+class EnvelopePolicy(Enum):
+    """How ``FilecoinAdapter.retrieve_content`` treats an encrypted envelope.
+
+    ``IGNORE`` never reads the payload as an envelope. ``OPEN`` opens an
+    envelope from its own header, and takes any other payload down the
+    ``key_hash`` path. ``REQUIRE`` accepts an envelope and nothing else.
+    """
+
+    IGNORE = "ignore"
+    OPEN = "open"
+    REQUIRE = "require"
+
+
+class EncryptedEnvelopeError(ValueError):
+    """An encrypted envelope could not be opened; nothing was decrypted."""
+
+
+class EnvelopeFormatError(EncryptedEnvelopeError):
+    """The envelope header is malformed or names a format this build cannot read."""
+
+
+class EnvelopeKeyUnavailableError(EncryptedEnvelopeError):
+    """No master key is configured to open an encrypted envelope with."""
+
+
+class EnvelopeKeyMismatchError(EncryptedEnvelopeError):
+    """The envelope was sealed under another master key than the configured one."""
+
+    def __init__(self, envelope_key_id: str, configured_key_id: str):
+        self.envelope_key_id = envelope_key_id
+        self.configured_key_id = configured_key_id
+        super().__init__(
+            f"the export was encrypted under key id {envelope_key_id}, but the "
+            f"configured KESTREL_DATA_KEY has key id {configured_key_id}"
+        )
+
+
+class EnvelopeDecryptionError(EncryptedEnvelopeError):
+    """The envelope failed authentication or its plaintext failed its digest."""
+
+
+class UnsealedContentError(ValueError):
+    """The payload is not an encrypted envelope and cannot be accepted as one.
+
+    ``legacy_encrypted`` is True when the payload is legacy ciphertext, whose
+    key derives from a content hash it does not carry; False when it is not
+    ciphertext at all.
+    """
+
+    def __init__(self, *, legacy_encrypted: bool):
+        self.legacy_encrypted = legacy_encrypted
+        super().__init__(
+            "payload is legacy ciphertext without a self-describing envelope"
+            if legacy_encrypted
+            else "payload is not encrypted"
+        )
+
+
+def is_encrypted_envelope(payload: bytes) -> bool:
+    return payload.startswith(ENVELOPE_MAGIC)
+
+
+def _is_legacy_ciphertext(payload: bytes) -> bool:
+    from kestrel_sdk.security.aead import KSA_V2_PREFIX
+
+    return payload.startswith(KSA_V2_PREFIX) or payload.startswith(_FERNET_TOKEN_PREFIX)
+
+
+def envelope_key_id(master_key: bytes) -> str:
+    """The one-way master-key identifier an envelope header records."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=_ENVELOPE_KEY_ID_BYTES,
+        salt=None,
+        info=_ENVELOPE_KEY_ID_INFO,
+    )
+    return hkdf.derive(master_key).hex()
+
+
+def _envelope_header(*, key_hash: str, key_id: str) -> bytes:
+    header = {
+        "format": ENVELOPE_FORMAT,
+        "version": ENVELOPE_VERSION,
+        "cipher": ENVELOPE_CIPHER,
+        "kdf": ENVELOPE_KDF,
+        "key_hash": key_hash,
+        "key_id": key_id,
+    }
+    return json.dumps(header, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+
+def _envelope_prefix(header: bytes) -> bytes:
+    return ENVELOPE_MAGIC + len(header).to_bytes(_ENVELOPE_LENGTH_BYTES, "big") + header
+
+
+def _is_lower_hex(value: Any, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
+def _parse_envelope(payload: bytes) -> Tuple[Dict[str, Any], bytes, bytes]:
+    """Split an envelope into its header, authenticated prefix and token."""
+    length_start = len(ENVELOPE_MAGIC)
+    header_start = length_start + _ENVELOPE_LENGTH_BYTES
+    if not is_encrypted_envelope(payload) or len(payload) < header_start:
+        raise EnvelopeFormatError("payload is not an encrypted envelope")
+    header_length = int.from_bytes(payload[length_start:header_start], "big")
+    header_end = header_start + header_length
+    if not 0 < header_length <= _ENVELOPE_HEADER_LIMIT or len(payload) <= header_end:
+        raise EnvelopeFormatError("encrypted envelope header length is invalid")
+    raw_header = payload[header_start:header_end]
+    try:
+        header = json.loads(raw_header.decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise EnvelopeFormatError("encrypted envelope header is not JSON") from exc
+    if not isinstance(header, dict) or header.get("format") != ENVELOPE_FORMAT:
+        raise EnvelopeFormatError("encrypted envelope header names no known format")
+    version = header.get("version")
+    if type(version) is not int or version != ENVELOPE_VERSION:
+        raise EnvelopeFormatError(
+            f"encrypted envelope version {version!r} is not supported "
+            f"(this build reads version {ENVELOPE_VERSION})"
+        )
+    if set(header) != _ENVELOPE_HEADER_FIELDS:
+        raise EnvelopeFormatError("encrypted envelope header fields are invalid")
+    if header["cipher"] != ENVELOPE_CIPHER or header["kdf"] != ENVELOPE_KDF:
+        raise EnvelopeFormatError(
+            f"encrypted envelope cipher {header['cipher']!r} / key derivation "
+            f"{header['kdf']!r} is not supported"
+        )
+    if not _is_lower_hex(header["key_hash"], 64) or not _is_lower_hex(
+        header["key_id"], _ENVELOPE_KEY_ID_BYTES * 2
+    ):
+        raise EnvelopeFormatError("encrypted envelope key fields are invalid")
+    if _envelope_header(key_hash=header["key_hash"], key_id=header["key_id"]) != raw_header:
+        raise EnvelopeFormatError("encrypted envelope header is not canonical")
+    return header, payload[:header_end], payload[header_end:]
 
 
 class _ProgressBytesIO(BytesIO):
@@ -206,27 +391,39 @@ class FilecoinAdapter:
                      storage_tier: StorageTier = StorageTier.IPFS,
                      encrypt: bool = False,
                      metadata: Optional[Dict] = None,
-                     on_progress: Optional[Callable[[int, int], None]] = None) -> StorageResult:
+                     on_progress: Optional[Callable[[int, int], None]] = None,
+                     *,
+                     seal_envelope: bool = False) -> StorageResult:
         """
         Store content in decentralized storage based on tier.
-        
+
         Args:
             content: Raw content bytes
             storage_tier: Where to store the content
             encrypt: Whether to encrypt before storage
             metadata: Additional metadata
             on_progress: Optional callback(bytes_sent, total_bytes)
-            
+            seal_envelope: Write the encrypted content as a self-describing
+                envelope that decrypts from the payload alone plus
+                KESTREL_DATA_KEY (#2873). Requires ``encrypt``.
+
         Returns:
             StorageResult with storage details
         """
+        if seal_envelope and not encrypt:
+            raise ValueError("seal_envelope=True requires encrypt=True")
+
         # Calculate content hash
         content_hash = hashlib.sha256(content).hexdigest()
-        
+
         # Handle encryption if requested
         final_content = content
         encryption_key_hash = None
-        if encrypt:
+        if seal_envelope:
+            final_content, encryption_key_hash = self._seal_envelope(
+                content, content_hash=content_hash
+            )
+        elif encrypt:
             final_content, encryption_key_hash = self._encrypt_content(
                 content, content_hash=content_hash
             )
@@ -308,7 +505,8 @@ class FilecoinAdapter:
                          key_hash: Optional[str] = None,
                          *,
                          max_output_bytes: Optional[int] = None,
-                         allow_local_cache: bool = True) -> bytes:
+                         allow_local_cache: bool = True,
+                         envelope: EnvelopePolicy = EnvelopePolicy.IGNORE) -> bytes:
         """
         Retrieve content from storage (cache first, then IPFS).
 
@@ -319,7 +517,15 @@ class FilecoinAdapter:
         export that was never published — or, failing that, tell the caller by
         its error whether the name exists (#3225). A caller with no ownership
         record for the name passes False.
-        
+
+        Under ``EnvelopePolicy.OPEN`` or ``REQUIRE`` an encrypted envelope is
+        decrypted from its own header with the configured master key, and
+        ``key_hash`` is not consulted for it. Under ``OPEN`` a payload without
+        an envelope is decrypted with ``key_hash`` as before; legacy
+        ciphertext with no ``key_hash`` raises ``UnsealedContentError``
+        instead of being returned undecrypted. Under ``REQUIRE`` any payload
+        without an envelope raises ``UnsealedContentError``.
+
         Args:
             content_hash: SHA256 hash of original content
             ipfs_cid: IPFS Content ID (if available)
@@ -327,7 +533,8 @@ class FilecoinAdapter:
             max_output_bytes: Optional hard ceiling for the fully decoded
                 result. Cache/network reads and decompression intermediates are
                 bounded as well when supplied.
-            
+            envelope: How a self-describing encrypted envelope is treated.
+
         Returns:
             Original content bytes
         """
@@ -370,15 +577,29 @@ class FilecoinAdapter:
             if not retrieved_content:
                 raise ValueError(f"Content not found: {content_hash}")
 
+            may_be_encrypted = bool(key_hash) or envelope is not EnvelopePolicy.IGNORE
             decompressed_content = _decompress_retrieved_content(
                 retrieved_content,
-                max_bytes=encoded_limit if key_hash else max_output_bytes,
+                max_bytes=encoded_limit if may_be_encrypted else max_output_bytes,
             )
 
-            if key_hash:
+            if envelope is EnvelopePolicy.IGNORE:
+                if key_hash:
+                    result = self._decrypt_content(decompressed_content, key_hash)
+                else:
+                    result = decompressed_content
+            elif is_encrypted_envelope(decompressed_content):
+                result = self.open_envelope(decompressed_content)
+            elif envelope is EnvelopePolicy.OPEN and key_hash:
                 result = self._decrypt_content(decompressed_content, key_hash)
-            else:
+            elif envelope is EnvelopePolicy.OPEN and not _is_legacy_ciphertext(
+                decompressed_content
+            ):
                 result = decompressed_content
+            else:
+                raise UnsealedContentError(
+                    legacy_encrypted=_is_legacy_ciphertext(decompressed_content)
+                )
 
             if max_output_bytes is not None and len(result) > max_output_bytes:
                 raise ContentRetrievalLimitError(
@@ -500,9 +721,63 @@ class FilecoinAdapter:
             algorithm=hashes.SHA256(),
             length=32,  # AES-256
             salt=content_hash.encode("utf-8"),
-            info=b"kestrel-filecoin-content-key-v1",
+            info=_CONTENT_KEY_INFO,
         )
         return hkdf.derive(master_key)
+
+    def _seal_envelope(self, content: bytes, content_hash: str) -> Tuple[bytes, str]:
+        """Encrypt content into a self-describing envelope (#2873).
+
+        The key is the same F187 per-content key ``_encrypt_content`` uses;
+        the envelope differs only in carrying ``key_hash`` and the master-key
+        identifier in its authenticated header, so it decrypts from the
+        payload and KESTREL_DATA_KEY alone.
+        """
+        from kestrel_sdk.security.aead import AEADCipher
+
+        master_key = self._get_master_key()
+        prefix = _envelope_prefix(
+            _envelope_header(key_hash=content_hash, key_id=envelope_key_id(master_key))
+        )
+        content_key = self._derive_content_key(master_key, content_hash)
+        token = AEADCipher(content_key).encrypt(content, aad=prefix)
+        return prefix + token, content_hash
+
+    def open_envelope(self, payload: bytes) -> bytes:
+        """Decrypt a self-describing envelope with the configured master key.
+
+        Raises an ``EncryptedEnvelopeError`` subclass, and returns nothing,
+        when the header is malformed, no master key is configured, the
+        envelope names another master key, or the token fails authentication
+        or its plaintext does not hash to the header's ``key_hash``.
+        """
+        from kestrel_sdk.security.aead import AEADCipher
+        from kestrel_sdk.security.exceptions import DecryptionError
+
+        header, prefix, token = _parse_envelope(payload)
+        try:
+            master_key = self._get_master_key()
+        except ValueError as exc:
+            raise EnvelopeKeyUnavailableError(
+                "the export is encrypted and no KESTREL_DATA_KEY is configured"
+            ) from exc
+        configured_key_id = envelope_key_id(master_key)
+        if header["key_id"] != configured_key_id:
+            raise EnvelopeKeyMismatchError(header["key_id"], configured_key_id)
+        content_key = self._derive_content_key(master_key, header["key_hash"])
+        try:
+            content = AEADCipher(content_key).decrypt(token, aad=prefix)
+        except DecryptionError as exc:
+            raise EnvelopeDecryptionError(
+                "the encrypted export failed authentication: it is corrupted "
+                "or was tampered with"
+            ) from exc
+        if hashlib.sha256(content).hexdigest() != header["key_hash"]:
+            raise EnvelopeDecryptionError(
+                "the decrypted export does not match the content hash its "
+                "envelope names"
+            )
+        return content
 
     def _encrypt_content(self, content: bytes,
                          content_hash: Optional[str] = None) -> Tuple[bytes, str]:

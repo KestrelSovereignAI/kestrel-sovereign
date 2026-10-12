@@ -5,7 +5,15 @@ from typing import Callable, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
-from kestrel_sovereign.filecoin_adapter import FilecoinAdapter, StorageTier
+from kestrel_sovereign.filecoin_adapter import (
+    EncryptedEnvelopeError,
+    EnvelopeKeyMismatchError,
+    EnvelopeKeyUnavailableError,
+    EnvelopePolicy,
+    FilecoinAdapter,
+    StorageTier,
+    UnsealedContentError,
+)
 from decimal import Decimal
 from datetime import datetime
 from kestrel_sovereign.audit_time import utc_now_iso
@@ -20,6 +28,12 @@ logger = logging.getLogger(__name__)
 # in ``kestrel_sovereign/endpoints/sovereignty.py``.
 REFUSAL_ENCRYPTION_KEY_UNAVAILABLE = "encryption_key_unavailable"
 REFUSAL_INSUFFICIENT_FUNDS = "insufficient_funds"
+# Import refusals (#2873): an export that cannot be decrypted, or cannot be
+# trusted, is refused before any of it reaches the restore.
+REFUSAL_ENCRYPTION_KEY_MISMATCH = "encryption_key_mismatch"
+REFUSAL_DECRYPTION_FAILED = "decryption_failed"
+REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE = "legacy_decryption_metadata_unavailable"
+REFUSAL_UNENCRYPTED_WITHOUT_RECEIPT = "unencrypted_export_without_receipt"
 
 
 class SovereigntyFeature(Feature):
@@ -121,9 +135,10 @@ class SovereigntyFeature(Feature):
         # complicates retrieval") and silently wrote a plaintext backup of the
         # whole database (#2872). Both halves of that rationale were wrong:
         # ``FilecoinAdapter.store_content`` encrypts BEFORE it branches on
-        # tier, and ``retrieve_content`` re-derives the portable per-content
-        # key from KESTREL_DATA_KEY + the content hash (no sidecar), so a local
-        # export decrypts through the identical path as a remote one.
+        # tier, and the export is sealed in a self-describing envelope whose
+        # authenticated header names the content hash the key derives from
+        # (#2873), so any export decrypts from its payload and
+        # KESTREL_DATA_KEY alone, on this host or a fresh one.
         #
         # The one request that cannot be honoured is encryption with no master
         # key configured. Refuse it BEFORE the backup blob, the adapter, and
@@ -181,6 +196,7 @@ class SovereigntyFeature(Feature):
             encrypt=encrypt,
             metadata={"agent": self.agent.agent_id},
             on_progress=progress,
+            seal_envelope=encrypt,
         )
         progress(len(backup_blob), len(backup_blob))
 
@@ -367,9 +383,13 @@ class SovereigntyFeature(Feature):
         """
         Restore conversation history from an IPFS CID backup.
 
-        The CID should correspond to a backup artifact that was previously
-        exported. If the backup was encrypted, the key will be looked up
-        from the backup artifact record.
+        An encrypted export carries its decryption metadata in a
+        self-describing envelope and decrypts with the configured
+        KESTREL_DATA_KEY alone, so it restores on a fresh host whose storage
+        holds no record of it (#2873). A legacy encrypted export, made before
+        the envelope, decrypts only with the key hash in this agent's backup
+        receipt. An export that cannot be decrypted is refused, and none of
+        its bytes reach the restore.
 
         Scope (#F265): restores ``conversation_history`` faithfully —
         ``created_at`` (ordering) and ``deleted_at`` (trash) are preserved, so
@@ -380,15 +400,13 @@ class SovereigntyFeature(Feature):
         try:
             adapter = FilecoinAdapter()
 
-            # The receipt is the gate, not a lookup for the key hash (#3225).
+            # The receipt is the gate to the host cache (#3225).
             # ``retrieve_content`` reads ``storage_cache/{name}.cache`` by
             # whatever name it is given, and the cache is one directory per
             # host: without this, any co-hosted agent could name another
             # agent's 64-hex content hash (which passes the CID pattern) and
             # restore that agent's conversation history into its own
-            # database, or probe which hashes exist by the error text. A
-            # name this agent holds no receipt for is refused with the same
-            # message an absent artifact gets, before anything is read.
+            # database, or probe which hashes exist by the error text.
             backup_nodes = await self.agent.storage.get_nodes_by_type("backup_artifact")
             receipt = next(
                 (
@@ -398,19 +416,35 @@ class SovereigntyFeature(Feature):
                 None,
             )
             if receipt is None:
-                logger.warning(
-                    f"Refused sovereignty import of {cid}: no backup receipt for it in this agent's storage"
+                # A fresh host, or a database lost with its records (#2873).
+                # The host cache still may not answer for a name this agent
+                # holds no receipt for, so only IPFS can, and only an export
+                # sealed in an envelope under the configured key is restored:
+                # holding that key is the authority a restore without a
+                # receipt has. A plaintext or legacy payload proves nothing.
+                logger.info(
+                    f"No backup receipt for CID {cid} in this agent's storage; "
+                    "restoring an encrypted export from IPFS only"
                 )
-                return ToolResult.failed(
-                    error=f"Could not retrieve content for CID {cid}"
+                content = await asyncio.to_thread(
+                    adapter.retrieve_content,
+                    cid,
+                    ipfs_cid=cid,
+                    allow_local_cache=False,
+                    envelope=EnvelopePolicy.REQUIRE,
                 )
-            key_hash = receipt.properties.get("encryption_key_hash")
-            logger.info(f"Found backup artifact node for CID {cid}, encrypted: {receipt.properties.get('encrypted')}")
-
-            # Retrieve content (will decrypt if key_hash provided)
-            content = await asyncio.to_thread(
-                adapter.retrieve_content, cid, ipfs_cid=cid, key_hash=key_hash
-            )
+            else:
+                # The envelope names its own key hash; the receipt's is used
+                # only for a legacy export that has no envelope.
+                key_hash = receipt.properties.get("encryption_key_hash")
+                logger.info(f"Found backup artifact node for CID {cid}, encrypted: {receipt.properties.get('encrypted')}")
+                content = await asyncio.to_thread(
+                    adapter.retrieve_content,
+                    cid,
+                    ipfs_cid=cid,
+                    key_hash=key_hash,
+                    envelope=EnvelopePolicy.OPEN,
+                )
 
             if not content:
                 return ToolResult.failed(
@@ -433,9 +467,55 @@ class SovereigntyFeature(Feature):
                     "stats": dict(stats) if stats else {},
                 },
             )
+        except EnvelopeKeyUnavailableError:
+            return self._import_refused(
+                cid,
+                REFUSAL_ENCRYPTION_KEY_UNAVAILABLE,
+                "it is an encrypted export and no KESTREL_DATA_KEY is "
+                "configured to decrypt it",
+            )
+        except EnvelopeKeyMismatchError as e:
+            return self._import_refused(
+                cid,
+                REFUSAL_ENCRYPTION_KEY_MISMATCH,
+                f"{e}; configure the KESTREL_DATA_KEY the export was made with",
+                export_key_id=e.envelope_key_id,
+                configured_key_id=e.configured_key_id,
+            )
+        except EncryptedEnvelopeError as e:
+            return self._import_refused(
+                cid,
+                REFUSAL_DECRYPTION_FAILED,
+                f"it could not be decrypted: {e}",
+            )
+        except UnsealedContentError as e:
+            if e.legacy_encrypted:
+                return self._import_refused(
+                    cid,
+                    REFUSAL_LEGACY_DECRYPTION_METADATA_UNAVAILABLE,
+                    "it is a legacy encrypted export and its decryption "
+                    "metadata is unavailable: it predates the self-describing "
+                    "envelope, and this agent's storage records no key hash "
+                    "for it",
+                )
+            return self._import_refused(
+                cid,
+                REFUSAL_UNENCRYPTED_WITHOUT_RECEIPT,
+                "it is an unencrypted export and this agent holds no backup "
+                "receipt for it; without a receipt only an export encrypted "
+                "under the configured KESTREL_DATA_KEY can be restored",
+            )
         except Exception as e:
             logger.error(f"Import failed: {e}")
             return ToolResult.failed(error=f"❌ Error during import: {str(e)}")
+
+    @staticmethod
+    def _import_refused(cid: str, refusal: str, reason: str, **details) -> ToolResult:
+        logger.warning(f"Refused sovereignty import of {cid}: {reason}")
+        return ToolResult.failed(
+            error=f"❌ Import refused for CID {cid}: {reason}. Nothing was restored.",
+            data={"refusal": refusal, "cid": cid, **details},
+        )
 
     @tool(
         name="check_sovereignty_status",
