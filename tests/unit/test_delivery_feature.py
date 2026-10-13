@@ -3967,20 +3967,22 @@ class TestQueueLifecycle:
                 assert queue._running is True
 
     @pytest.mark.asyncio
-    async def test_stop_cancels_task(self, queue):
-        import asyncio
+    async def test_stop_wakes_and_joins_native_idle_worker(self, tmp_path):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
 
-        # Create a real asyncio task that we can cancel
-        async def noop():
-            await asyncio.sleep(3600)
-
-        real_task = asyncio.create_task(noop())
-        queue._task = real_task
-        queue._running = True
-
-        await queue.stop()
-        assert queue._running is False
-        assert real_task.cancelled()
+        db = await AsyncDatabase.sqlite(str(tmp_path / "idle-delivery.db"))
+        queue = DeliveryQueue(db, "native-idle-worker", poll_interval=3600)
+        try:
+            await queue.start()
+            async with asyncio.timeout(3):
+                while not queue._stop_requested._waiters:
+                    await asyncio.sleep(.01)
+            await asyncio.wait_for(queue.stop(), 3)
+            assert queue._running is False
+            assert queue._task.done() and not queue._task.cancelled()
+        finally:
+            await queue.stop()
+            await db.close()
 
 
 # =========================================================================

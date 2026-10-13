@@ -779,3 +779,24 @@ each already-accepted native SQL write through its original COMMIT acknowledgeme
 Cancellation stops publication between statements; it does not manufacture an
 unknown transaction outcome by interrupting a healthy COMMIT. Genuine native
 unknown/committed receipts still fence readiness and remain available at shutdown.
+
+Reanchor inspection propagates original canonical control carriers before
+formatting operator diagnostics, including the initial runtime read, local
+birth-anchor retargeting and bootstrap-custody inspection. An ordinary database
+availability error still returns a readable `ReanchorResult`; authority denial,
+native retirement debt and unknown/committed evidence do not become one.
+
+Core delivery renewal acquires the exact delivery's PostgreSQL row lock or
+SQLite writer reservation before sampling its clock. An expired token cannot
+be revived by time spent waiting on that serialization point. A successful
+renewal returns its row from the same transaction. Delivery disable stops new
+polls and unstarted batch entries, wakes the idle interval, and physically joins
+accepted delivery/status operations through their original COMMIT acknowledgement;
+cancellation of the stop caller does not cancel those operations.
+
+Hosted default-VENV provisioning also consults retained immutable launch custody.
+Removing an operator setting does not authorize upgrade, adoption or manifest
+stamping of the same artifact. The no-follow restrictive namespace marker survives
+process loss and denies default provisioning in that namespace when the specific
+protected subtree can no longer be proved. It remains denial evidence, not launch
+authority, and Core never clears it or mutates the operator artifact to bypass it.

@@ -219,6 +219,7 @@ class DeliveryQueue:
         self._delivery_task_factory = delivery_task_factory
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        self._stop_requested = asyncio.Event()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -228,6 +229,7 @@ class DeliveryQueue:
         """Create DB tables and launch the background worker."""
         await self._ensure_tables()
         await self._reclaim_in_flight()
+        self._stop_requested.clear()
         self._running = True
         factory = self._runtime_task_factory or create_owned_task
         self._task = factory(
@@ -243,10 +245,12 @@ class DeliveryQueue:
     async def stop(self):
         """Gracefully stop the background worker."""
         self._running = False
+        self._stop_requested.set()
         terminal = getattr(self, "_worker_control", None)
         if self._task:
-            if not self._task.done():
-                self._task.cancel()
+            # Stop future polls, not a finite query/COMMIT already accepted by
+            # this resident or its original delivery child. Caller cancellation
+            # is replayed only after the original worker physically joins.
             outcome = await await_owned_task(self._task)
             terminal = execution_terminal_error(terminal,
                 outcome.error if outcome.error is not None and is_execution_control_error(outcome.error) else None,
@@ -1205,16 +1209,18 @@ class DeliveryQueue:
 
         processed = 0
         for row in rows:
+            if asyncio.current_task() is self._task and self._stop_requested.is_set():
+                break
             entry = self._row_to_entry(row)
-            if self._delivery_task_factory is None:
-                await self._attempt_delivery(entry)
-            else:
-                # The polling resident is restart infrastructure, but a real
-                # attempt (including its durable receipt) is ordinary work.
-                # Await it so cancellation/shutdown also joins this child.
-                await self._delivery_task_factory(
-                    self._attempt_delivery(entry), name=f"delivery-attempt:{entry.id}",
-                )
+            # The child retains ordinary work custody, including its finite
+            # native status acknowledgement. A cancelled polling parent cannot
+            # cancel that ACK and manufacture uncertainty on the shared runtime.
+            factory = self._delivery_task_factory or create_owned_task
+            child = factory(self._attempt_delivery(entry), name=f"delivery-attempt:{entry.id}")
+            outcome = await await_owned_task(child)
+            terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+            if terminal is not None:
+                raise terminal
             processed += 1
 
         return processed
@@ -1705,9 +1711,9 @@ class DeliveryQueue:
                     raise
                 logger.exception("DeliveryQueue worker tick error")
             try:
-                await asyncio.sleep(self._poll_interval)
-            except asyncio.CancelledError:
-                raise
+                await asyncio.wait_for(self._stop_requested.wait(), self._poll_interval)
+            except asyncio.TimeoutError:
+                pass
 
     # ------------------------------------------------------------------
     # Delivery attempt

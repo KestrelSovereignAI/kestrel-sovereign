@@ -4318,33 +4318,44 @@ class DurableSignalStore(UnifiedStoreBase):
         consumer = await self._get_consumer(agent_id, consumer_id)
         if consumer is None or not consumer[4]:
             return None
-        now = _as_utc(now or self.now_utc())
-        lease_expires_at = now + timedelta(seconds=int(consumer[3]))
-        updated = await self._backend.execute(
-            f"""
-            UPDATE {self.DELIVERIES}
-            SET lease_expires_at = ?, updated_at = ?
-            WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
-              AND status = ? AND lease_token = ? AND lease_expires_at > ?
-            """,
-            (
-                self.to_timestamp_param(lease_expires_at),
-                self.to_timestamp_param(now),
-                agent_id,
-                consumer_id,
-                delivery_id,
-                LEASED,
-                lease_token,
-                self.to_timestamp_param(now),
-            ),
-        )
-        if updated == 0:
-            return None
-        return await self._delivery_for_lease_locked(
-            agent_id=agent_id,
-            consumer_id=consumer_id,
-            lease_token=lease_token,
-        )
+        requested_now = _as_utc(now) if now is not None else None
+        async with self._backend.transaction():
+            # A renewal is not a fresh claim. Acquire the exact row's native
+            # serialization point BEFORE sampling time, just like initial
+            # handoff. Waiting on an UPDATE with a previously sampled clock
+            # could otherwise revive the original token after its expiry.
+            locked = await self._lock_delivery_lease_row(
+                agent_id=agent_id, consumer_id=consumer_id, delivery_id=delivery_id,
+            )
+            if locked is None:
+                return None
+            status, _owner, token, expires_at = locked
+            renewal_now = requested_now or self.now_utc()
+            if (
+                status != LEASED or token != lease_token or expires_at is None
+                or _as_utc(self.from_timestamp_field(expires_at)) <= renewal_now
+            ):
+                return None
+            lease_expires_at = renewal_now + timedelta(seconds=int(consumer[3]))
+            updated = await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                  AND status = ? AND lease_token = ? AND lease_expires_at > ?
+                """,
+                (
+                    self.to_timestamp_param(lease_expires_at),
+                    self.to_timestamp_param(renewal_now),
+                    agent_id, consumer_id, delivery_id, LEASED, lease_token,
+                    self.to_timestamp_param(renewal_now),
+                ),
+            )
+            if updated == 0:
+                return None
+            return await self._delivery_for_lease_locked(
+                agent_id=agent_id, consumer_id=consumer_id, lease_token=lease_token,
+            )
 
     async def claim_initial_delivery(
         self,
@@ -4383,7 +4394,7 @@ class DurableSignalStore(UnifiedStoreBase):
             # targeted no-op update reserves the actual writer slot; PostgreSQL
             # locks this row with ``FOR UPDATE``.  Sampling first can publish a
             # worker lease that has already expired while waiting here.
-            initial = await self._lock_initial_delivery_transfer(
+            initial = await self._lock_delivery_lease_row(
                 agent_id=agent_id,
                 consumer_id=consumer_id,
                 delivery_id=delivery_id,
@@ -5816,10 +5827,10 @@ class DurableSignalStore(UnifiedStoreBase):
             f"{self._backend.backend_type!r}"
         )
 
-    async def _lock_initial_delivery_transfer(
+    async def _lock_delivery_lease_row(
         self, *, agent_id: str, consumer_id: str, delivery_id: str
     ) -> Optional[tuple[Any, ...]]:
-        """Lock an activated initial delivery before starting its worker lease.
+        """Lock the exact delivery before validating or extending its lease.
 
         This deliberately uses the narrow delivery row rather than the
         registration/persistence scope lock: all we need here is stable
@@ -5857,7 +5868,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 params,
             )
         raise RuntimeError(
-            "Durable signal initial-delivery transfer does not support backend "
+            "Durable signal delivery-lease serialization does not support backend "
             f"{self._backend.backend_type!r}"
         )
 

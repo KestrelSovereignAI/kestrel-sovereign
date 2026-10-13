@@ -12689,6 +12689,49 @@ class ProxyFeature(Feature):
 
         return self._hosted_immutable_venv_custody_unproven
 
+    def _require_mutable_provisioning_custody(self) -> None:
+        """A removed setting never transfers retained operator artifacts to uv.
+
+        The restrictive namespace marker is intentionally coarser than one
+        selected venv. After a process restart it cannot prove which subtree
+        contains the immutable launch chain, so it denies default provisioning
+        in that namespace rather than guessing that custody has disappeared.
+        """
+        if not self._runtime_is_hosted():
+            return
+        assert self._venv_path is not None
+        if self._immutable_venv_custody_is_unproven() or self._hosted_immutable_bin_custody_unproven:
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature immutable launch custody is unproven; provisioning is refused."
+            )
+        selected = {Path(os.path.abspath(self._venv_path)), self._venv_path.resolve()}
+        retained = (
+            *self._validated_hosted_immutable_venv_custody_paths,
+            *self._validated_hosted_immutable_bin_custody_paths,
+        )
+        if any(
+            path == target or path in target.parents or target in path.parents
+            for path in retained for target in selected
+        ):
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature provisioning would mutate a retained immutable launch artifact."
+            )
+        scope = self._isolated_runtime_scope
+        if scope is None:
+            return
+        owner = _agent_runtime_owner(self.agent)
+        prepare_isolated_runtime_namespace(scope, owner)
+        descriptor = os.open(scope.path, _directory_open_flags())
+        try:
+            if not _same_file_identity(
+                os.stat(scope.path, follow_symlinks=False), os.fstat(descriptor),
+            ):
+                raise IsolatedRuntimeNamespaceError("Provisioning custody root changed during validation.")
+            _read_existing_runtime_owner(descriptor, owner)
+            _assert_no_immutable_launch_custody_at(descriptor)
+        finally:
+            os.close(descriptor)
+
     def _immutable_bin_override_is_inside_workspace(self) -> bool:
         """A validated operator runnable never acquires Core removal custody."""
         selected = self._validated_hosted_immutable_bin_path
@@ -13593,6 +13636,7 @@ class ProxyFeature(Feature):
             self._validated_hosted_console_path = validated_console_path
             return False
 
+        self._require_mutable_provisioning_custody()
         exists = python_path.exists()
 
         # A PREBUILT operator-supplied (override) venv is NOT ours to mutate:

@@ -106,6 +106,10 @@ from kestrel_sovereign.constitution.trust_root import (
     load_sovereign_trust_root,
 )
 from kestrel_sovereign.storage import AsyncStorage, GraphNode
+from kestrel_sovereign.execution_custody import (
+    execution_commit_outcome,
+    is_execution_control_error,
+)
 
 if TYPE_CHECKING:
     from kestrel_sovereign.cli_embeddings import AgentEmbeddingResolution
@@ -626,6 +630,8 @@ async def reanchor_constitution(
             governance_preflight,
         ) = await _read_agent_anchor(target)
     except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the operator
+        if is_execution_control_error(exc):
+            raise
         logger.exception("Could not read the anchor from %s", target.describe())
         return _result(
             old_hash=None,
@@ -686,6 +692,8 @@ async def reanchor_constitution(
                 governance_preflight,
             ) = await _read_agent_anchor(target)
         except Exception as exc:  # noqa: BLE001 — surfaced to the operator
+            if is_execution_control_error(exc):
+                raise
             logger.exception("Could not read the anchor at %s", target.describe())
             return _result(
                 old_hash=None,
@@ -868,6 +876,8 @@ async def reanchor_constitution(
         try:
             custody_pending = await _initial_anchor_custody_pending(target)
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             return _result(old_hash=old_hash, new_hash=new_hash, error=f"Cannot inspect initial-anchor custody: {exc}. Nothing was written.")
 
     if (
@@ -991,8 +1001,6 @@ async def reanchor_constitution(
             governance_preflight=governance_preflight,
         )
     except Exception as exc:  # noqa: BLE001 — surface the underlying error verbatim
-        from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
-
         if is_execution_control_error(exc):
             # Keep the exact committed/unknown receipt AND its retained native
             # owner. A printable error result cannot carry lifecycle custody.
