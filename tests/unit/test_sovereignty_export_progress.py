@@ -8,9 +8,13 @@ from kestrel_sovereign.features.sovereignty.feature import (
     REFUSAL_ENCRYPTION_KEY_UNAVAILABLE,
     SovereigntyFeature,
 )
+from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
 
 
 class _FakeStorage:
+    def allows_backups(self):
+        return True
+
     async def create_backup_blob(self, include_db=True):
         return b"x" * 1024
 
@@ -28,6 +32,10 @@ class _FakeAgent:
         self.storage = _FakeStorage()
         self.features = {}
         self.events = []
+        self._durable_persistence_gate = DurablePersistenceGate()
+
+    def _get_durable_persistence_gate(self):
+        return self._durable_persistence_gate
 
     async def emit_event(self, event_type, data):
         self.events.append((event_type, data))

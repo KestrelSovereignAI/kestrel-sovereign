@@ -72,18 +72,22 @@ def _export_error_status(envelope, err: str) -> int:
     "I asked for something impossible" indistinguishable from "the server
     broke" (#2918). An unset ``KESTREL_DATA_KEY`` is a host-configuration
     conflict the caller cannot fix by changing parameters, hence 409 rather
-    than 400. Anything without a known refusal code stays a 500; the legacy
+    than 400. A privacy mode that does not permit a backup (#2875) is the same
+    kind of conflict with the agent's current state, also 409. Anything without
+    a known refusal code stays a 500; the legacy
     ``Insufficient funds`` substring check is kept as a fallback for envelopes
     minted without the typed code.
     """
     from kestrel_sovereign.features.sovereignty.feature import (
         REFUSAL_ENCRYPTION_KEY_UNAVAILABLE,
         REFUSAL_INSUFFICIENT_FUNDS,
+        REFUSAL_PRIVACY_MODE_FORBIDS_BACKUP,
     )
 
     refusal_status = {
         REFUSAL_ENCRYPTION_KEY_UNAVAILABLE: 409,
         REFUSAL_INSUFFICIENT_FUNDS: 402,
+        REFUSAL_PRIVACY_MODE_FORBIDS_BACKUP: 409,
     }
     data = envelope.data if isinstance(envelope.data, dict) else {}
     status_code = refusal_status.get(data.get("refusal"))

@@ -740,6 +740,16 @@ asks for the gate exclusive is refused rather than left waiting on itself; a
 task that only inherited a hold may be detached from its holder, so its
 transition waits like any other.
 
+A sovereignty export holds the gate shared the same way, around "privacy
+check, then store" (`guarded_backup_store`, #2875). That covers the
+`export_sovereignty` tool, `/api/sovereignty/export` through it, and the sleep
+cycle's export, which the scheduler's `sleep` task runs when its args enable
+export. A transition that completed first is seen by the check, which refuses;
+one that arrives during the store waits for it, because an IPFS upload or
+Filecoin deal cannot be taken back once it lands. Once the tool's store
+begins, its receipts and fee settle with it even if the call is cancelled. An
+agent with no gate is refused rather than exported unguarded.
+
 Step 3 also writes the event's **ingress trust receipt** in the same
 transaction as the event (#3484), in `durable_signal_ingress_receipts`:
 

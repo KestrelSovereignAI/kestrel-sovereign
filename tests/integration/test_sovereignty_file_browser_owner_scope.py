@@ -27,8 +27,13 @@ from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.endpoints import sovereignty as sovereignty_endpoints
 from kestrel_sovereign.features.sovereignty.feature import SovereigntyFeature
 from kestrel_sovereign.filecoin_adapter import FilecoinAdapter, StorageTier
+from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage import Storage
 from kestrel_sovereign.storage.async_storage import AsyncStorage
+from kestrel_sovereign.storage.privacy_wrapper import (
+    DurablePersistenceGate,
+    PrivacyEnforcingStorage,
+)
 
 
 @pytest.fixture
@@ -527,7 +532,16 @@ async def test_an_envelope_receipt_confers_no_other_agents_bare_hash_entry(
         }
 
         mine.create_backup_blob = AsyncMock(return_value=blob)
-        agent = SimpleNamespace(agent_id=identities.mine, storage=mine, features={}, wallet=None)
+        # Wrapped the way ``KestrelAgent`` wraps it, with the gate an export
+        # holds across its store (#2875).
+        gate = DurablePersistenceGate()
+        agent = SimpleNamespace(
+            agent_id=identities.mine,
+            storage=PrivacyEnforcingStorage(mine, PrivacyMode.NORMAL),
+            features={},
+            wallet=None,
+            _get_durable_persistence_gate=lambda: gate,
+        )
         with patch(
             "kestrel_sovereign.filecoin_adapter.requests.post",
             side_effect=ConnectionError("no IPFS daemon"),

@@ -12,6 +12,7 @@ from kestrel_sovereign.features.sovereignty.feature import (
     SovereigntyFeature,
 )
 from kestrel_sovereign.filecoin_adapter import EnvelopePolicy
+from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
 from kestrel_sovereign.storage.providers.base import StorageResult, StorageTier
 
 
@@ -34,6 +35,7 @@ async def test_export_persists_receipt_with_import_and_audit_provenance():
     backup_blob = b"backup-bytes"
 
     storage = MagicMock()
+    storage.allows_backups.return_value = True
     storage.create_backup_blob = AsyncMock(return_value=backup_blob)
     storage.record_backup_artifact = AsyncMock(return_value="hash123")
     storage.add_node = AsyncMock(side_effect=lambda node: stored_nodes.append(deepcopy(node)))
@@ -42,11 +44,13 @@ async def test_export_persists_receipt_with_import_and_audit_provenance():
     wallet.can_afford.return_value = True
     wallet.transfer = AsyncMock()
 
+    gate = DurablePersistenceGate()
     agent = SimpleNamespace(
         agent_id="did:kestrel:test",
         features={"audit": AuditAnchorFeature()},
         storage=storage,
         wallet=wallet,
+        _get_durable_persistence_gate=lambda: gate,
     )
 
     storage_result = StorageResult(
@@ -113,6 +117,7 @@ async def test_export_partial_when_tier_falls_back_to_local():
     disk.
     """
     storage = MagicMock()
+    storage.allows_backups.return_value = True
     storage.create_backup_blob = AsyncMock(return_value=b"backup-bytes")
     storage.record_backup_artifact = AsyncMock(return_value="hash123")
     storage.add_node = AsyncMock()
@@ -121,11 +126,13 @@ async def test_export_partial_when_tier_falls_back_to_local():
     wallet.can_afford.return_value = True
     wallet.transfer = AsyncMock()
 
+    gate = DurablePersistenceGate()
     agent = SimpleNamespace(
         agent_id="did:kestrel:test",
         features={},
         storage=storage,
         wallet=wallet,
+        _get_durable_persistence_gate=lambda: gate,
     )
 
     storage_result = StorageResult(
