@@ -35,12 +35,12 @@ test.describe('Sovereignty Panel Modals', () => {
         await expect(page.locator('.modal-header h3')).toHaveText('Export Agent Data');
 
         // Verify tier options exist
-        await expect(page.locator('input[name="export-tier"][value="LOCAL_ONLY"]')).toBeVisible();
-        await expect(page.locator('input[name="export-tier"][value="IPFS"]')).toBeVisible();
-        await expect(page.locator('input[name="export-tier"][value="FILECOIN"]')).toBeVisible();
+        await expect(page.locator('input[name="export-tier"][value="local"]')).toBeVisible();
+        await expect(page.locator('input[name="export-tier"][value="ipfs"]')).toBeVisible();
+        await expect(page.locator('input[name="export-tier"][value="filecoin"]')).toBeVisible();
 
         // Verify IPFS is selected by default
-        await expect(page.locator('input[name="export-tier"][value="IPFS"]')).toBeChecked();
+        await expect(page.locator('input[name="export-tier"][value="ipfs"]')).toBeChecked();
 
         // Verify encryption checkbox exists and is checked by default
         await expect(page.locator('#export-encrypt')).toBeVisible();
@@ -192,17 +192,17 @@ test.describe('Sovereignty Panel Modals', () => {
         await expect(page.locator('#modal-overlay')).toBeVisible();
 
         // IPFS should be selected by default
-        await expect(page.locator('input[name="export-tier"][value="IPFS"]')).toBeChecked();
+        await expect(page.locator('input[name="export-tier"][value="ipfs"]')).toBeChecked();
 
         // Select Local Only
-        await page.click('input[name="export-tier"][value="LOCAL_ONLY"]');
-        await expect(page.locator('input[name="export-tier"][value="LOCAL_ONLY"]')).toBeChecked();
-        await expect(page.locator('input[name="export-tier"][value="IPFS"]')).not.toBeChecked();
+        await page.click('input[name="export-tier"][value="local"]');
+        await expect(page.locator('input[name="export-tier"][value="local"]')).toBeChecked();
+        await expect(page.locator('input[name="export-tier"][value="ipfs"]')).not.toBeChecked();
 
         // Select Filecoin
-        await page.click('input[name="export-tier"][value="FILECOIN"]');
-        await expect(page.locator('input[name="export-tier"][value="FILECOIN"]')).toBeChecked();
-        await expect(page.locator('input[name="export-tier"][value="LOCAL_ONLY"]')).not.toBeChecked();
+        await page.click('input[name="export-tier"][value="filecoin"]');
+        await expect(page.locator('input[name="export-tier"][value="filecoin"]')).toBeChecked();
+        await expect(page.locator('input[name="export-tier"][value="local"]')).not.toBeChecked();
     });
 
     test('should toggle encryption checkbox', async ({ page }) => {
