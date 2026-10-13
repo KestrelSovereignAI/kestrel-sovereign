@@ -16,6 +16,8 @@ import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
+from kestrel_sovereign.paths import CONTEXT_LIMITS_CACHE_FILE_ENV, runtime_path_env
+
 logger = logging.getLogger(__name__)
 
 # Lazy import to avoid circular dependency
@@ -46,20 +48,38 @@ except ImportError:
 _discovered_context_limits: Dict[str, int] = {}
 
 # --- Persistent cache of discovered limits ---
-CACHE_FILE = Path.home() / ".kestrel" / "discovered_context_limits.json"
 _cached_limits: Optional[Dict[str, int]] = None  # None = not loaded yet
+_cached_limits_file: Optional[Path] = None  # the file _cached_limits was read from
+
+
+def context_limits_cache_file() -> Path:
+    """Where discovered context limits persist between runs.
+
+    ``$KESTREL_CONTEXT_LIMITS_CACHE_FILE``, else
+    ``~/.kestrel/discovered_context_limits.json``. Resolved on call, not at
+    import (#3104), so the environment in force now decides it rather than
+    whichever caller imported this module first.
+    """
+    return Path(
+        runtime_path_env(
+            CONTEXT_LIMITS_CACHE_FILE_ENV,
+            str(Path.home() / ".kestrel" / "discovered_context_limits.json"),
+        )
+    ).expanduser()
 
 
 def _load_cached_limits() -> Dict[str, int]:
-    """Load cached context limits from disk. Lazy, one-time read."""
-    global _cached_limits
-    if _cached_limits is not None:
+    """Load cached context limits from disk. Lazy: read once per cache file."""
+    global _cached_limits, _cached_limits_file
+    cache_file = context_limits_cache_file()
+    if _cached_limits is not None and _cached_limits_file == cache_file:
         return _cached_limits
     _cached_limits = {}
+    _cached_limits_file = cache_file
     try:
-        if CACHE_FILE.exists():
-            _cached_limits = json.loads(CACHE_FILE.read_text())
-            logger.info(f"Loaded {len(_cached_limits)} cached context limits from {CACHE_FILE}")
+        if cache_file.exists():
+            _cached_limits = json.loads(cache_file.read_text())
+            logger.info(f"Loaded {len(_cached_limits)} cached context limits from {cache_file}")
     except Exception as e:
         logger.warning(f"Failed to load cached context limits: {e}")
     return _cached_limits
@@ -67,13 +87,14 @@ def _load_cached_limits() -> Dict[str, int]:
 
 def _persist_cache() -> None:
     """Write discovered limits to disk for cold starts."""
+    cache_file = context_limits_cache_file()
     try:
-        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
         # Merge with existing cache (preserve entries from providers not discovered this run)
         existing = _load_cached_limits()
         merged = {**existing, **_discovered_context_limits}
-        CACHE_FILE.write_text(json.dumps(merged, indent=2, sort_keys=True))
-        logger.debug(f"Persisted {len(merged)} context limits to {CACHE_FILE}")
+        cache_file.write_text(json.dumps(merged, indent=2, sort_keys=True))
+        logger.debug(f"Persisted {len(merged)} context limits to {cache_file}")
     except Exception as e:
         logger.warning(f"Failed to persist context limits cache: {e}")
 
@@ -83,7 +104,7 @@ def register_discovered_limits(models: list) -> None:
 
     Called by model_discovery after API discovery completes.
     Models with a non-None context_limit populate the in-memory registry
-    and are written to ~/.kestrel/discovered_context_limits.json.
+    and are written to :func:`context_limits_cache_file`.
     """
     for model in models:
         ctx = getattr(model, 'context_limit', None)

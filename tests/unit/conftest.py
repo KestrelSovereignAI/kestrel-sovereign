@@ -30,14 +30,17 @@ Scope, precisely: the per-test redirect isolates *function-based* path
 resolution -- ``paths.host_data_dir()``, ``paths.project_dir()``,
 ``host_database_path()`` and anything else that reads the environment when
 called. A module-scope constant that builds a path at **import** time is
-collected before any fixture runs. Those that read a registered runtime-path
-variable (``cli_serve.STATE_DIR`` / ``STATE_FILE`` / ``LOG_DIR``,
-``destructive_policy.DEFAULT_TRASH_DIR``, ``config.TRUSTED_AGENTS_DIR``)
-resolve against the session pins ``tests/conftest.py`` installs before any
-package import (#3286), so they name a session temporary root, shared by every
-test, rather than the operator's home. Resolving on call in the modules
-remains the fix (#3104), as ``local_mps_adapter.default_working_dir`` now does,
-not a longer patch list here.
+collected before any fixture runs, so no redirect here can move it. The
+home-derived ones now resolve on call in their modules: the MPS training
+directory since #3286, and ``cli_serve`` state and logs, the compute trash
+root and the discovered-context-limit cache since #3104.
+``tests/unit/test_import_time_home_paths.py`` fails on a new home lookup run
+at import, written out or reached through a call it can follow to a package
+function, rather than asking this fixture to patch it.
+``config.TRUSTED_AGENTS_DIR`` and ``endpoints.sovereignty.STORAGE_CACHE_DIR``
+still read their registered variables at import, so they name the session
+pins ``tests/conftest.py`` installs before any package import (#3286): a
+session temporary root shared by every test, never the operator's.
 
 Note for anyone verifying this: a probe that imports inside a test body sees
 everything clean, because the fixture has already run. Only a module-level

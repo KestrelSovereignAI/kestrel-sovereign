@@ -46,13 +46,30 @@ from kestrel_sovereign.paths import SERVE_STATE_DIR_ENV, runtime_path_env
 logger = __import__("logging").getLogger(__name__)
 
 DEFAULT_PORT = 8001
-STATE_DIR = Path(
-    runtime_path_env(SERVE_STATE_DIR_ENV, str(Path.home() / ".kestrel"))
-)
-STATE_FILE = STATE_DIR / "serve_state.json"
-LOG_DIR = STATE_DIR / "logs"
 # Keep a margin so we never fill RAM to the brim and trigger swap thrash.
 RAM_MARGIN_GB = 24.0
+
+
+def state_dir() -> Path:
+    """Model-server state: ``$KESTREL_SERVE_STATE_DIR``, else ``~/.kestrel``.
+
+    Resolved on call, not at import (#3104), so the environment in force when
+    a command runs decides it rather than whichever caller imported this
+    module first.
+    """
+    return Path(
+        runtime_path_env(SERVE_STATE_DIR_ENV, str(Path.home() / ".kestrel"))
+    ).expanduser()
+
+
+def state_file() -> Path:
+    """The running-model record, inside :func:`state_dir`."""
+    return state_dir() / "serve_state.json"
+
+
+def log_dir() -> Path:
+    """Launched model servers' logs, inside :func:`state_dir`."""
+    return state_dir() / "logs"
 
 
 # --------------------------------------------------------------------------- #
@@ -64,7 +81,7 @@ def resolve_registry_path(explicit: Optional[str] = None) -> Optional[Path]:
         explicit,
         os.environ.get("KESTREL_SERVE_REGISTRY"),
         "serve_models.toml",
-        str(STATE_DIR / "serve_models.toml"),
+        str(state_dir() / "serve_models.toml"),
     ]
     for c in candidates:
         if c and Path(c).expanduser().is_file():
@@ -146,21 +163,23 @@ def build_command(name: str, entry: dict[str, Any], port: int) -> list[str]:
 # State / process helpers
 # --------------------------------------------------------------------------- #
 def read_state() -> Optional[dict[str, Any]]:
-    if not STATE_FILE.is_file():
+    path = state_file()
+    if not path.is_file():
         return None
     try:
-        return json.loads(STATE_FILE.read_text())
+        return json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         return None
 
 
 def write_state(state: dict[str, Any]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    path = state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2))
 
 
 def clear_state() -> None:
-    STATE_FILE.unlink(missing_ok=True)
+    state_file().unlink(missing_ok=True)
 
 
 def pid_alive(pid: int) -> bool:
@@ -321,8 +340,9 @@ def _start(name: str, entry: dict[str, Any], port: int, *, timeout: int,
         return 1
 
     cmd = build_command(name, entry, port)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = LOG_DIR / f"serve-{name}.log"
+    logs = log_dir()
+    logs.mkdir(parents=True, exist_ok=True)
+    log_path = logs / f"serve-{name}.log"
     env = os.environ.copy()
     for k, v in (entry.get("env") or {}).items():
         env[str(k)] = str(v)

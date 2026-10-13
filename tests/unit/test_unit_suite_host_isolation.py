@@ -14,8 +14,8 @@ manifest means enable-all — so the isolation could start host features the
 operator had disabled. The fixture seeds a manifest that disables by default;
 these tests hold that seed to a policy rather than a list of today's slugs.
 
-Scope matches ``tests/unit/conftest.py``: module-scope constants frozen at
-import time are NOT covered here and are tracked in #3104.
+Scope matches ``tests/unit/conftest.py``: paths that used to be frozen at
+import time are covered by ``tests/unit/test_import_time_home_paths.py`` (#3104).
 """
 
 from __future__ import annotations
@@ -90,8 +90,10 @@ def test_the_isolation_root_is_not_inside_the_test_tmp_path(
 
 
 def test_discovered_context_limit_cache_is_redirected(host_runtime_isolation_root):
-    """``token_counter`` freezes its cache path at import, so ``HOME`` misses it."""
-    assert host_runtime_isolation_root in token_counter.CACHE_FILE.parents
+    """The cache path follows the harness pin, with no patch of the module."""
+    assert (
+        host_runtime_isolation_root in token_counter.context_limits_cache_file().parents
+    )
 
 
 @pytest.mark.asyncio

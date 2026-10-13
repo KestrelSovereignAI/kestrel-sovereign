@@ -211,24 +211,6 @@ class _CompatibilityExecutor(BaseExecutor):
         raise NotImplementedError
 
 
-@pytest.fixture(autouse=True)
-def _isolated_trash_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """Every executor in this module trashes into a per-test root.
-
-    ``DEFAULT_TRASH_DIR`` is frozen at import (#3104), so without this the
-    Docker executor tests staged into the operator's real ``~/.kestrel/trash``
-    and left owner records there; the next test's sweep then found those
-    dead-owner records and asked the (faked) docker client about their
-    containers, consuming the test's own process doubles (#3117).
-    """
-    from kestrel_sovereign.features.compute import destructive_policy, trash_manager
-
-    root = tmp_path / "trash"
-    monkeypatch.setattr(destructive_policy, "DEFAULT_TRASH_DIR", root)
-    monkeypatch.setattr(trash_manager, "DEFAULT_TRASH_DIR", root)
-    yield root
-
-
 def _make_executor(monkeypatch: pytest.MonkeyPatch, name: str, max_bytes: int = 4):
     if name == "local":
         return LocalExecutor(
@@ -919,9 +901,6 @@ async def test_docker_rejects_internal_trash_staging_inside_hold_custody(
     monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(custody / "host-features.db"))
     monkeypatch.setenv("KESTREL_TRASH_DIR", str(custody))
     executor = _make_executor(monkeypatch, "docker")
-    # DEFAULT_TRASH_DIR is intentionally captured at module import. Model a
-    # process that started with this setting without reloading shared modules.
-    executor._policy.trash_dir = custody
     launched = False
 
     async def reject_launch(*_args: object, **_kwargs: object):
