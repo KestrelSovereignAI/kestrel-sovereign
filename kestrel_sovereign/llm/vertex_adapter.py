@@ -303,6 +303,57 @@ class VertexAIAdapter(LLMAdapter):
                 })
         return function_declarations
 
+    def _generation_config(
+        self,
+        system_prompt: Optional[str],
+        tools: Optional[List[Dict[str, Any]]],
+        response_format: Optional[Type[BaseModel]],
+        call_kwargs: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """The request config both ``generate_content`` paths send.
+
+        Vertex takes tools on the config as function declarations, next to the
+        structured-output settings (#2811); with no tools the config carries
+        no ``tools`` key. ``None`` when there is nothing to configure.
+        """
+        config: Dict[str, Any] = {}
+        if call_kwargs.get("max_tokens"):
+            config["max_output_tokens"] = call_kwargs["max_tokens"]
+        if "temperature" in call_kwargs:
+            config["temperature"] = call_kwargs["temperature"]
+        if system_prompt:
+            config["system_instruction"] = system_prompt
+
+        # Handle structured output via response_schema
+        if response_format is not None and issubclass(response_format, BaseModel):
+            # Gemini supports JSON schema for structured output
+            config["response_mime_type"] = "application/json"
+            config["response_schema"] = response_format.model_json_schema()
+
+        tools_config = None
+        if tools:
+            function_declarations = self._convert_tools_to_vertex_format(tools)
+            if function_declarations:
+                tools_config = [{"function_declarations": function_declarations}]
+        if tools_config is not None:
+            config["tools"] = tools_config
+
+        return config or None
+
+    @staticmethod
+    def _tool_call(part: Any, index: int) -> Optional[ToolCall]:
+        """The tool call a response part carries, or None if it carries none.
+
+        google-genai's ``Part`` always has a ``function_call`` attribute
+        (``None`` on a text or thought-signature part), so the value decides,
+        never ``hasattr``. ``index`` numbers the call within its response.
+        """
+        fc = getattr(part, "function_call", None)
+        if fc is None:
+            return None
+        args = dict(fc.args) if getattr(fc, "args", None) else {}
+        return ToolCall(id=f"vertex_call_{index}", name=fc.name, arguments=args)
+
     def _extract_system_prompt(
         self,
         messages: List[Dict[str, Any]]
@@ -359,39 +410,16 @@ class VertexAIAdapter(LLMAdapter):
             # Extract system prompt from messages
             system_prompt, filtered_messages = self._extract_system_prompt(messages)
 
-            # Build generation config
-            config = {}
-            if kwargs.get("max_tokens"):
-                config["max_output_tokens"] = kwargs["max_tokens"]
-            if "temperature" in kwargs:
-                config["temperature"] = kwargs["temperature"]
-            if system_prompt:
-                config["system_instruction"] = system_prompt
-
-            # Handle structured output via response_schema
-            if response_format is not None and issubclass(response_format, BaseModel):
-                # Gemini supports JSON schema for structured output
-                config["response_mime_type"] = "application/json"
-                config["response_schema"] = response_format.model_json_schema()
-
-            # Prepare tool config
-            # BUG #2811: tools_config is built here and never passed to
-            # generate_content below, so Vertex is never told any tools exist
-            # and tool calling silently no-ops on every path through this
-            # adapter. Left in place deliberately as the evidence of the gap —
-            # do not delete it as an unused local; fix the wiring instead.
-            tools_config = None  # noqa: F841 - see #2811
-            if tools:
-                function_declarations = self._convert_tools_to_vertex_format(tools)
-                if function_declarations:
-                    tools_config = [{"function_declarations": function_declarations}]
+            config = self._generation_config(
+                system_prompt, tools, response_format, kwargs,
+            )
 
             # Generate content using the async client with retry
             response = await with_retry(
                 genai_client.aio.models.generate_content,
                 model=model,
                 contents=filtered_messages,
-                config=config if config else None,
+                config=config,
             )
 
             # Parse response
@@ -407,17 +435,11 @@ class VertexAIAdapter(LLMAdapter):
                     for part in candidate.content.parts:
                         if hasattr(part, 'text') and part.text:
                             content = part.text
-                        elif hasattr(part, 'function_call'):
-                            if parsed_tool_calls is None:
-                                parsed_tool_calls = []
-                            fc = part.function_call
-                            # Extract arguments
-                            args = dict(fc.args) if hasattr(fc, 'args') and fc.args else {}
-                            parsed_tool_calls.append(ToolCall(
-                                id=f"vertex_call_{len(parsed_tool_calls)}",
-                                name=fc.name,
-                                arguments=args
-                            ))
+                            continue
+                        tool_call = self._tool_call(part, len(parsed_tool_calls or ()))
+                        if tool_call is not None:
+                            parsed_tool_calls = parsed_tool_calls or []
+                            parsed_tool_calls.append(tool_call)
 
             # Fallback: try to get text directly
             if content is None and hasattr(response, 'text'):
@@ -474,39 +496,21 @@ class VertexAIAdapter(LLMAdapter):
             # Extract system prompt from messages
             system_prompt, filtered_messages = self._extract_system_prompt(messages)
 
-            # Build generation config
-            config = {}
-            if kwargs.get("max_tokens"):
-                config["max_output_tokens"] = kwargs["max_tokens"]
-            if "temperature" in kwargs:
-                config["temperature"] = kwargs["temperature"]
-            if system_prompt:
-                config["system_instruction"] = system_prompt
-
-            # Handle structured output in streaming mode
-            if response_format is not None and issubclass(response_format, BaseModel):
-                config["response_mime_type"] = "application/json"
-                config["response_schema"] = response_format.model_json_schema()
-
-            # Prepare tool config
-            # BUG #2811: as in get_response, tools_config never reaches the
-            # streaming call below. Kept as evidence of the gap, not dead weight.
-            tools_config = None  # noqa: F841 - see #2811
-            if tools:
-                function_declarations = self._convert_tools_to_vertex_format(tools)
-                if function_declarations:
-                    tools_config = [{"function_declarations": function_declarations}]
+            config = self._generation_config(
+                system_prompt, tools, response_format, kwargs,
+            )
 
             # Generate streaming content with retry - await the coroutine first to get the async iterator
             stream = await with_retry(
                 genai_client.aio.models.generate_content_stream,
                 model=model,
                 contents=filtered_messages,
-                config=config if config else None,
+                config=config,
             )
             text_content = ""
             usage_meta = None
             finish_reason = None
+            tool_calls: List[ToolCall] = []
             async for chunk in stream:
                 if getattr(chunk, "usage_metadata", None):
                     usage_meta = chunk.usage_metadata
@@ -514,6 +518,13 @@ class VertexAIAdapter(LLMAdapter):
                 candidates = getattr(chunk, "candidates", None)
                 if candidates:
                     finish_reason = _finish_reason(candidates[0]) or finish_reason
+                    # With tools on the request, a function call can arrive
+                    # on the stream; carry it on the terminal response.
+                    candidate_content = getattr(candidates[0], "content", None)
+                    for part in getattr(candidate_content, "parts", None) or ():
+                        tool_call = self._tool_call(part, len(tool_calls))
+                        if tool_call is not None:
+                            tool_calls.append(tool_call)
                 if hasattr(chunk, 'text') and chunk.text:
                     text_content += chunk.text
                     yield chunk.text
@@ -536,7 +547,7 @@ class VertexAIAdapter(LLMAdapter):
                 ) = _normalized_google_genai_usage(usage_meta)
             yield attach_stop_reason(LLMResponse(
                 content=text_content if text_content else None,
-                tool_calls=None,
+                tool_calls=tool_calls or None,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
@@ -561,7 +572,8 @@ class VertexAIAdapter(LLMAdapter):
 
         Delegates to :meth:`_stream_with_usage` and drops the terminal
         usage-bearing :class:`LLMResponse` so existing callers keep their
-        ``AsyncIterator[str]`` contract.
+        ``AsyncIterator[str]`` contract. A function call on that response
+        cannot travel on a text stream; its drop is logged, never silent.
 
         Yields:
             Text chunks as they arrive
@@ -576,6 +588,14 @@ class VertexAIAdapter(LLMAdapter):
         ):
             if isinstance(item, str):
                 yield item
+            elif item.tool_calls:
+                logger.warning(
+                    "Vertex AI returned %d function call(s) (%s) on the "
+                    "text-only stream, which cannot carry them; use "
+                    "get_streaming_response_with_tools to receive tool calls",
+                    len(item.tool_calls),
+                    ", ".join(call.name for call in item.tool_calls),
+                )
 
     async def get_streaming_response_with_tools(
         self,
