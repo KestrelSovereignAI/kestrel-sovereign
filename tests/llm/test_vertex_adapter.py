@@ -307,13 +307,33 @@ class TestModelDiscovery:
         assert len(gemini_models) > 0
         logger.info(f"Found Gemini models: {gemini_models[:5]}")
 
-    def test_fallback_models(self, adapter):
-        """Test fallback model list structure (ModelInfo objects)."""
+    @pytest.mark.asyncio
+    async def test_fallback_models(self, adapter, tmp_path, monkeypatch):
+        """A failed discovery falls back to the models the last discovery cached (#3610).
+
+        The fallback holds no hardcoded list (#215): it is the ``vertex_ai``
+        part of the discovery cache. Cache a live discovery the way
+        ``discover_all_models`` does, in ``tmp_path`` rather than the cache
+        beside the package, then make discovery fail.
+        """
+        from unittest.mock import MagicMock
+
+        from kestrel_sovereign.llm import model_catalog
+        from kestrel_sovereign.llm.model_catalog import ModelCatalogService
         from kestrel_sovereign.llm.model_metadata import ModelInfo
 
-        fallback = adapter._get_fallback_models()
+        catalog = ModelCatalogService(cache_path=tmp_path / "model_discovery_cache.json")
+        monkeypatch.setattr(model_catalog, "_catalog_service", catalog)
+        discovered = await adapter.list_models()
+        catalog.write_cache(discovered)
+
+        models_api = MagicMock()
+        models_api.list.side_effect = RuntimeError("Vertex discovery unavailable")
+        adapter._client = MagicMock(models=models_api)
+        fallback = await adapter.list_models()
 
         assert len(fallback) >= 3
+        assert fallback == discovered
         for model in fallback:
             assert isinstance(model, ModelInfo)
             assert model.id is not None
