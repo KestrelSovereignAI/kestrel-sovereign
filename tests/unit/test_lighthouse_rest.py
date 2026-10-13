@@ -401,3 +401,86 @@ def test_the_budget_is_the_larger_of_the_default_and_the_payload_rate(client):
     at_floor = int(client.timeout * client.TRANSFER_FLOOR_BYTES_PER_SECOND)
     assert client.transfer_timeout(at_floor).write == pytest.approx(client.timeout)
     assert client.transfer_timeout(at_floor * 3).write == pytest.approx(client.timeout * 3)
+
+
+def _gateway(body: bytes, *, declare_length: bool):
+    """A Lighthouse gateway serving ``body``; ``seen`` records each request."""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+
+        async def chunks():
+            for start in range(0, len(body), 10):
+                yield body[start:start + 10]
+
+        # Streamed, as a gateway sends it. Without a Content-Length only
+        # counting what arrives can enforce a ceiling.
+        headers = {"Content-Length": str(len(body))} if declare_length else {}
+        return httpx.Response(200, content=chunks(), headers=headers)
+
+    client = LighthouseRestClient(api_key="test-api-key")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return client, seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declare_length", [True, False])
+async def test_a_bounded_download_reads_up_to_its_ceiling(declare_length):
+    client, seen = _gateway(b"x" * 100, declare_length=declare_length)
+
+    assert await client.download("QmBody", max_bytes=100) == b"x" * 100
+    [request] = seen
+    assert request.url.path == "/ipfs/QmBody"
+    # The ceiling counts the bytes sent, not what a compressed body expands to.
+    assert request.headers["Accept-Encoding"] == "identity"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declare_length", [True, False])
+async def test_a_bounded_download_stops_past_its_ceiling(declare_length):
+    from kestrel_sovereign.storage.providers.lighthouse_rest import (
+        LighthouseDownloadLimitError,
+    )
+
+    client, _ = _gateway(b"x" * 101, declare_length=declare_length)
+
+    with pytest.raises(LighthouseDownloadLimitError):
+        await client.download("QmBody", max_bytes=100)
+
+
+@pytest.mark.asyncio
+async def test_a_bounded_download_refuses_an_encoded_body():
+    """A compressed body would be expanded before the ceiling could count
+    it, so a bounded download reads identity bodies only (#2874)."""
+    import gzip
+
+    body = gzip.compress(b"x" * 1_000_000)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body, headers={"Content-Encoding": "gzip"})
+
+    client = LighthouseRestClient(api_key="test-api-key")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ValueError, match="identity"):
+        await client.download("QmBody", max_bytes=len(body) + 10)
+
+
+@pytest.mark.asyncio
+async def test_listing_every_upload_keeps_only_records():
+    from kestrel_sovereign.storage.providers.lighthouse_rest import list_all_uploads
+
+    class Pages:
+        async def get_uploads(self, last_key=None):
+            # A junk entry last on a page still leaves the cursor at the
+            # page's last record, so the listing goes on.
+            return {
+                None: {"fileList": ["junk", {"id": "f1", "cid": "Qm1"}, None]},
+                "f1": {"fileList": [{"id": "f2", "cid": "Qm2"}]},
+            }.get(last_key, {"fileList": []})
+
+    assert await list_all_uploads(Pages()) == [
+        {"id": "f1", "cid": "Qm1"},
+        {"id": "f2", "cid": "Qm2"},
+    ]

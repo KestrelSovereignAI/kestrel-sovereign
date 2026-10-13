@@ -53,6 +53,7 @@ async def test_import_without_a_receipt_never_reads_the_host_cache():
         allow_local_cache=False,
         envelope=EnvelopePolicy.ENCRYPTED_ONLY,
         envelope_owner="did:test:me",
+        remote_ipfs=None,
     )
     feature.agent.storage.restore_from_backup_blob.assert_not_awaited()
 
@@ -141,6 +142,7 @@ async def test_import_with_a_receipt_follows_what_it_records(
         envelope_owner="did:test:me",
         envelope_key_hash=envelope_key_hash,
         cache_name=cache_name,
+        remote_ipfs=None,
     )
 
 
@@ -175,6 +177,7 @@ async def test_a_receipt_without_a_cache_name_reads_its_content_hash_not_its_cid
         envelope_owner="did:test:me",
         envelope_key_hash="kh",
         cache_name=cache_name,
+        remote_ipfs=None,
     )
 
 

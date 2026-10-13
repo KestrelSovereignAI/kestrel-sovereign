@@ -19,6 +19,7 @@ from kestrel_sovereign.filecoin_adapter import (
     EnvelopePolicy,
     FilecoinAdapter,
     LegacyDecryptionUnavailableError,
+    RemoteIpfsError,
     StorageTier,
     UnencryptedContentError,
     is_cache_name_of,
@@ -26,7 +27,11 @@ from kestrel_sovereign.filecoin_adapter import (
 from decimal import Decimal
 from datetime import datetime, timezone
 from kestrel_sovereign.audit_time import utc_now_iso
+from kestrel_sovereign.services.key_resolution import KeyUnreadableError
 from kestrel_sovereign.storage import GraphNode
+from kestrel_sovereign.storage.providers.lighthouse_rest import (
+    LighthouseDownloadLimitError,
+)
 from kestrel_sovereign.storage.privacy_wrapper import (
     BackupPolicyUnavailableError,
     PrivacyTransitionGuardUnavailableError,
@@ -74,12 +79,16 @@ REFUSAL_BACKUP_RECEIPT_INVALID = "backup_receipt_invalid"
 MAX_SOVEREIGNTY_IMPORT_BYTES = 1024 * 1024 * 1024
 
 
-class _LighthousePinning:
-    """The agent's Lighthouse provider as the IPFS tier's pinning service.
+class _LighthouseIpfs:
+    """The agent's Lighthouse provider as the IPFS tier's remote service.
 
-    ``FilecoinAdapter.store_content`` runs in a worker thread and calls
-    ``pin`` there. The provider's client belongs to the agent's event loop,
-    so the upload runs on that loop while the worker waits for its CID.
+    ``FilecoinAdapter`` publishes to it (``pin``) and reads from it
+    (``fetch``) when its own IPFS node is unreachable, from the worker thread
+    ``store_content`` and ``retrieve_content`` run in. The provider's client
+    belongs to the agent's event loop, so each call runs on that loop while
+    the worker waits for its result. A failure of the provider (unavailable,
+    an HTTP error, a response without a CID) is the adapter's
+    ``RemoteIpfsError``; the import ceiling is its ``ContentRetrievalLimitError``.
     """
 
     def __init__(self, provider, *, tag: str, loop: asyncio.AbstractEventLoop):
@@ -88,6 +97,30 @@ class _LighthousePinning:
         self._loop = loop
         self.provider_name = provider.provider_name
 
+    def _on_agent_loop(self, coroutine_function, *args, **kwargs):
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._loop:
+            raise RuntimeError(
+                "Lighthouse calls wait on the agent's event loop and must be "
+                "made from a worker thread"
+            )
+        call = coroutine_function(*args, **kwargs)
+        try:
+            future = asyncio.run_coroutine_threadsafe(call, self._loop)
+        except BaseException:
+            # Never scheduled (the loop is closed): nothing will await it.
+            call.close()
+            raise
+        try:
+            return future.result()
+        except LighthouseDownloadLimitError as exc:
+            raise ContentRetrievalLimitError(str(exc)) from exc
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            raise RemoteIpfsError(f"{type(exc).__name__}: {exc}") from exc
+
     def pin(
         self,
         payload: bytes,
@@ -95,19 +128,16 @@ class _LighthousePinning:
         filename: str,
         on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> str:
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is self._loop:
-            raise RuntimeError(
-                "Lighthouse pinning waits on the agent's event loop and must "
-                "be called from a worker thread"
-            )
-        upload = self.provider.publish(
-            payload, filename=filename, tag=self._tag, on_progress=on_progress
+        return self._on_agent_loop(
+            self.provider.publish,
+            payload,
+            filename=filename,
+            tag=self._tag,
+            on_progress=on_progress,
         )
-        return asyncio.run_coroutine_threadsafe(upload, self._loop).result()
+
+    def fetch(self, cid: str, *, max_bytes: Optional[int]) -> bytes:
+        return self._on_agent_loop(self.provider.fetch, cid, max_bytes=max_bytes)
 
 
 class SovereigntyFeature(Feature):
@@ -300,7 +330,7 @@ class SovereigntyFeature(Feature):
         # Lighthouse health check and retention attribute it to this agent
         # alone (#2874); IPFS ignores the name, so the CID is unchanged.
         adapter = FilecoinAdapter()
-        pinning = self._lighthouse_pinning(tier_enum)
+        remote_ipfs = self._lighthouse_ipfs() if tier_enum == StorageTier.IPFS else None
         store = functools.partial(
             adapter.store_content,
             backup_blob,
@@ -312,7 +342,7 @@ class SovereigntyFeature(Feature):
             upload_name=sovereignty_export_upload_name(
                 self.agent.agent_id, datetime.now(timezone.utc)
             ),
-            ipfs_pinning=pinning,
+            remote_ipfs=remote_ipfs,
         )
         # ``privacy_transition()`` takes the persistence gate exclusive, so
         # while the guard holds it shared no transition completes: one that
@@ -356,7 +386,15 @@ class SovereigntyFeature(Feature):
                 stored.cancellation,
             )
             raise_owned_outcome(charged, operation="sovereignty export fee")
-        result, node_id = raise_owned_outcome(stored, operation="sovereignty export store")
+        try:
+            result, node_id = raise_owned_outcome(
+                stored, operation="sovereignty export store"
+            )
+        except KeyUnreadableError as e:
+            # The agent's own Lighthouse key cannot be read. Nothing was
+            # stored, recorded or charged, and the host's key was not used in
+            # its place: it names another account (#2874).
+            return self._lighthouse_credential_refusal(e)
         progress(len(backup_blob), len(backup_blob))
 
         cid = result.ipfs_cid or result.content_hash
@@ -386,14 +424,14 @@ class SovereigntyFeature(Feature):
             "node_id": node_id,
         }
         if (
-            pinning is not None
+            remote_ipfs is not None
             and result.ipfs_cid
-            and getattr(result, "provider", None) == pinning.provider_name
+            and getattr(result, "provider", None) == remote_ipfs.provider_name
         ):
             # Published through the agent's Lighthouse provider: that
             # provider thins the agent's older exports on the same account.
             data["export_retention"] = await self._thin_lighthouse_exports(
-                pinning.provider, keep_cid=result.ipfs_cid
+                remote_ipfs.provider, keep_cid=result.ipfs_cid
             )
 
         # Honesty: a non-local request that ended up local (or that
@@ -420,20 +458,22 @@ class SovereigntyFeature(Feature):
 
         return ToolResult.ok(confirmation, data=data)
 
-    def _lighthouse_pinning(self, tier: StorageTier) -> Optional[_LighthousePinning]:
-        """The IPFS tier's publisher when the adapter's IPFS node is unreachable.
+    def _lighthouse_ipfs(self) -> Optional[_LighthouseIpfs]:
+        """The IPFS tier's remote service when the adapter's IPFS node is
+        unreachable: the agent's Lighthouse provider, or None without one.
 
-        The agent's Lighthouse provider exists only when its remote-tier
-        policy and PayerPolicy permitted one at boot, and resolves its own
-        key, so publishing through it decides neither (#2874). A node the
-        adapter reaches still takes the upload: a sovereign-operated node
-        outranks a delegated service. Without either, the export stays local
-        and reports the downgrade.
+        An export publishes to it, and an import reads an export back from
+        it, so an export it took restores after the host cache is lost
+        (#2874). The provider exists only when the agent's remote-tier policy
+        and PayerPolicy permitted one at boot, and resolves its own key, so
+        neither path decides either. A node the adapter reaches is still
+        used first: a sovereign-operated node outranks a delegated service.
+        Without either, an export stays local and reports the downgrade.
         """
         provider = getattr(self.agent, "lighthouse_provider", None)
-        if tier != StorageTier.IPFS or provider is None:
+        if provider is None:
             return None
-        return _LighthousePinning(
+        return _LighthouseIpfs(
             provider,
             tag=sovereignty_export_tag(self.agent.agent_id),
             loop=asyncio.get_running_loop(),
@@ -467,7 +507,7 @@ class SovereigntyFeature(Feature):
                     continue
                 await provider.delete_upload(str(file_id))
                 deleted.append(str(upload.get("cid") or file_id))
-        except (httpx.HTTPError, OSError, ValueError) as exc:
+        except (httpx.HTTPError, OSError, ValueError, KeyUnreadableError) as exc:
             logger.warning(
                 "Thinning older sovereignty exports on Lighthouse failed: %s", exc
             )
@@ -541,6 +581,21 @@ class SovereigntyFeature(Feature):
             error=(
                 f"Sovereignty export refused: {error}; no sovereignty backup "
                 "was created."
+            )
+        )
+
+    @staticmethod
+    def _lighthouse_credential_refusal(error: KeyUnreadableError) -> ToolResult:
+        """The export's Lighthouse publication needs the agent's own key,
+        which its key storage holds but cannot read (#2874)."""
+        logger.warning(f"Refused sovereignty export: {error}")
+        return ToolResult.failed(
+            error=(
+                f"Sovereignty export refused: {error}. This agent publishes to "
+                "Lighthouse with its own key, so the host's key was not used "
+                "in its place; no sovereignty backup was stored. Restore the "
+                "KESTREL_DATA_KEY the key was stored under, or replace the "
+                "agent's Lighthouse key."
             )
         )
 
@@ -714,6 +769,7 @@ class SovereigntyFeature(Feature):
                     allow_local_cache=False,
                     envelope=EnvelopePolicy.ENCRYPTED_ONLY,
                     envelope_owner=self.agent.agent_id,
+                    remote_ipfs=self._lighthouse_ipfs(),
                 )
             else:
                 # The envelope names its own key hash, and the receipt's must
@@ -770,6 +826,7 @@ class SovereigntyFeature(Feature):
                     envelope_owner=self.agent.agent_id,
                     envelope_key_hash=key_hash or receipt.node_id,
                     cache_name=cache_name,
+                    remote_ipfs=self._lighthouse_ipfs(),
                 )
 
             if not content:
@@ -928,9 +985,34 @@ class SovereigntyFeature(Feature):
         resolution: the account its exports were published to, which neither
         the host environment's key nor the snapshot target's need name
         (#2874). The export is attributed to this agent by its upload record.
+        A key the agent holds but cannot read is reported as an error, never
+        read past to the host's key.
         """
         provider = getattr(self.agent, "lighthouse_provider", None)
-        api_key = await provider.resolve_api_key() if provider is not None else None
+        api_key = None
+        if provider is None:
+            # Boot records why it could not build the provider, such as a key
+            # the agent holds but cannot read: that is an error, not the
+            # absence of a credential.
+            boot_error = getattr(self.agent, "lighthouse_provider_error", None)
+            if isinstance(boot_error, str):
+                return {
+                    "status": "error",
+                    "message": (
+                        "This agent's Lighthouse provider could not be built: "
+                        f"{boot_error}"
+                    ),
+                }
+        else:
+            try:
+                api_key = await provider.resolve_api_key()
+            except KeyUnreadableError as exc:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"This agent's Lighthouse credential cannot be resolved: {exc}"
+                    ),
+                }
         if not api_key:
             return {
                 "status": "not_configured",

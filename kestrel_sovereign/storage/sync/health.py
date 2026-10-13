@@ -10,6 +10,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
+from kestrel_sovereign.storage.providers.lighthouse_rest import (
+    deal_records,
+    list_all_uploads,
+)
 from kestrel_sovereign.storage.sync.retention import parse_timestamp
 from kestrel_sovereign.storage.sync.sovereignty_exports import sovereignty_export_uploads
 from kestrel_sovereign.storage.sync.targets import TierState, TrustTier, TIER_LABELS
@@ -216,7 +220,7 @@ async def _deal_details(
     """An upload's Filecoin deals, its age, and the status they amount to."""
     age = current_time - uploaded_at if uploaded_at else None
     deals = await client.get_deal_status(cid) if cid else []
-    deal_count = len(deals) if isinstance(deals, list) else 0
+    deal_count = len(deal_records(deals))
     if deal_count > 0:
         status = "ok"
     elif age is not None and age <= grace_period:
@@ -287,7 +291,7 @@ async def check_lighthouse_health(
             label=TIER_LABELS[TrustTier.DELEGATED],
             configured=False,
             status="not_configured",
-            message="LIGHTHOUSE_API_KEY is not set",
+            message="No Lighthouse credential is resolved for this agent",
         )
 
     if client_factory is None:
@@ -300,10 +304,8 @@ async def check_lighthouse_health(
     current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     client = client_factory(api_key=api_key)
     try:
-        uploads_response = await client.get_uploads()
-        uploads = uploads_response.get("fileList", [])
-        if not isinstance(uploads, list):
-            uploads = []
+        # Every page: the latest upload need not be on the first (#2874).
+        uploads = await list_all_uploads(client)
 
         latest = _latest_lighthouse_snapshot(uploads, agent_id)
         manifest = None
@@ -527,29 +529,47 @@ def _aggregate_overall_status(statuses: set[str]) -> str:
 async def build_storage_health_report(
     *,
     agent_id: str,
+    lighthouse_api_key: Optional[str],
+    lighthouse_error: Optional[str] = None,
     env: Mapping[str, str] = os.environ,
     lighthouse_grace: timedelta = DEFAULT_LIGHTHOUSE_DEAL_GRACE,
     gcs_prefix: str = "kestrel/",
     now: Optional[datetime] = None,
 ) -> StorageHealthReport:
-    """Build a combined backup storage health report from environment.
+    """Build a combined backup storage health report for one agent.
 
-    The Lighthouse check reads the host ``LIGHTHOUSE_API_KEY`` account. An
-    agent publishes its sovereignty exports with its own PayerPolicy
-    credential, which may name another account; the agent checks those
-    through its provider (``SovereigntyFeature.check_sovereignty_status``,
-    #2874).
+    ``lighthouse_api_key`` is the agent's Lighthouse credential as its
+    PayerPolicy resolves it (``resolve_lighthouse_storage`` and
+    ``lighthouse_api_key_for`` in ``lighthouse_provider``), the key its
+    sovereignty exports and snapshots are published with, so the check reads
+    the account they went to. ``None`` reports Lighthouse as not configured.
+    ``lighthouse_error`` is why that credential could not be resolved, which
+    the Lighthouse tier reports as its error while the other tiers are still
+    checked. Nothing here reads a Lighthouse key from ``env`` (#2874); the
+    other tiers' settings still come from it.
     """
+
+    async def lighthouse_health() -> TargetHealth:
+        if lighthouse_error is not None:
+            return TargetHealth(
+                name="lighthouse",
+                label=TIER_LABELS[TrustTier.DELEGATED],
+                configured=True,
+                status="error",
+                message=lighthouse_error,
+            )
+        return await check_lighthouse_health(
+            api_key=lighthouse_api_key,
+            agent_id=agent_id,
+            grace_period=lighthouse_grace,
+            now=now,
+        )
+
     sovereign_ipfs, lighthouse, gcs = await asyncio.gather(
         check_sovereign_ipfs_health(
             api_url=env.get("SOVEREIGN_IPFS_URL"),
         ),
-        check_lighthouse_health(
-            api_key=env.get("LIGHTHOUSE_API_KEY"),
-            agent_id=agent_id,
-            grace_period=lighthouse_grace,
-            now=now,
-        ),
+        lighthouse_health(),
         check_gcs_health(
             bucket=env.get("GCS_BACKUP_BUCKET"),
             agent_id=agent_id,

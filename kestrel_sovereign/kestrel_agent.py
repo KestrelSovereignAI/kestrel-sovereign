@@ -276,6 +276,68 @@ async def _add_sovereign_ipfs_target_if_active(
         ),
     )
 
+
+async def _build_lighthouse_provider(resolve_storage) -> tuple[Any, Optional[str]]:
+    """The agent's Lighthouse provider, built from ``resolve_storage()``, its
+    PayerPolicy storage resolution, and why there is none if building failed.
+
+    A failure is logged and returned, not raised, so boot continues without
+    the provider and the agent's health check can report it. That includes a
+    key the agent holds but cannot read, which is never read past to the
+    host's ``LIGHTHOUSE_API_KEY`` (#2874). A deferred PayerKind (for example
+    Lighthouse HOST_MASTER_PROVISIONED) raises ``NotImplementedError``, which
+    is surfaced explicitly rather than degraded silently.
+    """
+    try:
+        from kestrel_sovereign.storage.providers.lighthouse_provider import (
+            lighthouse_provider_for,
+        )
+
+        return await lighthouse_provider_for(await resolve_storage()), None
+    except NotImplementedError:
+        raise
+    except Exception as e:
+        logging.warning(f"LighthouseProvider init failed: {e}")
+        return None, f"{type(e).__name__}: {e}"
+
+
+async def _add_lighthouse_target_if_resolved(
+    sync_service,
+    *,
+    provider,
+    agent_id: str,
+    state_dir: Optional[Path],
+) -> bool:
+    """Add the Lighthouse snapshot target, keyed by the agent's provider.
+
+    Honors PayerPolicy.storage: with no provider (the NONE policy, or no
+    resolver-supplied key) there is no target, so the policy that gates live
+    storage gates snapshot uploads too. With one, the target uploads and its
+    retention prunes on the account the provider's key names, the account
+    the agent's sovereignty exports are published to, and never on a key of
+    its own: it asks the provider for the key before each call, so a rotated
+    key moves both together (#2874). Cold-start restore, which runs before
+    the agent's database exists, still reads ``LIGHTHOUSE_API_KEY``.
+    """
+    from kestrel_sovereign.storage.sync.targets import LighthouseTarget, TrustTier
+
+    if provider is None:
+        return False
+    api_key = await provider.resolve_api_key()
+    if not api_key:
+        return False
+    return sync_service.add_remote_target(
+        f"lighthouse://{agent_id}",
+        TrustTier.DELEGATED,
+        lambda: LighthouseTarget(
+            api_key=api_key,
+            agent_id=agent_id,
+            state_dir=state_dir,
+            key_source=provider.resolve_api_key,
+        ),
+    )
+
+
 # Maximum chars for a single tool result before truncation
 MAX_TOOL_RESULT_CHARS = int(os.environ.get("KESTREL_MAX_TOOL_RESULT_CHARS", "8000"))
 
@@ -1598,6 +1660,9 @@ class KestrelAgent(
         # Do NOT set self.agent_id = ... here; it would shadow the property.
         self.privacy_agent = None  # Will be initialized after storage
         self.lighthouse_provider = None  # Will be initialized after storage if API key available
+        # Why boot could not build the Lighthouse provider, when it tried and
+        # failed; the agent's health check reports it (#2874).
+        self.lighthouse_provider_error: Optional[str] = None
         self.wallet = None  # Set by WalletFeature.initialize()
         self.sleep_hooks = []  # *SleepHook instances; features append in post_all_features_loaded()
         # Declarative SDK contributions are wired lazily once the existing
@@ -3059,6 +3124,7 @@ class KestrelAgent(
         """Phase 3 — storage providers, payer policy, and the sync service. Reads the identity node carried from phase 1 for the constitution-anchor gate."""
         # Initialize storage providers for features (reflection self-model, etc.)
         self.lighthouse_provider = None
+        self.lighthouse_provider_error = None
         from kestrel_sovereign.storage.sync.service import (
             RemoteTierPolicyContext,
             SyncService,
@@ -3121,13 +3187,10 @@ class KestrelAgent(
                 remote_policy_decision.reason,
             )
         else:
-            try:
-                from kestrel_sdk.payer_policy import ResourceClass
-                from kestrel_sovereign.services.payer_resolver import (
-                    FoundationPayerResolver,
-                )
+
+            async def _resolve_storage():
                 from kestrel_sovereign.storage.providers.lighthouse_provider import (
-                    lighthouse_provider_for,
+                    resolve_lighthouse_storage,
                 )
 
                 # Injected policy/host-db (multi-tenant embedding) take
@@ -3136,26 +3199,21 @@ class KestrelAgent(
                 # None and the resolver falls back to the agent's db (which has
                 # no host_service_keys rows → 'no host master' for delegated
                 # kinds). See #1649.
-                _policy = self._resolve_payer_policy()
-                _host_db = await self._resolve_host_db()
-                _resolver = FoundationPayerResolver(
-                    _policy,
+                return await resolve_lighthouse_storage(
+                    self.did,
+                    policy=self._resolve_payer_policy(),
                     db=self._raw_storage.db if self._raw_storage else None,
-                    host_db=_host_db,
+                    host_db=await self._resolve_host_db(),
                     wallet_private_key=self._private_key,
                 )
-                _resolved = await _resolver.resolve_for(self.did, ResourceClass.STORAGE)
-                # None under the NONE policy, or when the resolver supplies no
-                # key. Sovereignty exports are published, thinned and checked
-                # through this provider's key (#2874).
-                self.lighthouse_provider = await lighthouse_provider_for(_resolved)
-            except NotImplementedError:
-                # Deferred PayerKind values (for example Lighthouse
-                # HOST_MASTER_PROVISIONED) raise here. Surface
-                # explicitly rather than degrading silently.
-                raise
-            except Exception as e:
-                logging.warning(f"LighthouseProvider init failed: {e}")
+
+            # None under the NONE policy, or when the resolver supplies no
+            # key. Every Lighthouse reader and writer of this agent uses
+            # this provider's key: its sovereignty exports, their thinning
+            # and health, and the snapshot target below (#2874).
+            self.lighthouse_provider, self.lighthouse_provider_error = (
+                await _build_lighthouse_provider(_resolve_storage)
+            )
 
         # Sync service — event-driven snapshots to all configured targets.
         # Targets are ordered by trust: Sovereign → Federated → Delegated → Expedient.
@@ -3165,7 +3223,6 @@ class KestrelAgent(
             try:
                 from kestrel_sovereign.storage.sync.targets import (
                     GCSTarget,
-                    LighthouseTarget,
                     TrustTier,
                 )
 
@@ -3186,24 +3243,14 @@ class KestrelAgent(
                     sovereign_url=sovereign_url,
                 )
 
-                # Delegated: Lighthouse (API key). Honor PayerPolicy.storage:
-                # if the resolver came back with no LighthouseProvider
-                # (NONE policy, or no resolver-supplied key, or env var
-                # unset), DO NOT add the sync target. Otherwise the
-                # policy would gate live storage but leave snapshot
-                # uploads going to Lighthouse anyway.
-                if self.lighthouse_provider is not None and os.environ.get(
-                    "LIGHTHOUSE_API_KEY"
-                ):
-                    self._sync_service.add_remote_target(
-                        f"lighthouse://{agent_id}",
-                        TrustTier.DELEGATED,
-                        lambda: LighthouseTarget(
-                            api_key=os.environ["LIGHTHOUSE_API_KEY"],
-                            agent_id=agent_id,
-                            state_dir=state_dir,
-                        ),
-                    )
+                # Delegated: Lighthouse, on the account the agent's
+                # PayerPolicy resolves (#2874).
+                await _add_lighthouse_target_if_resolved(
+                    self._sync_service,
+                    provider=self.lighthouse_provider,
+                    agent_id=agent_id,
+                    state_dir=state_dir,
+                )
 
                 # Expedient: GCS (fast cloud backup)
                 gcs_bucket = os.environ.get("GCS_BACKUP_BUCKET")

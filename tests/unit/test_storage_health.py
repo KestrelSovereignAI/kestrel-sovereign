@@ -1,7 +1,9 @@
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 
+from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 from kestrel_sovereign.storage.sync.health import (
     build_storage_health_report,
     check_gcs_health,
@@ -23,8 +25,8 @@ class FakeLighthouseClient:
         self.api_key = api_key
         self.closed = False
 
-    async def get_uploads(self):
-        return {"fileList": self.uploads}
+    async def get_uploads(self, last_key=None):
+        return {"fileList": self.uploads if last_key is None else []}
 
     async def get_deal_status(self, cid):
         return self.deals
@@ -76,6 +78,7 @@ async def test_sovereign_ipfs_unreachable_reports_decommissioned():
 async def test_storage_health_report_uses_honest_tier_labels():
     report = await build_storage_health_report(
         agent_id="agent-1",
+        lighthouse_api_key=None,
         env={},
         now=NOW,
     )
@@ -319,6 +322,135 @@ async def test_lighthouse_credits_no_agent_with_another_agents_sovereignty_expor
 
     assert result.status == "unavailable"
     assert "No Lighthouse snapshot" in result.message
+
+
+def _lighthouse_api(records, deals):
+    """Lighthouse's REST API over ``records`` (listed 1000 to a page, the
+    cursor the last record's id) and ``deals`` (each CID's deal_status body,
+    exactly as the endpoint returns it)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/user/files_uploaded":
+            assert request.headers["Authorization"] == "Bearer key"
+            last_key = request.url.params["lastKey"]
+            ids = [record["id"] for record in records]
+            start = 0 if last_key == "null" else ids.index(last_key) + 1
+            return httpx.Response(
+                200,
+                json={
+                    "fileList": records[start:start + 1000],
+                    "totalFiles": len(records),
+                },
+            )
+        if request.url.path == "/api/lighthouse/deal_status":
+            return httpx.Response(200, json=deals[request.url.params["cid"]])
+        raise AssertionError(f"unexpected Lighthouse request {request.url}")
+
+    class Client(LighthouseRestClient):
+        """The real REST client, its HTTP answered by ``handler``."""
+
+        def __init__(self, api_key):
+            super().__init__(api_key=api_key)
+            self._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    return Client
+
+
+def _filler(index):
+    return {
+        "id": f"file-{index:05d}",
+        "cid": f"QmFiller{index}",
+        "fileName": f"kestrel_state__agent-2__20260101_{index % 60:02d}0000.car",
+        "createdAt": int((NOW - timedelta(days=30)).timestamp() * 1000),
+    }
+
+
+def _export_record(index, cid, created_at):
+    record = _export_upload(cid, "agent-1", created_at)
+    record["id"] = f"file-{index:05d}"
+    return record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "deal_count"),
+    [
+        # The SDK's documented shape: the deal list wrapped in "data".
+        (
+            {
+                "data": [
+                    {"DealID": 100046008, "Provider": 10479},
+                    {"DealID": 100049432, "Provider": 97777},
+                ]
+            },
+            2,
+        ),
+        # The endpoint's own list of deals.
+        ([{"DealID": 100046008, "Provider": 10479}], 1),
+        ([{"DealID": 100046008}, {"DealID": 100049432}], 2),
+        (
+            [
+                {
+                    "chainDealID": 22340843,
+                    "dealId": 22340843,
+                    "storageProvider": "f01173170",
+                    "dealStatus": "Active",
+                }
+            ],
+            1,
+        ),
+        # One deal record, unwrapped.
+        ({"DealID": 100046008, "Provider": 10479}, 1),
+    ],
+)
+async def test_lighthouse_counts_deals_in_every_deal_status_shape(body, deal_count):
+    """``get_deal_status`` returns the endpoint's JSON as it is, a list or a
+    dict. Health reads the deals in either, through the real REST client
+    (#2874): a dict of deals is not zero deals."""
+    created = NOW - timedelta(days=3)
+    client = _lighthouse_api(
+        [_export_record(0, "QmExport", created)], {"QmExport": body}
+    )
+
+    result = await check_lighthouse_health(
+        api_key="key", agent_id="agent-1", now=NOW, client_factory=client
+    )
+
+    export = result.details["sovereignty_export"]
+    assert (result.status, export["deal_count"]) == ("ok", deal_count)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[], {"data": []}, {"dealStatus": "Queued"}])
+async def test_lighthouse_counts_no_deals_where_the_response_names_none(body):
+    created = NOW - timedelta(days=3)
+    client = _lighthouse_api(
+        [_export_record(0, "QmExport", created)], {"QmExport": body}
+    )
+
+    result = await check_lighthouse_health(
+        api_key="key", agent_id="agent-1", now=NOW, client_factory=client
+    )
+
+    assert result.status == "warning"
+    assert result.details["sovereignty_export"]["deal_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_lighthouse_health_reads_every_page_of_uploads():
+    """The agent's latest export is on the second page of the account's
+    uploads, behind an older one on the first (#2874)."""
+    records = [_export_record(0, "QmOlder", NOW - timedelta(days=9))]
+    records += [_filler(index) for index in range(1, 1000)]
+    records.append(_export_record(1000, "QmLatest", NOW - timedelta(hours=2)))
+    client = _lighthouse_api(records, {"QmLatest": {"data": []}, "QmOlder": []})
+
+    result = await check_lighthouse_health(
+        api_key="key", agent_id="agent-1", now=NOW, client_factory=client
+    )
+
+    assert result.status == "pending"
+    assert result.details["sovereignty_export"]["cid"] == "QmLatest"
 
 
 @pytest.mark.asyncio

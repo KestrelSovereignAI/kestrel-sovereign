@@ -11,7 +11,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
 from kestrel_sovereign.storage.sync.manifest_manager import ManifestManagerMixin
@@ -42,6 +42,18 @@ def _snapshot_size(manifest: Optional[Dict[str, Any]]) -> Optional[int]:
     return size or None
 
 
+def _account_digest(api_key: str) -> str:
+    """A one-way identifier of the Lighthouse account ``api_key`` names.
+
+    The local manifest records it beside the snapshot's content hash, so a
+    snapshot is skipped as unchanged only when it was uploaded to the account
+    the key names now. Never the key itself.
+    """
+    return hashlib.sha256(
+        b"kestrel-lighthouse-account-v1\0" + api_key.encode("utf-8")
+    ).hexdigest()
+
+
 class LighthouseTarget(ManifestManagerMixin, SyncTarget):
     """
     Lighthouse (Filecoin) storage target.
@@ -67,6 +79,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         api_key: str,
         agent_id: str,
         state_dir: Optional[Path] = None,
+        key_source: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
     ):
         """
         Initialize Lighthouse target.
@@ -76,14 +89,29 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             agent_id: Unique agent identifier for namespacing
             state_dir: Directory to store local state (latest CID tracking).
                        Defaults to parent of the DB path.
+            key_source: Where the current key comes from, asked before every
+                call: the agent's Lighthouse provider, so the target follows
+                the key the agent publishes with when it is rotated (#2874).
+                Without one, ``api_key`` is used throughout.
         """
         self.api_key = api_key
+        self._key_source = key_source
         self.agent_id = agent_id
         self._state_dir = state_dir
         self._manifest_filename = f".lighthouse_manifest_{self.agent_id}.json"
         self._latest_cid: Optional[str] = None
 
     kind = "lighthouse"
+
+    async def _current_api_key(self) -> str:
+        """The key to call Lighthouse with now (see ``key_source``)."""
+        if self._key_source is None:
+            return self.api_key
+        api_key = await self._key_source()
+        if not api_key:
+            raise ConnectionError("No Lighthouse credential resolves for this agent")
+        self.api_key = api_key
+        return api_key
 
     @property
     def name(self) -> str:
@@ -97,7 +125,11 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         """Upload snapshot to Lighthouse and update manifest.
 
         Uses sqlite3.backup() for a consistent snapshot and skips upload
-        if the content hash matches the previous upload.
+        if the previous upload had the same content hash and went to the
+        account the current key names. A snapshot uploaded to another
+        account, or recorded before uploads recorded their account, is
+        uploaded again: after a key rotation the new account would otherwise
+        hold no snapshot until the database changed (#2874).
         """
         timestamp = datetime.now(timezone.utc)
 
@@ -109,10 +141,16 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             # Use sqlite3.backup() for consistent snapshot (safe with active WAL)
             content = _create_consistent_snapshot(db_path)
 
-            # Skip upload if content unchanged
+            # Skip upload if content unchanged on this account
             content_hash = hashlib.sha256(content).hexdigest()
+            api_key = await self._current_api_key()
+            account_digest = _account_digest(api_key)
             manifest = self._load_local_manifest()
-            if manifest and manifest.get("content_hash") == content_hash:
+            if (
+                manifest
+                and manifest.get("content_hash") == content_hash
+                and manifest.get("account_digest") == account_digest
+            ):
                 logger.debug(f"Snapshot unchanged (hash={content_hash[:12]}), skipping upload")
                 return SyncResult(
                     success=True,
@@ -123,7 +161,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                     metadata={"cid": manifest.get("snapshot_cid"), "skipped": True},
                 )
 
-            client = LighthouseRestClient(api_key=self.api_key)
+            client = LighthouseRestClient(api_key=api_key)
 
             tag = f"{self.SNAPSHOT_TAG}-{self.agent_id}"
             timestamp_token = self._timestamp_token(timestamp)
@@ -158,7 +196,9 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 "source_file": db_path.name,
                 "content_hash": content_hash,
             }
-            await self._upload_manifest(client, new_manifest)
+            await self._upload_manifest(
+                client, new_manifest, account_digest=account_digest
+            )
             await client.close()
 
             return SyncResult(
@@ -186,8 +226,15 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 error=f"{type(e).__name__}: {e}",
             )
 
-    async def _upload_manifest(self, client: Any, manifest: Dict[str, Any]) -> None:
-        """Upload manifest file to Lighthouse and save locally."""
+    async def _upload_manifest(
+        self, client: Any, manifest: Dict[str, Any], *, account_digest: str
+    ) -> None:
+        """Upload manifest file to Lighthouse and save locally.
+
+        The local copy also records ``account_digest``, the account the
+        snapshot went to. The uploaded copy does not: Lighthouse's gateway
+        serves it to anyone holding its CID.
+        """
         try:
             manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
             tag = f"{self.MANIFEST_TAG}-{self.agent_id}"
@@ -206,7 +253,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             manifest_cid = result.get("Hash") or result.get("cid")
             manifest["manifest_cid"] = manifest_cid
             manifest["manifest_upload_name"] = manifest_filename
-            self._save_local_manifest(manifest)
+            self._save_local_manifest({**manifest, "account_digest": account_digest})
             logger.debug(f"Uploaded manifest to Lighthouse: {manifest_cid}")
 
         except Exception as e:
@@ -214,7 +261,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             logger.warning(
                 "Failed to upload manifest (snapshot is safe): %s: %s", type(e).__name__, e
             )
-            self._save_local_manifest(manifest)
+            self._save_local_manifest({**manifest, "account_digest": account_digest})
 
     async def restore_snapshot(self, dest_path: Path) -> Optional[SyncResult]:
         """
@@ -245,7 +292,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 LighthouseRestClient,
             )
 
-            client = LighthouseRestClient(api_key=self.api_key)
+            client = LighthouseRestClient(api_key=await self._current_api_key())
             # Whichever path named the snapshot also named its size when it
             # could (the local manifest, the uploads API record, a remote
             # manifest); a known size buys the gateway the patience a 1.2 GB
@@ -425,7 +472,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 LighthouseRestClient,
             )
 
-            client = LighthouseRestClient(api_key=self.api_key)
+            client = LighthouseRestClient(api_key=await self._current_api_key())
             try:
                 result = await client.get_uploads()
             finally:
@@ -486,7 +533,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 LighthouseRestClient,
             )
 
-            client = LighthouseRestClient(api_key=self.api_key)
+            client = LighthouseRestClient(api_key=await self._current_api_key())
             content = await client.download(manifest_cid)
             await client.close()
             manifest = json.loads(content)
@@ -535,7 +582,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             list_all_uploads,
         )
 
-        client = LighthouseRestClient(api_key=self.api_key)
+        client = LighthouseRestClient(api_key=await self._current_api_key())
         try:
             uploads = await list_all_uploads(client)
 
@@ -617,7 +664,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 LighthouseRestClient,
             )
 
-            client = LighthouseRestClient(api_key=self.api_key)
+            client = LighthouseRestClient(api_key=await self._current_api_key())
             await client.get_balance()
             await client.close()
             return True

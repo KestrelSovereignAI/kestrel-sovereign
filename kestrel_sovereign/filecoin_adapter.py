@@ -376,14 +376,22 @@ def _parse_envelope(payload: bytes) -> Tuple[Dict[str, Any], bytes, bytes]:
     return header, payload[:header_end], payload[header_end:]
 
 
-class IpfsPinningService(Protocol):
-    """A remote IPFS pinning service ``FilecoinAdapter.store_content`` can
-    publish the IPFS tier to when the adapter's own IPFS node is unreachable.
+class RemoteIpfsError(ConnectionError):
+    """A remote IPFS service could not take, or could not serve, content."""
 
-    ``pin`` is called from the thread ``store_content`` runs in, with the
-    payload exactly as the IPFS tier stores it (compressed, and sealed when
-    encrypted), and returns its CID. ``provider_name`` is recorded as the
-    result's provider.
+
+class RemoteIpfsService(Protocol):
+    """A remote IPFS service the adapter publishes the IPFS tier to, and reads
+    it back from, when its own IPFS node is unreachable (#2874).
+
+    Both methods are called from the thread ``store_content`` or
+    ``retrieve_content`` runs in, and raise ``RemoteIpfsError`` when the
+    service fails. ``pin`` takes the payload exactly as the IPFS tier stores
+    it (compressed, and sealed when encrypted) and returns its CID;
+    ``provider_name`` is recorded as the result's provider. ``fetch`` returns
+    the bytes the service serves for a CID, reading at most ``max_bytes`` and
+    raising ``ContentRetrievalLimitError`` past it; the adapter checks them
+    exactly as it checks its own node's.
     """
 
     provider_name: str
@@ -395,6 +403,8 @@ class IpfsPinningService(Protocol):
         filename: str,
         on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> str: ...
+
+    def fetch(self, cid: str, *, max_bytes: Optional[int]) -> bytes: ...
 
 
 class _ProgressBytesIO(BytesIO):
@@ -520,7 +530,7 @@ class FilecoinAdapter:
                      *,
                      envelope_owner: Optional[str] = None,
                      upload_name: Optional[str] = None,
-                     ipfs_pinning: Optional[IpfsPinningService] = None) -> StorageResult:
+                     remote_ipfs: Optional[RemoteIpfsService] = None) -> StorageResult:
         """
         Store content in decentralized storage based on tier.
 
@@ -537,9 +547,11 @@ class FilecoinAdapter:
                 ``envelope_cache_name``. Requires ``encrypt``.
             upload_name: The file name an IPFS upload carries, recorded as
                 the result's ``filename``. Defaults to ``content.bin``.
-            ipfs_pinning: The IPFS tier's publisher when this adapter's IPFS
+            remote_ipfs: The IPFS tier's publisher when this adapter's IPFS
                 node is unreachable, instead of storing locally only (#2874).
                 Consulted for the IPFS tier alone. Requires ``upload_name``.
+                When it fails too, the content is stored locally only and the
+                result's tier says so, as when there is no service.
 
         Returns:
             StorageResult with storage details. Its ``cache_name`` is the
@@ -547,8 +559,8 @@ class FilecoinAdapter:
         """
         if envelope_owner is not None and not encrypt:
             raise ValueError("envelope_owner requires encrypt=True")
-        if ipfs_pinning is not None and not upload_name:
-            raise ValueError("ipfs_pinning requires the upload_name it pins under")
+        if remote_ipfs is not None and not upload_name:
+            raise ValueError("remote_ipfs requires the upload_name it pins under")
 
         # Calculate content hash
         content_hash = hashlib.sha256(content).hexdigest()
@@ -590,17 +602,24 @@ class FilecoinAdapter:
             self._report_progress(on_progress, len(compressed_content), len(compressed_content))
 
         elif storage_tier == StorageTier.IPFS:
+            ipfs_cid = None
             if self.ipfs_is_available():
                 ipfs_cid = self._store_ipfs(
                     compressed_content, metadata, on_progress=on_progress,
                     filename=upload_name or _DEFAULT_UPLOAD_NAME,
                 )
-            elif ipfs_pinning is not None:
-                ipfs_cid = ipfs_pinning.pin(
-                    compressed_content, filename=upload_name, on_progress=on_progress
-                )
-                result.provider = ipfs_pinning.provider_name
-            else:
+            elif remote_ipfs is not None:
+                try:
+                    ipfs_cid = remote_ipfs.pin(
+                        compressed_content, filename=upload_name, on_progress=on_progress
+                    )
+                    result.provider = remote_ipfs.provider_name
+                except RemoteIpfsError as e:
+                    logging.warning(
+                        f"IPFS not available and {remote_ipfs.provider_name} "
+                        f"did not take the content: {e}"
+                    )
+            if ipfs_cid is None:
                 logging.warning("IPFS not available. Storing locally instead.")
                 result.tier = StorageTier.LOCAL_ONLY
                 self._store_local_cache(cache_name, compressed_content, metadata,
@@ -665,7 +684,8 @@ class FilecoinAdapter:
                          envelope: EnvelopePolicy = EnvelopePolicy.IGNORE,
                          envelope_owner: Optional[str] = None,
                          envelope_key_hash: Optional[str] = None,
-                         cache_name: Optional[str] = None) -> bytes:
+                         cache_name: Optional[str] = None,
+                         remote_ipfs: Optional[RemoteIpfsService] = None) -> bytes:
         """
         Retrieve content from storage (cache first, then IPFS).
 
@@ -715,6 +735,13 @@ class FilecoinAdapter:
                 (#2873). The result must hash to the content hash the name
                 begins with, from the cache or IPFS. Requires
                 ``allow_local_cache``.
+            remote_ipfs: Where ``ipfs_cid`` is read when this adapter's IPFS
+                node does not answer for it: the service the IPFS tier was
+                published to when that node was unreachable (#2874). Read
+                under the same byte ceiling, and its bytes are decompressed,
+                opened and checked exactly as the node's are. An
+                ``ipfs_cid`` that is a SHA-256 content hash is never sent to
+                it.
 
         Content fetched from IPFS is cached again under the name
         ``store_content`` gives it, not the name it was requested by, when
@@ -794,6 +821,29 @@ class FilecoinAdapter:
                         raise
                     except Exception as e:
                         logging.error(f"IPFS retrieval failed for {ipfs_cid}: {e}")
+                    # A content hash names a host-cache entry, never an IPFS
+                    # object, so it is not sent to a remote service.
+                    if (
+                        not retrieved_content
+                        and remote_ipfs is not None
+                        and not _looks_like_sha256(ipfs_cid)
+                    ):
+                        try:
+                            retrieved_content = remote_ipfs.fetch(
+                                ipfs_cid,
+                                max_bytes=encoded_limit,
+                            )
+                        except RemoteIpfsError as e:
+                            logging.error(
+                                f"{remote_ipfs.provider_name} retrieval failed "
+                                f"for {ipfs_cid}: {e}"
+                            )
+                        if retrieved_content:
+                            from_ipfs = True
+                            logging.info(
+                                f"📡 Retrieved from {remote_ipfs.provider_name}: "
+                                f"{content_hash[:16]}..."
+                            )
 
             if not retrieved_content:
                 raise ValueError(f"Content not found: {content_hash}")

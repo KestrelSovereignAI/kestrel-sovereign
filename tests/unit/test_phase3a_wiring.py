@@ -18,7 +18,6 @@ These tests pin the contracts the agent-init layer relies on:
 """
 from __future__ import annotations
 
-import os
 from typing import Iterator
 
 import pytest
@@ -68,6 +67,77 @@ class TestLighthouseConstructorContract:
         # is exactly right — _ensure_client() is the place that consults
         # the resolver, not __init__.
         assert provider.is_available() is False
+
+
+class _Resolver:
+    """A key resolver whose answers a test sets one call at a time."""
+
+    def __init__(self, *answers):
+        self._answers = list(answers)
+
+    async def resolve_key(self, provider, require=True, *, strict_storage=False):
+        # Strictly: a key the agent holds but cannot read is never read past
+        # to the host's key (#2874).
+        assert (provider, require, strict_storage) == ("lighthouse", False, True)
+        answer = self._answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+class _Client:
+    def __init__(self, api_key=None, gateway_url=None):
+        self.api_key = api_key
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
+class TestLighthouseResolverOwnsTheKey:
+    """With a resolver, the key it resolves now is the only key the provider
+    calls Lighthouse with; a removed key is not used again (#2874)."""
+
+    @pytest.fixture(autouse=True)
+    def _client(self, monkeypatch):
+        monkeypatch.setattr(
+            "kestrel_sovereign.storage.providers.lighthouse_provider.LighthouseRestClient",
+            _Client,
+        )
+
+    async def test_a_key_the_resolver_stops_supplying_is_dropped(self, tmp_path):
+        provider = LighthouseProvider(
+            cache_dir=str(tmp_path), key_resolver=_Resolver("old", None, "new")
+        )
+
+        assert await provider.resolve_api_key() == "old"
+        old_client = provider._client
+        assert await provider.resolve_api_key() is None
+        assert old_client.closed
+        assert (provider.api_key, provider.is_available()) == (None, False)
+        # A key that resolves again is used again.
+        assert await provider.resolve_api_key() == "new"
+        assert provider._client.api_key == "new"
+
+    async def test_a_resolver_failure_raises_and_drops_the_key(self, tmp_path):
+        provider = LighthouseProvider(
+            cache_dir=str(tmp_path),
+            key_resolver=_Resolver("old", RuntimeError("key store unreadable")),
+        )
+        assert await provider.resolve_api_key() == "old"
+        old_client = provider._client
+
+        with pytest.raises(RuntimeError, match="key store unreadable"):
+            await provider.publish(b"x", filename="f", tag="t")
+
+        assert old_client.closed
+        assert (provider.api_key, provider.is_available()) == (None, False)
+
+    async def test_without_a_resolver_the_constructed_key_is_used(self, tmp_path):
+        provider = LighthouseProvider(api_key="given", cache_dir=str(tmp_path))
+
+        assert await provider.resolve_api_key() == "given"
+        assert provider.is_available()
 
 
 class TestLLMServiceDisabledFlag:
