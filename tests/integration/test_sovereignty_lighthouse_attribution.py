@@ -77,6 +77,9 @@ from kestrel_sovereign.storage.sync.health import build_storage_health_report
 from kestrel_sovereign.storage.sync.lighthouse_target import LighthouseTarget
 from kestrel_sovereign.storage.sync.retention import RetentionPolicy
 from kestrel_sovereign.storage.sync.service import SyncService
+from kestrel_sovereign.storage.sync.sovereignty_exports import (
+    sovereignty_export_upload_name,
+)
 from scripts import backup_cleanup
 from tests.utils.lighthouse_gateway import GatewayServer
 
@@ -163,6 +166,7 @@ class _LighthouseAccount:
         self.deals: dict[str, list] = {}
         self.fail_deletes = False
         self.fail_uploads = False
+        self.fail_listing = False
         # Awaited after each upload lands, for a test to change the world.
         self.after_upload = None
         self.downloads: list[str] = []
@@ -233,6 +237,12 @@ class _LighthouseClient:
         return await self.upload(car_bytes, filename, tag, on_progress)
 
     async def get_uploads(self, last_key=None):
+        if self.account.fail_listing:
+            raise httpx.HTTPStatusError(
+                "files_uploaded failed",
+                request=httpx.Request("GET", "https://api.lighthouse.storage"),
+                response=httpx.Response(503),
+            )
         files = self.account.files
         start = 0
         if last_key not in (None, "null"):
@@ -520,10 +530,11 @@ async def test_export_is_found_by_the_health_check_and_attributed_to_its_agent(
     async with _host(host, monkeypatch, did=AGENT_A) as (agent, raw):
         cid = await _export(agent, raw)
 
-        # Published through the agent's provider, named for the agent alone.
+        # Published through the agent's provider, named for the agent alone
+        # and, by its nonce, for this publication alone (#3602).
         record = lighthouse.record(cid)
         assert re.fullmatch(
-            rf"kestrel_sovereignty__{re.escape(AGENT_A)}__\d{{8}}_\d{{6}}\.bin",
+            rf"kestrel_sovereignty__{re.escape(AGENT_A)}__\d{{8}}_\d{{6}}__[0-9a-f]{{16}}\.bin",
             record["fileName"],
         )
         assert record["tag"] == f"kestrel-sovereignty-{AGENT_A}"
@@ -769,6 +780,129 @@ async def test_an_agent_whose_key_differs_from_the_hosts_is_checked_and_thinned_
     assert report_a.lighthouse.details["sovereignty_export"]["cid"] == a_exports[1]
     report_b = await _health(host, AGENT_B, lighthouse)
     assert report_b.lighthouse.details["sovereignty_export"]["cid"] == b_export
+
+
+@pytest.mark.asyncio
+async def test_a_snapshot_account_that_fails_hides_no_export_from_health(
+    tmp_path, monkeypatch, kubo, lighthouse, data_key
+):
+    """The agent's exports go to its own account, its snapshots to the
+    host's, and the host account stops answering. ``kestrel storage health``
+    reports that account's error and still the agent's latest export on its
+    own account (#3602)."""
+    own = lighthouse.service.account(AGENT_KEY)
+    host = tmp_path / "host"
+    async with _host(host, monkeypatch, did=AGENT_A, agent_key=AGENT_KEY) as (agent, raw):
+        export = await _export(agent, raw)
+        await _snapshot(agent, raw, "a snapshot on the host account")
+    own.deals[export] = [{"DealID": 7}]
+
+    lighthouse.fail_listing = True
+    report = await _health(host, AGENT_A, own)
+
+    assert report.lighthouse.status == "error", report.lighthouse
+    details = report.lighthouse.details
+    assert "files_uploaded failed" in details["snapshot_error"]
+    assert details["sovereignty_export_error"] is None
+    exported = details["sovereignty_export"]
+    assert (exported["cid"], exported["agent_id"], exported["deal_count"]) == (
+        export,
+        AGENT_A,
+        1,
+    )
+    assert report.lighthouse.message == (
+        f"{details['snapshot_error']}; "
+        "Latest Lighthouse sovereignty export has 1 Filecoin deal(s)"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "offset",
+    [timedelta(days=-1), timedelta(0), timedelta(days=1)],
+    ids=["earlier", "same-second", "later-dated"],
+)
+async def test_another_upload_of_the_same_cid_is_thinned_by_its_own_record(
+    tmp_path, monkeypatch, kubo, lighthouse, data_key, offset
+):
+    """The account already holds an identical upload of the export, from
+    another attempt: two records of the CID just published, each taking
+    quota. Thinning decides on each record by its own id. An earlier record
+    is deleted, and so is one made in the same second, whose record id sorts
+    after the export's; one dated after the export, by a clock ahead of this
+    one's, is the newest and kept. The record just published is kept in
+    every case: it is the one with its own name (#3602)."""
+    other = {}
+
+    async def another_identical_upload():
+        lighthouse.after_upload = None
+        [published] = lighthouse.records()
+        other.update(
+            lighthouse.add(
+                lighthouse.blobs[published["cid"]],
+                sovereignty_export_upload_name(AGENT_A, lighthouse.now + offset),
+                published["tag"],
+                created_at=lighthouse.now + offset,
+            )
+        )
+        # An id that sorts after the export's: the record just published is
+        # the smaller of two of one time (#3602).
+        other["id"] = lighthouse.files[-1]["id"] = f"{published['id']}-retry"
+        # Listed first, where an upload made before this one would be.
+        lighthouse.files.insert(0, lighthouse.files.pop())
+
+    lighthouse.after_upload = another_identical_upload
+    async with _host(tmp_path / "host", monkeypatch, did=AGENT_A) as (agent, raw):
+        result = await _export_result(agent, raw)
+
+    cid = result.data["cid"]
+    assert other["cid"] == cid
+    survivors = [r for r in lighthouse.records() if r["id"] != other["id"]]
+    assert len(survivors) == 1, "the record just published was deleted"
+    [published] = survivors
+    assert published["cid"] == cid
+    assert published["fileName"] != other["fileName"]
+    assert other["id"] > published["id"]
+    retention = result.data["export_retention"]
+    if offset <= timedelta(0):
+        assert (retention["deleted"], retention["file_ids"], retention["cids"]) == (
+            1,
+            [other["id"]],
+            [cid],
+        )
+        assert lighthouse.records() == [published]
+    else:
+        assert (retention["deleted"], retention["file_ids"]) == (0, [])
+        assert lighthouse.records() == [other, published]
+
+
+@pytest.mark.asyncio
+async def test_an_account_listing_the_export_twice_thins_nothing_and_says_so(
+    tmp_path, monkeypatch, kubo, lighthouse, data_key
+):
+    """The account lists the export just published as two records under its
+    one name. Neither can be told apart from the record the upload made, so
+    the pass deletes nothing, not even the agent's older export, and says
+    why (#3602)."""
+    host = tmp_path / "host"
+    async with _host(host, monkeypatch, did=AGENT_A) as (agent, raw):
+        first = await _export(agent, raw)
+    lighthouse.now += timedelta(days=1)
+
+    async def listed_twice():
+        lighthouse.after_upload = None
+        published = lighthouse.records()[-1]
+        lighthouse.files.append(dict(published, id=f"file-{next(lighthouse.service.ids)}"))
+
+    lighthouse.after_upload = listed_twice
+    async with _host(host, monkeypatch, did=AGENT_A) as (agent, raw):
+        result = await _export_result(agent, raw)
+
+    retention = result.data["export_retention"]
+    assert (retention["deleted"], retention["file_ids"]) == (0, [])
+    assert "upload records are named" in retention["error"]
+    assert lighthouse.cids() == {first, result.data["cid"]}
+    assert len(lighthouse.records()) == 3
 
 
 @pytest.mark.asyncio

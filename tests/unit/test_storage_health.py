@@ -487,17 +487,36 @@ def _snapshot_upload(cid, agent_id, created_at):
     }
 
 
-def _accounts(uploads_by_key, deals_by_cid, listed):
-    """Lighthouse with one account per key; ``listed`` records each listing."""
+class AccountUnavailable(Exception):
+    """A Lighthouse account that does not answer."""
+
+
+def _accounts(uploads_by_key, deals_by_cid, listed, *, downloads=None, failing=None):
+    """Lighthouse with one account per key; ``listed`` records each listing.
+
+    ``failing`` maps a key to the call that fails on its account:
+    ``"listing"``, ``"manifest"`` (a download) or ``"deals"``.
+    """
+    failing = failing or {}
 
     class Client(FakeLighthouseClient):
+        def _answer(self, call):
+            if failing.get(self.api_key) == call:
+                raise AccountUnavailable(f"{self.api_key} account: {call} failed")
+
         async def get_uploads(self, last_key=None):
             listed.append(self.api_key)
+            self._answer("listing")
             if last_key is not None:
                 return {"fileList": []}
             return {"fileList": uploads_by_key.get(self.api_key, [])}
 
+        async def download(self, cid):
+            self._answer("manifest")
+            return (downloads or {})[cid]
+
         async def get_deal_status(self, cid):
+            self._answer("deals")
             return deals_by_cid.get(cid, [])
 
     return Client
@@ -595,6 +614,143 @@ async def test_an_unresolvable_export_key_is_an_error_beside_the_snapshot():
     assert result.details["cid"] == "QmSnapshot"
     assert result.details["sovereignty_export"] is None
     assert listed == ["host"]
+
+
+def _manifest_upload(cid, agent_id, created_at):
+    return {
+        "cid": cid,
+        "fileName": (
+            f"kestrel_manifest__{agent_id}__{created_at.strftime('%Y%m%d_%H%M%S')}.json"
+        ),
+        "createdAt": int(created_at.timestamp() * 1000),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_call", ["listing", "manifest", "deals"])
+async def test_a_failing_snapshot_account_still_reports_the_agents_export(
+    failing_call,
+):
+    """The snapshot account fails to list its uploads, to serve the manifest
+    its latest snapshot resolves through, or to answer that snapshot's deal
+    status. The export account answers, and the agent's latest export on it
+    is reported beside the snapshot account's error (#3602)."""
+    listed = []
+    client = _accounts(
+        {
+            "host": [_manifest_upload("QmManifest", "agent-1", NOW - timedelta(hours=1))],
+            "agent": [
+                _export_upload("QmOlderExport", "agent-1", NOW - timedelta(days=2)),
+                _export_upload("QmExport", "agent-1", NOW - timedelta(hours=3)),
+            ],
+        },
+        {"QmSnapshot": [{"DealID": 1}], "QmExport": [{"DealID": 2}]},
+        listed,
+        downloads={
+            "QmManifest": (
+                b'{"snapshot_cid":"QmSnapshot",'
+                b'"uploaded_at":"2026-05-10T11:00:00+00:00"}'
+            )
+        },
+        failing={"host": failing_call},
+    )
+
+    result = await check_lighthouse_health(
+        snapshot_api_key="host",
+        export_api_key="agent",
+        agent_id="agent-1",
+        now=NOW,
+        client_factory=client,
+    )
+
+    snapshot_error = f"Lighthouse snapshot check failed: host account: {failing_call} failed"
+    assert result.status == "error"
+    assert result.details["snapshot_error"] == snapshot_error
+    assert result.details["sovereignty_export_error"] is None
+    export = result.details["sovereignty_export"]
+    assert (export["cid"], export["agent_id"], export["status"], export["deal_count"]) == (
+        "QmExport",
+        "agent-1",
+        "ok",
+        1,
+    )
+    assert result.details["resolved_via"] == "sovereignty_export"
+    assert result.details["cid"] == "QmExport"
+    assert result.message == (
+        f"{snapshot_error}; Latest Lighthouse sovereignty export has 1 Filecoin deal(s)"
+    )
+    assert sorted(listed) == ["agent", "host"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_call", ["listing", "deals"])
+async def test_a_failing_export_account_still_reports_the_snapshot(failing_call):
+    """The reverse: the export account fails, and the snapshot on the host
+    account is reported beside its error (#3602)."""
+    listed = []
+    client = _accounts(
+        {
+            "host": [_snapshot_upload("QmSnapshot", "agent-1", NOW - timedelta(hours=1))],
+            "agent": [_export_upload("QmExport", "agent-1", NOW - timedelta(hours=3))],
+        },
+        {"QmSnapshot": [{"DealID": 1}], "QmExport": [{"DealID": 2}]},
+        listed,
+        failing={"agent": failing_call},
+    )
+
+    result = await check_lighthouse_health(
+        snapshot_api_key="host",
+        export_api_key="agent",
+        agent_id="agent-1",
+        now=NOW,
+        client_factory=client,
+    )
+
+    export_error = (
+        "Lighthouse sovereignty export check failed: "
+        f"agent account: {failing_call} failed"
+    )
+    assert result.status == "error"
+    assert result.details["snapshot_error"] is None
+    assert result.details["sovereignty_export_error"] == export_error
+    assert result.details["sovereignty_export"] is None
+    assert (result.details["cid"], result.details["deal_count"]) == ("QmSnapshot", 1)
+    assert result.message == (
+        f"{export_error}; Latest Lighthouse snapshot has 1 Filecoin deal(s)"
+    )
+    assert sorted(listed) == ["agent", "host"]
+
+
+@pytest.mark.asyncio
+async def test_an_account_both_keys_name_that_fails_is_listed_once_and_errs_for_both():
+    listed = []
+    client = _accounts(
+        {"host": [_export_upload("QmExport", "agent-1", NOW)]},
+        {},
+        listed,
+        failing={"host": "listing"},
+    )
+
+    result = await check_lighthouse_health(
+        snapshot_api_key="host",
+        export_api_key="host",
+        agent_id="agent-1",
+        now=NOW,
+        client_factory=client,
+    )
+
+    assert result.status == "error"
+    assert listed == ["host"]
+    assert result.details["snapshot_error"] == (
+        "Lighthouse snapshot check failed: host account: listing failed"
+    )
+    assert result.details["sovereignty_export_error"] == (
+        "Lighthouse sovereignty export check failed: host account: listing failed"
+    )
+    assert result.message == (
+        f"{result.details['snapshot_error']}; "
+        f"{result.details['sovereignty_export_error']}"
+    )
 
 
 @pytest.mark.asyncio
