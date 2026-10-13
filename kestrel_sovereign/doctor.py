@@ -1386,21 +1386,30 @@ class _GovernanceSource:
     pick a tenant by incidental row order. On SQLite the file holds one agent,
     but the DID is still needed: the runtime's store is bound on that backend
     too, and its reads carry an ownership predicate keyed by DID.
+
+    The connection fields are excluded from ``repr`` (and so from ``str`` and
+    any f-string or ``%r`` log line that embeds this object, including
+    ``_AgentGovernance``'s): ``dsn`` can carry a password, and ``postgres_env``
+    is the spawned agent's whole environment — API tokens and
+    ``KESTREL_DATA_KEY`` included (#2992). ``describe()`` is the human-facing
+    rendering.
     """
 
     anchor_path: Path
     agent_did: str
-    dsn: str | None = None
+    dsn: str | None = field(default=None, repr=False)
     #: Explicit DSN and environment-derived identities to redact from worker
     #: failures.  Asyncpg receives the launcher environment unchanged, so the
     #: redaction boundary must cover values that never appear in ``dsn``.
-    dsn_identity: tuple | None = None
+    dsn_identity: tuple | None = field(default=None, repr=False)
     #: HOME seen by asyncpg in the spawned agent, retained only for redaction
     #: of default credential and TLS paths in driver errors.
-    postgres_home: str | None = None
+    postgres_home: str | None = field(default=None, repr=False)
     #: Complete environment resolved by the launcher for the spawned agent.
     #: The asyncpg worker receives this copy unchanged, just like the agent.
-    postgres_env: dict[str, str] | None = None
+    #: A PostgreSQL read without it fails closed rather than borrowing
+    #: doctor's own process environment (#2992).
+    postgres_env: dict[str, str] | None = field(default=None, repr=False)
     #: Working directory ProcessManager gives the spawned agent. Relative GSS
     #: configuration/cache locations must resolve beneath the same directory.
     postgres_cwd: str | None = None
@@ -1779,7 +1788,7 @@ def _postgres_connection_files(dsn: str, env: dict) -> tuple:
     return tuple(sorted(found, key=lambda pair: len(pair[1]), reverse=True))
 
 
-def _dsn_identity(dsn: str, *, include_host: bool = True) -> tuple:
+def _dsn_identity(dsn: str) -> tuple:
     """Return identity-bearing URI fields without asking a different driver."""
     found: set[tuple[str, str]] = set()
     try:
@@ -1790,7 +1799,7 @@ def _dsn_identity(dsn: str, *, include_host: bool = True) -> tuple:
     if parts is not None:
         if parts.username:
             found.add(("user", unquote(parts.username)))
-        if include_host and parts.hostname:
+        if parts.hostname:
             found.add(("host", unquote(parts.hostname)))
         if parts.path and parts.path != "/":
             found.add(("dbname", unquote(parts.path.removeprefix("/"))))
@@ -1798,8 +1807,6 @@ def _dsn_identity(dsn: str, *, include_host: bool = True) -> tuple:
     for field_name, value in _dsn_query(dsn):
         normalized = "dbname" if field_name == "database" else field_name
         if normalized not in _DSN_IDENTITY_FIELDS:
-            continue
-        if normalized == "host" and not include_host:
             continue
         for member in value.split(",") if normalized == "host" else (value,):
             found.add((normalized, unquote(member)))
@@ -1863,6 +1870,10 @@ class _PostgresProbeQueryError(_PostgresProbeError):
     """Asyncpg connected, but the read-only governance query failed."""
 
 
+class _PostgresProbeContextMissingError(_PostgresProbeError):
+    """No spawned-agent context was supplied, so no worker was started."""
+
+
 class _PostgresProbeTimeoutError(_PostgresProbeError):
     """The bounded worker was terminated with its result still unknown."""
 
@@ -1905,8 +1916,18 @@ def _source_unreadable(
     return _postgres_unreadable(exc, reason=reason)
 
 
-def _postgres_probe_env(resolved_env: dict[str, str]) -> dict[str, str]:
-    """Copy the environment ProcessManager gives the spawned agent."""
+def _postgres_probe_env(resolved_env: dict[str, str] | None) -> dict[str, str]:
+    """Copy the environment ProcessManager gives the spawned agent.
+
+    Doctor's own ``os.environ`` is deliberately not the launcher's (#2932), so
+    a missing environment is a failure, never a cue to borrow ambient state.
+    """
+    if resolved_env is None:
+        raise _PostgresProbeContextMissingError(
+            "PostgreSQL probe context missing: no spawned-agent environment "
+            "was supplied, and doctor does not substitute its own process "
+            "environment"
+        )
     child_env = dict(resolved_env)
     child_env.setdefault("PYTHONUNBUFFERED", "1")
     return child_env
@@ -2043,9 +2064,14 @@ def _fetch_postgres_rows_isolated(
             "PostgreSQL diagnostic query parameters are not transportable"
         ) from exc
 
-    child_env = _postgres_probe_env(
-        postgres_env if postgres_env is not None else os.environ
-    )
+    child_env = _postgres_probe_env(postgres_env)
+    if postgres_cwd is None:
+        # Relative service-file, GSS and credential-cache paths resolve
+        # against the cwd, so doctor's own would be the wrong context too.
+        raise _PostgresProbeContextMissingError(
+            "PostgreSQL probe context missing: no spawned-agent working "
+            "directory was supplied, and doctor does not substitute its own"
+        )
     command = [
         sys.executable,
         "-m",
