@@ -509,11 +509,13 @@ class VertexAIAdapter(LLMAdapter):
                     yield chunk.text
                 elif hasattr(chunk, 'candidates') and chunk.candidates:
                     for candidate in chunk.candidates:
-                        if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
-                            for part in candidate.content.parts:
-                                if hasattr(part, 'text') and part.text:
-                                    text_content += part.text
-                                    yield part.text
+                        # A candidate cut before any text (its thinking took
+                        # the whole budget) has content but no parts (#3621).
+                        content = getattr(candidate, "content", None)
+                        for part in getattr(content, "parts", None) or ():
+                            if getattr(part, "text", None):
+                                text_content += part.text
+                                yield part.text
 
             input_tokens = output_tokens = total_tokens = None
             cache_read_input_tokens = None
