@@ -169,17 +169,25 @@ def test_sovereignty_export_typed_refusal_returns_4xx_not_500():
     this host cannot honour (``encrypt=True`` with no ``KESTREL_DATA_KEY``)
     could not tell "I asked for something impossible" from "the server broke".
     The feature now carries a typed ``data["refusal"]`` code and the endpoint
-    maps it: 409 for the unsatisfiable host configuration, 402 for the wallet.
+    maps it: 409 for the unsatisfiable host configuration and for a privacy
+    mode that does not permit a backup (#2875), 402 for the wallet.
     """
     from kestrel_sdk.tools.result import ToolResult
     from kestrel_sovereign.features.sovereignty.feature import (
         REFUSAL_ENCRYPTION_KEY_UNAVAILABLE,
         REFUSAL_INSUFFICIENT_FUNDS,
+        REFUSAL_PRIVACY_MODE_FORBIDS_BACKUP,
     )
 
     cases = [
         (REFUSAL_ENCRYPTION_KEY_UNAVAILABLE, "encrypt=True requires KESTREL_DATA_KEY", 409),
         (REFUSAL_INSUFFICIENT_FUNDS, "Insufficient funds for backup.", 402),
+        (
+            REFUSAL_PRIVACY_MODE_FORBIDS_BACKUP,
+            "Sovereignty export refused: the agent's privacy mode (ephemeral) "
+            "does not permit backups. No sovereignty backup was stored.",
+            409,
+        ),
     ]
 
     for refusal, message, expected_status in cases:

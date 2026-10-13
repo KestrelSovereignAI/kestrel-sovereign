@@ -701,7 +701,9 @@ class DurablePersistenceGate:
     (``KestrelAgent.workflow_await_signal_privacy_transition_lock``, #3484)
     holds it around "privacy check, then matcher/CAS", so no privacy
     transition completes inside that span, and the hook never queues behind
-    a turn.
+    a turn. A fourth does the same around "privacy check, then store": every
+    sovereignty export (#2875), through :func:`guarded_backup_store`, which
+    refuses to export without it.
 
     The gate is a leaf: nothing acquires CONVERSATION or the privacy-transition
     lock while holding it, so the global order stays CONVERSATION -> privacy
@@ -874,6 +876,79 @@ def _resolve_durable_persistence_gate(holder) -> Optional[DurablePersistenceGate
     if not callable(getter):
         return None
     return getter()
+
+
+class PrivacyTransitionGuardUnavailableError(RuntimeError):
+    """The holder exposes no durable persistence gate to hold against a transition."""
+
+
+def require_durable_persistence_gate(holder) -> DurablePersistenceGate:
+    """Return ``holder``'s durable persistence gate, refusing when it has none.
+
+    :func:`optional_durable_persistence_gate` runs unguarded without a gate,
+    which suits a persist with no privacy check to race. A writer whose
+    privacy check authorizes an effect it cannot take back, such as a
+    sovereignty export leaving the host (#2875), must not act on a check a
+    transition can invalidate before the write lands, so it refuses instead.
+    """
+    gate = _resolve_durable_persistence_gate(holder)
+    if not isinstance(gate, DurablePersistenceGate):
+        raise PrivacyTransitionGuardUnavailableError(
+            "the agent exposes no durable persistence gate to hold against a "
+            "privacy transition"
+        )
+    return gate
+
+
+class BackupPolicyUnavailableError(RuntimeError):
+    """The storage exposes no privacy policy that could permit a backup."""
+
+
+def require_backup_permitted(storage) -> None:
+    """Refuse unless ``storage``'s current privacy mode permits a backup.
+
+    Reads the policy :meth:`PrivacyEnforcingStorage.create_backup_blob`
+    enforces. Raises :class:`PrivacyViolationError` when the mode forbids a
+    backup, and :class:`BackupPolicyUnavailableError` when the storage exposes
+    no such policy, since a storage with none cannot permit one.
+    """
+    allows_backups = getattr(storage, "allows_backups", None)
+    if not callable(allows_backups):
+        raise BackupPolicyUnavailableError(
+            "the agent's storage exposes no privacy policy that could permit "
+            "a backup"
+        )
+    if allows_backups() is True:
+        return
+    mode = getattr(getattr(storage, "privacy_mode", None), "value", None)
+    raise PrivacyViolationError(
+        f"the agent's privacy mode ({mode}) does not permit backups"
+    )
+
+
+@asynccontextmanager
+async def guarded_backup_store(holder, storage):
+    """Hold ``holder``'s persistence gate shared across one backup store (#2875).
+
+    The one guard every sovereignty export holds around its store: the
+    ``export_sovereignty`` tool (and ``/api/sovereignty/export`` through it)
+    and the sleep cycle's export, which the scheduler runs. The policy is read
+    after the gate is acquired, so a transition that completed first is seen
+    and refused, and one that arrives during the block waits for it, because
+    ``privacy_transition()`` takes the same gate exclusive. Raises before the
+    block runs when ``holder`` has no gate
+    (:class:`PrivacyTransitionGuardUnavailableError`) or the policy refuses
+    (see :func:`require_backup_permitted`).
+
+    The block must not release the gate under a store still in flight: run a
+    blocking store through
+    :func:`kestrel_sovereign._async_ownership.run_blocking_operation`, or an
+    owned task, so caller cancellation waits for the store to finish.
+    """
+    gate = require_durable_persistence_gate(holder)
+    async with gate.shared():
+        require_backup_permitted(storage)
+        yield
 
 
 def _resolve_privacy_policy_epoch(holder) -> Optional[str]:
@@ -5274,14 +5349,24 @@ class PrivacyEnforcingStorage:
     
     # === Backup Operations (Privacy-Sensitive) ===
     
+    def allows_backups(self) -> bool:
+        """Whether the current privacy mode permits a backup of this agent's data.
+
+        ``False`` in EPHEMERAL / ISOLATED / DEIDENTIFIED. :meth:`create_backup_blob`
+        enforces it; a sovereignty export reads it again, under the durable
+        persistence gate, immediately before its store
+        (:func:`guarded_backup_store`, #2875).
+        """
+        return bool(self._policy.allow_cloud_backup)
+
     async def create_backup_blob(self, include_db: bool = True) -> bytes:
         """
         Create a backup blob.
-        
+
         - EPHEMERAL/ISOLATED: Raises PrivacyViolationError
         - Others: Creates backup
         """
-        if not self._policy.allow_cloud_backup:
+        if not self.allows_backups():
             raise PrivacyViolationError(
                 f"Backups are disabled in current privacy config (storage={self._privacy_config.storage})"
             )

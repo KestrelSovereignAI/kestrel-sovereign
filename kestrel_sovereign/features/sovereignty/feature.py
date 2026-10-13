@@ -1,7 +1,9 @@
 import asyncio
+import functools
 import inspect
 import logging
 from typing import Callable, Optional
+from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -22,6 +24,14 @@ from decimal import Decimal
 from datetime import datetime
 from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.storage import GraphNode
+from kestrel_sovereign.storage.privacy_wrapper import (
+    BackupPolicyUnavailableError,
+    PrivacyTransitionGuardUnavailableError,
+    PrivacyViolationError,
+    guarded_backup_store,
+    require_backup_permitted,
+    require_durable_persistence_gate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +42,9 @@ logger = logging.getLogger(__name__)
 # in ``kestrel_sovereign/endpoints/sovereignty.py``.
 REFUSAL_ENCRYPTION_KEY_UNAVAILABLE = "encryption_key_unavailable"
 REFUSAL_INSUFFICIENT_FUNDS = "insufficient_funds"
+# The agent's privacy mode does not permit a backup, read before the backup
+# blob or, after a transition, immediately before the store (#2875).
+REFUSAL_PRIVACY_MODE_FORBIDS_BACKUP = "privacy_mode_forbids_backup"
 # Import refusals (#2873): an export that cannot be decrypted, or cannot be
 # trusted, is refused before any of it reaches the restore.
 REFUSAL_ENCRYPTION_KEY_MISMATCH = "encryption_key_mismatch"
@@ -103,9 +116,10 @@ class SovereigntyFeature(Feature):
             ToolResult.ok with CID + tier + size on a clean export, PARTIAL
             when a non-local tier produced no IPFS CID (backup hashed
             locally but not actually pushed to the network), or
-            ToolResult.failed when requested encryption cannot be honoured
-            or a paid storage tier cannot be accounted for through a wallet.
-            Refusals carry a typed ``data["refusal"]`` code.
+            ToolResult.failed when requested encryption cannot be honoured,
+            a paid storage tier cannot be accounted for through a wallet, or
+            the agent's privacy mode does not permit a backup when the store
+            would begin. Refusals carry a typed ``data["refusal"]`` code.
         """
         # Validate storage_tier explicitly. The old code resolved this via
         # ``tier_map.get(storage_tier.lower(), StorageTier.IPFS)``, so a
@@ -173,6 +187,21 @@ class SovereigntyFeature(Feature):
                     data={"refusal": REFUSAL_ENCRYPTION_KEY_UNAVAILABLE},
                 )
 
+        # The privacy policy that authorizes this export is read here, before
+        # the backup blob, and again immediately before the store, under the
+        # durable persistence gate (#2875). Without the gate a transition could
+        # land between the two and the export would write under a policy that
+        # no longer permits it, so an agent that exposes none is refused.
+        try:
+            require_durable_persistence_gate(self.agent)
+            require_backup_permitted(getattr(self.agent, "storage", None))
+        except (
+            PrivacyTransitionGuardUnavailableError,
+            BackupPolicyUnavailableError,
+            PrivacyViolationError,
+        ) as e:
+            return self._backup_guard_refusal(e)
+
         wallet = getattr(self.agent, "wallet", None)
 
         # Budget check. Wallet is an optional feature package; core-only
@@ -193,34 +222,18 @@ class SovereigntyFeature(Feature):
                     data={"refusal": REFUSAL_INSUFFICIENT_FUNDS},
                 )
 
-        # Create backup blob
-        backup_blob = await self.agent.storage.create_backup_blob(include_db=True)
+        # Create backup blob. A transition that landed since the check above
+        # makes the storage wrapper refuse it; that is the same refusal.
+        try:
+            backup_blob = await self.agent.storage.create_backup_blob(include_db=True)
+        except PrivacyViolationError as e:
+            return self._backup_refused(str(e))
         progress = self._build_progress_reporter(
             on_progress=on_progress,
             tier=tier_enum.value,
             total_bytes=len(backup_blob),
         )
         progress(0, len(backup_blob))
-
-        # Store via adapter
-        adapter = FilecoinAdapter()
-        result = await asyncio.to_thread(
-            adapter.store_content,
-            backup_blob,
-            storage_tier=tier_enum,
-            encrypt=encrypt,
-            metadata={"agent": self.agent.agent_id},
-            on_progress=progress,
-            envelope_owner=self.agent.agent_id if encrypt else None,
-        )
-        progress(len(backup_blob), len(backup_blob))
-
-        # Record graph receipt
-        node_id = await self.agent.storage.record_backup_artifact(self.agent.agent_id, result)
-
-        # Deduct funds
-        if fee_main > 0 and wallet is not None:
-            await wallet.transfer(fee_main, memo=f"backup:{tier_enum.value}:{node_id}")
 
         audit_anchors = None
         try:
@@ -237,35 +250,61 @@ class SovereigntyFeature(Feature):
         except Exception:
             logger.debug("Failed to attach audit anchors to sovereignty receipt", exc_info=True)
 
-        receipt_properties = {
-            "cid": result.ipfs_cid,
-            "ipfs_cid": result.ipfs_cid,
-            "content_hash": result.content_hash,
-            "storage_tier": result.storage_tier.value,
-            "provider": getattr(result, "provider", None),
-            "encrypted": result.encrypted,
-            "encryption_key_hash": result.encryption_key_hash,
-            # The host-cache name, as the ``backup_artifact`` records it. A
-            # receipt that records it owns that cache entry only, never the
-            # bare content hash, which another agent's export of the same
-            # plaintext may be cached under (#2873).
-            "cache_name": getattr(result, "cache_name", None),
-            "size_bytes": getattr(result, "size_bytes", 0) or len(backup_blob),
-            # Graph created_at is a UTC ISO-8601 contract (#3256).
-            "created_at": utc_now_iso(),
-            "node_id": node_id,
-        }
-        if audit_anchors is not None:
-            receipt_properties["audit_anchors"] = audit_anchors
-
-        # Create receipt node
-        receipt_node = GraphNode(
-            node_id=f"sovereignty_receipt_{result.ipfs_cid or datetime.now().timestamp()}",
-            node_type="sovereignty_receipt",
-            label="Sovereignty Export Receipt",
-            properties=receipt_properties
+        # Store via adapter
+        adapter = FilecoinAdapter()
+        store = functools.partial(
+            adapter.store_content,
+            backup_blob,
+            storage_tier=tier_enum,
+            encrypt=encrypt,
+            metadata={"agent": self.agent.agent_id},
+            on_progress=progress,
+            envelope_owner=self.agent.agent_id if encrypt else None,
         )
-        await self.agent.storage.add_node(receipt_node)
+        # ``privacy_transition()`` takes the persistence gate exclusive, so
+        # while the guard holds it shared no transition completes: one that
+        # landed before it is seen by the guard's check, and one that arrives
+        # later waits until the store and its receipts are written (#2875).
+        # Concurrent exports share the gate, and it is not the
+        # privacy-transition lock a turn holds, so an export waits on neither.
+        # The store is held across, not re-checked after: an IPFS upload or
+        # Filecoin deal cannot be taken back once it lands, and its receipts
+        # are durable writes the same policy governs.
+        #
+        # Once the store begins, it, its receipts and its fee settle as one
+        # owned operation. A cancellation waits for them and is raised after,
+        # so the gate is never released under a write in flight, and a backup
+        # that landed is never left without its receipts or its charge.
+        try:
+            async with guarded_backup_store(
+                self.agent, getattr(self.agent, "storage", None)
+            ):
+                stored = await await_owned_task(
+                    asyncio.create_task(
+                        self._store_and_record(store, backup_blob, audit_anchors)
+                    )
+                )
+        except (
+            PrivacyTransitionGuardUnavailableError,
+            BackupPolicyUnavailableError,
+            PrivacyViolationError,
+        ) as e:
+            return self._backup_guard_refusal(e)
+
+        # Deduct funds
+        if stored.error is None and fee_main > 0 and wallet is not None:
+            _, node_id = stored.result
+            charged = await await_owned_task(
+                asyncio.create_task(
+                    self._charge_export_fee(
+                        wallet, fee_main, memo=f"backup:{tier_enum.value}:{node_id}"
+                    )
+                ),
+                stored.cancellation,
+            )
+            raise_owned_outcome(charged, operation="sovereignty export fee")
+        result, node_id = raise_owned_outcome(stored, operation="sovereignty export store")
+        progress(len(backup_blob), len(backup_blob))
 
         cid = result.ipfs_cid or result.content_hash
         size_bytes = getattr(result, "size_bytes", 0) or len(backup_blob)
@@ -317,6 +356,75 @@ class SovereigntyFeature(Feature):
             )
 
         return ToolResult.ok(confirmation, data=data)
+
+    async def _store_and_record(self, store, backup_blob: bytes, audit_anchors):
+        """Store the backup, then record it. Returns ``(result, node_id)``."""
+        result = await asyncio.to_thread(store)
+        node_id = await self._record_export(result, backup_blob, audit_anchors)
+        return result, node_id
+
+    @staticmethod
+    async def _charge_export_fee(wallet, fee: Decimal, *, memo: str) -> None:
+        await wallet.transfer(fee, memo=memo)
+
+    async def _record_export(self, result, backup_blob: bytes, audit_anchors) -> str:
+        """Record a stored export: its ``backup_artifact`` and its receipt."""
+        node_id = await self.agent.storage.record_backup_artifact(self.agent.agent_id, result)
+
+        receipt_properties = {
+            "cid": result.ipfs_cid,
+            "ipfs_cid": result.ipfs_cid,
+            "content_hash": result.content_hash,
+            "storage_tier": result.storage_tier.value,
+            "provider": getattr(result, "provider", None),
+            "encrypted": result.encrypted,
+            "encryption_key_hash": result.encryption_key_hash,
+            # The host-cache name, as the ``backup_artifact`` records it. A
+            # receipt that records it owns that cache entry only, never the
+            # bare content hash, which another agent's export of the same
+            # plaintext may be cached under (#2873).
+            "cache_name": getattr(result, "cache_name", None),
+            "size_bytes": getattr(result, "size_bytes", 0) or len(backup_blob),
+            # Graph created_at is a UTC ISO-8601 contract (#3256).
+            "created_at": utc_now_iso(),
+            "node_id": node_id,
+        }
+        if audit_anchors is not None:
+            receipt_properties["audit_anchors"] = audit_anchors
+
+        # Create receipt node
+        receipt_node = GraphNode(
+            node_id=f"sovereignty_receipt_{result.ipfs_cid or datetime.now().timestamp()}",
+            node_type="sovereignty_receipt",
+            label="Sovereignty Export Receipt",
+            properties=receipt_properties
+        )
+        await self.agent.storage.add_node(receipt_node)
+        return node_id
+
+    @classmethod
+    def _backup_guard_refusal(cls, error: Exception) -> ToolResult:
+        """The refusal for an export its privacy guard would not admit (#2875).
+
+        A privacy mode that forbids backups is a typed refusal; an agent with
+        no persistence gate or no backup policy is a host fault, untyped.
+        """
+        if isinstance(error, PrivacyViolationError):
+            return cls._backup_refused(str(error))
+        return ToolResult.failed(
+            error=(
+                f"Sovereignty export refused: {error}; no sovereignty backup "
+                "was created."
+            )
+        )
+
+    @staticmethod
+    def _backup_refused(reason: str) -> ToolResult:
+        logger.warning(f"Refused sovereignty export: {reason}")
+        return ToolResult.failed(
+            error=f"Sovereignty export refused: {reason}. No sovereignty backup was stored.",
+            data={"refusal": REFUSAL_PRIVACY_MODE_FORBIDS_BACKUP},
+        )
 
     def _build_progress_reporter(
         self,

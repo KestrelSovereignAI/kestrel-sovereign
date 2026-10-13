@@ -110,15 +110,21 @@ async def test_sovereignty_receipt_created_at_is_utc(monkeypatch, new_york_clock
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from kestrel_sovereign.features.sovereignty.feature import SovereigntyFeature
+    from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
     from kestrel_sovereign.storage.providers.base import StorageResult, StorageTier
 
     stored = []
     storage = MagicMock()
+    storage.allows_backups.return_value = True
     storage.create_backup_blob = AsyncMock(return_value=b"backup-bytes")
     storage.record_backup_artifact = AsyncMock(return_value="hash123")
     storage.add_node = AsyncMock(side_effect=lambda node: stored.append(deepcopy(node)))
     wallet = MagicMock(); wallet.can_afford.return_value = True; wallet.transfer = AsyncMock()
-    agent = SimpleNamespace(agent_id="did:kestrel:test", features={}, storage=storage, wallet=wallet)
+    gate = DurablePersistenceGate()
+    agent = SimpleNamespace(
+        agent_id="did:kestrel:test", features={}, storage=storage, wallet=wallet,
+        _get_durable_persistence_gate=lambda: gate,
+    )
     adapter = MagicMock()
     adapter.store_content.return_value = StorageResult(
         content_hash="hash123", cid="bafybackup", tier=StorageTier.IPFS, provider="ipfs",

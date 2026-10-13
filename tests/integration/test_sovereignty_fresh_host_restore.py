@@ -50,7 +50,10 @@ from kestrel_sovereign.filecoin_adapter import (
 )
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage import Storage
-from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.storage.privacy_wrapper import (
+    DurablePersistenceGate,
+    PrivacyEnforcingStorage,
+)
 
 AGENT_DID = "did:pkh:eip155:1:0x2873fresh"
 NEIGHBOUR_DID = "did:pkh:eip155:1:0x2873neighbour"
@@ -144,11 +147,14 @@ async def _host(directory, monkeypatch, *, did=AGENT_DID, database="kestrel_prim
     wallet = MagicMock()
     wallet.can_afford.return_value = True
     wallet.transfer = AsyncMock()
+    gate = DurablePersistenceGate()
     agent = SimpleNamespace(
         agent_id=did,
         storage=PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL),
         features={},
         wallet=wallet,
+        # An export holds it across its store (#2875).
+        _get_durable_persistence_gate=lambda: gate,
     )
     try:
         yield agent, raw
