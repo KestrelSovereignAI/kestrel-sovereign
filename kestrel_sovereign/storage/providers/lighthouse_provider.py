@@ -856,13 +856,14 @@ async def resolve_lighthouse_storage(
 ) -> Any:
     """An agent's Lighthouse credential, resolved by its PayerPolicy (#2874).
 
-    The one resolution of the account an agent's Lighthouse traffic uses.
+    The one resolution of the account an agent's sovereignty exports use.
     Boot builds the agent's provider from it (:func:`lighthouse_provider_for`),
-    and that provider publishes the agent's sovereignty exports, thins them,
-    reports their health and keys the agent's snapshot target, whose
-    retention prunes that account. ``kestrel storage health`` reads the
-    account it names (:func:`lighthouse_api_key_for`). None of them reads a
-    Lighthouse key of its own.
+    and that provider publishes the agent's sovereignty exports, thins them
+    and reports their health. ``kestrel storage health`` reads their account
+    with the key it names (:func:`lighthouse_api_key_for`). None of them
+    reads a Lighthouse key of its own. The agent's state snapshots are not
+    on this account: they go to the host's ``LIGHTHOUSE_API_KEY``, the one
+    account cold-start restore can read before the agent's database exists.
 
     ``policy``, ``db`` and ``host_db`` are the agent's, as
     ``FoundationPayerResolver`` takes them. ``wallet_private_key`` is needed

@@ -1022,7 +1022,9 @@ class SovereigntyFeature(Feature):
                 ),
             }
         health = await check_lighthouse_health(
-            api_key=api_key, agent_id=self.agent.agent_id
+            snapshot_api_key=None,
+            export_api_key=api_key,
+            agent_id=self.agent.agent_id,
         )
         if health.status == "error":
             return {"status": "error", "message": health.message}

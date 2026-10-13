@@ -122,12 +122,16 @@ kestrel storage health --agent Emma --json
 kestrel storage health --agent-id did:example:agent
 ```
 
-The Lighthouse check reads the account the agent publishes to. Its key comes
+The Lighthouse check reads each upload on the account it went to, and every
+tier is read in the environment `kestrel start` gives the agent: the project
+`.env` over an exported value. The agent's state snapshots are on the host's
+`LIGHTHOUSE_API_KEY` account, so a shell exporting another key than the
+`.env` does not move the check to an account the agent never uploads to. Its
+sovereignty exports are on the account it publishes them to, whose key comes
 from the agent's PayerPolicy, resolved the way boot resolves it
 (`resolve_lighthouse_storage` in
-`kestrel_sovereign/storage/providers/lighthouse_provider.py`), in the
-environment `kestrel start <name>` gives that agent: the project `.env` over
-an exported value, the agent's data directory as `KESTREL_DB_PATH` and its own
+`kestrel_sovereign/storage/providers/lighthouse_provider.py`), in that
+environment with the agent's data directory as `KESTREL_DB_PATH` and its own
 data key. `--agent` names a local agent in `multi_agent.toml`, and
 `--agent-id` alone names the local agent with that DID: its database supplies
 its DID and any key it holds itself (`!add-key`, a `SELF_WALLET` mint). When
@@ -135,8 +139,7 @@ no local agent has the DID there is no agent database, so only a host-level
 key resolves, and the command says so. Both databases are opened read-only,
 and nothing is minted. A credential that cannot be resolved (a `SELF_WALLET`
 key the agent has not minted yet, say) is reported as the Lighthouse tier's
-error while the other tiers are still checked. The command reads no
-`LIGHTHOUSE_API_KEY` of its own.
+error while the other tiers are still checked.
 
 Lighthouse upload names are agent scoped for restore safety and retention:
 state snapshots use `kestrel_state__<agent_id>__<YYYYMMDD_HHMMSS>.car`, and
@@ -158,17 +161,16 @@ content; the payload is the export's sealed envelope. The family is distinct
 from `kestrel_state__`/`kestrel_manifest__` on purpose: cold-start restore
 reads its database from those, and an export is an encrypted archive.
 
-Every reader and pruner of an agent's Lighthouse account uses the credential
-that publishes to it: the key the agent's PayerPolicy resolves (an
+Every reader and pruner of an agent's sovereignty exports uses the credential
+that publishes them: the key the agent's PayerPolicy resolves (an
 agent-scoped key in its encrypted key storage, a `SELF_WALLET` key, or the
 host key). Boot builds the agent's Lighthouse provider from that one
-resolution, and nothing else reads a Lighthouse key of its own. The provider
+resolution, and nothing else reads a key of its own for them. The provider
 asks the resolution for the key before each call and never falls back to the
 key it last had: once none resolves (the agent's own key removed, with no
 host key to stand in), it has no key, so an export stays local and says so,
-the snapshot target fails rather than upload, and both health checks report
-no credential. A resolution that fails is raised, not papered over with the
-old key.
+and both health checks report no export credential. A resolution that fails
+is raised, not papered over with the old key.
 
 Only a key the agent does not hold falls back to the host's
 `LIGHTHOUSE_API_KEY`. A key it holds but cannot read (a damaged row, an
@@ -177,28 +179,31 @@ was stored under) is an error, never
 a reason to use the host's account: every Lighthouse path asks
 `KeyResolutionService.resolve_key(..., strict_storage=True)`, which raises
 `KeyUnreadableError` instead of falling back. The export is then refused with
-nothing stored, recorded or charged; the snapshot target neither uploads nor
-prunes; and both health checks report the error. When boot meets it, boot
-builds no provider and `!check-sovereignty-status` reports why. Other callers
-of `resolve_key` keep falling back on any storage failure.
+nothing stored, recorded or charged; its thinning prunes nothing; and both
+health checks report the error. When boot meets it, boot builds no provider
+and `!check-sovereignty-status` reports why. Other callers of `resolve_key`
+keep falling back on any storage failure.
 
 - After each export it publishes, the provider thins the agent's older
   exports on that account, among themselves, with identity retention. Only
   uploads whose name and tag attribute to the agent are considered; another
   agent's are never touched.
-- The snapshot target boot registers asks the same provider for its key
-  before each call, so its snapshots, and the retention prune that follows
-  each one, are on the same account, a rotated key included. That prune
-  leaves exports alone. An unchanged snapshot is skipped only when its last
-  upload went to the account the key names now: the target's local manifest
-  records a one-way digest of that account (never the key, and not in the
-  manifest it uploads), and a snapshot recorded on another account, or
-  before the digest was recorded, is uploaded again.
+- State snapshots are not on that account. The snapshot target boot
+  registers uploads with the host's `LIGHTHOUSE_API_KEY`, and the retention
+  prune after each snapshot runs there too. That is the one account
+  cold-start restore can read: it runs before the agent's database exists,
+  so before any key the agent holds itself can be read. The target is
+  registered when PayerPolicy permits Lighthouse storage and the host key is
+  set, whichever key the agent's exports use, so a key the agent holds but
+  cannot read stops its exports, not its snapshots. The prune leaves exports
+  alone.
 - `!check-sovereignty-status` and `kestrel storage health` report the agent's
-  latest export on that account, attributed to the agent, with its Filecoin
-  deal status, whether or not this host still holds the export's receipt.
-  They read every page of the account's uploads, and count deals in either
-  shape `deal_status` answers with (a list of deals, or the list wrapped as
+  latest export on the export account, attributed to the agent, with its
+  Filecoin deal status, whether or not this host still holds the export's
+  receipt. `kestrel storage health` also reports the latest snapshot, from
+  the host account, and lists an account once when both keys name it. Both
+  read every page of an account's uploads, and count deals in either shape
+  `deal_status` answers with (a list of deals, or the list wrapped as
   `{"data": [...]}`). With no state snapshot, the export is the upload the
   check reports; with both, the status is the worse of the two.
 - `scripts/backup_cleanup.py` attributes exports by the same rule and never
@@ -216,11 +221,6 @@ of `resolve_key` keep falling back on any storage failure.
   reported as not durable off-host, as when no provider exists.
 - Exports made before the naming restore exactly as before; the name does not
   change an IPFS CID.
-
-Cold-start restore still reads `LIGHTHOUSE_API_KEY`: it runs before the
-agent's database, and so any key the agent holds itself, exists. An agent
-whose PayerPolicy resolves another key snapshots to that key's account, which
-cold-start does not read.
 
 ## Pricing Reality (Mar 2026)
 

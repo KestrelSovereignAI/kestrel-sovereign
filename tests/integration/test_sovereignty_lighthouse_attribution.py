@@ -6,7 +6,8 @@ whose restore point it destroyed. Every test here goes through the entry
 points: ``SovereigntyFeature.export_sovereignty``, ``check_sovereignty_status``
 and ``import_sovereignty``, ``kestrel storage health --agent``, the snapshot
 target boot registers and its retention under ``SyncService.force_snapshot``,
-and the backlog cleanup tool in ``scripts/backup_cleanup.py``.
+a real ``KestrelAgent`` boot and cold-start restore, and the backlog cleanup
+tool in ``scripts/backup_cleanup.py``.
 
 Lighthouse keeps one account per API key, behind the REST client core uses.
 Each agent's Lighthouse provider is built the way boot builds it, from its
@@ -14,7 +15,9 @@ PayerPolicy resolution: an agent-scoped key in its encrypted key storage, or
 else the host ``LIGHTHOUSE_API_KEY``. Agents that resolve the host key share
 its account, which is what makes attribution matter; an agent with its own key
 publishes to another account, which every reader and pruner of its exports
-must then use. The gateway is public: any account's upload downloads by CID.
+must then use. State snapshots stay on the host key's account whatever key an
+agent's exports use: it is the one account cold-start restore can read. The
+gateway is public: any account's upload downloads by CID.
 The adapter's own IPFS node is offline unless a test brings it up: the agent's
 Lighthouse provider then takes the IPFS tier, and serves it back.
 """
@@ -53,7 +56,7 @@ from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
 from kestrel_sovereign.services.key_resolution import KeyUnreadableError
 from kestrel_sovereign.kestrel_agent import (
-    _add_lighthouse_target_if_resolved,
+    _add_lighthouse_snapshot_target,
     _build_lighthouse_provider,
 )
 from kestrel_sovereign.storage import GraphNode, Storage
@@ -67,6 +70,7 @@ from kestrel_sovereign.storage.providers.lighthouse_provider import (
 from kestrel_sovereign.storage.providers.lighthouse_rest import (
     LighthouseDownloadLimitError,
 )
+from kestrel_sovereign.paths import spawned_agent_env
 from kestrel_sovereign.storage.sync.health import build_storage_health_report
 from kestrel_sovereign.storage.sync.lighthouse_target import LighthouseTarget
 from kestrel_sovereign.storage.sync.retention import RetentionPolicy
@@ -398,6 +402,7 @@ async def _host(directory, monkeypatch, *, did, lighthouse=True, agent_key=None)
     if agent_key is not None and not await keys.has_key("lighthouse"):
         await keys.store_key("lighthouse", agent_key)
     provider = provider_error = None
+    storage_permitted = False
     if lighthouse:
         # Built only when policy permits a remote tier, by boot's own helper.
         async def resolve_storage():
@@ -405,7 +410,9 @@ async def _host(directory, monkeypatch, *, did, lighthouse=True, agent_key=None)
                 did, policy=PayerPolicy.host_env_default(), db=raw.db, host_db=None
             )
 
-        provider, provider_error = await _build_lighthouse_provider(resolve_storage)
+        provider, provider_error, storage_permitted = await _build_lighthouse_provider(
+            resolve_storage
+        )
     wallet = MagicMock()
     wallet.can_afford.return_value = True
     wallet.transfer = AsyncMock()
@@ -420,6 +427,8 @@ async def _host(directory, monkeypatch, *, did, lighthouse=True, agent_key=None)
         _get_durable_persistence_gate=lambda: gate,
         lighthouse_provider=provider,
         lighthouse_provider_error=provider_error,
+        # Boot's gate for the snapshot target, which uses the host's key.
+        lighthouse_storage_permitted=storage_permitted,
     )
     try:
         yield agent, raw
@@ -454,17 +463,20 @@ async def _history(raw):
 
 
 async def _health(directory, did, account, *, after=timedelta(hours=1)):
-    """``kestrel storage health --agent <name>``: the report on the account
-    the agent's PayerPolicy resolves, the one it publishes to."""
+    """``kestrel storage health --agent <name>``: exports read on the account
+    the agent's PayerPolicy resolves, the one it publishes them to, and
+    snapshots on the host key's account, both in the environment the
+    launcher hands the agent, as the command reads them."""
+    launch_env = spawned_agent_env(directory)
     credential = await cli._storage_health_lighthouse_key(
-        directory, agent_name=NAMES[did], agent_id=None
+        directory, launch_env, agent_name=NAMES[did], agent_id=None
     )
     assert (credential.agent_id, credential.with_agent_database) == (did, True)
     assert credential.error is None, credential.error
     return await build_storage_health_report(
         agent_id=credential.agent_id,
-        lighthouse_api_key=credential.api_key,
-        env={},
+        export_api_key=credential.api_key,
+        env=launch_env,
         now=account.now + after,
     )
 
@@ -932,21 +944,26 @@ async def test_health_finds_an_export_beyond_the_first_page_of_uploads(
     assert report.lighthouse.details["sovereignty_export"]["cid"] == latest
 
 
-async def _snapshot(agent, raw, message):
-    """The agent's sync service, with the Lighthouse target boot registers,
-    takes a snapshot: the upload and the retention prune after it."""
-    await raw.add_conversation("user", message, metadata={})
+def _snapshot_service(agent) -> SyncService:
+    """The agent's sync service, with the Lighthouse target boot registers."""
     service = SyncService(
         db_path=str(agent.agent_dir / "kestrel_prime.db"),
         retention_policy=NEWEST_ONLY,
     )
-    assert await _add_lighthouse_target_if_resolved(
+    assert _add_lighthouse_snapshot_target(
         service,
-        provider=agent.lighthouse_provider,
+        storage_permitted=agent.lighthouse_storage_permitted,
         agent_id=agent.agent_id,
         state_dir=agent.agent_dir,
     )
-    [result] = (await service.force_snapshot()).values()
+    return service
+
+
+async def _snapshot(agent, raw, message):
+    """The agent's sync service takes a snapshot: the upload and the
+    retention prune after it."""
+    await raw.add_conversation("user", message, metadata={})
+    [result] = (await _snapshot_service(agent).force_snapshot()).values()
     assert result.success, result
     return result
 
@@ -955,31 +972,168 @@ def _snapshot_cids(account):
     return {r["cid"] for r in account.files if r["fileName"].startswith("kestrel_state__")}
 
 
+def _export_records(account):
+    return [
+        r for r in account.records() if r["fileName"].startswith("kestrel_sovereignty__")
+    ]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("host_key", [True, False], ids=["differing-host-key", "no-host-key"])
-async def test_automatic_retention_runs_on_the_account_the_agent_publishes_to(
+async def test_snapshots_stay_on_the_host_account_while_exports_go_to_the_agents(
     tmp_path, monkeypatch, kubo, lighthouse, data_key, host_key
 ):
-    """The snapshot target boot registers is keyed by the agent's provider:
-    its uploads and its retention prune land on the agent's own account, the
-    one its exports went to, whether the host's key names another account or
-    there is none (#2874)."""
+    """The agent's exports go to the account its own key names. Its state
+    snapshots, and the retention prune after each, stay on the host's
+    LIGHTHOUSE_API_KEY account, the one cold-start restore reads. With no
+    host key, boot registers no snapshot target at all (#2874)."""
     if not host_key:
         monkeypatch.delenv("LIGHTHOUSE_API_KEY")
     own = lighthouse.service.account(AGENT_KEY)
     host = tmp_path / "host"
     async with _host(host, monkeypatch, did=AGENT_A, agent_key=AGENT_KEY) as (agent, raw):
         export = await _export(agent, raw)
-        first = (await _snapshot(agent, raw, "first")).metadata["cid"]
-        lighthouse.now += timedelta(days=1)
-        second = (await _snapshot(agent, raw, "second")).metadata["cid"]
+        if host_key:
+            first = (await _snapshot(agent, raw, "first")).metadata["cid"]
+            lighthouse.now += timedelta(days=1)
+            second = (await _snapshot(agent, raw, "second")).metadata["cid"]
+        else:
+            service = SyncService(db_path=str(agent.agent_dir / "kestrel_prime.db"))
+            assert not _add_lighthouse_snapshot_target(
+                service,
+                storage_permitted=agent.lighthouse_storage_permitted,
+                agent_id=AGENT_A,
+                state_dir=agent.agent_dir,
+            )
+            assert service.targets == []
 
-    # Retention kept the newest snapshot and left the export alone.
-    assert _snapshot_cids(own) == {second}
-    assert first != second
-    assert export in own.cids()
-    # Nothing reached the host account.
-    assert lighthouse.files == []
+    # The export, alone, is on the agent's account.
+    assert own.cids() == {export}
+    if host_key:
+        # Retention kept the newest snapshot, on the host account, which
+        # holds no export of the agent's.
+        assert _snapshot_cids(lighthouse) == {second}
+        assert first != second
+        assert _export_records(lighthouse) == []
+    else:
+        assert lighthouse.files == []
+
+
+@asynccontextmanager
+async def _booted(did, db_path):
+    """A real agent through every boot phase, on the database at ``db_path``,
+    loading no optional feature, under the host-env PayerPolicy."""
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.llm.service import LLMService
+
+    llm_service = LLMService()
+    agent = KestrelAgent(
+        did=did,
+        storage_path=str(db_path),
+        llm_service=llm_service,
+        allowed_features=set(),
+        payer_policy=PayerPolicy.host_env_default(),
+    )
+    try:
+        await agent.initialize()
+        yield agent
+    finally:
+        await agent.shutdown()
+        await llm_service.close()
+
+
+async def _incept_with_own_key(tmp_path, monkeypatch):
+    """An agent incepted in ``tmp_path`` holding a Lighthouse key of its own,
+    AGENT_KEY, in its encrypted key storage, ready for :func:`_booted`.
+    Returns its DID and database path."""
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.storage.sync import service as sync_service
+
+    # The remote-tier gate refuses a test instance in a temporary directory.
+    # It is opened here: the account a snapshot goes to is under test, not
+    # the gate.
+    monkeypatch.setattr(
+        sync_service,
+        "_remote_tiers_allowed",
+        lambda context: sync_service.RemoteTierPolicyDecision(True),
+    )
+    monkeypatch.delenv("LIGHTHOUSE_STATE_CID", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
+    credentials = await create_kestrel_identity_async(
+        output_dir=str(tmp_path), is_test_instance=True, agent_name="kite"
+    )
+    did = credentials.agent_did
+    db_path = tmp_path / "kestrel_prime.db"
+    raw = Storage(str(db_path), agent_id=did)
+    await raw.initialize()
+    await ServiceKeyStorage(raw.db, did).store_key("lighthouse", AGENT_KEY)
+    await raw.close()
+    return did, db_path
+
+
+@pytest.mark.asyncio
+async def test_a_snapshot_from_boot_restores_on_a_cold_start_when_the_agents_key_differs(
+    tmp_path, monkeypatch, kubo, lighthouse, data_key
+):
+    """Through the real boot phases. An agent whose PayerPolicy resolves a key
+    of its own, naming another account than the host's, boots and takes a
+    snapshot with the target boot registered. Its database and the target's
+    local manifest are then lost, as on an ephemeral host. A cold start,
+    which can read only the host's key, finds the snapshot and restores the
+    database (#2874)."""
+    own = lighthouse.service.account(AGENT_KEY)
+    did, db_path = await _incept_with_own_key(tmp_path, monkeypatch)
+
+    async with _booted(did, db_path) as agent:
+        assert await agent.lighthouse_provider.resolve_api_key() == AGENT_KEY
+        await agent._raw_storage.add_conversation(
+            "user", "the heron nests by the weir", metadata={}
+        )
+        results = await agent._sync_service.force_snapshot()
+    snapshot = results[f"lighthouse://{did}"]
+    assert snapshot.success, snapshot
+    assert snapshot.metadata["cid"] in _snapshot_cids(lighthouse)
+    assert own.files == []
+
+    # The host is lost: the database, its sidecars, and the snapshot target's
+    # local record of what it uploaded.
+    for lost in [*tmp_path.glob("kestrel_prime.db*"), *tmp_path.glob(".lighthouse_manifest_*")]:
+        lost.unlink()
+    assert not db_path.exists()
+
+    async with _booted(did, db_path) as restored:
+        history = await restored._raw_storage.get_conversation_history()
+
+    assert "the heron nests by the weir" in [m["content"] for m in history]
+
+
+@pytest.mark.asyncio
+async def test_a_boot_that_cannot_read_the_agents_key_still_snapshots_to_the_host(
+    tmp_path, monkeypatch, kubo, lighthouse, data_key
+):
+    """Through the real boot phases. The agent's own Lighthouse key cannot be
+    read, so boot builds no provider and its exports stay on this host. The
+    snapshot target never used that key: boot still registers it, and its
+    snapshot reaches the host account cold-start restore reads (#2874)."""
+    own = lighthouse.service.account(AGENT_KEY)
+    did, db_path = await _incept_with_own_key(tmp_path, monkeypatch)
+    raw = Storage(str(db_path), agent_id=did)
+    await raw.initialize()
+    await _make_agent_key_unreadable(raw, did)
+    await raw.close()
+
+    async with _booted(did, db_path) as agent:
+        provider, provider_error = agent.lighthouse_provider, agent.lighthouse_provider_error
+        results = await agent._sync_service.force_snapshot()
+        on_host = _snapshot_cids(lighthouse)
+
+    assert provider is None
+    assert provider_error.startswith(f"{KeyUnreadableError.__name__}: ")
+    snapshot = results[f"lighthouse://{did}"]
+    assert snapshot.success, snapshot
+    assert on_host == {snapshot.metadata["cid"]}
+    assert own.files == []
 
 
 @pytest.mark.asyncio
@@ -1044,6 +1198,44 @@ async def test_kestrel_storage_health_resolves_in_the_agents_environment(
     assert report["lighthouse"]["details"]["sovereignty_export"]["cid"] == cid
     # The shell's environment is its own again afterwards.
     assert "LIGHTHOUSE_API_KEY" not in os.environ
+
+
+@pytest.mark.asyncio
+async def test_kestrel_storage_health_reads_snapshots_on_the_account_the_agent_uses(
+    tmp_path, monkeypatch, kubo, lighthouse, data_key, capsys
+):
+    """The shell exports one LIGHTHOUSE_API_KEY and the project ``.env``
+    names another. The launcher hands the agent the file's, so its snapshot
+    target uploads to that account. The command reads snapshots there too,
+    not on the account the shell's key names, which holds only an older
+    snapshot from before the ``.env`` changed (#2874)."""
+    shell_key = "shell-exported-key"
+    shell = lighthouse.service.account(shell_key)
+    host = tmp_path / "host"
+    monkeypatch.setenv("LIGHTHOUSE_API_KEY", shell_key)
+    async with _host(host, monkeypatch, did=AGENT_A) as (agent, raw):
+        stale = (await _snapshot(agent, raw, "before the .env changed")).metadata["cid"]
+        (host / ".env").write_text(f"LIGHTHOUSE_API_KEY={API_KEY}\n")
+        lighthouse.now += timedelta(days=1)
+        # The agent runs in the environment ``kestrel start`` hands it.
+        with patch.dict(os.environ, spawned_agent_env(host), clear=True):
+            assert os.environ["LIGHTHOUSE_API_KEY"] == API_KEY
+            fresh = (await _snapshot(agent, raw, "after")).metadata["cid"]
+    assert (_snapshot_cids(shell), _snapshot_cids(lighthouse)) == ({stale}, {fresh})
+    lighthouse.deals[fresh] = [{"DealID": 1, "Provider": 10479}]
+    args = cli.build_parser().parse_args(
+        ["storage", "health", "--agent", NAMES[AGENT_A], "--json"]
+    )
+
+    assert await asyncio.to_thread(cli.cmd_storage_health, args) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    details = report["lighthouse"]["details"]
+    assert report["lighthouse"]["status"] == "ok", report["lighthouse"]
+    assert (details["resolved_via"], details["cid"]) == ("snapshot_upload", fresh)
+    assert shell.downloads == []
+    # The shell's environment is its own again afterwards.
+    assert os.environ["LIGHTHOUSE_API_KEY"] == shell_key
 
 
 @pytest.mark.asyncio
@@ -1156,27 +1348,19 @@ async def test_kestrel_storage_health_writes_nothing_to_the_host_database(
 
 
 @pytest.mark.asyncio
-async def test_the_snapshot_target_follows_a_rotated_agent_key(
+async def test_a_rotated_agent_key_moves_exports_not_snapshots(
     tmp_path, monkeypatch, kubo, lighthouse, data_key
 ):
-    """The target asks the provider for the key on every call, so after a
-    rotation its snapshots go where the agent now publishes (#2874)."""
+    """After the agent's own key is rotated its exports go to the account
+    the new key names; its snapshots stay on the host account (#2874)."""
     old = lighthouse.service.account(AGENT_KEY)
     new = lighthouse.service.account("agent-alpha-rotated-key")
     async with _host(tmp_path / "host", monkeypatch, did=AGENT_A, agent_key=AGENT_KEY) as (
         agent,
         raw,
     ):
-        service = SyncService(
-            db_path=str(agent.agent_dir / "kestrel_prime.db"),
-            retention_policy=NEWEST_ONLY,
-        )
-        assert await _add_lighthouse_target_if_resolved(
-            service,
-            provider=agent.lighthouse_provider,
-            agent_id=agent.agent_id,
-            state_dir=agent.agent_dir,
-        )
+        service = _snapshot_service(agent)
+        before = await _export(agent, raw)
         await raw.add_conversation("user", "before", metadata={})
         await service.force_snapshot()
         await ServiceKeyStorage(raw.db, AGENT_A).store_key(
@@ -1185,52 +1369,11 @@ async def test_the_snapshot_target_follows_a_rotated_agent_key(
         lighthouse.now += timedelta(days=1)
         await raw.add_conversation("user", "after", metadata={})
         [result] = (await service.force_snapshot()).values()
-        export = await _export(agent, raw)
+        after = await _export(agent, raw)
 
     assert result.success, result
-    assert _snapshot_cids(new) == {result.metadata["cid"]}
-    assert export in new.cids()
-    assert len(_snapshot_cids(old)) == 1
-
-
-def _local_snapshot_manifest(agent) -> dict:
-    """The snapshot target's local record of its last upload."""
-    path = agent.agent_dir / f".lighthouse_manifest_{agent.agent_id}.json"
-    return json.loads(path.read_text())
-
-
-def _snapshot_uploads(account) -> int:
-    return sum(
-        1 for r in account.records() if r["fileName"].startswith("kestrel_state__")
-    )
-
-
-# Keep every snapshot, so each account's upload records count its uploads.
-KEEP_ALL = RetentionPolicy.from_config(
-    {
-        "backup": {
-            "retention": {
-                cls: {"keep_all_days": 3650}
-                for cls in ("working_memory", "identity")
-            }
-        }
-    }
-)
-
-
-async def _registered_snapshot_service(agent) -> SyncService:
-    """The agent's sync service with the Lighthouse target boot registers."""
-    service = SyncService(
-        db_path=str(agent.agent_dir / "kestrel_prime.db"),
-        retention_policy=KEEP_ALL,
-    )
-    assert await _add_lighthouse_target_if_resolved(
-        service,
-        provider=agent.lighthouse_provider,
-        agent_id=agent.agent_id,
-        state_dir=agent.agent_dir,
-    )
-    return service
+    assert (old.cids(), new.cids()) == ({before}, {after})
+    assert _snapshot_cids(lighthouse) == {result.metadata["cid"]}
 
 
 async def _force_snapshot(service):
@@ -1239,80 +1382,19 @@ async def _force_snapshot(service):
 
 
 @pytest.mark.asyncio
-async def test_an_unchanged_snapshot_is_uploaded_to_an_account_it_is_not_on(
-    tmp_path, monkeypatch, kubo, lighthouse, data_key
-):
-    """The key the agent resolves now names another account, and the database
-    has not changed. The snapshot is not on that account, so it is uploaded
-    there rather than skipped as unchanged; on the account it is on, it is
-    skipped. A local record from before uploads recorded their account
-    cannot say where the snapshot went, so it is uploaded again (#2874)."""
-    rotated = lighthouse.service.account("rotated-host-key")
-    async with _host(tmp_path / "host", monkeypatch, did=AGENT_A) as (agent, raw):
-        service = await _registered_snapshot_service(agent)
-        await raw.add_conversation("user", "the only change", metadata={})
-
-        first = await _force_snapshot(service)
-        content_hash = _local_snapshot_manifest(agent)["content_hash"]
-        unchanged = await _force_snapshot(service)
-
-        # The host key is rotated. The agent resolves the new one, and nothing
-        # writes to its database.
-        monkeypatch.setenv("LIGHTHOUSE_API_KEY", "rotated-host-key")
-        moved = await _force_snapshot(service)
-        recorded = _local_snapshot_manifest(agent)
-        again = await _force_snapshot(service)
-
-        # A record written before uploads recorded their account.
-        legacy = {k: v for k, v in recorded.items() if k != "account_digest"}
-        (agent.agent_dir / f".lighthouse_manifest_{AGENT_A}.json").write_text(
-            json.dumps(legacy)
-        )
-        reuploaded = await _force_snapshot(service)
-
-    for result in (first, unchanged, moved, again, reuploaded):
-        assert result.success, result
-    cid = first.metadata["cid"]
-    # The same bytes throughout: only the account changed.
-    assert recorded["content_hash"] == content_hash
-    assert {moved.metadata["cid"], reuploaded.metadata["cid"]} == {cid}
-    for skipped in (unchanged, again):
-        assert (skipped.metadata["cid"], skipped.metadata.get("skipped")) == (cid, True)
-    assert not moved.metadata.get("skipped")
-    assert not reuploaded.metadata.get("skipped")
-    assert _snapshot_uploads(lighthouse) == 1
-    assert _snapshot_uploads(rotated) == 2
-    # The account is recorded on this host as a digest, never the key, and
-    # not in the manifest uploaded to Lighthouse, which its gateway serves.
-    assert recorded["account_digest"]
-    assert "rotated-host-key" not in json.dumps(recorded)
-    manifests = [
-        r for r in rotated.records() if r["fileName"].startswith("kestrel_manifest__")
-    ]
-    assert manifests
-    for record in manifests:
-        assert "account_digest" not in json.loads(rotated.blobs[record["cid"]])
-
-
-@pytest.mark.asyncio
 async def test_a_removed_agent_key_is_not_used_again(
     tmp_path, monkeypatch, kubo, lighthouse, data_key
 ):
     """The agent's own key is deleted and no host key stands in. Its provider
     resolves none, so nothing more reaches the account the removed key named:
-    an export stays local and says so, the snapshot target boot registered
-    fails rather than uploading, and the agent's health check reports no
-    credential, as ``kestrel storage health`` does (#2874)."""
+    an export stays local and says so, and the agent's health check reports
+    no credential, as ``kestrel storage health`` does (#2874)."""
     monkeypatch.delenv("LIGHTHOUSE_API_KEY")
     own = lighthouse.service.account(AGENT_KEY)
     host = tmp_path / "host"
     async with _host(host, monkeypatch, did=AGENT_A, agent_key=AGENT_KEY) as (agent, raw):
         export = await _export(agent, raw)
-        service = await _registered_snapshot_service(agent)
-        snapshot = await _force_snapshot(service)
-        assert snapshot.success, snapshot
-        assert {export, snapshot.metadata["cid"]} <= own.cids()
-        published = own.cids()
+        assert own.cids() == {export}
 
         assert await ServiceKeyStorage(raw.db, AGENT_A).delete_key("lighthouse")
 
@@ -1320,21 +1402,17 @@ async def test_a_removed_agent_key_is_not_used_again(
         result = await SovereigntyFeature(agent).export_sovereignty(
             storage_tier="ipfs", encrypt=True
         )
-        await raw.add_conversation("user", "after", metadata={})
-        snapshot_after = await _force_snapshot(service)
         provider_key = await agent.lighthouse_provider.resolve_api_key()
 
     assert status["status"] == "not_configured", status
     assert result.status is ToolResultStatus.PARTIAL, result
     assert result.data["tier"] == "local_only"
-    assert not snapshot_after.success
-    assert "No Lighthouse credential" in snapshot_after.error
     assert provider_key is None
     assert not agent.lighthouse_provider.is_available()
-    assert own.cids() == published
+    assert own.cids() == {export}
     # ``kestrel storage health`` resolves no key for the agent either.
     credential = await cli._storage_health_lighthouse_key(
-        host, agent_name=NAMES[AGENT_A], agent_id=None
+        host, spawned_agent_env(host), agent_name=NAMES[AGENT_A], agent_id=None
     )
     assert (credential.api_key, credential.error) == (None, None)
 
@@ -1402,33 +1480,24 @@ async def test_an_unreadable_agent_key_is_never_replaced_by_the_hosts(
 ):
     """The agent's own Lighthouse key stops decrypting, or its row loses its
     ciphertext, while the host's LIGHTHOUSE_API_KEY names another account.
-    Nothing reads past it to that account: the export is refused, the
-    snapshot target neither uploads nor prunes there, and both health checks
-    report the credential error (#2874)."""
+    Nothing reads past it to that account for the agent's exports: the export
+    is refused, nothing is published or thinned on either account, and both
+    health checks report the credential error. The agent's snapshots, which
+    use the host key whatever the agent's own, carry on there (#2874)."""
     own = lighthouse.service.account(AGENT_KEY)
     host = tmp_path / "host"
-    # Before it held a key of its own the agent snapshotted to the host
-    # account, so a snapshot and prune there would replace that snapshot.
+    # Before it held a key of its own the agent published an export to the
+    # host account, which an export or a thinning there would change.
     async with _host(host, monkeypatch, did=AGENT_A) as (agent, raw):
-        await _snapshot(agent, raw, "on the host account")
-    on_host = _account_state(lighthouse)
-    assert _snapshot_cids(lighthouse)
+        await _export(agent, raw)
+    host_exports = _export_records(lighthouse)
+    assert host_exports
     async with _host(host, monkeypatch, did=AGENT_A, agent_key=AGENT_KEY) as (agent, raw):
         await _export(agent, raw)
-        await _snapshot(agent, raw, "on its own account")
         on_own = _account_state(own)
         receipts = await agent.storage.get_nodes_by_type("sovereignty_receipt")
         charged = agent.wallet.transfer.await_count
-        service = SyncService(
-            db_path=str(agent.agent_dir / "kestrel_prime.db"),
-            retention_policy=NEWEST_ONLY,
-        )
-        assert await _add_lighthouse_target_if_resolved(
-            service,
-            provider=agent.lighthouse_provider,
-            agent_id=AGENT_A,
-            state_dir=agent.agent_dir,
-        )
+        service = _snapshot_service(agent)
 
         await _make_agent_key_unreadable(raw, AGENT_A, how)
 
@@ -1448,13 +1517,14 @@ async def test_an_unreadable_agent_key_is_never_replaced_by_the_hosts(
     # Nothing was stored, recorded or charged for the refused export.
     assert len(receipts_after) == len(receipts)
     assert charged_after == charged
-    assert not snapshot.success
-    assert "KeyUnreadableError" in snapshot.error
     assert status["status"] == "error", status
     assert "cannot be read" in status["message"]
-    # Neither account changed: no upload and no prune on the host's.
-    assert _account_state(lighthouse) == on_host
+    # Neither account's exports changed: no upload and no thinning.
     assert _account_state(own) == on_own
+    assert _export_records(lighthouse) == host_exports
+    # The snapshot went to the host account, as every snapshot does.
+    assert snapshot.success, snapshot
+    assert _snapshot_cids(lighthouse) == {snapshot.metadata["cid"]}
 
     args = cli.build_parser().parse_args(
         ["storage", "health", "--agent", NAMES[AGENT_A], "--json"]
@@ -1463,6 +1533,8 @@ async def test_an_unreadable_agent_key_is_never_replaced_by_the_hosts(
     report = json.loads(capsys.readouterr().out)
     assert report["lighthouse"]["status"] == "error"
     assert "cannot be read" in report["lighthouse"]["message"]
+    # The snapshot on the host account is still reported beside the error.
+    assert report["lighthouse"]["details"]["cid"] == snapshot.metadata["cid"]
 
 
 @pytest.mark.asyncio
@@ -1534,7 +1606,8 @@ async def test_an_agent_key_unreadable_at_boot_builds_no_provider_and_says_why(
 ):
     """Boot meets the unreadable key: it builds no provider rather than one on
     the host's key, the export stays on this host and says so, and the
-    agent's health check reports why it has no provider (#2874)."""
+    agent's health check reports why it has no provider. Its snapshots,
+    which use the host's key, carry on (#2874)."""
     host = tmp_path / "host"
     async with _host(host, monkeypatch, did=AGENT_A, agent_key=AGENT_KEY) as (agent, raw):
         await _make_agent_key_unreadable(raw, AGENT_A, how)
@@ -1545,6 +1618,9 @@ async def test_an_agent_key_unreadable_at_boot_builds_no_provider_and_says_why(
         result = await SovereigntyFeature(agent).export_sovereignty(
             storage_tier="ipfs", encrypt=True
         )
+        # The policy permits Lighthouse storage, so boot still registers the
+        # snapshot target, which never used the agent's key.
+        snapshot = await _snapshot(agent, raw, "the agent's key is unreadable")
 
     assert agent.lighthouse_provider is None
     assert agent.lighthouse_provider_error.startswith(
@@ -1554,4 +1630,5 @@ async def test_an_agent_key_unreadable_at_boot_builds_no_provider_and_says_why(
     assert "cannot be read" in status["message"]
     assert result.status is ToolResultStatus.PARTIAL, result
     assert result.data["tier"] == "local_only"
-    assert lighthouse.files == []
+    assert _export_records(lighthouse) == []
+    assert _snapshot_cids(lighthouse) == {snapshot.metadata["cid"]}

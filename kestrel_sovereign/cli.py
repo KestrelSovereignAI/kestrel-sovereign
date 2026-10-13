@@ -1186,18 +1186,22 @@ class _StorageHealthCredential:
 
 async def _storage_health_lighthouse_key(
     project_dir: Path,
+    launch_env: Mapping[str, str],
     *,
     agent_name: Optional[str],
     agent_id: Optional[str],
 ) -> _StorageHealthCredential:
     """The agent a storage health report is for, and its Lighthouse key.
 
-    The key is the one the agent publishes its sovereignty exports and
-    snapshots with: ``resolve_lighthouse_storage``, the resolution boot builds
-    the agent's Lighthouse provider from, run in the environment
-    ``kestrel start <name>`` hands that agent (the project ``.env`` over the
-    exported one, its data directory as ``KESTREL_DB_PATH`` and its own data
-    key). The agent is ``agent_name``, or the local agent whose DID is
+    The key is the one the agent publishes its sovereignty exports with:
+    ``resolve_lighthouse_storage``, the resolution boot builds the agent's
+    Lighthouse provider from, run in ``launch_env`` (``spawned_agent_env``,
+    the environment ``kestrel start`` hands its agents: the project ``.env``
+    over the exported one) with the agent's data directory as
+    ``KESTREL_DB_PATH`` and its own data key. Its state snapshots are not
+    read with this key: they go to the host's ``LIGHTHOUSE_API_KEY`` account,
+    which the report reads from that same ``launch_env``. The agent is
+    ``agent_name``, or the local agent whose DID is
     ``agent_id``; its database supplies its DID and any key it holds itself
     (``!add-key``, a SELF_WALLET mint). With no local agent there is no agent
     database, and only a host-level key resolves (#2874). Both databases are
@@ -1238,7 +1242,6 @@ async def _storage_health_lighthouse_key(
         ValueError,
         KeyUnreadableError,
     )
-    launch_env = spawned_agent_env(project_dir)
 
     async def resolve(
         did: str, *, db, storage_path: Optional[Path], with_agent_database: bool
@@ -1326,17 +1329,21 @@ def cmd_storage_health(args) -> int:
     """Show backup tier health with honest tier labels."""
     from datetime import timedelta
 
-    from kestrel_sovereign.storage.sync.health import (
-        build_storage_health_report,
-        load_env_file,
-    )
+    from kestrel_sovereign.storage.sync.health import build_storage_health_report
 
     project_dir = _get_project_dir()
-    env = load_env_file(project_dir / ".env")
+    # Every tier is read in the environment the agent runs in, where the
+    # project ``.env`` wins over an exported value: a shell exporting another
+    # ``LIGHTHOUSE_API_KEY`` than the file's must not send the snapshot check
+    # to an account the agent never uploads to (#2874).
+    launch_env = spawned_agent_env(project_dir)
     try:
         credential = asyncio.run(
             _storage_health_lighthouse_key(
-                project_dir, agent_name=args.agent, agent_id=args.agent_id
+                project_dir,
+                launch_env,
+                agent_name=args.agent,
+                agent_id=args.agent_id,
             )
         )
     except _StorageHealthTargetError as exc:
@@ -1357,9 +1364,9 @@ def cmd_storage_health(args) -> int:
     report = asyncio.run(
         build_storage_health_report(
             agent_id=credential.agent_id,
-            lighthouse_api_key=credential.api_key,
-            lighthouse_error=credential.error,
-            env=env,
+            export_api_key=credential.api_key,
+            export_key_error=credential.error,
+            env=launch_env,
             lighthouse_grace=timedelta(hours=args.lighthouse_grace_hours),
             gcs_prefix=args.gcs_prefix,
         )

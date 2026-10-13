@@ -9,7 +9,6 @@ from kestrel_sovereign.storage.sync.health import (
     check_gcs_health,
     check_lighthouse_health,
     check_sovereign_ipfs_health,
-    load_env_file,
 )
 
 
@@ -78,7 +77,7 @@ async def test_sovereign_ipfs_unreachable_reports_decommissioned():
 async def test_storage_health_report_uses_honest_tier_labels():
     report = await build_storage_health_report(
         agent_id="agent-1",
-        lighthouse_api_key=None,
+        export_api_key=None,
         env={},
         now=NOW,
     )
@@ -98,7 +97,8 @@ async def _lighthouse_status(uploads, deals, grace=timedelta(hours=24)):
     Client.deals = deals
     Client.downloads = {}
     return await check_lighthouse_health(
-        api_key="key",
+        snapshot_api_key="key",
+        export_api_key="key",
         agent_id="agent-1",
         grace_period=grace,
         now=NOW,
@@ -221,7 +221,8 @@ async def test_lighthouse_resolves_snapshot_cid_from_manifest_when_tags_missing(
     }
 
     result = await check_lighthouse_health(
-        api_key="key",
+        snapshot_api_key="key",
+        export_api_key="key",
         agent_id="agent-1",
         now=NOW,
         client_factory=Client,
@@ -253,7 +254,8 @@ async def _lighthouse_status_with_deals(uploads, deals_by_cid):
     Client.uploads = uploads
     Client.downloads = {}
     return await check_lighthouse_health(
-        api_key="key",
+        snapshot_api_key="key",
+        export_api_key="key",
         agent_id="agent-1",
         now=NOW,
         client_factory=Client,
@@ -413,7 +415,11 @@ async def test_lighthouse_counts_deals_in_every_deal_status_shape(body, deal_cou
     )
 
     result = await check_lighthouse_health(
-        api_key="key", agent_id="agent-1", now=NOW, client_factory=client
+        snapshot_api_key="key",
+        export_api_key="key",
+        agent_id="agent-1",
+        now=NOW,
+        client_factory=client,
     )
 
     export = result.details["sovereignty_export"]
@@ -429,7 +435,11 @@ async def test_lighthouse_counts_no_deals_where_the_response_names_none(body):
     )
 
     result = await check_lighthouse_health(
-        api_key="key", agent_id="agent-1", now=NOW, client_factory=client
+        snapshot_api_key="key",
+        export_api_key="key",
+        agent_id="agent-1",
+        now=NOW,
+        client_factory=client,
     )
 
     assert result.status == "warning"
@@ -446,7 +456,11 @@ async def test_lighthouse_health_reads_every_page_of_uploads():
     client = _lighthouse_api(records, {"QmLatest": {"data": []}, "QmOlder": []})
 
     result = await check_lighthouse_health(
-        api_key="key", agent_id="agent-1", now=NOW, client_factory=client
+        snapshot_api_key="key",
+        export_api_key="key",
+        agent_id="agent-1",
+        now=NOW,
+        client_factory=client,
     )
 
     assert result.status == "pending"
@@ -455,10 +469,162 @@ async def test_lighthouse_health_reads_every_page_of_uploads():
 
 @pytest.mark.asyncio
 async def test_lighthouse_missing_key_is_not_configured():
-    result = await check_lighthouse_health(api_key=None, agent_id="agent-1")
+    result = await check_lighthouse_health(
+        snapshot_api_key=None, export_api_key=None, agent_id="agent-1"
+    )
 
     assert result.status == "not_configured"
     assert result.configured is False
+
+
+def _snapshot_upload(cid, agent_id, created_at):
+    return {
+        "cid": cid,
+        "fileName": (
+            f"kestrel_state__{agent_id}__{created_at.strftime('%Y%m%d_%H%M%S')}.car"
+        ),
+        "createdAt": int(created_at.timestamp() * 1000),
+    }
+
+
+def _accounts(uploads_by_key, deals_by_cid, listed):
+    """Lighthouse with one account per key; ``listed`` records each listing."""
+
+    class Client(FakeLighthouseClient):
+        async def get_uploads(self, last_key=None):
+            listed.append(self.api_key)
+            if last_key is not None:
+                return {"fileList": []}
+            return {"fileList": uploads_by_key.get(self.api_key, [])}
+
+        async def get_deal_status(self, cid):
+            return deals_by_cid.get(cid, [])
+
+    return Client
+
+
+@pytest.mark.asyncio
+async def test_lighthouse_reads_snapshots_and_exports_on_their_own_accounts():
+    """Snapshots are uploaded with the host's key and exports with the
+    agent's, so each is read on its own account. An export of the agent's
+    on the host account, and a snapshot on the agent's, are not the uploads
+    those keys stand for (#2874)."""
+    listed = []
+    client = _accounts(
+        {
+            "host": [
+                _snapshot_upload("QmSnapshot", "agent-1", NOW - timedelta(hours=1)),
+                _export_upload("QmHostExport", "agent-1", NOW),
+            ],
+            "agent": [
+                _export_upload("QmExport", "agent-1", NOW - timedelta(days=3)),
+                _snapshot_upload("QmStray", "agent-1", NOW),
+            ],
+        },
+        {"QmSnapshot": [{"DealID": 1}], "QmExport": [{"DealID": 2}]},
+        listed,
+    )
+
+    result = await check_lighthouse_health(
+        snapshot_api_key="host",
+        export_api_key="agent",
+        agent_id="agent-1",
+        now=NOW,
+        client_factory=client,
+    )
+
+    assert result.status == "ok"
+    assert result.details["cid"] == "QmSnapshot"
+    assert result.details["sovereignty_export"]["cid"] == "QmExport"
+    assert sorted(listed) == ["agent", "host"]
+
+
+@pytest.mark.asyncio
+async def test_lighthouse_lists_an_account_both_keys_name_once():
+    listed = []
+    client = _accounts(
+        {
+            "host": [
+                _snapshot_upload("QmSnapshot", "agent-1", NOW - timedelta(hours=1)),
+                _export_upload("QmExport", "agent-1", NOW - timedelta(hours=2)),
+            ]
+        },
+        {},
+        listed,
+    )
+
+    result = await check_lighthouse_health(
+        snapshot_api_key="host",
+        export_api_key="host",
+        agent_id="agent-1",
+        now=NOW,
+        client_factory=client,
+    )
+
+    assert result.status == "pending"
+    assert result.details["cid"] == "QmSnapshot"
+    assert result.details["sovereignty_export"]["cid"] == "QmExport"
+    assert listed == ["host"]
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_export_key_is_an_error_beside_the_snapshot():
+    """The agent's export credential cannot be read. The tier is an error,
+    and the snapshot on the host account is still reported (#2874)."""
+    listed = []
+    client = _accounts(
+        {"host": [_snapshot_upload("QmSnapshot", "agent-1", NOW)]},
+        {"QmSnapshot": [{"DealID": 1}]},
+        listed,
+    )
+
+    result = await check_lighthouse_health(
+        snapshot_api_key="host",
+        export_api_key=None,
+        export_key_error="the agent's Lighthouse key cannot be read",
+        agent_id="agent-1",
+        now=NOW,
+        client_factory=client,
+    )
+
+    assert result.status == "error"
+    assert result.message == (
+        "the agent's Lighthouse key cannot be read; "
+        "Latest Lighthouse snapshot has 1 Filecoin deal(s)"
+    )
+    assert result.details["cid"] == "QmSnapshot"
+    assert result.details["sovereignty_export"] is None
+    assert listed == ["host"]
+
+
+@pytest.mark.asyncio
+async def test_storage_health_report_reads_snapshots_with_the_host_key(monkeypatch):
+    """The report reads snapshots with ``env``'s LIGHTHOUSE_API_KEY, the key
+    the snapshot target uploads with, and exports with the agent's key."""
+    listed = []
+    client = _accounts(
+        {
+            "host": [_snapshot_upload("QmSnapshot", "agent-1", NOW)],
+            "agent": [_export_upload("QmExport", "agent-1", NOW)],
+        },
+        {},
+        listed,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+        client,
+    )
+
+    report = await build_storage_health_report(
+        agent_id="agent-1",
+        export_api_key="agent",
+        env={"LIGHTHOUSE_API_KEY": "host"},
+        now=NOW,
+    )
+
+    assert report.lighthouse.details["cid"] == "QmSnapshot"
+    assert report.lighthouse.details["sovereignty_export"]["cid"] == "QmExport"
+    assert sorted(listed) == ["agent", "host"]
 
 
 class FakeBlob:
@@ -540,16 +706,6 @@ async def test_gcs_unavailable_when_bucket_unhealthy():
     )
 
     assert result.status == "unavailable"
-
-
-def test_load_env_file_preserves_existing_values(tmp_path):
-    env_path = tmp_path / ".env"
-    env_path.write_text("LIGHTHOUSE_API_KEY=file-value\nGCS_BACKUP_BUCKET=backup\n")
-
-    result = load_env_file(env_path, env={"LIGHTHOUSE_API_KEY": "existing"})
-
-    assert result["LIGHTHOUSE_API_KEY"] == "existing"
-    assert result["GCS_BACKUP_BUCKET"] == "backup"
 
 
 def test_aggregate_status_counts_active_sovereign_as_healthy():
