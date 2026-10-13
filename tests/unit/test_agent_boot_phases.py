@@ -1731,6 +1731,41 @@ async def test_boot_records_its_embedding_profile_after_loading_the_config(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_boot_checks_the_embedding_column_width_once_the_profile_is_loaded(
+    tmp_path,
+):
+    """A profile/column width mismatch is found at boot, not per write (#2913).
+
+    Checked before the configuration is loaded, it would compare the column
+    with a profile the agent does not write.
+    """
+    agent = _make_agent(tmp_path)
+    calls = []
+    record = agent.record_active_embedding_profile
+
+    async def recorded():
+        calls.append("record_active_embedding_profile")
+        return await record()
+
+    agent.record_active_embedding_profile = recorded
+    try:
+        with _boot_mocks() as mocks:
+            check = mocks.storage.conversation.check_embedding_column_dimensions
+            check.side_effect = lambda: calls.append(
+                "check_embedding_column_dimensions"
+            )
+            await agent.initialize()
+        assert agent._boot_state is BootPhaseState.READY
+        assert calls == [
+            "record_active_embedding_profile",
+            "check_embedding_column_dimensions",
+        ]
+        check.assert_awaited_once_with()
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
 async def test_second_initialize_when_ready_is_a_noop(tmp_path):
     agent = _make_agent(tmp_path)
     try:

@@ -18,7 +18,7 @@ import struct
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
@@ -50,6 +50,7 @@ from .session_id_column import (
     new_session_id,
 )
 from .destructive_audit import DestructiveAuditEvent, DestructiveAuditLog, hash_rows
+from .embedding_vec_backfill import declared_embedding_vec_dimension
 from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
 from .lexical_memory_index import (
     ConversationLexicalIndex,
@@ -119,6 +120,43 @@ class ConversationSessionTimestampError(RuntimeError):
     """Exact session membership cannot be proven from stored chronology."""
 
 
+# A misconfigured agent drops an embedding on every turn. Its first drop is
+# logged, then at most one line per window, each carrying the running count.
+DROPPED_EMBEDDING_WARNING_INTERVAL_S = 300.0
+
+
+@dataclass(frozen=True)
+class DroppedConversationEmbedding:
+    """One conversation embedding computed but not persisted with its turn (#2913).
+
+    Public because the health surface reports it: the turn is stored without
+    its vector, so semantic recall cannot find it, and a loss nobody can see
+    is operationally the same as no loss.
+    """
+
+    profile_id: Optional[str]
+    embedding_dim: int
+    # The width the vector had to fit; ``None`` when it was never read.
+    column_dim: Optional[int]
+    error: str
+    dropped_at: datetime
+
+
+@dataclass(frozen=True)
+class EmbeddingColumnMismatch:
+    """The embedding profile and the declared vector column width disagree (#2913).
+
+    Found once at startup. Every embedded conversation write then persists
+    without its vector, so this is a misconfiguration rather than a per-row
+    failure.
+    """
+
+    profile_id: str
+    profile_dim: int
+    column_dim: int
+    checked_at: datetime
+
+
 @dataclass(slots=True)
 class _PreparedConversationWrite:
     """Precomputed, not-yet-visible conversation row material.
@@ -141,6 +179,20 @@ class _PreparedConversationWrite:
     provider: Optional[str]
     lexical_index_id: Optional[str]
     lexical_index_version: Optional[str]
+    # A computed embedding this row will not carry. Counted only once the
+    # row has committed (see ``_count_embedding_drop_on_commit``), so a
+    # write that fails or rolls back is not a drop.
+    embedding_drop: Optional[DroppedConversationEmbedding] = None
+
+
+@dataclass(frozen=True, slots=True)
+class _InsertedConversation:
+    """What one conversation INSERT stored, before its transaction commits."""
+
+    lexical_columns_written: bool
+    # A vector no INSERT shape this schema offers could store; the row
+    # landed without it.
+    embedding_drop: Optional[DroppedConversationEmbedding] = None
 
 
 def _escape_like_session_value(session_id: str) -> str:
@@ -656,6 +708,15 @@ class AsyncConversationStore:
         self._lexical_index = ConversationLexicalIndex(db, agent_id)
         self._last_lexical_bridge_stats: Dict[str, Any] = {}
         self._lexical_coverage_index_available: Optional[bool] = None
+        # Dropped-embedding accounting (#2913), surfaced at /health/detailed.
+        # In-memory like the dispatcher's dropped signal_log rows (#2660): it
+        # is an observability signal, not a second record of the rows.
+        self._dropped_embeddings = 0
+        self._last_dropped_embedding: Optional[DroppedConversationEmbedding] = None
+        self._dropped_embedding_logged_at: Optional[float] = None
+        # Read once by ``check_embedding_column_dimensions`` at startup.
+        self._embedding_column_dim: Optional[int] = None
+        self._embedding_column_mismatch: Optional[EmbeddingColumnMismatch] = None
 
     async def _audit_destructive_operation(
         self,
@@ -1022,6 +1083,167 @@ class AsyncConversationStore:
         embeddings or if the opt-out env var is set.
         """
         return self._lazy_embedding_service()
+
+    @property
+    def dropped_embedding_count(self) -> int:
+        """Embeddings dropped from persisted turns since this store was built.
+
+        Monotonic by design, like the dispatcher's dropped signal_log rows:
+        a later successful write does not restore the vectors already lost.
+        """
+        return self._dropped_embeddings
+
+    @property
+    def last_dropped_embedding(self) -> Optional[DroppedConversationEmbedding]:
+        """The most recent dropped embedding, or None if none have dropped."""
+        return self._last_dropped_embedding
+
+    @property
+    def embedding_column_mismatch(self) -> Optional[EmbeddingColumnMismatch]:
+        """The profile/column width disagreement found at startup, if any."""
+        return self._embedding_column_mismatch
+
+    def _current_profile_id(self, service: Optional[Any]) -> Optional[str]:
+        """The profile id *service* stamps on rows, or ``None``."""
+        if service is None or not hasattr(service, "current_profile_id"):
+            return None
+        try:
+            return service.current_profile_id()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(
+                "current_profile_id() failed for agent %s: %s",
+                self.agent_id, exc,
+            )
+            return None
+
+    def _count_embedding_drop_on_commit(
+        self, drop: DroppedConversationEmbedding
+    ) -> None:
+        """Count *drop* once the INSERT that left out its vector commits (#2913).
+
+        Only a turn that persisted can have lost its vector, and the count and
+        its WARNING cannot be taken back. With no transaction open the INSERT
+        has already committed and the drop is counted now. Inside a
+        transaction, whoever owns it (the caller, or ``AsyncStorage``'s
+        semantic-recall fence) decides: the drop is counted when it commits,
+        and not at all if it rolls back.
+        """
+        if self.db.call_after_commit(lambda: self._record_dropped_embedding(drop)):
+            return
+        logger.warning(
+            "Dropped the embedding of a conversation write for agent %s "
+            "(embedding profile %s, %d dimensions: %s) inside a transaction "
+            "whose commit this database backend cannot report, so it is not "
+            "counted in /health/detailed.",
+            self.agent_id, drop.profile_id or "unknown", drop.embedding_dim,
+            drop.error,
+        )
+
+    def _record_dropped_embedding(self, drop: DroppedConversationEmbedding) -> None:
+        """Count one embedding dropped from a committed turn, and report it (#2913).
+
+        The turn is stored but semantic recall cannot find it, and until this
+        existed the only trace was an INFO line per retry. WARNING, logged for
+        the first drop and then at most once per
+        ``DROPPED_EMBEDDING_WARNING_INTERVAL_S`` so an agent that drops one
+        every turn does not flood its log; every drop is counted for
+        ``/health/detailed``.
+        """
+        self._dropped_embeddings += 1
+        self._last_dropped_embedding = drop
+        now = monotonic()
+        logged_at = self._dropped_embedding_logged_at
+        if (
+            logged_at is not None
+            and now - logged_at < DROPPED_EMBEDDING_WARNING_INTERVAL_S
+        ):
+            return
+        self._dropped_embedding_logged_at = now
+        column = (
+            f"{drop.column_dim} dimensions"
+            if drop.column_dim is not None
+            else "an unknown width"
+        )
+        logger.warning(
+            "Dropped the embedding of a conversation write for agent %s: "
+            "embedding profile %s produced %d dimensions, "
+            "conversation_history.embedding_vec takes %s (%s). The turn was "
+            "persisted without its vector, so semantic recall cannot find it. "
+            "%d embedding(s) dropped since start; /health/detailed reports "
+            "the count.",
+            self.agent_id, drop.profile_id or "unknown", drop.embedding_dim,
+            column, drop.error, self._dropped_embeddings,
+        )
+
+    async def check_embedding_column_dimensions(
+        self,
+    ) -> Optional[EmbeddingColumnMismatch]:
+        """Compare the embedding profile with the column's declared width (#2913).
+
+        Run once at startup, after the agent's embedding configuration is
+        loaded. A disagreement means every embedded write will persist
+        without its vector, so it is logged at ERROR and kept for
+        ``/health/detailed`` as a misconfiguration. It never raises: the turn
+        writes keep succeeding, and refusing to boot would take the agent
+        down over a recall degradation.
+
+        Silent when the widths agree, when there is no embedding profile, and
+        when the backend declares no width to read (SQLite stores bytes).
+        """
+        try:
+            column_dim = await declared_embedding_vec_dimension(
+                self.db, "conversation_history"
+            )
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not fail boot
+            logger.debug(
+                "Could not read conversation_history.embedding_vec's declared "
+                "width for agent %s: %s", self.agent_id, exc,
+            )
+            return None
+        if column_dim is None:
+            return None
+        self._embedding_column_dim = column_dim
+
+        service = self._lazy_embedding_service()
+        describe = getattr(service, "describe", None)
+        try:
+            profile = describe() if callable(describe) else None
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not fail boot
+            logger.debug(
+                "Could not describe the embedding profile for agent %s: %s",
+                self.agent_id, exc,
+            )
+            return None
+        profile_id = getattr(profile, "profile_id", None)
+        profile_dim = getattr(profile, "dim", None)
+        if (
+            not isinstance(profile_id, str)
+            or not isinstance(profile_dim, int)
+            or isinstance(profile_dim, bool)
+        ):
+            return None
+
+        if profile_dim == column_dim:
+            self._embedding_column_mismatch = None
+            return None
+        mismatch = EmbeddingColumnMismatch(
+            profile_id=profile_id,
+            profile_dim=profile_dim,
+            column_dim=column_dim,
+            checked_at=datetime.now(timezone.utc),
+        )
+        self._embedding_column_mismatch = mismatch
+        logger.error(
+            "Embedding misconfiguration for agent %s: embedding profile %s "
+            "produces %d-dimension vectors, but "
+            "conversation_history.embedding_vec is vector(%d). Every "
+            "conversation write will be persisted without its embedding, so "
+            "semantic recall will not find new turns. Migrate the column or "
+            "repin the embedding profile; /health/detailed reports the "
+            "dropped count.",
+            self.agent_id, profile_id, profile_dim, column_dim,
+        )
+        return mismatch
 
     def _now_sql(self) -> str:
         """Get SQL expression for current timestamp based on backend type."""
@@ -1467,18 +1689,17 @@ class AsyncConversationStore:
         embedding_vec_val = await self._maybe_embed(content)
         profile_id: Optional[str] = None
         embedding_service: Optional[Any] = None
+        embedding_drop: Optional[DroppedConversationEmbedding] = None
         if embedding_vec_val is not None:
             embedding_service = self._lazy_embedding_service()
-            if embedding_service is not None and hasattr(
-                embedding_service, "current_profile_id"
-            ):
-                try:
-                    profile_id = embedding_service.current_profile_id()
-                except Exception as exc:  # pragma: no cover - defensive
-                    logger.debug(
-                        "current_profile_id() failed for agent %s: %s",
-                        self.agent_id, exc,
-                    )
+            profile_id = self._current_profile_id(embedding_service)
+            embedding_drop = self._column_width_drop(
+                embedding_vec_val, profile_id
+            )
+            if embedding_drop is not None:
+                embedding_vec_val = None
+                profile_id = None
+                embedding_service = None
 
         lexical_index_id: Optional[str] = uuid.uuid4().hex
         lexical_index_version: Optional[str] = self._lexical_index.version
@@ -1511,6 +1732,7 @@ class AsyncConversationStore:
             provider=provider,
             lexical_index_id=lexical_index_id,
             lexical_index_version=lexical_index_version,
+            embedding_drop=embedding_drop,
         )
 
     async def _exclude_prepared_conversation_from_retrieval(
@@ -1527,6 +1749,7 @@ class AsyncConversationStore:
         prepared.embedding = None
         prepared.embedding_profile_id = None
         prepared.embedding_service = None
+        prepared.embedding_drop = None
 
     async def _persist_prepared_conversation(
         self,
@@ -1534,7 +1757,7 @@ class AsyncConversationStore:
     ) -> None:
         """Insert precomputed bytes and clean token-first work on failure."""
         try:
-            lexical_columns_written = await self._insert_message(
+            inserted = await self._insert_message(
                 role=prepared.role,
                 content=prepared.content,
                 rendered_content=prepared.rendered_content,
@@ -1557,16 +1780,23 @@ class AsyncConversationStore:
                 await self._discard_lexical_tokens(prepared.lexical_index_id)
                 prepared.lexical_index_id = None
             raise
-        if not lexical_columns_written and prepared.lexical_index_id:
+        if not inserted.lexical_columns_written and prepared.lexical_index_id:
             await self._discard_lexical_tokens(prepared.lexical_index_id)
             prepared.lexical_index_id = None
+        drop = inserted.embedding_drop or prepared.embedding_drop
+        prepared.embedding_drop = None
+        if drop is not None:
+            self._count_embedding_drop_on_commit(drop)
 
         # Upsert the profile descriptor into the registry table so
         # ``kestrel-sovereign embeddings audit`` can map id →
         # human-readable fields. Best-effort: registry write must never block
-        # the already-persisted message.
+        # the already-persisted message. A row whose vector dropped carries no
+        # profile id to map, so it skips this write and the risk of it
+        # failing inside a caller's transaction (#2913).
         if (
-            prepared.embedding_profile_id is not None
+            drop is None
+            and prepared.embedding_profile_id is not None
             and prepared.embedding_service is not None
         ):
             try:
@@ -1590,14 +1820,8 @@ class AsyncConversationStore:
         rows. Crucially, a provider / network outage during a chat
         turn must NOT block writing the message.
 
-        Validates the returned embedding's dimension against the
-        column dim chosen at boot time. A mismatch (e.g. provider
-        switched from Ollama-768 to OpenAI-1536 after migration) is
-        treated as "no embedding" — better to fall back to keyword
-        overlap than persist data the retriever will silently reject.
-        The first mismatch per store instance logs a clear error
-        pointing operators at the fix (re-migrate the column).
-        (Codex P2 on PR-B.)
+        The caller checks the result's width against the column with
+        :meth:`_column_width_drop`.
         """
         if not content:
             # Empty content (rare — guardrails would normally reject
@@ -1622,47 +1846,89 @@ class AsyncConversationStore:
         if not embedding:
             return None
 
-        # Defend against provider/column dim mismatch. The vector
-        # column was created at ``CONVERSATION_MESSAGE_EMBEDDING_DIM``
-        # at boot; if the active provider returns a different dim
-        # (e.g. config drift between agent restart and migration run),
-        # writing it would either crash on PG or persist bytes that
-        # the retriever can't decode on SQLite. Skip the embedding,
-        # log once per store instance, and keep persisting the row.
+        return list(embedding)
+
+    def _column_width_drop(
+        self,
+        embedding: List[float],
+        profile_id: Optional[str],
+    ) -> Optional[DroppedConversationEmbedding]:
+        """Why *embedding* cannot be stored in ``embedding_vec``, or ``None``.
+
+        The width it must fit is the column's declared width when
+        :meth:`check_embedding_column_dimensions` read one at startup, and
+        otherwise ``CONVERSATION_MESSAGE_EMBEDDING_DIM``, the width the column
+        is created at. The declared width wins because it is the column the
+        INSERT lands in, and the two can disagree: production's column was
+        ``vector(768)`` while the configured and provider widths were 1536.
+        Inside a PostgreSQL transaction the INSERT pgvector refuses aborts
+        the transaction, so the turn would not persist at all (#2913).
+
+        A vector of another width would either fail on PG or persist bytes
+        the retriever cannot decode on SQLite, so the row keeps its turn and
+        drops the vector, falling back to keyword overlap. (Codex P2 on PR-B.)
+        """
         from .sqla.conversation_message import (
             CONVERSATION_MESSAGE_EMBEDDING_DIM,
         )
-        if len(embedding) != CONVERSATION_MESSAGE_EMBEDDING_DIM:
-            if not getattr(self, "_warned_dim_mismatch", False):
-                logger.error(
-                    "Embedding dim mismatch for agent %s: provider returned "
-                    "%d, column is %d. Vector recall disabled for this "
-                    "agent until the column is re-migrated at the new dim. "
-                    "Set KESTREL_EMBEDDING_DIM=%d + drop "
-                    "conversation_history.embedding_vec to re-migrate, OR "
-                    "switch the active provider back to one that emits "
-                    "%d-dim embeddings.",
-                    self.agent_id, len(embedding),
-                    CONVERSATION_MESSAGE_EMBEDDING_DIM,
-                    len(embedding),
-                    CONVERSATION_MESSAGE_EMBEDDING_DIM,
-                )
-                # Mark on the instance so we don't flood the log on
-                # every turn. Operators get one error per agent boot.
-                self._warned_dim_mismatch = True
+
+        declared = self._embedding_column_dim
+        column_dim = (
+            declared if declared is not None else CONVERSATION_MESSAGE_EMBEDDING_DIM
+        )
+        if len(embedding) == column_dim:
             return None
-        return list(embedding)
+        if declared is not None:
+            remedy = (
+                f"conversation_history.embedding_vec is declared "
+                f"vector({declared}): migrate the column or repin the "
+                f"embedding profile to {declared}-dimension embeddings"
+            )
+        else:
+            remedy = (
+                f"the configured column width is {column_dim}: set "
+                f"KESTREL_EMBEDDING_DIM={len(embedding)} and re-migrate "
+                f"conversation_history.embedding_vec, or switch to a provider "
+                f"that emits {column_dim}-dimension embeddings"
+            )
+        return DroppedConversationEmbedding(
+            profile_id=profile_id,
+            embedding_dim=len(embedding),
+            column_dim=column_dim,
+            error=f"dimension mismatch: {remedy}",
+            dropped_at=datetime.now(timezone.utc),
+        )
 
     async def _discard_lexical_tokens(self, lexical_index_id: str) -> None:
         """Best-effort cleanup for a token-first write whose row did not land."""
         try:
-            await self.db.execute(
+            await self._execute_confined(
                 "DELETE FROM conversation_lexical_tokens "
                 "WHERE agent_id = ? AND lexical_index_id = ?",
                 (self.agent_id, lexical_index_id),
             )
         except Exception as exc:  # noqa: BLE001 - original write error wins
             logger.debug("Could not clean orphan lexical tokens: %s", exc)
+
+    async def _execute_confined(self, sql: str, params: tuple) -> None:
+        """Run one write whose failure this store handles and moves past.
+
+        Inside a transaction this task owns, a statement PostgreSQL refuses
+        aborts the whole transaction: the fallback INSERT after it fails too,
+        and so does every later write of the caller's, or COMMIT quietly
+        rolls them all back (#2913). A savepoint confines the failure to this
+        statement. Otherwise it runs as it always did: on its own when no
+        transaction is open, and plainly when the backend cannot say whether
+        one is, or cannot isolate a savepoint inside one.
+        """
+        if (
+            self.db.owns_open_transaction is True
+            and self.db.isolates_nested_savepoints
+        ):
+            async with self.db.transaction(savepoint=True):
+                await self.db.execute_commit(sql, params)
+            return
+        await self.db.execute_commit(sql, params)
 
     async def _insert_message(
         self,
@@ -1678,7 +1944,7 @@ class AsyncConversationStore:
         session_id: Optional[str] = None,
         lexical_index_id: Optional[str] = None,
         lexical_index_version: Optional[str] = None,
-    ) -> bool:
+    ) -> _InsertedConversation:
         """Persist a conversation row, optionally co-writing
         ``embedding_vec`` and ``embedding_profile_id``.
 
@@ -1706,7 +1972,13 @@ class AsyncConversationStore:
         lists because its migration raises unless the column exists, so no
         schema this method can reach is without it — unlike the
         lexical/embedding columns, whose migrations are non-fatal and whose
-        absence the fallbacks below exist to survive.
+        absence the fallbacks below exist to survive. Each attempt a fallback
+        follows runs through :meth:`_execute_confined`, so inside a caller's
+        transaction a refused attempt does not take the fallback down with it.
+
+        Returns whether the lexical-index columns were written and, when no
+        vector-bearing shape was accepted, the dropped embedding. The caller
+        counts that drop only once the row commits (#2913).
         """
         base_cols = (
             "agent_id, role, content, rendered_content, model, provider, "
@@ -1723,7 +1995,7 @@ class AsyncConversationStore:
             "metadata, session_id, created_at"
         )
         legacy_params = base_params[:8]
-        # Generated, not hand-counted: these lists are spelled into six
+        # Generated, not hand-counted: these lists are spelled into seven
         # statements below and a miscount would only surface at runtime.
         base_binds = ", ".join(["?"] * len(base_params))
         legacy_binds = ", ".join(["?"] * len(legacy_params))
@@ -1734,8 +2006,8 @@ class AsyncConversationStore:
                 f"VALUES ({base_binds}{base_vals_suffix})"
             )
             try:
-                await self.db.execute_commit(sql, base_params)
-                return True
+                await self._execute_confined(sql, base_params)
+                return _InsertedConversation(lexical_columns_written=True)
             except Exception as exc:
                 if not _is_missing_lexical_column_error(exc):
                     raise
@@ -1748,7 +2020,7 @@ class AsyncConversationStore:
                     f"VALUES ({legacy_binds}{base_vals_suffix})",
                     legacy_params,
                 )
-                return False
+                return _InsertedConversation(lexical_columns_written=False)
 
         backend_type = getattr(self.db, "backend_type", None)
         try:
@@ -1769,7 +2041,7 @@ class AsyncConversationStore:
                 f"VALUES ({base_binds}{base_vals_suffix}, "
                 f"{emb_placeholder}, ?)"
             )
-            await self.db.execute_commit(
+            await self._execute_confined(
                 sql, base_params + (emb_bind, embedding_profile_id),
             )
         except Exception as e:
@@ -1779,14 +2051,14 @@ class AsyncConversationStore:
                 # older schema shapes; otherwise failed lexical DDL silently
                 # removes the row from profile-filtered kNN.
                 try:
-                    await self.db.execute_commit(
+                    await self._execute_confined(
                         f"INSERT INTO conversation_history "
                         f"({legacy_cols}, embedding_vec, embedding_profile_id) "
                         f"VALUES ({legacy_binds}{base_vals_suffix}, "
                         f"{emb_placeholder}, ?)",
                         legacy_params + (emb_bind, embedding_profile_id),
                     )
-                    return False
+                    return _InsertedConversation(lexical_columns_written=False)
                 except Exception as legacy_exc:
                     if not _is_missing_column_error(
                         legacy_exc, "embedding_profile_id", "embedding_vec"
@@ -1799,7 +2071,11 @@ class AsyncConversationStore:
             # doesn't). Without this middle step we would regress
             # those deployments from storing vectors to dropping
             # them entirely. (Codex P2 on #1477.)
-            logger.info(
+            #
+            # The retries log at DEBUG: a misconfigured agent fails all of
+            # them on every turn, and the outcome is reported once below
+            # (#2913).
+            logger.debug(
                 "Could not write conversation_history.embedding_vec + "
                 "embedding_profile_id for agent %s (%s); retrying "
                 "without embedding_profile_id.", self.agent_id, e,
@@ -1811,24 +2087,26 @@ class AsyncConversationStore:
                     f"VALUES ({base_binds}{base_vals_suffix}, "
                     f"{emb_placeholder})"
                 )
-                await self.db.execute_commit(sql, base_params + (emb_bind,))
-                return True
+                await self._execute_confined(sql, base_params + (emb_bind,))
+                self._log_unstamped_embedding(e)
+                return _InsertedConversation(lexical_columns_written=True)
             except Exception as e2:
-                logger.info(
+                logger.debug(
                     "New lexical-index INSERT paths failed for agent %s (%s); "
                     "retrying the legacy embedding_vec path.", self.agent_id, e2,
                 )
                 try:
-                    await self.db.execute_commit(
+                    await self._execute_confined(
                         f"INSERT INTO conversation_history "
                         f"({legacy_cols}, embedding_vec) "
                         f"VALUES ({legacy_binds}{base_vals_suffix}, "
                         f"{emb_placeholder})",
                         legacy_params + (emb_bind,),
                     )
-                    return False
+                    self._log_unstamped_embedding(e)
+                    return _InsertedConversation(lexical_columns_written=False)
                 except Exception as e3:
-                    logger.info(
+                    logger.debug(
                         "Legacy embedding_vec INSERT also failed for agent %s "
                         "(%s); persisting without an embedding.", self.agent_id, e3,
                     )
@@ -1837,8 +2115,29 @@ class AsyncConversationStore:
                         f"VALUES ({legacy_binds}{base_vals_suffix})",
                         legacy_params,
                     )
-                    return False
-        return True
+                    # The last vector-bearing attempt names why the vector
+                    # could not be stored in any shape this schema offers.
+                    # Returned, not recorded: the row is not durable until
+                    # its transaction commits.
+                    return _InsertedConversation(
+                        lexical_columns_written=False,
+                        embedding_drop=DroppedConversationEmbedding(
+                            profile_id=embedding_profile_id,
+                            embedding_dim=len(embedding),
+                            column_dim=self._embedding_column_dim,
+                            error=f"{type(e3).__name__}: {e3}",
+                            dropped_at=datetime.now(timezone.utc),
+                        ),
+                    )
+        return _InsertedConversation(lexical_columns_written=True)
+
+    def _log_unstamped_embedding(self, error: BaseException) -> None:
+        """Report a vector INSERT accepted only without ``embedding_profile_id``."""
+        logger.info(
+            "conversation_history.embedding_vec INSERT for agent %s was "
+            "accepted only without embedding_profile_id (%s).",
+            self.agent_id, error,
+        )
 
     def decrypt_stored_content(self, content: str, meta: Optional[Dict]) -> str:
         """Public: decrypt one stored row's content to plaintext.

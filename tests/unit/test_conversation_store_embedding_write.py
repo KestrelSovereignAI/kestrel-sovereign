@@ -25,6 +25,16 @@ from kestrel_sovereign.storage.async_conversation_store import (
 # ----------------------------------------------------------------- helpers
 
 
+def _run_now_committed(callback) -> bool:
+    """``AsyncDatabase.call_after_commit`` with no caller transaction open.
+
+    Each ``execute_commit`` commits on its own, so work deferred until commit
+    runs as soon as it is registered (#2913).
+    """
+    callback()
+    return True
+
+
 def _make_store(
     backend_type: str = "sqlite",
     embedding_service: object = None,
@@ -45,6 +55,7 @@ def _make_store(
     db.execute = AsyncMock(return_value=1)
     db.fetchone = AsyncMock(return_value=None)  # no prior history → new session
     db.fetchall = AsyncMock(return_value=[])
+    db.call_after_commit = _run_now_committed
     store = AsyncConversationStore(db=db, agent_id=agent_id)
     # Per-instance override of the provider-embedding lookup. Doing this
     # post-construction instead of via ``__init__`` keeps the production
@@ -361,20 +372,22 @@ async def test_add_conversation_skips_embedding_on_dim_mismatch(caplog):
 
     store, db = _make_store(embedding_service=svc)
     import logging
-    with caplog.at_level(logging.ERROR):
+    with caplog.at_level(logging.WARNING):
         await store.add_conversation(role="assistant", content="hi")
 
     sql, _ = _insert_call(db)
     assert "embedding_vec" not in sql
-    assert any("dim mismatch" in r.message.lower() for r in caplog.records), (
-        "expected a clear error log on dim mismatch"
-    )
+    assert any(
+        r.levelno == logging.WARNING and "dimension mismatch" in r.message.lower()
+        for r in caplog.records
+    ), "expected a clear WARNING on dim mismatch"
+    assert store.dropped_embedding_count == 1
 
 
 @pytest.mark.asyncio
 async def test_add_conversation_dim_mismatch_logs_once(caplog):
-    """A misconfigured agent will hit the mismatch on every turn.
-    Log once per store instance so logs aren't flooded."""
+    """A misconfigured agent will hit the mismatch on every turn. Log once per
+    window so logs aren't flooded, but count every drop (#2913)."""
     from kestrel_sovereign.storage.sqla.conversation_message import (
         CONVERSATION_MESSAGE_EMBEDDING_DIM,
     )
@@ -384,15 +397,18 @@ async def test_add_conversation_dim_mismatch_logs_once(caplog):
 
     store, db = _make_store(embedding_service=svc)
     import logging
-    with caplog.at_level(logging.ERROR):
+    with caplog.at_level(logging.WARNING):
         await store.add_conversation(role="assistant", content="hi 1")
         await store.add_conversation(role="assistant", content="hi 2")
         await store.add_conversation(role="assistant", content="hi 3")
 
-    dim_records = [r for r in caplog.records if "dim mismatch" in r.message.lower()]
+    dim_records = [
+        r for r in caplog.records if "dimension mismatch" in r.message.lower()
+    ]
     assert len(dim_records) == 1, (
-        f"expected exactly one dim-mismatch log per store, got {len(dim_records)}"
+        f"expected exactly one dim-mismatch log per window, got {len(dim_records)}"
     )
+    assert store.dropped_embedding_count == 3
 
 
 @pytest.mark.asyncio

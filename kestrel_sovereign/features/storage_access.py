@@ -184,6 +184,27 @@ def resolve_feature_database(agent: Any) -> Optional[Any]:
     return None
 
 
+def resolve_conversation_store(agent: Any) -> Optional[Any]:
+    """Resolve the agent's conversation store for read-only diagnostics.
+
+    Same order as :func:`resolve_feature_database`, so a privacy-wrapped
+    agent's deprecated ``storage.conversation`` passthrough (which logs a
+    warning on every access) is never touched.
+    """
+    raw_storage = _safe_attr(agent, "_raw_storage")
+    store = _safe_attr(raw_storage, "conversation")
+    if store is not None:
+        return store
+
+    storage = _safe_attr(agent, "storage")
+    wrapped_storage = _safe_attr(storage, "_storage")
+    store = _safe_attr(wrapped_storage, "conversation")
+    if store is not None:
+        return store
+
+    return _safe_attr(storage, "conversation")
+
+
 def resolve_agent_privacy_config(agent: Any) -> Optional[Any]:
     """Resolve the active privacy config without MagicMock fabrication."""
     config = _safe_privacy_config(agent)

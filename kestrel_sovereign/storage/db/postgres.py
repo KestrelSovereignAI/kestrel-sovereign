@@ -43,6 +43,11 @@ from .interface import (
 )
 from .placeholder import sqlite_to_postgres
 from .timestamp import TimestamptzParameter
+from .after_commit import (
+    AfterCommitCallback,
+    AfterCommitCallbacks,
+    run_after_commit,
+)
 from .write_audit import record_write_query, record_write_script
 from .transaction_control import reject_transaction_control
 
@@ -90,6 +95,21 @@ def concurrent_write_retry_delay(
     ):
         return None
     return _CONCURRENT_WRITE_BACKOFF_S * (retries_done + 1)
+
+
+async def _prove_committable(conn: Any, after_commit: AfterCommitCallbacks) -> None:
+    """Refuse to commit an aborted transaction that has after-commit work.
+
+    A statement that fails inside a PostgreSQL transaction aborts it. If the
+    caller swallows that failure, COMMIT rolls the transaction back and
+    asyncpg reports no error, so ``call_after_commit`` work would run for
+    writes that never persisted (#2913). When there is such work, one trivial
+    statement first: on an aborted transaction it raises, the transaction
+    rolls back as a failure, and the work is discarded. Transactions with
+    nothing registered are left exactly as they were.
+    """
+    if after_commit.pending:
+        await conn.execute("SELECT 1")
 
 
 # asyncpg is optional - only required for PostgreSQL usage
@@ -455,6 +475,44 @@ class PostgresBackend(DatabaseBackend):
         ``transaction()`` entered now would join (as a savepoint) rather than
         commit."""
         return self._current_txn_conn() is not None
+
+    def call_after_commit(self, callback: AfterCommitCallback) -> None:
+        """Run *callback* once this task's writes so far have committed.
+
+        Inside a transaction this task owns, it runs after that transaction
+        commits and never if it rolls back; a savepoint that rolls back
+        discards what was registered inside it. With no transaction open the
+        writes committed on their own, so it runs now.
+        """
+        if self.owns_open_transaction:
+            self._current_after_commit().register(callback)
+        else:
+            run_after_commit(callback)
+
+    def _after_commit_context(self) -> "contextvars.ContextVar":
+        """``(owner_task, AfterCommitCallbacks)`` for this task's transaction.
+
+        Created on first use rather than in ``__init__``: like
+        ``_operational_conn_var``, it must exist on instances built without
+        running ``__init__`` (``PoolBackendAdapter`` wraps an existing pool),
+        or every transaction on them would fail.
+        """
+        var = getattr(self, "_after_commit_var", None)
+        if var is None:
+            var = contextvars.ContextVar("pg_after_commit", default=None)
+            self._after_commit_var = var
+        return var
+
+    def _current_after_commit(self) -> AfterCommitCallbacks:
+        """What this task's open transaction runs once it commits.
+
+        Set with the transaction's connection in :meth:`transaction`, so it
+        exists whenever :meth:`_current_txn_conn` does.
+        """
+        owner, callbacks = self._after_commit_context().get()
+        if owner is not asyncio.current_task():
+            raise RuntimeError("this task does not own the open transaction")
+        return callbacks
 
     @property
     def is_connected(self) -> bool:
@@ -893,35 +951,62 @@ class PostgresBackend(DatabaseBackend):
         existing = self._current_txn_conn()
         if existing is not None:
             # Nested transaction (same task) - use savepoint on this task's conn.
-            async with existing.transaction():
-                yield
+            after_commit = self._current_after_commit()
+            after_commit.open_savepoint()
+            try:
+                async with existing.transaction():
+                    yield
+            except BaseException:
+                after_commit.roll_back_savepoint()
+                raise
+            after_commit.release_savepoint()
             return
 
+        # Run once the transaction has committed and its connection is back.
+        committed: Optional[AfterCommitCallbacks] = None
         operational = self._current_operational_lease()
         if operational is not None:
             async with operational.lock:
                 if operational.active:
+                    after_commit = AfterCommitCallbacks()
                     token = self._txn_conn_var.set(
                         (asyncio.current_task(), operational.connection)
+                    )
+                    after_commit_token = self._after_commit_context().set(
+                        (asyncio.current_task(), after_commit)
                     )
                     try:
                         async with operational.connection.transaction():
                             yield
+                            await _prove_committable(
+                                operational.connection, after_commit
+                            )
                     except Exception as e:
                         raise TransactionError(f"Transaction failed: {e}") from e
                     finally:
+                        self._after_commit_context().reset(after_commit_token)
                         self._txn_conn_var.reset(token)
-                    return
+                    committed = after_commit
+            if committed is not None:
+                committed.run()
+                return
 
+        after_commit = AfterCommitCallbacks()
         async with pool.acquire() as conn:
             token = self._txn_conn_var.set((asyncio.current_task(), conn))
+            after_commit_token = self._after_commit_context().set(
+                (asyncio.current_task(), after_commit)
+            )
             try:
                 async with conn.transaction():
                     yield
+                    await _prove_committable(conn, after_commit)
             except Exception as e:
                 raise TransactionError(f"Transaction failed: {e}") from e
             finally:
+                self._after_commit_context().reset(after_commit_token)
                 self._txn_conn_var.reset(token)
+        after_commit.run()
 
     @asynccontextmanager
     async def advisory_locks(
