@@ -425,7 +425,7 @@ class VertexAIAdapter(LLMAdapter):
                 content = response.text
 
             # Extract token usage from response
-            # Google/Vertex uses usage_metadata with prompt_token_count and candidates_token_count
+            # Gemini usage_metadata, normalized once for both Gemini routes
             input_tokens = output_tokens = total_tokens = None
             cache_read_input_tokens = None
             if hasattr(response, 'usage_metadata') and response.usage_metadata:
