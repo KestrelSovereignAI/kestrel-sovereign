@@ -7,10 +7,14 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
+from kestrel_sovereign.storage.providers.lighthouse_rest import (
+    deal_records,
+    list_all_uploads,
+)
 from kestrel_sovereign.storage.sync.retention import parse_timestamp
+from kestrel_sovereign.storage.sync.sovereignty_exports import sovereignty_export_uploads
 from kestrel_sovereign.storage.sync.targets import TierState, TrustTier, TIER_LABELS
 
 
@@ -154,6 +158,20 @@ def _upload_filename(upload: Mapping[str, Any]) -> str:
     return str(upload.get("fileName") or upload.get("Name") or "")
 
 
+def _upload_order_key(upload: Mapping[str, Any]) -> datetime:
+    return (
+        parse_timestamp(upload.get("createdAt"))
+        or parse_timestamp(_upload_filename(upload))
+        or datetime.min.replace(tzinfo=timezone.utc)
+    )
+
+
+def _upload_time(upload: Mapping[str, Any]) -> Optional[datetime]:
+    return _parse_upload_time(upload.get("createdAt")) or parse_timestamp(
+        _upload_filename(upload)
+    )
+
+
 def _latest_lighthouse_snapshot(
     uploads: list[Mapping[str, Any]],
     agent_id: str,
@@ -173,14 +191,57 @@ def _latest_lighthouse_snapshot(
     ]
     if not candidates:
         return None
-    return max(
-        candidates,
-        key=lambda upload: (
-            parse_timestamp(upload.get("createdAt"))
-            or parse_timestamp(_upload_filename(upload))
-            or datetime.min.replace(tzinfo=timezone.utc)
-        ),
-    )
+    return max(candidates, key=_upload_order_key)
+
+
+def _latest_sovereignty_export(
+    uploads: list[Mapping[str, Any]],
+    agent_id: str,
+) -> Optional[Mapping[str, Any]]:
+    """This agent's latest sovereignty export, attributed by its record (#2874)."""
+    candidates = sovereignty_export_uploads(uploads, agent_id)
+    if not candidates:
+        return None
+    return max(candidates, key=_upload_order_key)
+
+
+_DEAL_STATUS_RANK = {"ok": 0, "pending": 1, "warning": 2}
+
+
+async def _deal_details(
+    client: Any,
+    *,
+    cid: Optional[str],
+    uploaded_at: Optional[datetime],
+    current_time: datetime,
+    grace_period: timedelta,
+) -> dict[str, Any]:
+    """An upload's Filecoin deals, its age, and the status they amount to."""
+    age = current_time - uploaded_at if uploaded_at else None
+    deals = await client.get_deal_status(cid) if cid else []
+    deal_count = len(deal_records(deals))
+    if deal_count > 0:
+        status = "ok"
+    elif age is not None and age <= grace_period:
+        status = "pending"
+    else:
+        status = "warning"
+    return {
+        "cid": cid,
+        "uploaded_at": uploaded_at.isoformat() if uploaded_at else None,
+        "age_seconds": int(age.total_seconds()) if age else None,
+        "deal_count": deal_count,
+        "deals": deals,
+        "status": status,
+    }
+
+
+def _deal_phrase(details: Mapping[str, Any]) -> str:
+    if details["status"] == "ok":
+        return f"has {details['deal_count']} Filecoin deal(s)"
+    if details["status"] == "pending":
+        return "has no deals yet but is within grace"
+    return "has no Filecoin deals beyond grace"
 
 
 def _latest_lighthouse_manifest(
@@ -204,32 +265,43 @@ def _latest_lighthouse_manifest(
     ]
     if not candidates:
         return None
-    return max(
-        candidates,
-        key=lambda upload: (
-            parse_timestamp(upload.get("createdAt"))
-            or parse_timestamp(_upload_filename(upload))
-            or datetime.min.replace(tzinfo=timezone.utc)
-        ),
-    )
+    return max(candidates, key=_upload_order_key)
 
 
 async def check_lighthouse_health(
     *,
-    api_key: Optional[str],
+    snapshot_api_key: Optional[str],
+    export_api_key: Optional[str],
     agent_id: str,
+    export_key_error: Optional[str] = None,
     grace_period: timedelta = DEFAULT_LIGHTHOUSE_DEAL_GRACE,
     now: Optional[datetime] = None,
     client_factory: Optional[Callable[..., Any]] = None,
 ) -> TargetHealth:
-    """Check latest Lighthouse snapshot deal status."""
-    if not api_key:
+    """Check the deal status of the agent's latest Lighthouse snapshot and
+    sovereignty export, each on the account it is uploaded to.
+
+    State snapshots are read with ``snapshot_api_key``, the host's
+    ``LIGHTHOUSE_API_KEY``: the key the snapshot target uploads with and
+    cold-start restore reads. Sovereignty exports are read with
+    ``export_api_key``, the agent's key as its PayerPolicy resolves it,
+    which need not name the same account (#2874). An account both keys name
+    is listed once. Either key may be ``None``, and its uploads are then not
+    looked for.
+
+    A sovereignty export is reported under ``details["sovereignty_export"]``
+    and attributed to ``agent_id`` by its agent-scoped upload record. With no
+    snapshot it is the upload the check reports; with both, the status is the
+    worse of the two. ``export_key_error`` is why the export key could not be
+    resolved: the status is then ``error``, whatever the snapshot shows.
+    """
+    if not snapshot_api_key and not export_api_key and export_key_error is None:
         return TargetHealth(
             name="lighthouse",
             label=TIER_LABELS[TrustTier.DELEGATED],
             configured=False,
             status="not_configured",
-            message="LIGHTHOUSE_API_KEY is not set",
+            message="No Lighthouse credential is configured for this agent",
         )
 
     if client_factory is None:
@@ -240,78 +312,69 @@ async def check_lighthouse_health(
         client_factory = LighthouseRestClient
 
     current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    client = client_factory(api_key=api_key)
+    clients: dict[str, Any] = {}
+    listings: dict[str, list[Mapping[str, Any]]] = {}
+
+    async def account(api_key: str) -> tuple[Any, list[Mapping[str, Any]]]:
+        """The client for ``api_key``'s account and every upload in it."""
+        if api_key not in clients:
+            clients[api_key] = client_factory(api_key=api_key)
+        if api_key not in listings:
+            # Every page: the latest upload need not be on the first (#2874).
+            listings[api_key] = await list_all_uploads(clients[api_key])
+        return clients[api_key], listings[api_key]
+
+    latest = manifest = snapshot = None
+    export = export_details = None
     try:
-        uploads_response = await client.get_uploads()
-        uploads = uploads_response.get("fileList", [])
-        if not isinstance(uploads, list):
-            uploads = []
+        if snapshot_api_key:
+            client, uploads = await account(snapshot_api_key)
+            latest = _latest_lighthouse_snapshot(uploads, agent_id)
+            if latest is None:
+                latest_manifest = _latest_lighthouse_manifest(uploads, agent_id)
+                manifest_cid = (
+                    _upload_cid(latest_manifest) if latest_manifest else None
+                )
+                if manifest_cid:
+                    manifest_bytes = await client.download(manifest_cid)
+                    manifest = json.loads(manifest_bytes)
+                    latest = latest_manifest
+            if latest is not None:
+                cid = (
+                    str(manifest.get("snapshot_cid"))
+                    if manifest
+                    else _upload_cid(latest)
+                )
+                uploaded_at = (
+                    _parse_upload_time(manifest.get("uploaded_at")) if manifest else None
+                ) or _parse_upload_time(latest.get("createdAt"))
+                snapshot = await _deal_details(
+                    client,
+                    cid=cid,
+                    uploaded_at=uploaded_at,
+                    current_time=current_time,
+                    grace_period=grace_period,
+                )
 
-        latest = _latest_lighthouse_snapshot(uploads, agent_id)
-        manifest = None
-        if latest is None:
-            latest_manifest = _latest_lighthouse_manifest(uploads, agent_id)
-            manifest_cid = _upload_cid(latest_manifest) if latest_manifest else None
-            if manifest_cid:
-                manifest_bytes = await client.download(manifest_cid)
-                manifest = json.loads(manifest_bytes)
-                latest = latest_manifest
-
-        if latest is None:
-            return TargetHealth(
-                name="lighthouse",
-                label=TIER_LABELS[TrustTier.DELEGATED],
-                configured=True,
-                status="unavailable",
-                message="No Lighthouse snapshot upload found",
-            )
-
-        cid = str(manifest.get("snapshot_cid")) if manifest else _upload_cid(latest)
-        uploaded_at = (
-            _parse_upload_time(manifest.get("uploaded_at")) if manifest else None
-        ) or _parse_upload_time(latest.get("createdAt"))
-        age = current_time - uploaded_at if uploaded_at else None
-        deals = await client.get_deal_status(cid) if cid else []
-        deal_count = len(deals) if isinstance(deals, list) else 0
-
-        details = {
-            "cid": cid,
-            "file_name": latest.get("fileName"),
-            "tag": latest.get("tag"),
-            "resolved_via": "manifest" if manifest else "snapshot_upload",
-            "uploaded_at": uploaded_at.isoformat() if uploaded_at else None,
-            "age_seconds": int(age.total_seconds()) if age else None,
-            "deal_count": deal_count,
-            "deals": deals if isinstance(deals, list) else deals,
-            "grace_seconds": int(grace_period.total_seconds()),
-        }
-
-        if deal_count > 0:
-            return TargetHealth(
-                name="lighthouse",
-                label=TIER_LABELS[TrustTier.DELEGATED],
-                configured=True,
-                status="ok",
-                message=f"Latest Lighthouse snapshot has {deal_count} Filecoin deal(s)",
-                details=details,
-            )
-        if age is not None and age <= grace_period:
-            return TargetHealth(
-                name="lighthouse",
-                label=TIER_LABELS[TrustTier.DELEGATED],
-                configured=True,
-                status="pending",
-                message="Latest Lighthouse snapshot has no deals yet but is within grace",
-                details=details,
-            )
-        return TargetHealth(
-            name="lighthouse",
-            label=TIER_LABELS[TrustTier.DELEGATED],
-            configured=True,
-            status="warning",
-            message="Latest Lighthouse snapshot has no Filecoin deals beyond grace",
-            details=details,
-        )
+        if export_api_key:
+            client, uploads = await account(export_api_key)
+            export = _latest_sovereignty_export(uploads, agent_id)
+            if export is not None:
+                export_details = await _deal_details(
+                    client,
+                    cid=_upload_cid(export),
+                    uploaded_at=_upload_time(export),
+                    current_time=current_time,
+                    grace_period=grace_period,
+                )
+                export_details.update(
+                    {
+                        # The one agent the export's record names (#2874).
+                        "agent_id": agent_id,
+                        "file_name": export.get("fileName"),
+                        "tag": export.get("tag"),
+                    }
+                )
     except Exception as exc:
         return TargetHealth(
             name="lighthouse",
@@ -321,9 +384,68 @@ async def check_lighthouse_health(
             message=f"Lighthouse health check failed: {exc}",
         )
     finally:
-        close = getattr(client, "close", None)
-        if close is not None:
-            await close()
+        for client in clients.values():
+            close = getattr(client, "close", None)
+            if close is not None:
+                await close()
+
+    grace_seconds = int(grace_period.total_seconds())
+    if snapshot is not None:
+        details = {
+            "cid": snapshot["cid"],
+            "file_name": latest.get("fileName"),
+            "tag": latest.get("tag"),
+            "resolved_via": "manifest" if manifest else "snapshot_upload",
+            "uploaded_at": snapshot["uploaded_at"],
+            "age_seconds": snapshot["age_seconds"],
+            "deal_count": snapshot["deal_count"],
+            "deals": snapshot["deals"],
+            "grace_seconds": grace_seconds,
+            "sovereignty_export": export_details,
+        }
+        status = snapshot["status"]
+        message = "Latest Lighthouse snapshot " + _deal_phrase(snapshot)
+        if export_details is not None:
+            # The snapshot does not stand in for the export: the check
+            # reports the worse of the two.
+            if _DEAL_STATUS_RANK[export_details["status"]] > _DEAL_STATUS_RANK[status]:
+                status = export_details["status"]
+            message += "; latest sovereignty export " + _deal_phrase(export_details)
+    elif export_details is not None:
+        # No state snapshot: the sovereignty export is this agent's restore
+        # point on Lighthouse, so it is what the check reports.
+        details = {
+            "cid": export_details["cid"],
+            "file_name": export_details["file_name"],
+            "tag": export_details["tag"],
+            "resolved_via": "sovereignty_export",
+            "uploaded_at": export_details["uploaded_at"],
+            "age_seconds": export_details["age_seconds"],
+            "deal_count": export_details["deal_count"],
+            "deals": export_details["deals"],
+            "grace_seconds": grace_seconds,
+            "sovereignty_export": export_details,
+        }
+        status = export_details["status"]
+        message = "Latest Lighthouse sovereignty export " + _deal_phrase(export_details)
+    else:
+        details = {}
+        status = "unavailable"
+        message = "No Lighthouse snapshot or sovereignty export upload found"
+
+    if export_key_error is not None:
+        # The account the agent's exports go to cannot be read: an error,
+        # whatever the snapshot account shows.
+        status = "error"
+        message = export_key_error + ("; " + message if snapshot is not None else "")
+    return TargetHealth(
+        name="lighthouse",
+        label=TIER_LABELS[TrustTier.DELEGATED],
+        configured=True,
+        status=status,
+        message=message,
+        details=details,
+    )
 
 
 async def check_gcs_health(
@@ -429,18 +551,34 @@ def _aggregate_overall_status(statuses: set[str]) -> str:
 async def build_storage_health_report(
     *,
     agent_id: str,
+    export_api_key: Optional[str],
+    export_key_error: Optional[str] = None,
     env: Mapping[str, str] = os.environ,
     lighthouse_grace: timedelta = DEFAULT_LIGHTHOUSE_DEAL_GRACE,
     gcs_prefix: str = "kestrel/",
     now: Optional[datetime] = None,
 ) -> StorageHealthReport:
-    """Build a combined backup storage health report from environment."""
+    """Build a combined backup storage health report for one agent.
+
+    The Lighthouse tier reads each of the agent's uploads on the account it
+    went to (``check_lighthouse_health``). Its state snapshots are read with
+    ``env``'s ``LIGHTHOUSE_API_KEY``, the host key the snapshot target uploads
+    with and cold-start restore reads. Its sovereignty exports are read with
+    ``export_api_key``, the agent's Lighthouse credential as its PayerPolicy
+    resolves it (``resolve_lighthouse_storage`` and ``lighthouse_api_key_for``
+    in ``lighthouse_provider``), the key they are published with (#2874).
+    ``export_key_error`` is why that credential could not be resolved, which
+    the Lighthouse tier reports as its error while the other tiers are still
+    checked.
+    """
     sovereign_ipfs, lighthouse, gcs = await asyncio.gather(
         check_sovereign_ipfs_health(
             api_url=env.get("SOVEREIGN_IPFS_URL"),
         ),
         check_lighthouse_health(
-            api_key=env.get("LIGHTHOUSE_API_KEY"),
+            snapshot_api_key=env.get("LIGHTHOUSE_API_KEY"),
+            export_api_key=export_api_key,
+            export_key_error=export_key_error,
             agent_id=agent_id,
             grace_period=lighthouse_grace,
             now=now,
@@ -462,17 +600,3 @@ async def build_storage_health_report(
         lighthouse=lighthouse,
         gcs=gcs,
     )
-
-
-def load_env_file(path: Path, env: Optional[dict[str, str]] = None) -> dict[str, str]:
-    """Load simple KEY=VALUE lines from an env file without overwriting env."""
-    values = dict(os.environ if env is None else env)
-    if not path.exists():
-        return values
-    for raw_line in path.read_text().splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-    return values

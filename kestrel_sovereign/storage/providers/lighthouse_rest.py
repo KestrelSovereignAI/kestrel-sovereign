@@ -13,12 +13,88 @@ Lighthouse REST API reference:
 """
 
 import logging
+from collections.abc import Mapping
 from io import BytesIO
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+
+# Fields that name one Filecoin deal in a deal_status record: its deal id
+# (chain, client or UUID) or the storage provider holding it.
+_DEAL_IDENTITY_KEYS = frozenset(
+    {
+        "DealID",
+        "dealId",
+        "dealID",
+        "deal_id",
+        "chainDealID",
+        "dealUUID",
+        "Provider",
+        "StorageProvider",
+        "storageProvider",
+        "miner",
+    }
+)
+# Keys a deal_status response wraps its list of deals in.
+_DEAL_LIST_KEYS = ("data", "deals", "dealStatus", "dealInfo")
+
+
+class LighthouseDownloadLimitError(ValueError):
+    """A bounded gateway download exceeded its byte ceiling."""
+
+
+def deal_records(status: Any) -> List[Mapping]:
+    """The Filecoin deals a ``get_deal_status`` response names.
+
+    The endpoint answers with a JSON list of deal records; the SDK wraps that
+    list as ``{"data": [...]}``, and a single deal may arrive as one record.
+    A record counts only when it names a deal (a deal id or the provider
+    holding it), so a response this cannot read counts no deals rather than
+    reporting storage that is not shown to exist.
+    """
+    if isinstance(status, (list, tuple)):
+        records: List[Mapping] = []
+        for item in status:
+            records.extend(deal_records(item))
+        return records
+    if not isinstance(status, Mapping):
+        return []
+    if _DEAL_IDENTITY_KEYS.intersection(status):
+        return [status]
+    for key in _DEAL_LIST_KEYS:
+        if key in status:
+            return deal_records(status[key])
+    return []
+
+
+async def list_all_uploads(client: Any) -> List[Dict[str, Any]]:
+    """Every upload record in the account ``client`` authenticates as.
+
+    ``files_uploaded`` has no nextLastKey/lastKey: the cursor is the last
+    record's id (page size 1000), and listing continues until a page is
+    empty. A repeated or missing cursor ends it rather than looping. An
+    entry that is not a record is dropped, so every reader gets mappings.
+    """
+    uploads: List[Dict[str, Any]] = []
+    last_key: Optional[str] = None
+    seen_cursors: set[str] = set()
+    while True:
+        page = await client.get_uploads(last_key=last_key)
+        file_list = page.get("fileList", [])
+        if not isinstance(file_list, list) or not file_list:
+            break
+        # A record is a JSON object; anything else names no upload.
+        records = [item for item in file_list if isinstance(item, dict)]
+        uploads.extend(records)
+        last_key = str(records[-1].get("id")) if records and records[-1].get("id") else None
+        if not last_key or last_key in seen_cursors:
+            break
+        seen_cursors.add(last_key)
+    return uploads
 
 
 class _ProgressBytesIO(BytesIO):
@@ -218,6 +294,7 @@ class LighthouseRestClient:
         timeout: Optional[float] = None,
         *,
         expected_bytes: Optional[int] = None,
+        max_bytes: Optional[int] = None,
     ) -> bytes:
         """
         Download content from IPFS gateway.
@@ -228,26 +305,62 @@ class LighthouseRestClient:
             expected_bytes: The object's size when known (a manifest's
                 ``snapshot_size``); buys the payload-sized budget of
                 :meth:`transfer_timeout` instead of the flat default
+            max_bytes: A ceiling on the bytes read. The body is streamed and
+                the read stops, raising ``LighthouseDownloadLimitError``, as
+                soon as it would pass the ceiling, so a caller restoring
+                whatever a CID returns never holds more than it allows.
 
         Returns:
             Content bytes
         """
         client = await self._get_client()
-        response = await client.get(
-            f"{self.gateway_url}/{cid}",
-            # The gateway assembles the whole object before the first byte, so
-            # a known size buys the same payload-proportional patience as an
-            # upload; an explicit timeout wins, then the flat default.
-            timeout=(
-                timeout
-                if timeout is not None
-                else self.transfer_timeout(expected_bytes)
-                if expected_bytes
-                else 120.0
-            ),
+        url = f"{self.gateway_url}/{cid}"
+        # The gateway assembles the whole object before the first byte, so
+        # a known size buys the same payload-proportional patience as an
+        # upload; an explicit timeout wins, then the flat default.
+        request_timeout = (
+            timeout
+            if timeout is not None
+            else self.transfer_timeout(expected_bytes)
+            if expected_bytes
+            else 120.0
         )
-        response.raise_for_status()
-        return response.content
+        if max_bytes is None:
+            response = await client.get(url, timeout=request_timeout)
+            response.raise_for_status()
+            return response.content
+
+        # Identity encoding only, read raw, so the ceiling counts the bytes
+        # the gateway sends; a compressed body would be expanded, chunk by
+        # chunk, before anything could count it.
+        async with client.stream(
+            "GET",
+            url,
+            headers={"Accept-Encoding": "identity"},
+            timeout=request_timeout,
+        ) as response:
+            response.raise_for_status()
+            encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
+            if encoding not in ("", "identity"):
+                raise ValueError(
+                    f"gateway sent {cid} with Content-Encoding {encoding!r}; a "
+                    "bounded download reads identity bodies only"
+                )
+            declared = response.headers.get("Content-Length")
+            if declared is not None and declared.isdigit() and int(declared) > max_bytes:
+                raise LighthouseDownloadLimitError(
+                    f"gateway response for {cid} exceeds {max_bytes} bytes"
+                )
+            chunks: List[bytes] = []
+            total = 0
+            async for chunk in response.aiter_raw(_DOWNLOAD_CHUNK_BYTES):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise LighthouseDownloadLimitError(
+                        f"gateway response for {cid} exceeds {max_bytes} bytes"
+                    )
+                chunks.append(chunk)
+        return b"".join(chunks)
 
     async def get_uploads(self, last_key: Optional[str] = None) -> Dict[str, Any]:
         """

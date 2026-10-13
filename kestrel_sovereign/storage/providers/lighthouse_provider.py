@@ -83,7 +83,9 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
                 fallback is NOT consulted at construction time — the
                 resolver is the single source of truth, so a PayerPolicy
                 slot of ``NONE`` actually means NONE even on a host where
-                ``LIGHTHOUSE_API_KEY`` happens to be set.
+                ``LIGHTHOUSE_API_KEY`` happens to be set. Nor is a key given
+                here used once the resolver has answered: when it resolves
+                none, the provider has none.
             cache_dir: Local cache directory for performance
             default_tier: Default storage tier (CLOUD_HOT or CLOUD_COLD)
             key_resolver: Optional KeyResolutionService for dynamic key resolution
@@ -121,32 +123,61 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
         self._index_file = self.cache_dir / "lighthouse_index.json"
 
     async def _get_api_key(self) -> Optional[str]:
-        """Get API key, using resolver if available."""
-        if self._key_resolver:
-            try:
-                key = await self._key_resolver.resolve_key("lighthouse", require=False)
-                if key:
-                    return key
-            except Exception as e:
-                logger.warning(f"Key resolver failed: {e}")
-        return self.api_key
+        """The key to call Lighthouse with now.
+
+        With a key resolver its answer is the key, and None means no
+        credential resolves: the agent's key was removed and nothing stands
+        in for it. A resolver that fails raises. Neither falls back to the
+        key last resolved, which would keep a removed credential in use for
+        every export, thinning and health read while ``kestrel storage
+        health`` resolves none (#2874). Only a provider without a resolver
+        uses the key it was constructed with.
+
+        The resolver is asked strictly: a key the agent holds but cannot
+        read raises ``KeyUnreadableError`` rather than resolving the host's
+        ``LIGHTHOUSE_API_KEY``, which names another account (#2874).
+        """
+        if self._key_resolver is None:
+            return self.api_key
+        return await self._key_resolver.resolve_key(
+            "lighthouse", require=False, strict_storage=True
+        )
 
     async def _ensure_client(self) -> bool:
-        """Ensure client is initialized with current API key."""
-        api_key = await self._get_api_key()
-        if api_key:
-            if not self._client or self.api_key != api_key:
-                # Close old client if key changed
-                if self._client:
-                    await self._client.close()
-                self._client = LighthouseRestClient(
-                    api_key=api_key,
-                    gateway_url=get_lighthouse_gateway_url(),
-                )
-                self.api_key = api_key
-                self._available = True
-                return True
+        """Ensure client is initialized with current API key.
+
+        When the resolver supplies no key, or fails, the client and the key
+        it holds are dropped, so the provider is unavailable until a key
+        resolves again; a failure is then raised.
+        """
+        try:
+            api_key = await self._get_api_key()
+        except Exception:
+            await self._drop_client()
+            raise
+        if not api_key:
+            if self._key_resolver is not None:
+                await self._drop_client()
+            return self._available
+        if not self._client or self.api_key != api_key:
+            # Close old client if key changed
+            if self._client:
+                await self._client.close()
+            self._client = LighthouseRestClient(
+                api_key=api_key,
+                gateway_url=get_lighthouse_gateway_url(),
+            )
+            self.api_key = api_key
+            self._available = True
         return self._available
+
+    async def _drop_client(self) -> None:
+        """Forget the key and close its client: nothing is called with it."""
+        client, self._client = self._client, None
+        self.api_key = None
+        self._available = False
+        if client is not None:
+            await client.close()
 
     @property
     def tier(self) -> StorageTier:
@@ -234,6 +265,82 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
         await self._update_index(result)
 
         return result
+
+    async def publish(
+        self,
+        payload: bytes,
+        *,
+        filename: str,
+        tag: str,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> str:
+        """Pin ``payload`` exactly as given and return its CID.
+
+        Unlike :meth:`store`, this neither encrypts, caches nor indexes: the
+        caller has already sealed the payload and keeps its own record of it.
+        A sovereignty export is published this way (#2874). Its host-cache
+        copy is owned by the receipt that records it (#2873), and ``store``
+        would add a second copy under another name in the cache co-hosted
+        agents share.
+        """
+        await self._ensure_client()
+        if not self.is_available():
+            raise ConnectionError("Lighthouse provider not available")
+        upload_response = await self._client.upload(
+            content=payload,
+            filename=filename,
+            tag=tag,
+            on_progress=on_progress,
+        )
+        cid = upload_response.get("Hash") or upload_response.get("cid")
+        if not cid:
+            raise ValueError(f"Lighthouse returned no CID for {filename}")
+        logger.info(f"Published to Lighthouse: {cid} ({filename})")
+        return str(cid)
+
+    async def resolve_api_key(self) -> Optional[str]:
+        """The API key this provider publishes with, or None without one.
+
+        It is the key resolver's current key when the provider has one (the
+        agent's PayerPolicy resolution), and None once it resolves none; a
+        resolver failure raises. Without a resolver it is the key the
+        provider was constructed with. A reader of what this provider
+        published must use this key: the account it names is the one the
+        upload went to (#2874).
+        """
+        await self._ensure_client()
+        return self.api_key if self.is_available() else None
+
+    async def list_uploads(self) -> List[Dict[str, Any]]:
+        """Every upload record in the account this provider publishes to."""
+        from kestrel_sovereign.storage.providers.lighthouse_rest import (
+            list_all_uploads,
+        )
+
+        await self._ensure_client()
+        if not self.is_available():
+            raise ConnectionError("Lighthouse provider not available")
+        return await list_all_uploads(self._client)
+
+    async def delete_upload(self, file_id: str) -> None:
+        """Delete one upload record, by file id, from that account."""
+        await self._ensure_client()
+        if not self.is_available():
+            raise ConnectionError("Lighthouse provider not available")
+        await self._client.delete_file(file_id)
+
+    async def fetch(self, cid: str, *, max_bytes: Optional[int]) -> bytes:
+        """The bytes Lighthouse's gateway serves for ``cid``, exactly as given.
+
+        The counterpart of :meth:`publish`: it neither decrypts, caches nor
+        indexes, and reads at most ``max_bytes`` (raising
+        ``LighthouseDownloadLimitError`` past it). The caller verifies what
+        it receives; an import does so through the export's envelope (#2874).
+        """
+        await self._ensure_client()
+        if not self.is_available():
+            raise ConnectionError("Lighthouse provider not available")
+        return await self._client.download(cid, max_bytes=max_bytes)
 
     async def retrieve(self, cid: str, encryption_key_hash: Optional[str] = None) -> bytes:
         """
@@ -737,3 +844,72 @@ def create_lighthouse_provider(
         Configured LighthouseProvider
     """
     return LighthouseProvider(api_key=api_key, default_tier=tier, key_resolver=key_resolver)
+
+
+async def resolve_lighthouse_storage(
+    agent_did: str,
+    *,
+    policy: Any,
+    db: Any,
+    host_db: Any,
+    wallet_private_key: Any = None,
+) -> Any:
+    """An agent's Lighthouse credential, resolved by its PayerPolicy (#2874).
+
+    The one resolution of the account an agent's sovereignty exports use.
+    Boot builds the agent's provider from it (:func:`lighthouse_provider_for`),
+    and that provider publishes the agent's sovereignty exports, thins them
+    and reports their health. ``kestrel storage health`` reads their account
+    with the key it names (:func:`lighthouse_api_key_for`). None of them
+    reads a Lighthouse key of its own. The agent's state snapshots are not
+    on this account: they go to the host's ``LIGHTHOUSE_API_KEY``, the one
+    account cold-start restore can read before the agent's database exists.
+
+    ``policy``, ``db`` and ``host_db`` are the agent's, as
+    ``FoundationPayerResolver`` takes them. ``wallet_private_key`` is needed
+    only to mint a SELF_WALLET key the agent does not hold yet. Raises what
+    the resolver raises for a policy it cannot honour.
+    """
+    from kestrel_sdk.payer_policy import ResourceClass
+    from kestrel_sovereign.services.payer_resolver import FoundationPayerResolver
+
+    resolver = FoundationPayerResolver(
+        policy,
+        db=db,
+        host_db=host_db,
+        wallet_private_key=wallet_private_key,
+    )
+    return await resolver.resolve_for(agent_did, ResourceClass.STORAGE)
+
+
+async def lighthouse_api_key_for(resolved: Any) -> Optional[str]:
+    """The Lighthouse API key a :func:`resolve_lighthouse_storage` result
+    names, or None when it is disabled (``NONE``) or its resolver holds none.
+
+    The same strict lookup the agent's provider makes before every request:
+    a key the agent holds but cannot read raises ``KeyUnreadableError``.
+    """
+    if not resolved.enabled or resolved.key_resolver is None:
+        return None
+    return await resolved.key_resolver.resolve_key(
+        "lighthouse", require=False, strict_storage=True
+    )
+
+
+async def lighthouse_provider_for(resolved: Any) -> Optional[LighthouseProvider]:
+    """The agent's Lighthouse provider for its PayerPolicy storage resolution.
+
+    ``resolved`` is what :func:`resolve_lighthouse_storage` returned. A
+    disabled resolution (``NONE``) builds no provider, and a provider whose
+    resolver supplies no key is not returned. With a resolver in charge the
+    constructor reads no environment key, so the resolver is the one source
+    of the provider's key (#2874).
+    """
+    if not resolved.enabled:
+        return None
+    provider = LighthouseProvider(api_key=None, key_resolver=resolved.key_resolver)
+    # With api_key=None the client is not created until _ensure_client()
+    # consults the resolver, so is_available() reflects the resolver's
+    # result only after this call.
+    await provider._ensure_client()
+    return provider if provider.is_available() else None

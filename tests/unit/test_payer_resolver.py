@@ -18,10 +18,11 @@ Coverage:
 """
 from __future__ import annotations
 
-from decimal import Decimal
+import base64
 from typing import Iterator
 
 import pytest
+import pytest_asyncio
 
 from kestrel_sdk.payer_policy import (
     PayerKind,
@@ -32,7 +33,20 @@ from kestrel_sdk.payer_policy import (
     UnsupportedCombinationError,
 )
 
-from kestrel_sovereign.services.key_resolution import KeyResolutionService
+from kestrel_sovereign.security.exceptions import (
+    DecryptionError,
+    KeyNotConfiguredError as StoredKeyNotConfiguredError,
+)
+from kestrel_sovereign.security.service_key_storage import (
+    ServiceKeyStorage,
+    StoredKeyCiphertextMissingError,
+)
+from kestrel_sovereign.services.key_resolution import (
+    KeyResolutionService,
+    KeyUnreadableError,
+    resolve_key,
+)
+from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.services.payer_resolver import (
     FoundationPayerResolver,
     load_policy_from_toml,
@@ -284,3 +298,128 @@ class TestLoadPolicyFromToml:
         monkeypatch.delenv("KESTREL_PROJECT_DIR", raising=False)
         policy = load_policy_from_toml()
         assert policy == PayerPolicy.host_env_default()
+
+
+# How an agent's stored key becomes unreadable, and what its lookup raises:
+# a ciphertext that does not decrypt (a damaged row or another
+# KESTREL_DATA_KEY), or an active row whose ciphertext is empty.
+UNREADABLE = {
+    "undecryptable": (
+        base64.b64encode(b"not a ciphertext").decode(),
+        DecryptionError,
+    ),
+    "empty": ("", StoredKeyCiphertextMissingError),
+}
+
+
+async def _make_unreadable(
+    db, agent_did: str, provider: str, how: str = "undecryptable"
+) -> None:
+    """The agent's stored key stops being readable, as ``UNREADABLE[how]``."""
+    await db.execute(
+        "UPDATE agent_service_keys SET encrypted_key = ? "
+        "WHERE agent_did = ? AND provider_id = ?",
+        (UNREADABLE[how][0], agent_did, provider),
+    )
+
+
+class TestStrictStorageResolution:
+    """``strict_storage`` separates a key the agent holds but cannot read from
+    one it does not hold. Only the absent key falls back to the environment;
+    without the flag every storage failure still does (#2874)."""
+
+    @pytest_asyncio.fixture
+    async def db(self, tmp_path):
+        database = await AsyncDatabase.sqlite(str(tmp_path / "agent.db"))
+        yield database
+        await database.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how", sorted(UNREADABLE))
+    async def test_a_non_lighthouse_caller_still_falls_back_on_a_storage_error(
+        self, db, monkeypatch, how
+    ) -> None:
+        agent_did = "did:test:agent-llm"
+        await ServiceKeyStorage(db, agent_did).store_key("openrouter", "sk-or-agent")
+        await _make_unreadable(db, agent_did, "openrouter", how)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-host")
+        result = await FoundationPayerResolver(
+            PayerPolicy.host_env_default(), db=db
+        ).resolve_for(agent_did, ResourceClass.LLM)
+
+        assert await result.key_resolver.resolve_key("openrouter", require=False) == (
+            "sk-or-host"
+        )
+        assert await resolve_key(
+            "openrouter", storage=ServiceKeyStorage(db, agent_did), require=False
+        ) == "sk-or-host"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how", sorted(UNREADABLE))
+    async def test_strictly_an_unreadable_key_raises_instead_of_the_hosts(
+        self, db, monkeypatch, how
+    ) -> None:
+        agent_did = "did:test:agent-storage"
+        await ServiceKeyStorage(db, agent_did).store_key("lighthouse", "lh-agent")
+        await _make_unreadable(db, agent_did, "lighthouse", how)
+        monkeypatch.setenv("LIGHTHOUSE_API_KEY", "lh-host")
+        result = await FoundationPayerResolver(
+            PayerPolicy.host_env_default(), db=db
+        ).resolve_for(agent_did, ResourceClass.STORAGE)
+
+        with pytest.raises(KeyUnreadableError, match="cannot be read") as raised:
+            await result.key_resolver.resolve_key(
+                "lighthouse", require=False, strict_storage=True
+            )
+        assert raised.value.provider == "lighthouse"
+        assert isinstance(raised.value.__cause__, UNREADABLE[how][1])
+        with pytest.raises(KeyUnreadableError):
+            await resolve_key(
+                "lighthouse",
+                storage=ServiceKeyStorage(db, agent_did),
+                require=False,
+                strict_storage=True,
+            )
+        # Without the flag the same lookup still falls back.
+        assert await result.key_resolver.resolve_key("lighthouse", require=False) == (
+            "lh-host"
+        )
+
+    @pytest.mark.asyncio
+    async def test_strictly_an_absent_key_still_falls_back_to_the_host(
+        self, db, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("LIGHTHOUSE_API_KEY", "lh-host")
+        result = await FoundationPayerResolver(
+            PayerPolicy.host_env_default(), db=db
+        ).resolve_for("did:test:agent-without-key", ResourceClass.STORAGE)
+
+        assert await result.key_resolver.resolve_key(
+            "lighthouse", require=False, strict_storage=True
+        ) == "lh-host"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_key_row_still_reads_as_no_key_to_direct_callers(
+        self, db
+    ) -> None:
+        """A caller of ``ServiceKeyStorage.get_key`` that catches the storage
+        layer's ``KeyNotConfiguredError`` (the LLM service's agent-key
+        activation, the keys feature) still reads an empty row as no key. Only
+        the type it raises tells the damaged row from the absent one."""
+        agent_did = "did:test:agent-direct"
+        storage = ServiceKeyStorage(db, agent_did)
+        with pytest.raises(StoredKeyNotConfiguredError) as absent:
+            await storage.get_key("openrouter")
+        assert not isinstance(absent.value, StoredKeyCiphertextMissingError)
+
+        await storage.store_key("openrouter", "sk-or-agent")
+        await _make_unreadable(db, agent_did, "openrouter", "empty")
+        with pytest.raises(StoredKeyNotConfiguredError) as empty:
+            await storage.get_key("openrouter")
+        assert isinstance(empty.value, StoredKeyCiphertextMissingError)
+
+        # A removed key is absent, not damaged.
+        await storage.deactivate_key(provider_id="openrouter")
+        with pytest.raises(StoredKeyNotConfiguredError) as removed:
+            await storage.get_key("openrouter")
+        assert not isinstance(removed.value, StoredKeyCiphertextMissingError)
