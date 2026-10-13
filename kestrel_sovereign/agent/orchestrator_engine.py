@@ -35,7 +35,11 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
     infer_tool_result_status,
     tool_result_size_bytes,
 )
-from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
+from kestrel_sovereign.llm.adapter import (
+    LLMResponse,
+    ThinkingDelta,
+    tool_call_history_entry,
+)
 from kestrel_sovereign.llm.call_progress import call_progress_listener
 from kestrel_sovereign.llm.generation_gate import failure_summary, judge_generation
 from kestrel_sovereign.llm.output_ceiling import IncompleteGenerationError
@@ -1800,19 +1804,7 @@ class OrchestratorEngineMixin:
     @staticmethod
     def _build_tool_calls_msg(tool_calls) -> list:
         """Convert LLMResponse tool_calls to OpenAI-format dicts."""
-        return [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.name,
-                    # ollama library expects arguments as dict, not string
-                    "arguments": tc.arguments if isinstance(tc.arguments, dict)
-                    else json.loads(tc.arguments) if tc.arguments else {}
-                }
-            }
-            for tc in tool_calls
-        ]
+        return [tool_call_history_entry(tc) for tc in tool_calls]
 
     @staticmethod
     def _extract_response_reasoning_content(response: LLMResponse) -> Optional[str]:

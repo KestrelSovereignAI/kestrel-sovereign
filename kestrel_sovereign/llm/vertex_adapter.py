@@ -32,6 +32,7 @@ from .google_adapter import _finish_reason, _normalized_google_genai_usage
 from .gemini_contents import (
     SYSTEM_MARKER_ROLE,
     to_gemini_contents,
+    tool_call_from_part,
     tool_result_messages,
 )
 from .output_ceiling import attach_stop_reason
@@ -349,15 +350,11 @@ class VertexAIAdapter(LLMAdapter):
     def _tool_call(part: Any, index: int) -> Optional[ToolCall]:
         """The tool call a response part carries, or None if it carries none.
 
-        google-genai's ``Part`` always has a ``function_call`` attribute
-        (``None`` on a text or thought-signature part), so the value decides,
-        never ``hasattr``. ``index`` numbers the call within its response.
+        Parsed by :func:`tool_call_from_part`, which keeps a Gemini 3 call's
+        thought signature (#3619). ``index`` numbers the call within its
+        response.
         """
-        fc = getattr(part, "function_call", None)
-        if fc is None:
-            return None
-        args = dict(fc.args) if getattr(fc, "args", None) else {}
-        return ToolCall(id=f"vertex_call_{index}", name=fc.name, arguments=args)
+        return tool_call_from_part(part, f"vertex_call_{index}")
 
     async def get_response(
         self,

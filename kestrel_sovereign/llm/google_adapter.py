@@ -12,7 +12,7 @@ import os
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union, AsyncIterator
 
-from .adapter import LLMAdapter, LLMResponse, ToolCall
+from .adapter import LLMAdapter, LLMResponse
 from kestrel_sdk.llm import (
     ProviderCapabilities,
     StructuredOutputMode,
@@ -21,7 +21,11 @@ from kestrel_sdk.llm import (
 )
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
-from .gemini_contents import to_gemini_contents, tool_result_messages
+from .gemini_contents import (
+    to_gemini_contents,
+    tool_call_from_part,
+    tool_result_messages,
+)
 from .output_ceiling import (
     OutputCeilingUnknownError,
     OutputCeilings,
@@ -415,21 +419,14 @@ class GoogleAdapter(LLMAdapter):
                     continue
                 if getattr(part, "text", None):
                     content = part.text
-                # google-genai Part ALWAYS carries a `function_call` attribute
-                # (defaults to None), so `hasattr` is always True — check the
-                # value, or a plain text/thought part (function_call=None) would
-                # enter this branch and crash on fc.name / dict(fc.args).
-                elif getattr(part, "function_call", None) is not None:
-                    if parsed_tool_calls is None:
-                        parsed_tool_calls = []
-                    fc = part.function_call
-                    # Gemini function_call has name and args
-                    args = dict(fc.args) if getattr(fc, "args", None) else {}
-                    parsed_tool_calls.append(ToolCall(
-                        id=f"gemini_call_{len(parsed_tool_calls)}",
-                        name=fc.name,
-                        arguments=args
-                    ))
+                    continue
+                # A Gemini 3 call keeps its thought signature (#3619).
+                tool_call = tool_call_from_part(
+                    part, f"gemini_call_{len(parsed_tool_calls or ())}",
+                )
+                if tool_call is not None:
+                    parsed_tool_calls = parsed_tool_calls or []
+                    parsed_tool_calls.append(tool_call)
 
             input_tokens = output_tokens = total_tokens = None
             cache_read_input_tokens = None
