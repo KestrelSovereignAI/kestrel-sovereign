@@ -3127,7 +3127,7 @@ class KestrelAgent(
                     FoundationPayerResolver,
                 )
                 from kestrel_sovereign.storage.providers.lighthouse_provider import (
-                    LighthouseProvider,
+                    lighthouse_provider_for,
                 )
 
                 # Injected policy/host-db (multi-tenant embedding) take
@@ -3145,21 +3145,10 @@ class KestrelAgent(
                     wallet_private_key=self._private_key,
                 )
                 _resolved = await _resolver.resolve_for(self.did, ResourceClass.STORAGE)
-                if _resolved.enabled:
-                    self.lighthouse_provider = LighthouseProvider(
-                        api_key=None,
-                        key_resolver=_resolved.key_resolver,
-                    )
-                    # With api_key=None at construction, the provider's
-                    # internal client isn't created until _ensure_client()
-                    # consults the resolver. Drive that once now so
-                    # is_available() reflects the resolver's result rather
-                    # than the (None) constructor input. Without this poke
-                    # the provider would always look unavailable post-policy.
-                    await self.lighthouse_provider._ensure_client()
-                    if not self.lighthouse_provider.is_available():
-                        self.lighthouse_provider = None
-                # else: NONE policy — leave self.lighthouse_provider as None
+                # None under the NONE policy, or when the resolver supplies no
+                # key. Sovereignty exports are published, thinned and checked
+                # through this provider's key (#2874).
+                self.lighthouse_provider = await lighthouse_provider_for(_resolved)
             except NotImplementedError:
                 # Deferred PayerKind values (for example Lighthouse
                 # HOST_MASTER_PROVISIONED) raise here. Surface

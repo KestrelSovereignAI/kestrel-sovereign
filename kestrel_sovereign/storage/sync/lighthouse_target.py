@@ -532,30 +532,12 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         """Prune Lighthouse upload records when the API can enumerate/delete."""
         from kestrel_sovereign.storage.providers.lighthouse_rest import (
             LighthouseRestClient,
+            list_all_uploads,
         )
 
         client = LighthouseRestClient(api_key=self.api_key)
         try:
-            uploads: list[Dict[str, Any]] = []
-            last_key = None
-            seen_cursors: set[str] = set()
-            while True:
-                page = await client.get_uploads(last_key=last_key)
-                file_list = page.get("fileList", [])
-                if not isinstance(file_list, list) or not file_list:
-                    break
-                uploads.extend(file_list)
-                # files_uploaded has no nextLastKey/lastKey; the cursor is the
-                # last record's id (page size 1000, continue until empty).
-                last_item = file_list[-1]
-                last_key = (
-                    str(last_item.get("id"))
-                    if isinstance(last_item, dict) and last_item.get("id")
-                    else None
-                )
-                if not last_key or last_key in seen_cursors:
-                    break
-                seen_cursors.add(last_key)
+            uploads = await list_all_uploads(client)
 
             items: list[RetentionItem] = []
             for upload in uploads:
@@ -566,6 +548,11 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 # pruning them here could delete another agent's data. That
                 # unattributed legacy backlog is handled by the cleanup tool
                 # (#1841) via manifest attribution under dry-run + confirm.
+                #
+                # Sovereignty exports are not this target's: the agent's
+                # Lighthouse provider publishes and thins them, on the account
+                # its PayerPolicy resolves, which need not be this target's
+                # (#2874).
                 if self._is_structured_snapshot_upload(upload):
                     role = "snapshot"
                 elif self._is_structured_manifest_upload(

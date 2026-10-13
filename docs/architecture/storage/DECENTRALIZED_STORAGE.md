@@ -129,6 +129,47 @@ renamed and are attributed during cleanup only through the local manifest or
 legacy agent manifest (`manifest_<did>.json`); filename-only flat database
 heuristics are intentionally not used for restore.
 
+Sovereignty exports (`export_sovereignty`) are named for their agent too:
+`kestrel_sovereignty__<agent_id>__<YYYYMMDD_HHMMSS>.bin`, tagged
+`kestrel-sovereignty-<agent_id>`. The agent id is percent-encoded (a DID is
+unchanged by it). An `ipfs`-tier export goes to the IPFS node at
+`IPFS_API_URL` when it is reachable. When it is not, it goes to the agent's
+Lighthouse provider, which exists only when remote-tier policy and
+PayerPolicy permitted one at boot. With neither, the export stays local and
+reports the downgrade. The name and tag carry the agent id and a time, never
+content; the payload is the export's sealed envelope. The family is distinct
+from `kestrel_state__`/`kestrel_manifest__` on purpose: cold-start restore
+reads its database from those, and an export is an encrypted archive.
+
+Every reader and pruner of an agent's exports on Lighthouse uses the
+credential that published them: the agent's Lighthouse provider, whose key
+its PayerPolicy resolves (an agent-scoped key in its encrypted key storage, a
+`SELF_WALLET` key, or the host key). That account need not be the host
+`LIGHTHOUSE_API_KEY` account the snapshot target and `kestrel storage health`
+read.
+
+- After each export it publishes, the provider thins the agent's older
+  exports on that account, among themselves, with identity retention. Only
+  uploads whose name and tag attribute to the agent are considered; another
+  agent's are never touched. The Lighthouse sync target's snapshot prune
+  leaves exports alone.
+- `!check-sovereignty-status` reports the agent's latest export on that
+  account, attributed to the agent, with its Filecoin deal status, whether or
+  not this host still holds the export's receipt.
+- `kestrel storage health` reads the host `LIGHTHOUSE_API_KEY` account and
+  reports the agent's latest export there under `sovereignty_export`. With no
+  state snapshot, the export is the upload the check reports; with both, the
+  status is the worse of the two. It cannot read an agent's own credential:
+  an agent whose PayerPolicy resolves another key is checked through
+  `!check-sovereignty-status`.
+- `scripts/backup_cleanup.py` attributes exports by the same rule and never
+  deletes an upload that is, or may be, an export: attributed exports, names
+  and tags in the export family that attribute to no one agent, and legacy
+  `content.bin` uploads. That holds under `--include-quarantined` and the
+  `--delete-older-than-days` age purge.
+- Exports made before the naming restore exactly as before; the name does not
+  change an IPFS CID.
+
 ## Pricing Reality (Mar 2026)
 
 | Storage Type | Cost | Duration | Notes |

@@ -651,6 +651,78 @@ class TestPrune:
         assert "QmOtherAgent" not in deleted
 
 
+    @pytest.mark.asyncio
+    async def test_prune_leaves_sovereignty_exports_alone(self):
+        """Exports are published and thinned by the agent's Lighthouse
+        provider, on the account its PayerPolicy resolves, which need not be
+        this target's (#2874). The snapshot prune deletes none, even its own
+        agent's, under a policy that would expire every one of them."""
+        uploads = [
+            {
+                "fileName": "kestrel_sovereignty__agent-1__20240302_090000.bin",
+                "tag": "kestrel-sovereignty-agent-1",
+                "cid": "QmExportOld",
+                "id": "file-export-old",
+                "createdAt": "2024-03-02T09:00:00Z",
+            },
+            {
+                "fileName": "kestrel_sovereignty__agent-1__20240402_090000.bin",
+                "tag": "kestrel-sovereignty-agent-1",
+                "cid": "QmExportNew",
+                "id": "file-export-new",
+                "createdAt": "2024-04-02T09:00:00Z",
+            },
+            {
+                "fileName": "content.bin",
+                "tag": "kestrel-sovereignty",
+                "cid": "QmLegacyExport",
+                "id": "file-legacy-export",
+                "createdAt": "2024-01-02T09:00:00Z",
+            },
+            {
+                "fileName": "kestrel_state__agent-1__20240301_090000.car",
+                "cid": "QmSnapshotOld",
+                "id": "file-snapshot-old",
+                "createdAt": "2024-03-01T09:00:00Z",
+            },
+            {
+                "fileName": "kestrel_state__agent-1__20240401_090000.car",
+                "cid": "QmSnapshotNew",
+                "id": "file-snapshot-new",
+                "createdAt": "2024-04-01T09:00:00Z",
+            },
+        ]
+        client = _mock_rest_client()
+        client.get_uploads = AsyncMock(
+            side_effect=[{"fileList": uploads}, {"fileList": []}]
+        )
+        expire_everything = RetentionPolicy.from_config(
+            {
+                "backup": {
+                    "retention": {
+                        cls: {
+                            "keep_all_days": 0,
+                            "weekly_forever": False,
+                            "weekly_until_months": 0,
+                            "monthly_forever": False,
+                        }
+                        for cls in ("working_memory", "identity")
+                    }
+                }
+            }
+        )
+
+        with patch(LIGHTHOUSE_REST_CLIENT, return_value=client):
+            result = await LighthouseTarget(api_key="k", agent_id="agent-1").prune(
+                expire_everything
+            )
+
+        # Only the older snapshot goes; the newest snapshot is always kept.
+        assert result["scanned"] == 2
+        assert result["cids"] == ["QmSnapshotOld"]
+        client.delete_file.assert_awaited_once_with("file-snapshot-old")
+
+
 class TestGetLatestPosition:
     """Test WAL position tracking (returns max to prevent WAL sync)."""
 

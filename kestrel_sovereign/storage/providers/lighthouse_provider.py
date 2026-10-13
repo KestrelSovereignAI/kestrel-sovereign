@@ -235,6 +235,67 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
 
         return result
 
+    async def publish(
+        self,
+        payload: bytes,
+        *,
+        filename: str,
+        tag: str,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> str:
+        """Pin ``payload`` exactly as given and return its CID.
+
+        Unlike :meth:`store`, this neither encrypts, caches nor indexes: the
+        caller has already sealed the payload and keeps its own record of it.
+        A sovereignty export is published this way (#2874). Its host-cache
+        copy is owned by the receipt that records it (#2873), and ``store``
+        would add a second copy under another name in the cache co-hosted
+        agents share.
+        """
+        await self._ensure_client()
+        if not self.is_available():
+            raise ConnectionError("Lighthouse provider not available")
+        upload_response = await self._client.upload(
+            content=payload,
+            filename=filename,
+            tag=tag,
+            on_progress=on_progress,
+        )
+        cid = upload_response.get("Hash") or upload_response.get("cid")
+        if not cid:
+            raise ValueError(f"Lighthouse returned no CID for {filename}")
+        logger.info(f"Published to Lighthouse: {cid} ({filename})")
+        return str(cid)
+
+    async def resolve_api_key(self) -> Optional[str]:
+        """The API key this provider publishes with, or None without one.
+
+        It is the key resolver's current key when the provider has one (the
+        agent's PayerPolicy resolution), else the key it was constructed
+        with. A reader of what this provider published must use this key:
+        the account it names is the one the upload went to (#2874).
+        """
+        await self._ensure_client()
+        return self.api_key if self.is_available() else None
+
+    async def list_uploads(self) -> List[Dict[str, Any]]:
+        """Every upload record in the account this provider publishes to."""
+        from kestrel_sovereign.storage.providers.lighthouse_rest import (
+            list_all_uploads,
+        )
+
+        await self._ensure_client()
+        if not self.is_available():
+            raise ConnectionError("Lighthouse provider not available")
+        return await list_all_uploads(self._client)
+
+    async def delete_upload(self, file_id: str) -> None:
+        """Delete one upload record, by file id, from that account."""
+        await self._ensure_client()
+        if not self.is_available():
+            raise ConnectionError("Lighthouse provider not available")
+        await self._client.delete_file(file_id)
+
     async def retrieve(self, cid: str, encryption_key_hash: Optional[str] = None) -> bytes:
         """
         Retrieve content by CID.
@@ -737,3 +798,23 @@ def create_lighthouse_provider(
         Configured LighthouseProvider
     """
     return LighthouseProvider(api_key=api_key, default_tier=tier, key_resolver=key_resolver)
+
+
+async def lighthouse_provider_for(resolved: Any) -> Optional[LighthouseProvider]:
+    """The agent's Lighthouse provider for its PayerPolicy storage resolution.
+
+    ``resolved`` is what ``PayerResolver.resolve_for(did, ResourceClass.STORAGE)``
+    returned. A disabled resolution (``NONE``) builds no provider, and a
+    provider whose resolver supplies no key is not returned. With a resolver
+    in charge the constructor reads no environment key, so the resolver is the
+    one source of the provider's key: the credential every sovereignty export
+    is published, thinned and checked with (#2874).
+    """
+    if not resolved.enabled:
+        return None
+    provider = LighthouseProvider(api_key=None, key_resolver=resolved.key_resolver)
+    # With api_key=None the client is not created until _ensure_client()
+    # consults the resolver, so is_available() reflects the resolver's
+    # result only after this call.
+    await provider._ensure_client()
+    return provider if provider.is_available() else None

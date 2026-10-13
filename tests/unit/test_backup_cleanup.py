@@ -400,6 +400,145 @@ async def test_manifest_index_attributes_export_car_and_rejects_malformed_manife
 
 
 @pytest.mark.asyncio
+async def test_sovereignty_exports_are_attributed_by_record_and_never_deleted(tmp_path):
+    """A sovereignty export names its one agent in its upload record (#2874).
+    The backlog tool credits it to that agent, credits it to nobody when a
+    manifest names another agent for the same CID or its name and tag
+    disagree, and deletes none of them, nor a legacy ``content.bin``."""
+    old = int((NOW - timedelta(days=900)).timestamp() * 1000)
+
+    class FakeClient:
+        async def get_uploads(self, last_key=None):
+            if last_key is not None:
+                return {"fileList": []}
+            return {
+                "fileList": [
+                    {
+                        "id": "file-export",
+                        "cid": "cid-export",
+                        "fileName": "kestrel_sovereignty__agent-a__20240101_000000.bin",
+                        "createdAt": old,
+                    },
+                    {
+                        "id": "file-claimed",
+                        "cid": "cid-claimed",
+                        "fileName": "kestrel_sovereignty__agent-a__20240102_000000.bin",
+                        "createdAt": old,
+                    },
+                    {
+                        "id": "file-manifest",
+                        "cid": "cid-manifest",
+                        "fileName": "manifest_agent-b.json",
+                        "createdAt": old,
+                    },
+                    {
+                        "id": "file-mistagged",
+                        "cid": "cid-mistagged",
+                        "fileName": "kestrel_sovereignty__agent-a__20240103_000000.bin",
+                        "tag": "kestrel-sovereignty-agent-b",
+                        "createdAt": old,
+                    },
+                    {
+                        "id": "file-legacy",
+                        "cid": "cid-legacy",
+                        "fileName": "content.bin",
+                        "tag": "kestrel-sovereignty",
+                        "createdAt": old,
+                    },
+                    {
+                        "id": "file-blob",
+                        "cid": "cid-blob",
+                        "fileName": "0123456789abcdef.bin",
+                        "createdAt": old,
+                    },
+                ],
+            }
+
+        async def download(self, cid, timeout=None):
+            assert cid == "cid-manifest"
+            return json.dumps({"agent_id": "agent-b", "snapshot_cid": "cid-claimed"}).encode()
+
+        async def close(self):
+            pass
+
+    records = await backup_cleanup.lighthouse_records(FakeClient())
+    by_key = {row.record.key: row for row in backup_cleanup.classify_records(records)}
+
+    assert by_key["cid-export"].record.agent_id == "agent-a"
+    assert by_key["cid-export"].inventory_class == "attributed_sovereignty_export"
+    assert by_key["cid-claimed"].record.agent_id is None
+    assert by_key["cid-claimed"].inventory_class == "conflicting_sovereignty_export"
+    for key in ("cid-mistagged", "cid-legacy"):
+        assert by_key[key].record.agent_id is None
+        assert by_key[key].inventory_class == "unattributed_sovereignty_export"
+    assert by_key["cid-blob"].inventory_class == "unattributed_bin"
+
+    plan = backup_cleanup.build_delete_plan(
+        records,
+        _expire_everything_policy(),
+        quarantine_state={"objects": {}},
+        include_quarantined=True,
+        now=NOW,
+    )
+    reasons = {row.record.key: row.reason for row in plan.records}
+    exports = ("cid-export", "cid-claimed", "cid-mistagged", "cid-legacy")
+    for key in exports:
+        assert reasons[key] == "sovereignty_export"
+        assert key not in _delete_keys(plan)
+    # The operator's quarantine override still reaches an unattributed blob
+    # that is no export.
+    assert "cid-blob" in _delete_keys(plan)
+
+    quarantine = backup_cleanup.quarantine_records(
+        backup_cleanup.classify_records(records),
+        state_path=tmp_path / "quarantine.json",
+    )
+    assert quarantine["added"] == 2  # the blob and the manifest, no export
+
+
+@pytest.mark.asyncio
+async def test_age_purge_keeps_every_upload_that_is_or_may_be_a_sovereignty_export(
+    tmp_path,
+):
+    """The account-wide age purge keeps an attributed export, and also one it
+    cannot attribute: a legacy ``content.bin`` and a name and tag that name
+    different agents (#2874). An old upload that is no export still goes."""
+    old = int((NOW - timedelta(days=900)).timestamp() * 1000)
+    client = AsyncMock()
+
+    async def _get(last_key=None):
+        if last_key is not None:
+            return {"fileList": []}
+        return {
+            "fileList": [
+                {"cid": "cid-export", "id": "f1", "createdAt": old,
+                 "fileName": "kestrel_sovereignty__agent-a__20240101_000000.bin",
+                 "tag": "kestrel-sovereignty-agent-a"},
+                {"cid": "cid-legacy", "id": "f2", "createdAt": old,
+                 "fileName": "content.bin"},
+                {"cid": "cid-legacy-tagged", "id": "f3", "createdAt": old,
+                 "fileName": "export.bin", "tag": "kestrel-sovereignty"},
+                {"cid": "cid-mistagged", "id": "f4", "createdAt": old,
+                 "fileName": "kestrel_sovereignty__agent-a__20240102_000000.bin",
+                 "tag": "kestrel-sovereignty-agent-b"},
+                {"cid": "cid-blob", "id": "f5", "createdAt": old,
+                 "fileName": "0123456789abcdef.bin", "tag": "kestrel-storage"},
+            ]
+        }
+
+    client.get_uploads = _get
+    client.delete_file = AsyncMock(return_value={"deleted": True})
+
+    rc = await backup_cleanup.age_purge_lighthouse(
+        client, days=14, keep_cids=set(), audit_log=tmp_path / "age.jsonl",
+        confirmation=backup_cleanup.CONFIRMATION_PHRASE, now=NOW,
+    )
+
+    assert rc == 0
+    assert {c.args[0] for c in client.delete_file.await_args_list} == {"f5"}
+
+
+@pytest.mark.asyncio
 async def test_manifest_index_retries_429_and_preserves_attribution():
     request = httpx.Request("GET", "https://gateway.lighthouse.storage/ipfs/cid-manifest")
     response = httpx.Response(429, request=request)

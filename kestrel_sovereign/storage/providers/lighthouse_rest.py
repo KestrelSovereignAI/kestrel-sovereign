@@ -14,11 +14,39 @@ Lighthouse REST API reference:
 
 import logging
 from io import BytesIO
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+async def list_all_uploads(client: Any) -> List[Dict[str, Any]]:
+    """Every upload record in the account ``client`` authenticates as.
+
+    ``files_uploaded`` has no nextLastKey/lastKey: the cursor is the last
+    record's id (page size 1000), and listing continues until a page is
+    empty. A repeated or missing cursor ends it rather than looping.
+    """
+    uploads: List[Dict[str, Any]] = []
+    last_key: Optional[str] = None
+    seen_cursors: set[str] = set()
+    while True:
+        page = await client.get_uploads(last_key=last_key)
+        file_list = page.get("fileList", [])
+        if not isinstance(file_list, list) or not file_list:
+            break
+        uploads.extend(file_list)
+        last_item = file_list[-1]
+        last_key = (
+            str(last_item.get("id"))
+            if isinstance(last_item, dict) and last_item.get("id")
+            else None
+        )
+        if not last_key or last_key in seen_cursors:
+            break
+        seen_cursors.add(last_key)
+    return uploads
 
 
 class _ProgressBytesIO(BytesIO):

@@ -31,6 +31,10 @@ from kestrel_sovereign.storage.sync.retention import (
     load_retention_policy,
     parse_timestamp,
 )
+from kestrel_sovereign.storage.sync.sovereignty_exports import (
+    is_sovereignty_export_candidate,
+    sovereignty_export_owner,
+)
 
 
 DEFAULT_GCS_BUCKET = "kestrel-agent-backup"
@@ -504,6 +508,19 @@ async def lighthouse_records(client: LighthouseClient) -> list[BackupRecord]:
         attribution = manifest_index.get(cid)
         agent_id = attribution.agent_id if attribution else manifest_agents.get(cid)
         metadata = dict(upload)
+        # A sovereignty export names its one agent in its upload record
+        # (#2874). This tool never deletes an upload that is, or may be, an
+        # export: the agent thins its own exports through the provider that
+        # published them, and one this tool cannot attribute (a legacy
+        # content.bin, a name and tag that disagree) is kept. A manifest that
+        # names another agent for the same CID leaves it attributed to neither.
+        export_agent = sovereignty_export_owner(upload)
+        export_candidate = is_sovereignty_export_candidate(upload)
+        if export_candidate:
+            metadata["sovereignty_export_candidate"] = True
+        if export_agent is not None:
+            metadata["sovereignty_export_agent"] = export_agent
+            agent_id = export_agent if agent_id in (None, export_agent) else None
         if attribution:
             metadata.update(
                 {
@@ -537,6 +554,8 @@ async def lighthouse_records(client: LighthouseClient) -> list[BackupRecord]:
             ),
             metadata=metadata,
             attributed=agent_id is not None,
+            protected=export_candidate,
+            reason="sovereignty_export" if export_candidate else "",
         )
         records.append(_with_test_flag(record))
     return records
@@ -553,6 +572,28 @@ def classify_inventory_record(record: BackupRecord) -> ClassifiedRecord:
         }
     )
     filename = Path(record.name).name.lower()
+    export_agent = record.metadata.get("sovereignty_export_agent")
+    if export_agent:
+        if record.agent_id == export_agent:
+            return ClassifiedRecord(
+                record,
+                "attributed_sovereignty_export",
+                "high",
+                "agent-scoped sovereignty export upload record",
+            )
+        return ClassifiedRecord(
+            record,
+            "conflicting_sovereignty_export",
+            "high",
+            "sovereignty export record and manifest name different agents",
+        )
+    if record.metadata.get("sovereignty_export_candidate"):
+        return ClassifiedRecord(
+            record,
+            "unattributed_sovereignty_export",
+            "medium",
+            "sovereignty export upload that names no one agent; kept",
+        )
     if record.test_artifact or _is_test_artifact(record):
         return ClassifiedRecord(
             record,
@@ -1293,12 +1334,14 @@ async def age_purge_lighthouse(
 ) -> int:
     """Gateway-free age purge: delete Lighthouse uploads older than `days` by
     file id. Needs only the files_uploaded listing (id + createdAt) — no
-    manifest-body / gateway reads. Never deletes a CID in `keep_cids`, and never
-    deletes an undated upload (fails safe)."""
+    manifest-body / gateway reads. Never deletes a CID in `keep_cids`, an
+    upload that is or may be a sovereignty export, attributed or not (#2874;
+    the agent thins its own exports, and one this purge cannot attribute is
+    kept), or an undated upload (fails safe)."""
     now = now or datetime.now(timezone.utc)
     uploads = await _all_lighthouse_uploads(client)
     plan: list[Mapping[str, Any]] = []
-    kept_protected = kept_recent = kept_undated = 0
+    kept_protected = kept_recent = kept_undated = kept_exports = 0
     for u in uploads:
         if not u.get("id"):
             kept_undated += 1
@@ -1306,6 +1349,9 @@ async def age_purge_lighthouse(
         cid = _cid(u)
         if cid and cid in keep_cids:
             kept_protected += 1
+            continue
+        if is_sovereignty_export_candidate(u):
+            kept_exports += 1
             continue
         age = _upload_age_days(u, now)
         if age is None:
@@ -1322,6 +1368,7 @@ async def age_purge_lighthouse(
         f"to delete: {len(plan)} files ({total / 1024**3:.1f} GiB)\n"
         f"kept (recent <= {days}d): {kept_recent}\n"
         f"kept (protected keep-set CIDs): {kept_protected}\n"
+        f"kept (sovereignty exports, attributed or not): {kept_exports}\n"
         f"kept (undated, fail-safe): {kept_undated}\n"
     )
     if not _confirm_apply(confirmation):
@@ -1542,8 +1589,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Gateway-free age purge: delete Lighthouse uploads older than N days "
             "by file id (no manifest/gateway reads). Keeps recent uploads + any "
-            "CID in --keep-cids-file; never deletes undated uploads. Requires "
-            "the typed --confirm phrase."
+            "CID in --keep-cids-file; never deletes sovereignty exports "
+            "(attributed or not) or undated uploads. Requires the typed "
+            "--confirm phrase."
         ),
     )
     parser.add_argument(

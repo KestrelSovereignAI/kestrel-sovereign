@@ -229,6 +229,98 @@ async def test_lighthouse_resolves_snapshot_cid_from_manifest_when_tags_missing(
     assert result.details["resolved_via"] == "manifest"
 
 
+def _export_upload(cid, agent_id, created_at, *, tag="default"):
+    """A sovereignty export's upload record (#2874)."""
+    return {
+        "cid": cid,
+        "fileName": (
+            f"kestrel_sovereignty__{agent_id}__"
+            f"{created_at.strftime('%Y%m%d_%H%M%S')}.bin"
+        ),
+        "tag": f"kestrel-sovereignty-{agent_id}" if tag == "default" else tag,
+        "createdAt": int(created_at.timestamp() * 1000),
+    }
+
+
+async def _lighthouse_status_with_deals(uploads, deals_by_cid):
+    class Client(FakeLighthouseClient):
+        async def get_deal_status(self, cid):
+            return deals_by_cid.get(cid, [])
+
+    Client.uploads = uploads
+    Client.downloads = {}
+    return await check_lighthouse_health(
+        api_key="key",
+        agent_id="agent-1",
+        now=NOW,
+        client_factory=Client,
+    )
+
+
+@pytest.mark.asyncio
+async def test_lighthouse_reports_a_sovereignty_export_when_no_snapshot_exists():
+    result = await _lighthouse_status_with_deals(
+        uploads=[_export_upload("QmExport", "agent-1", NOW - timedelta(hours=2), tag=None)],
+        deals_by_cid={},
+    )
+
+    assert result.status == "pending"
+    assert result.message == (
+        "Latest Lighthouse sovereignty export has no deals yet but is within grace"
+    )
+    assert result.details["resolved_via"] == "sovereignty_export"
+    assert result.details["cid"] == "QmExport"
+    export = result.details["sovereignty_export"]
+    assert export["agent_id"] == "agent-1"
+    assert export["cid"] == "QmExport"
+    assert export["age_seconds"] == 7200
+
+
+@pytest.mark.asyncio
+async def test_lighthouse_reports_the_worse_of_snapshot_and_sovereignty_export():
+    result = await _lighthouse_status_with_deals(
+        uploads=[
+            {
+                "cid": "QmSnapshot",
+                "fileName": "kestrel_state__agent-1__20260510_120000.car",
+                "createdAt": int(NOW.timestamp() * 1000),
+            },
+            _export_upload("QmOldExport", "agent-1", NOW - timedelta(days=9)),
+            _export_upload("QmExport", "agent-1", NOW - timedelta(days=3)),
+        ],
+        deals_by_cid={"QmSnapshot": [{"DealID": 1}]},
+    )
+
+    assert result.status == "warning"
+    assert result.message == (
+        "Latest Lighthouse snapshot has 1 Filecoin deal(s); "
+        "latest sovereignty export has no Filecoin deals beyond grace"
+    )
+    assert result.details["cid"] == "QmSnapshot"
+    assert result.details["sovereignty_export"]["cid"] == "QmExport"
+    assert result.details["sovereignty_export"]["status"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_lighthouse_credits_no_agent_with_another_agents_sovereignty_export():
+    result = await _lighthouse_status_with_deals(
+        uploads=[
+            _export_upload("QmOther", "agent-2", NOW),
+            # Extends agent-1's id: a prefix match would credit it to agent-1.
+            _export_upload("QmExtended", "agent-1__20260101_000000", NOW),
+            # Named for agent-1 but tagged for agent-2: attributable to neither.
+            _export_upload(
+                "QmConflict", "agent-1", NOW, tag="kestrel-sovereignty-agent-2"
+            ),
+            {"cid": "QmLegacy", "fileName": "content.bin", "tag": "kestrel-sovereignty"},
+        ],
+        deals_by_cid={},
+    )
+
+    assert result.status == "unavailable"
+    assert "No Lighthouse snapshot" in result.message
+
+
 @pytest.mark.asyncio
 async def test_lighthouse_missing_key_is_not_configured():
     result = await check_lighthouse_health(api_key=None, agent_id="agent-1")

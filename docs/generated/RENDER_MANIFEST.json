@@ -1426,7 +1426,9 @@
       "type": "Architecture Spec"
     },
     {
-      "existing_code_refs": [],
+      "existing_code_refs": [
+        "scripts/backup_cleanup.py"
+      ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],

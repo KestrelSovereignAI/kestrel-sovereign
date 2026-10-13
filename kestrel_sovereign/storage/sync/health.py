@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 from kestrel_sovereign.storage.sync.retention import parse_timestamp
+from kestrel_sovereign.storage.sync.sovereignty_exports import sovereignty_export_uploads
 from kestrel_sovereign.storage.sync.targets import TierState, TrustTier, TIER_LABELS
 
 
@@ -154,6 +155,20 @@ def _upload_filename(upload: Mapping[str, Any]) -> str:
     return str(upload.get("fileName") or upload.get("Name") or "")
 
 
+def _upload_order_key(upload: Mapping[str, Any]) -> datetime:
+    return (
+        parse_timestamp(upload.get("createdAt"))
+        or parse_timestamp(_upload_filename(upload))
+        or datetime.min.replace(tzinfo=timezone.utc)
+    )
+
+
+def _upload_time(upload: Mapping[str, Any]) -> Optional[datetime]:
+    return _parse_upload_time(upload.get("createdAt")) or parse_timestamp(
+        _upload_filename(upload)
+    )
+
+
 def _latest_lighthouse_snapshot(
     uploads: list[Mapping[str, Any]],
     agent_id: str,
@@ -173,14 +188,57 @@ def _latest_lighthouse_snapshot(
     ]
     if not candidates:
         return None
-    return max(
-        candidates,
-        key=lambda upload: (
-            parse_timestamp(upload.get("createdAt"))
-            or parse_timestamp(_upload_filename(upload))
-            or datetime.min.replace(tzinfo=timezone.utc)
-        ),
-    )
+    return max(candidates, key=_upload_order_key)
+
+
+def _latest_sovereignty_export(
+    uploads: list[Mapping[str, Any]],
+    agent_id: str,
+) -> Optional[Mapping[str, Any]]:
+    """This agent's latest sovereignty export, attributed by its record (#2874)."""
+    candidates = sovereignty_export_uploads(uploads, agent_id)
+    if not candidates:
+        return None
+    return max(candidates, key=_upload_order_key)
+
+
+_DEAL_STATUS_RANK = {"ok": 0, "pending": 1, "warning": 2}
+
+
+async def _deal_details(
+    client: Any,
+    *,
+    cid: Optional[str],
+    uploaded_at: Optional[datetime],
+    current_time: datetime,
+    grace_period: timedelta,
+) -> dict[str, Any]:
+    """An upload's Filecoin deals, its age, and the status they amount to."""
+    age = current_time - uploaded_at if uploaded_at else None
+    deals = await client.get_deal_status(cid) if cid else []
+    deal_count = len(deals) if isinstance(deals, list) else 0
+    if deal_count > 0:
+        status = "ok"
+    elif age is not None and age <= grace_period:
+        status = "pending"
+    else:
+        status = "warning"
+    return {
+        "cid": cid,
+        "uploaded_at": uploaded_at.isoformat() if uploaded_at else None,
+        "age_seconds": int(age.total_seconds()) if age else None,
+        "deal_count": deal_count,
+        "deals": deals,
+        "status": status,
+    }
+
+
+def _deal_phrase(details: Mapping[str, Any]) -> str:
+    if details["status"] == "ok":
+        return f"has {details['deal_count']} Filecoin deal(s)"
+    if details["status"] == "pending":
+        return "has no deals yet but is within grace"
+    return "has no Filecoin deals beyond grace"
 
 
 def _latest_lighthouse_manifest(
@@ -204,14 +262,7 @@ def _latest_lighthouse_manifest(
     ]
     if not candidates:
         return None
-    return max(
-        candidates,
-        key=lambda upload: (
-            parse_timestamp(upload.get("createdAt"))
-            or parse_timestamp(_upload_filename(upload))
-            or datetime.min.replace(tzinfo=timezone.utc)
-        ),
-    )
+    return max(candidates, key=_upload_order_key)
 
 
 async def check_lighthouse_health(
@@ -222,7 +273,14 @@ async def check_lighthouse_health(
     now: Optional[datetime] = None,
     client_factory: Optional[Callable[..., Any]] = None,
 ) -> TargetHealth:
-    """Check latest Lighthouse snapshot deal status."""
+    """Check the deal status of the agent's latest Lighthouse snapshot and
+    sovereignty export.
+
+    A sovereignty export is reported under ``details["sovereignty_export"]``
+    and attributed to ``agent_id`` by its agent-scoped upload record (#2874).
+    With no snapshot it is the upload the check reports; with both, the
+    status is the worse of the two.
+    """
     if not api_key:
         return TargetHealth(
             name="lighthouse",
@@ -256,60 +314,100 @@ async def check_lighthouse_health(
                 manifest_bytes = await client.download(manifest_cid)
                 manifest = json.loads(manifest_bytes)
                 latest = latest_manifest
+        export = _latest_sovereignty_export(uploads, agent_id)
 
-        if latest is None:
+        if latest is None and export is None:
             return TargetHealth(
                 name="lighthouse",
                 label=TIER_LABELS[TrustTier.DELEGATED],
                 configured=True,
                 status="unavailable",
-                message="No Lighthouse snapshot upload found",
+                message="No Lighthouse snapshot or sovereignty export upload found",
+            )
+
+        export_details = None
+        if export is not None:
+            export_details = await _deal_details(
+                client,
+                cid=_upload_cid(export),
+                uploaded_at=_upload_time(export),
+                current_time=current_time,
+                grace_period=grace_period,
+            )
+            export_details.update(
+                {
+                    # The one agent the export's record names (#2874).
+                    "agent_id": agent_id,
+                    "file_name": export.get("fileName"),
+                    "tag": export.get("tag"),
+                }
+            )
+
+        if latest is None:
+            # No state snapshot: the sovereignty export is this agent's
+            # restore point on Lighthouse, so it is what the check reports.
+            details = {
+                "cid": export_details["cid"],
+                "file_name": export_details["file_name"],
+                "tag": export_details["tag"],
+                "resolved_via": "sovereignty_export",
+                "uploaded_at": export_details["uploaded_at"],
+                "age_seconds": export_details["age_seconds"],
+                "deal_count": export_details["deal_count"],
+                "deals": export_details["deals"],
+                "grace_seconds": int(grace_period.total_seconds()),
+                "sovereignty_export": export_details,
+            }
+            return TargetHealth(
+                name="lighthouse",
+                label=TIER_LABELS[TrustTier.DELEGATED],
+                configured=True,
+                status=export_details["status"],
+                message=(
+                    "Latest Lighthouse sovereignty export "
+                    + _deal_phrase(export_details)
+                ),
+                details=details,
             )
 
         cid = str(manifest.get("snapshot_cid")) if manifest else _upload_cid(latest)
         uploaded_at = (
             _parse_upload_time(manifest.get("uploaded_at")) if manifest else None
         ) or _parse_upload_time(latest.get("createdAt"))
-        age = current_time - uploaded_at if uploaded_at else None
-        deals = await client.get_deal_status(cid) if cid else []
-        deal_count = len(deals) if isinstance(deals, list) else 0
+        snapshot = await _deal_details(
+            client,
+            cid=cid,
+            uploaded_at=uploaded_at,
+            current_time=current_time,
+            grace_period=grace_period,
+        )
 
         details = {
             "cid": cid,
             "file_name": latest.get("fileName"),
             "tag": latest.get("tag"),
             "resolved_via": "manifest" if manifest else "snapshot_upload",
-            "uploaded_at": uploaded_at.isoformat() if uploaded_at else None,
-            "age_seconds": int(age.total_seconds()) if age else None,
-            "deal_count": deal_count,
-            "deals": deals if isinstance(deals, list) else deals,
+            "uploaded_at": snapshot["uploaded_at"],
+            "age_seconds": snapshot["age_seconds"],
+            "deal_count": snapshot["deal_count"],
+            "deals": snapshot["deals"],
             "grace_seconds": int(grace_period.total_seconds()),
+            "sovereignty_export": export_details,
         }
-
-        if deal_count > 0:
-            return TargetHealth(
-                name="lighthouse",
-                label=TIER_LABELS[TrustTier.DELEGATED],
-                configured=True,
-                status="ok",
-                message=f"Latest Lighthouse snapshot has {deal_count} Filecoin deal(s)",
-                details=details,
-            )
-        if age is not None and age <= grace_period:
-            return TargetHealth(
-                name="lighthouse",
-                label=TIER_LABELS[TrustTier.DELEGATED],
-                configured=True,
-                status="pending",
-                message="Latest Lighthouse snapshot has no deals yet but is within grace",
-                details=details,
-            )
+        status = snapshot["status"]
+        message = "Latest Lighthouse snapshot " + _deal_phrase(snapshot)
+        if export_details is not None:
+            # The snapshot does not stand in for the export: the check
+            # reports the worse of the two.
+            if _DEAL_STATUS_RANK[export_details["status"]] > _DEAL_STATUS_RANK[status]:
+                status = export_details["status"]
+            message += "; latest sovereignty export " + _deal_phrase(export_details)
         return TargetHealth(
             name="lighthouse",
             label=TIER_LABELS[TrustTier.DELEGATED],
             configured=True,
-            status="warning",
-            message="Latest Lighthouse snapshot has no Filecoin deals beyond grace",
+            status=status,
+            message=message,
             details=details,
         )
     except Exception as exc:
@@ -434,7 +532,14 @@ async def build_storage_health_report(
     gcs_prefix: str = "kestrel/",
     now: Optional[datetime] = None,
 ) -> StorageHealthReport:
-    """Build a combined backup storage health report from environment."""
+    """Build a combined backup storage health report from environment.
+
+    The Lighthouse check reads the host ``LIGHTHOUSE_API_KEY`` account. An
+    agent publishes its sovereignty exports with its own PayerPolicy
+    credential, which may name another account; the agent checks those
+    through its provider (``SovereigntyFeature.check_sovereignty_status``,
+    #2874).
+    """
     sovereign_ipfs, lighthouse, gcs = await asyncio.gather(
         check_sovereign_ipfs_health(
             api_url=env.get("SOVEREIGN_IPFS_URL"),

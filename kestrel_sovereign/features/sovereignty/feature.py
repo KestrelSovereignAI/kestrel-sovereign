@@ -3,6 +3,9 @@ import functools
 import inspect
 import logging
 from typing import Callable, Optional
+
+import httpx
+
 from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
@@ -21,7 +24,7 @@ from kestrel_sovereign.filecoin_adapter import (
     is_cache_name_of,
 )
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.storage import GraphNode
 from kestrel_sovereign.storage.privacy_wrapper import (
@@ -31,6 +34,13 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     guarded_backup_store,
     require_backup_permitted,
     require_durable_persistence_gate,
+)
+from kestrel_sovereign.storage.sync.health import check_lighthouse_health
+from kestrel_sovereign.storage.sync.retention import load_retention_policy
+from kestrel_sovereign.storage.sync.sovereignty_exports import (
+    sovereignty_export_deletions,
+    sovereignty_export_tag,
+    sovereignty_export_upload_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +72,42 @@ REFUSAL_BACKUP_RECEIPT_INVALID = "backup_receipt_invalid"
 # blob larger than it is refused. The largest export observed, a long-lived
 # agent's whole database, was 105 MB; 1 GiB leaves ten times that.
 MAX_SOVEREIGNTY_IMPORT_BYTES = 1024 * 1024 * 1024
+
+
+class _LighthousePinning:
+    """The agent's Lighthouse provider as the IPFS tier's pinning service.
+
+    ``FilecoinAdapter.store_content`` runs in a worker thread and calls
+    ``pin`` there. The provider's client belongs to the agent's event loop,
+    so the upload runs on that loop while the worker waits for its CID.
+    """
+
+    def __init__(self, provider, *, tag: str, loop: asyncio.AbstractEventLoop):
+        self.provider = provider
+        self._tag = tag
+        self._loop = loop
+        self.provider_name = provider.provider_name
+
+    def pin(
+        self,
+        payload: bytes,
+        *,
+        filename: str,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> str:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._loop:
+            raise RuntimeError(
+                "Lighthouse pinning waits on the agent's event loop and must "
+                "be called from a worker thread"
+            )
+        upload = self.provider.publish(
+            payload, filename=filename, tag=self._tag, on_progress=on_progress
+        )
+        return asyncio.run_coroutine_threadsafe(upload, self._loop).result()
 
 
 class SovereigntyFeature(Feature):
@@ -250,8 +296,11 @@ class SovereigntyFeature(Feature):
         except Exception:
             logger.debug("Failed to attach audit anchors to sovereignty receipt", exc_info=True)
 
-        # Store via adapter
+        # Store via adapter. The upload is named for this agent, so the
+        # Lighthouse health check and retention attribute it to this agent
+        # alone (#2874); IPFS ignores the name, so the CID is unchanged.
         adapter = FilecoinAdapter()
+        pinning = self._lighthouse_pinning(tier_enum)
         store = functools.partial(
             adapter.store_content,
             backup_blob,
@@ -260,6 +309,10 @@ class SovereigntyFeature(Feature):
             metadata={"agent": self.agent.agent_id},
             on_progress=progress,
             envelope_owner=self.agent.agent_id if encrypt else None,
+            upload_name=sovereignty_export_upload_name(
+                self.agent.agent_id, datetime.now(timezone.utc)
+            ),
+            ipfs_pinning=pinning,
         )
         # ``privacy_transition()`` takes the persistence gate exclusive, so
         # while the guard holds it shared no transition completes: one that
@@ -332,6 +385,16 @@ class SovereigntyFeature(Feature):
             "size_bytes": size_bytes,
             "node_id": node_id,
         }
+        if (
+            pinning is not None
+            and result.ipfs_cid
+            and getattr(result, "provider", None) == pinning.provider_name
+        ):
+            # Published through the agent's Lighthouse provider: that
+            # provider thins the agent's older exports on the same account.
+            data["export_retention"] = await self._thin_lighthouse_exports(
+                pinning.provider, keep_cid=result.ipfs_cid
+            )
 
         # Honesty: a non-local request that ended up local (or that
         # returned no IPFS CID) means the blob is sitting on the local
@@ -356,6 +419,69 @@ class SovereigntyFeature(Feature):
             )
 
         return ToolResult.ok(confirmation, data=data)
+
+    def _lighthouse_pinning(self, tier: StorageTier) -> Optional[_LighthousePinning]:
+        """The IPFS tier's publisher when the adapter's IPFS node is unreachable.
+
+        The agent's Lighthouse provider exists only when its remote-tier
+        policy and PayerPolicy permitted one at boot, and resolves its own
+        key, so publishing through it decides neither (#2874). A node the
+        adapter reaches still takes the upload: a sovereign-operated node
+        outranks a delegated service. Without either, the export stays local
+        and reports the downgrade.
+        """
+        provider = getattr(self.agent, "lighthouse_provider", None)
+        if tier != StorageTier.IPFS or provider is None:
+            return None
+        return _LighthousePinning(
+            provider,
+            tag=sovereignty_export_tag(self.agent.agent_id),
+            loop=asyncio.get_running_loop(),
+        )
+
+    async def _thin_lighthouse_exports(self, provider, *, keep_cid: str) -> dict:
+        """Thin this agent's older exports on the account ``provider`` just
+        published ``keep_cid`` to, by the backup retention policy (#2874).
+
+        The provider that published the export does it, so the account is
+        the one the agent's PayerPolicy resolved, whichever key the host
+        environment or the snapshot target holds. Only uploads that attribute
+        to this agent are considered. The export has landed whatever happens
+        here: a failure leaves the remaining exports in place and is
+        reported, not raised.
+        """
+        deleted: list[str] = []
+        skipped_missing_id = 0
+        try:
+            uploads = await provider.list_uploads()
+            deletions = sovereignty_export_deletions(
+                uploads,
+                self.agent.agent_id,
+                load_retention_policy(),
+                keep_cids={keep_cid},
+            )
+            for upload in deletions:
+                file_id = upload.get("id")
+                if not file_id:
+                    skipped_missing_id += 1
+                    continue
+                await provider.delete_upload(str(file_id))
+                deleted.append(str(upload.get("cid") or file_id))
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            logger.warning(
+                "Thinning older sovereignty exports on Lighthouse failed: %s", exc
+            )
+            return {
+                "deleted": len(deleted),
+                "cids": deleted,
+                "skipped_missing_id": skipped_missing_id,
+                "error": str(exc),
+            }
+        return {
+            "deleted": len(deleted),
+            "cids": deleted,
+            "skipped_missing_id": skipped_missing_id,
+        }
 
     async def _store_and_record(self, store, backup_blob: bytes, audit_anchors):
         """Store the backup, then record it. Returns ``(result, node_id)``."""
@@ -750,13 +876,21 @@ class SovereigntyFeature(Feature):
         command_prefix="!check-sovereignty-status"
     )
     async def check_sovereignty_status(self) -> ToolResult:
-        """Check sovereignty status."""
+        """Check sovereignty status: the exports this host recorded, and this
+        agent's latest export on the Lighthouse account it publishes to."""
         try:
             receipts = await self.agent.storage.get_nodes_by_type("sovereignty_receipt")
+            lighthouse = await self._lighthouse_export_health()
+            lighthouse_line = self._lighthouse_status_line(lighthouse)
             if not receipts:
                 return ToolResult.ok(
-                    "No sovereignty exports found.",
-                    data={"latest_cid": None, "latest_created_at": None, "total_exports": 0},
+                    "No sovereignty exports found on this host.\n" + lighthouse_line,
+                    data={
+                        "latest_cid": None,
+                        "latest_created_at": None,
+                        "total_exports": 0,
+                        "lighthouse": lighthouse,
+                    },
                 )
 
             receipts_sorted = sorted(
@@ -773,6 +907,7 @@ class SovereigntyFeature(Feature):
                 f"Latest Export: {latest_created_at}\n"
                 f"CID: {latest_cid}\n"
                 f"Total Exports: {len(receipts)}\n"
+                f"{lighthouse_line}"
             )
             return ToolResult.ok(
                 confirmation,
@@ -780,7 +915,59 @@ class SovereigntyFeature(Feature):
                     "latest_cid": latest_cid,
                     "latest_created_at": latest_created_at,
                     "total_exports": len(receipts),
+                    "lighthouse": lighthouse,
                 },
             )
         except Exception as e:
             return ToolResult.failed(error=f"Error checking status: {e}")
+
+    async def _lighthouse_export_health(self) -> dict:
+        """This agent's latest sovereignty export on its Lighthouse account.
+
+        Read with the agent's Lighthouse provider's key, its PayerPolicy
+        resolution: the account its exports were published to, which neither
+        the host environment's key nor the snapshot target's need name
+        (#2874). The export is attributed to this agent by its upload record.
+        """
+        provider = getattr(self.agent, "lighthouse_provider", None)
+        api_key = await provider.resolve_api_key() if provider is not None else None
+        if not api_key:
+            return {
+                "status": "not_configured",
+                "message": (
+                    "This agent has no Lighthouse credential, so it publishes "
+                    "no sovereignty export to Lighthouse."
+                ),
+            }
+        health = await check_lighthouse_health(
+            api_key=api_key, agent_id=self.agent.agent_id
+        )
+        if health.status == "error":
+            return {"status": "error", "message": health.message}
+        export = (health.details or {}).get("sovereignty_export")
+        if export is None:
+            return {
+                "status": "not_found",
+                "message": (
+                    "No sovereignty export of this agent on its Lighthouse account."
+                ),
+            }
+        return {
+            "status": export["status"],
+            "message": f"Latest Lighthouse sovereignty export: {export['status']}",
+            "agent_id": export["agent_id"],
+            "cid": export["cid"],
+            "file_name": export["file_name"],
+            "uploaded_at": export["uploaded_at"],
+            "age_seconds": export["age_seconds"],
+            "deal_count": export["deal_count"],
+        }
+
+    @staticmethod
+    def _lighthouse_status_line(lighthouse: dict) -> str:
+        if "cid" not in lighthouse:
+            return f"Lighthouse: {lighthouse['status']}: {lighthouse['message']}\n"
+        return (
+            f"Lighthouse: {lighthouse['status']}: {lighthouse['cid']} "
+            f"(deals: {lighthouse['deal_count']})\n"
+        )

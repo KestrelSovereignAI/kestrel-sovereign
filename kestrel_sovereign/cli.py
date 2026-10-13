@@ -1152,6 +1152,20 @@ def cmd_storage_health(args) -> int:
                         print(f"    age: {age_seconds // 3600}h")
                     if deal_count is not None:
                         print(f"    deals: {deal_count}")
+                    export = target.details.get("sovereignty_export")
+                    if export:
+                        print(
+                            f"    sovereignty export: {export['cid']} "
+                            f"({export['status']}, deals: {export['deal_count']})"
+                        )
+                if target.name == "lighthouse" and target.configured:
+                    # An agent publishes its exports with its own PayerPolicy
+                    # credential, which may name another account (#2874).
+                    print(
+                        "    account: host LIGHTHOUSE_API_KEY; an agent's own "
+                        "Lighthouse credential is checked by "
+                        "!check-sovereignty-status"
+                    )
                 if target.name == "gcs":
                     print(f"    bucket: {target.details.get('bucket')}")
                     print(f"    latest: {target.details.get('latest_blob')}")

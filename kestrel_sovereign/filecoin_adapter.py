@@ -12,7 +12,7 @@ import logging
 import zlib
 from pathlib import Path
 import os
-from typing import Callable, Dict, Optional, Tuple, Any
+from typing import Callable, Dict, Optional, Protocol, Tuple, Any
 import requests
 
 from kestrel_sovereign.kestrel_config.constants import (
@@ -36,6 +36,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 _RETRIEVAL_ENVELOPE_ALLOWANCE = 64 * 1024
 _RETRIEVAL_CHUNK_BYTES = 64 * 1024
+# The file name an IPFS upload carries when its caller names none.
+_DEFAULT_UPLOAD_NAME = "content.bin"
 
 
 class ContentRetrievalLimitError(ValueError):
@@ -374,6 +376,27 @@ def _parse_envelope(payload: bytes) -> Tuple[Dict[str, Any], bytes, bytes]:
     return header, payload[:header_end], payload[header_end:]
 
 
+class IpfsPinningService(Protocol):
+    """A remote IPFS pinning service ``FilecoinAdapter.store_content`` can
+    publish the IPFS tier to when the adapter's own IPFS node is unreachable.
+
+    ``pin`` is called from the thread ``store_content`` runs in, with the
+    payload exactly as the IPFS tier stores it (compressed, and sealed when
+    encrypted), and returns its CID. ``provider_name`` is recorded as the
+    result's provider.
+    """
+
+    provider_name: str
+
+    def pin(
+        self,
+        payload: bytes,
+        *,
+        filename: str,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> str: ...
+
+
 class _ProgressBytesIO(BytesIO):
     """BytesIO wrapper that reports file-byte progress as requests reads."""
 
@@ -495,7 +518,9 @@ class FilecoinAdapter:
                      metadata: Optional[Dict] = None,
                      on_progress: Optional[Callable[[int, int], None]] = None,
                      *,
-                     envelope_owner: Optional[str] = None) -> StorageResult:
+                     envelope_owner: Optional[str] = None,
+                     upload_name: Optional[str] = None,
+                     ipfs_pinning: Optional[IpfsPinningService] = None) -> StorageResult:
         """
         Store content in decentralized storage based on tier.
 
@@ -510,6 +535,11 @@ class FilecoinAdapter:
                 sealed for that agent, which decrypts from the payload alone
                 plus KESTREL_DATA_KEY (#2873), and is cached under
                 ``envelope_cache_name``. Requires ``encrypt``.
+            upload_name: The file name an IPFS upload carries, recorded as
+                the result's ``filename``. Defaults to ``content.bin``.
+            ipfs_pinning: The IPFS tier's publisher when this adapter's IPFS
+                node is unreachable, instead of storing locally only (#2874).
+                Consulted for the IPFS tier alone. Requires ``upload_name``.
 
         Returns:
             StorageResult with storage details. Its ``cache_name`` is the
@@ -517,6 +547,8 @@ class FilecoinAdapter:
         """
         if envelope_owner is not None and not encrypt:
             raise ValueError("envelope_owner requires encrypt=True")
+        if ipfs_pinning is not None and not upload_name:
+            raise ValueError("ipfs_pinning requires the upload_name it pins under")
 
         # Calculate content hash
         content_hash = hashlib.sha256(content).hexdigest()
@@ -558,7 +590,17 @@ class FilecoinAdapter:
             self._report_progress(on_progress, len(compressed_content), len(compressed_content))
 
         elif storage_tier == StorageTier.IPFS:
-            if not self.ipfs_is_available():
+            if self.ipfs_is_available():
+                ipfs_cid = self._store_ipfs(
+                    compressed_content, metadata, on_progress=on_progress,
+                    filename=upload_name or _DEFAULT_UPLOAD_NAME,
+                )
+            elif ipfs_pinning is not None:
+                ipfs_cid = ipfs_pinning.pin(
+                    compressed_content, filename=upload_name, on_progress=on_progress
+                )
+                result.provider = ipfs_pinning.provider_name
+            else:
                 logging.warning("IPFS not available. Storing locally instead.")
                 result.tier = StorageTier.LOCAL_ONLY
                 self._store_local_cache(cache_name, compressed_content, metadata,
@@ -566,8 +608,8 @@ class FilecoinAdapter:
                 self._report_progress(on_progress, len(compressed_content), len(compressed_content))
                 return result
 
-            ipfs_cid = self._store_ipfs(compressed_content, metadata, on_progress=on_progress)
             result.cid = ipfs_cid
+            result.filename = upload_name
             # Also cache locally for performance
             self._store_local_cache(cache_name, compressed_content, metadata,
                                     tier=result.tier, cid=result.cid)
@@ -582,8 +624,12 @@ class FilecoinAdapter:
                 return result
 
             # First store in IPFS
-            ipfs_cid = self._store_ipfs(compressed_content, metadata, on_progress=on_progress)
+            ipfs_cid = self._store_ipfs(
+                compressed_content, metadata, on_progress=on_progress,
+                filename=upload_name or _DEFAULT_UPLOAD_NAME,
+            )
             result.cid = ipfs_cid
+            result.filename = upload_name
 
             # Then create Filecoin deal for permanent storage
             deal_id = self._create_filecoin_deal(ipfs_cid, metadata)
@@ -1257,6 +1303,8 @@ class FilecoinAdapter:
         content: bytes,
         metadata: Optional[Dict] = None,
         on_progress: Optional[Callable[[int, int], None]] = None,
+        *,
+        filename: Optional[str] = None,
     ) -> str:
         """Store content in IPFS and return CID"""
         try:
@@ -1264,7 +1312,7 @@ class FilecoinAdapter:
             file_content = (
                 _ProgressBytesIO(content, on_progress) if on_progress else content
             )
-            files = {'file': ('content.bin', file_content)}
+            files = {'file': (filename or _DEFAULT_UPLOAD_NAME, file_content)}
             response = requests.post(
                 f"{self.ipfs_api_url}/api/v0/add",
                 files=files,
