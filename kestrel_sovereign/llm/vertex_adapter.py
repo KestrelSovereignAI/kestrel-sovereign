@@ -29,6 +29,11 @@ from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
 from .image_utils import process_images
 from .google_adapter import _finish_reason, _normalized_google_genai_usage
+from .gemini_contents import (
+    SYSTEM_MARKER_ROLE,
+    to_gemini_contents,
+    tool_result_messages,
+)
 from .output_ceiling import attach_stop_reason
 
 logger = logging.getLogger(__name__)
@@ -242,7 +247,7 @@ class VertexAIAdapter(LLMAdapter):
         if system_prompt:
             # Store as metadata - will be extracted in get_response
             messages.append({
-                "role": "_system",  # Special marker, not sent to API
+                "role": SYSTEM_MARKER_ROLE,  # Special marker, not sent to API
                 "parts": [{"text": system_prompt}]
             })
 
@@ -354,30 +359,6 @@ class VertexAIAdapter(LLMAdapter):
         args = dict(fc.args) if getattr(fc, "args", None) else {}
         return ToolCall(id=f"vertex_call_{index}", name=fc.name, arguments=args)
 
-    def _extract_system_prompt(
-        self,
-        messages: List[Dict[str, Any]]
-    ) -> tuple[Optional[str], List[Dict[str, Any]]]:
-        """
-        Extract system prompt from messages.
-
-        Returns:
-            Tuple of (system_prompt, filtered_messages)
-        """
-        system_prompt = None
-        filtered = []
-
-        for msg in messages:
-            if msg.get("role") == "_system":
-                # Extract system prompt
-                parts = msg.get("parts", [])
-                if parts and "text" in parts[0]:
-                    system_prompt = parts[0]["text"]
-            else:
-                filtered.append(msg)
-
-        return system_prompt, filtered
-
     async def get_response(
         self,
         client: Any,
@@ -394,7 +375,8 @@ class VertexAIAdapter(LLMAdapter):
         Args:
             client: The genai.Client instance (or None to use internal client)
             model: Model name (e.g., 'gemini-2.0-flash-001', 'gemini-1.5-pro')
-            messages: List of message dicts in Vertex AI format
+            messages: Chat messages in OpenAI format, or already in Gemini
+                format (``parts``); converted by ``to_gemini_contents``
             format: Response format (ignored for Vertex AI)
             tools: Optional tools in OpenAI format (will be converted)
             response_format: Optional Pydantic model for structured output
@@ -407,8 +389,8 @@ class VertexAIAdapter(LLMAdapter):
             # Use provided client or internal client
             genai_client = client if client else self._get_client()
 
-            # Extract system prompt from messages
-            system_prompt, filtered_messages = self._extract_system_prompt(messages)
+            # OpenAI-format messages become Gemini contents (#3608)
+            system_prompt, contents = to_gemini_contents(messages)
 
             config = self._generation_config(
                 system_prompt, tools, response_format, kwargs,
@@ -418,7 +400,7 @@ class VertexAIAdapter(LLMAdapter):
             response = await with_retry(
                 genai_client.aio.models.generate_content,
                 model=model,
-                contents=filtered_messages,
+                contents=contents,
                 config=config,
             )
 
@@ -493,8 +475,8 @@ class VertexAIAdapter(LLMAdapter):
             # Use provided client or internal client
             genai_client = client if client else self._get_client()
 
-            # Extract system prompt from messages
-            system_prompt, filtered_messages = self._extract_system_prompt(messages)
+            # OpenAI-format messages become Gemini contents (#3608)
+            system_prompt, contents = to_gemini_contents(messages)
 
             config = self._generation_config(
                 system_prompt, tools, response_format, kwargs,
@@ -504,7 +486,7 @@ class VertexAIAdapter(LLMAdapter):
             stream = await with_retry(
                 genai_client.aio.models.generate_content_stream,
                 model=model,
-                contents=filtered_messages,
+                contents=contents,
                 config=config,
             )
             text_content = ""
@@ -686,29 +668,14 @@ class VertexAIAdapter(LLMAdapter):
         """
         Continue conversation after executing tool calls.
 
-        Vertex AI expects function responses in a specific format.
+        ``messages`` ends with the assistant turn whose ``tool_calls`` the
+        ``tool_results`` (``{"tool_call_id", "content"}``) answer; each result
+        becomes a ``function_response`` named after its call (#3608).
         """
-        extended_messages = messages.copy()
-
-        # Add function response parts
-        function_responses = []
-        for result in tool_results:
-            function_responses.append({
-                "function_response": {
-                    "name": result.get("name", "unknown"),
-                    "response": {"result": result["content"]}
-                }
-            })
-
-        extended_messages.append({
-            "role": "function",
-            "parts": function_responses
-        })
-
         return await self.get_response(
             client=client,
             model=model,
-            messages=extended_messages,
+            messages=[*messages, *tool_result_messages(tool_results)],
             tools=tools,
             **kwargs
         )

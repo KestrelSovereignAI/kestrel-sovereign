@@ -14,6 +14,7 @@ import base64
 from typing import List, Dict, Any
 
 from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter, create_vertex_adapter, VertexAIConfig
+from kestrel_sovereign.llm.gemini_contents import to_gemini_contents
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -194,7 +195,7 @@ class TestMessageCreation:
             {"role": "user", "parts": [{"text": "Hello"}]}
         ]
 
-        system_prompt, filtered = adapter._extract_system_prompt(messages)
+        system_prompt, filtered = to_gemini_contents(messages)
 
         assert system_prompt == "Be helpful"
         assert len(filtered) == 1
