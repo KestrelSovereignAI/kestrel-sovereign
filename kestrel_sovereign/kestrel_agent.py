@@ -8377,6 +8377,7 @@ Expected Duration: {expected_duration}
             tool_calls=stop_tool_calls,
             tool_results=stop_tool_results or None,
             hook_snapshot=audit_hook_snapshot,
+            user_message=user_input,
         )
 
         # Store agent response (linked to session for resumed conversations)
