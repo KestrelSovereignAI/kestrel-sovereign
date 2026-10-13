@@ -295,25 +295,101 @@ class TestGoogleAdapterListModels:
 
 
 class TestVertexAIAdapterListModels:
-    """Test VertexAIAdapter.list_models()"""
+    """Test VertexAIAdapter.list_models() when discovery fails (#3610).
+
+    The fallback holds no hardcoded list (#215): it is the ``vertex_ai`` part
+    of the discovery cache the last successful discovery wrote. The default
+    cache sits beside the package, so what it holds depends on what last ran
+    in the checkout; these tests give the catalog a cache in ``tmp_path``.
+    """
+
+    VERTEX_MODELS = [
+        ModelInfo(
+            id="models/gemini-2.5-flash",
+            provider="vertex_ai",
+            display_name="Gemini 2.5 Flash",
+            category=ModelCategory.CHAT,
+            is_featured=True,
+            context_limit=1048576,
+            supports_vision=True,
+            supports_tools=True,
+            supports_streaming=True,
+        ),
+        ModelInfo(
+            id="models/gemini-2.5-pro",
+            provider="vertex_ai",
+            display_name="Gemini 2.5 Pro",
+            category=ModelCategory.CHAT,
+            description="Stable release of Gemini 2.5 Pro",
+            context_limit=1048576,
+            supports_vision=True,
+            supports_tools=True,
+            supports_streaming=True,
+        ),
+        ModelInfo(
+            id="models/text-embedding-005",
+            provider="vertex_ai",
+            display_name="Text Embedding 005",
+            category=ModelCategory.EMBEDDING,
+            context_limit=2048,
+            supports_tools=True,
+            supports_streaming=True,
+        ),
+    ]
+    OPENROUTER_MODELS = [
+        ModelInfo(id="openai/gpt-5-mini", provider="openrouter", display_name="GPT-5 Mini"),
+        ModelInfo(id="google/gemini-2.5-flash", provider="openrouter", display_name="Gemini 2.5 Flash"),
+    ]
+
+    @pytest.fixture
+    def catalog(self, tmp_path, monkeypatch):
+        from kestrel_sovereign.llm import model_catalog
+        from kestrel_sovereign.llm.model_catalog import ModelCatalogService
+
+        service = ModelCatalogService(cache_path=tmp_path / "model_discovery_cache.json")
+        monkeypatch.setattr(model_catalog, "_catalog_service", service)
+        return service
+
+    @pytest.fixture
+    def adapter(self):
+        from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter
+
+        adapter = VertexAIAdapter(project_id="fallback-test-project")
+        models_api = MagicMock()
+        models_api.list.side_effect = RuntimeError("Vertex discovery unavailable")
+        adapter._client = MagicMock(models=models_api)
+        return adapter
 
     @pytest.mark.asyncio
-    async def test_list_models_returns_model_info_list(self):
-        """Test that list_models returns List[ModelInfo]"""
-        from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter
-        adapter = VertexAIAdapter()
+    async def test_failed_discovery_returns_the_cached_vertex_models(self, catalog, adapter):
+        """Discovery down: the Vertex models of the last discovery, in cache order."""
+        catalog.write_cache([
+            self.OPENROUTER_MODELS[0],
+            *self.VERTEX_MODELS[:2],
+            self.OPENROUTER_MODELS[1],
+            self.VERTEX_MODELS[2],
+        ])
 
-        # Vertex adapter may not require mocking if it uses fallback models
-        # When API discovery fails, it should return a curated list
-        with patch.dict(os.environ, {}, clear=True):
-            # Without credentials, should return fallback models
-            models = await adapter.list_models()
+        models = await adapter.list_models()
 
-        # Should return some fallback models
-        assert isinstance(models, list)
-        if models:
-            assert all(isinstance(m, ModelInfo) for m in models)
-            assert all(m.provider == "vertex_ai" for m in models)
+        adapter._client.models.list.assert_called_once_with()
+        assert len(models) >= 3
+        assert all(isinstance(m, ModelInfo) for m in models)
+        assert models == self.VERTEX_MODELS
+
+    @pytest.mark.asyncio
+    async def test_fallback_without_a_cache_is_empty(self, catalog, adapter):
+        """No discovery has run: there is nothing to fall back to."""
+        assert not catalog.cache_path.exists()
+
+        assert await adapter.list_models() == []
+
+    @pytest.mark.asyncio
+    async def test_fallback_never_takes_another_providers_models(self, catalog, adapter):
+        """A cache with no Vertex entries, as a unit test's discovery leaves, gives nothing."""
+        catalog.write_cache(self.OPENROUTER_MODELS)
+
+        assert await adapter.list_models() == []
 
 
 class TestModelInfoSerialization:
