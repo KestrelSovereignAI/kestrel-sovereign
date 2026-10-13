@@ -1,4 +1,5 @@
-"""The IPFS tier's remote service when the adapter's node is unreachable (#2874)."""
+"""The IPFS tier's remote publisher and reader when the adapter's node is
+unreachable (#2874, #3601)."""
 
 import asyncio
 import json
@@ -9,16 +10,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from kestrel_sovereign.features.sovereignty.feature import _LighthouseIpfs
+from kestrel_sovereign.features.sovereignty.feature import (
+    _LighthouseGatewayIpfs,
+    _LighthouseIpfs,
+)
 from kestrel_sovereign.filecoin_adapter import (
     ContentRetrievalLimitError,
     FilecoinAdapter,
     RemoteIpfsError,
     StorageTier,
 )
-from kestrel_sovereign.storage.providers.lighthouse_rest import (
-    LighthouseDownloadLimitError,
-)
+from tests.utils.lighthouse_gateway import GATEWAY_URL, GatewayServer
 
 UPLOAD_NAME = "kestrel_sovereignty__did:example:a__20261012_000000.bin"
 
@@ -317,26 +319,93 @@ def test_a_content_hash_is_never_sent_to_the_remote_service(tmp_path):
     assert service.fetches == []
 
 
+@pytest.fixture
+def gateway(monkeypatch):
+    """Lighthouse's public gateway, serving what ``served`` holds, on a host
+    with no Lighthouse key."""
+    monkeypatch.delenv("LIGHTHOUSE_API_KEY", raising=False)
+    served: dict = {}
+    server = GatewayServer(served.get).install(monkeypatch)
+    server.served = served
+    return server
+
+
 @pytest.mark.asyncio
-async def test_lighthouse_fetches_on_the_agent_loop_under_the_ceiling():
-    provider = MagicMock(provider_name="lighthouse")
-    provider.fetch = AsyncMock(return_value=b"sealed")
-    remote = _LighthouseIpfs(provider, tag="t", loop=asyncio.get_running_loop())
+async def test_the_lighthouse_gateway_reads_by_cid_with_no_credential(gateway):
+    """An import reads an export back from the public gateway, which needs
+    no key: a fresh host has none (#3601)."""
+    gateway.served["bafylh"] = b"sealed"
+    remote = _LighthouseGatewayIpfs(loop=asyncio.get_running_loop())
 
     content = await asyncio.to_thread(remote.fetch, "bafylh", max_bytes=99)
 
     assert content == b"sealed"
-    provider.fetch.assert_awaited_once_with("bafylh", max_bytes=99)
+    assert remote.provider_name == "lighthouse"
+    [request] = gateway.requests
+    assert str(request.url) == f"{GATEWAY_URL}/bafylh"
+    assert "authorization" not in request.headers
+    # Read raw, so the ceiling counts the bytes the gateway sends.
+    assert request.headers["accept-encoding"] == "identity"
+    # The read's client is closed with it.
+    [client] = gateway.clients
+    assert client.is_closed
 
 
 @pytest.mark.asyncio
-async def test_lighthouse_download_ceiling_is_the_adapters_ceiling():
-    provider = MagicMock(provider_name="lighthouse")
-    provider.fetch = AsyncMock(side_effect=LighthouseDownloadLimitError("too big"))
-    remote = _LighthouseIpfs(provider, tag="t", loop=asyncio.get_running_loop())
+@pytest.mark.parametrize("declare_length", [True, False], ids=["declared", "streamed"])
+async def test_the_lighthouse_gateway_ceiling_is_the_adapters_ceiling(
+    gateway, declare_length
+):
+    gateway.served["bafylh"] = b"x" * 100_000
+    gateway.declare_length = declare_length
+    remote = _LighthouseGatewayIpfs(loop=asyncio.get_running_loop())
 
-    with pytest.raises(ContentRetrievalLimitError, match="too big"):
+    with pytest.raises(ContentRetrievalLimitError, match="exceeds 99 bytes"):
         await asyncio.to_thread(remote.fetch, "bafylh", max_bytes=99)
+
+    # The read stopped at the ceiling rather than buffering the answer.
+    [sent] = gateway.sent
+    assert sent <= 99 + 64 * 1024
+    [client] = gateway.clients
+    assert client.is_closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [404, 503])
+async def test_a_gateway_that_cannot_serve_is_the_adapters_remote_error(gateway, failure):
+    gateway.failure = failure
+    remote = _LighthouseGatewayIpfs(loop=asyncio.get_running_loop())
+
+    with pytest.raises(RemoteIpfsError, match=str(failure)):
+        await asyncio.to_thread(remote.fetch, "bafylh", max_bytes=99)
+
+    [client] = gateway.clients
+    assert client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_retrieval_reads_the_lighthouse_gateway_when_the_node_cannot_answer(
+    tmp_path, gateway
+):
+    """Through the adapter: the node is unreachable and the gateway answers
+    with what an IPFS-tier store published, read under the encoded ceiling
+    and checked as the node's answer is."""
+    result, service = _published(tmp_path)
+    gateway.served[result.ipfs_cid] = service.served[result.ipfs_cid]
+    adapter, _, patcher = _adapter(tmp_path, node_online=False)
+    try:
+        content = await asyncio.to_thread(
+            adapter.retrieve_content,
+            result.content_hash,
+            ipfs_cid=result.ipfs_cid,
+            max_output_bytes=1024,
+            remote_ipfs=_LighthouseGatewayIpfs(loop=asyncio.get_running_loop()),
+        )
+    finally:
+        patcher.stop()
+
+    assert content == b"backup"
+    assert gateway.cids == [result.ipfs_cid]
 
 
 class _Failing(_Pinning):
@@ -403,7 +472,7 @@ def test_a_service_that_cannot_serve_reports_the_content_missing(tmp_path):
         ConnectionError("Lighthouse provider not available"),
         httpx.HTTPStatusError(
             "503",
-            request=httpx.Request("GET", "https://gateway.lighthouse.storage/ipfs/x"),
+            request=httpx.Request("POST", "https://upload.lighthouse.storage/api/v0/add"),
             response=httpx.Response(503),
         ),
         ValueError("Lighthouse returned no CID"),
@@ -412,13 +481,10 @@ def test_a_service_that_cannot_serve_reports_the_content_missing(tmp_path):
 async def test_lighthouse_failures_are_the_adapters_remote_error(error):
     provider = MagicMock(provider_name="lighthouse")
     provider.publish = AsyncMock(side_effect=error)
-    provider.fetch = AsyncMock(side_effect=error)
     remote = _LighthouseIpfs(provider, tag="t", loop=asyncio.get_running_loop())
 
     with pytest.raises(RemoteIpfsError):
         await asyncio.to_thread(remote.pin, b"payload", filename=UPLOAD_NAME)
-    with pytest.raises(RemoteIpfsError):
-        await asyncio.to_thread(remote.fetch, "bafylh", max_bytes=99)
 
 
 def test_a_call_that_cannot_be_scheduled_leaves_no_coroutine_behind():
@@ -427,17 +493,43 @@ def test_a_call_that_cannot_be_scheduled_leaves_no_coroutine_behind():
     provider = MagicMock(provider_name="lighthouse")
     calls = []
 
-    async def fetch(cid, *, max_bytes):
-        return b""
+    async def publish(payload, *, filename, tag, on_progress):
+        return "bafylh"
 
-    def tracked(cid, *, max_bytes):
-        calls.append(fetch(cid, max_bytes=max_bytes))
+    def tracked(payload, **kwargs):
+        calls.append(publish(payload, **kwargs))
         return calls[-1]
 
-    provider.fetch = tracked
+    provider.publish = tracked
     remote = _LighthouseIpfs(provider, tag="t", loop=loop)
 
     with pytest.raises(RuntimeError):
-        remote.fetch("bafylh", max_bytes=1)
+        remote.pin(b"payload", filename=UPLOAD_NAME)
     [coroutine] = calls
     assert coroutine.cr_frame is None  # closed, not left un-awaited
+
+
+def test_the_lighthouse_gateway_refuses_to_block_the_agent_loop():
+    """Called on the loop it reads on, ``fetch`` would wait on itself."""
+    outcome = {}
+
+    def call_fetch_on_its_loop():
+        loop = asyncio.new_event_loop()
+        remote = _LighthouseGatewayIpfs(loop=loop)
+
+        async def on_the_loop():
+            return remote.fetch("bafylh", max_bytes=1)
+
+        try:
+            outcome["content"] = loop.run_until_complete(on_the_loop())
+        except RuntimeError as exc:
+            outcome["error"] = exc
+        finally:
+            loop.close()
+
+    caller = threading.Thread(target=call_fetch_on_its_loop, daemon=True)
+    caller.start()
+    caller.join(timeout=10)
+
+    assert not caller.is_alive(), "fetch blocked the loop it reads on"
+    assert "worker thread" in str(outcome["error"])

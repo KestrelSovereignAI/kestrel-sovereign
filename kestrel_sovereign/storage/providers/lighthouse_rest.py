@@ -9,7 +9,11 @@ Lighthouse REST API reference:
 - List:    https://api.lighthouse.storage/api/user/files_uploaded (GET, cursor)
 - Deals:   https://api.lighthouse.storage/api/lighthouse/deal_status?cid=X (no auth)
 - Balance: https://api.lighthouse.storage/api/user/user_data_usage
-- Gateway: https://gateway.lighthouse.storage/ipfs/{cid}
+- Gateway: https://gateway.lighthouse.storage/ipfs/{cid} (no auth)
+
+The gateway serves any account's upload by CID to anyone, so reading it needs
+no API key: ``LighthouseGateway`` reads it alone, and ``LighthouseRestClient``
+adds the account API, which does.
 """
 
 import logging
@@ -134,33 +138,33 @@ class _ProgressBytesIO(BytesIO):
         return chunk
 
 
-class LighthouseRestClient:
-    """Async HTTP client for Lighthouse storage REST API."""
+class LighthouseGateway:
+    """Lighthouse's public IPFS gateway: any upload, from any account, by CID.
 
-    UPLOAD_URL = "https://upload.lighthouse.storage"
+    A read needs no API key and is not tied to the account that uploaded the
+    content, so a host that holds no Lighthouse key at all (a fresh host
+    restoring a sovereignty export, #3601) reads through this alone.
+    """
+
     #: Payload per second of patience a transfer is granted, per socket
     #: operation, in either direction. The budget for a payload is
     #: ``max(timeout, size / this)``, so a 60 s default still applies to
     #: small requests and a 1.2 GB snapshot gets ~2300 s for the server's
     #: processing before it answers.
     TRANSFER_FLOOR_BYTES_PER_SECOND = 512 * 1024
-    API_URL = "https://api.lighthouse.storage"
 
     def __init__(
         self,
-        api_key: str,
         gateway_url: str = "https://gateway.lighthouse.storage/ipfs",
         timeout: float = 60.0,
     ):
         """
-        Initialize Lighthouse REST client.
+        Initialize a Lighthouse gateway reader.
 
         Args:
-            api_key: Lighthouse API key for authentication
             gateway_url: IPFS gateway URL for downloads
             timeout: Default request timeout in seconds
         """
-        self.api_key = api_key
         self.gateway_url = gateway_url.rstrip("/")
         self.timeout = timeout
         self._client: Optional[httpx.AsyncClient] = None
@@ -176,54 +180,6 @@ class LighthouseRestClient:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
-
-    @property
-    def _auth_headers(self) -> Dict[str, str]:
-        """Authorization headers for API requests."""
-        return {"Authorization": f"Bearer {self.api_key}"}
-
-    async def upload(
-        self,
-        content: bytes,
-        filename: str,
-        tag: str = "kestrel-storage",
-        on_progress: Optional[Callable[[int, int], None]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Upload file via multipart POST.
-
-        Args:
-            content: File content bytes
-            filename: Name for the uploaded file
-            tag: Tag for organizing uploads
-            on_progress: Optional callback(bytes_sent, total_bytes)
-
-        Returns:
-            Dict with 'Hash' (CID), 'Name', and 'Size' keys
-
-        Raises:
-            httpx.HTTPStatusError: On API errors
-        """
-        client = await self._get_client()
-        file_content = (
-            _ProgressBytesIO(content, on_progress) if on_progress else content
-        )
-        files = {"file": (filename, file_content)}
-
-        response = await client.post(
-            f"{self.UPLOAD_URL}/api/v0/add",
-            headers=self._auth_headers,
-            files=files,
-            params={"tag": tag},
-            timeout=self.transfer_timeout(len(content)),
-        )
-        response.raise_for_status()
-
-        data = response.json()
-        # Normalize: Lighthouse wraps in {"data": {...}} sometimes
-        if isinstance(data, dict) and "data" in data:
-            return data["data"]
-        return data
 
     def transfer_timeout(self, payload_bytes: int) -> "httpx.Timeout":
         """The request budget for transferring ``payload_bytes`` either way.
@@ -245,48 +201,6 @@ class LighthouseRestClient:
         return httpx.Timeout(
             connect=self.timeout, read=budget, write=budget, pool=self.timeout
         )
-
-    async def upload_car(
-        self,
-        car_bytes: bytes,
-        tag: str = "kestrel-storage",
-        filename: str = "export.car",
-        on_progress: Optional[Callable[[int, int], None]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Upload CAR (Content Addressable aRchive) file.
-
-        Lighthouse SDK v0.4.4+ supports direct CAR upload for
-        faster, verifiable ingestion of content-addressed DAGs.
-
-        Args:
-            car_bytes: CAR v1 file bytes
-            tag: Tag for organizing uploads
-            filename: Name for the uploaded CAR file
-            on_progress: Optional callback(bytes_sent, total_bytes)
-
-        Returns:
-            Dict with 'Hash' (CID), 'Name', and 'Size' keys
-        """
-        client = await self._get_client()
-        file_content = (
-            _ProgressBytesIO(car_bytes, on_progress) if on_progress else car_bytes
-        )
-        files = {"file": (filename, file_content, "application/vnd.ipld.car")}
-
-        response = await client.post(
-            f"{self.UPLOAD_URL}/api/v0/add",
-            headers=self._auth_headers,
-            files=files,
-            params={"tag": tag},
-            timeout=self.transfer_timeout(len(car_bytes)),
-        )
-        response.raise_for_status()
-
-        data = response.json()
-        if isinstance(data, dict) and "data" in data:
-            return data["data"]
-        return data
 
     async def download(
         self,
@@ -361,6 +275,120 @@ class LighthouseRestClient:
                     )
                 chunks.append(chunk)
         return b"".join(chunks)
+
+
+class LighthouseRestClient(LighthouseGateway):
+    """Async HTTP client for Lighthouse storage REST API."""
+
+    UPLOAD_URL = "https://upload.lighthouse.storage"
+    API_URL = "https://api.lighthouse.storage"
+
+    def __init__(
+        self,
+        api_key: str,
+        gateway_url: str = "https://gateway.lighthouse.storage/ipfs",
+        timeout: float = 60.0,
+    ):
+        """
+        Initialize Lighthouse REST client.
+
+        Args:
+            api_key: Lighthouse API key for authentication
+            gateway_url: IPFS gateway URL for downloads
+            timeout: Default request timeout in seconds
+        """
+        super().__init__(gateway_url=gateway_url, timeout=timeout)
+        self.api_key = api_key
+
+    @property
+    def _auth_headers(self) -> Dict[str, str]:
+        """Authorization headers for API requests."""
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    async def upload(
+        self,
+        content: bytes,
+        filename: str,
+        tag: str = "kestrel-storage",
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Upload file via multipart POST.
+
+        Args:
+            content: File content bytes
+            filename: Name for the uploaded file
+            tag: Tag for organizing uploads
+            on_progress: Optional callback(bytes_sent, total_bytes)
+
+        Returns:
+            Dict with 'Hash' (CID), 'Name', and 'Size' keys
+
+        Raises:
+            httpx.HTTPStatusError: On API errors
+        """
+        client = await self._get_client()
+        file_content = (
+            _ProgressBytesIO(content, on_progress) if on_progress else content
+        )
+        files = {"file": (filename, file_content)}
+
+        response = await client.post(
+            f"{self.UPLOAD_URL}/api/v0/add",
+            headers=self._auth_headers,
+            files=files,
+            params={"tag": tag},
+            timeout=self.transfer_timeout(len(content)),
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        # Normalize: Lighthouse wraps in {"data": {...}} sometimes
+        if isinstance(data, dict) and "data" in data:
+            return data["data"]
+        return data
+
+    async def upload_car(
+        self,
+        car_bytes: bytes,
+        tag: str = "kestrel-storage",
+        filename: str = "export.car",
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Upload CAR (Content Addressable aRchive) file.
+
+        Lighthouse SDK v0.4.4+ supports direct CAR upload for
+        faster, verifiable ingestion of content-addressed DAGs.
+
+        Args:
+            car_bytes: CAR v1 file bytes
+            tag: Tag for organizing uploads
+            filename: Name for the uploaded CAR file
+            on_progress: Optional callback(bytes_sent, total_bytes)
+
+        Returns:
+            Dict with 'Hash' (CID), 'Name', and 'Size' keys
+        """
+        client = await self._get_client()
+        file_content = (
+            _ProgressBytesIO(car_bytes, on_progress) if on_progress else car_bytes
+        )
+        files = {"file": (filename, file_content, "application/vnd.ipld.car")}
+
+        response = await client.post(
+            f"{self.UPLOAD_URL}/api/v0/add",
+            headers=self._auth_headers,
+            files=files,
+            params={"tag": tag},
+            timeout=self.transfer_timeout(len(car_bytes)),
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        if isinstance(data, dict) and "data" in data:
+            return data["data"]
+        return data
 
     async def get_uploads(self, last_key: Optional[str] = None) -> Dict[str, Any]:
         """

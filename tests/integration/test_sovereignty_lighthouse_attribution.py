@@ -17,7 +17,8 @@ its account, which is what makes attribution matter; an agent with its own key
 publishes to another account, which every reader and pruner of its exports
 must then use. State snapshots stay on the host key's account whatever key an
 agent's exports use: it is the one account cold-start restore can read. The
-gateway is public: any account's upload downloads by CID.
+gateway is public: any account's upload downloads by CID, with no key, and an
+import reads it through the real gateway reader, answered in-process.
 The adapter's own IPFS node is offline unless a test brings it up: the agent's
 Lighthouse provider then takes the IPFS tier, and serves it back.
 """
@@ -31,6 +32,7 @@ import itertools
 import json
 import os
 import re
+import tracemalloc
 import zlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -76,6 +78,7 @@ from kestrel_sovereign.storage.sync.lighthouse_target import LighthouseTarget
 from kestrel_sovereign.storage.sync.retention import RetentionPolicy
 from kestrel_sovereign.storage.sync.service import SyncService
 from scripts import backup_cleanup
+from tests.utils.lighthouse_gateway import GatewayServer
 
 AGENT_A = "did:pkh:eip155:1:0x2874alpha"
 AGENT_B = "did:pkh:eip155:1:0x2874bravo"
@@ -126,11 +129,19 @@ class _Lighthouse:
     def account(self, api_key: str) -> "_LighthouseAccount":
         return self.accounts.setdefault(api_key, _LighthouseAccount(self))
 
-    def blob(self, cid: str) -> bytes:
-        """What the public gateway serves for ``cid``, from any account."""
+    def public(self, cid: str):
+        """What the public gateway serves for ``cid``: any account's upload,
+        or None."""
         for account in self.accounts.values():
             if cid in account.blobs:
                 return account.blobs[cid]
+        return None
+
+    def blob(self, cid: str) -> bytes:
+        """What the public gateway serves for ``cid``, from any account."""
+        content = self.public(cid)
+        if content is not None:
+            return content
         raise httpx.HTTPStatusError(
             "gateway 404",
             request=httpx.Request("GET", f"https://gateway.lighthouse.storage/ipfs/{cid}"),
@@ -157,6 +168,10 @@ class _LighthouseAccount:
         self.downloads: list[str] = []
         # The byte ceiling each gateway read was made under.
         self.download_ceilings: list = []
+
+    @property
+    def gateway(self) -> GatewayServer:
+        return self.service.gateway
 
     @property
     def now(self) -> datetime:
@@ -325,10 +340,12 @@ def kubo():
 @pytest.fixture
 def lighthouse(monkeypatch):
     """The host account, behind the host's LIGHTHOUSE_API_KEY. Other accounts
-    are ``lighthouse.service.account(key)``."""
+    are ``lighthouse.service.account(key)``; the public gateway, read with no
+    key, is ``lighthouse.gateway``."""
     service = _Lighthouse()
     host = service.account(API_KEY)
     monkeypatch.setenv("LIGHTHOUSE_API_KEY", API_KEY)
+    service.gateway = GatewayServer(service.public).install(monkeypatch)
     with patch(
         "kestrel_sovereign.storage.providers.lighthouse_provider.LighthouseRestClient",
         side_effect=service.client,
@@ -871,7 +888,9 @@ async def test_a_lighthouse_export_restores_after_the_host_cache_is_lost(
         restored = await SovereigntyFeature(agent).import_sovereignty(cid)
         assert restored.status is ToolResultStatus.OK, restored
         assert await _history(raw) == MESSAGES
-    assert lighthouse.downloads == [cid]
+    # Read from the public gateway, not through the agent's provider.
+    assert lighthouse.gateway.cids == [cid]
+    assert lighthouse.downloads == []
 
     # A brand-new host and database: no receipt, no cache, Kubo offline.
     _lose_host_cache(origin)
@@ -881,7 +900,7 @@ async def test_a_lighthouse_export_restores_after_the_host_cache_is_lost(
         restored = await SovereigntyFeature(agent).import_sovereignty(cid)
         assert restored.status is ToolResultStatus.OK, restored
         assert await _history(raw) == MESSAGES
-    assert lighthouse.downloads == [cid, cid]
+    assert lighthouse.gateway.cids == [cid, cid]
     assert kubo.blocks == {}
 
 
@@ -890,11 +909,16 @@ async def test_a_lighthouse_export_is_restored_only_by_its_agent_and_under_the_c
     tmp_path, monkeypatch, kubo, lighthouse, data_key
 ):
     """What Lighthouse serves goes through the envelope's ownership check
-    and the import ceiling exactly as Kubo's answer does (#2873, #2874)."""
+    and the import ceiling exactly as Kubo's answer does (#2873, #2874), on
+    hosts that hold no Lighthouse key (#3601)."""
     origin = tmp_path / "origin"
     async with _host(origin, monkeypatch, did=AGENT_A) as (agent, raw):
+        # Incompressible, so the export outgrows the ceiling below.
+        noise = base64.b64encode(os.urandom(512 * 1024)).decode()
+        await raw.add_conversation("user", noise, metadata={})
         cid = await _export(agent, raw)
     _lose_host_cache(origin)
+    monkeypatch.delenv("LIGHTHOUSE_API_KEY")
 
     async with _host(tmp_path / "other", monkeypatch, did=AGENT_B) as (agent, raw):
         refused = await SovereigntyFeature(agent).import_sovereignty(cid)
@@ -906,13 +930,181 @@ async def test_a_lighthouse_export_is_restored_only_by_its_agent_and_under_the_c
         "kestrel_sovereign.features.sovereignty.feature.MAX_SOVEREIGNTY_IMPORT_BYTES",
         16,
     )
+    published = len(lighthouse.blobs[cid])
+    ceiling = _encoded_retrieval_limit(16)
+    assert published > 3 * ceiling
+    # The gateway need not say how long its answer is: only counting what
+    # arrives can stop the read.
+    lighthouse.gateway.declare_length = False
     async with _host(tmp_path / "fresh", monkeypatch, did=AGENT_A) as (agent, raw):
         refused = await SovereigntyFeature(agent).import_sovereignty(cid)
         assert refused.status is ToolResultStatus.ERROR
         assert refused.data["refusal"] == "export_exceeds_import_limit"
         assert await _history(raw) == []
-    # The gateway was read under the ceiling Kubo is read under, not in full.
-    assert lighthouse.download_ceilings[-1] == _encoded_retrieval_limit(16)
+    # The gateway was read under the ceiling Kubo is read under, not in
+    # full: the read stopped at the first chunk past it.
+    assert lighthouse.gateway.cids == [cid, cid]
+    assert lighthouse.gateway.sent[-1] <= ceiling + 64 * 1024 + 4096 < published
+
+
+@pytest.mark.asyncio
+async def test_a_host_with_no_lighthouse_key_restores_an_export_from_the_gateway(
+    tmp_path, monkeypatch, kubo, lighthouse, data_key
+):
+    """The export went to Lighthouse on the agent's own key, and the host
+    configured none. The key was lost with the agent's database, and the new
+    host configures none either, so boot builds no provider there. With Kubo
+    offline and no cache, the export still restores into the empty database
+    by CID, from Lighthouse's public gateway, which needs no key (#3601)."""
+    monkeypatch.delenv("LIGHTHOUSE_API_KEY")
+    own = lighthouse.service.account(AGENT_KEY)
+    origin = tmp_path / "origin"
+    async with _host(origin, monkeypatch, did=AGENT_A, agent_key=AGENT_KEY) as (agent, raw):
+        cid = await _export(agent, raw)
+    assert own.cids() == {cid}
+    _lose_host_cache(origin)
+
+    fresh = tmp_path / "fresh"
+    async with _host(fresh, monkeypatch, did=AGENT_A) as (agent, raw):
+        # No key anywhere: boot built no provider, and not because building
+        # one failed.
+        assert "LIGHTHOUSE_API_KEY" not in os.environ
+        assert not await ServiceKeyStorage(raw.db, AGENT_A).has_key("lighthouse")
+        assert (agent.lighthouse_provider, agent.lighthouse_provider_error) == (None, None)
+        assert await agent.storage.get_nodes_by_type("backup_artifact") == []
+        assert await _history(raw) == []
+
+        restored = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert restored.status is ToolResultStatus.OK, restored
+        assert restored.data["messages_restored"] == len(MESSAGES)
+        assert await _history(raw) == MESSAGES
+    [request] = lighthouse.gateway.requests
+    assert lighthouse.gateway.cids == [cid]
+    assert "authorization" not in request.headers
+    assert all(client.is_closed for client in lighthouse.gateway.clients)
+    assert own.downloads == [] and lighthouse.downloads == []
+    assert kubo.blocks == {}
+
+
+@pytest.mark.asyncio
+async def test_a_privacy_mode_that_keeps_storage_local_asks_no_gateway(
+    tmp_path, monkeypatch, kubo, lighthouse, data_key
+):
+    """The keyless read still tells Lighthouse which CID this host wants, so
+    it follows the agent's privacy mode as it is when the import runs: a mode
+    that permits no remote tier makes no request (#3601)."""
+    origin = tmp_path / "origin"
+    async with _host(origin, monkeypatch, did=AGENT_A) as (agent, raw):
+        cid = await _export(agent, raw)
+    _lose_host_cache(origin)
+    monkeypatch.delenv("LIGHTHOUSE_API_KEY")
+
+    async with _host(tmp_path / "fresh", monkeypatch, did=AGENT_A) as (agent, raw):
+        agent.storage.set_privacy_mode(PrivacyMode.ISOLATED)
+        refused = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert refused.status is ToolResultStatus.ERROR, refused
+        assert "Content not found" in refused.error
+        assert lighthouse.gateway.requests == []
+
+        agent.storage.set_privacy_mode(PrivacyMode.NORMAL)
+        restored = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert restored.status is ToolResultStatus.OK, restored
+        assert await _history(raw) == MESSAGES
+    assert lighthouse.gateway.cids == [cid]
+
+
+@pytest.mark.asyncio
+async def test_an_agent_whose_key_was_removed_still_restores_from_the_gateway(
+    tmp_path, monkeypatch, kubo, lighthouse, data_key
+):
+    """The agent's provider resolves no key once its own is removed, so it
+    publishes nothing more (#2874). Reading its earlier export back never
+    asked it for one (#3601)."""
+    monkeypatch.delenv("LIGHTHOUSE_API_KEY")
+    lighthouse.service.account(AGENT_KEY)
+    host = tmp_path / "host"
+    async with _host(host, monkeypatch, did=AGENT_A, agent_key=AGENT_KEY) as (agent, raw):
+        cid = await _export(agent, raw)
+        assert await ServiceKeyStorage(raw.db, AGENT_A).delete_key("lighthouse")
+        _lose_host_cache(host)
+        await raw.db.execute_commit("DELETE FROM conversation_history")
+
+        restored = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert restored.status is ToolResultStatus.OK, restored
+        assert await _history(raw) == MESSAGES
+        assert await agent.lighthouse_provider.resolve_api_key() is None
+    assert lighthouse.gateway.cids == [cid]
+
+
+def _tamper_ciphertext(served: bytes) -> bytes:
+    """The export's sealed envelope with one ciphertext byte changed."""
+    payload = zlib.decompress(served)
+    flipped = b"A" if payload[-10:-9] != b"A" else b"B"
+    return zlib.compress(payload[:-10] + flipped + payload[-9:])
+
+
+@pytest.mark.asyncio
+async def test_a_substituted_gateway_answer_is_refused_on_a_host_with_no_key(
+    tmp_path, monkeypatch, kubo, lighthouse, data_key
+):
+    """The gateway is not trusted for being reachable without a key: the
+    envelope it serves is opened and authenticated as Kubo's is (#2873)."""
+    origin = tmp_path / "origin"
+    async with _host(origin, monkeypatch, did=AGENT_A) as (agent, raw):
+        cid = await _export(agent, raw)
+    _lose_host_cache(origin)
+    lighthouse.blobs[cid] = _tamper_ciphertext(lighthouse.blobs[cid])
+    monkeypatch.delenv("LIGHTHOUSE_API_KEY")
+
+    async with _host(tmp_path / "fresh", monkeypatch, did=AGENT_A) as (agent, raw):
+        assert agent.lighthouse_provider is None
+        refused = await SovereigntyFeature(agent).import_sovereignty(cid)
+
+        assert refused.status is ToolResultStatus.ERROR, refused
+        assert refused.data["refusal"] == "decryption_failed"
+        assert await _history(raw) == []
+    assert lighthouse.gateway.cids == [cid]
+
+
+@pytest.mark.asyncio
+async def test_a_compression_bomb_from_the_gateway_is_refused_while_it_is_decompressed(
+    tmp_path, monkeypatch, kubo, lighthouse, data_key
+):
+    """64 MiB of zeros compresses to about 64 KB, inside the read ceiling.
+    Decompression stops at the ceiling instead of inflating it, whatever
+    served it (#2873)."""
+    limit = 1024 * 1024
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.sovereignty.feature.MAX_SOVEREIGNTY_IMPORT_BYTES",
+        limit,
+    )
+    inflated = b"\0" * (64 * limit)
+    lighthouse.blobs["bafybomb"] = zlib.compress(inflated, 9)
+    del inflated
+    assert len(lighthouse.blobs["bafybomb"]) < _encoded_retrieval_limit(limit)
+    monkeypatch.delenv("LIGHTHOUSE_API_KEY")
+
+    async with _host(tmp_path / "fresh", monkeypatch, did=AGENT_A) as (agent, raw):
+        restore = AsyncMock(wraps=agent.storage.restore_from_backup_blob)
+        monkeypatch.setattr(agent.storage, "restore_from_backup_blob", restore)
+        tracemalloc.start()
+        try:
+            refused = await SovereigntyFeature(agent).import_sovereignty("bafybomb")
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert refused.status is ToolResultStatus.ERROR, refused
+        assert refused.data["refusal"] == "export_exceeds_import_limit"
+        restore.assert_not_awaited()
+        assert await _history(raw) == []
+    assert lighthouse.gateway.cids == ["bafybomb"]
+    # Inflating it whole would allocate 64 MiB.
+    assert peak < 8 * limit
 
 
 @pytest.mark.asyncio

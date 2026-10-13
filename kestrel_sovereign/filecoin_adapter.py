@@ -380,18 +380,14 @@ class RemoteIpfsError(ConnectionError):
     """A remote IPFS service could not take, or could not serve, content."""
 
 
-class RemoteIpfsService(Protocol):
-    """A remote IPFS service the adapter publishes the IPFS tier to, and reads
-    it back from, when its own IPFS node is unreachable (#2874).
+class RemoteIpfsPublisher(Protocol):
+    """A remote IPFS service the adapter publishes the IPFS tier to when its
+    own IPFS node is unreachable (#2874).
 
-    Both methods are called from the thread ``store_content`` or
-    ``retrieve_content`` runs in, and raise ``RemoteIpfsError`` when the
-    service fails. ``pin`` takes the payload exactly as the IPFS tier stores
-    it (compressed, and sealed when encrypted) and returns its CID;
-    ``provider_name`` is recorded as the result's provider. ``fetch`` returns
-    the bytes the service serves for a CID, reading at most ``max_bytes`` and
-    raising ``ContentRetrievalLimitError`` past it; the adapter checks them
-    exactly as it checks its own node's.
+    ``pin`` is called from the thread ``store_content`` runs in, and raises
+    ``RemoteIpfsError`` when the service fails. It takes the payload exactly
+    as the IPFS tier stores it (compressed, and sealed when encrypted) and
+    returns its CID; ``provider_name`` is recorded as the result's provider.
     """
 
     provider_name: str
@@ -403,6 +399,22 @@ class RemoteIpfsService(Protocol):
         filename: str,
         on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> str: ...
+
+
+class RemoteIpfsReader(Protocol):
+    """A remote IPFS service the adapter reads the IPFS tier back from when
+    its own IPFS node does not answer (#2874).
+
+    It serves content by CID, so it need not be the publisher that took the
+    content, nor hold any credential for it (#3601). ``fetch`` is called from
+    the thread ``retrieve_content`` runs in, and raises ``RemoteIpfsError``
+    when the service fails. It returns the bytes the service serves for a
+    CID, reading at most ``max_bytes`` and raising
+    ``ContentRetrievalLimitError`` past it; the adapter checks them exactly as
+    it checks its own node's. ``provider_name`` names the service in logs.
+    """
+
+    provider_name: str
 
     def fetch(self, cid: str, *, max_bytes: Optional[int]) -> bytes: ...
 
@@ -530,7 +542,7 @@ class FilecoinAdapter:
                      *,
                      envelope_owner: Optional[str] = None,
                      upload_name: Optional[str] = None,
-                     remote_ipfs: Optional[RemoteIpfsService] = None) -> StorageResult:
+                     remote_ipfs: Optional[RemoteIpfsPublisher] = None) -> StorageResult:
         """
         Store content in decentralized storage based on tier.
 
@@ -685,7 +697,7 @@ class FilecoinAdapter:
                          envelope_owner: Optional[str] = None,
                          envelope_key_hash: Optional[str] = None,
                          cache_name: Optional[str] = None,
-                         remote_ipfs: Optional[RemoteIpfsService] = None) -> bytes:
+                         remote_ipfs: Optional[RemoteIpfsReader] = None) -> bytes:
         """
         Retrieve content from storage (cache first, then IPFS).
 
@@ -736,12 +748,13 @@ class FilecoinAdapter:
                 begins with, from the cache or IPFS. Requires
                 ``allow_local_cache``.
             remote_ipfs: Where ``ipfs_cid`` is read when this adapter's IPFS
-                node does not answer for it: the service the IPFS tier was
-                published to when that node was unreachable (#2874). Read
-                under the same byte ceiling, and its bytes are decompressed,
-                opened and checked exactly as the node's are. An
-                ``ipfs_cid`` that is a SHA-256 content hash is never sent to
-                it.
+                node does not answer for it: a service that serves the IPFS
+                tier by CID, such as the public gateway of the one it was
+                published to when that node was unreachable (#2874, #3601).
+                Read under the same byte ceiling, and its bytes are
+                decompressed, opened and checked exactly as the node's are.
+                An ``ipfs_cid`` that is a SHA-256 content hash is never sent
+                to it.
 
         Content fetched from IPFS is cached again under the name
         ``store_content`` gives it, not the name it was requested by, when
