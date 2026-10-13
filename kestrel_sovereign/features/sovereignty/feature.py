@@ -366,9 +366,14 @@ class SovereigntyFeature(Feature):
 
         # Store via adapter. The upload is named for this agent, so the
         # Lighthouse health check and retention attribute it to this agent
-        # alone (#2874); IPFS ignores the name, so the CID is unchanged.
+        # alone (#2874); IPFS ignores the name, so the CID is unchanged. The
+        # name is unique to this publication: Lighthouse answers with the CID
+        # alone, and thinning finds the record it made by this name (#3602).
         adapter = FilecoinAdapter()
         remote_ipfs = self._lighthouse_ipfs() if tier_enum == StorageTier.IPFS else None
+        upload_name = sovereignty_export_upload_name(
+            self.agent.agent_id, datetime.now(timezone.utc)
+        )
         store = functools.partial(
             adapter.store_content,
             backup_blob,
@@ -377,9 +382,7 @@ class SovereigntyFeature(Feature):
             metadata={"agent": self.agent.agent_id},
             on_progress=progress,
             envelope_owner=self.agent.agent_id if encrypt else None,
-            upload_name=sovereignty_export_upload_name(
-                self.agent.agent_id, datetime.now(timezone.utc)
-            ),
+            upload_name=upload_name,
             remote_ipfs=remote_ipfs,
         )
         # ``privacy_transition()`` takes the persistence gate exclusive, so
@@ -469,7 +472,7 @@ class SovereigntyFeature(Feature):
             # Published through the agent's Lighthouse provider: that
             # provider thins the agent's older exports on the same account.
             data["export_retention"] = await self._thin_lighthouse_exports(
-                remote_ipfs.provider, keep_cid=result.ipfs_cid
+                remote_ipfs.provider, cid=result.ipfs_cid, upload_name=upload_name
             )
 
         # Honesty: a non-local request that ended up local (or that
@@ -539,48 +542,54 @@ class SovereigntyFeature(Feature):
             return None
         return _LighthouseGatewayIpfs(loop=asyncio.get_running_loop())
 
-    async def _thin_lighthouse_exports(self, provider, *, keep_cid: str) -> dict:
+    async def _thin_lighthouse_exports(
+        self, provider, *, cid: str, upload_name: str
+    ) -> dict:
         """Thin this agent's older exports on the account ``provider`` just
-        published ``keep_cid`` to, by the backup retention policy (#2874).
+        published ``cid`` to, as ``upload_name``, by the backup retention
+        policy (#2874).
 
         The provider that published the export does it, so the account is
         the one the agent's PayerPolicy resolved, whichever key the host
         environment or the snapshot target holds. Only uploads that attribute
-        to this agent are considered. The export has landed whatever happens
-        here: a failure leaves the remaining exports in place and is
+        to this agent are considered, each by its own upload record: an older
+        record of the same CID is thinned like any other, and the record just
+        published, the one named ``upload_name``, is kept (#3602). When the
+        account does not list that name as one record of ``cid``, nothing is
+        thinned and the refusal is reported. The export has landed whatever
+        happens here: a failure leaves the remaining exports in place and is
         reported, not raised.
         """
-        deleted: list[str] = []
-        skipped_missing_id = 0
+        deleted_cids: list[str] = []
+        deleted_ids: list[str] = []
         try:
             uploads = await provider.list_uploads()
             deletions = sovereignty_export_deletions(
                 uploads,
                 self.agent.agent_id,
                 load_retention_policy(),
-                keep_cids={keep_cid},
+                published_cid=cid,
+                published_name=upload_name,
             )
             for upload in deletions:
-                file_id = upload.get("id")
-                if not file_id:
-                    skipped_missing_id += 1
-                    continue
-                await provider.delete_upload(str(file_id))
-                deleted.append(str(upload.get("cid") or file_id))
+                file_id = str(upload["id"])
+                await provider.delete_upload(file_id)
+                deleted_ids.append(file_id)
+                deleted_cids.append(str(upload.get("cid") or file_id))
         except (httpx.HTTPError, OSError, ValueError, KeyUnreadableError) as exc:
             logger.warning(
                 "Thinning older sovereignty exports on Lighthouse failed: %s", exc
             )
             return {
-                "deleted": len(deleted),
-                "cids": deleted,
-                "skipped_missing_id": skipped_missing_id,
+                "deleted": len(deleted_ids),
+                "cids": deleted_cids,
+                "file_ids": deleted_ids,
                 "error": str(exc),
             }
         return {
-            "deleted": len(deleted),
-            "cids": deleted,
-            "skipped_missing_id": skipped_missing_id,
+            "deleted": len(deleted_ids),
+            "cids": deleted_cids,
+            "file_ids": deleted_ids,
         }
 
     async def _store_and_record(self, store, backup_blob: bytes, audit_anchors):

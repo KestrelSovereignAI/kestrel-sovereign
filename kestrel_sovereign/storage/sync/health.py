@@ -268,6 +268,75 @@ def _latest_lighthouse_manifest(
     return max(candidates, key=_upload_order_key)
 
 
+async def _snapshot_health(
+    client: Any,
+    uploads: list[Mapping[str, Any]],
+    *,
+    agent_id: str,
+    current_time: datetime,
+    grace_period: timedelta,
+) -> tuple[
+    Optional[Mapping[str, Any]], Optional[Mapping[str, Any]], Optional[dict[str, Any]]
+]:
+    """The agent's latest state snapshot on ``client``'s account: its upload
+    record, the manifest it was resolved through (if any), and its deals.
+    All three are ``None`` without one."""
+    manifest = None
+    latest = _latest_lighthouse_snapshot(uploads, agent_id)
+    if latest is None:
+        latest_manifest = _latest_lighthouse_manifest(uploads, agent_id)
+        manifest_cid = _upload_cid(latest_manifest) if latest_manifest else None
+        if manifest_cid:
+            manifest_bytes = await client.download(manifest_cid)
+            manifest = json.loads(manifest_bytes)
+            latest = latest_manifest
+    if latest is None:
+        return None, None, None
+    cid = str(manifest.get("snapshot_cid")) if manifest else _upload_cid(latest)
+    uploaded_at = (
+        _parse_upload_time(manifest.get("uploaded_at")) if manifest else None
+    ) or _parse_upload_time(latest.get("createdAt"))
+    snapshot = await _deal_details(
+        client,
+        cid=cid,
+        uploaded_at=uploaded_at,
+        current_time=current_time,
+        grace_period=grace_period,
+    )
+    return latest, manifest, snapshot
+
+
+async def _sovereignty_export_health(
+    client: Any,
+    uploads: list[Mapping[str, Any]],
+    *,
+    agent_id: str,
+    current_time: datetime,
+    grace_period: timedelta,
+) -> Optional[dict[str, Any]]:
+    """The agent's latest sovereignty export on ``client``'s account and its
+    deals, or ``None`` without one."""
+    export = _latest_sovereignty_export(uploads, agent_id)
+    if export is None:
+        return None
+    export_details = await _deal_details(
+        client,
+        cid=_upload_cid(export),
+        uploaded_at=_upload_time(export),
+        current_time=current_time,
+        grace_period=grace_period,
+    )
+    export_details.update(
+        {
+            # The one agent the export's record names (#2874).
+            "agent_id": agent_id,
+            "file_name": export.get("fileName"),
+            "tag": export.get("tag"),
+        }
+    )
+    return export_details
+
+
 async def check_lighthouse_health(
     *,
     snapshot_api_key: Optional[str],
@@ -294,6 +363,12 @@ async def check_lighthouse_health(
     snapshot it is the upload the check reports; with both, the status is the
     worse of the two. ``export_key_error`` is why the export key could not be
     resolved: the status is then ``error``, whatever the snapshot shows.
+
+    Each account is read on its own. A failure reading one, listing its
+    uploads, a manifest or a deal status, is that account's error, under
+    ``details["snapshot_error"]`` or ``details["sovereignty_export_error"]``,
+    and the status is ``error``; what the other account shows is still
+    reported beside it (#3602).
     """
     if not snapshot_api_key and not export_api_key and export_key_error is None:
         return TargetHealth(
@@ -314,75 +389,61 @@ async def check_lighthouse_health(
     current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     clients: dict[str, Any] = {}
     listings: dict[str, list[Mapping[str, Any]]] = {}
+    listing_errors: dict[str, Exception] = {}
 
     async def account(api_key: str) -> tuple[Any, list[Mapping[str, Any]]]:
-        """The client for ``api_key``'s account and every upload in it."""
+        """The client for ``api_key``'s account and every upload in it.
+
+        An account is listed once, whether the listing succeeds or fails.
+        """
         if api_key not in clients:
             clients[api_key] = client_factory(api_key=api_key)
+        if api_key in listing_errors:
+            raise listing_errors[api_key]
         if api_key not in listings:
-            # Every page: the latest upload need not be on the first (#2874).
-            listings[api_key] = await list_all_uploads(clients[api_key])
+            try:
+                # Every page: the latest upload need not be on the first (#2874).
+                listings[api_key] = await list_all_uploads(clients[api_key])
+            except Exception as exc:
+                listing_errors[api_key] = exc
+                raise
         return clients[api_key], listings[api_key]
 
     latest = manifest = snapshot = None
-    export = export_details = None
+    export_details = None
+    # Each account's failure is its own, never the other account's: an export
+    # account that answers is reported whatever the snapshot account does,
+    # and the reverse (#3602).
+    snapshot_error: Optional[str] = None
+    export_errors = [export_key_error] if export_key_error is not None else []
     try:
         if snapshot_api_key:
-            client, uploads = await account(snapshot_api_key)
-            latest = _latest_lighthouse_snapshot(uploads, agent_id)
-            if latest is None:
-                latest_manifest = _latest_lighthouse_manifest(uploads, agent_id)
-                manifest_cid = (
-                    _upload_cid(latest_manifest) if latest_manifest else None
-                )
-                if manifest_cid:
-                    manifest_bytes = await client.download(manifest_cid)
-                    manifest = json.loads(manifest_bytes)
-                    latest = latest_manifest
-            if latest is not None:
-                cid = (
-                    str(manifest.get("snapshot_cid"))
-                    if manifest
-                    else _upload_cid(latest)
-                )
-                uploaded_at = (
-                    _parse_upload_time(manifest.get("uploaded_at")) if manifest else None
-                ) or _parse_upload_time(latest.get("createdAt"))
-                snapshot = await _deal_details(
+            try:
+                client, uploads = await account(snapshot_api_key)
+                latest, manifest, snapshot = await _snapshot_health(
                     client,
-                    cid=cid,
-                    uploaded_at=uploaded_at,
+                    uploads,
+                    agent_id=agent_id,
                     current_time=current_time,
                     grace_period=grace_period,
                 )
+            except Exception as exc:
+                snapshot_error = f"Lighthouse snapshot check failed: {exc}"
 
         if export_api_key:
-            client, uploads = await account(export_api_key)
-            export = _latest_sovereignty_export(uploads, agent_id)
-            if export is not None:
-                export_details = await _deal_details(
+            try:
+                client, uploads = await account(export_api_key)
+                export_details = await _sovereignty_export_health(
                     client,
-                    cid=_upload_cid(export),
-                    uploaded_at=_upload_time(export),
+                    uploads,
+                    agent_id=agent_id,
                     current_time=current_time,
                     grace_period=grace_period,
                 )
-                export_details.update(
-                    {
-                        # The one agent the export's record names (#2874).
-                        "agent_id": agent_id,
-                        "file_name": export.get("fileName"),
-                        "tag": export.get("tag"),
-                    }
+            except Exception as exc:
+                export_errors.append(
+                    f"Lighthouse sovereignty export check failed: {exc}"
                 )
-    except Exception as exc:
-        return TargetHealth(
-            name="lighthouse",
-            label=TIER_LABELS[TrustTier.DELEGATED],
-            configured=True,
-            status="error",
-            message=f"Lighthouse health check failed: {exc}",
-        )
     finally:
         for client in clients.values():
             close = getattr(client, "close", None)
@@ -433,11 +494,17 @@ async def check_lighthouse_health(
         status = "unavailable"
         message = "No Lighthouse snapshot or sovereignty export upload found"
 
-    if export_key_error is not None:
-        # The account the agent's exports go to cannot be read: an error,
-        # whatever the snapshot account shows.
+    export_error = "; ".join(export_errors) or None
+    details["snapshot_error"] = snapshot_error
+    details["sovereignty_export_error"] = export_error
+    errors = [error for error in (snapshot_error, export_error) if error is not None]
+    if errors:
+        # An account that cannot be read is an error, whatever the other
+        # shows; what the other shows is still reported beside it.
         status = "error"
-        message = export_key_error + ("; " + message if snapshot is not None else "")
+        if snapshot is not None or export_details is not None:
+            errors.append(message)
+        message = "; ".join(errors)
     return TargetHealth(
         name="lighthouse",
         label=TIER_LABELS[TrustTier.DELEGATED],

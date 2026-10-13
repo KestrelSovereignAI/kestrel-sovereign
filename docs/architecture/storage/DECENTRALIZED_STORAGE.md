@@ -150,9 +150,11 @@ legacy agent manifest (`manifest_<did>.json`); filename-only flat database
 heuristics are intentionally not used for restore.
 
 Sovereignty exports (`export_sovereignty`) are named for their agent too:
-`kestrel_sovereignty__<agent_id>__<YYYYMMDD_HHMMSS>.bin`, tagged
+`kestrel_sovereignty__<agent_id>__<YYYYMMDD_HHMMSS>__<nonce>.bin`, tagged
 `kestrel-sovereignty-<agent_id>`. The agent id is percent-encoded (a DID is
-unchanged by it). An `ipfs`-tier export goes to the IPFS node at
+unchanged by it). The nonce is 16 random hex digits, so no two publications
+share a name; exports published before it was added carry none and are
+attributed the same way. An `ipfs`-tier export goes to the IPFS node at
 `IPFS_API_URL` when it is reachable. When it is not, it goes to the agent's
 Lighthouse provider, which exists only when remote-tier policy and
 PayerPolicy permitted one at boot. With neither, the export stays local and
@@ -189,7 +191,13 @@ keep falling back on any storage failure.
 - After each export it publishes, the provider thins the agent's older
   exports on that account, among themselves, with identity retention. Only
   uploads whose name and tag attribute to the agent are considered; another
-  agent's are never touched.
+  agent's are never touched. Each upload record is decided on by its own id,
+  not its CID: an earlier upload of identical content is a separate record
+  holding quota, and is thinned like any other. Lighthouse answers an upload
+  with its CID alone, not the id of the record it made, so the record just
+  published is the one carrying its unique upload name, and it is kept. When
+  the account lists that name as more than one record, or under another CID,
+  the pass deletes nothing and reports why.
 - State snapshots are not on that account. The snapshot target boot
   registers uploads with the host's `LIGHTHOUSE_API_KEY`, and the retention
   prune after each snapshot runs there too. That is the one account
@@ -207,7 +215,10 @@ keep falling back on any storage failure.
   read every page of an account's uploads, and count deals in either shape
   `deal_status` answers with (a list of deals, or the list wrapped as
   `{"data": [...]}`). With no state snapshot, the export is the upload the
-  check reports; with both, the status is the worse of the two.
+  check reports; with both, the status is the worse of the two. Each account
+  is read on its own: when one cannot be read (its listing, a manifest or a
+  deal status fails), the status is `error` and that account's failure is
+  reported, beside what the other account holds.
 - `scripts/backup_cleanup.py` attributes exports by the same rule and never
   deletes an upload that is, or may be, an export: attributed exports, names
   and tags in the export family that attribute to no one agent, and legacy
