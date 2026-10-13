@@ -11,11 +11,11 @@ import pytest
 import logging
 import os
 import base64
-from typing import List, Dict, Any
 
 from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter, create_vertex_adapter, VertexAIConfig
 from kestrel_sovereign.llm.gemini_contents import to_gemini_contents
-from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+from kestrel_sovereign.llm.generation_gate import judge_generation
+from kestrel_sovereign.llm.output_ceiling import OutputCapReachedError, response_stop_reason
 
 logger = logging.getLogger(__name__)
 
@@ -404,7 +404,16 @@ class TestGeneration:
 
     @pytest.mark.asyncio
     async def test_generation_with_max_tokens(self, adapter):
-        """Test generation with max_tokens parameter."""
+        """A max_tokens budget reaches Gemini, and a reply it cuts says so (#3621).
+
+        Gemini 2.5 thinks by default and counts its thinking against
+        ``max_output_tokens``, so a 50-token budget can go entirely to
+        thinking: the reply then has no text, only ``finishReason:
+        MAX_TOKENS``. Whether any text survives varies from call to call.
+        Either way the reply must be reported as cut at the budget, never as
+        a finished answer.
+        """
+        budget = 50
         messages = adapter.create_messages(
             user_prompt="Tell me a very long story about a dragon."
         )
@@ -413,12 +422,25 @@ class TestGeneration:
             client=None,
             model=LIVE_MODEL,
             messages=messages,
-            max_tokens=50
+            max_tokens=budget
         )
 
-        assert response.content is not None
-        # Response should be truncated
-        logger.info(f"Truncated response ({len(response.content)} chars): {response.content}")
+        # The budget was applied: a very long story cannot finish within it,
+        # and the text and the thinking together stayed inside it.
+        assert response_stop_reason(response) == "MAX_TOKENS"
+        usage = response.raw.usage_metadata
+        generated = (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)
+        assert 0 < generated <= budget
+        # Text, or none at all when thinking took the whole budget; never an
+        # empty string standing in for an answer.
+        assert response.content is None or response.content != ""
+        # The cut is reported: the generation gate never takes it as an answer.
+        verdict = judge_generation(response, provider="Vertex AI", model=LIVE_MODEL)
+        assert isinstance(verdict, OutputCapReachedError)
+        logger.info(
+            "Cut at %d tokens (%s thinking): %r",
+            generated, usage.thoughts_token_count, response.content,
+        )
 
     @pytest.mark.asyncio
     async def test_generation_different_models(self, adapter):
