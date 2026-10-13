@@ -49,7 +49,6 @@ async def test_reanchor_inspection_preserves_original_native_control(
         original_read = reanchor._read_agent_anchor
         original_bootstrap = reanchor._initial_anchor_custody_pending
         original_errors, entered = [], []
-        scope = None
 
         async def deny_native(operation, target):
             entered.append(target.backend)
