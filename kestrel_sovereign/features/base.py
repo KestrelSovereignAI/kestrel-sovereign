@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -1540,20 +1541,23 @@ class Feature(_SdkFeature):
             # with a hand-built OpenAI-style list would bypass that
             # translation and break Gemini/Vertex routes — codex
             # round 3 P2 on #1461 follow-up.
-            tool_executor = (
-                self._make_feature_inline_tool_executor(
-                    parts_sink=subagent_parts, runtime_tools=available_tools
-                )
-                if feature_tools else None
-            )
             # The subagent reasons on behalf of the turn that dispatched it, so
             # every LLM call it makes — this one AND the continuation/repair
             # turns the tool loop drives — joins that turn's session band
-            # (#2940). Resolved once here: ``_turn_session_id`` answers from the
+            # (#2940), and so does every tool hook it fires, on both doors
+            # (#3612). Resolved once here: ``_turn_session_id`` answers from the
             # turn lifecycle, and a multi-step subagent can outlive the turn
             # binding, so re-resolving deeper in the loop would let a long run
             # start stamping None halfway through and split the band anyway.
             turn_session_id = self._turn_session_id()
+            tool_executor = (
+                self._make_feature_inline_tool_executor(
+                    parts_sink=subagent_parts,
+                    runtime_tools=available_tools,
+                    session_id=turn_session_id,
+                )
+                if feature_tools else None
+            )
             response = await self.agent.llm_service.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
@@ -1616,17 +1620,23 @@ class Feature(_SdkFeature):
         self,
         parts_sink: Optional[List[dict]] = None,
         runtime_tools: Optional[List[Any]] = None,
+        session_id: Optional[str] = None,
     ):
         """Build an inline ``(name, args) -> result_dict`` async callable
         bound to this invocation's runtime tool palette, gated by the same
-        ``PRE_TOOL_USE`` hooks the non-inline ``_handle_feature_tool_calls``
-        path enforces.
+        ``PRE_TOOL_USE`` / ``POST_TOOL_USE`` hooks the non-inline
+        ``_handle_feature_tool_calls`` path enforces.
 
         ``runtime_tools`` is the same list the non-inline loop executes
         against. Both paths must resolve a name identically: this one was
         rebuilding the map from an unfiltered ``self.get_tools()``, so the
         two doors to the same tool palette disagreed about which tools
         security had denied.
+
+        ``session_id`` is the dispatching turn's session, resolved once by
+        ``execute_as_subagent`` and handed to the tool hooks (#3612) — the
+        same value the non-inline loop passes, so both doors file a tool
+        call under the same turn.
 
         ``parts_sink`` (#2641) is the subagent-local typed-parts buffer:
         threaded into ``_execute_subagent_tool`` so parts emitted by inline
@@ -1686,6 +1696,7 @@ class Feature(_SdkFeature):
                     },
                     return_with_effective_args=True,
                     parts_sink=parts_sink,
+                    session_id=session_id,
                 )
         return _exec
 
@@ -1697,13 +1708,26 @@ class Feature(_SdkFeature):
         tools_by_name: Dict[str, Any],
         return_with_effective_args: bool = False,
         parts_sink: Optional[List[dict]] = None,
+        session_id: Optional[str] = None,
     ) -> Any:
-        """Execute one of this feature's tools with PRE_TOOL_USE hook
-        enforcement. Shared between the inline-executor path (used by
-        codex app-server) and the post-LLM tool loop in
+        """Execute one of this feature's tools inside the PRE_TOOL_USE /
+        POST_TOOL_USE hook envelope. Shared between the inline-executor
+        path (used by codex app-server) and the post-LLM tool loop in
         ``_handle_feature_tool_calls`` so security policies, approval
         prompts, and argument-redaction hooks apply uniformly
         regardless of which transport ran the tool call.
+
+        The envelope matches the chat path's ``_execute_tool_with_hooks``
+        (#3612): POST_TOOL_USE fires once the tool has RUN — including a
+        run that raised, which is reported as the failure result the model
+        sees — and never for a DENY/ASK, which did not run. Both edges carry
+        ``session_id``, the session of the turn that dispatched this
+        subagent (``""`` for a session-less turn, as ``USER_PROMPT_SUBMIT``
+        stamps it). A hook keyed on the session — the observability hook
+        pairs a start with its completion and closes leftovers at the turn's
+        ``Stop`` — must see the turn the call belongs to. The old constant
+        ``"subagent"`` was no session: nothing ever ended it, and it lumped
+        every subagent call the agent made, across restarts, into one.
 
         ``return_with_effective_args`` controls the return shape:
 
@@ -1759,6 +1783,7 @@ class Feature(_SdkFeature):
             from kestrel_sovereign.agent.parts import bind_part_collector
             sink_scope = bind_part_collector(parts_sink)
 
+        hook_session_id = session_id or ""
         with sink_scope:
             hooks_manager = getattr(self.agent, "hooks_manager", None)
             effective_args = args
@@ -1767,7 +1792,7 @@ class Feature(_SdkFeature):
                     HookEvent, HookInput, PermissionDecision,
                 )
                 hook_input = HookInput(
-                    session_id="subagent",
+                    session_id=hook_session_id,
                     hook_event_name=HookEvent.PRE_TOOL_USE.value,
                     tool_name=tool_name,
                     tool_input=args,
@@ -1835,6 +1860,7 @@ class Feature(_SdkFeature):
                 # ``updated_input`` override) — see the comment block
                 # before the DENY/ASK branch.
 
+            exec_start = time.time()
             try:
                 result = await selected_tool.execute(**effective_args)
             except Exception as e:
@@ -1842,20 +1868,39 @@ class Feature(_SdkFeature):
                     "[SUBAGENT-TOOL] %s raised %s",
                     tool_name, e,
                 )
-                return _shape(
-                    effective_args,
-                    {"success": False, "error": f"{type(e).__name__}: {e}"},
+                serialized = {"success": False, "error": f"{type(e).__name__}: {e}"}
+            else:
+                serialized = _serialize_tool_result(result)
+                # Harvest envelope-carried parts (``ToolResult.parts`` / a result
+                # dict's ``parts`` field) into the sink too — the explicit,
+                # ContextVar-free half of the #2641 contract. The envelope keeps
+                # its copy; delivery to the outbound stream happens once, at the
+                # orchestrator's dispatch site. Harvested BEFORE POST_TOOL_USE
+                # fires, so a part a POST hook emits lands after the tool's own,
+                # the order the chat path keeps.
+                if parts_sink is not None and isinstance(serialized, dict):
+                    envelope_parts = serialized.get("parts")
+                    if isinstance(envelope_parts, list) and envelope_parts:
+                        parts_sink.extend(envelope_parts)
+            exec_duration_ms = int((time.time() - exec_start) * 1000)
+
+            if hooks_manager is not None:
+                post_hook_input = HookInput(
+                    session_id=hook_session_id,
+                    hook_event_name=HookEvent.POST_TOOL_USE.value,
+                    tool_name=tool_name,
+                    tool_input=effective_args,
+                    feature_name=type(self).__name__,
+                    tool_response=(
+                        serialized
+                        if isinstance(serialized, dict)
+                        else {"result": str(serialized)}
+                    ),
+                    execution_time_ms=exec_duration_ms,
                 )
-            serialized = _serialize_tool_result(result)
-            # Harvest envelope-carried parts (``ToolResult.parts`` / a result
-            # dict's ``parts`` field) into the sink too — the explicit,
-            # ContextVar-free half of the #2641 contract. The envelope keeps its
-            # copy; delivery to the outbound stream happens once, at the
-            # orchestrator's dispatch site.
-            if parts_sink is not None and isinstance(serialized, dict):
-                envelope_parts = serialized.get("parts")
-                if isinstance(envelope_parts, list) and envelope_parts:
-                    parts_sink.extend(envelope_parts)
+                await hooks_manager.execute_hooks_parallel(
+                    HookEvent.POST_TOOL_USE, post_hook_input,
+                )
             return _shape(effective_args, serialized)
 
     def _compose_subagent_runtime_tools(
@@ -2070,7 +2115,8 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                         continuation and repair call this loop makes is part of
                         that same turn, so each stamps it and lands in one
                         Timeline band; a multi-step subagent otherwise split its
-                        turn across a band per step (#2940). Applied as the
+                        turn across a band per step (#2940). The tool hooks
+                        carry it too (#3612). Applied as the
                         invocation identity — NOT the wire ``session_id``, which
                         is a provider continuation key the subagent must not
                         share (:func:`_subagent_turn_identity`).
@@ -2147,7 +2193,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
 
                 # Execute through the shared hook-enforced helper so
                 # this loop AND the inline-executor path apply
-                # identical PRE_TOOL_USE policy. Without this the
+                # identical PRE/POST_TOOL_USE envelopes. Without this the
                 # codex app-server inline path would bypass security
                 # hooks the orchestrator-driven path enforces (codex
                 # round 1 P1 on #1461 follow-up).
@@ -2156,6 +2202,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     args=args,
                     tools_by_name=tools_by_name,
                     parts_sink=parts_sink,
+                    session_id=session_id,
                 )
                 result_str = json.dumps(result) if isinstance(result, dict) else str(result)
                 logger.info(

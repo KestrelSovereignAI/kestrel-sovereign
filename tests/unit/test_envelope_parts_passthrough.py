@@ -340,25 +340,32 @@ async def test_execute_as_subagent_returns_explicit_toolresult_parts():
     ]
 
 
-class _PreHookEmitsPart:
-    """Subagent-side hooks manager whose PRE_TOOL_USE hook emits a part —
-    the ordering probe for #2641 review P1: that part must land on the
-    subagent's sink BEFORE the tool's own parts, in emission order."""
+class _PrePostHooksEmitParts:
+    """Subagent-side hooks manager whose PRE_TOOL_USE and POST_TOOL_USE hooks
+    each emit a part — the ordering probe for #2641 review P1 and #3612: the
+    PRE part must land on the subagent's sink BEFORE the tool's own parts and
+    the POST part AFTER them, in emission order."""
 
     async def execute_hooks(self, event, hook_input):
         if event == HookEvent.PRE_TOOL_USE:
             emit_part("pre_hook_part", {"stage": "pre"})
         return _allow_hook_output()
 
+    async def execute_hooks_parallel(self, event, hook_input):
+        if event == HookEvent.POST_TOOL_USE:
+            emit_part("post_hook_part", {"stage": "post"})
+        return []
+
 
 @pytest.mark.asyncio
-async def test_subagent_pre_hook_parts_precede_tool_body_parts():
+async def test_subagent_hook_parts_bracket_tool_body_parts():
     """#2641 review P1: the parts sink binds BEFORE the PRE_TOOL_USE hooks
     run, so a hook-emitted part keeps its emission-order position (first).
     Binding late let it fall to the ambient turn collector, where the loop's
-    stray-drain re-harvested it AFTER the tool-body parts."""
+    stray-drain re-harvested it AFTER the tool-body parts. POST_TOOL_USE
+    (#3612) fires inside the same binding, so its part lands last."""
     feature = _make_selfie_feature(_ToolCallOnceLLM("generate_selfie"))
-    feature.agent.hooks_manager = _PreHookEmitsPart()
+    feature.agent.hooks_manager = _PrePostHooksEmitParts()
 
     # Simulate the chat-path topology: the parent turn's collector is bound
     # on the dispatching task while the subagent runs.
@@ -368,15 +375,33 @@ async def test_subagent_pre_hook_parts_precede_tool_body_parts():
 
     assert envelope["success"] is True
     assert [p["type"] for p in envelope["parts"]] == [
-        "pre_hook_part", "selfie_pending", "selfie_finished",
+        "pre_hook_part", "selfie_pending", "selfie_finished", "post_hook_part",
     ], (
-        "PRE-hook parts must ride the subagent sink in emission order — "
-        "landing after tool-body parts (or on the parent collector) is the "
-        "#2641 review P1 ordering regression"
+        "hook parts must ride the subagent sink in emission order — a PRE "
+        "part landing after tool-body parts (or on the parent collector) is "
+        "the #2641 review P1 ordering regression"
     )
     # Nothing bled onto the parent turn's collector: the envelope is the
     # single delivery channel for the whole gated call.
     assert leaked == []
+
+
+@pytest.mark.asyncio
+async def test_subagent_post_hook_part_follows_harvested_envelope_parts():
+    """#3612: a tool's EXPLICIT ``ToolResult.parts`` reach the sink by harvest
+    from the returned envelope, not through ``emit_part``. The harvest must
+    run before POST_TOOL_USE fires, or a POST-hook part jumps ahead of the
+    tool's own — the order the chat path keeps by re-emitting envelope parts
+    before its POST hooks."""
+    feature = _make_selfie_feature(_ToolCallOnceLLM("explicit_parts_selfie"))
+    feature.agent.hooks_manager = _PrePostHooksEmitParts()
+
+    envelope = await feature.execute_as_subagent(task="take a selfie")
+
+    assert envelope["success"] is True
+    assert [p["type"] for p in envelope["parts"]] == [
+        "pre_hook_part", "selfie_finished", "post_hook_part",
+    ]
 
 
 @pytest.mark.asyncio
@@ -642,12 +667,13 @@ class _SharedPrePartHooks:
     """Production-shaped hooks manager: ONE instance serves both the
     orchestrator's outer PRE_TOOL_USE gate and the subagent's inner gate
     (``feature.agent`` IS the orchestrator agent). Emits a part on every PRE
-    edge, labeled by which gate fired it — the subagent gate always passes
-    ``session_id="subagent"``."""
+    edge, labeled by which gate fired it — the inner gate is the one for the
+    feature's own tool. (Not the session: both gates carry the dispatching
+    turn's session, #3612.)"""
 
     async def execute_hooks(self, event, hook_input):
         if event == HookEvent.PRE_TOOL_USE:
-            gate = "inner" if hook_input.session_id == "subagent" else "outer"
+            gate = "inner" if hook_input.tool_name == "generate_selfie" else "outer"
             emit_part(f"pre_part_{gate}", {"session": hook_input.session_id})
         return _allow_hook_output()
 
