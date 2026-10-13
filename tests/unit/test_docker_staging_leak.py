@@ -336,13 +336,10 @@ async def test_the_feature_passes_its_configured_maximum_to_the_executor(
     record-less directory two hours old may still be a live run."""
     from unittest.mock import MagicMock
 
-    from kestrel_sovereign.features.compute import destructive_policy, trash_manager
     from kestrel_sovereign.features.compute.feature import ComputeFeature
 
     monkeypatch.setenv("KESTREL_COMPUTE_MAX_TIMEOUT", "86400")
-    # DEFAULT_TRASH_DIR is frozen at import (#3104); the env var alone is inert.
-    monkeypatch.setattr(destructive_policy, "DEFAULT_TRASH_DIR", tmp_path / "trash")
-    monkeypatch.setattr(trash_manager, "DEFAULT_TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setenv("KESTREL_TRASH_DIR", str(tmp_path / "trash"))
     monkeypatch.setattr(ComputeFeature, "_docker_available", lambda self: True)
     agent = MagicMock()
     agent.storage_path = str(tmp_path / "agent.db")
@@ -351,7 +348,7 @@ async def test_the_feature_passes_its_configured_maximum_to_the_executor(
     assert feature.executors["docker"]._legacy_staging_age_seconds == (
         86400 + DockerExecutor.LEGACY_STAGING_GRACE_SECONDS
     )
-    assert (tmp_path / "trash").is_dir(), "the feature used the patched trash root"
+    assert (tmp_path / "trash").is_dir(), "the feature used the configured trash root"
 
 
 def test_an_unreadable_record_counts_as_no_record(tmp_path: Path):

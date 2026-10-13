@@ -10,7 +10,9 @@ This adapter implements the "Convergent Sharding" protocol:
 
 import abc
 import asyncio
+import contextlib
 import enum
+import functools
 import json
 import logging
 import hashlib
@@ -18,7 +20,8 @@ import hmac
 import os
 import warnings
 from typing import (
-    TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Any, Tuple,
+    TYPE_CHECKING, AsyncContextManager, Callable, Dict, Iterable, List,
+    Optional, Any, Tuple,
 )
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, UTC
@@ -31,6 +34,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 # importing FilecoinAdapter eagerly here forms a package-initialization cycle
 # (#2384). FilecoinAdapter is imported lazily inside __init__ instead.
 from kestrel_sovereign.storage.providers.base import StorageTier
+from kestrel_sovereign._async_ownership import run_blocking_operation
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
 from kestrel_sovereign.storage.conversation_created_at import created_at_bind
@@ -472,16 +476,29 @@ class SovereignStorageAdapter:
     # ------------------------------------------------------------------
 
     async def _upload_content(
-        self, content: bytes, storage_tier: StorageTier, metadata: Optional[Dict] = None
+        self,
+        content: bytes,
+        storage_tier: StorageTier,
+        metadata: Optional[Dict] = None,
+        *,
+        store_guard: Optional[Callable[[], AsyncContextManager[None]]] = None,
     ) -> str:
-        """Upload *content* and return its CID (or local fallback)."""
-        result = await asyncio.to_thread(
+        """Upload *content* and return its CID (or local fallback).
+
+        ``store_guard``, when given, is entered around the store and nothing
+        else. The store finishes before a cancellation propagates, so the
+        guard is never exited under a store still in flight.
+        """
+        store = functools.partial(
             self.adapter.store_content,
             content=content,
             storage_tier=storage_tier,
             encrypt=False,
             metadata=metadata,
         )
+        guard = store_guard() if store_guard is not None else contextlib.nullcontext()
+        async with guard:
+            result = await run_blocking_operation(store)
         cid = result.ipfs_cid
         if not cid and result.storage_tier == StorageTier.LOCAL_ONLY:
             cid = f"local-{result.content_hash}"
@@ -521,6 +538,8 @@ class SovereignStorageAdapter:
         agent_did: str,
         storage_tier: StorageTier = StorageTier.IPFS,
         asset_collector: Optional[AssetCollector] = None,
+        *,
+        store_guard: Optional[Callable[[], AsyncContextManager[None]]] = None,
     ) -> str:
         """
         Export agent state as a single CAR v1 archive.
@@ -534,6 +553,11 @@ class SovereignStorageAdapter:
         3. Encrypt keyring → add as raw block
         4. Build dag-cbor manifest → set as CAR root
         5. Upload single CAR blob → return one CID
+
+        ``store_guard`` is entered around step 5's store alone. An agent's
+        export passes its privacy guard here
+        (:func:`kestrel_sovereign.storage.privacy_wrapper.guarded_backup_store`,
+        #2875), so a privacy transition cannot complete inside the store.
         """
         self.logger.info(f"🌲 Starting V3 CAR Export for {agent_did}...")
 
@@ -612,7 +636,9 @@ class SovereignStorageAdapter:
 
         # 5. Upload single CAR blob
         car_bytes = builder.build()
-        root_cid = await self._upload_content(car_bytes, storage_tier)
+        root_cid = await self._upload_content(
+            car_bytes, storage_tier, store_guard=store_guard
+        )
 
         self.logger.info(
             f"✅ V3 CAR Export Complete. {builder.block_count} blocks, "

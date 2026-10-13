@@ -94,6 +94,8 @@ ISOLATED_LAYOUT: dict[str, Optional[str]] = {
     paths.CACHE_DIR_ENV: "storage-cache",
     paths.TRASH_DIR_ENV: "trash",
     paths.SERVE_STATE_DIR_ENV: "serve-state",
+    # Default: ``~/.kestrel/discovered_context_limits.json``.
+    paths.CONTEXT_LIMITS_CACHE_FILE_ENV: "discovered_context_limits.json",
     paths.PROJECT_ROOT_ENV: None,
     # A registry nothing creates: unset, the host loads a cwd-relative
     # ``multi_agent.toml``, which in the operator's checkout names the
@@ -196,9 +198,10 @@ def install_session_guard() -> Optional[Path]:
     """Allow only temporary roots and pin a session root, before any import.
 
     Called from the top of ``tests/conftest.py``, so it runs before any package
-    module is imported: a path frozen at import (``DEFAULT_TRASH_DIR``,
-    ``cli_serve.STATE_DIR``) or resolved by a session fixture lands in the
-    session root, and a guarded resolver never meets the operator's. pytest's
+    module is imported: a path frozen at import (``config.TRUSTED_AGENTS_DIR``,
+    ``endpoints.sovereignty.STORAGE_CACHE_DIR``) or resolved by a session
+    fixture lands in the session root, and a guarded resolver never meets the
+    operator's. pytest's
     ``--basetemp`` is added in ``pytest_configure``, once options are parsed.
 
     A child session (an xdist worker, a nested pytest) inherits the parent's

@@ -28,13 +28,6 @@ def _unified_config_path() -> Path:
     return project_dir() / "kestrel.toml"
 
 
-# Backwards-compat alias for callers and tests that imported the old
-# module-level constant. ``_unified_config_path()`` is preferred — the
-# constant is frozen at import time and won't see late ``KESTREL_HOME``
-# changes.
-UNIFIED_CONFIG_PATH = _unified_config_path()
-
-
 @dataclass
 class PromptAdaptation:
     """Prompt adaptation strategy for a constitutional profile."""

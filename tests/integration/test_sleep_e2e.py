@@ -137,23 +137,22 @@ class TestSleepMixin:
         print(str(report))
 
     @pytest.mark.asyncio
-    async def test_ephemeral_agent_sleep_succeeds(self, ephemeral_agent):
-        """Test that EPHEMERAL mode agents can sleep (they just have nothing to export).
+    async def test_ephemeral_agent_sleep_refuses_its_export(self, ephemeral_agent):
+        """An EPHEMERAL agent's sleep exports nothing (#2875).
 
-        Privacy mode is message-level, not agent-level. EPHEMERAL messages aren't
-        stored at all. Sleep doesn't need to be blocked - it just exports whatever
-        IS stored (which for a pure ephemeral session is nothing).
+        EPHEMERAL does not permit backups. The sleep export reads the database
+        beneath the privacy wrapper, so it checks that policy itself, as the
+        ``export_sovereignty`` tool does, rather than exporting whatever is
+        stored. Consolidation is skipped too, so the cycle does not succeed.
         """
         agent = ephemeral_agent
 
         report = await agent.sleep(tier="local")
 
-        # Sleep should succeed - it exports whatever is stored
-        # For an ephemeral agent with no stored messages, that's essentially empty
-        assert report.success, f"Sleep should succeed: {report.error}"
-        print(f"✅ EPHEMERAL agent sleep succeeded (exports whatever is stored)")
-        print(f"   Messages archived: {report.messages_archived}")
-        print(f"   Shards exported: {report.shards_exported}")
+        assert not report.success
+        assert report.cid is None
+        assert report.failure_code == "export_failed"
+        assert "does not permit backups" in (report.error or "")
 
     @pytest.mark.asyncio
     async def test_sleep_callback(self, agent_with_storage):

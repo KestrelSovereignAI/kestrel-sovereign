@@ -37,7 +37,6 @@ from tests.shared.pytest_cleanup_plugin import (
 )
 from tests.shared.resource_registry import registry
 from kestrel_sovereign import paths
-from kestrel_sovereign.agent import token_counter
 from tests.shared.host_runtime_isolation import (
     ISOLATION_DIRNAME,
     OWNS_HOST_PATHS_MARKER,
@@ -365,19 +364,6 @@ def _isolate_host_runtime_paths(request, tmp_path_factory, monkeypatch):
 
     root = tmp_path_factory.mktemp(ISOLATION_DIRNAME)
     isolate_host_runtime_paths(root, monkeypatch)
-    # ``token_counter`` freezes its cache path at import time, so no variable
-    # above can move it: without this, every test reads (and a discovery run
-    # rewrites) the operator's real ``~/.kestrel/discovered_context_limits.json``.
-    # Reset the one-time read too, so the redirect is what the next lookup sees.
-    #
-    # This is a point fix for the one import-time constant the suite was
-    # observed to write, NOT a general solution: more are frozen the same way
-    # and are deliberately left alone here (see ``tests/unit/conftest.py`` and
-    # #3104). Do not grow this into a patch list.
-    monkeypatch.setattr(
-        token_counter, "CACHE_FILE", root / "discovered_context_limits.json"
-    )
-    monkeypatch.setattr(token_counter, "_cached_limits", None)
     try:
         yield root
     finally:

@@ -116,10 +116,30 @@ Storage tiers should be read as layered backups, not equivalent sovereignty:
 Examples:
 
 ```bash
+kestrel storage health --agent Emma
+kestrel storage health --agent Emma --lighthouse-grace-hours 48
+kestrel storage health --agent Emma --json
 kestrel storage health --agent-id did:example:agent
-kestrel storage health --agent-id did:example:agent --lighthouse-grace-hours 48
-kestrel storage health --agent-id did:example:agent --json
 ```
+
+The Lighthouse check reads each upload on the account it went to, and every
+tier is read in the environment `kestrel start` gives the agent: the project
+`.env` over an exported value. The agent's state snapshots are on the host's
+`LIGHTHOUSE_API_KEY` account, so a shell exporting another key than the
+`.env` does not move the check to an account the agent never uploads to. Its
+sovereignty exports are on the account it publishes them to, whose key comes
+from the agent's PayerPolicy, resolved the way boot resolves it
+(`resolve_lighthouse_storage` in
+`kestrel_sovereign/storage/providers/lighthouse_provider.py`), in that
+environment with the agent's data directory as `KESTREL_DB_PATH` and its own
+data key. `--agent` names a local agent in `multi_agent.toml`, and
+`--agent-id` alone names the local agent with that DID: its database supplies
+its DID and any key it holds itself (`!add-key`, a `SELF_WALLET` mint). When
+no local agent has the DID there is no agent database, so only a host-level
+key resolves, and the command says so. Both databases are opened read-only,
+and nothing is minted. A credential that cannot be resolved (a `SELF_WALLET`
+key the agent has not minted yet, say) is reported as the Lighthouse tier's
+error while the other tiers are still checked.
 
 Lighthouse upload names are agent scoped for restore safety and retention:
 state snapshots use `kestrel_state__<agent_id>__<YYYYMMDD_HHMMSS>.car`, and
@@ -128,6 +148,98 @@ Pre-cutover flat uploads such as `export.car` or `kestrel_prime.db` are not
 renamed and are attributed during cleanup only through the local manifest or
 legacy agent manifest (`manifest_<did>.json`); filename-only flat database
 heuristics are intentionally not used for restore.
+
+Sovereignty exports (`export_sovereignty`) are named for their agent too:
+`kestrel_sovereignty__<agent_id>__<YYYYMMDD_HHMMSS>__<nonce>.bin`, tagged
+`kestrel-sovereignty-<agent_id>`. The agent id is percent-encoded (a DID is
+unchanged by it). The nonce is 16 random hex digits, so no two publications
+share a name; exports published before it was added carry none and are
+attributed the same way. An `ipfs`-tier export goes to the IPFS node at
+`IPFS_API_URL` when it is reachable. When it is not, it goes to the agent's
+Lighthouse provider, which exists only when remote-tier policy and
+PayerPolicy permitted one at boot. With neither, the export stays local and
+reports the downgrade. The name and tag carry the agent id and a time, never
+content; the payload is the export's sealed envelope. The family is distinct
+from `kestrel_state__`/`kestrel_manifest__` on purpose: cold-start restore
+reads its database from those, and an export is an encrypted archive.
+
+Everything that reads an agent's sovereignty exports on its account (the
+health checks) or prunes them uses the credential that publishes them: the
+key the agent's PayerPolicy resolves (an agent-scoped key in its encrypted
+key storage, a `SELF_WALLET` key, or the host key). Boot builds the agent's
+Lighthouse provider from that one resolution, and nothing else reads a key of
+its own for them. Restoring an export needs no key at all: an import fetches
+it by CID from the public gateway (see below). The provider
+asks the resolution for the key before each call and never falls back to the
+key it last had: once none resolves (the agent's own key removed, with no
+host key to stand in), it has no key, so an export stays local and says so,
+and both health checks report no export credential. A resolution that fails
+is raised, not papered over with the old key.
+
+Only a key the agent does not hold falls back to the host's
+`LIGHTHOUSE_API_KEY`. A key it holds but cannot read (a damaged row, an
+active row with no ciphertext, or a `KESTREL_DATA_KEY` other than the one it
+was stored under) is an error, never
+a reason to use the host's account: every Lighthouse path asks
+`KeyResolutionService.resolve_key(..., strict_storage=True)`, which raises
+`KeyUnreadableError` instead of falling back. The export is then refused with
+nothing stored, recorded or charged; its thinning prunes nothing; and both
+health checks report the error. When boot meets it, boot builds no provider
+and `!check-sovereignty-status` reports why. Other callers of `resolve_key`
+keep falling back on any storage failure.
+
+- After each export it publishes, the provider thins the agent's older
+  exports on that account, among themselves, with identity retention. Only
+  uploads whose name and tag attribute to the agent are considered; another
+  agent's are never touched. Each upload record is decided on by its own id,
+  not its CID: an earlier upload of identical content is a separate record
+  holding quota, and is thinned like any other. Lighthouse answers an upload
+  with its CID alone, not the id of the record it made, so the record just
+  published is the one carrying its unique upload name, and it is kept. When
+  the account lists that name as more than one record, or under another CID,
+  the pass deletes nothing and reports why.
+- State snapshots are not on that account. The snapshot target boot
+  registers uploads with the host's `LIGHTHOUSE_API_KEY`, and the retention
+  prune after each snapshot runs there too. That is the one account
+  cold-start restore can read: it runs before the agent's database exists,
+  so before any key the agent holds itself can be read. The target is
+  registered when PayerPolicy permits Lighthouse storage and the host key is
+  set, whichever key the agent's exports use, so a key the agent holds but
+  cannot read stops its exports, not its snapshots. The prune leaves exports
+  alone.
+- `!check-sovereignty-status` and `kestrel storage health` report the agent's
+  latest export on the export account, attributed to the agent, with its
+  Filecoin deal status, whether or not this host still holds the export's
+  receipt. `kestrel storage health` also reports the latest snapshot, from
+  the host account, and lists an account once when both keys name it. Both
+  read every page of an account's uploads, and count deals in either shape
+  `deal_status` answers with (a list of deals, or the list wrapped as
+  `{"data": [...]}`). With no state snapshot, the export is the upload the
+  check reports; with both, the status is the worse of the two. Each account
+  is read on its own: when one cannot be read (its listing, a manifest or a
+  deal status fails), the status is `error` and that account's failure is
+  reported, beside what the other account holds.
+- `scripts/backup_cleanup.py` attributes exports by the same rule and never
+  deletes an upload that is, or may be, an export: attributed exports, names
+  and tags in the export family that attribute to no one agent, and legacy
+  `content.bin` uploads. That holds under `--include-quarantined` and the
+  `--delete-older-than-days` age purge.
+- An export the provider took restores from it. `import_sovereignty` reads the
+  host cache, then the IPFS node, then Lighthouse's public gateway
+  (`LIGHTHOUSE_GATEWAY_URL`), which it fetches the CID from under the same
+  byte ceiling, reading only an unencoded body. The gateway serves any
+  account's upload by CID, so this read uses no key and not the agent's
+  provider: a fresh host holding no Lighthouse key at all, the agent's own
+  lost with its database, still restores the export (#3601). The gateway is
+  read only when the agent's current privacy mode permits a remote storage
+  tier, since the request discloses the CID and the host to Lighthouse. Its
+  bytes are opened and checked exactly as the node's are: the envelope's
+  owner and key, and the content hash. A content hash is never sent to
+  Lighthouse.
+- When Lighthouse cannot take an export either, it is kept on this host and
+  reported as not durable off-host, as when no provider exists.
+- Exports made before the naming restore exactly as before; the name does not
+  change an IPFS CID.
 
 ## Pricing Reality (Mar 2026)
 

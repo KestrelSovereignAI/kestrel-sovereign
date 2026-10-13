@@ -326,6 +326,11 @@ class FoundationPayerResolver:
         for the legacy did:pkh identity, so SELF_WALLET signs with that
         key and stores the resulting Lighthouse API key in
         ServiceKeyStorage under the agent DID.
+
+        The wallet is needed only to mint: an agent that already holds its
+        minted key resolves without it, which is how a reader with no access
+        to the wallet (``kestrel storage health``) reaches the account the
+        agent publishes to (#2874).
         """
         if self._db is None:
             from kestrel_sdk.payer_policy import PayerPolicyError
@@ -336,6 +341,12 @@ class FoundationPayerResolver:
                 "API key would have nowhere to be stored."
             )
         if self._wallet_private_key is None:
+            from kestrel_sovereign.security.service_key_storage import (
+                ServiceKeyStorage,
+            )
+
+            if await ServiceKeyStorage(self._db, agent_did).has_key("lighthouse"):
+                return
             from kestrel_sdk.payer_policy import PayerPolicyError
 
             raise PayerPolicyError(
@@ -796,11 +807,16 @@ def _find_host_db(start: "Path") -> Optional["Path"]:
     return None
 
 
+async def _leave_schema_unchanged(db: Any) -> None:
+    """Schema initializer for a cold read: run no DDL."""
+
+
 async def open_host_db(
     *,
     storage_path: "Path | str | None" = None,
     agent_data_dir: "Path | None" = None,
     project_dir: "Path | None" = None,
+    cold_read: bool = False,
 ) -> Optional["AsyncDatabase"]:
     """Open the deployment-wide host database for HostKeyStorage.
 
@@ -821,6 +837,9 @@ async def open_host_db(
             (e.g. SetupContext.agent_data_root).
         project_dir: Project root; host.db is at ``<project_dir>/agent_data/host.db``.
             Defaults to cwd when none of the above are given.
+        cold_read: Open it read-only, running no DDL and leaving its journal
+            mode alone, for a reader that must not write (``kestrel storage
+            health``, #2874).
     """
     from pathlib import Path
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -847,7 +866,13 @@ async def open_host_db(
         from kestrel_sovereign.services.process_host_database import (
             open_process_host_database,
         )
-        return await open_process_host_database(str(host_db_path))
+        return await open_process_host_database(str(host_db_path), cold_read=cold_read)
+    if cold_read:
+        return await AsyncDatabase.sqlite(
+            str(host_db_path),
+            schema_initializer=_leave_schema_unchanged,
+            cold_read=True,
+        )
     return await AsyncDatabase.sqlite(str(host_db_path))
 
 

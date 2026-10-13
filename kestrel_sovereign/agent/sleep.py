@@ -975,8 +975,9 @@ class SleepMixin:
                 _record_failure_code(report, "semantic_artifact_expiry_sweep_failed")
                 artifact_sweep_succeeded = False
 
-        # Note: Privacy mode checks are handled by the storage layer.
-        # - EPHEMERAL/ISOLATED: Storage will raise PrivacyViolationError on export
+        # Note: Privacy mode checks are handled by each phase.
+        # - EPHEMERAL/ISOLATED/DEIDENTIFIED forbid backups: the export raises
+        #   PrivacyViolationError (_export_sovereignty, #2875)
         # - Consolidation is always allowed (reorganizes existing data)
         # We don't block sleep here - let it try and handle errors gracefully.
 
@@ -1904,10 +1905,26 @@ class SleepMixin:
         Export agent state to sovereignty storage.
 
         Uses SovereignStorageAdapter for sharded, encrypted export.
+
+        The export reads the database beneath the privacy wrapper, so the
+        wrapper refuses none of it. Like the ``export_sovereignty`` tool it is
+        refused unless the agent's privacy mode permits a backup, read before
+        the archive is built and again under the durable persistence gate
+        around the store (#2875). An agent with no gate is refused.
         """
+        from kestrel_sovereign.storage.privacy_wrapper import (
+            guarded_backup_store,
+            require_backup_permitted,
+            require_durable_persistence_gate,
+        )
         from kestrel_sovereign.storage.sovereign_adapter import SovereignStorageAdapter
         from kestrel_sovereign.filecoin_adapter import FilecoinAdapter
+        import functools
         import os
+
+        storage = getattr(self, "storage", None)
+        require_durable_persistence_gate(self)
+        require_backup_permitted(storage)
 
         # Get user secret for convergent encryption
         user_secret = os.getenv("KESTREL_USER_SECRET", "default-secret")
@@ -1939,7 +1956,11 @@ class SleepMixin:
 
         # Export
         agent_did = getattr(self, 'did', None) or 'unknown'
-        cid = await adapter.export_agent(agent_did, storage_tier=storage_tier)
+        cid = await adapter.export_agent(
+            agent_did,
+            storage_tier=storage_tier,
+            store_guard=functools.partial(guarded_backup_store, self, storage),
+        )
 
         # Get export stats (from manifest if available)
         return {

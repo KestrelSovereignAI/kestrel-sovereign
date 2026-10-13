@@ -7,7 +7,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kestrel_sdk.tools.result import ToolResult
-from kestrel_sovereign.features.sovereignty.feature import SovereigntyFeature
+from kestrel_sovereign.features.sovereignty.feature import (
+    MAX_SOVEREIGNTY_IMPORT_BYTES,
+    SovereigntyFeature,
+    _LighthouseGatewayIpfs,
+)
+from kestrel_sovereign.filecoin_adapter import EnvelopePolicy
+from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
 from kestrel_sovereign.storage.providers.base import StorageResult, StorageTier
 
 
@@ -30,6 +37,7 @@ async def test_export_persists_receipt_with_import_and_audit_provenance():
     backup_blob = b"backup-bytes"
 
     storage = MagicMock()
+    storage.allows_backups.return_value = True
     storage.create_backup_blob = AsyncMock(return_value=backup_blob)
     storage.record_backup_artifact = AsyncMock(return_value="hash123")
     storage.add_node = AsyncMock(side_effect=lambda node: stored_nodes.append(deepcopy(node)))
@@ -38,11 +46,13 @@ async def test_export_persists_receipt_with_import_and_audit_provenance():
     wallet.can_afford.return_value = True
     wallet.transfer = AsyncMock()
 
+    gate = DurablePersistenceGate()
     agent = SimpleNamespace(
         agent_id="did:kestrel:test",
         features={"audit": AuditAnchorFeature()},
         storage=storage,
         wallet=wallet,
+        _get_durable_persistence_gate=lambda: gate,
     )
 
     storage_result = StorageResult(
@@ -53,6 +63,7 @@ async def test_export_persists_receipt_with_import_and_audit_provenance():
         encrypted=True,
         encryption_key_hash="keyhash123",
         size_bytes=len(backup_blob),
+        cache_name="hash123.owner123",
     )
     adapter = MagicMock()
     adapter.store_content.return_value = storage_result
@@ -87,6 +98,8 @@ async def test_export_persists_receipt_with_import_and_audit_provenance():
         "provider": "ipfs",
         "encrypted": True,
         "encryption_key_hash": "keyhash123",
+        # The cache entry it owns, as the backup_artifact records it (#2873).
+        "cache_name": "hash123.owner123",
         "size_bytes": len(backup_blob),
         "created_at": receipt.properties["created_at"],
         "node_id": "hash123",
@@ -106,6 +119,7 @@ async def test_export_partial_when_tier_falls_back_to_local():
     disk.
     """
     storage = MagicMock()
+    storage.allows_backups.return_value = True
     storage.create_backup_blob = AsyncMock(return_value=b"backup-bytes")
     storage.record_backup_artifact = AsyncMock(return_value="hash123")
     storage.add_node = AsyncMock()
@@ -114,11 +128,13 @@ async def test_export_partial_when_tier_falls_back_to_local():
     wallet.can_afford.return_value = True
     wallet.transfer = AsyncMock()
 
+    gate = DurablePersistenceGate()
     agent = SimpleNamespace(
         agent_id="did:kestrel:test",
         features={},
         storage=storage,
         wallet=wallet,
+        _get_durable_persistence_gate=lambda: gate,
     )
 
     storage_result = StorageResult(
@@ -176,8 +192,9 @@ async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotate
     storage = MagicMock()
     storage.get_nodes_by_type = AsyncMock(return_value=[backup_node])
     storage.restore_from_backup_blob = AsyncMock()
+    storage.privacy_mode = PrivacyMode.NORMAL
 
-    agent = SimpleNamespace(storage=storage)
+    agent = SimpleNamespace(storage=storage, agent_id="did:kestrel:test")
     adapter = MagicMock()
     adapter.retrieve_content.side_effect = error
 
@@ -195,5 +212,15 @@ async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotate
         "bafybackup",
         ipfs_cid="bafybackup",
         key_hash="keyhash123",
+        max_output_bytes=MAX_SOVEREIGNTY_IMPORT_BYTES,
+        envelope=EnvelopePolicy.ENCRYPTED_ONLY,
+        envelope_owner="did:kestrel:test",
+        envelope_key_hash="keyhash123",
+        cache_name=None,
+        remote_ipfs=adapter.retrieve_content.call_args.kwargs["remote_ipfs"],
+    )
+    # The keyless gateway: this agent has no Lighthouse provider (#3601).
+    assert isinstance(
+        adapter.retrieve_content.call_args.kwargs["remote_ipfs"], _LighthouseGatewayIpfs
     )
     storage.restore_from_backup_blob.assert_not_awaited()

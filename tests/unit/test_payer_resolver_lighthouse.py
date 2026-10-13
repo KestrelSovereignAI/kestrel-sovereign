@@ -189,6 +189,29 @@ class TestLighthouseSelfWalletMint:
             )
 
     @pytest.mark.asyncio
+    async def test_a_held_key_resolves_without_the_wallet(
+        self, db: AsyncDatabase
+    ) -> None:
+        """The wallet only mints. A reader without it, such as
+        ``kestrel storage health``, resolves the key the agent already holds
+        (#2874), and mints nothing."""
+        agent_did = "did:test:agent-held-key"
+        await ServiceKeyStorage(db, agent_did).store_key("lighthouse", "lh-held")
+        mock_class, mock_instance = _mock_lighthouse_client()
+
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest."
+            "LighthouseRestClient",
+            mock_class,
+        ):
+            resolver = FoundationPayerResolver(_self_wallet_storage_policy(), db=db)
+            result = await resolver.resolve_for(agent_did, ResourceClass.STORAGE)
+
+        assert await result.key_resolver.resolve_key("lighthouse") == "lh-held"
+        mock_class.assert_not_called()
+        mock_instance.create_api_key.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_missing_db_fails_closed(self) -> None:
         resolver = FoundationPayerResolver(
             _self_wallet_storage_policy(),

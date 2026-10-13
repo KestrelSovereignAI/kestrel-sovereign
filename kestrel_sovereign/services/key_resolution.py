@@ -9,6 +9,13 @@ import logging
 import os
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
+from kestrel_sovereign.security.exceptions import (
+    KeyNotConfiguredError as StoredKeyNotConfiguredError,
+)
+from kestrel_sovereign.security.service_key_storage import (
+    StoredKeyCiphertextMissingError,
+)
+
 if TYPE_CHECKING:
     from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
 
@@ -21,6 +28,35 @@ class KeyNotConfiguredError(Exception):
     def __init__(self, provider: str, message: Optional[str] = None):
         self.provider = provider
         super().__init__(message or f"No API key configured for {provider}")
+
+
+class KeyUnreadableError(Exception):
+    """The agent's key storage holds a key for a provider that cannot be read.
+
+    Raised by ``resolve_key(..., strict_storage=True)`` when the lookup fails
+    for any reason other than the key being absent: a decryption or database
+    error, or an active key row with no ciphertext. The caller learns the agent's own credential is broken instead of
+    being handed the environment's key, which names another account (#2874).
+    """
+
+    def __init__(self, provider: str, cause: BaseException):
+        self.provider = provider
+        super().__init__(
+            f"the {provider} key in this agent's key storage cannot be read "
+            f"({type(cause).__name__}: {cause})"
+        )
+
+
+def _absent_from_storage(error: Exception) -> bool:
+    """Whether a storage lookup failed because the agent holds no such key.
+
+    An active row with no ciphertext also raises the storage layer's
+    ``KeyNotConfiguredError``, but the agent does hold that credential: it
+    is damaged, not absent.
+    """
+    return isinstance(error, StoredKeyNotConfiguredError) and not isinstance(
+        error, StoredKeyCiphertextMissingError
+    )
 
 
 class KeyResolutionService:
@@ -104,6 +140,8 @@ class KeyResolutionService:
         self,
         provider: str,
         require: bool = True,
+        *,
+        strict_storage: bool = False,
     ) -> Optional[str]:
         """
         Resolve API key for a provider.
@@ -115,12 +153,21 @@ class KeyResolutionService:
         Args:
             provider: Service provider ID (openrouter, lighthouse, openai, anthropic, github, runpod, vastai)
             require: If True, raise KeyNotConfiguredError when key not found
+            strict_storage: If True, only a key ABSENT from the agent's
+                storage falls back to the environment. A lookup that fails
+                otherwise (decryption, database, an active key row with no
+                ciphertext) raises KeyUnreadableError
+                rather than resolving the environment's key, which names
+                another account than the agent's own (#2874). Default False
+                keeps the fallback for every failure.
 
         Returns:
             Decrypted API key or None if not found and require=False
 
         Raises:
             KeyNotConfiguredError: If require=True and no key available
+            KeyUnreadableError: If strict_storage=True and the agent's
+                storage lookup fails other than by the key being absent
         """
         provider = provider.lower()
         key = None
@@ -133,6 +180,8 @@ class KeyResolutionService:
                     logger.debug(f"Resolved key for {provider} from agent storage")
                     return key
             except Exception as e:
+                if strict_storage and not _absent_from_storage(e):
+                    raise KeyUnreadableError(provider, e) from e
                 logger.warning(f"Storage key lookup failed for {provider}: {e}")
 
         # Fall back to environment variables
@@ -342,6 +391,8 @@ async def resolve_key(
     agent_did: Optional[str] = None,
     storage: Optional["ServiceKeyStorage"] = None,
     require: bool = True,
+    *,
+    strict_storage: bool = False,
 ) -> Optional[str]:
     """
     Quick key resolution without creating a service instance.
@@ -351,6 +402,7 @@ async def resolve_key(
         agent_did: Agent DID (unused if storage provided)
         storage: ServiceKeyStorage instance (already bound to agent)
         require: If True, raise on missing key
+        strict_storage: See ``KeyResolutionService.resolve_key``
 
     Returns:
         API key or None
@@ -359,4 +411,6 @@ async def resolve_key(
         storage=storage,
         agent_did=agent_did,
     )
-    return await resolver.resolve_key(provider, require=require)
+    return await resolver.resolve_key(
+        provider, require=require, strict_storage=strict_storage
+    )

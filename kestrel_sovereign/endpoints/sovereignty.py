@@ -28,7 +28,8 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.features.sovereignty.artifacts import (
     owned_artifacts,
-    owned_content_hashes,
+    owned_cache_names,
+    owned_legacy_content_hashes,
 )
 from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.paths import CACHE_DIR_ENV, runtime_path_env
@@ -71,18 +72,22 @@ def _export_error_status(envelope, err: str) -> int:
     "I asked for something impossible" indistinguishable from "the server
     broke" (#2918). An unset ``KESTREL_DATA_KEY`` is a host-configuration
     conflict the caller cannot fix by changing parameters, hence 409 rather
-    than 400. Anything without a known refusal code stays a 500; the legacy
+    than 400. A privacy mode that does not permit a backup (#2875) is the same
+    kind of conflict with the agent's current state, also 409. Anything without
+    a known refusal code stays a 500; the legacy
     ``Insufficient funds`` substring check is kept as a fallback for envelopes
     minted without the typed code.
     """
     from kestrel_sovereign.features.sovereignty.feature import (
         REFUSAL_ENCRYPTION_KEY_UNAVAILABLE,
         REFUSAL_INSUFFICIENT_FUNDS,
+        REFUSAL_PRIVACY_MODE_FORBIDS_BACKUP,
     )
 
     refusal_status = {
         REFUSAL_ENCRYPTION_KEY_UNAVAILABLE: 409,
         REFUSAL_INSUFFICIENT_FUNDS: 402,
+        REFUSAL_PRIVACY_MODE_FORBIDS_BACKUP: 409,
     }
     data = envelope.data if isinstance(envelope.data, dict) else {}
     status_code = refusal_status.get(data.get("refusal"))
@@ -99,62 +104,71 @@ def _read_metadata_file(meta_path: Path):
     return {"raw": content}
 
 
-def _artifact_hash(filename: str) -> "str | None":
-    """The content hash a cache filename belongs to, or None.
-
-    The producers write exactly three shapes into the cache:
-    ``{hash}.cache`` (the bytes), ``{hash}.meta`` (the durability
-    sidecar) and, for content encrypted before F187, ``key_{hash}.key``.
-    Any other name belongs to no artifact and so to no agent.
-    """
-    if filename.endswith(".cache") or filename.endswith(".meta"):
-        stem = filename.rsplit(".", 1)[0]
-    elif filename.startswith("key_") and filename.endswith(".key"):
-        stem = filename[len("key_"):-len(".key")]
-    else:
-        return None
-    return stem or None
-
-
-async def _owned_hashes(agent) -> set:
-    """Content hashes the routed agent durably owns (#3225).
+async def _owned_names(agent) -> "tuple[set, set]":
+    """The cache names the routed agent durably owns its artifacts under,
+    and the content hashes of those its receipts record no name for (#3225).
 
     From the receipts in the agent's *own* storage, never from the cache:
     the directory is one per host, shared by every agent and every producer
     that ever ran here, so a filename, a CID, or a sidecar's ``agent`` field
-    is a claim anyone with the filesystem can plant. A hash with no receipt
-    here is unavailable to this agent, indistinguishably from a hash that
-    does not exist.
+    is a claim anyone with the filesystem can plant. A name with no receipt
+    here is unavailable to this agent, indistinguishably from a name that
+    does not exist. A receipt that records a cache name owns that name
+    only: two agents' exports of one plaintext share its content hash, so
+    the bare hash is not an encrypted envelope's receipt's to confer
+    (#2873). A receipt written before the name was recorded owns its
+    content hash, under which every export was cached then.
     """
-    return owned_content_hashes(await owned_artifacts(getattr(agent, "storage", None)))
+    artifacts = await owned_artifacts(getattr(agent, "storage", None))
+    return owned_cache_names(artifacts), owned_legacy_content_hashes(artifacts)
 
 
 async def _artifact_is_owned(agent, filename: str) -> bool:
-    content_hash = _artifact_hash(filename)
-    if content_hash is None:
-        return False
-    return content_hash in await _owned_hashes(agent)
+    """Whether a cache filename is one of the routed agent's artifacts.
+
+    The producers write these shapes into the cache: ``{name}.cache`` (the
+    bytes) and ``{name}.meta`` (the durability sidecar), where ``name`` is
+    the name the receipt records (the content hash, for one that records
+    none); and, for content encrypted before F187, ``key_{hash}.key``,
+    which only a receipt recording no name can own. Any other name belongs
+    to no artifact and so to no agent.
+    """
+    if filename.endswith(".cache") or filename.endswith(".meta"):
+        stem = filename.rsplit(".", 1)[0]
+        return bool(stem) and stem in (await _owned_names(agent))[0]
+    if filename.startswith("key_") and filename.endswith(".key"):
+        stem = filename[len("key_"):-len(".key")]
+        return bool(stem) and stem in (await _owned_names(agent))[1]
+    return False
 
 
-def _list_owned_cache_files(cache_dir: Path, owned: set):
-    """List the cache entries for the given hashes, and only those.
+def _list_owned_cache_files(cache_dir: Path, cache_names: set, legacy_hashes: set):
+    """List the cache entries under the given names, and only those.
 
-    Walks the owned set rather than the directory: the host cache holds
+    Walks the owned sets rather than the directory: the host cache holds
     thousands of other agents' and long-gone producers' files, and reading
     their sidecars (or even their names) would be the disclosure this
-    browser exists to avoid. Symlinks are followed here as before; the
-    download and preview handlers still resolve and contain the real path.
+    browser exists to avoid. ``cache_names`` holds the names the agent's
+    receipts record, so another agent's export of the same content, under
+    its own envelope name or the bare content hash, is not listed;
+    ``legacy_hashes`` the content hashes of receipts recording no name,
+    whose pre-F187 key sidecars are listed too. Symlinks are followed here
+    as before; the download and preview handlers still resolve and contain
+    the real path.
     """
     files = []
     total_size = 0
 
-    for content_hash in sorted(owned):
-        candidates = (
-            (f"{content_hash}.cache", "cache"),
-            (f"{content_hash}.meta", "meta"),
+    for stem in sorted(cache_names):
+        # An envelope is cached under ``{content_hash}.{owner_id}``.
+        content_hash = stem.partition(".")[0]
+        candidates = [
+            (f"{stem}.cache", "cache"),
+            (f"{stem}.meta", "meta"),
+        ]
+        if stem in legacy_hashes:
             # Pre-F187 key sidecar, classified as it always was.
-            (f"key_{content_hash}.key", "other"),
-        )
+            candidates.append((f"key_{content_hash}.key", "other"))
         for name, file_type in candidates:
             filepath = cache_dir / name
             try:
@@ -169,7 +183,7 @@ def _list_owned_cache_files(cache_dir: Path, owned: set):
             metadata = None
             has_meta = False
             if file_type == "cache":
-                meta_path = cache_dir / f"{content_hash}.meta"
+                meta_path = cache_dir / f"{stem}.meta"
                 has_meta = meta_path.exists()
                 if has_meta:
                     try:
@@ -405,13 +419,13 @@ async def list_sovereignty_files(request: Request):
     carries.
     """
     agent = get_agent(request)
-    owned = await _owned_hashes(agent)
-    if not owned or not STORAGE_CACHE_DIR.exists():
+    cache_names, legacy_hashes = await _owned_names(agent)
+    if not cache_names or not STORAGE_CACHE_DIR.exists():
         return {"files": [], "total_size": 0, "file_count": 0}
 
     try:
         files, total_size = await asyncio.to_thread(
-            _list_owned_cache_files, STORAGE_CACHE_DIR, owned
+            _list_owned_cache_files, STORAGE_CACHE_DIR, cache_names, legacy_hashes
         )
 
         return {

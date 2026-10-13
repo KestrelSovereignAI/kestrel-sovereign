@@ -34,8 +34,8 @@ _HOST_TABLES = frozenset({
 
 
 class _ProcessHostBackend(SQLiteBackend):
-    def __init__(self, path, scopes):
-        super().__init__(path)
+    def __init__(self, path, scopes, *, cold_read=False):
+        super().__init__(path, cold_read=cold_read)
         self._host_process_scopes = scopes
         # SQLAlchemy must refuse this retained owner even outside the opener's
         # context. Its generic executor cannot preserve this host boundary.
@@ -122,9 +122,9 @@ class _ProcessHostBackend(SQLiteBackend):
         return result
 
 
-async def open_process_host_database(path):
+async def open_process_host_database(path, *, cold_read=False):
     """Open only the host.db path already resolved by the host-store caller."""
-    backend = _ProcessHostBackend(path, current_execution_custody())
+    backend = _ProcessHostBackend(path, current_execution_custody(), cold_read=cold_read)
     db = AsyncDatabase(backend)
     connect = asyncio.create_task(backend.connect(), name="process-host-store-connect")
     cancelled = False
@@ -143,6 +143,8 @@ async def open_process_host_database(path):
         await _close_failed_database_initialization(db, error)
         raise
     async def initialize_host_schema(database):
+        if cold_read:
+            return
         # Reuse the canonical four table declarations, without creating graph,
         # conversations, tenant storage or unrelated migrations in host.db.
         for table in sorted(_HOST_TABLES):

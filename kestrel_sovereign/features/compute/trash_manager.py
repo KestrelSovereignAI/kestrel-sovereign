@@ -18,9 +18,9 @@ from pathlib import Path
 from typing import List, Optional
 
 from .destructive_policy import (
-    DEFAULT_TRASH_DIR,
     AgentDataProtectionError,
     DestructiveOperationPolicy,
+    default_trash_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -234,11 +234,11 @@ class TrashManager:
         Initialize the trash manager.
 
         Args:
-            trash_dir: Path to trash directory (default: ~/.kestrel/trash)
+            trash_dir: Path to trash directory (default: ``default_trash_dir()``)
             current_agent_data_path: This agent's own data directory. Restore
                 targets under other agent_data children are rejected.
         """
-        self.trash_dir = trash_dir or DEFAULT_TRASH_DIR
+        self.trash_dir = trash_dir or default_trash_dir()
         self._policy = DestructiveOperationPolicy(
             trash_dir=self.trash_dir,
             current_agent_data_path=current_agent_data_path,

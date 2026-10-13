@@ -1,6 +1,7 @@
 """Focused contract tests for sovereignty endpoints."""
 
 import asyncio
+import hashlib
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -168,17 +169,25 @@ def test_sovereignty_export_typed_refusal_returns_4xx_not_500():
     this host cannot honour (``encrypt=True`` with no ``KESTREL_DATA_KEY``)
     could not tell "I asked for something impossible" from "the server broke".
     The feature now carries a typed ``data["refusal"]`` code and the endpoint
-    maps it: 409 for the unsatisfiable host configuration, 402 for the wallet.
+    maps it: 409 for the unsatisfiable host configuration and for a privacy
+    mode that does not permit a backup (#2875), 402 for the wallet.
     """
     from kestrel_sdk.tools.result import ToolResult
     from kestrel_sovereign.features.sovereignty.feature import (
         REFUSAL_ENCRYPTION_KEY_UNAVAILABLE,
         REFUSAL_INSUFFICIENT_FUNDS,
+        REFUSAL_PRIVACY_MODE_FORBIDS_BACKUP,
     )
 
     cases = [
         (REFUSAL_ENCRYPTION_KEY_UNAVAILABLE, "encrypt=True requires KESTREL_DATA_KEY", 409),
         (REFUSAL_INSUFFICIENT_FUNDS, "Insufficient funds for backup.", 402),
+        (
+            REFUSAL_PRIVACY_MODE_FORBIDS_BACKUP,
+            "Sovereignty export refused: the agent's privacy mode (ephemeral) "
+            "does not permit backups. No sovereignty backup was stored.",
+            409,
+        ),
     ]
 
     for refusal, message, expected_status in cases:
@@ -374,6 +383,10 @@ def test_sovereignty_import_reports_owner_self_fence_as_retryable():
         _restore_app(app, original)
 
 
+# The name store_content caches content under: its lowercase SHA-256.
+SAMPLE = hashlib.sha256(b"sample").hexdigest()
+
+
 def _agent_owning(*content_hashes):
     """An agent whose own storage holds a backup receipt for each hash.
 
@@ -394,10 +407,10 @@ def test_sovereignty_files_listing_and_preview_contract(tmp_path):
 
     cache_dir = tmp_path / "storage_cache"
     cache_dir.mkdir()
-    (cache_dir / "sample.cache").write_text("hello world")
-    (cache_dir / "sample.meta").write_text('{"source":"test"}')
+    (cache_dir / f"{SAMPLE}.cache").write_text("hello world")
+    (cache_dir / f"{SAMPLE}.meta").write_text('{"source":"test"}')
 
-    agent = _agent_owning("sample")
+    agent = _agent_owning(SAMPLE)
     app, original = _prepare_app(agent)
     original_cache_dir = sovereignty_endpoints.STORAGE_CACHE_DIR
     sovereignty_endpoints.STORAGE_CACHE_DIR = cache_dir
@@ -406,7 +419,7 @@ def test_sovereignty_files_listing_and_preview_contract(tmp_path):
             with TestClient(app) as client:
                 list_response = client.get("/api/sovereignty/files", headers={"X-API-Key": "test-key"})
                 preview_response = client.get(
-                    "/api/sovereignty/files/sample.cache/preview",
+                    f"/api/sovereignty/files/{SAMPLE}.cache/preview",
                     headers={"X-API-Key": "test-key"},
                 )
                 invalid_response = client.get(
@@ -428,10 +441,10 @@ def test_sovereignty_file_browser_offloads_blocking_io(tmp_path):
 
     cache_dir = tmp_path / "storage_cache"
     cache_dir.mkdir()
-    (cache_dir / "sample.cache").write_text("hello world")
-    (cache_dir / "sample.meta").write_text('{"source":"test"}')
+    (cache_dir / f"{SAMPLE}.cache").write_text("hello world")
+    (cache_dir / f"{SAMPLE}.meta").write_text('{"source":"test"}')
 
-    agent = _agent_owning("sample")
+    agent = _agent_owning(SAMPLE)
     app, original = _prepare_app(agent)
     original_cache_dir = sovereignty_endpoints.STORAGE_CACHE_DIR
     sovereignty_endpoints.STORAGE_CACHE_DIR = cache_dir
@@ -449,7 +462,7 @@ def test_sovereignty_file_browser_offloads_blocking_io(tmp_path):
                 with TestClient(app) as client:
                     list_response = client.get("/api/sovereignty/files", headers={"X-API-Key": "test-key"})
                     preview_response = client.get(
-                        "/api/sovereignty/files/sample.cache/preview",
+                        f"/api/sovereignty/files/{SAMPLE}.cache/preview",
                         headers={"X-API-Key": "test-key"},
                     )
         assert list_response.status_code == 200

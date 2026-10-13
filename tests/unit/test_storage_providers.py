@@ -131,6 +131,7 @@ class TestStorageResult:
             cid="QmRoundTrip",
             tier=StorageTier.CLOUD_COLD,
             provider="lighthouse",
+            cache_name="xyz789.owner",
             deal_id="deal123",
             deal_status="active",
             encrypted=True,
@@ -149,6 +150,7 @@ class TestStorageResult:
         assert restored.cid == original.cid
         assert restored.tier == original.tier
         assert restored.deal_id == original.deal_id
+        assert restored.cache_name == original.cache_name
         assert restored.encrypted == original.encrypted
         assert restored.size_bytes == original.size_bytes
         assert restored.storage_cost_usd == original.storage_cost_usd

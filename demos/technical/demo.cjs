@@ -468,13 +468,6 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
             narrator.narrate('IPFS tier selected — decentralized storage for true data ownership...');
             await demoPause(page, 1000);
 
-            // Fix radio values to lowercase (UI bug: sends uppercase, API wants lowercase)
-            await page.evaluate(() => {
-                document.querySelectorAll('input[name="export-tier"]').forEach(r => {
-                    r.value = r.value.toLowerCase();
-                });
-            });
-
             // Click export
             narrator.narrate('Executing export — packaging agent data into a portable snapshot...');
             await page.click('.modal-btn-primary');

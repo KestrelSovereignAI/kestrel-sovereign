@@ -41,7 +41,7 @@ import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 from kestrel_sovereign import __version__
 from kestrel_sovereign.hold import HoldTurnRefusal
@@ -1106,21 +1106,267 @@ def cmd_tool_log_recent_failures(args) -> int:
     return 0
 
 
+class _StorageHealthTargetError(Exception):
+    """The agent or credential ``kestrel storage health`` needs cannot be resolved."""
+
+
+class _ProcessEnvironment:
+    """``os.environ`` as another process holds it, for the length of a block.
+
+    The Lighthouse credential resolver reads the process environment: the
+    ``LIGHTHOUSE_API_KEY`` fallback, the data key that decrypts an
+    agent-scoped key, and ``KESTREL_DB_PATH``, where an agent-level
+    ``kestrel.toml`` is found. Resolving in the agent's environment is what
+    makes the result the agent's. The previous values are restored after.
+    """
+
+    def __init__(self, environment: Mapping[str, str]):
+        self._environment = dict(environment)
+        self._saved: Dict[str, str] = {}
+
+    def __enter__(self):
+        self._saved = dict(os.environ)
+        os.environ.clear()
+        os.environ.update(self._environment)
+        return self
+
+    def __exit__(self, *exc_info):
+        os.environ.clear()
+        os.environ.update(self._saved)
+        return False
+
+
+async def _local_agent_with_did(
+    project_dir: Path, agents: Mapping, did: str
+) -> Optional[str]:
+    """The local agent whose database names ``did``, or None.
+
+    Read without disturbing a running agent; an agent whose database names
+    no DID, or cannot be read, names none."""
+    from kestrel_sovereign.identity.local_anchor import (
+        AgentDIDLookupMode,
+        read_anchor_agent_did,
+    )
+
+    for name, config in agents.items():
+        agent_dir = (project_dir / config.data_dir).resolve()
+        try:
+            anchor_did = await read_anchor_agent_did(
+                str(agent_dir), mode=AgentDIDLookupMode.INSPECTION
+            )
+        except (OSError, ValueError):
+            continue
+        if anchor_did == did:
+            return name
+    return None
+
+
+class _StorageHealthCredential:
+    """The agent a storage health report is for, and its Lighthouse key.
+
+    ``error`` says why the key could not be resolved; the report then shows
+    it as the Lighthouse tier's error. ``with_agent_database`` says whether
+    the agent's own database took part, without which a key the agent holds
+    itself is not visible.
+    """
+
+    def __init__(
+        self,
+        agent_id: str,
+        api_key: Optional[str],
+        *,
+        error: Optional[str],
+        with_agent_database: bool,
+    ):
+        self.agent_id = agent_id
+        self.api_key = api_key
+        self.error = error
+        self.with_agent_database = with_agent_database
+
+
+async def _storage_health_lighthouse_key(
+    project_dir: Path,
+    launch_env: Mapping[str, str],
+    *,
+    agent_name: Optional[str],
+    agent_id: Optional[str],
+) -> _StorageHealthCredential:
+    """The agent a storage health report is for, and its Lighthouse key.
+
+    The key is the one the agent publishes its sovereignty exports with:
+    ``resolve_lighthouse_storage``, the resolution boot builds the agent's
+    Lighthouse provider from, run in ``launch_env`` (``spawned_agent_env``,
+    the environment ``kestrel start`` hands its agents: the project ``.env``
+    over the exported one) with the agent's data directory as
+    ``KESTREL_DB_PATH`` and its own data key. Its state snapshots are not
+    read with this key: they go to the host's ``LIGHTHOUSE_API_KEY`` account,
+    which the report reads from that same ``launch_env``. The agent is
+    ``agent_name``, or the local agent whose DID is
+    ``agent_id``; its database supplies its DID and any key it holds itself
+    (``!add-key``, a SELF_WALLET mint). With no local agent there is no agent
+    database, and only a host-level key resolves (#2874). Both databases are
+    opened read-only; nothing is written or minted.
+
+    Raises:
+        _StorageHealthTargetError: The registry cannot be read, the agent is
+            unknown or its database cannot be read or name it, or
+            ``agent_id`` names another agent. A PayerPolicy that cannot be
+            resolved, or a key the agent holds that cannot be read, is not
+            raised: it is the credential's ``error``.
+    """
+    from kestrel_sdk.payer_policy import PayerPolicyError, UnsupportedCombinationError
+    from kestrel_sovereign.paths import spawned_agent_data_key
+    from kestrel_sovereign.services.key_resolution import KeyUnreadableError
+    from kestrel_sovereign.services.payer_resolver import (
+        load_policy_from_toml,
+        open_host_db,
+    )
+    from kestrel_sovereign.setup.constitution_reanchor import (
+        ReanchorTargetError,
+        resolve_reanchor_target,
+    )
+    from kestrel_sovereign.storage.db.interface import DatabaseError
+    from kestrel_sovereign.storage.providers.lighthouse_provider import (
+        lighthouse_api_key_for,
+        resolve_lighthouse_storage,
+    )
+
+    # A key the agent holds but cannot read is an error here, never a reason
+    # to check the host key's account instead (#2874).
+    resolution_errors = (
+        PayerPolicyError,
+        UnsupportedCombinationError,
+        NotImplementedError,
+        DatabaseError,
+        OSError,
+        ValueError,
+        KeyUnreadableError,
+    )
+
+    async def resolve(
+        did: str, *, db, storage_path: Optional[Path], with_agent_database: bool
+    ) -> _StorageHealthCredential:
+        host_db = None
+        try:
+            host_db = await open_host_db(
+                storage_path=storage_path,
+                project_dir=project_dir,
+                cold_read=True,
+            )
+            resolved = await resolve_lighthouse_storage(
+                did, policy=load_policy_from_toml(), db=db, host_db=host_db
+            )
+            api_key, error = await lighthouse_api_key_for(resolved), None
+        except resolution_errors as exc:
+            api_key = None
+            error = f"the Lighthouse credential of {did} cannot be resolved: {exc}"
+        finally:
+            if host_db is not None:
+                await host_db.close()
+        return _StorageHealthCredential(
+            did, api_key, error=error, with_agent_database=with_agent_database
+        )
+
+    try:
+        agents = MultiAgentConfig.load(
+            project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
+        ).get_local_agents()
+    except (OSError, ValueError) as exc:
+        raise _StorageHealthTargetError(
+            f"{MULTI_AGENT_CONFIG_FILENAME} cannot be read: {exc}"
+        ) from exc
+    if agent_name is None and agent_id is not None:
+        agent_name = await _local_agent_with_did(project_dir, agents, agent_id)
+    if agent_name is None:
+        did = agent_id or "default"
+        with _ProcessEnvironment(launch_env):
+            return await resolve(
+                did, db=None, storage_path=None, with_agent_database=False
+            )
+
+    if agent_name not in agents:
+        raise _StorageHealthTargetError(
+            f"'{agent_name}' not in multi_agent. "
+            f"Available: {', '.join(agents.keys()) or '(none)'}"
+        )
+    agent_dir = (project_dir / agents[agent_name].data_dir).resolve()
+    # The database the runtime opens for this agent, and the DID it binds,
+    # read without disturbing a running agent.
+    try:
+        target = await resolve_reanchor_target(
+            agent_dir,
+            backend=launch_env.get("KESTREL_DB_BACKEND"),
+            dsn=launch_env.get("KESTREL_DATABASE_URL"),
+            cold=True,
+        )
+    except ReanchorTargetError as exc:
+        raise _StorageHealthTargetError(str(exc)) from exc
+    if agent_id is not None and agent_id != target.agent_did:
+        raise _StorageHealthTargetError(
+            f"--agent-id {agent_id} is not '{agent_name}', whose DID is "
+            f"{target.agent_did}"
+        )
+    agent_env = {**launch_env, "KESTREL_DB_PATH": str(agent_dir)}
+    data_key = spawned_agent_data_key(launch_env, agent_name)
+    if data_key is not None:
+        agent_env["KESTREL_DATA_KEY"] = data_key
+    with _ProcessEnvironment(agent_env):
+        try:
+            async with target.open_storage(cold_read=True) as storage:
+                return await resolve(
+                    target.agent_did,
+                    db=storage.db,
+                    storage_path=agent_dir / "kestrel_prime.db",
+                    with_agent_database=True,
+                )
+        except (DatabaseError, OSError) as exc:
+            raise _StorageHealthTargetError(
+                f"the database of '{agent_name}' cannot be read: {exc}"
+            ) from exc
+
+
 def cmd_storage_health(args) -> int:
     """Show backup tier health with honest tier labels."""
     from datetime import timedelta
 
-    from kestrel_sovereign.storage.sync.health import (
-        build_storage_health_report,
-        load_env_file,
-    )
+    from kestrel_sovereign.storage.sync.health import build_storage_health_report
 
     project_dir = _get_project_dir()
-    env = load_env_file(project_dir / ".env")
+    # Every tier is read in the environment the agent runs in, where the
+    # project ``.env`` wins over an exported value: a shell exporting another
+    # ``LIGHTHOUSE_API_KEY`` than the file's must not send the snapshot check
+    # to an account the agent never uploads to (#2874).
+    launch_env = spawned_agent_env(project_dir)
+    try:
+        credential = asyncio.run(
+            _storage_health_lighthouse_key(
+                project_dir,
+                launch_env,
+                agent_name=args.agent,
+                agent_id=args.agent_id,
+            )
+        )
+    except _StorageHealthTargetError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not credential.with_agent_database:
+        named = (
+            f"no local agent is {args.agent_id}"
+            if args.agent_id
+            else "no agent was named"
+        )
+        print(
+            f"note: {named}, so a Lighthouse key an agent holds itself is not "
+            "visible here; the check uses the host-level credential. Name a "
+            "local agent with --agent.",
+            file=sys.stderr,
+        )
     report = asyncio.run(
         build_storage_health_report(
-            agent_id=args.agent_id,
-            env=env,
+            agent_id=credential.agent_id,
+            export_api_key=credential.api_key,
+            export_key_error=credential.error,
+            env=launch_env,
             lighthouse_grace=timedelta(hours=args.lighthouse_grace_hours),
             gcs_prefix=args.gcs_prefix,
         )
@@ -1152,6 +1398,12 @@ def cmd_storage_health(args) -> int:
                         print(f"    age: {age_seconds // 3600}h")
                     if deal_count is not None:
                         print(f"    deals: {deal_count}")
+                    export = target.details.get("sovereignty_export")
+                    if export:
+                        print(
+                            f"    sovereignty export: {export['cid']} "
+                            f"({export['status']}, deals: {export['deal_count']})"
+                        )
                 if target.name == "gcs":
                     print(f"    bucket: {target.details.get('bucket')}")
                     print(f"    latest: {target.details.get('latest_blob')}")
@@ -2287,9 +2539,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Check Lighthouse deal lag and GCS fallback readiness",
     )
     storage_health_p.add_argument(
+        "--agent",
+        default=None,
+        help=(
+            "Local agent (multi_agent.toml name) whose backups are checked. Its "
+            "database supplies its DID and its own Lighthouse credential, so "
+            "the check reads the account the agent publishes to"
+        ),
+    )
+    storage_health_p.add_argument(
         "--agent-id",
-        default="default",
-        help="Agent identifier used by sync targets (default: default)",
+        default=None,
+        help=(
+            "Agent identifier used by sync targets (default: the --agent's "
+            "DID, else 'default')"
+        ),
     )
     storage_health_p.add_argument(
         "--lighthouse-grace-hours",

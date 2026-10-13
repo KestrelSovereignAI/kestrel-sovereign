@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-12
-**Scope:** 2693 tracked files (1904 `.py`, 352 `.md`, 437 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-13
+**Scope:** 2699 tracked files (1909 `.py`, 352 `.md`, 438 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -197,7 +197,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/agent/token_budget.py** — Token budget allocation for context management.
   - `class DegradedModeError`; `class TokenAllocation`; `class TokenBudget`; `class AdaptiveTokenBudget`; `class ElasticTokenBudget`; `def create_budget(model, message_count, adaptive)`
 - **kestrel_sovereign/agent/token_counter.py** — Token counting for context management.
-  - `def register_discovered_limits(models)`; `class TokenCounter`; `def get_token_counter(model)`
+  - `def context_limits_cache_file()`; `def register_discovered_limits(models)`; `class TokenCounter`; `def get_token_counter(model)`
 - **kestrel_sovereign/agent/tool_context_manager.py** — Tool Context Manager for Kestrel Agent.
   - `class ToolContextManager`
 - **kestrel_sovereign/agent/tool_registry.py** — Dynamic tool registry mixin for KestrelAgent.
@@ -250,7 +250,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/cli_runpod.py** — ``kestrel runpod {deploy,status,stop,kill}`` CLI command - sub-PR 4 of epic #1050 (bash-to-Python port of ``scripts/runpod/deploy_lora_trainer.sh``).
   - `def add_runpod_subcommand(subparsers)`; `def cmd_runpod(args)`
 - **kestrel_sovereign/cli_serve.py** — ``kestrel serve`` — manage local llama.cpp model servers on this host.
-  - `def resolve_registry_path(explicit)`; `def load_registry(path)`; `def resolve_gguf(pattern)`; `def build_command(name, entry, port)`; `def read_state()`; `def write_state(state)`; `def clear_state()`; `def pid_alive(pid)`; `…`
+  - `def state_dir()`; `def state_file()`; `def log_dir()`; `def resolve_registry_path(explicit)`; `def load_registry(path)`; `def resolve_gguf(pattern)`; `def build_command(name, entry, port)`; `def read_state()`; `…`
 - **kestrel_sovereign/cli_stop.py** — Cooperative ``kestrel stop`` commands.
   - `def cmd_stop(args)`; `def add_stop_subparser(subparsers)`
 - **kestrel_sovereign/cli_verify_install.py** — ``kestrel verify-install`` CLI command — sub-PR 2.2 of epic #1050 (bash-to-Python port).
@@ -449,7 +449,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/compute/__init__.py** — Execute scripts with constitutional security controls.
 - **kestrel_sovereign/features/compute/component.yaml** — (configuration)
 - **kestrel_sovereign/features/compute/destructive_policy.py** — Canonical destructive-operation policy for the compute feature.
-  - `class AgentDataProtectionError`; `class DestructiveOperationPolicy`; `def rewrite_script_for_safety(content, language, workdir)`
+  - `def default_trash_dir()`; `class AgentDataProtectionError`; `class DestructiveOperationPolicy`; `def rewrite_script_for_safety(content, language, workdir)`
 - **kestrel_sovereign/features/compute/executors/__init__.py** — Kestrel Compute Feature - Executors Package.
 - **kestrel_sovereign/features/compute/executors/base.py** — Kestrel Compute Feature - Base Executor.
   - `class OutputSinks`; `class ExecutionError`; `class ExecutionTimeoutError`; `class ExecutionEnvironmentError`; `class CommandExecutionUnsupported`; `class BaseExecutor`
@@ -652,7 +652,7 @@ Repo entry points and standard project files.
   - `class Skill`; `def normalize_title(title)`; `def skill_id_from_title(title)`
 - **kestrel_sovereign/features/sovereignty/__init__.py** — —
 - **kestrel_sovereign/features/sovereignty/artifacts.py** — The export artifacts an agent durably owns.
-  - `class OwnedArtifact`; `async def owned_artifacts(storage)`; `def owned_content_hashes(artifacts)`; `def owned_cids(artifacts)`
+  - `class OwnedArtifact`; `async def owned_artifacts(storage)`; `def owned_cache_names(artifacts)`; `def owned_legacy_content_hashes(artifacts)`; `def owned_cids(artifacts)`
 - **kestrel_sovereign/features/sovereignty/component.yaml** — (configuration)
 - **kestrel_sovereign/features/sovereignty/feature.py** — —
   - `class SovereigntyFeature`
@@ -767,7 +767,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/wellness/metrics.py** — Operational Wellness Metric Calculators.
   - `class FrictionCalculator`; `class ContextPressureCalculator`; `class InteractionDepthCalculator`; `class SessionContinuityCalculator`; `class MemoryHealthCalculator`
 - **kestrel_sovereign/filecoin_adapter.py** — Filecoin/IPFS adapter for Kestrel's sovereign storage system.
-  - `class ContentRetrievalLimitError`; `class FilecoinAdapter`
+  - `class ContentRetrievalLimitError`; `class EnvelopePolicy`; `class EncryptedContentError`; `class DecryptionKeyUnavailableError`; `class EncryptedEnvelopeError`; `class EnvelopeFormatError`; `class EnvelopeKeyMismatchError`; `class EnvelopeOwnerMismatchError`; `…`
 - **kestrel_sovereign/fleet/__init__.py** — Fleet coordination: sovereign-side agent definitions (#2321).
 - **kestrel_sovereign/fleet/orchestrator.py** — The **Fleet Orchestrator** agent definition (#2321).
   - `def registered_tool_names(feature_cls)`; `def mandatory_feature_tool_names()`; `def effective_feature_allowlist()`; `def additional_constraints()`; `def unclassified_tool_names(feature_cls)`; `def is_tool_allowed(tool_name)`; `def is_tool_denied(tool_name)`; `def is_tool_call_allowed(tool_name, tool_input)`; `…`
@@ -1008,11 +1008,11 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/llm/modality_recording.py** — One recording path for the content-free modalities (#3424, #3426).
   - `class ModalityCall`; `class ModalityRecorder`; `class ModalityRecordingMixin`
 - **kestrel_sovereign/llm/model_cache.py** — Shared Model Discovery Cache
-  - `class SharedModelCache`; `def get_shared_model_cache()`
+  - `class DiscoveryStatus`; `class VendorDiscoveryOutcome`; `class ModelCatalogSnapshot`; `class SharedModelCache`; `def get_shared_model_cache()`
 - **kestrel_sovereign/llm/model_catalog.py** — Model Catalog Service
   - `class ModelCatalogService`; `def get_catalog_service()`
 - **kestrel_sovereign/llm/model_discovery.py** — Model Discovery Service
-  - `class ModelDiscoveryMixin`
+  - `def collect_discovery_outcomes()`; `class ModelDiscoveryMixin`
 - **kestrel_sovereign/llm/model_metadata.py** — Re-exports of model metadata types from the SDK.
   - `class ModelInfo`
 - **kestrel_sovereign/llm/model_selection.py** — Shared helpers for config-driven model selection before live discovery.
@@ -2261,6 +2261,7 @@ Repo entry points and standard project files.
 - **tests/frontend/sendmessage_interrupts_when_busy.test.mjs** — (mjs asset)
 - **tests/frontend/session_id_property.test.mjs** — (mjs asset)
 - **tests/frontend/signal_completed_wake.test.mjs** — (mjs asset)
+- **tests/frontend/sovereignty_export_tier.test.mjs** — (mjs asset)
 - **tests/frontend/standalone_reveal.test.mjs** — (mjs asset)
 - **tests/frontend/streaming_block_render.test.mjs** — (mjs asset)
 - **tests/frontend/tasks_status_badges.test.mjs** — (mjs asset)
@@ -2564,6 +2565,8 @@ Repo entry points and standard project files.
   - `def temp_db()`; `async def llm_service()`; `async def test_v2_export_flow(temp_db)`; `async def test_convergent_encryption_deduplication(temp_db)`; `async def test_agent_command_integration(temp_db, llm_service, monkeypatch)`
 - **tests/integration/test_sovereignty_file_browser_owner_scope.py** — The sovereignty file browser serves only the routed agent's artifacts (#3225).
   - `def identities()`; `async def agents(db_backend, identities)`; `def cache_dir(tmp_path, identities, monkeypatch)`; `async def test_listing_shows_only_the_routed_agents_artifacts(agents, cache_dir, identities)`; `async def test_foreign_orphan_and_unknown_names_are_the_same_404(agents, cache_dir, identities)`; `async def test_owner_can_preview_and_download_its_own_artifact(agents, cache_dir, identities)`; `async def test_traversal_is_refused_before_ownership_is_asked(sqlite_backend, cache_dir, identities)`; `async def test_privacy_mode_that_hides_persisted_rows_hides_artifacts(cache_dir, identities)`; `…`
+- **tests/integration/test_sovereignty_fresh_host_restore.py** — An encrypted sovereignty export restores on a fresh host (#2873).
+  - `def kubo()`; `def data_key(monkeypatch)`; `async def test_encrypted_export_restores_into_a_fresh_database(tmp_path, monkeypatch, kubo, data_key)`; `async def test_restore_under_another_key_names_the_mismatch_and_restores_nothing(tmp_path, monkeypatch, kubo, data_key)`; `async def test_export_of_another_agent_is_refused_and_restores_nothing(tmp_path, monkeypatch, kubo, data_key)`; `async def test_local_export_under_another_key_is_refused_naming_the_key(tmp_path, monkeypatch, kubo, data_key)`; `async def test_local_export_with_no_key_configured_is_refused_naming_the_absence(tmp_path, monkeypatch, kubo, data_key)`; `async def test_a_restore_by_cid_caches_the_export_under_its_receipt_s_name(tmp_path, monkeypatch, kubo, data_key)`; `…`
 - **tests/integration/test_sovereignty_guarantees.py** — IDIOT-PROOF SOVEREIGNTY TESTS (V2)
   - `async def test_conversations_are_actually_saved()`; `async def test_platform_shutdown_does_not_lose_data()`; `async def test_encryption_actually_works()`; `async def test_content_integrity_verification()`; `async def test_sovereignty_vs_simple_download()`; `async def test_inheritance_scenario()`; `async def test_performance_vs_cloud()`
 - **tests/integration/test_sovereignty_import.py** — Integration tests for V2 Import/Restore functionality.
@@ -3397,6 +3400,8 @@ Repo entry points and standard project files.
   - `async def test_read_features_allowed_from_edge(tmp_path)`; `async def test_read_features_allowed_none_for_root(tmp_path)`; `async def test_read_features_allowed_none_for_empty(tmp_path)`; `async def test_direct_boot_enforces_feature_ceiling(tmp_path)`; `async def test_do_spawn_persists_inherited_ceiling()`; `async def test_root_agent_loads_beyond_the_ceiling(tmp_path)`
 - **tests/unit/test_features_api.py** — Tests for the Feature Store API endpoints (endpoints/features.py).
   - `class TestListFeatures`; `class TestListInstalledFeatures`; `class TestGetFeatureDetail`; `class TestEnableFeature`; `class TestDisableFeature`; `class TestInstallFeature`; `class TestRemoveFeature`; `class TestGetFeatureConfig`; `…`
+- **tests/unit/test_filecoin_encrypted_envelope.py** — The self-describing encrypted envelope (#2873).
+  - `def no_ipfs_daemon()`; `def data_key(monkeypatch)`; `def test_header_names_what_decryption_needs_and_no_key(tmp_path, data_key)`; `def test_header_is_the_tokens_associated_data(tmp_path, data_key)`; `def test_envelope_opens_on_another_host_from_the_payload_and_data_key(tmp_path, data_key)`; `def test_envelope_under_another_key_names_both_key_ids(tmp_path, data_key, monkeypatch)`; `def test_envelope_without_a_configured_key_is_refused(tmp_path, data_key)`; `def test_envelope_whose_plaintext_misses_its_key_hash_is_refused(tmp_path, data_key)`; `…`
 - **tests/unit/test_filecoin_encryption_portability.py** — F187 portability: an encrypted export must be restorable on a *different* host from only the CID + ``key_hash``, with no local key sidecar present.
   - `def data_key(monkeypatch)`; `def test_encrypted_content_restores_without_sidecar(tmp_path, data_key)`; `def test_store_and_retrieve_roundtrip_encrypted(tmp_path, data_key)`; `def test_legacy_sidecar_still_decrypts(tmp_path, data_key)`
 - **tests/unit/test_filecoin_miner_selection.py** — Unit tests for Filecoin miner selection logic.
@@ -3521,6 +3526,8 @@ Repo entry points and standard project files.
   - `def test_adapter_family_maps_to_identity_substrate(vendor, route, model, family, …)`; `def test_composite_preference_selects_matching_route()`; `def test_heterogeneous_route_uses_active_model_family(vendor, model, expected)`; `def test_heterogeneous_route_keeps_explicit_fallback_when_model_is_auto(vendor, expected)`; `def test_plugin_family_is_preserved_without_framework_vendor_branch()`; `def test_missing_runtime_is_explicit_unknown()`; `async def test_exporter_uses_its_agent_llm_service_not_process_global_config()`
 - **tests/unit/test_implicit_sessions.py** — Tests for implicit session_id derivation in AsyncConversationStore.
   - `async def store()`; `class TestImplicitSessionDerivation`; `class TestSessionGapBoundary`; `class TestSessionIdRetrieval`; `class TestErrorIsolation`; `class TestSessionGapMinutesCentralized`; `class TestSearchHistorySessionScoping`
+- **tests/unit/test_import_time_home_paths.py** — Paths derived from the home directory resolve when called, not at import (#3104).
+  - `def test_each_path_follows_the_home_in_force_when_called(resolve, relative, tmp_path, monkeypatch)`; `def test_cached_context_limits_are_read_from_the_cache_file_in_force(tmp_path, monkeypatch)`; `def import_time_home_lookups(modules, names)`; `def test_no_package_module_looks_up_the_home_directory_at_import()`; `def test_the_guard_detects_every_import_time_form()`
 - **tests/unit/test_import_validation_runner.py** — Contracts for import validation timing and project-environment selection.
   - `def test_parse_collection_summary_accepts_pytest_summary_forms(summary, expected)`; `def test_collection_parser_uses_last_complete_summary_not_node_id_text()`; `def test_validate_imports_times_direct_pytest_and_pins_summary_environment(monkeypatch, capsys)`; `def test_plain_assert_collection_still_fails_on_a_broken_import(monkeypatch, tmp_path, capsys)`; `def test_validate_imports_enforces_pytest_duration_not_process_wall_time(monkeypatch)`; `def test_validate_imports_rejects_real_pytest_over_budget_summary(monkeypatch, capsys)`; `def test_validate_imports_warns_before_collection_budget(monkeypatch, capsys)`; `def test_successful_unparseable_collection_reports_parser_failure(monkeypatch, capsys)`; `…`
 - **tests/unit/test_inception_atomicity.py** — Inception must record an agent atomically with its governing edge (#2867).
@@ -3679,6 +3686,8 @@ Repo entry points and standard project files.
   - `class NoCredentialsError`; `def fixture_http(monkeypatch)`; `def fixture_catalog(tmp_path, monkeypatch)`; `async def discovery(fixture_http, fixture_catalog, monkeypatch)`; `class TestDiscoveryReturnsOnlyModelInfo`; `class TestVendorFailureOutcomes`; `class TestDiscoveryFilters`; `class TestDiscoveryCache`; `…`
 - **tests/unit/test_model_discovery_health_surface.py** — A dead model-discovery credential must be visible on the health surface (#3190).
   - `class TestModelDiscoveryCheck`; `class TestLlmServiceSurfacesDroppedMandate`; `class TestRegisteredInTheSharedList`; `class TestWorstStatus`
+- **tests/unit/test_model_discovery_shared_snapshot.py** — Every service on a host reports discovery for the catalog it reads (#3197).
+  - `def host(tmp_path, monkeypatch)`; `class TestSiblingsReportTheSameSnapshot`; `class TestRecoveryIsShared`; `class TestPublicationIsAtomic`; `class TestFailuresAreScopedToTheirVendor`; `class TestVersions`; `class TestTheCarryOutlivesCatalogInvalidation`
 - **tests/unit/test_model_discovery_stale_while_revalidate.py** — Latency contract for stale-while-revalidate model catalog reads.
   - `async def test_stale_catalog_returns_without_awaiting_provider_refresh(monkeypatch)`; `async def test_fresh_caller_joins_inflight_background_refresh(monkeypatch)`
 - **tests/unit/test_model_metadata.py** — Unit tests for ModelInfo and ModelCategory in model_metadata.py
@@ -4175,12 +4184,14 @@ Repo entry points and standard project files.
   - `class TestTrustTier`; `class TestTargetTrustTiers`; `class TestSovereignIPFSTarget`; `class TestSyncService`
 - **tests/unit/test_sovereignty_endpoint_contracts.py** — Focused contract tests for sovereignty endpoints.
   - `def test_storage_stats_returns_expected_shape(tmp_path)`; `def test_sovereignty_exports_serializes_receipts_and_backups()`; `def test_sovereignty_export_rejects_invalid_tier()`; `def test_sovereignty_export_returns_402_on_insufficient_funds()`; `def test_sovereignty_export_typed_refusal_returns_4xx_not_500()`; `def test_sovereignty_export_unrecognized_error_still_returns_500()`; `def test_sovereignty_export_partial_returns_200_with_caveat()`; `def test_sovereignty_import_rejects_invalid_cid()`; `…`
+- **tests/unit/test_sovereignty_export_privacy_transition.py** — #2875 — a sovereignty export and a privacy transition do not interleave.
+  - `async def rig(tmp_path)`; `async def test_a_transition_between_the_policy_read_and_the_store_prevents_the_remote_store(rig)`; `async def test_a_transition_waits_for_an_in_flight_store(rig)`; `async def test_a_cancelled_export_holds_the_gate_until_its_store_has_finished(rig)`; `async def test_an_export_cancelled_during_its_fee_still_pays_it(rig)`; `async def test_an_export_behind_a_queued_transition_reads_the_policy_it_installs(rig)`; `async def test_concurrent_exports_with_no_transition_both_succeed(rig)`; `async def test_an_export_without_a_persistence_gate_is_refused_and_stores_nothing(getter)`; `…`
 - **tests/unit/test_sovereignty_export_progress.py** — —
   - `async def test_export_sovereignty_reports_upload_progress()`; `async def test_export_sovereignty_unknown_tier_is_failed()`; `async def test_export_sovereignty_falsy_nonstring_tier_is_failed(bad_tier)`; `async def test_export_sovereignty_valid_local_tier_resolves()`; `async def test_export_sovereignty_cloud_tier_is_rejected(cloud_tier)`; `async def test_encrypted_local_export_is_honoured_not_downgraded()`; `async def test_encrypted_export_without_master_key_is_refused_before_backup(tier)`; `async def test_unencrypted_export_needs_no_master_key()`; `…`
 - **tests/unit/test_sovereignty_export_receipt_contracts.py** — Sovereignty export receipt seam contracts.
   - `class AuditAnchorFeature`; `async def test_export_persists_receipt_with_import_and_audit_provenance()`; `async def test_export_partial_when_tier_falls_back_to_local()`; `async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotated(error, expected)`
 - **tests/unit/test_sovereignty_import_receipt_gate.py** — Reading the host cache by a caller-supplied name needs a receipt (#3225).
-  - `async def test_import_without_a_receipt_is_refused_before_any_read()`; `async def test_import_with_a_receipt_reads_and_uses_its_key_hash()`; `def test_identity_intake_never_answers_a_cid_from_the_local_cache()`; `def test_adapter_honours_allow_local_cache(tmp_path)`; `def test_artifacts_module_imports_standalone()`
+  - `async def test_import_without_a_receipt_never_reads_the_host_cache()`; `async def test_import_without_a_receipt_cannot_restore_a_cached_export(tmp_path, monkeypatch, seal_envelope)`; `async def test_import_with_a_receipt_follows_what_it_records(properties, key_hash, policy, envelope_key_hash, …)`; `async def test_a_receipt_without_a_cache_name_reads_its_content_hash_not_its_cid(node_id, cache_name)`; `async def test_import_refuses_a_receipt_whose_cache_name_is_not_its_exports(cache_name)`; `def test_identity_intake_never_answers_a_cid_from_the_local_cache()`; `def test_adapter_honours_allow_local_cache(tmp_path)`; `def test_artifacts_module_imports_standalone()`
 - **tests/unit/test_sovereignty_sanitization.py** — Unit tests for sovereignty endpoint input sanitization.
   - `class TestTierValidation`; `class TestCIDValidation`; `class TestMaxSizeBounded`
 - **tests/unit/test_sovereignty_v3.py** — Unit tests for V3 Sovereignty: AssetCollector, manifest v3, and CAR packaging.

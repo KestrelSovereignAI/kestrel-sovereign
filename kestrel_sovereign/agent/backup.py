@@ -88,7 +88,8 @@ class BackupMixin:
 
         adapter = FilecoinAdapter()
         result = await asyncio.to_thread(
-            adapter.store_content, backup_blob, storage_tier=storage_tier, encrypt=encrypt, metadata={"agent": self.agent_id}
+            adapter.store_content, backup_blob, storage_tier=storage_tier, encrypt=encrypt, metadata={"agent": self.agent_id},
+            envelope_owner=self.agent_id if encrypt else None,
         )
 
         node_id = await self.storage.record_backup_artifact(self.agent_id, result)

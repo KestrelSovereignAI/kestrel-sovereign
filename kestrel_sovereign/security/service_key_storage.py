@@ -62,6 +62,16 @@ def _as_datetime(value: Any) -> datetime:
 # are now available from the import above
 
 
+class StoredKeyCiphertextMissingError(KeyNotConfiguredError):
+    """An active key row exists for the provider but holds no ciphertext.
+
+    A subclass of ``KeyNotConfiguredError``, so a caller that treats the
+    unusable row as "no key" keeps doing so. Strict key resolution tells it
+    apart from an absent key: the agent holds a credential that is damaged,
+    and the environment's key names another account (#2874).
+    """
+
+
 @dataclass
 class ServiceKeyInfo:
     """Information about a stored service key (no secret exposed)."""
@@ -303,6 +313,8 @@ class ServiceKeyStorage:
 
         Raises:
             KeyNotConfiguredError: If no key found for provider
+            StoredKeyCiphertextMissingError: If the active key row for the
+                provider has an empty or NULL ciphertext
             DecryptionError: If decryption fails
         """
         rows = await self._db.fetchall(
@@ -313,9 +325,14 @@ class ServiceKeyStorage:
             (self._agent_did, provider_id)
         )
 
-        if not rows or not rows[0][0]:
+        if not rows:
             raise KeyNotConfiguredError(
                 f"No API key configured for provider '{provider_id}' and agent '{self._agent_did[:30]}...'"
+            )
+        if not rows[0][0]:
+            raise StoredKeyCiphertextMissingError(
+                f"The API key for provider '{provider_id}' and agent "
+                f"'{self._agent_did[:30]}...' has no ciphertext"
             )
 
         encrypted_b64 = rows[0][0]

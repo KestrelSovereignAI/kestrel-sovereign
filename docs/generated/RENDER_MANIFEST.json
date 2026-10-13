@@ -1426,7 +1426,10 @@
       "type": "Architecture Spec"
     },
     {
-      "existing_code_refs": [],
+      "existing_code_refs": [
+        "kestrel_sovereign/storage/providers/lighthouse_provider.py",
+        "scripts/backup_cleanup.py"
+      ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],

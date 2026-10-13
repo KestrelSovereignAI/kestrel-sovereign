@@ -1642,7 +1642,11 @@ def test_a_driver_error_never_carries_the_dsn(tmp_path):
 
     dsn = "postgresql://kestrel:hunter2@[bad/kestrel"
     source = _GovernanceSource(
-        anchor_path=tmp_path / "k.db", agent_did="did:x", dsn=dsn
+        anchor_path=tmp_path / "k.db",
+        agent_did="did:x",
+        dsn=dsn,
+        postgres_env=dict(os.environ),
+        postgres_cwd=str(tmp_path),
     )
 
     result = _read_agent_node(source)
@@ -1921,6 +1925,186 @@ def test_postgres_probe_env_is_the_launcher_environment_unchanged():
 
     assert child == {**resolved, "PYTHONUNBUFFERED": "1"}
     assert child is not resolved
+
+
+def test_postgres_probe_env_refuses_a_missing_launcher_environment(monkeypatch):
+    """Doctor's own environment is not the launcher's (#2932), so no stand-in."""
+    from kestrel_sovereign.doctor import (
+        _postgres_probe_env,
+        _PostgresProbeContextMissingError,
+    )
+
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://ambient-sentinel/db")
+
+    with pytest.raises(_PostgresProbeContextMissingError, match="context missing"):
+        _postgres_probe_env(None)
+
+
+@pytest.mark.parametrize("missing", ["postgres_env", "postgres_cwd"])
+def test_isolated_probe_without_spawned_context_starts_no_worker(
+    tmp_path, monkeypatch, missing
+):
+    import subprocess
+
+    from kestrel_sovereign.doctor import (
+        _fetch_postgres_rows_isolated,
+        _PostgresProbeContextMissingError,
+    )
+
+    launched = []
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda *args, **kwargs: launched.append(kwargs)
+    )
+    context = {"postgres_env": {}, "postgres_cwd": str(tmp_path)}
+    context[missing] = None
+
+    with pytest.raises(_PostgresProbeContextMissingError, match="context missing"):
+        _fetch_postgres_rows_isolated(
+            "postgresql://user@host/database", "SELECT 1", **context
+        )
+
+    assert launched == []
+
+
+def test_missing_probe_context_is_a_finding_not_the_ambient_environment(
+    tmp_path, monkeypatch
+):
+    """A PostgreSQL source with no launcher environment fails closed (#2992).
+
+    Before, the worker silently ran under doctor's own ``os.environ`` — the
+    wrong-environment failure #2932 fixed, recreated for any caller that
+    forgot the context. The fake worker below would succeed, so a fallback
+    shows up as a launch, not as a quieter failure.
+    """
+    import subprocess
+
+    from kestrel_sovereign.doctor import (
+        DoctorReport,
+        _AgentGovernance,
+        _check_constitution_drift,
+        _GovernanceSource,
+        _read_agent_node,
+    )
+
+    ambient = {
+        "KESTREL_DATABASE_URL": "postgresql://ambient-user@ambient-host/ambient",
+        "PGPASSWORD": "ambient-sentinel-password",
+        "PGHOST": "ambient-sentinel-host",
+    }
+    for name, value in ambient.items():
+        monkeypatch.setenv(name, value)
+
+    launched = []
+
+    class _Process:
+        returncode = 0
+
+        def communicate(self, payload, timeout):
+            row = ["did:test:agent", "agent", json.dumps({"constitution_hash": "a"})]
+            return json.dumps({"ok": True, "rows": [row]}), ""
+
+    def popen(command, **kwargs):
+        launched.append(kwargs.get("env"))
+        return _Process()
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db",
+        agent_did="did:test:agent",
+        dsn="postgresql://explicit-user@explicit-host/runtime",
+        postgres_cwd=str(tmp_path),
+    )
+
+    node = _read_agent_node(source)
+
+    assert launched == []
+    assert isinstance(node, _UnreadableDB)
+    assert node.postgres_failure == "diagnostic_tooling"
+    assert "probe context missing" in node.reason
+
+    report = DoctorReport()
+    _check_constitution_drift(
+        [_AgentGovernance(name="Test", agent_dir=tmp_path, source=source, node=node)],
+        report,
+        {},
+    )
+
+    assert launched == []
+    findings = [m for m in report.fail if "governance NOT verified" in m]
+    assert len(findings) == 1
+    assert "probe context missing" in findings[0]
+    rendered = "\n".join(report.fail + report.warn + report.ok)
+    for value in ambient.values():
+        assert value not in rendered
+
+
+def test_governance_source_repr_never_carries_connection_secrets(tmp_path):
+    """The spawned environment holds API tokens and ``KESTREL_DATA_KEY``."""
+    import logging
+
+    from kestrel_sovereign.doctor import _AgentGovernance, _GovernanceSource
+
+    environment = {
+        "KESTREL_DATA_KEY": "data-key-sentinel-0123456789",
+        "ANTHROPIC_API_KEY": "sk-ant-api-token-sentinel",
+        "PGPASSWORD": "pg-password-sentinel",
+    }
+    dsn = "postgresql://kestrel:dsn-password-sentinel@db-sentinel.internal/kestrel"
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db",
+        agent_did="did:test:agent",
+        dsn=dsn,
+        dsn_identity=(("host", "db-sentinel.internal"),),
+        postgres_home="/home/operator-sentinel",
+        postgres_env=dict(environment),
+        postgres_cwd=str(tmp_path),
+    )
+    reading = _AgentGovernance(
+        name="Test", agent_dir=tmp_path, source=source, node=None
+    )
+
+    renderings = [
+        repr(source),
+        str(source),
+        f"{source}",
+        logging.LogRecord(
+            "doctor", logging.INFO, __file__, 0, "source=%r", (source,), None
+        ).getMessage(),
+        repr(reading),
+        str(reading),
+    ]
+    secrets = [
+        *environment.values(),
+        "dsn-password-sentinel",
+        "db-sentinel.internal",
+        "/home/operator-sentinel",
+    ]
+    for rendered in renderings:
+        for secret in secrets:
+            assert secret not in rendered
+    assert "did:test:agent" in repr(source)
+    # Hidden from rendering, not from the probe that needs it.
+    assert source.postgres_env == environment
+    assert source.dsn == dsn
+
+
+def test_dsn_identity_always_covers_every_host():
+    from kestrel_sovereign.doctor import _dsn_identity
+
+    identity = set(
+        _dsn_identity(
+            "postgresql://runtime-user@db-primary/runtime"
+            "?host=db-replica-one,db-replica-two"
+        )
+    )
+
+    assert {
+        ("user", "runtime-user"),
+        ("dbname", "runtime"),
+        ("host", "db-primary"),
+        ("host", "db-replica-one"),
+        ("host", "db-replica-two"),
+    } <= identity
 
 
 def test_isolated_asyncpg_probe_uses_exact_runtime_context(tmp_path, monkeypatch):

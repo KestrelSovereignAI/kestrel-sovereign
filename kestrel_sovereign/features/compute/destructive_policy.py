@@ -30,9 +30,18 @@ from .shell_rewriter import ShellRewriteError, ShellScriptRewriter
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_TRASH_DIR = Path(
-    runtime_path_env(TRASH_DIR_ENV, os.path.expanduser("~/.kestrel/trash"))
-)
+def default_trash_dir() -> Path:
+    """The compute trash root when a caller names none.
+
+    ``$KESTREL_TRASH_DIR``, else ``~/.kestrel/trash``. Resolved on call, not
+    at import (#3104), so the environment in force when a policy or trash
+    manager is built decides it rather than whichever caller imported this
+    module first.
+    """
+    return Path(
+        runtime_path_env(TRASH_DIR_ENV, os.path.expanduser("~/.kestrel/trash"))
+    ).expanduser()
+
 
 # Each value denotes a parent plus a generated-directory name prefix, not an
 # arbitrary string prefix.  ``is_deletable_path`` resolves both sides and uses
@@ -81,7 +90,7 @@ class DestructiveOperationPolicy:
         deletable_prefixes: Optional[list[str]] = None,
         current_agent_data_path: Optional[str | Path] = None,
     ) -> None:
-        self.trash_dir = trash_dir or DEFAULT_TRASH_DIR
+        self.trash_dir = trash_dir or default_trash_dir()
         self.deletable_prefixes = (
             list(deletable_prefixes)
             if deletable_prefixes is not None
@@ -501,8 +510,8 @@ def rewrite_script_for_safety(
 __all__ = [
     "AgentDataProtectionError",
     "DEFAULT_DELETABLE_PREFIXES",
-    "DEFAULT_TRASH_DIR",
     "DestructiveOperationPolicy",
     "ShellRewriteError",
+    "default_trash_dir",
     "rewrite_script_for_safety",
 ]
